@@ -2,6 +2,8 @@
 
 pub mod model;
 pub mod sqlite;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -647,6 +649,7 @@ mod tests {
         let sop_run = SopRun {
             run_id: id.to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -659,11 +662,14 @@ mod tests {
             total_steps: 1,
             started_at: started_at.clone(),
             completed_at: completed_at.map(|s| s.to_string()),
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         PersistedRun {
             version: SOP_STORE_VERSION,

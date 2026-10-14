@@ -1,11 +1,11 @@
 # SOP Syntax Reference
 
-SOP definitions are loaded from subdirectories under `sops_dir`. When `sops_dir` is omitted from config, CLI commands fall back to `<workspace>/sops` for offline inspection, but runtime SOP execution is disabled.
+SOP definitions are loaded from subdirectories under `sops_dir`, which is unset by default, so runtime SOP execution is off until an operator opts in. Set `sops_dir` to a directory to enable it: a relative value resolves against the install root (the directory holding `config.toml`), so the documented `shared/sops` yields `<install>/shared/sops`, the same directory the SOP author writes to. An absolute or `~`-prefixed value is used as-is. Setting it back to `""` (or leaving it unset) disables runtime SOP execution; CLI commands still fall back to `<install>/shared/sops` for offline inspection.
 
 ## 1. Directory Layout
 
 ```text
-<workspace>/sops/
+<shared>/sops/
   deploy-prod/
     SOP.toml
     SOP.md
@@ -25,14 +25,35 @@ the runtime schema, and `condition` expressions. Before running a generated or
 checked-in SOP, validate it with `zeroclaw sop validate <name>`.
 
 `SOP.toml` carries the SOP's identity (`name`, `description`, `version`), its
-`triggers`, and its execution knobs. The concurrency-admission fields govern what
-happens when a trigger arrives while this SOP's execution slots are full:
+`triggers`, its owning `agent`, and its execution knobs.
+
+`agent` names the configured agent alias that `execute` steps run as; an
+individual step's own `agent` overrides it, and the resolved alias must be a
+configured agent with `enabled = true`. **A SOP with any headless trigger
+(cron, mqtt, webhook, amqp, filesystem, calendar, peripheral, channel) must
+resolve an owner for every `execute` step**, from one level or the other:
+validation blocks the save otherwise. Those triggers fire with no agent turn to
+inherit an identity from, and an unowned step is refused at dispatch rather than
+run as an unrelated agent.
+
+`manual` triggers are the one case validation only warns about, because they
+start from both sides: through `sop_execute` the calling agent owns the run, so
+no `agent` is needed, while the dashboard's run endpoint starts the same
+procedure with no agent behind it. That endpoint refuses an unowned procedure
+(see [Manual](./fan-in/manual.md)), so declare `agent` on any SOP you intend to
+start from the dashboard.
+
+The concurrency-admission fields govern what happens when a trigger arrives
+while this SOP's execution slots are full:
 
 | Field | Default | Effect |
 |---|---:|---|
 | `max_concurrent` | `1` | Maximum runs of this SOP *executing* at once. A run parked at a HITL approval or a deterministic checkpoint releases its slot, so it does not count against this. |
 | `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
 | `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
+
+An optional `[decision]` table lets a decision model gate each matched event
+and choose the run's execution mode. See [Decision models](./decision-models.md).
 
 `admission_policy` values (`SopAdmissionPolicy`, snake_case):
 
@@ -153,30 +174,84 @@ Routing and approval bullets can be combined in the same `SOP.md` steps:
 
 Parser behavior:
 
+<!-- >>> generated:sop-parser-behavior by `cargo generate sop-syntax` - do not edit <<< -->
+- The `## Steps` section is parsed until the next level-two heading.
 - Numbered items (`1.`, `2.`, ...) define step order.
-- Leading bold text (`**Title**`) becomes step title.
-- `- tools:` maps to `suggested_tools`.
+- Leading bold text (`**Title**`) becomes the step title; the remaining text becomes its body.
+- `- tools:` maps to `suggested_tools` and provides advisory tool names for the step.
+- `- allow-tools:` (or `- allow_tools:`) defines an explicit per-step tool allow-list.
+- `- deny-tools:` (or `- deny_tools:`) defines an explicit per-step tool deny-list.
 - `- requires_confirmation: true` enforces approval for that step.
-- `- kind:` accepts `execute` (default) or `checkpoint`. A checkpoint step
-  pauses deterministic execution at that step. Use `requires_confirmation: true`
-  when a step must require approval in any execution mode.
-- `- allow-tools:` and `- deny-tools:` define an explicit per-step tool scope.
-- `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
-- `- when:` is a routing guard evaluated against accumulated completed-step
-  outputs after the current step finishes. When it does not match, the run
-  completes instead of dispatching another step.
-- `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
-  are marked `skipped` and leave the run `pending` instead of dispatching.
-- `- when:` guards an explicit `- next:` jump; when the condition is false, the
-  run advances to the next linear step (`current_step + 1`) instead of completing.
-- `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
-  enforced for reported step failures and output schema failures.
+- `- kind:` accepts `execute` (default), `checkpoint`/`approval`, or `capability`; a checkpoint pauses deterministic execution, while `requires_confirmation: true` requires approval in any execution mode.
+- `- capability:` names the deterministic capability used by a `kind: capability` step.
+- `- with:` supplies the structured input for a capability step.
+- `- input:` attaches a JSON Schema-like input contract to the step boundary.
+- `- output:` attaches a JSON Schema-like output contract to the step boundary.
+- `- when:` is evaluated against accumulated completed-step outputs after the current step finishes. A false guard bypasses `switch` and explicit `next`, taking the linear successor or completing when the step is terminal or has no successor. With a true or absent guard, a non-empty `switch` takes precedence over `next`; without a switch, an explicit `next` is used before terminal or linear routing.
+- `- next:` routes to an explicit successor only when the top-level `when` allows routing and no `switch` ports are declared; ineligible routed steps are marked `skipped` and leave the run `pending` instead of dispatching.
+- `- terminal: true` completes the run instead of advancing to another step; the final step also completes when it has no linear successor.
+- `- depends_on:` (or `- depends-on:`) lists prerequisite steps for a non-linear run.
+- `- switch:` defines ordered `name>condition>step` ports for multi-branch routing. With a true or absent top-level `when`, the first matching port wins; an unmatched switch completes the run, and `next` plus the linear successor are ignored. A false top-level `when` bypasses switch evaluation.
+- `- on_failure:` (or `- on-failure:`) accepts `fail`, `retry:<count>`, or `goto:<step>` and is enforced for reported step failures and output-schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
-- `- policy:` names an approval-broker policy (a key in `[sop.approval].policies`)
-  that gates this step's approval with required-group membership and quorum. Omit
-  it for an unpoliced gate. A step that names a policy absent from
-  `[sop.approval].policies` fails closed (the gate stays waiting) rather than
-  clearing on a single approval.
+- `- agent:` overrides the parent agent alias for that step.
+- `- call:` adds a JSON planned tool call to the step when the value parses as a planned call.
+- `- prompt:` sets the approval-gate notice template.
+- `- policy:` names an approval-broker policy in `[sop.approval].policies`; the policy gates approval through required-group membership and quorum. An absent policy fails closed rather than clearing on a single approval, while omission leaves the gate unpoliced.
+- `- edit:` opts a checkpoint into editing the named field before resume.
+- `- decide:` makes the step a conditional part: a yes/no question the SOP's `[decision]` model answers about the triggering event when the run starts. The step runs only on yes; on no it is recorded as skipped and the run continues. If the model cannot answer, the step runs.
+- `- unless_decided: N` skips the step when step N's `decide` question was answered yes, so one decision can switch between alternative sets of steps.
+- Unrecognized sub-bullets and other non-empty continuation lines are appended to the step body.
+<!-- >>> end generated:sop-parser-behavior <<< -->
+
+### Copyable conditional-routing example
+
+This complete `SOP.md` routes critical alerts through an approved remediation
+step while recording other alerts without remediation:
+
+```md
+# Alert triage
+
+Classify an incoming alert, remediate critical alerts, and notify the operator.
+
+## Steps
+
+1. **Classify alert** - Normalize the incoming alert severity.
+   - output: {"type":"object","required":["severity"],"properties":{"severity":{"type":"string"}}}
+   - when: $.steps.1.severity == "critical"
+   - next: 3
+
+2. **Record routine alert** - Add the non-critical alert to the incident log.
+   - tools: shell
+   - next: 4
+
+3. **Remediate critical alert** - Run the approved remediation command.
+   - tools: shell
+   - requires_confirmation: true
+   - on_failure: retry:2
+   - next: 4
+
+4. **Notify operator** - Send the outcome to the operations channel.
+   - tools: http_request
+```
+
+When step 1 outputs `{"severity":"critical"}`, its guard matches and `next`
+jumps to step 3. Any other severity falls through to step 2, whose explicit
+`next` skips remediation and joins the critical path at step 4.
+
+The loader only discovers a directory that also contains a `SOP.toml`, so pair
+the steps above with this manifest in `<sops_dir>/alert-triage/`:
+
+```toml
+[sop]
+name = "alert-triage"
+description = "Classify an incoming alert, remediate critical alerts, and notify the operator."
+
+[[triggers]]
+type = "manual"
+```
+
+Then run `zeroclaw sop validate alert-triage`, which reports the SOP as valid.
 
 ### `[sop.approval]` policies and route delivery
 
@@ -410,9 +485,20 @@ useful for scalar event payloads.
 
 ### Operators
 
-A comparison uses one operator, matched longest-first: `>=`, `<=`, `!=`, `==`,
-`>`, `<`. JSON-path comparisons try numeric comparison first. If both sides
-parse as numbers, they compare numerically; otherwise values compare as strings.
+A comparison uses one operator. The source-owned authoring catalog is:
+
+<!-- >>> generated:sop-condition-operators by `cargo generate sop-syntax` - do not edit <<< -->
+- `==`: is
+- `!=`: is not
+- `>`: is greater than
+- `>=`: is at least
+- `<`: is less than
+- `<=`: is at most
+<!-- >>> end generated:sop-condition-operators <<< -->
+
+The parser matches operator tokens longest-first. JSON-path comparisons try
+numeric comparison first. If both sides parse as numbers, they compare
+numerically; otherwise values compare as strings.
 Surrounding double quotes on the comparand are stripped, so quote string
 literals: `$.status == "critical"`. Direct numeric conditions are numeric-only:
 if either side does not parse as a number, there is no match.

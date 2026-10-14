@@ -218,7 +218,7 @@ fn shared_prefix(file: &Path) -> Option<String> {
     Some("../".repeat(depth - 1))
 }
 
-fn resolve_stable(present: &[String]) -> Option<String> {
+pub(super) fn resolve_stable(present: &[String]) -> Option<String> {
     let raw = fs::read_to_string("stable-version.txt").ok()?;
     let tag = raw.trim().to_string();
     if tag.is_empty() {

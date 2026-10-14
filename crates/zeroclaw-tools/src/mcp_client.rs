@@ -198,12 +198,19 @@ impl RecoveryBarrier {
         }
     }
 
+    fn needed_epoch(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        match self.needed_epoch.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Publish that the observed epoch now needs recovery before any further
     /// write. Idempotent for a given epoch; a newer epoch supersedes an older
     /// pending one. This is intentionally synchronous (no `.await`) so it takes
     /// effect the instant an outcome becomes unknown.
     fn arm(&self, epoch: u64) {
-        let mut needed = self.needed_epoch.lock().unwrap();
+        let mut needed = self.needed_epoch();
         match *needed {
             Some(existing) if existing >= epoch => {}
             _ => *needed = Some(epoch),
@@ -214,7 +221,7 @@ impl RecoveryBarrier {
     /// for `recovered_epoch`, then wake any waiting writers.
     fn finish(&self, recovered_epoch: u64) {
         {
-            let mut needed = self.needed_epoch.lock().unwrap();
+            let mut needed = self.needed_epoch();
             if matches!(*needed, Some(pending) if pending <= recovered_epoch) {
                 *needed = None;
             }
@@ -234,7 +241,7 @@ impl RecoveryBarrier {
     }
 
     fn recovery_pending(&self) -> bool {
-        self.needed_epoch.lock().unwrap().is_some()
+        self.needed_epoch().is_some()
     }
 }
 
@@ -951,9 +958,9 @@ impl McpRegistry {
                 _request: &JsonRpcRequest,
                 _lifecycle: &McpRequestLifecycle,
             ) -> Result<JsonRpcResponse> {
-                unreachable!(
-                    "for_test_with_server_count registry is only used for server_count/Arc equality"
-                )
+                Err(anyhow::Error::msg(
+                    "for_test_with_server_count transport does not support requests",
+                ))
             }
 
             async fn close(&self) -> Result<()> {
@@ -1104,10 +1111,9 @@ impl McpRegistry {
                 _request: &JsonRpcRequest,
                 _lifecycle: &McpRequestLifecycle,
             ) -> Result<JsonRpcResponse> {
-                unreachable!(
-                    "for_test_make_stub_server is only used for identity / \
-                     ptr_eq / server_count assertions — never for actual tool calls"
-                )
+                Err(anyhow::Error::msg(
+                    "for_test_make_stub_server transport does not support requests",
+                ))
             }
 
             async fn close(&self) -> Result<()> {
@@ -1137,6 +1143,79 @@ impl McpRegistry {
         }
     }
 
+    /// Test-only: a registry whose single server answers every JSON-RPC
+    /// request with the same canned `result` and advertises `tool`, so
+    /// `call_tool` routes through the production path. Sibling unit-test
+    /// modules (e.g. `mcp_tool`) use this to drive production `execute`
+    /// end to end without spawning a live MCP child.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_tool_server(
+        server_name: &str,
+        tool: &str,
+        result: serde_json::Value,
+    ) -> Self {
+        use crate::mcp_protocol::{JsonRpcRequest, JsonRpcResponse};
+        use async_trait::async_trait;
+
+        struct CannedTransport {
+            result: serde_json::Value,
+        }
+
+        #[async_trait]
+        impl SharedMcpTransportConn for CannedTransport {
+            async fn send_and_recv(
+                &self,
+                request: &JsonRpcRequest,
+                _lifecycle: &McpRequestLifecycle,
+            ) -> Result<JsonRpcResponse> {
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: Some(self.result.clone()),
+                    error: None,
+                })
+            }
+
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(CannedTransport { result });
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: server_name.to_string(),
+                ..McpServerConfig::default()
+            },
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![McpToolDef {
+                name: tool.to_string(),
+                description: Some("fake tool".into()),
+                input_schema: serde_json::json!({}),
+            }],
+            capabilities: McpServerCapabilities::default(),
+        };
+        let server = McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
+        };
+        let mut tool_index = HashMap::new();
+        tool_index.insert(format!("{server_name}__{tool}"), (0usize, tool.to_string()));
+        let mut server_index = HashMap::new();
+        server_index.insert(server_name.to_string(), 0usize);
+        Self {
+            servers: vec![server],
+            tool_index,
+            server_index,
+        }
+    }
+
     /// All prefixed tool names across all connected servers.
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_index.keys().cloned().collect()
@@ -1154,11 +1233,16 @@ impl McpRegistry {
     }
 
     /// Execute a tool by prefixed name.
+    ///
+    /// Returns the raw JSON-RPC result value. Callers that surface the result
+    /// to the model should run
+    /// `embedded_resource::format_mcp_tool_result_for_model` so
+    /// `resource`+`blob` content is materialized instead of pretty-printed.
     pub async fn call_tool(
         &self,
         prefixed_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<String> {
+    ) -> Result<serde_json::Value> {
         let (server_idx, original_name) = self.tool_index.get(prefixed_name).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1169,11 +1253,9 @@ impl McpRegistry {
             );
             anyhow::Error::msg(format!("unknown MCP tool `{prefixed_name}`"))
         })?;
-        let result = self.servers[*server_idx]
+        self.servers[*server_idx]
             .call_tool(original_name, arguments)
-            .await?;
-        serde_json::to_string_pretty(&result)
-            .with_context(|| format!("failed to serialize result of MCP tool `{prefixed_name}`"))
+            .await
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1400,18 +1482,8 @@ mod tests {
     use zeroclaw_config::schema::McpTransport;
 
     #[cfg(unix)]
-    fn write_executable_script(path: &std::path::Path, body: &[u8]) {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut script = std::fs::File::create(path).expect("create script");
-        script.write_all(body).expect("write script");
-        drop(script);
-        let mut permissions = std::fs::metadata(path)
-            .expect("script metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("chmod script");
+    fn write_script(path: &std::path::Path, body: &[u8]) {
+        std::fs::write(path, body).expect("write script");
     }
 
     #[cfg(unix)]
@@ -1446,12 +1518,14 @@ mod tests {
     fn stdio_test_config(
         name: &str,
         script: &std::path::Path,
-        args: Vec<String>,
+        mut args: Vec<String>,
         timeout_secs: u64,
     ) -> McpServerConfig {
+        // Execute the stable interpreter, not a freshly written executable inode.
+        args.insert(0, script.display().to_string());
         McpServerConfig {
             name: name.to_string(),
-            command: script.display().to_string(),
+            command: "/bin/sh".to_string(),
             args,
             tool_timeout_secs: Some(timeout_secs),
             transport: McpTransport::Stdio,
@@ -1592,6 +1666,8 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            tls_ca_cert_path: None,
+            max_response_bytes: None,
         };
         let result = McpServer::connect(config).await;
         assert!(result.is_err());
@@ -1612,6 +1688,8 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            tls_ca_cert_path: None,
+            max_response_bytes: None,
         }];
         let registry = McpRegistry::connect_all(&configs)
             .await
@@ -2233,6 +2311,115 @@ mod tests {
         }
     }
 
+    /// Like `server_returning`, but the server advertises a single tool so a
+    /// registry built from it routes `call_tool` through the production path.
+    fn server_with_tool_returning(tool: &str, result: serde_json::Value) -> McpServer {
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FakeTransport { result });
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: "fake".into(),
+                ..Default::default()
+            },
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![crate::mcp_protocol::McpToolDef {
+                name: tool.to_string(),
+                description: Some("fake tool".into()),
+                input_schema: serde_json::json!({}),
+            }],
+            capabilities: McpServerCapabilities::default(),
+        };
+        McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
+        }
+    }
+
+    /// Production-path fixture: a tool result carrying text + a `resource` blob +
+    /// `structuredContent` + `_meta` flows through `McpToolWrapper::execute`
+    /// (call_tool -> format) exactly as in production. Proves the model output
+    /// keeps every non-binary surface, omits the base64, and materializes the
+    /// blob only inside the workspace.
+    #[tokio::test]
+    async fn mcp_tool_wrapper_execute_materializes_blob_and_preserves_full_result() {
+        use crate::mcp_tool::McpToolWrapper;
+        use base64::Engine as _;
+        use zeroclaw_api::tool::Tool as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pdf_b64 = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 hello world");
+        let result = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "Here is your report." },
+                { "type": "resource", "resource": {
+                    "uri": "file:///report.pdf",
+                    "mimeType": "application/pdf",
+                    "blob": pdf_b64,
+                }},
+            ],
+            "structuredContent": { "rows": [ { "id": 1, "name": "alpha-row" } ] },
+            "_meta": { "trace": "t-123" },
+            "isError": false,
+        });
+
+        let server = server_with_tool_returning("do_thing", result);
+        let mut tool_index = HashMap::new();
+        tool_index.insert(
+            "fake__do_thing".to_string(),
+            (0usize, "do_thing".to_string()),
+        );
+        let mut server_index = HashMap::new();
+        server_index.insert("fake".to_string(), 0usize);
+        let registry = Arc::new(McpRegistry {
+            servers: vec![server],
+            tool_index,
+            server_index,
+        });
+
+        let security = Arc::new(zeroclaw_config::policy::SecurityPolicy {
+            workspace_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let def = crate::mcp_protocol::McpToolDef {
+            name: "do_thing".into(),
+            description: Some("does".into()),
+            input_schema: serde_json::json!({}),
+        };
+        let wrapper = McpToolWrapper::new("fake__do_thing".into(), def, registry, security);
+
+        let out = wrapper
+            .execute(serde_json::json!({}))
+            .await
+            .expect("execute is non-fatal");
+        assert!(out.success, "execute should succeed: {:?}", out.error);
+        let text = out.output.as_str();
+
+        // Every non-binary result surface is preserved.
+        assert!(text.contains("Here is your report."), "text lost: {text}");
+        assert!(text.contains("alpha-row"), "structuredContent lost: {text}");
+        assert!(text.contains("t-123"), "_meta lost: {text}");
+        // The base64 payload never reaches the model output.
+        assert!(
+            !text.contains(&pdf_b64),
+            "raw base64 leaked into model output"
+        );
+        // The blob is materialized only under {workspace}/uploads, with real bytes.
+        let files: Vec<_> = std::fs::read_dir(dir.path().join("uploads"))
+            .expect("uploads dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one materialized file");
+        assert_eq!(
+            std::fs::read(files[0].path()).unwrap(),
+            b"%PDF-1.4 hello world"
+        );
+    }
+
     /// Like `server_returning`, but with explicit advertised capabilities.
     fn server_with_caps_returning(
         capabilities: McpServerCapabilities,
@@ -2412,8 +2599,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn dropping_stdio_registry_reaps_child_process() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
         use std::path::Path;
         use tokio::time::{Duration, sleep};
 
@@ -2432,10 +2617,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let server_path = temp.path().join("echo-mcp.sh");
         let pid_path = temp.path().join("echo-mcp.pid");
-        let mut script = std::fs::File::create(&server_path).expect("script");
-        script
-            .write_all(
-                br#"#!/bin/sh
+        write_script(
+            &server_path,
+            br#"#!/bin/sh
 echo "$$" > "$1"
 while IFS= read -r line; do
   case "$line" in
@@ -2449,25 +2633,23 @@ while IFS= read -r line; do
   esac
 done
 "#,
-            )
-            .expect("write script");
-        drop(script);
-        let mut perms = std::fs::metadata(&server_path)
-            .expect("metadata")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&server_path, perms).expect("chmod");
+        );
 
         let config = McpServerConfig {
             pinned_resources: Vec::new(),
             name: "echo".to_string(),
-            command: server_path.display().to_string(),
-            args: vec![pid_path.display().to_string()],
+            command: "/bin/sh".to_string(),
+            args: vec![
+                server_path.display().to_string(),
+                pid_path.display().to_string(),
+            ],
             env: std::collections::HashMap::default(),
             tool_timeout_secs: None,
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            tls_ca_cert_path: None,
+            max_response_bytes: None,
         };
 
         let registry = McpRegistry::connect_all(&[config])
@@ -2499,7 +2681,7 @@ done
         let script_path = temp.path().join("multiplex-mcp.sh");
         let first_received = temp.path().join("first-received.fifo");
         make_fifo(&first_received);
-        write_executable_script(
+        write_script(
             &script_path,
             br#"#!/bin/sh
 first_id=
@@ -2571,7 +2753,7 @@ done
         let effects = temp.path().join("effects.log");
         make_fifo(&effect_ready);
         make_fifo(&recovered);
-        write_executable_script(
+        write_script(
             &script_path,
             br#"#!/bin/sh
 printf '%s\n' "$$" >> "$3"
@@ -2666,7 +2848,7 @@ done
         let script_path = temp.path().join("queued-writer-mcp.sh");
         let requests = temp.path().join("requests.log");
         let generations = temp.path().join("generations.log");
-        write_executable_script(
+        write_script(
             &script_path,
             br#"#!/bin/sh
 printf '%s\n' "$$" >> "$2"

@@ -20,3 +20,15 @@ mod desktop_release;
 
 #[path = "architecture/container_release.rs"]
 mod container_release;
+
+#[path = "architecture/publish_contract.rs"]
+mod publish_contract;
+
+#[path = "architecture/ci_runner_labels.rs"]
+mod ci_runner_labels;
+
+#[path = "architecture/auth_boundary.rs"]
+mod auth_boundary;
+
+#[path = "architecture/stream_error_terminal.rs"]
+mod stream_error_terminal;

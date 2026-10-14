@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
+use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -16,6 +17,7 @@ pub struct ModelRates {
     pub input_per_mtok: Option<f64>,
     pub output_per_mtok: Option<f64>,
     pub cached_input_per_mtok: Option<f64>,
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 impl ModelRates {
@@ -25,9 +27,12 @@ impl ModelRates {
         self.input_per_mtok.is_none()
             && self.output_per_mtok.is_none()
             && self.cached_input_per_mtok.is_none()
+            && self.cache_write_per_mtok.is_none()
     }
 
-    /// True when every dimension carries a rate (nothing left to fill).
+    /// True when the billing-critical dimensions carry a rate. Cache writes
+    /// are optional: without a write rate they stay priced at the plain
+    /// input rate, so they never block completeness.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.input_per_mtok.is_some()
@@ -36,8 +41,10 @@ impl ModelRates {
     }
 
     /// Per-dimension precedence merge: `self` wins, `fallback` fills only the
-    /// dimensions `self` left unset (`Option::or`). A `Some(0.0)` in `self`
-    /// (a deliberately-free rate) is preserved, never overridden.
+    /// dimensions `self` left unset (`Option::or`). A `Some(0.0)` in `self` is
+    /// an explicitly configured rate and is preserved, never overridden: free
+    /// for input and output, and the "no cache discount" sentinel for cached
+    /// input, which the cost constructor bills at the standard input rate.
     #[must_use]
     pub fn or(self, fallback: ModelRates) -> ModelRates {
         ModelRates {
@@ -46,18 +53,13 @@ impl ModelRates {
             cached_input_per_mtok: self
                 .cached_input_per_mtok
                 .or(fallback.cached_input_per_mtok),
+            cache_write_per_mtok: self.cache_write_per_mtok.or(fallback.cache_write_per_mtok),
         }
     }
 }
 
-/// Upper bound on a sane per-1M-token rate. At `$1`/token this sits orders of
-/// magnitude above any real model price, so a genuine rate never trips it; it
-/// only catches a parsing artifact or a hostile/buggy gateway reporting an
-/// absurd value (which would otherwise bill a fortune).
-const MAX_SANE_PER_MTOK: f64 = 1_000_000.0;
-
 pub(crate) fn sane_mtok(rate: f64) -> Option<f64> {
-    (0.0..=MAX_SANE_PER_MTOK).contains(&rate).then_some(rate)
+    zeroclaw_config::cost::is_sane_usd_rate(rate).then_some(rate)
 }
 
 fn per_token_str_to_mtok(value: &Option<String>) -> Option<f64> {
@@ -67,12 +69,13 @@ fn per_token_str_to_mtok(value: &Option<String>) -> Option<f64> {
 
 /// Normalize a provider's `/models` [`ModelPricing`] (per-token strings) into
 /// per-1M-token [`ModelRates`]. `prompt`→input, `completion`→output,
-/// `input_cache_read`→cached.
+/// `input_cache_read`→cached, `input_cache_write`→cache write.
 pub(crate) fn normalize_pricing(pricing: &ModelPricing) -> ModelRates {
     ModelRates {
         input_per_mtok: per_token_str_to_mtok(&pricing.prompt),
         output_per_mtok: per_token_str_to_mtok(&pricing.completion),
         cached_input_per_mtok: per_token_str_to_mtok(&pricing.input_cache_read),
+        cache_write_per_mtok: per_token_str_to_mtok(&pricing.input_cache_write),
     }
 }
 
@@ -85,7 +88,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 static LIVE_PRICES: LazyLock<RwLock<Arc<PriceSnapshot>>> =
     LazyLock::new(|| RwLock::new(Arc::new(HashMap::new())));
 
-static CONFIG_HANDLE: LazyLock<RwLock<Option<Arc<RwLock<Config>>>>> =
+static CONFIG_HANDLE: LazyLock<RwLock<Option<LiveConfigHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
 /// Guards against spawning more than one refresher when both the channels
@@ -139,6 +142,15 @@ fn any_live_pricing(config: &Config) -> bool {
         .any(|(_, _, base)| base.live_pricing)
 }
 
+/// Whether the background price refresher has been started in this process.
+///
+/// Read-only: it reports the once-per-process guard [`spawn_refresher`]
+/// claims, so an owner can confirm the refresher runs without depending on
+/// which component started it.
+pub fn refresher_running() -> bool {
+    REFRESHER_STARTED.get().is_some()
+}
+
 /// Spawn the background price refresher, once per process.
 ///
 /// No-op when no provider currently sets `live_pricing = true`: zero network,
@@ -151,22 +163,23 @@ fn any_live_pricing(config: &Config) -> bool {
 ///
 /// Every call re-binds `CONFIG_HANDLE` before anything else, and the running
 /// task re-resolves it each cycle, so a daemon reload (which re-instantiates
-/// the config `Arc` and re-runs both call sites) re-points the refresher at
-/// the current config, and toggling `live_pricing` on a provider (or changing
-/// its model/endpoint) is honored on the next refresh without a restart. Each
-/// cycle rebuilds the per-gateway poll set via the normal factory path
-/// (reusing each provider's configured `base_url`, credentials, and options),
-/// fetches one `/models` per gateway, and fills only the flagged models,
-/// falling back to the models.dev catalog for models a gateway doesn't price
-/// (or providers with no HTTP listing, e.g. the `kilocli` subprocess gateway).
-/// A fetch error for one source keeps the previous snapshot rather than
-/// regressing good prices to empty; disabling `live_pricing` on the last
-/// flagged provider instead clears the snapshot on the next cycle, so stale
-/// prices stop filling after an opt-out.
-pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
+/// the authority — and its read-only handle — and re-runs both call sites)
+/// re-points the refresher at the current published config, and toggling
+/// `live_pricing` on a provider (or changing its model/endpoint) is honored
+/// on the next refresh without a restart. Each cycle rebuilds the
+/// per-gateway poll set via the normal factory path (reusing each
+/// provider's configured `base_url`, credentials, and options), fetches one
+/// `/models` per gateway, and fills only the flagged models, falling back to
+/// the models.dev catalog for models a gateway doesn't price (or providers
+/// with no HTTP listing, e.g. the `kilocli` subprocess gateway). A fetch
+/// error for one source keeps the previous snapshot rather than regressing
+/// good prices to empty; disabling `live_pricing` on the last flagged
+/// provider instead clears the snapshot on the next cycle, so stale prices
+/// stop filling after an opt-out.
+pub fn spawn_refresher(config: LiveConfigHandle) {
     // Re-bind before the enabled pre-check so even a "nothing enabled yet"
     // call leaves the freshest handle for a refresher started later.
-    *CONFIG_HANDLE.write() = Some(Arc::clone(&config));
+    bind_config(config.clone());
     if !any_live_pricing(&config.read()) {
         return;
     }
@@ -176,26 +189,54 @@ pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
 
     ::zeroclaw_spawn::spawn!(async {
         loop {
-            // Re-resolve the handle (re-bound across daemon reloads), then
-            // clone the config under the lock and build/poll without holding
-            // it. The handle is bound above before this task can exist, and
-            // never unbound, so the `expect` cannot fire.
-            let handle = CONFIG_HANDLE
-                .read()
-                .clone()
-                .expect("config handle is bound before the refresher is spawned");
-            let cfg = handle.read().clone();
-            let (groups, total_aliases_per_family) = enabled_pricing_groups(&cfg);
-            if groups.is_empty() {
-                if !current_snapshot().is_empty() {
-                    store_snapshot(PriceSnapshot::new());
-                }
-            } else {
-                refresh_once(&groups, &total_aliases_per_family).await;
-            }
+            refresh_cycle().await;
             tokio::time::sleep(REFRESH_INTERVAL).await;
         }
     });
+}
+
+/// Point the refresher at the live config handle a surface writes, without
+/// starting it.
+///
+/// Starting the refresher belongs to the process that owns the runtime (the
+/// daemon, or a standalone command). A surface that owns a *live* config
+/// handle, one its config API writes in place, binds that handle here so the
+/// next cycle sees an operator's change (an opt-out, a new endpoint or model)
+/// without waiting for a reload. The gateway does this at startup.
+pub fn bind_config(config: LiveConfigHandle) {
+    *CONFIG_HANDLE.write() = Some(config);
+}
+
+/// Whether the config the refresher is bound to opts any provider into live
+/// pricing. `false` when nothing is bound yet.
+pub fn live_pricing_enabled() -> bool {
+    bound_config().is_some_and(|cfg| any_live_pricing(&cfg))
+}
+
+/// A copy of the bound config, read under its lock at the moment of the call.
+fn bound_config() -> Option<Config> {
+    let handle = CONFIG_HANDLE.read().clone()?;
+    Some(handle.snapshot())
+}
+
+/// One refresh cycle. Re-resolves the bound handle (re-bound across daemon
+/// reloads and by a surface that owns a live handle), then builds and polls
+/// without holding either lock. An opt-out on the bound handle clears the
+/// snapshot on the very next cycle.
+async fn refresh_cycle() {
+    // The handle is bound before the refresher task can exist and is never
+    // unbound, so a missing handle means there is nothing to refresh.
+    let Some(cfg) = bound_config() else {
+        return;
+    };
+    let (groups, total_aliases_per_family) = enabled_pricing_groups(&cfg);
+    if groups.is_empty() {
+        if !current_snapshot().is_empty() {
+            store_snapshot(PriceSnapshot::new());
+        }
+    } else {
+        refresh_once(&groups, &total_aliases_per_family).await;
+    }
 }
 
 /// One model whose price we want filled: the composite alias (`<type>.<alias>`)
@@ -410,6 +451,7 @@ fn assemble_snapshot(
                     cached_input_per_mtok: slot
                         .cached_input_per_mtok
                         .or(rates.cached_input_per_mtok),
+                    cache_write_per_mtok: slot.cache_write_per_mtok.or(rates.cache_write_per_mtok),
                 };
             }
         }
@@ -514,6 +556,91 @@ async fn refresh_once(groups: &[GatewayGroup], total_aliases_per_family: &HashMa
 mod tests {
     use super::*;
 
+    /// The bound config handle and the price snapshot are process-global.
+    /// Every test here that reads or writes them holds this lock.
+    static GLOBAL_STATE: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+    fn opted_in_config() -> Config {
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "priced".to_string(),
+            zeroclaw_config::schema::OllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("priced-model".to_string()),
+                    live_pricing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    fn opt_out(config: &mut Config) {
+        config
+            .providers
+            .models
+            .ollama
+            .get_mut("priced")
+            .expect("the opted-in provider exists")
+            .base
+            .live_pricing = false;
+    }
+
+    /// An operator's opt-out written through the bound live handle, the way
+    /// the gateway config API writes its handle, stops live pricing on the
+    /// next cycle without a reload: the snapshot is cleared.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_live_opt_out_on_the_bound_handle_clears_prices_on_the_next_cycle() {
+        let _guard = GLOBAL_STATE.lock();
+        let live = zeroclaw_config::live::LiveConfig::new(opted_in_config());
+        bind_config(live.handle());
+        assert!(live_pricing_enabled());
+
+        let mut stale = PriceSnapshot::new();
+        stale
+            .entry("ollama.priced".to_string())
+            .or_default()
+            .insert("priced-model".to_string(), rate(1.0));
+        store_snapshot(stale);
+        assert!(!current_snapshot().is_empty());
+
+        let mut config = live.snapshot();
+        opt_out(&mut config);
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        assert!(
+            !live_pricing_enabled(),
+            "the refresher reads the live handle, so the opt-out is visible at once"
+        );
+        refresh_cycle().await;
+        assert!(
+            current_snapshot().is_empty(),
+            "the next cycle honors the opt-out and clears the stale prices"
+        );
+    }
+
+    /// Binding a private copy is the regression this guards against: a write
+    /// to the live handle never reaches a copy taken before it, so the
+    /// refresher would keep polling a provider the operator opted out of.
+    #[test]
+    fn a_copy_of_the_config_does_not_see_later_live_writes() {
+        let _guard = GLOBAL_STATE.lock();
+        let live = zeroclaw_config::live::LiveConfig::new(opted_in_config());
+        let copy = zeroclaw_config::live::LiveConfig::new(live.snapshot());
+        bind_config(copy.handle());
+        let mut config = live.snapshot();
+        opt_out(&mut config);
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        assert!(
+            live_pricing_enabled(),
+            "a copy keeps the stale opt-in, which is why a surface binds its live handle"
+        );
+        bind_config(live.handle());
+        assert!(!live_pricing_enabled());
+    }
+
     #[test]
     fn lookup_keyed_by_family_with_bare_type_fallback() {
         let mut snap = PriceSnapshot::new();
@@ -525,6 +652,7 @@ mod tests {
                 input_per_mtok: Some(0.3),
                 output_per_mtok: Some(1.2),
                 cached_input_per_mtok: Some(0.06),
+                cache_write_per_mtok: None,
             },
         );
         // The cost path passes the bare family: direct hit.
@@ -585,6 +713,7 @@ mod tests {
 
     #[test]
     fn current_snapshot_is_synchronous_and_non_blocking() {
+        let _guard = GLOBAL_STATE.lock();
         // Reading the global must never block or require an async runtime:
         // this whole test runs without a tokio runtime.
         store_snapshot(PriceSnapshot::new());
@@ -610,14 +739,21 @@ mod tests {
             input_per_mtok: Some(input),
             output_per_mtok: None,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         }
     }
 
-    fn full_rate(input: Option<f64>, output: Option<f64>, cached: Option<f64>) -> ModelRates {
+    fn full_rate(
+        input: Option<f64>,
+        output: Option<f64>,
+        cached: Option<f64>,
+        write: Option<f64>,
+    ) -> ModelRates {
         ModelRates {
             input_per_mtok: input,
             output_per_mtok: output,
             cached_input_per_mtok: cached,
+            cache_write_per_mtok: write,
         }
     }
 
@@ -635,7 +771,10 @@ mod tests {
         gateway.insert("minimax/m2.7".to_string(), rate(0.3));
         gateway.insert("slug".to_string(), rate(0.7)); // matched via suffix
         // Gateway prices input+output for `partial` but leaves cache_read unset.
-        gateway.insert("partial".to_string(), full_rate(Some(2.0), Some(4.0), None));
+        gateway.insert(
+            "partial".to_string(),
+            full_rate(Some(2.0), Some(4.0), None, None),
+        );
         let gateway_results = vec![(wanted.as_slice(), gateway)];
 
         let mut md = HashMap::new();
@@ -646,7 +785,7 @@ mod tests {
         // models.dev has all three for `partial`; only cache_read should be used.
         md.insert(
             "partial".to_string(),
-            full_rate(Some(9.9), Some(9.9), Some(0.5)),
+            full_rate(Some(9.9), Some(9.9), Some(0.5), None),
         );
         let models_dev = HashMap::from([("kilo".to_string(), md)]);
 
@@ -680,12 +819,15 @@ mod tests {
     fn sane_mtok_rejects_nonfinite_negative_and_absurd() {
         assert_eq!(sane_mtok(3.0), Some(3.0));
         assert_eq!(sane_mtok(0.0), Some(0.0));
-        assert_eq!(sane_mtok(MAX_SANE_PER_MTOK), Some(MAX_SANE_PER_MTOK));
+        assert_eq!(
+            sane_mtok(zeroclaw_config::cost::MAX_SANE_USD_RATE),
+            Some(zeroclaw_config::cost::MAX_SANE_USD_RATE)
+        );
         assert!(sane_mtok(-1.0).is_none());
         assert!(sane_mtok(f64::INFINITY).is_none());
         assert!(sane_mtok(f64::NAN).is_none());
         // Above the ceiling ($1/token) -> rejected (parsing artifact / hostile gateway).
-        assert!(sane_mtok(MAX_SANE_PER_MTOK * 2.0).is_none());
+        assert!(sane_mtok(zeroclaw_config::cost::MAX_SANE_USD_RATE * 2.0).is_none());
     }
 
     // Alias-boundary regression test 1: when one alias opts in and another does

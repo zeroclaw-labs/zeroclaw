@@ -29,8 +29,8 @@ macro_rules! record {
 macro_rules! attribution_span {
     ($attributable:expr) => {{
         let __zc_thing = $attributable;
-        let __zc_role = ::zeroclaw_api::attribution::Attributable::role(__zc_thing);
-        let __zc_alias = ::zeroclaw_api::attribution::Attributable::alias(__zc_thing);
+        let __zc_role = $crate::__private::zeroclaw_api::attribution::Attributable::role(__zc_thing);
+        let __zc_alias = $crate::__private::zeroclaw_api::attribution::Attributable::alias(__zc_thing);
         $crate::__private::tracing::info_span!(
             target: "zeroclaw_log_internal_attribution",
             "zeroclaw_attribution",
@@ -61,13 +61,22 @@ mod tests {
     use crate::{Action, Event, EventOutcome};
     use serde_json::json;
 
+    // `record!` reaches the global subscriber, and once any test in this crate
+    // installs the capture subscriber that path runs `writer::record_event`.
+    // Without the writer lock these events land in whatever tempdir a
+    // concurrent `writer::tests` case has installed, and that test then counts
+    // a line it never wrote.
+    use crate::writer::WRITER_TEST_LOCK;
+
     #[test]
     fn record_compiles_minimal() {
+        let _writer_guard = WRITER_TEST_LOCK.lock();
         record!(INFO, Event::new(module_path!(), Action::Note), "hello");
     }
 
     #[test]
     fn record_compiles_with_attrs_and_outcome() {
+        let _writer_guard = WRITER_TEST_LOCK.lock();
         record!(
             WARN,
             Event::new(module_path!(), Action::Fail)
@@ -79,6 +88,7 @@ mod tests {
 
     #[test]
     fn record_compiles_with_duration() {
+        let _writer_guard = WRITER_TEST_LOCK.lock();
         record!(
             INFO,
             Event::new(module_path!(), Action::Complete)

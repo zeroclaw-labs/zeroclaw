@@ -17,7 +17,7 @@ but "which surface owns this data, and how long does it live?"
 | Session history | `zeroclaw-infra` session backends, ACP store, and live RPC/session maps | Chat/ACP history can persist; live RPC handles are process-local | History preserves conversation continuity. It is not the canonical store for user preferences, config, or files. |
 | Current prompt context | Agent loop prompt assembly | Ephemeral provider request | Recalled memory, hardware RAG, current input, system prompt, skills, and tool results may be sent to the provider. This does not make them durable. |
 | History trimming | `agent::history` and `agent::history_trim` | Lossy change to the request/session history shape | Trimming must be visible, preserve tool-call/tool-result pairing, and avoid pretending old context is still available. |
-| Tool result payloads | `ToolResult`, `ToolResultMessage`, and the tool dispatcher | Current turn and any persisted session history that records the turn | Bound size and provenance. Large outputs should be capped or summarized intentionally; image-path promotion must only happen for producing tools, not path-listing tools. |
+| Tool result payloads | `ToolResult`, `ToolResultMessage`, and the tool dispatcher | Current turn and any persisted session history that records the turn | Bound size and provenance. Large outputs should be capped or summarized intentionally; nothing in a tool's output text is promoted to an attachment unless the tool declared it. Promotion is explicit: a producing tool declares a `RenderedMarker` attachment, which rides the tool-result carrier at a fixed position (`attachments` array native, `[Tool attachments: N]` count line plus marker lines in prompt mode) and is never recovered by scanning the result text. The runtime infers no attachments from tool text, so a bare image path in any tool's output stays text. |
 | Files and workspaces | Per-agent workspace security policy | Files persist according to the filesystem, not memory | File contents are not memory just because a tool read them. Writes belong in the agent workspace unless policy explicitly allows more. |
 | Media attachments | Channel/gateway media pipeline and `MediaAttachment` | Inbound payload by default; persistence depends on the receiving path | Raw bytes should stay bounded and path-validated. Store summaries or references deliberately rather than silently copying media into memory. |
 | Logs and observer events | `zeroclaw-log`, `ObserverEvent`, runtime trace | Optional runtime trace and live observers | Logs are evidence and diagnostics, not source-of-truth memory. Scrub or bound user/tool payloads before logging. |
@@ -96,6 +96,11 @@ Tool result payloads are easy to over-preserve. Reviewers should check:
   rather than raw sensitive output;
 - whether the result is only in the current turn/session history or is also
   intentionally written to memory.
+
+When `max_tool_result_chars` truncates a result, the runtime emits a
+`tool_result_truncated` log event with the original, retained, elided, and limit
+byte counts. The event carries no tool-result content; it makes the lossy prompt
+boundary visible through the normal live and persisted log surfaces.
 
 If a PR says a tool result is "remembered", require it to say whether that means
 provider-visible history, persisted session history, a memory backend row, a

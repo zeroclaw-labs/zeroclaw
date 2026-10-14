@@ -4,7 +4,9 @@ pub mod broadcast;
 pub mod chain;
 pub mod config;
 pub mod event;
+mod export_bridge;
 pub mod layer;
+mod log_bridge;
 pub mod migrate;
 pub mod observer_bridge;
 pub mod reader;
@@ -22,6 +24,7 @@ pub mod __private {
     pub use ::serde_json;
     pub use ::tracing;
     pub use ::uuid;
+    pub use ::zeroclaw_api;
 }
 
 pub use broadcast::{
@@ -34,6 +37,9 @@ pub use event::{
     ATTRIBUTION_FIELDS, Action, COMPOSITE_PREFIXES, Event, EventCategory, EventOutcome, LogEvent,
     Severity, ZeroclawAttribution, is_attribution_field, severity_text_from_number,
     severity_text_from_tracing_level,
+};
+pub use export_bridge::{
+    LogRecordExporter, clear_log_exporter, flush_log_exporter, set_log_exporter,
 };
 pub use layer::LogCaptureLayer;
 pub use writer::{
@@ -63,12 +69,17 @@ pub mod field {
 
 pub use migrate::migrate_legacy_jsonl_in_place;
 pub use observer_bridge::{clear_observer_bridge, set_observer_bridge};
-pub use reader::{LogFilter, LogPage, current_log_path, find_event_by_id, load_page};
-pub use subscriber::{install_global_subscriber, try_install_capture_subscriber};
+pub use reader::{
+    LogFilter, LogPage, SegmentCursor, current_log_path, find_event_across_segments,
+    find_event_by_id, load_page, query_log_page,
+};
+pub use subscriber::{
+    install_global_subscriber, try_install_capture_subscriber, try_install_line_sink_for_tests,
+};
 pub use tool_io::{ToolIoCapture, capture_llm_request, capture_tool_input, capture_tool_output};
 pub use writer::{
-    active_log_path, flush_for_test, init_from_config, llm_request_payload_policy, record_event,
-    runtime_trace_path,
+    active_log_path, active_log_query_scope, flush_for_test, init_from_config,
+    llm_request_payload_policy, record_event, runtime_trace_path,
 };
 
 mod r#macro;
@@ -92,4 +103,16 @@ pub fn __private_test_writer_lock() -> impl Drop {
 #[must_use]
 pub fn __private_test_hook_lock() -> impl Drop {
     crate::broadcast::HOOK_TEST_LOCK.lock()
+}
+
+/// Test support: whether the dispatcher active on the calling thread
+/// includes [`LogCaptureLayer`]. Capture tests report this when an
+/// expected event is missing, to tell "the layer never saw it" apart
+/// from "the broadcast channel lost it".
+#[doc(hidden)]
+#[must_use]
+pub fn __private_test_capture_layer_active() -> bool {
+    ::tracing::dispatcher::get_default(|dispatch| {
+        dispatch.downcast_ref::<LogCaptureLayer>().is_some()
+    })
 }

@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "LLM provider implementations, auth services, and multimodal processing."
-publish = false
+repository.workspace = true
+homepage.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-log.workspace = true
@@ -14,12 +16,20 @@ zeroclaw-config = { workspace = true, default-features = false }
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
+cap-fs-ext = "4"
+cap-std = "4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 chacha20poly1305 = "0.10"
 hex = "0.4"
 hmac = "0.12"
+image = { version = "0.25", default-features = false, features = [
+  "gif",
+  "jpeg",
+  "png",
+  "webp",
+] }
 parking_lot = "0.12"
 rand = "0.10"
 regex = "1.10"
@@ -41,3 +51,15 @@ hyper = { version = "1", features = ["http1", "server"] }
 tempfile = "3.26"
 scopeguard = "1.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[features]
+default = []
+test-helpers = []

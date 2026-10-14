@@ -1,4 +1,4 @@
-use crate::auth::oauth_common::{parse_query_params, url_encode};
+use crate::auth::oauth_common::{is_structured_callback_input, parse_query_params, url_encode};
 
 use crate::auth::profiles::TokenSet;
 use anyhow::{Context, Result};
@@ -276,7 +276,7 @@ async fn receive_loopback_code_inner(expected_state: &str, timeout: Duration) ->
         anyhow::Error::msg("Callback request missing path")
     })?;
 
-    let code = parse_code_from_redirect(path, Some(expected_state))?;
+    let code = parse_callback_code(path, expected_state)?;
 
     let body =
         "<html><body><h2>ZeroClaw login complete</h2><p>You can close this tab.</p></body></html>";
@@ -290,7 +290,7 @@ async fn receive_loopback_code_inner(expected_state: &str, timeout: Duration) ->
     Ok(code)
 }
 
-pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Result<String> {
+pub(super) fn parse_manual_code_input(input: &str, expected_state: &str) -> Result<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         anyhow::bail!("No OAuth code provided");
@@ -303,10 +303,35 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
     };
 
     let params = parse_query_params(query);
-    let is_callback_payload = trimmed.contains('?')
-        || params.contains_key("code")
-        || params.contains_key("state")
-        || params.contains_key("error");
+    if !is_structured_callback_input(trimmed, "/auth/callback") {
+        return Ok(trimmed.to_string());
+    }
+
+    parse_callback_params(&params, expected_state)
+}
+
+fn parse_callback_code(input: &str, expected_state: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("No OAuth code provided");
+    }
+
+    let query = trimmed.split_once('?').map_or(trimmed, |(_, query)| query);
+    let params = parse_query_params(query);
+
+    parse_callback_params(&params, expected_state)
+}
+
+fn parse_callback_params(
+    params: &std::collections::BTreeMap<String, String>,
+    expected_state: &str,
+) -> Result<String> {
+    let state = params
+        .get("state")
+        .ok_or_else(|| anyhow::Error::msg("Missing OAuth state in callback"))?;
+    if state != expected_state {
+        anyhow::bail!("OAuth state mismatch");
+    }
 
     if let Some(err) = params.get("error") {
         let desc = params
@@ -316,25 +341,29 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
         anyhow::bail!("OpenAI OAuth error: {err} ({desc})");
     }
 
-    if let Some(expected_state) = expected_state {
-        if let Some(got) = params.get("state") {
-            if got != expected_state {
-                anyhow::bail!("OAuth state mismatch");
-            }
-        } else if is_callback_payload {
-            anyhow::bail!("Missing OAuth state in callback");
-        }
-    }
-
-    if let Some(code) = params.get("code").cloned() {
-        return Ok(code);
-    }
-
-    if !is_callback_payload {
-        return Ok(trimmed.to_string());
+    if let Some(code) = params.get("code")
+        && !code.trim().is_empty()
+    {
+        return Ok(code.trim().to_string());
     }
 
     anyhow::bail!("Missing OAuth code in callback")
+}
+
+pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Result<String> {
+    match expected_state {
+        Some(state) => parse_callback_code(input, state),
+        None => {
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("No OAuth code provided");
+            }
+            if is_structured_callback_input(trimmed, "/auth/callback") {
+                anyhow::bail!("Expected OAuth state is required for callback input");
+            }
+            Ok(trimmed.to_string())
+        }
+    }
 }
 
 pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
@@ -518,32 +547,60 @@ mod tests {
     }
 
     #[test]
-    fn parse_redirect_url_extracts_code() {
-        let code = parse_code_from_redirect(
+    fn callback_redirect_requires_matching_state() {
+        let code = parse_callback_code(
             "http://127.0.0.1:1455/auth/callback?code=abc123&state=xyz",
-            Some("xyz"),
+            "xyz",
         )
         .unwrap();
         assert_eq!(code, "abc123");
+
+        assert!(parse_callback_code("/auth/callback?code=abc123", "xyz").is_err());
+        assert!(parse_callback_code("abc123", "xyz").is_err());
     }
 
     #[test]
-    fn parse_redirect_accepts_raw_code() {
-        let code = parse_code_from_redirect("raw-code", None).unwrap();
+    fn manual_code_input_accepts_raw_code() {
+        let code = parse_manual_code_input("raw-code", "xyz").unwrap();
         assert_eq!(code, "raw-code");
     }
 
     #[test]
-    fn parse_redirect_rejects_state_mismatch() {
-        let err = parse_code_from_redirect("/auth/callback?code=x&state=a", Some("b")).unwrap_err();
-        assert!(err.to_string().contains("state mismatch"));
+    fn manual_callback_input_rejects_missing_or_mismatched_state() {
+        let missing = parse_manual_code_input("/auth/callback?code=x", "b").unwrap_err();
+        assert!(missing.to_string().contains("Missing OAuth state"));
+
+        for input in [
+            "/auth/callback?code=x&state=a",
+            "?code=x&state=a",
+            "https://example.test/other?code=x&state=a",
+        ] {
+            let err = parse_manual_code_input(input, "b").unwrap_err();
+            assert!(err.to_string().contains("state mismatch"), "{input}");
+        }
+    }
+
+    #[test]
+    fn manual_callback_input_rejects_url_or_path_without_query() {
+        for input in ["http://localhost:1455/auth/callback", "/auth/callback"] {
+            assert!(parse_manual_code_input(input, "xyz").is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn compatibility_parser_accepts_raw_code_only_without_state_expectation() {
+        assert_eq!(
+            parse_code_from_redirect("raw-code", None).unwrap(),
+            "raw-code"
+        );
+        assert!(parse_code_from_redirect("raw-code", Some("xyz")).is_err());
     }
 
     #[test]
     fn parse_redirect_rejects_error_without_code() {
-        let err = parse_code_from_redirect(
-            "/auth/callback?error=access_denied&error_description=user+cancelled",
-            Some("xyz"),
+        let err = parse_manual_code_input(
+            "/auth/callback?error=access_denied&error_description=user+cancelled&state=xyz",
+            "xyz",
         )
         .unwrap_err();
         assert!(

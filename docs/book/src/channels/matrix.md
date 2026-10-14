@@ -413,7 +413,12 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 - **Inline-reply media:** `channels.matrix.mention_only = true` makes the bot ignore naked media uploads (no text body to mention against). When the user inline-replies to such a dropped event with a question (`@bot can you see this?`), ZeroClaw walks the reply's `m.relates_to.m.in_reply_to.event_id`, fetches the parent event, and pulls its media into the current message: the agent's vision pipeline sees the image even though the original upload was filtered out.
 - **Attachments thread alongside text:** `room.send_attachment` calls carry an `AttachmentConfig::reply(...)` with `EnforceThread::Threaded` when a thread anchor is present, so PDFs / images / voice notes land inside the bot's thread instead of the main timeline.
 - **Outbound media markers:** the agent emits `[image:url|path]`, `[file:url|path]`, `[voice:url|path]`, `[video:...]`, `[audio:...]` (and uppercase / `[document:...]` aliases) inside its reply text; ZeroClaw fetches the bytes (HTTP for `http(s)://`, local read otherwise) and uploads as the appropriate Matrix message event. **Missing or unreadable targets are non-fatal:** the channel logs a warning, drops just that marker, and appends a `(note: I couldn't deliver the file at <path>.)` line so the operator sees what was attempted instead of a silently-dropped reply.
-- **Voice messages** (MSC3245): inbound `m.audio` events carrying the `org.matrix.msc3245.voice` field are saved to `{workspace_dir}/matrix_files/` and run through the agent's configured transcription provider so the agent gets both the transcript text and the source path. Outbound voice notes use the `[voice:<url|path>]` marker; ZeroClaw uploads as `m.audio` with the voice flag + zero-waveform set so Element renders the bubble as a voice note. See [Model Providers](../providers/overview.md) for transcription provider setup.
+- **Voice messages** (MSC3245): inbound `m.audio` events carrying the `org.matrix.msc3245.voice` field are saved to `{workspace_dir}/matrix_files/` and run through the agent's configured transcription provider so the agent gets both the transcript text and the source path. Outbound voice notes upload as `m.audio` with the voice flag + zero-waveform set, so Element renders the bubble as a voice note; in an encrypted room the audio is encrypted before upload like any other attachment. See [Model Providers](../providers/overview.md) for transcription provider setup.
+- **Spoken replies:** with `tts.enabled` and the owning agent's `tts_provider` set, a reply is synthesized and posted as a voice note *alongside* its text, in the same thread, so the room keeps a searchable transcript either way. Which replies get spoken is decided by configuration, never guessed from the reply text:
+  - A sender in a `[peer_groups.*]` group with `output_modality = "voice"` on this channel. Matrix peers are named by user ID (`@user:server`, the form `peer-groups.toml` documents), matched case-insensitively with a leading `@` optional, and `["*"]` covers everyone. Both the reply path and the proactive path below accept the same shapes. Room IDs belong in `allowed_rooms` and are never peer identities.
+  - Proactive delivery (cron `delivery.to`, announcements) has no sender to consult, so a target room is voiced when one of its joined members belongs to such a group.
+  - `output_modality = "mirror"`, the default, replies in kind: a voice message gets the text reply plus a voice note, a text message gets text only. The choice is made per message from the inbound event's voice flag (`org.matrix.msc3245.voice`), never from the transcript or from earlier messages in the room, so one sender's voice note cannot voice another sender's reply. A `text` group is always text-only. Because `mirror` is the default, a group that never set `output_modality` answers voice messages with a voice note alongside the text as soon as TTS is configured; set `output_modality = "text"` to keep text-only replies.
+- **Outbound voice markers:** the agent can also emit `[voice:<url|path>]` explicitly, which uploads that file as a voice note whatever the peer group says.
 - **Acknowledgement reactions:** controlled by `channels.matrix.ack_reactions` (default `true`). When on, the bot reacts with 👀 while processing and ✅ when done. Set to `false` to keep rooms reaction-free.
 - **Persistent sessions:** on first successful login, ZeroClaw writes `~/.zeroclaw/state/matrix/session.json` (user_id + device_id + access_token + optional refresh_token). Subsequent restarts call `restore_session()` from that blob: no re-login. The matrix-rust-sdk SQLite crypto store lives alongside it at `~/.zeroclaw/state/matrix/store/`. **Once `session.json` exists, rotating `access_token` in config has no effect until the file is deleted**: the saved token wins. Delete `session.json` to force a re-login from config values.
 - **Cross-signing:** when `recovery_key` matches what is sealed in your account's server-side secret storage, ZeroClaw runs `recovery().recover(key)` on every startup, the SDK imports your existing master / self-signing / user-signing keys, and the freshly registered device is automatically signed. **No bootstrap, no UIA, no key rotation.** If your account doesn't yet have cross-signing set up, generate the recovery key in Element (Settings → Security & Privacy → Secure Backup) before configuring `recovery_key`.
@@ -423,7 +428,39 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 
 {{#streaming channel="Matrix" mode="stream_mode" path="channels.matrix.<alias>.stream_mode"}}
 
-Matrix specifics: in `partial` mode, tool-execution status is shown through the same edit pipeline. In `multi_message` mode each paragraph posts as its own threaded message, and the split is code-fence-aware, so blank lines inside fenced blocks don't break a code block across messages.
+Matrix specifics: in `partial` mode, tool-execution status is shown through the same edit pipeline as answer text. In `single_message` mode, tool/progress status updates are edited into one sliding draft while the final answer is sent as a separate Matrix message. `stream_draft_lines` controls visible progress lines: `0` removes only the line-count limit; it never creates a second progress message. `message_max_bytes` caps both draft and final event content, counting rendered Markdown (including generated HTML) and Matrix reply/edit relation metadata rather than only Markdown source. Oversized progress drops complete oldest lines or entries so the window retains newest activity; an oversized individual item is replaced by a visible alert. The separate final response retains a UTF-8-safe prefix. Progress content is escaped before Markdown rendering, so reasoning remains readable across lines while user/model/tool content cannot introduce Markdown or HTML formatting. Values below `512` use that effective minimum so a non-empty serialized Matrix event can fit. The budget does not apply to approval prompts, system notices, scheduled delivery, or other ordinary sends. Choose a budget below the Matrix event limit. `stream_reasoning` controls provider reasoning visibility in that progress draft: `off` suppresses reasoning-derived draft updates, `status` emits liveness ticks without raw reasoning text, and `full` emits raw provider reasoning text into the progress draft. `stream_draft_delete` controls whether durable progress transcripts are deleted before the final answer is posted; delete failures are logged and final answer delivery still proceeds. Placeholder-only drafts are removed before the final answer even when transcript retention is enabled. In `multi_message` mode each paragraph posts as its own threaded message, and the split is code-fence-aware, so blank lines inside fenced blocks don't break a code block across messages.
+
+`stream_tool_arguments` controls which tool arguments appear in `single_message`
+progress lines. Missing or empty configuration uses conservative per-tool
+defaults; skill wrappers, plugins, MCP tools, and unresolved names show their
+names only. A single `default_base` entry selects `none`, `safe`, or `all`,
+while exact-name tool rules can replace that base or add and remove fields:
+
+```toml
+stream_tool_arguments = [
+    { default_base = "safe", argument_chars = 60 },
+    { tool = "delegate", base = "none", include = ["agent", "background", "prompt"], argument_chars = 0 },
+    { tool = "mock_tool", base = "all", exclude = ["token"] },
+]
+```
+
+Rule order is irrelevant, duplicate tool/default entries are rejected, and an
+omitted rule `base` inherits `default_base`. `include` adds fields after the
+base is selected; `exclude` removes them. Runtime-only fields are never shown,
+credential-named fields are redacted recursively within every selected value,
+and every rendered value passes credential leak detection and one-line
+normalization before it reaches Matrix. Including a composite remains an
+explicit operator disclosure decision, but does not bypass credential
+redaction.
+In `safe` mode, only the recommended top-level scalar arguments are rendered;
+nulls, arrays, and objects are omitted. Selecting `all` or naming an argument
+in `include` is explicit operator opt-in to compact JSON rendering of a
+composite value.
+`argument_chars` on the default entry changes the inherited per-value cap from
+`60`; the same field on a tool rule overrides it for that tool. `0` keeps full
+values while `message_max_bytes` still bounds the rendered draft. Explicit
+`all` applies to unknown tools; use an exact-name rule when enabling arguments
+for only one extension tool.
 
 ## 8. Auto-recovery from corrupted local state
 

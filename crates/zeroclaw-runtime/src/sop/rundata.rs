@@ -9,6 +9,10 @@ use super::types::{SopStepResult, SopStepStatus};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunData {
     pub outputs: BTreeMap<u32, Value>,
+    /// The decision model's p(yes) per conditional-part step, exposed to
+    /// `when:` conditions as `$.decisions.<step>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub decisions: BTreeMap<u32, f64>,
 }
 
 impl RunData {
@@ -22,6 +26,11 @@ impl RunData {
         data
     }
 
+    pub fn with_decisions(mut self, decisions: &BTreeMap<u32, f64>) -> Self {
+        self.decisions.clone_from(decisions);
+        self
+    }
+
     pub fn insert_output(&mut self, step_number: u32, output: Value) {
         self.outputs.insert(step_number, output);
     }
@@ -33,6 +42,7 @@ impl RunData {
 
     pub fn merge(&mut self, other: RunData) {
         self.outputs.extend(other.outputs);
+        self.decisions.extend(other.decisions);
     }
 
     pub fn to_payload(&self) -> Value {
@@ -41,7 +51,15 @@ impl RunData {
             .iter()
             .map(|(step, value)| (step.to_string(), value.clone()))
             .collect();
-        json!({ "steps": Value::Object(steps) })
+        if self.decisions.is_empty() {
+            return json!({ "steps": Value::Object(steps) });
+        }
+        let decisions = self
+            .decisions
+            .iter()
+            .map(|(step, p)| (step.to_string(), json!(p)))
+            .collect();
+        json!({ "steps": Value::Object(steps), "decisions": Value::Object(decisions) })
     }
 
     pub fn get_path(&self, path: &str) -> Option<Value> {
@@ -68,6 +86,17 @@ pub(crate) fn parse_step_output_value(raw: &str, output_schema: Option<&Value>) 
     let trimmed = raw.trim();
 
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        // A double-encoded payload parses cleanly as a top-level JSON string,
+        // so the embedded-container recovery below never gets a chance at it.
+        // One schema-gated unwrap of the inner text is a recovery, not a
+        // reinterpretation: the inner value is accepted only when the declared
+        // schema validates it; anything else keeps the string untouched.
+        if let (Some(schema), Value::String(inner)) = (output_schema, &value)
+            && let Ok(unwrapped) = serde_json::from_str::<Value>(inner.trim())
+            && super::schema::validate_value(schema, &unwrapped).is_ok()
+        {
+            return unwrapped;
+        }
         return value;
     }
 
@@ -121,6 +150,46 @@ fn unique_embedded_container(text: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_encoded_output_with_schema_is_unwrapped() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["head_sha"],
+            "properties": {"head_sha": {"type": "string"}}
+        });
+        let payload = r#"{"head_sha":"abc"}"#;
+        let raw = serde_json::to_string(payload).unwrap();
+
+        let value = parse_step_output_value(&raw, Some(&schema));
+
+        assert_eq!(value["head_sha"], "abc");
+    }
+
+    #[test]
+    fn double_encoded_output_without_schema_stays_a_string() {
+        let payload = r#"{"head_sha":"abc"}"#;
+        let raw = serde_json::to_string(payload).unwrap();
+
+        let value = parse_step_output_value(&raw, None);
+
+        assert_eq!(value, Value::String(payload.to_string()));
+    }
+
+    #[test]
+    fn double_encoded_output_failing_the_schema_stays_a_string() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["review_path"],
+            "properties": {"review_path": {"type": "string"}}
+        });
+        let payload = r#"{"head_sha":"abc"}"#;
+        let raw = serde_json::to_string(payload).unwrap();
+
+        let value = parse_step_output_value(&raw, Some(&schema));
+
+        assert_eq!(value, Value::String(payload.to_string()));
+    }
 
     #[test]
     fn run_data_parses_json_outputs() {

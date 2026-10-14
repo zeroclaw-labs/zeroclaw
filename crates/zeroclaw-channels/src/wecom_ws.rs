@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{StreamMode, WeComWsConfig};
 use zeroclaw_runtime::i18n;
+use zeroclaw_tool_call_parser::TERMINAL_MARKERS;
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -33,7 +34,6 @@ const WECOM_WS_READY_POLL_MILLIS: u64 = 100;
 const WECOM_STREAM_CONFLICT_MAX_RETRIES: usize = 3;
 const WECOM_STREAM_CONFLICT_RETRY_BASE_MILLIS: u64 = 150;
 const WECOM_IDEMPOTENCY_MAX_KEYS: usize = 4096;
-const WECOM_PROVIDER_TRAILING_SENTINELS: &[&str] = &["<|eom|>"];
 
 const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
 const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
@@ -317,9 +317,14 @@ impl WeComWsChannel {
         policy_resolver: Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync>,
         workspace_dir: &Path,
     ) -> Result<Self> {
-        if config.stream_mode == StreamMode::MultiMessage {
+        let unsupported_stream_mode = match config.stream_mode {
+            StreamMode::MultiMessage => Some("multi_message"),
+            StreamMode::Off | StreamMode::Partial => None,
+        };
+        if let Some(mode) = unsupported_stream_mode {
             anyhow::bail!(
-                "WeCom WebSocket stream_mode=multi_message is not supported; use partial or off"
+                "WeCom WebSocket stream_mode={} is not supported; use partial or off",
+                mode
             );
         }
 
@@ -1923,6 +1928,10 @@ fn parse_inbound_payload(payload: Value) -> Result<ParsedInbound> {
     })
 }
 
+// The `user--` / `group--` scope prefixes are load-bearing beyond this
+// module: the orchestrator's `is_single_party_reply_target` recognizes
+// `user--` to keep direct-message prompts free of speaker attribution.
+// Change the prefixes only together with that helper.
 fn compute_scopes(inbound: &ParsedInbound) -> ScopeDecision {
     let chat_type = inbound.chat_type.to_ascii_lowercase();
     if chat_type == "group" {
@@ -1966,10 +1975,14 @@ fn normalize_wecom_allowlist(entries: Vec<String>) -> Vec<String> {
 
 fn allowlist_matches(allowlist: &[String], candidate: &str) -> bool {
     let candidate = normalize_wecom_identity(candidate);
+    // Via the shared helper rather than a local wildcard test, so an `ignore`
+    // carried through as a deny marker is applied ahead of the wildcard.
     !candidate.is_empty()
-        && allowlist
-            .iter()
-            .any(|entry| entry == "*" || entry == &candidate)
+        && crate::allowlist::is_user_allowed(
+            allowlist,
+            &candidate,
+            crate::allowlist::Match::Sensitive,
+        )
 }
 
 fn evaluate_access_decision(
@@ -1977,7 +1990,11 @@ fn evaluate_access_decision(
     allowed_groups: &[String],
     inbound: &ParsedInbound,
 ) -> AccessDecision {
-    if allowed_users.is_empty() && allowed_groups.is_empty() {
+    // Grants, not entries: a policy holding only denies has authorized no one,
+    // which is the missing-allowlist case the operator needs told about.
+    if !crate::allowlist::grants_anyone(allowed_users)
+        && !crate::allowlist::grants_anyone(allowed_groups)
+    {
         return AccessDecision::AllowlistMissing;
     }
 
@@ -2404,7 +2421,7 @@ fn split_stream_content_and_overflow(input: &str) -> (String, Option<String>) {
 fn strip_trailing_provider_sentinels(input: &str) -> String {
     let mut trimmed = input.trim_end();
 
-    while let Some(sentinel) = WECOM_PROVIDER_TRAILING_SENTINELS
+    while let Some(sentinel) = TERMINAL_MARKERS
         .iter()
         .find(|sentinel| trimmed.ends_with(**sentinel))
     {
@@ -2792,6 +2809,21 @@ mod tests {
     }
 
     #[test]
+    fn strip_trailing_provider_sentinels_covers_shared_marker_vocabulary() {
+        // The channel reuses the parser crate's canonical terminal-marker
+        // vocabulary (single source of truth). Every marker added to
+        // `TERMINAL_MARKERS` must be stripped here too; a channel-local
+        // copy would go stale and violate the shared-vocabulary contract.
+        for marker in TERMINAL_MARKERS {
+            assert_eq!(
+                strip_trailing_provider_sentinels(&format!("Hi there!{marker}")),
+                "Hi there!",
+                "channel stripper must reuse TERMINAL_MARKERS for {marker:?}"
+            );
+        }
+    }
+
+    #[test]
     fn outbound_stream_normalization_strips_trailing_provider_sentinel() {
         assert_eq!(normalize_stream_content("Hi there!<|eom|>"), "Hi there!");
         assert_eq!(
@@ -3145,6 +3177,38 @@ mod tests {
     }
 
     #[test]
+    fn split_channel_spellings_carry_one_ignore_into_the_runtime_policy() {
+        // The normal daemon startup path resolved the two spellings separately
+        // and concatenated them, so a wildcard under `wecom-ws` never met an
+        // `ignore` under `wecom_ws` and the ignored sender was admitted. Both
+        // startup paths now share `wecom_ws_external_peers`, which this uses.
+        let config: zeroclaw_config::schema::Config = toml::from_str(
+            r#"
+            [peer_groups.wecom_grant]
+            channel = "wecom-ws.ops"
+            external_peers = ["*"]
+
+            [peer_groups.wecom_deny]
+            channel = "wecom_ws.ops"
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        let peers = crate::orchestrator::wecom_ws_external_peers(&config, "ops");
+        let policy = WeComWsRuntimePolicy::from_config(&test_wecom_ws_config(), peers);
+
+        assert!(
+            !allowlist_matches(&policy.direct_userids, "alice"),
+            "an ignore under either spelling must deny the sender"
+        );
+        assert!(
+            allowlist_matches(&policy.direct_userids, "bob"),
+            "an unignored sender still rides the wildcard"
+        );
+    }
+
+    #[test]
     fn channel_access_uses_live_runtime_policy() {
         let mut config = test_wecom_ws_config();
         config.allowed_users = vec!["user-1".to_string()];
@@ -3228,6 +3292,31 @@ mod tests {
         );
         assert_eq!(
             evaluate_access_decision(&[], &["*".to_string()], &inbound),
+            AccessDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn access_decision_denies_an_ignored_user_under_a_wildcard() {
+        // The resolved peer list carries `ignore` forward as a deny marker
+        // when a wildcard survives, so the channel must apply it rather than
+        // testing for `"*"` on its own.
+        let inbound = test_inbound("single", None, "zeroclaw_user");
+        assert_eq!(
+            evaluate_access_decision(
+                &["*".to_string(), "!zeroclaw_user".to_string()],
+                &[],
+                &inbound
+            ),
+            AccessDecision::Denied
+        );
+        let other = test_inbound("single", None, "someone_else");
+        assert_eq!(
+            evaluate_access_decision(
+                &["*".to_string(), "!zeroclaw_user".to_string()],
+                &[],
+                &other
+            ),
             AccessDecision::Allowed
         );
     }

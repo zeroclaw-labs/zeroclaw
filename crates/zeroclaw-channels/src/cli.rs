@@ -109,6 +109,7 @@ mod tests {
                 cancellation_token: None,
                 attachments: vec![],
                 in_reply_to: None,
+                references: Vec::new(),
                 suppress_voice: false,
                 force_voice: false,
             })
@@ -128,6 +129,7 @@ mod tests {
                 cancellation_token: None,
                 attachments: vec![],
                 in_reply_to: None,
+                references: Vec::new(),
                 suppress_voice: false,
                 force_voice: false,
             })

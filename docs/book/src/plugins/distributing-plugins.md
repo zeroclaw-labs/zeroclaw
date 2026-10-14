@@ -11,22 +11,32 @@ install path in `host.rs`.
 
 ### What is signed
 
-The signature covers the **canonical manifest bytes**: the manifest file's
-content with every line whose trimmed form starts with `signature` or
-`publisher_key` followed by `=` removed, and trailing empty lines stripped
+The signature covers the **canonical manifest bytes**. The host parses the TOML,
+removes only the exact root `signature` and `publisher_key` entries, preserves
+the rest of the document, and strips trailing empty lines
 (`canonical_manifest_bytes` in `signature.rs`). This makes the signature
-self-embeddable: you sign the manifest without the signature fields, then add
-them, and verification strips them back out before checking.
+self-embeddable: sign the manifest without those root fields, then add them;
+verification removes them before checking.
 
-Two consequences worth knowing:
+Consequences worth knowing:
 
-- The `.wasm` component itself is **not** covered by the signature. What the
-  signature attests is the manifest: the name, version, capabilities, and
-  permissions a publisher stands behind. Pair it with a registry `sha256`
-  digest (below) when the artifact integrity matters in transit.
-- Canonicalization is line-based. Reformatting the manifest (reordering
-  lines, changing whitespace within a kept line) invalidates the signature.
-  Sign last, after the manifest is final.
+- Put the component's SHA-256 in the root `wasm_sha256` field before signing.
+  The signature then binds that digest to the manifest. The host verifies it
+  over the exact bytes it admits and compiles; strict mode rejects executable
+  manifests without it. The registry `sha256` below independently protects the
+  distribution archive in transit.
+- Nested fields with names such as `config_schema.properties.signature`, and
+  similarly prefixed root fields such as `signature_algorithm`, remain signed.
+  Reformatting or reordering retained content invalidates the signature. Sign
+  last, after the manifest is final.
+- Config exposure markers such as
+  `config_schema.properties.api_token.x-secret` are therefore
+  signature-covered policy. Changing a tool or channel property between public
+  config exposure and scoped `secrets.get` access requires rebuilding and
+  re-signing.
+- Packages signed by the former prefix-based canonicalizer need re-signing only
+  if they relied on one of those edge cases or on TOML decoration attached to a
+  removed field. Ordinary manifests keep the same signed content.
 
 ### Keys and process
 
@@ -35,13 +45,78 @@ The signature is base64url (no padding); the public key is hex-encoded. The
 crate exposes the full toolchain (`signature.rs`): `generate_signing_key`
 produces a PKCS#8 keypair and its hex public key, `sign_manifest` produces
 the base64url signature over the canonical bytes, and `public_key_hex`
-recovers the public key from a stored private key. There is no CLI wrapper
-for signing today; publishers drive these functions from a short Rust helper
-in their release pipeline.
+recovers the public key from a stored private key. `sign_manifest_document`
+does both steps and returns the signed manifest with the two root fields
+already in place. There is no `zeroclaw plugin sign` command; publishers call
+these functions from their release pipeline. The crate ships a ready-made
+helper, `crates/zeroclaw-plugins/examples/sign_manifest.rs`. Run it from a
+ZeroClaw checkout with paths into your plugin's directory, and keep the private
+key outside both trees. Use a new, separate package directory and a new archive
+path for each release;
+the helper creates it when it writes the signed manifest:
 
-The signed manifest then carries two extra fields: `signature` (the base64url
-value) and `publisher_key` (your hex public key). Operators who want to trust
-you add that hex key to their `plugins.security.trusted_publisher_keys` list:
+```bash
+cargo run -p zeroclaw-plugins --example sign_manifest -- keygen ~/.keys/my-plugin.pk8
+cargo run -p zeroclaw-plugins --example sign_manifest -- \
+    sign path/to/my-plugin/manifest.toml path/to/my-plugin-package/manifest.toml \
+    --key ~/.keys/my-plugin.pk8 --payload path/to/my-plugin/my-plugin.wasm
+cp path/to/my-plugin/my-plugin.wasm path/to/my-plugin-package/my-plugin.wasm
+(cd path/to/my-plugin-package && zip -r ../my-plugin.zip .)
+```
+
+This recipe assumes `wasm_path = "my-plugin.wasm"`. `--payload` hashes the
+component but does not copy it. Copy those exact bytes, and any other required
+assets, to the paths the manifest declares relative to the package directory
+before making the zip. Archive only that directory, containing the signed
+`manifest.toml`; do not include the unsigned source manifest or edit the signed
+manifest after signing.
+
+`keygen` writes a new private key, creating its directory when needed
+(readable by the owner only on Unix), refuses to overwrite an existing file,
+and prints the hex public key. `sign` records the component's SHA-256 in
+`wasm_sha256` when `--payload` is given, signs, checks the signature with the
+host's verifier, writes the signed manifest, and prints the same public key.
+For a manifest that declares `wasm_path`, it warns when no `wasm_sha256` is
+recorded, because strict mode refuses such a package. A manifest without
+`wasm_path`, such as a skill bundle, takes no `--payload`: the host rejects a
+digest there.
+
+On Windows the key file inherits its directory's ACL. Keep the private key
+in a directory that only the publisher can read.
+
+The signed manifest then carries two extra **root** fields: `signature` (the
+base64url value) and `publisher_key` (your hex public key). Put both before the
+first table header, including `[config_schema]`; appending them after a table
+header makes them members of that table under TOML rules and the host will see
+an unsigned manifest.
+
+If you embed the fields by hand after signing, place them directly after
+another root field. The host's TOML editor attaches a blank line or comment to
+the entry or table header below it. If the fields land directly under a blank line or comment
+that was already in the manifest you signed, verification removes that line
+together with the fields, the remaining bytes no longer match what you signed,
+and strict mode rejects the package. A blank line or comment you add directly
+above the fields is removed together with them and is harmless. Anything you
+add below them attaches to the next entry or table header and changes the
+signed bytes, so add nothing there. `sign_manifest_document` and the helper place the fields before
+they sign, so the question does not arise.
+
+```toml
+name = "my-plugin"
+version = "0.1.0"
+wasm_path = "my-plugin.wasm"
+wasm_sha256 = "<64-hex-character-component-sha256>"
+signature = "<base64url-signature>"
+publisher_key = "<hex-public-key>"
+
+[config_schema]
+type = "object"
+properties = {}
+additionalProperties = false
+```
+
+Operators who want to trust you add that hex key to their
+`plugins.security.trusted_publisher_keys` list:
 
 ```bash
 zeroclaw config set plugins.security.signature_mode strict
@@ -71,7 +146,11 @@ The install path is the local plugin directory; a registry is only a JSON
 index consulted at command time (`zeroclaw plugin search` / `install`).
 Both commands exist only in binaries with the plugin host compiled in (see
 [build features](../developing/plugin-protocol.md#build-features)); the
-prebuilt release binaries ship without it. The
+prebuilt release binaries ship without it. Fetching an index through either
+command caches it locally. `zeroclaw plugin list` then combines installed
+packages with the cache without making a network request; it keeps installed
+and registry versions separate rather than guessing whether an arbitrary
+version string is newer. The
 default index is the `zeroclaw-labs/zeroclaw-plugins` repository's
 `registry.json`; private registries are a URL away
 (`--registry <url>` per command, or the `ZEROCLAW_PLUGIN_REGISTRY_URL`
@@ -87,9 +166,16 @@ an optional `sha256` digest of the zip.
 
 `zeroclaw plugin install <name>` resolves the entry, downloads the zip,
 verifies the digest when present, safely extracts, and hands the extracted
-directory to the same `PluginHost::install` path a local install uses. The
-extraction is defensive by construction (`src/plugin_registry.rs`), and your
-archive must survive it:
+directory to the same admission and install path a local install uses: the
+manifest is signature-checked and validated, a name that is already installed
+is refused, the component is read once (confined to the package, no symlinks,
+capped at 64 MiB), and the install-time load check instantiates those admitted
+bytes against this host's
+WIT world before anything is installed. A component that does not load fails
+the install with the instantiation diagnostic; `--no-verify` installs it
+anyway, skipping the check, and the daemon will skip the plugin at startup
+instead. The extraction is defensive by construction
+(`src/plugin_registry.rs`), and your archive must survive it:
 
 - The zip must contain either a root-level `manifest.toml` or exactly one
   nested plugin directory containing one. Zero manifests or more than one is
@@ -122,7 +208,7 @@ accordingly: assume everything before install is untrusted transport.
    `SKILL.md` (discovery enforces `name` and `description`).
 3. Sign: generate or load your Ed25519 key, sign the canonical manifest
    bytes, embed `signature` and `publisher_key`.
-4. Zip the plugin directory (one manifest, no path tricks, under {{#include ../_snippets/plugin-archive-max-mib.md}} MiB).
+4. Zip the assembled package directory (one signed manifest, its referenced component and required assets, no path tricks, under {{#include ../_snippets/plugin-archive-max-mib.md}} MiB).
 5. Compute the zip's SHA-256 and publish the registry entry with the digest.
 6. Publish your public key hex somewhere operators can verify independently
    of the registry (your repository, your site). The key, not the registry,

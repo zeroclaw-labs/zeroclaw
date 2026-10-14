@@ -59,6 +59,23 @@ pub fn alias_kind_for_map_path(path: &str) -> Option<AliasKind> {
     None
 }
 
+/// Return the agent alias targeted by a dotted property path.
+///
+/// Only property paths below `agents.<alias>` qualify; the map root and entry
+/// root are handled by the explicit map-key lifecycle operations.
+#[must_use]
+pub fn agent_alias_for_prop_path(path: &str) -> Option<&str> {
+    let mut segments = path.split('.');
+    if segments.next()? != "agents" {
+        return None;
+    }
+    let alias = segments.next()?;
+    if alias.is_empty() || segments.next().is_none() {
+        return None;
+    }
+    Some(alias)
+}
+
 /// HARD = mandatory referrer; deleting the target invalidates config, so the
 /// delete must refuse. SOFT = removable; the delete scrubs the referrer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -724,7 +741,7 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
         // workspace.read_memory_from[] (raw match).
         for m in agent.workspace.read_memory_from.iter_mut() {
             if m.as_str() == old {
-                *m = AgentAlias::new(new);
+                *m.agent_mut() = AgentAlias::new(new);
                 touched = true;
             }
         }
@@ -1268,6 +1285,21 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_property_paths_identify_only_nested_agent_fields() {
+        assert_eq!(
+            agent_alias_for_prop_path("agents.researcher.workspace.path"),
+            Some("researcher")
+        );
+        assert_eq!(agent_alias_for_prop_path("agents.researcher"), None);
+        assert_eq!(agent_alias_for_prop_path("agents"), None);
+        assert_eq!(agent_alias_for_prop_path("agents..enabled"), None);
+        assert_eq!(
+            agent_alias_for_prop_path("channels.telegram.bot.agent"),
+            None
+        );
+    }
     use crate::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
     use crate::schema::{
         AliasedAgentConfig, Config, DelegateTargetConfig, EmbeddingRouteConfig, ModelRouteConfig,
@@ -1428,7 +1460,9 @@ mod tests {
         referrer
             .workspace
             .read_memory_from
-            .push(AgentAlias::new("bot"));
+            .push(crate::multi_agent::MemoryGrant::Agent(AgentAlias::new(
+                "bot",
+            )));
         cfg.agents.insert("lead".to_string(), referrer);
         let mut group = PeerGroupConfig::default();
         group.agents.push(AgentAlias::new("bot"));
@@ -1544,7 +1578,9 @@ mod tests {
             .unwrap()
             .workspace
             .read_memory_from
-            .push(AgentAlias::new(" bot "));
+            .push(crate::multi_agent::MemoryGrant::Agent(AgentAlias::new(
+                " bot ",
+            )));
 
         let sites = find_all_references(&cfg, &AliasKind::Agent, "bot");
         let paths: Vec<_> = sites.iter().map(|s| s.path.as_str()).collect();
@@ -2048,7 +2084,12 @@ mod tests {
         lead.workspace
             .access
             .insert(AgentAlias::new("bot"), AccessMode::Read);
-        lead.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        lead.workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: AgentAlias::new("bot"),
+                categories: Some(vec!["family".to_string(), "events".to_string()]),
+            });
         cfg.agents.insert("lead".to_string(), lead);
         cfg.peer_groups.insert(
             "crew".to_string(),
@@ -2091,9 +2132,9 @@ mod tests {
             delegates: vec![DelegateTargetConfig::bounded(" bot ")],
             ..Default::default()
         };
-        lead.workspace
-            .read_memory_from
-            .push(AgentAlias::new(" bot ")); // raw, must remain
+        lead.workspace.read_memory_from.push(
+            crate::multi_agent::MemoryGrant::Agent(AgentAlias::new(" bot ")), // raw, must remain
+        );
         cfg.agents.insert("lead".to_string(), lead);
 
         let report = delete_with_cascade(
@@ -2153,7 +2194,11 @@ mod tests {
             delegates: vec![DelegateTargetConfig::bounded("bot")],
             ..Default::default()
         };
-        bot.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        bot.workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Agent(AgentAlias::new(
+                "bot",
+            )));
         cfg.agents.insert("bot".to_string(), bot);
 
         let report = delete_with_cascade(
@@ -2396,7 +2441,12 @@ mod tests {
         lead.workspace
             .access
             .insert(AgentAlias::new("bot"), AccessMode::Read);
-        lead.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        lead.workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: AgentAlias::new("bot"),
+                categories: Some(vec!["family".to_string(), "events".to_string()]),
+            });
         cfg.agents.insert("lead".to_string(), lead);
         let mut group = PeerGroupConfig::default();
         group.agents.push(AgentAlias::new("bot"));
@@ -2433,7 +2483,10 @@ mod tests {
         );
         assert_eq!(
             cfg.agents["lead"].workspace.read_memory_from,
-            vec![AgentAlias::new("bot2")]
+            vec![crate::multi_agent::MemoryGrant::Scoped {
+                agent: AgentAlias::new("bot2"),
+                categories: Some(vec!["family".to_string(), "events".to_string()]),
+            }]
         );
         assert_eq!(
             cfg.peer_groups["crew"].agents,

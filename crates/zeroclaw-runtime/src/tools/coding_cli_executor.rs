@@ -6,7 +6,7 @@ use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_tools::coding_cli::{
-    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, host_native_program,
+    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, host_native_program_for_command,
 };
 
 pub(crate) struct RuntimeCodingCliExecutor {
@@ -107,7 +107,7 @@ fn command_env_snapshot(process: &tokio::process::Command) -> Vec<(OsString, Opt
 fn native_command(
     command: &CodingCliCommand,
 ) -> Result<tokio::process::Command, CodingCliExecutionError> {
-    let mut process = tokio::process::Command::new(host_native_program(&command.program)?);
+    let mut process = tokio::process::Command::new(host_native_program_for_command(command)?);
     process.args(&command.args);
     process.current_dir(&command.working_dir);
     Ok(process)
@@ -136,16 +136,14 @@ fn shell_escape(value: &std::ffi::OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::SecurityPolicy;
-    use crate::security::traits::Sandbox;
-    use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-    use zeroclaw_api::runtime_traits::RuntimeAdapter;
-    use zeroclaw_api::tool::Tool;
-    use zeroclaw_config::autonomy::AutonomyLevel;
-    use zeroclaw_config::schema::CodexCliConfig;
-    use zeroclaw_tools::codex_cli::CodexCliTool;
+    #[cfg(not(target_os = "windows"))]
+    use {
+        crate::security::SecurityPolicy, crate::security::traits::Sandbox, serde_json::json,
+        std::sync::Mutex, zeroclaw_api::runtime_traits::RuntimeAdapter, zeroclaw_api::tool::Tool,
+        zeroclaw_config::autonomy::AutonomyLevel, zeroclaw_config::schema::CodexCliConfig,
+        zeroclaw_tools::codex_cli::CodexCliTool,
+    };
 
     #[test]
     fn shell_command_uses_posix_quoting_for_shell_runtimes() {
@@ -154,6 +152,25 @@ mod tests {
 
         let rendered = shell_command(&command);
         assert_eq!(rendered, "codex exec 'hello world' 'it'\\''s safe; really'");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_command_uses_the_command_specific_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_dir = tempfile::tempdir().unwrap();
+        let launcher = launcher_dir.path().join("codex");
+        std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = CodingCliCommand::new("codex", PathBuf::from("."), 1);
+        command.env("PATH", launcher_dir.path().as_os_str());
+
+        let process = native_command(&command).unwrap();
+        assert_eq!(
+            process.as_std().get_program(),
+            launcher.canonicalize().unwrap().as_os_str()
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -167,10 +184,6 @@ mod tests {
             "fake-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -181,6 +194,10 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             true
+        }
+
+        fn shell_dialect(&self) -> zeroclaw_api::runtime_traits::ShellDialect {
+            zeroclaw_api::runtime_traits::ShellDialect::Posix
         }
 
         fn build_shell_command(
@@ -308,10 +325,6 @@ mod tests {
             "env-forwarding-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -322,6 +335,10 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             true
+        }
+
+        fn shell_dialect(&self) -> zeroclaw_api::runtime_traits::ShellDialect {
+            zeroclaw_api::runtime_traits::ShellDialect::Posix
         }
 
         fn build_shell_command(
@@ -462,7 +479,8 @@ mod tests {
         });
         let executor =
             RuntimeCodingCliExecutor::shared(runtime, Arc::new(ReplacingPwdSandbox), true);
-        let command = CodingCliCommand::new("/bin/false", workspace_path.clone(), 5);
+        let executable = std::env::current_exe().expect("current test executable");
+        let command = CodingCliCommand::new(executable, workspace_path.clone(), 5);
 
         let output = executor
             .output(command)

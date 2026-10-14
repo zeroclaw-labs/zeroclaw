@@ -1,11 +1,31 @@
 //! Sandbox trait for pluggable OS-level isolation.
 
 use async_trait::async_trait;
+use std::ffi::OsStr;
 use std::process::Command;
 
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()>;
+
+    /// Wrap a runtime-built shell command with its pre-resolution identity.
+    ///
+    /// Host sandboxes retain the resolved program in `cmd`. A container
+    /// sandbox may instead use `shell_program` inside its image, without
+    /// changing how its own host launcher is resolved. `None` means that the
+    /// runtime does not expose a direct shell program.
+    fn wrap_shell_command(
+        &self,
+        cmd: &mut Command,
+        _shell_program: Option<&OsStr>,
+    ) -> std::io::Result<()> {
+        self.wrap_command(cmd)
+    }
+
+    /// Report a retained construction failure without probing backend availability.
+    fn check_initialization(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 
     fn is_available(&self) -> bool;
 
@@ -64,6 +84,7 @@ mod tests {
     #[test]
     fn noop_sandbox_is_always_available() {
         assert!(NoopSandbox.is_available());
+        assert!(NoopSandbox.check_initialization().is_ok());
     }
 
     #[test]

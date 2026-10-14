@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -14,6 +14,15 @@ pub struct SessionActorQueue {
     max_queue_depth: usize,
     lock_timeout: Duration,
     idle_ttl: Duration,
+    /// Per-session transcript generation. Every gateway write to a session's
+    /// transcript, and its deletion, advances it, so a connection holding
+    /// history can tell that the transcript changed under it even when the
+    /// message count did not. Not subject to idle eviction: dropping an entry
+    /// would let a stale holder match again.
+    generations: std::sync::Mutex<HashMap<String, u64>>,
+    next_generation: AtomicU64,
+    #[cfg(test)]
+    registration_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct SessionSlot {
@@ -24,11 +33,26 @@ struct SessionSlot {
 
 /// RAII guard that releases the session permit on drop.
 pub struct SessionGuard {
-    slot: Arc<SessionSlot>,
     _permit: OwnedSemaphorePermit,
+    _registration: PendingRegistration,
+    /// The session this guard admits. Lets admission-aware helpers (e.g.
+    /// `SessionStore::insert_admitted`) verify the caller holds the permit
+    /// for the session it is about to mutate.
+    session_id: String,
 }
 
-impl Drop for SessionGuard {
+impl SessionGuard {
+    /// The session id whose admission permit this guard owns.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+struct PendingRegistration {
+    slot: Arc<SessionSlot>,
+}
+
+impl Drop for PendingRegistration {
     fn drop(&mut self) {
         self.slot.pending.fetch_sub(1, Ordering::Relaxed);
     }
@@ -69,15 +93,39 @@ impl SessionActorQueue {
             max_queue_depth,
             lock_timeout: Duration::from_secs(lock_timeout_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
+            generations: std::sync::Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            registration_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The session's current transcript generation; `0` until first written
+    /// through [`Self::advance_generation`].
+    pub fn generation(&self, session_id: &str) -> u64 {
+        self.generations
+            .lock()
+            .map(|map| map.get(session_id).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// Record a write to, or deletion of, a session's transcript and return
+    /// the new generation. Values are unique across the queue, so a
+    /// generation never recurs for a key once superseded.
+    pub fn advance_generation(&self, session_id: &str) -> u64 {
+        let next = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut map) = self.generations.lock() {
+            map.insert(session_id.to_string(), next);
+        }
+        next
     }
 
     /// Acquire exclusive access to a session. Blocks until the session is free
     /// or the timeout expires. Returns a guard that releases on drop.
     pub async fn acquire(&self, session_id: &str) -> Result<SessionGuard, SessionQueueError> {
-        let slot = {
+        let registration = {
             let mut slots = self.slots.lock().await;
-            slots
+            let slot = slots
                 .entry(session_id.to_string())
                 .or_insert_with(|| {
                     Arc::new(SessionSlot {
@@ -86,36 +134,52 @@ impl SessionActorQueue {
                         pending: AtomicUsize::new(0),
                     })
                 })
-                .clone()
+                .clone();
+
+            #[cfg(test)]
+            let registration_hook = match self.registration_hook.lock() {
+                Ok(hook) => hook,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            #[cfg(test)]
+            if let Some(hook) = registration_hook.as_ref() {
+                hook();
+            }
+
+            // Register while holding the map lock so idle eviction cannot
+            // remove this slot before it sees the pending request.
+            let current = slot.pending.fetch_add(1, Ordering::Relaxed);
+            let registration = PendingRegistration { slot };
+            if current >= self.max_queue_depth {
+                return Err(SessionQueueError::QueueFull {
+                    session_id: session_id.to_string(),
+                    depth: current,
+                });
+            }
+
+            registration
         };
 
-        // Check queue depth before waiting
-        let current = slot.pending.fetch_add(1, Ordering::Relaxed);
-        if current >= self.max_queue_depth {
-            slot.pending.fetch_sub(1, Ordering::Relaxed);
-            return Err(SessionQueueError::QueueFull {
-                session_id: session_id.to_string(),
-                depth: current,
-            });
-        }
-
         // Acquire owned permit with timeout
-        let sem = slot.semaphore.clone();
+        let sem = registration.slot.semaphore.clone();
         match tokio::time::timeout(self.lock_timeout, sem.acquire_owned()).await {
             Ok(Ok(permit)) => {
-                *slot.last_active.lock().await = Instant::now();
+                *registration.slot.last_active.lock().await = Instant::now();
                 Ok(SessionGuard {
-                    slot,
                     _permit: permit,
-                })
-            }
-            Ok(Err(_)) | Err(_) => {
-                slot.pending.fetch_sub(1, Ordering::Relaxed);
-                Err(SessionQueueError::Timeout {
+                    _registration: registration,
                     session_id: session_id.to_string(),
                 })
             }
+            Ok(Err(_)) | Err(_) => Err(SessionQueueError::Timeout {
+                session_id: session_id.to_string(),
+            }),
         }
+    }
+
+    #[cfg(test)]
+    fn set_registration_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.registration_hook.lock().unwrap() = Some(hook);
     }
 
     /// Get the number of pending requests for a session.
@@ -204,6 +268,17 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(900));
     }
 
+    #[test]
+    fn transcript_generation_advances_uniquely_per_session() {
+        let queue = SessionActorQueue::new(8, 30, 600);
+        assert_eq!(queue.generation("gw_a"), 0);
+        let first = queue.advance_generation("gw_a");
+        assert_eq!(queue.generation("gw_a"), first);
+        let second = queue.advance_generation("gw_a");
+        assert!(second > first, "a superseded generation never recurs");
+        assert_eq!(queue.generation("gw_b"), 0, "generations are per session");
+    }
+
     #[tokio::test]
     async fn idle_eviction() {
         let queue = SessionActorQueue::new(8, 5, 0); // 0s TTL
@@ -213,6 +288,63 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         let evicted = queue.evict_idle().await;
         assert_eq!(evicted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_and_eviction_are_atomic() {
+        let queue = Arc::new(SessionActorQueue::new(8, 5, 0));
+        let selected = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let hook_selected = selected.clone();
+        let hook_resume = resume.clone();
+        queue.set_registration_hook(Arc::new(move || {
+            hook_selected.wait();
+            hook_resume.wait();
+        }));
+
+        let acquire_queue = queue.clone();
+        let acquire = zeroclaw_spawn::spawn!(async move { acquire_queue.acquire("s1").await });
+        tokio::task::spawn_blocking(move || selected.wait())
+            .await
+            .unwrap();
+
+        let evict_queue = queue.clone();
+        let mut eviction = zeroclaw_spawn::spawn!(async move { evict_queue.evict_idle().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut eviction)
+                .await
+                .is_err(),
+            "eviction must wait for request registration to release the slot map"
+        );
+        tokio::task::spawn_blocking(move || resume.wait())
+            .await
+            .unwrap();
+
+        let guard = acquire.await.unwrap().unwrap();
+        assert_eq!(eviction.await.unwrap(), 0);
+        assert_eq!(queue.queue_depth("s1").await, 1);
+
+        drop(guard);
+        assert_eq!(queue.evict_idle().await, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_releases_registration() {
+        let queue = Arc::new(SessionActorQueue::new(8, 30, 0));
+        let guard = queue.acquire("s1").await.unwrap();
+
+        let waiter_queue = queue.clone();
+        let waiter = zeroclaw_spawn::spawn!(async move { waiter_queue.acquire("s1").await });
+        while queue.queue_depth("s1").await < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(queue.queue_depth("s1").await, 1);
+
+        drop(guard);
+        assert_eq!(queue.evict_idle().await, 1);
     }
 
     #[tokio::test]

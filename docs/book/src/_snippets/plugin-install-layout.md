@@ -32,6 +32,23 @@ zeroclaw plugin list
 zeroclaw plugin info my-plugin
 ```
 
+`zeroclaw plugin list` and `zeroclaw plugin info` confirm a package is installed
+and discoverable, but discovery is not activation. `plugins.enabled = true`
+turns the plugin host on; auto-discovered tool and skill capabilities load at
+runtime only when `plugins.auto_discover = true` as well, and that flag is
+`false` by default (fail-closed):
+
+```bash
+zeroclaw config set plugins.auto_discover true
+```
+
+So `plugins.enabled = true` on its own gives you the channels you declare under
+`[channels.plugin.<alias>]` and no plugin tools or skills: a tool or skill
+package can appear in `zeroclaw plugin list` yet contribute nothing at runtime.
+Explicit channel bindings are operator-named rather than auto-discovered, so they
+do not need `auto_discover`; the flag gates only auto-discovered tools and
+skills.
+
 A plugin missing from `zeroclaw plugin list` was skipped at discovery: check
 the startup log for the skip warning (malformed manifest, missing `wasm_path`
 file, or signature policy rejection).

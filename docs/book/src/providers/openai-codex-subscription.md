@@ -52,6 +52,32 @@ There is no `api_key` field; `requires_openai_auth = true` is the switch that
 reads the stored Codex login rather than a key on the entry. See
 [Configuration → OAuth and subscription auth](./configuration.md#oauth-and-subscription-auth).
 
+### Astra on the Codex subscription backend
+
+Treat Astra availability here as a separate backend/account check. The public
+API serves `gpt-6-astra`, but that does not prove that the Codex subscription
+catalog serves the same ID, or any Astra ID, to this account. Query the live
+Codex catalog as described below, then use the exact returned string:
+
+```toml
+[providers.models.openai.astra_subscription]
+model                = "<exact-astra-id-from-codex-catalog>"
+wire_api             = "responses"
+requires_openai_auth = true
+```
+
+Keep `api_key` and `temperature` unset. `requires_openai_auth = true` selects
+the stored Codex login; it is not an alternative spelling for API-key auth.
+Use a reasoning level shared by the current ZeroClaw validator and the selected
+backend, such as `low`, `medium`, `high`, or `xhigh`, and verify it with a real
+request. Follow the [Astra configuration checklist](./configuration.md#openai-astra-setup)
+for the distinct context, output, history, iteration, image-input, and pending
+capability boundaries.
+
+Record this route as verified only after `zeroclaw auth status` succeeds, the
+live catalog contains the configured ID, and an agent request returns output.
+API-key verification and Codex-subscription verification are independent.
+
 The alias half (`coding`, `review`) is operator-chosen; pick whatever fits.
 Reference it from an agent with `model_provider = "openai.coding"`.
 

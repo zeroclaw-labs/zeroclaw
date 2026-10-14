@@ -19,7 +19,7 @@ ingress and agent-side action.
 | Provider request | `agent::turn::tool_specs` and provider call | Native-tool providers receive structured specs; text-protocol providers receive prompt instructions unless strict parsing hides them. |
 | Tool-call parsing | `agent::turn::parse_response` and parser helpers | Native and text tool calls are normalized into parsed calls with provider ids when available. |
 | Preparation | `agent::turn::call_prep` | Hooks, delivery defaults, approval, prompt-required duplicate guards, and ordinary duplicate-call guards run before dispatch. |
-| Execution | `agent::tool_execution` | Calls run sequentially or in parallel according to policy, cancellation, and activation constraints. |
+| Execution | `agent::tool_execution` | Prepared calls run sequentially or in parallel according to policy, cancellation, and activation constraints. |
 | Result recording | `post_exec`, `results_collect`, and `history_append` | Results are ordered, logged, observed, optionally receipted, bounded, and appended back to provider history. |
 | Loop control | `run_tool_call_loop` | The model sees tool results and may continue until it returns final text, hits cancellation, or reaches the iteration cap. |
 
@@ -95,6 +95,14 @@ race activation. Delegate/subagent paths must thread the activated set they were
 granted; otherwise a delegated turn can advertise or attempt a tool that its
 executor cannot resolve.
 
+Parallel eligibility is evaluated after preparation because `before_tool_call`
+hooks can rewrite names and arguments. The policy therefore sees the calls the
+runtime will actually dispatch, not only the model's original request. A
+prepared batch containing `file_edit` plus another `file_edit` or `file_write`
+runs sequentially in model order to prevent stale read-modify-write results
+from overwriting a sibling mutation. One edit alongside non-mutating tools and
+two atomic full-file writes remain parallel-eligible.
+
 ## Approval and preparation
 
 Preparation happens before the executor runs a tool:
@@ -137,7 +145,8 @@ Parallel execution is allowed only when:
 - the runtime knob enables parallel tools;
 - the batch has more than one executable call;
 - no call in the batch requires approval;
-- the batch does not contain `tool_search`.
+- the batch does not contain `tool_search`; and
+- the batch does not combine `file_edit` with another `file_edit` or `file_write`.
 
 Otherwise calls run sequentially. Sequential dispatch checks cancellation
 before each call and stops dispatching the tail when cancelled. Parallel

@@ -60,7 +60,7 @@ Most features work with a stock macOS install. Optional extras:
 |---|---|
 | Docs translation | `brew install gettext` |
 | Browser tool | Playwright pulls Chromium automatically on first use |
-| Hardware | No native GPIO on macOS; use a USB peripheral like Aardvark. See [Hardware → Aardvark](../hardware/aardvark.md) |
+| Hardware | No native GPIO on macOS; use a USB-attached board. See [Hardware](../hardware/index.md) |
 | iMessage channel | Requires macOS 11+. See [Channels → Other chat platforms](../channels/chat-others.md) |
 
 ## Running as a service

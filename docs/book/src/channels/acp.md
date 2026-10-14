@@ -57,19 +57,17 @@ The server always responds `protocolVersion: 1`. If you send a client-side `prot
 
 Open an isolated agent session.
 
-**`agentAlias`** names which configured `[agents.<alias>]` entry to use. It is required when more than one agent is configured; when exactly one agent exists, it is auto-selected and the field may be omitted. The alias accepts the camelCase `agentAlias`, the snake_case `agent_alias`, or the short `agent` form.
+**`agentAlias`** names which configured `[agents.<alias>]` entry to use. It may be omitted when a process, connection, or configured default supplies the alias, or when exactly one agent exists. Otherwise, multi-agent installations must send it explicitly. The alias accepts the camelCase `agentAlias`, the snake_case `agent_alias`, or the short `agent` form.
 
-When connecting through the **gateway WebSocket** endpoint, the connection URL may also carry a **`?agent=<alias>`** query parameter. That value is a **connection-scoped default**, not a config change. Alias resolution for `session/new` follows this precedence:
+When starting standalone stdio ACP, the command may carry **`--agent <alias>`**. When connecting through the **gateway WebSocket** endpoint, the connection URL may instead carry **`?agent=<alias>`**. These values are process- or connection-scoped defaults, not config changes. Alias resolution for `session/new` follows this precedence:
 
 1. explicit `agentAlias` / `agent_alias` / `agent` in the `session/new` params
-2. gateway `?agent=<alias>` on the WebSocket URL
+2. standalone `--agent <alias>` or gateway `?agent=<alias>`
 3. `[acp].default_agent`
 4. sole configured `[agents.<alias>]` entry when exactly one exists
 5. error when no alias can be resolved
 
-Every resolved alias, regardless of which step selected it, must name an **enabled, dispatchable** agent. Unknown aliases and configured-but-disabled agents fail `session/new` with `-32602 INVALID_PARAMS`. A blank or whitespace-only `?agent=` is treated as absent and falls through to the next step.
-
-Standalone **`zeroclaw acp`** (stdio subprocess) does not read `?agent=`; use an explicit `agentAlias` or `[acp].default_agent` there instead.
+Every resolved alias, regardless of which step selected it, must name an **enabled, dispatchable** agent. Unknown aliases and configured-but-disabled agents fail `session/new` with `-32602 INVALID_PARAMS`. A blank or whitespace-only process or connection default is treated as absent and falls through to the next step. Restore operations ignore both defaults so launcher or transport input cannot rebind persisted session ownership.
 
 The optional **`cwd`** parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session file-access boundary, it becomes the `workspace_dir` inside the `SecurityPolicy` that all file tools enforce. It does **not** relocate the agent's own persistent state: per-agent plaintext state (`MEMORY.md`, `IDENTITY.md`, `SOUL.md`) lives in the resolved **agent workspace** (`agent_workspace_dir(<alias>)`, i.e. `[agents.<alias>]` workspace), which remains an additional permitted root; shared SQLite stores and cron state live under `config.data_dir`. None of these is a single daemon-level `workspace_dir`.
 
@@ -201,7 +199,10 @@ When a tool requires user approval (via `always_ask` in the autonomy config, or 
   }}
 ```
 
-The server-issued id (`"zc-out-N"`) is always a string prefixed `zc-out-`, disjoint from any integer or string ids the client uses for its own requests.
+The server-issued id (`"zc-out-N"`) is always a string prefixed `zc-out-`.
+Correlation is directional: each peer matches responses only against its own
+pending-request map, so the same textual id may be in flight independently in
+both directions.
 
 Response shape:
 - `{"outcome": {"outcome": "selected", "optionId": "<id>"}}`, user picked an option
@@ -256,11 +257,23 @@ ZeroClaw automatically persists ACP sessions to SQLite. No configuration is requ
 What is persisted:
 
 - Session metadata: `sessionId`, `workspaceDir`, `created_at`, `last_activity`
-- Full conversation history: every `ConversationMessage` written after each completed `session/prompt` turn, in one atomic transaction per turn
+- Finalized conversation history: the agent's post-turn `ConversationMessage` history, including partial output retained after cancellation or failure, written atomically after the turn reaches a terminal outcome
+
+Standalone `zeroclaw acp` and gateway WebSocket ACP persist terminal turn state. They do not write the in-progress checkpoints described below, so a process exit during a turn can retain only history that was finalized before the exit.
 
 Sessions survive process restarts. A session created in one `zeroclaw acp` invocation can be loaded or resumed in a later one, as long as the same `workspace_dir` is in use (and therefore the same `acp-sessions.db` file).
 
-Sessions are not automatically deleted. Use `session/close` to deactivate a session without deleting it, then `session/load` or `session/resume` to bring it back.
+Sessions are not automatically deleted. `session/close` removes the live owner but retains ACP history so the session can be loaded or resumed.
+
+### ZeroCode / daemon RPC checkpoints
+
+ZeroCode uses the separate [daemon RPC interface](../architecture/rpc-socket.md). For an ACP-mode RPC session, the daemon saves the accepted prompt, assistant text, tool calls, and tool results before sending their corresponding updates to the client. If the process stops during a turn, the next supported RPC resume recovers that checkpoint once and appends an interruption marker to the client-visible transcript.
+
+Provider replay uses a separate safe projection: it keeps partial assistant text, omits the synthetic interruption marker and unmatched or ambiguous native tool exchanges, and limits each persisted tool-result payload to 16 KiB at a UTF-8 boundary plus a truncation marker. Thinking events and approval prompts are not checkpointed. Automatic trimming also stores the owner-selected retained provider context and its checkpoint frontier without deleting or renumbering the original visible transcript.
+
+A completed turn finalizes the visible transcript and retained provider context atomically. If a cancelled or failed turn has no terminal message delta to finalize, the daemon keeps its checkpoint for recovery and removes the live owner rather than discarding the accepted prompt or earlier saved progress. A later supported resume can then recover that checkpoint normally.
+
+Daemon RPC also provides `session/kill`, which records a durable tombstone so the session cannot be resumed, and `session/delete`, which removes the selected ACP history and checkpoint. Both methods first cancel an active turn and wait for its finalization before changing durable state. If the durable operation fails, the RPC returns an error, but cancellation is not undone. An idle live session remains available; hard cancellation can remove an active live owner, leaving its saved history and checkpoint available for recovery once storage is working. These two methods are not served by standalone or gateway WebSocket ACP.
 
 ### `session/load` _(ZeroClaw extension)_
 
@@ -278,7 +291,7 @@ Restore a previously persisted session with **full history replay**. The server 
 
 After `session/load` returns, the session is active and ready to accept `session/prompt` calls.
 
-When restoring a persisted session, the server reuses the stored owner alias only if that agent is still dispatchable. Otherwise it falls back through the operator-controlled `[acp].default_agent` → sole-agent chain, skipping any disabled aliases along the way. Gateway `?agent=` is a `session/new` default only and does not rebind restore.
+When restoring a persisted session, the server reuses the stored owner alias only if that agent is still dispatchable. Otherwise it falls back through the operator-controlled `[acp].default_agent` → sole-agent chain, skipping any disabled aliases along the way. Standalone `--agent` and gateway `?agent=` are `session/new` defaults only and do not rebind restore.
 
 `session_id` is accepted as a snake_case alias for `sessionId`.
 
@@ -325,7 +338,7 @@ Returns `SESSION_NOT_FOUND` (`-32000`) if the session is not currently active (i
 
 `default_agent` is consulted when `session/new` omits `agentAlias` and more than one agent is configured; if it is absent and exactly one `[agents.<alias>]` entry exists, that agent is auto-selected.
 
-When running `zeroclaw acp` as a subprocess, the command starts the server unconditionally. When running as a daemon, the gateway exposes ACP over WebSocket at `/acp` with no additional config required. Gateway clients may append `?agent=<alias>` to that URL so each configured agent can be addressed from a spec-vanilla one-agent-per-endpoint client; authentication (`Authorization`, `Sec-WebSocket-Protocol`, or `?token=`) is enforced before the connection is upgraded, and the query parameter grants no access beyond selecting among already-configured agents.
+When running `zeroclaw acp` as a subprocess, the command starts the server unconditionally. Add `--agent <alias>` when a launcher entry should default alias-less new sessions to one configured agent without modifying `[acp].default_agent`. When running as a daemon, the gateway exposes ACP over WebSocket at `/acp` with no additional config required. Gateway clients may append `?agent=<alias>` to that URL so each configured agent can be addressed from a spec-vanilla one-agent-per-endpoint client; authentication (`Authorization`, `Sec-WebSocket-Protocol`, or `?token=`) is enforced before the connection is upgraded, and the query parameter grants no access beyond selecting among already-configured agents.
 
 ## Running
 
@@ -337,6 +350,9 @@ When running `zeroclaw acp` as a subprocess, the command starts the server uncon
 
 ```sh
 zeroclaw acp
+
+# Default alias-less new sessions to one agent for this process only.
+zeroclaw acp --agent fable
 ```
 
 </div>
@@ -384,7 +400,7 @@ ACP v0 clients (using the flat `{streaming, maxSessions, ...}` initialize respon
 
 ## Security
 
-ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel, a `session/request_permission` outbound request the client must acknowledge. In `full` mode, tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); `forbidden_paths` still apply.
+ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel, a `session/request_permission` outbound request the client must acknowledge. In `full` mode, uncovered tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); tools listed in `always_ask` still prompt through `session/request_permission` (or fail closed if the client cannot answer). `forbidden_paths` still apply.
 
 The `cwd` from `session/new` becomes the `SecurityPolicy` workspace boundary used by all file and shell tools for that session. The agent's system prompt reflects that same effective session workspace: the prompt's "Working directory" is rendered from `SecurityPolicy.workspace_dir` (the session `cwd`, or the agent workspace when `cwd` is omitted), while the agent's identity and personality (`IDENTITY.md`, `SOUL.md`) are loaded from the separate agent workspace. The model therefore sees the directory its file and shell tools are actually rooted at.
 

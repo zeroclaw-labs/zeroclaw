@@ -1,9 +1,9 @@
 # FND-004: Engineering Infrastructure: CI/CD Pipeline and Release Automation
 
-> Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 1
+> Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 8
 >
-> **Canonical reference** · Ratified by the team · Rev. 1
-> Discussion thread and full revision history: [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)
+> **Canonical reference** · Ratified by the team · Rev. 8
+> Original RFC discussion: [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)
 
 ---
 
@@ -31,6 +31,14 @@
 | Rev | Date | Summary |
 |---|---|---|
 | 1 | 2026-04-09 | Initial draft |
+| 2 | 2026-06-04 | Replaced format-and-lint serial gating with format-only gating followed by parallel required Rust jobs ([#7111](https://github.com/zeroclaw-labs/zeroclaw/pull/7111)) |
+| 3 | 2026-06-10 | Required trusted `master` runs to seed caches consumed by pull requests ([#7355](https://github.com/zeroclaw-labs/zeroclaw/pull/7355)) |
+| 4 | 2026-06-21 | Changed the plugin build and release target from `wasm32-wasip1` to `wasm32-wasip2` ([#8061](https://github.com/zeroclaw-labs/zeroclaw/pull/8061)) |
+| 5 | 2026-06-30 | Removed the desktop artifact and its release-pipeline obligations ([#8544](https://github.com/zeroclaw-labs/zeroclaw/pull/8544)) |
+| 6 | 2026-07-04 | Restored the desktop artifact and its release-pipeline obligations ([#8565](https://github.com/zeroclaw-labs/zeroclaw/pull/8565)) |
+| 7 | 2026-08-07 | Replaced `actions/attest-build-provenance` guidance with direct `actions/attest` artifact attestation ([#9717](https://github.com/zeroclaw-labs/zeroclaw/pull/9717)) |
+| 8 | 2026-08-20 | Removed the retired hardware-library class from independent-release guidance after `aardvark-sys` and `zeroclaw-robot-kit` left the workspace ([#10152](https://github.com/zeroclaw-labs/zeroclaw/pull/10152)) |
+| 9 | 2026-09-17 | Removed formatting dependencies from GitHub-hosted and compile jobs while retaining formatting in the required gate ([#10874](https://github.com/zeroclaw-labs/zeroclaw/pull/10874), [#10896](https://github.com/zeroclaw-labs/zeroclaw/pull/10896)) |
 
 ---
 
@@ -106,26 +114,26 @@ The existing workflows do pin actions to full commit SHAs, which is correct secu
 
 The two parallel workflows should be consolidated into a single, well-structured pipeline. The distinction between "Quality Gate" and "CI" is not meaningful to contributors: both are checks a PR must pass. The consolidation creates one place to find check results, one place to update when behaviour changes, and one place to document what each check is doing and why.
 
-The consolidated pipeline follows a staged structure where a very cheap formatting check runs first, then Rust-heavy jobs fan out in parallel. Lint remains required, but it should not unnecessarily hold the build and test cache warm-up hostage when the goal is to shorten the green critical path:
+The consolidated pipeline schedules formatting, quality checks, builds, tests, and security checks without a formatting dependency between them. Path detectors and other job-specific dependencies still apply. Formatting and lint remain required results, but a formatting runner queue must not hold the rest of the pipeline at zero:
 
 ```
-Stage 1: Format (cheap serial gate)
+Format (parallel, required)
   └── cargo fmt --check
 
-Post-format quality gate (parallel, required)
+Quality checks (parallel, required)
   └── cargo clippy --workspace --all-targets -- -D warnings
   └── Docs quality gate
 
-Post-format Build + Check (parallel, 5–15 min)
+Build + Check (parallel, 5–15 min)
   └── Build matrix (Linux x86_64, macOS ARM, Windows)
   └── cargo check --features ci-all
   └── cargo check --no-default-features (kernel profile)
   └── cargo check --target i686 (32-bit)
 
-Post-format Test (parallel, 10–30 min)
+Test (parallel, 10–30 min)
   └── cargo nextest run --workspace
 
-Post-format Security (parallel)
+Security (parallel)
   └── cargo deny check (licenses, sources, advisories)
   └── Advisory triage gate (see §4)
 
@@ -133,7 +141,7 @@ Required Gate
   └── Composite status — branch protection requires only this job
 ```
 
-The post-format jobs run in parallel after formatting passes. This means a formatting error fails fast without burning compute on a build that will be thrown away, while clippy, build, test, and security can make progress together on cleanly formatted PRs. The Required Gate job aggregates all results so branch protection needs to track only one job name, a pattern already present in both current workflows.
+Jobs no longer wait for formatting to pass. A formatting error still fails the Required Gate, but other jobs may already have spent runner time. This deliberate cost avoids serial queue waits and allows independent work to progress during runner shortages. The Required Gate aggregates all required results, including formatting, so branch protection needs to track only one job name.
 
 ### 3.2 Workspace-Aware Clippy
 
@@ -294,7 +302,7 @@ The architecture RFC §4.4.1 specifies `release-plz` as the release automation t
 
 - On push to `master`, `release-plz` opens a "Release PR" that bumps the workspace version, updates changelogs from conventional commit history, and lists all crates that have changed since the last release
 - When the Release PR is merged, the release pipeline triggers automatically
-- Crates with `version.workspace = true` are bumped together; independently-versioned crates (`zeroclaw-api`, hardware library crates) are handled separately per the versioning policy
+- Crates with `version.workspace = true` are bumped together; the independently versioned `zeroclaw-api` crate is handled separately per the versioning policy
 
 The Release PR serves as a review checkpoint: the team sees exactly what version will be published and what the changelog says before anything goes out. This replaces manual version bumps and the `version-sync.yml` workflow.
 
@@ -474,7 +482,7 @@ Extract the build, test, and security jobs into reusable workflow files under `.
 
 ##### D1: Introduce `release-plz` and remove `version-sync.yml`
 
-Configure `release-plz` for the workspace. Workspace application crates use `version.workspace = true`. `zeroclaw-api` and hardware library crates are configured with independent release settings. The `version-sync.yml` workflow is retired.
+Configure `release-plz` for the workspace. Workspace application crates use `version.workspace = true`. The independently versioned `zeroclaw-api` crate uses its own release settings. The `version-sync.yml` workflow is retired.
 
 ##### D2: Build the structured release pipeline in `release.yml`
 
@@ -548,7 +556,7 @@ cargo deny check
 
 ### For contributors opening PRs
 
-The consolidated pipeline means one place to look for results. Stage 1 (format and lint) fails fast: if you have a formatting error, you know in two minutes without waiting for a build. If Stage 1 passes, the build and test stages run in parallel and you have a full result in under 30 minutes for most changes.
+The consolidated pipeline means one place to look for results. Formatting, lint, build, and test jobs progress independently subject to their path detectors and other job dependencies. A formatting failure can be reported before a build finishes, but it does not prevent other jobs from spending runner time. The final required gate still rejects a formatting failure.
 
 The conventional commit requirement on PR titles is enforced by CI. If your title does not match the format, the lint job fails immediately with a clear message. This is not bureaucracy: it is the input that generates the changelog automatically, which means releases happen faster and with less manual work.
 

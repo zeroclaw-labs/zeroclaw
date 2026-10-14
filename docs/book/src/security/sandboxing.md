@@ -4,7 +4,25 @@ The runtime can wrap tool invocations in an OS-level sandbox that restricts file
 
 Sandbox settings live on a risk profile. Each agent points at a risk profile via `agents.<alias>.risk_profile`; the agent's sandbox enable/backend are read from that profile.
 
-`sandbox_enabled = false` (or `sandbox_backend = "none"`) disables sandboxing for tools running under this profile. See the canonical [Minimal working example](../providers/configuration.md#minimal-working-example) for how a risk profile slots into the rest of the config.
+**CLI model providers (for example `grok_cli`):** the external CLI is outside
+ZeroClaw's native tool-approval path. Risk-profile sandboxing above does not
+confine it. The `grok_cli` ACP provider therefore injects `--sandbox strict`,
+`--permission-mode dontAsk`, and an empty built-in tool set by default, and it
+rejects ACP permission requests (selecting `reject_once` when the CLI offers
+it, otherwise cancelling the request). Explicit bypass flags in alias
+`extra_args` instead select the request's `allow_once` option; this does not
+disable Grok's active OS sandbox or override its deny rules. Other permission
+modes remain fail closed. See
+[Catalog → Grok Build CLI](../providers/catalog.md#grok-build-cli-slot-grok_cli).
+
+`sandbox_enabled = false` (or `sandbox_backend = "none"`) disables the
+profile's additional OS-level sandbox wrapper. Under the native runtime, that
+leaves tools without an OS sandbox. Under `[runtime] kind = "docker"`, the
+Docker runtime remains the container boundary and is reported as
+`docker-runtime`; these settings prevent a second sandbox container from
+wrapping the runtime's own `docker run`. See the canonical
+[Minimal working example](../providers/configuration.md#minimal-working-example)
+for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
 
@@ -25,7 +43,10 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 - **Read access**: restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
 - **Write access**: restricted to the workspace and `/tmp`.
-- **Forbidden paths**: anything listed in `[risk_profiles.<alias>].forbidden_paths`.
+- **Forbidden paths**: absolute component-prefix rules from
+  `[risk_profiles.<alias>].forbidden_paths`. Competing allow and deny prefixes
+  use most-specific-match precedence, with deny winning ties; see
+  [Autonomy path rules](./autonomy.md#path-rules).
 
 ### Network
 
@@ -49,16 +70,39 @@ Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].t
 
 ### Shell binary
 
-By default, the native runtime invokes commands via `/bin/sh`. Set `[runtime].shell` to use a different shell:
+When `[runtime].shell` is unset, the native runtime detects a platform default. Windows tries `pwsh`, then `powershell`, then `cmd.exe`. macOS first uses the current user's passwd login shell, then tries `zsh`, `bash`, and `/bin/sh`. Linux first uses the passwd login shell, then tries `bash`, `zsh`, and `/bin/sh`. Android remains pinned to `/system/bin/sh`. Set `[runtime].shell` to choose an interpreter explicitly:
 
 ```toml
 [runtime]
 shell = "bash"      # resolves through PATH, or use an absolute path
 ```
 
-The shell is called as `<shell> -c "<command>"`, so any POSIX-compatible shell works. The value must be either a bare command name found on `PATH` (e.g. `"bash"`) or an absolute path to an executable (e.g. `"/bin/bash"`); relative paths with separators (e.g. `"./sh"`, `"bin/sh"`) are rejected. It is validated when the runtime starts, so an empty, missing, non-executable, or malformed shell fails fast with a clear error instead of breaking the first command. Defaults to `"sh"` when unset.
+On Unix, POSIX-compatible shells are called as `<shell> -c "<command>"`. `powershell`/`pwsh` select PowerShell syntax and policy on every supported desktop host and run as `<interpreter> -NoProfile -NonInteractive -Command <command>`, so profile scripts cannot redefine commands behind policy's back and prompts cannot block execution. The value must be either a bare command name found on `PATH` (e.g. `"bash"` or `"pwsh"`) or an absolute path to an executable (e.g. `"/bin/bash"`); configuration validation rejects empty values and relative paths with separators (e.g. `"./sh"`, `"bin/sh"`). Before spawn, ZeroClaw canonicalizes an absolute shell path directly and resolves a bare name against the effective `PATH` when one is supplied; a runtime factory may resolve and retain that canonical launcher earlier, while other paths use the retained or ambient resolution during command preparation. The target must be a regular executable file, and failure returns from runtime construction or command preparation before execution. Explicit configuration takes precedence over default detection. Unix login-shell lookup uses `getpwuid_r`; if it fails or names an unavailable executable, the platform fallback order is used. If an injected `PATH` omits a selected bare default, preparation fails rather than switching interpreters.
 
-Only applies to the native runtime kind. Docker uses its container's shell, and Windows (always `cmd.exe`) and Android (always `/system/bin/sh`) ignore the setting and do not validate it.
+Firejail, Bubblewrap, and macOS Seatbelt replace the host command with a sandbox launcher. When the requested shell identity differs from the canonical executable path, the wrapper must preserve that identity (for example, `sh` selecting a BusyBox applet or Bash compatibility mode) while executing the validated canonical target. On Linux, Firejail and Bubblewrap require a GNU-compatible `env` or `genv` with `--argv0` support on the host process's absolute `PATH` entries. ZeroClaw probes each candidate for up to two seconds; the helper and its libraries must be accessible inside the sandbox. On macOS, Seatbelt uses the system `/bin/bash` with a fixed `exec -a` trampoline, so a separate GNU coreutils installation is not required. The trampoline passes the requested identity and command arguments as process arguments, not interpolated shell source. ZeroClaw does not widen filesystem access or fall back to an unsandboxed command when a required helper cannot execute. The Linux host-helper lookup does not use the TUI-only environment overlay.
+
+For these identity-preserving wrapped launches, canonical shell paths containing `=` remain rejected; on Linux, `env` would interpret such operands as environment assignments. Linux helper paths containing `=` are rejected for the same reason, and missing or unsupported helpers produce a preparation error. Direct native execution, Landlock, and Docker's separate in-container shell selection do not require a host identity helper.
+
+On **Windows**, the value selects the interpreter family by its file name:
+
+```toml
+[runtime]
+shell = "pwsh"        # PowerShell 7+   -> pwsh -NoProfile -NonInteractive -Command <cmd>
+# shell = "powershell"  # Windows PowerShell 5.x
+# shell = "cmd"         # explicit cmd.exe /C "<cmd>"
+```
+
+`powershell` and `pwsh` (as a bare name resolved via `PATH`, or an absolute path such as `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`) run through PowerShell; any other explicit value runs through `cmd.exe /C`, matching the historical behaviour. Only an empty/whitespace value is rejected on Windows; the interpreter is located at spawn time.
+
+The shell tool, shell-backed skill tools, and cron/schedule shell jobs all use this runtime selection. The runtime also reports the shell dialect to security policy, so policy validates the same language that will execute the command.
+
+The same runtime selection is reported to the model. The system prompt's `## Runtime` line carries a `Shell:` field naming the configured interpreter (`bash`, `zsh`, `pwsh`, `powershell`, `cmd`), and when a registered tool takes a model-authored command (`shell`, `cron_add`, `cron_update`, `schedule`) a `## Shell` section lists the command forms that dialect accepts, so the model writes `Get-ChildItem` under PowerShell and `dir /a` under `cmd.exe` instead of guessing from the OS name. Both come from the same adapter that builds the command, so the reported shell cannot drift from the executed one. Runtimes without shell access (such as WASM) omit both. Deletion advice in the safety section follows the dialect too: `trash` is only suggested where it exists.
+
+PowerShell policy accepts a bounded grammar: simple command invocations, plain or quoted arguments, and pipelines. Simple variable reads such as `$PSHOME` and `$PSVersionTable.PSVersion` are limited to a standalone `Write-Output`/`echo` command so they cannot hide filesystem paths from later commands. Expressions and alternate invocation forms, including subexpressions, parentheses, script blocks, type literals/static method calls, call operators, redirection, statement separators, backtick escapes, scoped variables such as `$env:NAME`, PowerShell provider paths, direct script execution, and nested command interpreters, are classified as high risk. PowerShell-only command names are not added to the cross-dialect default allowlist; add the cmdlets you need to `allowed_commands`, or opt into `"*"` with the corresponding approval and high-risk settings. Known mutation cmdlets follow the medium/high-risk approval gates; unknown bare commands and `Verb-Noun` cmdlets are high risk by default.
+
+Cron shell jobs inherit the global runtime boundary at both validation and execution time. Native jobs use the configured native shell, while Docker jobs run through the configured image, mount, network, CPU, memory, and read-only-root settings. A cron row stores the command, not a copied runtime or dialect. After a daemon reload recreates the scheduler and tool registry, existing jobs therefore use the newly loaded `[runtime]` configuration on their next run. Scheduled cron runs are revalidated and are never pre-approved.
+
+Only applies to the native runtime kind. Docker uses its container's shell, and Android (always `/system/bin/sh`) ignores the setting and does not validate it.
 
 ## Per-backend notes
 
@@ -115,7 +159,7 @@ Firejail's default profile is fairly permissive; ZeroClaw applies a custom profi
 
 ### Docker
 
-Works anywhere Docker does. The Docker runtime kind (`[runtime] kind = "docker"`) runs each shell invocation in an ephemeral container; see the `[runtime.docker]` block above for image and resource controls.
+Works anywhere Docker does. The Docker runtime kind (`[runtime] kind = "docker"`) runs each shell invocation in an ephemeral container; see the `[runtime.docker]` block above for image and resource controls. `git_operations` does not execute inside that container: write-classified Git commands are rejected for the Docker runtime, while read-classified commands retain their existing host-side read isolation. Use the shell tool for Git commands that must run inside the container.
 
 <div class="os-tabs-src">
 

@@ -4,6 +4,7 @@
 //! dispatch is the other SubAgent spawn site; both funnel through
 
 use crate::agent::loop_::AgentRunOverrides;
+use crate::live_config_authority::AgentExecutionCapability;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use crate::subagent::{SubAgentOverrides, SubAgentSpawn};
@@ -26,6 +27,7 @@ pub struct SpawnSubagentTool {
     /// any spawn work happens. Set by the agent loop from
     /// `AgentRunOverrides.is_subagent` at registry construction time.
     is_subagent_caller: bool,
+    execution_capability: Option<AgentExecutionCapability>,
 }
 
 impl SpawnSubagentTool {
@@ -43,6 +45,7 @@ impl SpawnSubagentTool {
             parent_alias: parent_alias.into(),
             security,
             is_subagent_caller: false,
+            execution_capability: None,
         }
     }
 
@@ -54,10 +57,60 @@ impl SpawnSubagentTool {
         self.is_subagent_caller = is_subagent_caller;
         self
     }
+
+    pub fn with_execution_capability(
+        mut self,
+        capability: Option<AgentExecutionCapability>,
+    ) -> Self {
+        self.execution_capability = capability;
+        self
+    }
+}
+
+/// Overrides for the child run this tool starts.
+///
+/// The child inherits the parent's security policy and, when the parent turn is
+/// a headless SOP step, that step's tool scope. Spawning a child is not a way
+/// out of the step's capability boundary: without this the child would rebuild
+/// the agent's full surface, including tools the step denies and the SOP control
+/// tools every step turn drops. The scope is carried, not resolved here — the
+/// child re-resolves it against its own registry, so a differently assembled
+/// child registry is narrowed by the same contract.
+fn child_run_overrides(policy: Arc<SecurityPolicy>) -> AgentRunOverrides {
+    AgentRunOverrides {
+        security: Some(policy),
+        memory: None,
+        is_subagent: true,
+        // Sub-turn origin already skips memory injection; explicit for
+        // the same future-proofing reason as `is_subagent` above.
+        suppress_memory_inject: true,
+        // Subagents keep a live memory backend and the memory tools; only
+        // the injected context preamble is suppressed above.
+        memory_free: false,
+        suppress_memory_auto_save: false,
+        // Subagent runs are short-lived; no cross-turn reuse contract,
+        // so the per-call `connect_all` path inside `agent::run` is
+        // the correct choice. The daemon heartbeat worker is the
+        // only `mcp_registry` supplier.
+        mcp_registry: None,
+        execution_capability: None,
+        execution_admission: None,
+        sop_step_scope: crate::sop::active_scope::active_headless_step_scope(),
+        // Not yet propagated: a sub-turn spawned by an internally
+        // initiated parent (e.g. a cron turn delegating) loses the
+        // parent's initiating principal here. Inheritance semantics for
+        // nested dispatch belong to the reply-provenance slice of the
+        // internal-turn contract; until then absence is explicit.
+        internal_principal: None,
+    }
 }
 
 #[async_trait]
 impl Tool for SpawnSubagentTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
         Self::NAME
     }
@@ -101,11 +154,31 @@ impl Tool for SpawnSubagentTool {
             });
         }
 
-        let risk_profile = self.config.risk_profile_for_agent(&self.parent_alias);
+        let execution_admission = match self
+            .execution_capability
+            .as_ref()
+            .map(|capability| capability.admit(&self.parent_alias))
+            .transpose()
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("subagent admission failed: {error}")),
+                });
+            }
+        };
+        let config = execution_admission
+            .as_ref()
+            .map(|admission| admission.config())
+            .unwrap_or_else(|| Arc::clone(&self.config));
+        let risk_profile = config.risk_profile_for_agent(&self.parent_alias);
         if let Some(rp) = risk_profile {
             let excluded = rp.excluded_tools.iter().any(|t| t == "spawn_subagent");
-            let allowed_when_listed = rp.allowed_tools.is_empty()
-                || rp.allowed_tools.iter().any(|t| t == "spawn_subagent");
+            let allowed_when_listed = rp
+                .effective_allowed_tools()
+                .is_none_or(|tools| tools.iter().any(|t| t == "spawn_subagent"));
             if excluded || !allowed_when_listed {
                 return Ok(ToolResult {
                     success: false,
@@ -150,7 +223,7 @@ impl Tool for SpawnSubagentTool {
         }
 
         let subagent_ctx = match SubAgentSpawn::for_agent_with_policy(
-            &self.config,
+            &config,
             &self.parent_alias,
             Arc::clone(&self.security),
         )
@@ -168,28 +241,13 @@ impl Tool for SpawnSubagentTool {
 
         let run_id = uuid::Uuid::new_v4().to_string();
 
-        let temperature: Option<f64> = self
-            .config
+        let temperature: Option<f64> = config
             .model_provider_for_agent(&self.parent_alias)
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
-        let run_overrides = AgentRunOverrides {
-            security: Some(subagent_ctx.policy.clone()),
-            memory: None,
-            is_subagent: true,
-            // Sub-turn origin already skips memory injection; explicit for
-            // the same future-proofing reason as `is_subagent` above.
-            suppress_memory_inject: true,
-            // Subagents keep a live memory backend and the memory tools; only
-            // the injected context preamble is suppressed above.
-            memory_free: false,
-            // Subagent runs are short-lived; no cross-turn reuse contract,
-            // so the per-call `connect_all` path inside `agent::run` is
-            // the correct choice. The daemon heartbeat worker is the
-            // only `mcp_registry` supplier.
-            mcp_registry: None,
-        };
+        let mut run_overrides = child_run_overrides(subagent_ctx.policy.clone());
+        run_overrides.execution_admission = execution_admission.clone();
         let parent_alias = subagent_ctx.parent_alias.clone();
 
         let cp_task_id = run_id.clone();
@@ -207,6 +265,7 @@ impl Tool for SpawnSubagentTool {
                     depth: u32::from(self.is_subagent_caller),
                     parent_id: None,
                     originator_route: None,
+                    originator_chain: Vec::new(),
                     delivered: false,
                     idem_key: None,
                     principal_id: None,
@@ -221,7 +280,7 @@ impl Tool for SpawnSubagentTool {
             session_key: run_id,
             =>
             crate::agent::run(
-                (*self.config).clone(),
+                (*config).clone(),
                 &self.parent_alias,
                 Some(prompt),
                 None,
@@ -294,6 +353,29 @@ mod tests {
             },
         );
         config
+    }
+
+    #[tokio::test]
+    async fn closed_authority_rejects_subagent_before_construction() {
+        let config = config_with_agent("alpha");
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_execution_capability(Some(authority.execution_capability()));
+        authority.close_agent_lifecycle();
+
+        let result = tool.execute(json!({"prompt": "hello"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("lifecycle generation is closing")
+        );
+        assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 0);
     }
 
     #[tokio::test]
@@ -413,6 +495,25 @@ mod tests {
         config
     }
 
+    fn config_with_deny_all_tools(alias: &str) -> Config {
+        let mut config = Config::default();
+        config.risk_profiles.insert(
+            "default".to_string(),
+            RiskProfileConfig {
+                deny_all_tools: true,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            alias.to_string(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
     #[tokio::test]
     async fn refuses_when_risk_profile_excludes_spawn_subagent() {
         // Parent's non-empty risk_profile.allowed_tools omits
@@ -457,6 +558,74 @@ mod tests {
         assert!(
             !(err.contains("risk_profile") && err.contains("spawn_subagent")),
             "spawn_subagent in allowed_tools must not trigger the gate refusal, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admits_when_risk_profile_allowed_tools_is_legacy_empty() {
+        // `allowed_tools = []` is legacy-unrestricted, so the gate must not
+        // refuse. The spawn may still fail later for unrelated reasons; pin
+        // only that the gate refusal is absent.
+        let config = config_with_allowed_tools("alpha", vec![]);
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({ "prompt": "hello" }))
+            .await
+            .expect("execute returns Ok");
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            !(err.contains("risk_profile") && err.contains("spawn_subagent")),
+            "legacy empty allowed_tools is unrestricted and must not trigger the gate refusal, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_when_risk_profile_deny_all_tools() {
+        let config = config_with_deny_all_tools("alpha");
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({ "prompt": "hello" }))
+            .await
+            .expect("execute returns Ok with structured failure");
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("risk_profile") && err.contains("spawn_subagent"),
+            "deny_all_tools must deny spawn_subagent, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_when_risk_profile_uses_legacy_deny_all_sentinel() {
+        let config = config_with_allowed_tools(
+            "alpha",
+            vec![
+                RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+                RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            ],
+        );
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({ "prompt": "hello" }))
+            .await
+            .expect("execute returns Ok with structured failure");
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("risk_profile") && err.contains("spawn_subagent"),
+            "legacy __none__ must deny spawn_subagent, got: {err:?}"
         );
     }
 
@@ -551,6 +720,76 @@ mod tests {
         assert!(
             !overrides.is_subagent,
             "AgentRunOverrides::default().is_subagent must be false so cron paths inherit a top-level shape"
+        );
+    }
+
+    // ── A child run may not escape its parent step's scope ──
+
+    fn scoped_step() -> crate::sop::active_scope::HeadlessStepScope {
+        use crate::sop::{SopStep, StepToolScope};
+        crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: SopStep {
+                number: 2,
+                scope: Some(StepToolScope {
+                    allow: Some(vec!["read_file".into()]),
+                    deny: Vec::new(),
+                }),
+                ..SopStep::default()
+            },
+            config: zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A scoped headless step may still call `spawn_subagent`, but the child it
+    /// starts must not regain what the step gave up. Before this, the child ran
+    /// with `sop_step_scope: None` and rebuilt the agent's whole surface,
+    /// including the SOP control tools the step turn always drops — so spawning
+    /// a child was a way out of the step's capability boundary.
+    #[tokio::test]
+    async fn child_run_inherits_the_parent_step_scope() {
+        let registry = vec![
+            "read_file".to_string(),
+            "shell".to_string(),
+            "sop_advance".to_string(),
+        ];
+
+        let inherited =
+            crate::sop::active_scope::with_active_headless_step_scope(scoped_step(), async {
+                child_run_overrides(Arc::new(SecurityPolicy::default())).sop_step_scope
+            })
+            .await
+            .expect("a child started inside a headless step must carry that step's scope");
+
+        assert_eq!(inherited.run_id, "run-1");
+        assert_eq!(inherited.step.number, 2);
+        let excluded = inherited.excluded(&registry);
+        assert!(
+            excluded.iter().any(|t| t == "shell"),
+            "the step's denied tools must stay denied in the child, got {excluded:?}"
+        );
+        assert!(
+            excluded.iter().any(|t| t == "sop_advance"),
+            "the SOP control surface must stay excluded in the child, got {excluded:?}"
+        );
+        assert!(
+            !excluded.iter().any(|t| t == "read_file"),
+            "the step's allowed tool must survive into the child, got {excluded:?}"
+        );
+    }
+
+    /// The inheritance is bounded by the step: an ordinary agent turn spawns a
+    /// child with no step scope at all.
+    #[tokio::test]
+    async fn child_run_outside_a_headless_step_carries_no_scope() {
+        let overrides = child_run_overrides(Arc::new(SecurityPolicy::default()));
+        assert!(overrides.sop_step_scope.is_none());
+        assert!(
+            overrides.is_subagent,
+            "a spawned child is always a subagent"
         );
     }
 

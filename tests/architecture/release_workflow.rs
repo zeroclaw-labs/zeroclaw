@@ -6,7 +6,63 @@
 
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+
+fn bash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Resolve the interpreter that runs the POSIX release scripts below.
+///
+/// `Command::new("bash")` is not safe on Windows: `CreateProcess` searches the
+/// system directory before `PATH`, and Windows ships a WSL launcher stub at
+/// `%SystemRoot%\System32\bash.exe`. The GitHub Windows images carry that stub
+/// without a WSL distribution, so it exits non-zero without running the script
+/// and without writing anything to stderr — every script-driven gate here then
+/// fails with an empty diagnostic. Resolve Git for Windows' Bash explicitly
+/// (the same interpreter the workflow's own `shell: bash` steps use) and only
+/// fall back to bare name resolution when no real Bash can be located.
+fn bash_command() -> Command {
+    Command::new(bash_program())
+}
+
+#[cfg(not(windows))]
+fn bash_program() -> PathBuf {
+    PathBuf::from("bash")
+}
+
+#[cfg(windows)]
+fn bash_program() -> PathBuf {
+    let git_bash = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(|root| PathBuf::from(root).join("Git").join("bin").join("bash.exe"));
+
+    let on_path = std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .filter(|directory| !is_windows_system_directory(directory))
+                .map(|directory| directory.join("bash.exe"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    git_bash
+        .chain(on_path)
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("bash"))
+}
+
+/// The WSL stub lives in the system directory; nothing else named `bash.exe`
+/// is expected there, so excluding it is enough to reach a real interpreter.
+#[cfg(windows)]
+fn is_windows_system_directory(directory: &Path) -> bool {
+    directory.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        name == "system32" || name == "syswow64"
+    })
+}
 
 fn workflow(name: &str) -> String {
     let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14,6 +70,20 @@ fn workflow(name: &str) -> String {
         .join(name);
     fs::read_to_string(&workflow_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", workflow_path.display()))
+}
+
+/// Render everything a failed script run can tell us.
+///
+/// A misresolved or non-functional interpreter fails with an empty stderr, so
+/// an assertion that reports stderr alone leaves nothing to diagnose. Include
+/// the exit status and stdout as well.
+fn command_diagnostics(output: &std::process::Output) -> String {
+    format!(
+        "status={:?} stdout={:?} stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 fn assert_command_failure(
@@ -280,18 +350,20 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source_srcinfo = root.join("dist/aur/.SRCINFO");
     let source_pkgbuild = root.join("dist/aur/PKGBUILD");
-    let source_guard = Command::new("bash")
-        .arg(root.join("scripts/release/aur_version_guard.sh"))
-        .arg(&source_srcinfo)
-        .arg(&source_srcinfo)
-        .arg(&source_pkgbuild)
-        .arg(&source_pkgbuild)
+    let source_guard = bash_command()
+        .arg(bash_path(
+            &root.join("scripts/release/aur_version_guard.sh"),
+        ))
+        .arg(bash_path(&source_srcinfo))
+        .arg(bash_path(&source_srcinfo))
+        .arg(bash_path(&source_pkgbuild))
+        .arg(bash_path(&source_pkgbuild))
         .output()
         .expect("validate checked-in AUR package metadata");
     assert!(
         source_guard.status.success(),
         "checked-in PKGBUILD and .SRCINFO version tuples must agree: {}",
-        String::from_utf8_lossy(&source_guard.stderr)
+        command_diagnostics(&source_guard)
     );
 
     let freshness = workflow("aur-freshness-check.yml");
@@ -312,6 +384,332 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
             && freshness.contains("this check remains red until that tag is published"),
         "freshness must compare the published epoch and scope downgrade recovery advice"
     );
+}
+
+#[test]
+fn crates_io_publisher_is_preflighted_gated_and_resumable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let release = workflow("release-stable-manual.yml");
+    let publisher = workflow("pub-crates.yml");
+    let script_path = root.join("scripts/release/publish-crates.sh");
+    let script = fs::read_to_string(&script_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", script_path.display()));
+
+    for required in [
+        "uses: ./.github/workflows/pub-crates.yml",
+        "release_tag: ${{ needs.validate.outputs.tag }}",
+        "release_sha: ${{ github.sha }}",
+    ] {
+        assert!(
+            release.contains(required),
+            "stable release is missing crates.io wiring: {required}"
+        );
+    }
+    let crates_call = yaml_block(&release, "  crates:\n");
+    assert!(
+        crates_call
+            .contains("secrets:\n      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}"),
+        "the reusable crates.io workflow must receive the existing repository secret explicitly"
+    );
+    assert!(
+        !crates_call.contains("secrets: inherit"),
+        "the crates.io caller must pass only the named registry secret"
+    );
+
+    // The crates.io preflight runs beside the binary builds and gates the
+    // GitHub Release, so a release whose crates cannot publish never becomes
+    // public. It gets no token; the late `crates` call uploads what it verified.
+    let early = yaml_block(&release, "  crates-preflight:\n");
+    for required in [
+        "needs: [validate]\n",
+        "uses: ./.github/workflows/pub-crates.yml",
+        "release_tag: ${{ needs.validate.outputs.tag }}",
+        "release_sha: ${{ github.sha }}",
+        "stage: preflight",
+        "dry_run: true",
+    ] {
+        assert!(
+            early.contains(required),
+            "early crates.io preflight is missing invariant: {required}"
+        );
+    }
+    assert!(
+        !early.contains("secrets"),
+        "the early crates.io preflight cannot upload and must not receive any secret"
+    );
+    let github_release = yaml_block(&release, "  publish:\n");
+    assert!(
+        github_release.contains(
+            "needs: [validate, release-notes, build, build-desktop, build-desktop-linux, build-desktop-windows, sbom, crates-preflight]"
+        ),
+        "the GitHub Release must wait for the crates.io preflight"
+    );
+    assert!(
+        !github_release
+            .lines()
+            .any(|line| line.starts_with("    if:")),
+        "the GitHub Release must keep the implicit success() gate over crates-preflight"
+    );
+    for required in [
+        "needs: [validate, publish, crates-preflight]",
+        "needs.crates-preflight.result == 'success'",
+        "stage: publish",
+        "verified_web_dist_digest: ${{ needs.crates-preflight.outputs.web_dist_digest }}",
+        "dry_run: false",
+    ] {
+        assert!(
+            crates_call.contains(required),
+            "the late crates.io call is missing invariant: {required}"
+        );
+    }
+
+    assert!(
+        publisher.contains(
+            "  group: ${{ inputs.stage == 'preflight' && format('crates-io-preflight-{0}', github.run_id) || 'crates-io-publish' }}\n  cancel-in-progress: false"
+        ),
+        "only calls that can upload may share the serialised publish group"
+    );
+
+    // A version bump cannot merge unless the crates it announces package and
+    // compile. The Quality Gate runs the same tokenless preflight stage on
+    // pull requests and merge-queue entries that change the workspace version.
+    let quality_gate = workflow("ci.yml");
+    let bump_detector = yaml_block(&quality_gate, "  crates-preflight-changes:\n");
+    assert!(
+        bump_detector.contains(
+            "BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}"
+        ) && bump_detector
+            .contains("bash scripts/ci/crates_preflight_trigger.sh \"$EVENT_NAME\" \"$BASE_SHA\""),
+        "the version-bump detector must compare against the PR or merge-queue base"
+    );
+    let bump_preflight = yaml_block(&quality_gate, "  crates-preflight:\n");
+    for required in [
+        "needs: [crates-preflight-changes]",
+        "if: needs.crates-preflight-changes.outputs.run == 'true'",
+        "uses: ./.github/workflows/pub-crates.yml",
+        "release_tag: ${{ needs.crates-preflight-changes.outputs.tag }}",
+        "release_sha: ${{ github.sha }}",
+        "stage: preflight",
+        "dry_run: true",
+    ] {
+        assert!(
+            bump_preflight.contains(required),
+            "the version-bump crates.io preflight is missing invariant: {required}"
+        );
+    }
+    assert!(
+        !bump_preflight.contains("secrets"),
+        "pull requests, including forks, must never hand the publisher a secret"
+    );
+    let gate_needs = yaml_block(&quality_gate, "  gate:\n")
+        .lines()
+        .find(|line| line.starts_with("    needs: ["))
+        .expect("the required gate must declare needs");
+    for job in ["crates-preflight-changes", "crates-preflight"] {
+        assert!(
+            gate_needs.contains(&format!(" {job},")) || gate_needs.contains(&format!(" {job}]")),
+            "CI Required Gate must block on {job}"
+        );
+    }
+    assert!(
+        quality_gate.contains("run: bash scripts/ci/crates_preflight_trigger.test.sh"),
+        "the version-bump trigger must keep its process test in CI"
+    );
+    assert!(
+        publisher.contains(
+            "save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}"
+        ),
+        "pull-request runs of the publisher may read the Rust cache but never write it"
+    );
+
+    let workflow_call = yaml_block(&publisher, "  workflow_call:\n");
+    for required in [
+        "CARGO_REGISTRY_TOKEN:\n        description: \"Repository-scoped crates.io token; referenced only by the protected publish job\"\n        required: false",
+        "stage:\n",
+        "default: all",
+        "verified_web_dist_digest:\n",
+        "value: ${{ jobs.preflight.outputs.web_dist_digest }}",
+    ] {
+        assert!(
+            workflow_call.contains(required),
+            "the reusable publisher is missing workflow_call invariant: {required}"
+        );
+    }
+
+    let preflight = yaml_block(&publisher, "  preflight:\n");
+    let publish = yaml_block(&publisher, "  publish:\n");
+    for required in [
+        "ref: ${{ inputs.release_sha || inputs.release_tag }}",
+        "fetch-depth: 0",
+        "bash .release-tooling/scripts/release/resolve_crates_release.sh",
+        "TOOLING_SHA: ${{ github.workflow_sha }}",
+        "tooling_sha: ${{ steps.meta.outputs.tooling_sha }}",
+        "STAGE: ${{ inputs.stage }}",
+        "cargo test --locked --test architecture publish_contract",
+        "CARGO_TARGET_DIR: ${{ runner.temp }}/crates-io-package-target",
+        "./.release-tooling/scripts/release/publish-crates.sh",
+    ] {
+        assert!(
+            preflight.contains(required),
+            "crates.io preflight is missing invariant: {required}"
+        );
+    }
+    assert!(
+        !preflight.contains("CARGO_REGISTRY_TOKEN"),
+        "the reversible preflight must never reference the registry token"
+    );
+    // The publish stage reuses the preflight stage's verification, so every
+    // verification step skips there, while tag resolution never does.
+    let skips = |step: &str| {
+        step.lines()
+            .any(|line| line == "        if: steps.meta.outputs.stage != 'publish'")
+    };
+    for step in preflight.split("\n      - ").skip(1) {
+        let verifies = [
+            "rust-toolchain@",
+            "rust-cache@",
+            "setup-node@",
+            "cargo web build",
+            "web_dist_digest.sh",
+            "publish_contract",
+            "publish-crates.sh",
+            "upload-artifact@",
+        ]
+        .iter()
+        .any(|marker| step.contains(marker));
+        if verifies {
+            assert!(
+                skips(step),
+                "a preflight verification step must skip in the publish stage:\n{step}"
+            );
+        } else {
+            assert!(
+                !skips(step),
+                "tag resolution and the summary must run in every stage:\n{step}"
+            );
+        }
+    }
+    assert!(
+        publish.contains("if: ${{ inputs.dry_run == false && inputs.stage != 'preflight' }}"),
+        "the preflight stage must never reach the upload job"
+    );
+    assert!(
+        publish.contains("if [[ -z \"${CARGO_REGISTRY_TOKEN:-}\" ]]; then"),
+        "an optional token declaration relies on the publish step failing closed without it"
+    );
+
+    // Recovery: release scripts run from a pinned checkout that is separate
+    // from the tree being packaged, so a publisher fix merged after the tag
+    // reaches that release without moving the tag. Both jobs use the tooling
+    // commit the resolver approved and keep it out of the packaged tree.
+    for (job, name, reference) in [
+        (preflight, "preflight", "${{ github.workflow_sha }}"),
+        (
+            publish,
+            "publish",
+            "${{ needs.preflight.outputs.tooling_sha }}",
+        ),
+    ] {
+        for required in [
+            format!("          ref: {reference}\n          path: .release-tooling\n"),
+            "          sparse-checkout: |\n            /scripts/release/\n          sparse-checkout-cone-mode: false\n          persist-credentials: false\n".to_string(),
+            format!("          TOOLING_SHA: {reference}\n"),
+            "test \"$(git -C .release-tooling rev-parse HEAD)\" = \"$TOOLING_SHA\"".to_string(),
+            "echo '/.release-tooling/' >> .git/info/exclude".to_string(),
+            "PUBLISH_SOURCE_ROOT: ${{ github.workspace }}".to_string(),
+        ] {
+            assert!(
+                job.contains(&required),
+                "crates.io {name} job is missing release-tooling invariant: {required}"
+            );
+        }
+        assert!(
+            !job.contains("./scripts/release/") && !job.contains("bash scripts/release/"),
+            "crates.io {name} job must run release scripts from .release-tooling only"
+        );
+    }
+
+    for required in [
+        "environment:\n      name: crates-io",
+        "ref: ${{ needs.preflight.outputs.sha }}",
+        "CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
+        "./.release-tooling/scripts/release/publish-crates.sh --execute",
+    ] {
+        assert!(
+            publish.contains(required),
+            "crates.io publish job is missing invariant: {required}"
+        );
+    }
+
+    // The dashboard is built once. Preflight records its digest and hands the
+    // verified tree to the publish job, which must not rebuild it and must make
+    // the publisher recheck the digest before anything reaches crates.io.
+    for required in [
+        "cargo web build",
+        "web_dist_digest: ${{ steps.web_digest.outputs.digest || inputs.verified_web_dist_digest }}",
+        "bash .release-tooling/scripts/release/web_dist_digest.sh web/dist",
+        "WEB_DIST_DIGEST: ${{ steps.web_digest.outputs.digest }}",
+        "uses: actions/upload-artifact@",
+        "name: crates-io-web-dist",
+        "include-hidden-files: true",
+        "retention-days: 30",
+    ] {
+        assert!(
+            preflight.contains(required),
+            "crates.io preflight is missing web bundle invariant: {required}"
+        );
+    }
+    let preflight_run = preflight
+        .split_once("      - name: Preflight\n")
+        .expect("crates.io preflight must define the Preflight step")
+        .1;
+    assert!(
+        preflight_run.contains("uses: actions/upload-artifact@"),
+        "the web bundle artifact must be uploaded only after the verifying dry run"
+    );
+    for required in [
+        "uses: actions/download-artifact@",
+        "name: crates-io-web-dist",
+        "path: web/dist/",
+        "WEB_DIST_DIGEST: ${{ needs.preflight.outputs.web_dist_digest }}",
+        "^[0-9a-f]{64}$",
+    ] {
+        assert!(
+            publish.contains(required),
+            "crates.io publish job is missing web bundle invariant: {required}"
+        );
+    }
+    for forbidden in ["cargo web build", "actions/setup-node@", "npm "] {
+        assert!(
+            !publish.contains(forbidden),
+            "the crates.io publish job must reuse the verified bundle, not rebuild it: {forbidden}"
+        );
+    }
+    assert!(
+        !release.contains("name: crates-io-web-dist"),
+        "the crates.io artifact name must stay distinct from the release run's artifacts"
+    );
+
+    for required in [
+        "EXECUTE=0",
+        "--execute) EXECUTE=1",
+        "cargo metadata --format-version 1 --no-deps",
+        "git diff --quiet",
+        "git ls-files --others --exclude-standard",
+        "web/dist/index.html",
+        "bash \"$SCRIPT_DIR/web_dist_digest.sh\" web/dist",
+        "web/dist does not match the bundle preflight verified",
+        "cargo publish --dry-run --locked --allow-dirty",
+        "--locked --no-verify --allow-dirty",
+        "python3 \"$SCRIPT_DIR/publish_order.py\" \"$VERSION\" <<<\"$META\"",
+        "wait_for_registry_version",
+        "will skip what already landed",
+    ] {
+        assert!(
+            script.contains(required),
+            "publish-crates.sh is missing safety contract: {required}"
+        );
+    }
 }
 
 #[test]
@@ -344,16 +742,16 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         fs::write(&current_srcinfo, current_metadata).expect("write current AUR .SRCINFO");
         fs::write(&target_pkgbuild, target_build).expect("write target AUR PKGBUILD");
         fs::write(&current_pkgbuild, current_build).expect("write current AUR PKGBUILD");
-        let mut command = Command::new("bash");
-        command.arg(&guard_script);
+        let mut command = bash_command();
+        command.arg(bash_path(&guard_script));
         if allow_downgrade {
             command.arg("--allow-downgrade");
         }
         command
-            .arg(&target_srcinfo)
-            .arg(&current_srcinfo)
-            .arg(&target_pkgbuild)
-            .arg(&current_pkgbuild)
+            .arg(bash_path(&target_srcinfo))
+            .arg(bash_path(&current_srcinfo))
+            .arg(bash_path(&target_pkgbuild))
+            .arg(bash_path(&current_pkgbuild))
             .output()
             .expect("run AUR monotonic package guard")
     };
@@ -364,7 +762,7 @@ fn aur_publisher_rejects_stale_release_downgrades() {
     assert!(
         output.status.success(),
         "an unchanged package must be idempotent: {}",
-        String::from_utf8_lossy(&output.stderr)
+        command_diagnostics(&output)
     );
 
     for (target, current) in [("1.2.4", "1.2.3"), ("1.10.0", "1.9.9")] {
@@ -378,7 +776,7 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         assert!(
             output.status.success(),
             "target {target} should be allowed over {current}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            command_diagnostics(&output)
         );
     }
 
@@ -525,12 +923,12 @@ fn aur_publisher_rejects_stale_release_downgrades() {
     fs::write(&target_pkgbuild, &same_build).expect("restore target AUR PKGBUILD");
     fs::remove_file(&current_srcinfo).expect("remove current AUR .SRCINFO");
     fs::remove_file(&current_pkgbuild).expect("remove current AUR PKGBUILD");
-    let output = Command::new("bash")
-        .arg(&guard_script)
-        .arg(&target_srcinfo)
-        .arg(&current_srcinfo)
-        .arg(&target_pkgbuild)
-        .arg(&current_pkgbuild)
+    let output = bash_command()
+        .arg(bash_path(&guard_script))
+        .arg(bash_path(&target_srcinfo))
+        .arg(bash_path(&current_srcinfo))
+        .arg(bash_path(&target_pkgbuild))
+        .arg(bash_path(&current_pkgbuild))
         .output()
         .expect("run AUR guard with missing current metadata");
     assert_command_failure(
@@ -541,12 +939,12 @@ fn aur_publisher_rejects_stale_release_downgrades() {
     );
 
     fs::write(&current_srcinfo, &equal).expect("restore only current AUR .SRCINFO");
-    let output = Command::new("bash")
-        .arg(&guard_script)
-        .arg(&target_srcinfo)
-        .arg(&current_srcinfo)
-        .arg(&target_pkgbuild)
-        .arg(&current_pkgbuild)
+    let output = bash_command()
+        .arg(bash_path(&guard_script))
+        .arg(bash_path(&target_srcinfo))
+        .arg(bash_path(&current_srcinfo))
+        .arg(bash_path(&target_pkgbuild))
+        .arg(bash_path(&current_pkgbuild))
         .output()
         .expect("run AUR guard with partial current metadata");
     assert_command_failure(
@@ -566,9 +964,9 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
                     credential_canary: &str,
                     bucket_repo: Option<&str>,
                     bucket_token: Option<&str>| {
-        let mut command = Command::new("bash");
+        let mut command = bash_command();
         command
-            .arg(&gate)
+            .arg(bash_path(&gate))
             .env("DRY_RUN", dry_run)
             .env("CREDENTIAL_CANARY", credential_canary)
             .env_remove("SCOOP_BUCKET_REPO")
@@ -586,7 +984,7 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
     assert!(
         generic_dry_run.status.success(),
         "a generic dry run may omit bucket credentials: {}",
-        String::from_utf8_lossy(&generic_dry_run.stderr)
+        command_diagnostics(&generic_dry_run)
     );
     assert_eq!(generic_dry_run.stdout, b"skip\n");
 
@@ -610,7 +1008,7 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
     assert!(
         configured_canary.status.success(),
         "configured credential canary must reach the authorization probe: {}",
-        String::from_utf8_lossy(&configured_canary.stderr)
+        command_diagnostics(&configured_canary)
     );
     assert_eq!(configured_canary.stdout, b"probe\n");
 
@@ -835,7 +1233,7 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
 }
 
 #[test]
-fn scoop_publisher_metadata_follows_canonical_url_template() {
+fn scoop_metadata_template_is_not_evaluated() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let metadata_script = root.join("scripts/release/scoop_metadata.sh");
     let script = fs::read_to_string(&metadata_script)
@@ -844,7 +1242,13 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
         !script.contains("eval "),
         "canonical Scoop URL templates must never be evaluated as shell code"
     );
+}
 
+#[test]
+#[cfg(unix)]
+fn scoop_publisher_metadata_follows_canonical_url_template() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let metadata_script = root.join("scripts/release/scoop_metadata.sh");
     let temp = tempfile::tempdir().expect("create temporary Scoop manifest directory");
     let manifest_path = temp.path().join("zeroclaw.json");
     fs::write(
@@ -861,16 +1265,16 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
     )
     .expect("write temporary Scoop manifest");
 
-    let output = Command::new("bash")
-        .arg(&metadata_script)
-        .arg(&manifest_path)
+    let output = bash_command()
+        .arg(bash_path(&metadata_script))
+        .arg(bash_path(&manifest_path))
         .arg("1.2.3")
         .output()
         .expect("run Scoop metadata materializer");
     assert!(
         output.status.success(),
         "Scoop metadata materializer failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        command_diagnostics(&output)
     );
     let metadata: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse Scoop publisher metadata");
@@ -885,9 +1289,9 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
         "https://downloads.example.test/renamed/repository/releases/v1.2.3/SHA256SUMS"
     );
 
-    let output = Command::new("bash")
-        .arg(&metadata_script)
-        .arg(&manifest_path)
+    let output = bash_command()
+        .arg(bash_path(&metadata_script))
+        .arg(bash_path(&manifest_path))
         .arg("v1.2.3")
         .output()
         .expect("run Scoop version validation");
@@ -913,9 +1317,9 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
             serde_json::to_vec(&invalid_manifest).expect("serialize invalid Scoop manifest"),
         )
         .expect("write invalid Scoop manifest");
-        let output = Command::new("bash")
-            .arg(&metadata_script)
-            .arg(&manifest_path)
+        let output = bash_command()
+            .arg(bash_path(&metadata_script))
+            .arg(bash_path(&manifest_path))
             .arg("1.2.3")
             .output()
             .expect("run Scoop metadata validation");

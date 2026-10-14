@@ -1,9 +1,11 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
+use crate::tools::shell_env::{ForwardedEnvironment, SAFE_SHELL_ENV_VARS};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
@@ -48,39 +50,14 @@ impl Drop for ChildGroupGuard {
                 .with_attrs(::serde_json::json!({ "pgid": pgid, "signal": "SIGKILL" })),
             "shell tool reaping child process group"
         );
+        // SAFETY: `pgid` was published only after the spawned child created
+        // its own process group; a negative PID targets that group, and this
+        // best-effort signal call passes no pointers.
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
         }
     }
 }
-
-/// Environment variables safe to pass to shell commands.
-/// Only functional variables are included — never API keys or secrets.
-#[cfg(not(target_os = "windows"))]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
-/// Environment variables safe to pass to shell commands on Windows.
-/// Includes Windows-specific variables needed for cmd.exe and program resolution.
-#[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "TEMP",
-    "TMP",
-    "TERM",
-    "LANG",
-    "USERNAME",
-];
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -92,7 +69,11 @@ pub struct ShellTool {
     /// vars are overlaid on top of the safe-env snapshot, letting the user's
     /// real shell environment (PATH, credentials, etc.) reach subprocesses
     /// even though the daemon itself may have a stripped-down env.
-    tui_env: Option<HashMap<String, String>>,
+    ///
+    /// Immutable for the session incarnation. The same Arc is held by the
+    /// Agent and RpcSession, so admission and subprocess execution inspect
+    /// one map throughout that incarnation.
+    tui_env: Option<ForwardedEnvironment>,
     persistent_writes: bool,
 }
 
@@ -140,59 +121,25 @@ impl ShellTool {
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
     /// calling this method at all).
     pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
+        self.tui_env = env.map(Arc::new);
+        self
+    }
+
+    /// Install an already-shared [`ForwardedEnvironment`] handle. Callers that
+    /// also hand the same `Arc` to the `Agent`/RPC session use this so the
+    /// tool, the agent and admission all observe one immutable map.
+    pub(crate) fn with_shared_tui_env(mut self, env: Option<ForwardedEnvironment>) -> Self {
         self.tui_env = env;
         self
     }
 }
 
-#[cfg(target_os = "windows")]
 fn decode_output(bytes: &[u8]) -> String {
-    use windows::Win32::Globalization::GetACP;
-    use windows::Win32::System::Console::GetConsoleOutputCP;
-
-    let cp = unsafe { GetConsoleOutputCP() };
-    let cp = if cp == 0 { unsafe { GetACP() } } else { cp };
-
-    decode_output_with_code_page(bytes, cp)
+    super::shell_output::decode_shell_output(bytes)
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn decode_output_with_code_page(bytes: &[u8], cp: u32) -> String {
-    let encoding = windows_code_page_to_encoding(cp);
-    if std::ptr::eq(encoding, encoding_rs::UTF_8) {
-        String::from_utf8_lossy(bytes).into_owned()
-    } else {
-        let (cow, _enc_used, _had_errors) = encoding.decode(bytes);
-        cow.into_owned()
-    }
-}
-
-/// Map a Windows code page identifier to an `encoding_rs` `Encoding`.
-/// Falls back to UTF-8 (lossy) for unknown code pages.
-#[cfg(any(target_os = "windows", test))]
-fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
-    match cp {
-        932 => encoding_rs::SHIFT_JIS,
-        936 | 54936 => encoding_rs::GBK,
-        949 => encoding_rs::EUC_KR,
-        950 => encoding_rs::BIG5,
-        1250 => encoding_rs::WINDOWS_1250,
-        1251 => encoding_rs::WINDOWS_1251,
-        1252 => encoding_rs::WINDOWS_1252,
-        1253 => encoding_rs::WINDOWS_1253,
-        1254 => encoding_rs::WINDOWS_1254,
-        1255 => encoding_rs::WINDOWS_1255,
-        1256 => encoding_rs::WINDOWS_1256,
-        1257 => encoding_rs::WINDOWS_1257,
-        1258 => encoding_rs::WINDOWS_1258,
-        20127 | 65001 => encoding_rs::UTF_8,
-        _ => encoding_rs::UTF_8,
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn decode_output(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+fn decode_truncated_output(bytes: &[u8]) -> String {
+    super::shell_output::decode_truncated_shell_output(bytes)
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -207,7 +154,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
 fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for key in SAFE_ENV_VARS
+    for key in SAFE_SHELL_ENV_VARS
         .iter()
         .copied()
         .chain(security.shell_env_passthrough.iter().map(|s| s.as_str()))
@@ -316,10 +263,17 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
-        {
+        // The forwarded map is immutable for the session incarnation, so
+        // launcher resolution and the child process read the same values.
+        let tui_env_snapshot = self.tui_env.as_ref();
+        let effective_path = tui_env_snapshot
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        let mut cmd = match self.runtime.build_shell_command_with_effective_path(
+            command,
+            &self.security.workspace_dir,
+            effective_path,
+        ) {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -335,16 +289,18 @@ impl Tool for ShellTool {
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut
         // to get a mutable reference to the underlying command.
-        self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "shell tool: sandbox wrap_command failed"
-            );
-            anyhow::Error::msg(format!("Sandbox error: {e}"))
-        })?;
+        self.sandbox
+            .wrap_shell_command(cmd.as_std_mut(), self.runtime.shell_program())
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "shell tool: sandbox wrap_command failed"
+                );
+                anyhow::Error::msg(format!("Sandbox error: {e}"))
+            })?;
 
         cmd.env_clear();
 
@@ -362,8 +318,8 @@ impl Tool for ShellTool {
         // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
         // conflict — the user's real PATH etc. should take precedence over
         // whatever the daemon process inherited.
-        if let Some(ref tui_env) = self.tui_env {
-            for (k, v) in tui_env {
+        if let Some(tui_env) = tui_env_snapshot {
+            for (k, v) in tui_env.iter() {
                 cmd.env(k, v);
             }
         }
@@ -374,19 +330,31 @@ impl Tool for ShellTool {
         // Detect Android at runtime (works for bionic and musl builds).
         if is_android() {
             let ambient = std::env::var("PATH").unwrap_or_default();
-            let tui_path = self
-                .tui_env
-                .as_ref()
+            let tui_path = tui_env_snapshot
                 .and_then(|env| env.get("PATH"))
                 .map(String::as_str);
             cmd.env("PATH", android_child_path(tui_path, &ambient));
         }
 
         let timeout_secs = self.timeout_secs;
-        // Run in own process group so `ChildGroupGuard` can reap the
-        // whole subtree (backgrounded jobs, subshells) on any exit path.
+        // A process group alone still inherits the daemon's controlling terminal.
+        // A new session detaches it and gives ChildGroupGuard the same child-owned PGID.
         #[cfg(unix)]
-        cmd.process_group(0);
+        {
+            use std::os::unix::process::CommandExt;
+
+            // SAFETY: setsid is async-signal-safe; the post-fork hook takes no
+            // locks and allocates nothing before exec.
+            unsafe {
+                cmd.as_std_mut().pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
         cmd.kill_on_drop(true);
         // `output()` pipes stdio implicitly; `spawn()` does not.
         cmd.stdout(std::process::Stdio::piped());
@@ -421,8 +389,8 @@ impl Tool for ShellTool {
                     let (stdout_capture, stderr_capture) =
                         tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
 
-                    let mut stdout = decode_output(&stdout_capture.bytes);
-                    let mut stderr = decode_output(&stderr_capture.bytes);
+                    let mut stdout = decode_capture(&stdout_capture);
+                    let mut stderr = decode_capture(&stderr_capture);
 
                     if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
                         append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
@@ -467,7 +435,7 @@ impl Tool for ShellTool {
         // Inject the warning into whichever field the dispatcher surfaces to the
         // model — `output` on success, `error` on failure — so it is never lost.
         if !self.persistent_writes {
-            result.output = with_ephemeral_workspace_warning(&result.output).into();
+            result.output.map_text(with_ephemeral_workspace_warning);
             if let Some(err) = result.error.take() {
                 result.error = Some(with_ephemeral_workspace_warning(&err));
             }
@@ -486,6 +454,15 @@ struct DrainHandle {
 struct DrainOutput {
     bytes: Vec<u8>,
     truncated: bool,
+    complete: bool,
+}
+
+fn decode_capture(capture: &DrainOutput) -> String {
+    if capture.truncated || !capture.complete {
+        decode_truncated_output(&capture.bytes)
+    } else {
+        decode_output(&capture.bytes)
+    }
 }
 
 fn spawn_drain<R>(reader: Option<R>, cap: usize) -> DrainHandle
@@ -530,12 +507,20 @@ async fn drain_capped_into<R>(
 {
     use tokio::io::AsyncReadExt;
     let Some(mut reader) = reader else {
+        if let Ok(mut capture) = output.lock() {
+            capture.complete = true;
+        }
         return;
     };
     let mut chunk = [0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) => {
+                if let Ok(mut capture) = output.lock() {
+                    capture.complete = true;
+                }
+                break;
+            }
             Ok(n) => {
                 let Ok(mut capture) = output.lock() else {
                     break;
@@ -578,6 +563,51 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct ErrorAfterBytes {
+        bytes: Option<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for ErrorAfterBytes {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(bytes) = self.bytes.take() {
+                buf.put_slice(&bytes);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(std::io::Error::other("injected read failure")))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_drain_preserves_utf8_prefix_below_capture_limit() {
+        let mut bytes = "€".repeat(12).into_bytes();
+        bytes.push(0xe2);
+        let output = Arc::new(std::sync::Mutex::new(DrainOutput::default()));
+
+        drain_capped_into(
+            Some(ErrorAfterBytes { bytes: Some(bytes) }),
+            MAX_OUTPUT_BYTES,
+            Arc::clone(&output),
+        )
+        .await;
+
+        let capture = output.lock().unwrap().clone();
+        assert!(!capture.complete);
+        assert!(!capture.truncated);
+        let decoded = decode_capture(&capture);
+        assert!(
+            decoded.starts_with(&"€".repeat(12)),
+            "decoded text: {decoded:?}"
+        );
+        assert!(decoded.ends_with('\u{fffd}'), "decoded text: {decoded:?}");
+    }
 
     #[test]
     fn android_child_path_prefixes_platform_dirs_with_tui_path_winning() {
@@ -635,6 +665,21 @@ mod tests {
         })
     }
 
+    fn test_security_with_allowed_commands(
+        autonomy: AutonomyLevel,
+        commands: &[&str],
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: commands
+                .iter()
+                .map(|command| (*command).to_string())
+                .collect(),
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[cfg(unix)]
     fn unrestricted_shell_test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -647,7 +692,11 @@ mod tests {
     }
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
-        Arc::new(NativeRuntime::new())
+        #[cfg(windows)]
+        let runtime = NativeRuntime::with_shell("cmd.exe".into());
+        #[cfg(not(windows))]
+        let runtime = NativeRuntime::new();
+        Arc::new(runtime)
     }
 
     #[cfg(windows)]
@@ -672,7 +721,7 @@ mod tests {
 
     #[cfg(windows)]
     fn medium_risk_write_command() -> &'static str {
-        "copy /Y NUL zeroclaw_shell_approval_test"
+        "copy NUL zeroclaw_shell_approval_test"
     }
 
     #[cfg(not(windows))]
@@ -693,6 +742,27 @@ mod tests {
     /// `PathGuardedTool`. Tests exercise this exact shape.
     fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<ShellTool> {
         RateLimitedTool::new(ShellTool::new(security.clone(), test_runtime()), security)
+    }
+
+    /// A forbidden path argument is refused by whichever guard sees it first,
+    /// and the two guards word it differently. On a Windows shell dialect the
+    /// policy's own scan inside `validate_command_execution_for_shell` runs
+    /// before the tool body and reports `Command blocked: forbidden path
+    /// argument`; on POSIX dialects that scan is skipped (an operator may
+    /// legitimately allow absolute arguments there) and the refusal comes from
+    /// the shell tool's workspace scan as `Path blocked by security policy`.
+    /// Both are the same verdict, so assert the refusal rather than one
+    /// platform's phrasing.
+    fn assert_path_argument_blocked(result: &ToolResult, context: &str) {
+        assert!(
+            !result.success,
+            "{context}: the forbidden path argument must be refused, got: {result:?}"
+        );
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("Path blocked") || error.contains("forbidden path argument"),
+            "{context}: expected a path-guard refusal, got: {error:?}"
+        );
     }
 
     #[test]
@@ -721,6 +791,88 @@ mod tests {
         assert!(schema["properties"]["approved"].is_object());
     }
 
+    #[cfg(all(any(unix, windows), not(target_os = "android")))]
+    #[tokio::test]
+    async fn rebuilt_shell_tool_adopts_reloaded_runtime_shell_dialect() {
+        use crate::platform::{ShellDialect, create_runtime};
+        use zeroclaw_config::schema::Config;
+
+        let mut config = Config::default();
+        #[cfg(target_os = "windows")]
+        {
+            config.runtime.shell = Some("cmd".into());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            config.runtime.shell = Some("sh".into());
+        }
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let build_shell_tool = |config: &Config| {
+            let runtime: Arc<dyn RuntimeAdapter> =
+                Arc::from(create_runtime(&config.runtime).expect("runtime should rebuild"));
+            ShellTool::new(security.clone(), runtime)
+        };
+
+        let before_reload = build_shell_tool(&config);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            before_reload.runtime.shell_dialect(),
+            ShellDialect::WindowsCmd
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(before_reload.runtime.shell_dialect(), ShellDialect::Posix);
+        let before_result = before_reload
+            .execute(json!({"command": "echo Env:NAME"}))
+            .await
+            .expect("pre-reload shell should return a tool result");
+        assert!(
+            before_result.success,
+            "the pre-reload non-PowerShell policy should accept the probe: {before_result:?}"
+        );
+
+        // A daemon reload re-reads Config and rebuilds the subsystem graph.
+        // Use an executable shim named `pwsh` on Unix so the real runtime
+        // factory validates the reloaded value without requiring PowerShell to
+        // be installed; policy rejection occurs before the shim can spawn.
+        #[cfg(unix)]
+        let powershell_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let powershell = powershell_dir.path().join("pwsh");
+            std::fs::write(&powershell, "#!/bin/sh\nexit 99\n").unwrap();
+            std::fs::set_permissions(&powershell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            config.runtime.shell = Some(powershell.to_string_lossy().into_owned());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            config.runtime.shell = Some("powershell".into());
+        }
+
+        let after_reload = build_shell_tool(&config);
+        assert_eq!(
+            after_reload.runtime.shell_dialect(),
+            ShellDialect::PowerShell
+        );
+        let after_result = after_reload
+            .execute(json!({"command": "echo Env:NAME", "approved": true}))
+            .await
+            .expect("reloaded shell should return a policy result");
+        assert!(!after_result.success);
+        assert!(
+            after_result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed")),
+            "the rebuilt PowerShell path must apply provider-aware validation: {after_result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn shell_stdin_is_eof_not_the_terminal() {
         let security = Arc::new(SecurityPolicy {
@@ -743,6 +895,103 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_child_cannot_open_owners_controlling_terminal() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        const CHILD_MODE: &str = "ZEROCLAW_TEST_SHELL_TERMINAL_CHILD";
+        const TEST_NAME: &str =
+            "tools::shell::tests::shell_child_cannot_open_owners_controlling_terminal";
+
+        if std::env::var_os(CHILD_MODE).is_none() {
+            let mut master_fd = -1;
+            let mut slave_fd = -1;
+            // SAFETY: the output pointers are valid, and optional settings are null.
+            let result = unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());
+            // SAFETY: openpty supplied two distinct, owned descriptors.
+            let (master, slave) = unsafe {
+                (
+                    OwnedFd::from_raw_fd(master_fd),
+                    OwnedFd::from_raw_fd(slave_fd),
+                )
+            };
+            for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+                // SAFETY: both descriptors remain live throughout this setup.
+                assert_ne!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    -1
+                );
+            }
+
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD_MODE, "1")
+                .stdin(Stdio::from(slave))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // SAFETY: only libc syscalls and errno conversion run between fork and exec.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1
+                        || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+                        || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) == -1
+                    {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let mut command = tokio::process::Command::from(command);
+            command.kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+                .await
+                .expect("isolated PTY test should finish")
+                .expect("isolated PTY test should spawn");
+            assert!(
+                output.status.success(),
+                "isolated PTY test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let tty = std::fs::File::open("/dev/tty").expect("test owner must have a terminal");
+        // SAFETY: tty is live; the process-group query takes no pointers.
+        let owner_group = unsafe { libc::getpgrp() };
+        assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, owner_group);
+        // Admit the probe so policy rejection cannot masquerade as terminal isolation.
+        let security = Arc::new(SecurityPolicy {
+            allowed_roots_read_only: vec!["/dev/tty".into()],
+            ..(*unrestricted_shell_test_security()).clone()
+        });
+        let tool = ShellTool::new(security, test_runtime()).with_timeout_secs(2);
+        let result = tool
+            .execute(json!({
+                "command": "if ( : < /dev/tty ) 2> /dev/null; then printf attached; else printf detached; fi"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output.trim(), "detached");
+        // SAFETY: tty still refers to this subprocess's isolated terminal.
+        assert_eq!(unsafe { libc::tcgetpgrp(tty.as_raw_fd()) }, owner_group);
+    }
+
     #[tokio::test]
     async fn shell_executes_allowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
@@ -753,6 +1002,69 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_bounded_command_configures_redirected_stdout_as_utf8() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let encoding = tool
+            .execute(json!({
+                "command": "Write-Output $OutputEncoding.WebName",
+                "approved": true
+            }))
+            .await
+            .expect("PowerShell encoding probe should return a result");
+        assert!(encoding.success, "PowerShell command failed: {encoding:?}");
+        assert_eq!(encoding.output.trim(), "utf-8");
+
+        let output = tool
+            .execute(json!({
+                "command": "Write-Output '标准输出'",
+                "approved": true
+            }))
+            .await
+            .expect("PowerShell UTF-8 output should return a result");
+        assert!(output.success, "PowerShell command failed: {output:?}");
+        assert_eq!(output.output.trim(), "标准输出");
+        assert!(output.error.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_hidden_redirected_output_decodes_stdout_and_stderr_as_utf8() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+        // This full-script fixture is intentionally outside the bounded grammar.
+        // Emit UTF-8 bytes explicitly so this test isolates hidden redirected capture/decoding.
+        let command = "$stdout = [Text.Encoding]::UTF8.GetBytes('标准输出'); [Console]::OpenStandardOutput().Write($stdout, 0, $stdout.Length); $stderr = [Text.Encoding]::UTF8.GetBytes('标准错误'); [Console]::OpenStandardError().Write($stderr, 0, $stderr.Length)";
+
+        let result = tool
+            .execute(json!({"command": command, "approved": true}))
+            .await
+            .expect("PowerShell execution should return a result");
+
+        assert!(result.success, "PowerShell command failed: {result:?}");
+        assert_eq!(result.output, "标准输出");
+        assert_eq!(result.error.as_deref(), Some("标准错误"));
     }
 
     #[cfg(windows)]
@@ -850,12 +1162,202 @@ mod tests {
     async fn shell_blocks_disallowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
-            .execute(json!({"command": "rm -rf /"}))
+            .execute(json!({"command": "zeroclaw_disallowed_test_command"}))
             .await
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        assert!(error.contains("not allowed"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn shell_policy_blocks_powershell_native_high_risk_command() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let result = tool
+            .execute(json!({"command": "Remove-Item important.txt"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "PowerShell-native operation must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_shell_blocks_windows_relative_path_for_powershell() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
+
+        let result = tool
+            .execute(json!({"command": "cat ..\\secret.txt"}))
+            .await
+            .expect("path rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("forbidden path argument")),
+            "Windows-relative path must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_shell_blocks_powershell_stop_parsing_native_mutation() {
+        // `git --% push` would reach native Git as `push` on PowerShell while
+        // policy sees only `--%` as the first argument. The dialect-aware
+        // validator must reject it before the process is ever built, so the
+        // guard holds on this Unix host too.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["git".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
+
+        let result = tool
+            .execute(json!({"command": "git --% push origin main"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "stop-parsing native mutation must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_shell_blocks_powershell_mixed_quoted_provider_path() {
+        // `cat E'nv:'PATH` binds as the `Env:PATH` provider read on PowerShell,
+        // but the interior quote hides the `Env:` prefix from policy's raw-token
+        // provider check. The bounded grammar rejects the mixed quoted/unquoted
+        // token so it is blocked before the process is ever built.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
+
+        let result = tool
+            .execute(json!({"command": "cat E'nv:'PATH"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "mixed-quoted provider path must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let safe = tool
+            .execute(json!({
+                    "command": "Write-Output \"quoted safe value\" | Select-Object -First 1"
+            }))
+            .await
+            .expect("safe PowerShell pipeline should return a tool result");
+        assert!(safe.success, "{:?}", safe.error);
+        assert!(safe.output.contains("quoted safe value"), "{}", safe.output);
+
+        let dangerous = tool
+            .execute(json!({"command": "ac .\\blocked.txt value", "approved": true}))
+            .await
+            .expect("dangerous PowerShell alias should return a policy result");
+        assert!(!dangerous.success);
+        assert!(
+            dangerous
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "{:?}",
+            dangerous.error
+        );
+        assert!(!workspace.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn shell_uses_runtime_dialect_to_reject_powershell_expression_bypass() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["echo".into()],
+            ..SecurityPolicy::default()
+        });
+        // Policy rejection happens before spawn, so this test does not require
+        // pwsh to be installed on the host.
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let result = tool
+            .execute(json!({
+                "command": "echo ([System.IO.File]::Delete('important.txt'))"
+            }))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed")),
+            "PowerShell expression must be rejected before spawn: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
@@ -995,19 +1497,15 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_absolute_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["cat"],
+        ));
         let result = tool
             .execute(json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
             .expect("absolute path argument should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "absolute path argument");
     }
 
     /// End-to-end regression for the shell workspace-boundary bypass: driving
@@ -1067,53 +1565,41 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_option_assignment_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["grep"],
+        ));
         let result = tool
             .execute(json!({"command": format!("grep --file={} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("option-assigned forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "option-assigned forbidden path");
     }
 
     #[tokio::test]
     async fn shell_blocks_short_option_attached_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["grep"],
+        ));
         let result = tool
             .execute(json!({"command": format!("grep -f{} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("short option attached forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "short option attached forbidden path");
     }
 
     #[tokio::test]
     async fn shell_blocks_tilde_user_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["cat"],
+        ));
         let result = tool
             .execute(json!({"command": "cat ~root/.ssh/id_rsa"}))
             .await
             .expect("tilde-user path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "tilde-user path");
     }
 
     #[tokio::test]
@@ -1151,6 +1637,68 @@ mod tests {
             shell_env_passthrough: vars.iter().map(|v| (*v).to_string()).collect(),
             ..SecurityPolicy::default()
         })
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_preserves_inherited_powershell_cache_path() {
+        const CHILD: &str = "ZEROCLAW_SHELL_CACHE_TEST_CHILD";
+        const KEY: &str = "PSModuleAnalysisCachePath";
+        const VALUE: &str = r"C:\synthetic cache\ModuleAnalysisCache";
+
+        if let Ok(case) = std::env::var(CHILD) {
+            let expected = match case.as_str() {
+                "present" => Some(VALUE),
+                "absent" => None,
+                _ => panic!("unknown cache forwarding test case"),
+            };
+            assert_eq!(std::env::var(KEY).ok().as_deref(), expected);
+            let tool = ShellTool::new(
+                test_security_with_env_cmd(),
+                Arc::new(NativeRuntime::with_shell("cmd".into())),
+            );
+            let result = tool
+                .execute(json!({"command": format!("set {KEY}"), "approved": true}))
+                .await
+                .unwrap();
+            if let Some(value) = expected {
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(result.output.trim(), format!("{KEY}={value}"));
+            } else {
+                assert!(!result.success);
+                assert!(result.output.trim().is_empty());
+                assert!(result.error.as_deref().unwrap_or_default().contains(KEY));
+            }
+            return;
+        }
+
+        // Set the inherited value only on a separate harness process, never on
+        // the shared test process. cmd reads it without touching a cache file.
+        for case in ["present", "absent"] {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tools::shell::tests::shell_preserves_inherited_powershell_cache_path",
+                ])
+                .env(CHILD, case)
+                .kill_on_drop(true);
+            if case == "present" {
+                child.env(KEY, VALUE);
+            } else {
+                child.env_remove(KEY);
+            }
+            let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.output())
+                .await
+                .expect("isolated cache test timed out")
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{case}: {stdout}");
+            assert!(
+                stdout.contains("1 passed;"),
+                "exact child test was not executed: {stdout}"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -1333,10 +1881,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_requires_approval_for_medium_risk_command() {
+        let workspace = tempfile::TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec![medium_risk_write_base().into()],
-            workspace_dir: std::env::temp_dir(),
+            workspace_dir: workspace.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
 
@@ -1361,10 +1910,7 @@ mod tests {
             }))
             .await
             .expect("approved command execution should succeed");
-        assert!(allowed.success);
-
-        let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+        assert!(allowed.success, "{:?}", allowed.error);
     }
 
     // ── shell timeout enforcement tests ─────────────────
@@ -1382,6 +1928,96 @@ mod tests {
             MAX_OUTPUT_BYTES, 1_048_576,
             "max output must be 1 MB to prevent OOM"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_reaps_descendants_after_timeout_or_cancellation() {
+        for cancel in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                workspace_dir: workspace.path().to_path_buf(),
+                ..(*unrestricted_shell_test_security()).clone()
+            });
+            let tool = ShellTool::new(security, test_runtime()).with_timeout_secs(if cancel {
+                10
+            } else {
+                1
+            });
+            // The descendant publishes its own PID, then becomes the sleep, so
+            // the PID file proves it is running and names the process to check.
+            let task = zeroclaw_spawn::spawn!(async move {
+                tool.execute(json!({
+                    "command": "sh -c 'echo $$ > pid.tmp && mv pid.tmp descendant.pid && exec sleep 30' & wait"
+                }))
+                .await
+            });
+            let pid_file = workspace.path().join("descendant.pid");
+            let pid: libc::pid_t = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                        break text.trim().parse().expect("descendant PID");
+                    }
+                    assert!(
+                        !task.is_finished(),
+                        "shell exited before starting its descendant"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("shell descendant should start");
+
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                let result = task.await.unwrap().unwrap();
+                assert!(!result.success);
+                assert!(result.error.unwrap().contains("timed out"));
+            }
+            let exited = tokio::time::timeout(Duration::from_secs(2), async {
+                while descendant_running(pid) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .is_ok();
+            if !exited {
+                // SAFETY: kill only signals the PID the descendant reported.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            assert!(
+                exited,
+                "descendant {pid} survived {}",
+                if cancel { "cancellation" } else { "timeout" }
+            );
+        }
+    }
+
+    /// True while `pid` names a live process. A killed descendant whose new
+    /// parent has not reaped it yet still answers `kill(pid, 0)`, so a zombie
+    /// counts as exited. Only `kill(pid, 0)` failing or `ps` reporting a
+    /// zombie state counts as exited; a `ps` that fails or reports no state
+    /// counts as running, and the caller's next poll repeats both checks.
+    #[cfg(unix)]
+    fn descendant_running(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks that the PID exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return true;
+        };
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        if !output.status.success() || state.is_empty() {
+            return true;
+        }
+        !state.starts_with('Z')
     }
 
     #[cfg(unix)]
@@ -1489,11 +2125,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_invalid_utf8_uses_replacement_chars() {
-        // 0xFF is not valid UTF-8
+    fn decode_output_invalid_utf8_is_safe() {
+        // 0xFF is not valid UTF-8. Detection may select a legacy encoding,
+        // but the output must remain usable and must never panic.
         let input = b"hello\xFF world";
         let result = super::decode_output(input);
-        // Must not panic; non-UTF-8 bytes become replacement characters on non-Windows
         assert!(result.contains("hello"));
         assert!(result.contains("world"));
     }
@@ -1501,64 +2137,6 @@ mod tests {
     #[test]
     fn decode_output_empty_bytes_returns_empty_string() {
         assert_eq!(super::decode_output(b""), "");
-    }
-
-    #[test]
-    fn windows_code_page_mapping_covers_cjk() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(936), encoding_rs::GBK);
-        assert_eq!(windows_code_page_to_encoding(932), encoding_rs::SHIFT_JIS);
-        assert_eq!(windows_code_page_to_encoding(949), encoding_rs::EUC_KR);
-        assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_utf8_variants() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(65001), encoding_rs::UTF_8);
-        assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
-        use super::windows_code_page_to_encoding;
-        assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
-    }
-
-    #[test]
-    fn decode_output_with_cp936_gbk_bytes_transcodes_to_utf8() {
-        // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
-        let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
-        let decoded = super::decode_output_with_code_page(gbk_bytes, 936);
-        assert_eq!(decoded, "你好");
-        assert!(!decoded.contains('\u{FFFD}'));
-    }
-
-    #[test]
-    fn shell_safe_env_vars_excludes_secrets() {
-        for var in SAFE_ENV_VARS {
-            let lower = var.to_lowercase();
-            assert!(
-                !lower.contains("key") && !lower.contains("secret") && !lower.contains("token"),
-                "SAFE_ENV_VARS must not include sensitive variable: {var}"
-            );
-        }
-    }
-
-    #[test]
-    fn shell_safe_env_vars_includes_essentials() {
-        assert!(
-            SAFE_ENV_VARS.contains(&"PATH"),
-            "PATH must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"HOME") || SAFE_ENV_VARS.contains(&"USERPROFILE"),
-            "HOME or USERPROFILE must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"TERM"),
-            "TERM must be in safe env vars"
-        );
     }
 
     #[tokio::test]
@@ -1689,7 +2267,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_is_passed_to_subprocess() {
-        // A var that is NOT in SAFE_ENV_VARS and NOT in passthrough —
+        // A var that is NOT in SAFE_SHELL_ENV_VARS and NOT in passthrough —
         // it should only appear if tui_env injects it.
         let tool =
             ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
@@ -1708,6 +2286,78 @@ mod tests {
             env_output_contains_assignment(&result.output, "ZC_TUI_TEST_VAR", "tui_injected"),
             "tui_env var should appear in subprocess env, got:\n{}",
             result.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_resolves_independent_native_runtime_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_dir = tempfile::tempdir().expect("launcher tempdir should be created");
+        let launcher = launcher_dir.path().join("tui-only-shell");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\necho TUI_PATH_SHIM_RAN\nfor arg in \"$@\"; do echo \"arg:$arg\"; done\n",
+        )
+        .expect("recording shell should be written");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("recording shell should be executable");
+        let split_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-decoy"),
+            launcher_dir.path().to_path_buf(),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), split_path)])));
+        let result = tool
+            .execute(json!({"command": "echo direct_tui_path"}))
+            .await
+            .expect("shell tool should return a result");
+
+        assert!(
+            result.success && result.output.contains("TUI_PATH_SHIM_RAN"),
+            "TUI-only launcher should execute, got output={:?} error={:?}",
+            result.output,
+            result.error
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn effective_path_with_no_absolute_entries_fails_closed() {
+        let unusable_path = std::env::join_paths([
+            std::path::PathBuf::new(),
+            std::path::PathBuf::from("relative-only"),
+        ])
+        .expect("test PATH should be joined")
+        .into_string()
+        .expect("test PATH should be UTF-8");
+        let tool = ShellTool::new(
+            unrestricted_shell_test_security(),
+            Arc::new(NativeRuntime::with_shell("tui-only-shell".into())),
+        )
+        .with_tui_env(Some(HashMap::from([("PATH".into(), unusable_path)])));
+        let result = tool
+            .execute(json!({"command": "echo must_not_run"}))
+            .await
+            .expect("shell tool should return a failed result");
+
+        assert!(!result.success, "unusable TUI PATH must fail closed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("effective child PATH")),
+            "unexpected error: {:?}",
+            result.error
         );
     }
 
@@ -1730,7 +2380,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_overrides_safe_var() {
-        // tui_env wins over the process-level value for a var that is also in SAFE_ENV_VARS.
+        // tui_env wins over the process-level value for a var that is also in SAFE_SHELL_ENV_VARS.
         // This lets the TUI's PATH (e.g. with nix/brew) win over the daemon's PATH.
         let home_key = home_env_key();
         let _guard = EnvGuard::set(home_key, "daemon-home");
@@ -1767,7 +2417,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_none_behaves_like_existing() {
         // with_tui_env(None) must be identical to no tui_env at all —
-        // only SAFE_ENV_VARS + passthrough reach the subprocess.
+        // only SAFE_SHELL_ENV_VARS + passthrough reach the subprocess.
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(None);
 
         let result = tool
@@ -1786,7 +2436,7 @@ mod tests {
     async fn shell_tui_env_secrets_reach_subprocess_but_not_safe_list() {
         // The whole point: secrets from the TUI env (e.g. SSH_AUTH_SOCK)
         // DO reach the subprocess via tui_env even though they are not
-        // in SAFE_ENV_VARS.
+        // in SAFE_SHELL_ENV_VARS.
         let tool =
             ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
                 let mut m = std::collections::HashMap::new();
@@ -1796,8 +2446,8 @@ mod tests {
 
         // Confirm SSH_AUTH_SOCK is not in the safe list (would be a bug if it were)
         assert!(
-            !SAFE_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
-            "SSH_AUTH_SOCK must not be in SAFE_ENV_VARS"
+            !SAFE_SHELL_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
+            "SSH_AUTH_SOCK must not be in SAFE_SHELL_ENV_VARS"
         );
 
         let result = tool

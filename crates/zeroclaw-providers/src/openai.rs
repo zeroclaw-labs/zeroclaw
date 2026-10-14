@@ -1,7 +1,9 @@
+use crate::compatible::{MAX_MODELS_RESPONSE_BYTES, read_body_capped};
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
+use crate::opencode_session::OPENCODE_SESSION_HEADER;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -22,13 +24,11 @@ pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 /// Default endpoint for the OpenAI Responses API.
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
-/// Maximum silence between body reads for OpenAI Responses SSE streams.
-const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
 pub struct OpenAiModelProvider {
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
+    canonical_base_url: &'static str,
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
@@ -64,18 +64,24 @@ struct Choice {
 struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning/thinking models may return output in `reasoning_content`.
-    #[serde(default)]
-    reasoning_content: Option<String>,
 }
 
 impl ResponseMessage {
     fn effective_content(&self) -> String {
-        match &self.content {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => self.reasoning_content.clone().unwrap_or_default(),
-        }
+        self.content.clone().unwrap_or_default()
     }
+}
+
+/// String-only completions have no native tool-call escape hatch. An empty or
+/// reasoning-only result is therefore a typed terminal failure, not a valid
+/// string result for direct callers that do not use the structured chat API.
+fn require_terminal_text(content: String) -> anyhow::Result<String> {
+    if zeroclaw_api::model_provider::strip_think_tags(&content).is_empty() {
+        return Err(anyhow::Error::new(
+            zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+        ));
+    }
+    Ok(content)
 }
 
 #[derive(Debug, Serialize)]
@@ -215,10 +221,10 @@ struct NativeResponseMessage {
 
 impl NativeResponseMessage {
     fn effective_content(&self) -> Option<String> {
-        match &self.content {
-            Some(c) if !c.is_empty() => Some(c.clone()),
-            _ => self.reasoning_content.clone(),
-        }
+        self.content
+            .as_ref()
+            .filter(|content| !content.is_empty())
+            .cloned()
     }
 }
 
@@ -232,6 +238,7 @@ pub struct OpenAiBuilder {
     alias: String,
     credential: Option<String>,
     base_url: Option<String>,
+    canonical_base_url: Option<&'static str>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
 }
@@ -250,6 +257,11 @@ impl OpenAiBuilder {
     /// Override the API endpoint. Trailing slashes are stripped.
     pub fn base_url(mut self, base_url: &str) -> Self {
         self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    pub(crate) fn canonical_base_url(mut self, base_url: &'static str) -> Self {
+        self.canonical_base_url = Some(base_url);
         self
     }
 
@@ -273,6 +285,7 @@ impl OpenAiBuilder {
         OpenAiModelProvider {
             alias: self.alias,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            canonical_base_url: self.canonical_base_url.unwrap_or(BASE_URL),
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
@@ -288,6 +301,7 @@ impl OpenAiModelProvider {
             alias: alias.to_string(),
             credential: None,
             base_url: None,
+            canonical_base_url: None,
             max_tokens: None,
             timeout_secs: None,
         }
@@ -453,7 +467,7 @@ impl OpenAiModelProvider {
 impl ModelProvider for OpenAiModelProvider {
     // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
-        Some(BASE_URL)
+        Some(self.canonical_base_url)
     }
 
     async fn chat_with_system(
@@ -516,7 +530,8 @@ impl ModelProvider for OpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.effective_content())
+            .map(|c| require_terminal_text(c.message.effective_content()))
+            .transpose()?
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -594,6 +609,7 @@ impl ModelProvider for OpenAiModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -680,6 +696,7 @@ impl ModelProvider for OpenAiModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            cache_creation_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -830,17 +847,25 @@ fn extract_responses_api_tool_calls(body: &ResponsesApiBody) -> Vec<ProviderTool
 
 /// Drive a Responses API SSE connection to completion, emitting events on `tx`.
 /// `request_builder` must already have URL, auth headers, `Accept: text/event-stream`,
-/// and the JSON body attached. Sends `StreamEvent::Final` on clean stream end.
+/// and the JSON body attached. `idle_timeout` is the streaming client's
+/// read-idle bound; it names the bound that fired in timeout errors, including
+/// whether `timeout_secs` can raise it. Sends `StreamEvent::Final` on clean
+/// stream end.
 pub(crate) async fn run_responses_sse(
     request_builder: reqwest::RequestBuilder,
     tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
     count_tokens: bool,
+    idle_timeout: super::StreamIdleBound,
 ) {
     let http_response = match request_builder.send().await {
         Ok(r) => r,
         Err(err) => {
             let _ = tx
-                .send(Err(StreamError::ModelProvider(err.to_string())))
+                .send(Err(if err.is_connect() {
+                    StreamError::ConnectFailed(super::stream_idle_error_message(&err, idle_timeout))
+                } else {
+                    StreamError::ModelProvider(super::stream_idle_error_message(&err, idle_timeout))
+                }))
                 .await;
             return;
         }
@@ -877,7 +902,9 @@ pub(crate) async fn run_responses_sse(
             }
             Some(Err(err)) => {
                 let _ = tx
-                    .send(Err(StreamError::ModelProvider(err.to_string())))
+                    .send(Err(StreamError::ModelProvider(
+                        super::stream_idle_error_message(&err, idle_timeout),
+                    )))
                     .await;
                 return;
             }
@@ -957,8 +984,11 @@ pub struct OpenAiResponsesModelProvider {
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
     /// HTTP request timeout in seconds for non-streaming LLM API calls.
-    /// Streaming SSE calls use `streaming_client` which sets only a
-    /// connect timeout so long-running responses aren't killed mid-stream.
+    /// Streaming SSE calls use `streaming_client`, which sets no overall
+    /// timeout (long-running responses aren't killed mid-stream) and derives
+    /// its read-idle bound as `max(300 s, timeout_secs)` via
+    /// `stream_idle_timeout`: the 300 s floor applies when this field is
+    /// unset or lower, and a higher value raises the idle bound to match.
     /// Default: 120 (matches `OpenAiCompatibleModelProvider`).
     timeout_secs: u64,
     extra_headers: std::collections::HashMap<String, String>,
@@ -1140,6 +1170,34 @@ impl OpenAiResponsesModelProvider {
         headers
     }
 
+    /// OpenCode affinity header value for the calling conversation, or `None`
+    /// when this provider does not target OpenCode.
+    ///
+    /// `responses_url` is the full endpoint rather than a base URL; the target
+    /// test parses its host, so it matches either shape. Returns `None` when
+    /// the operator already pinned a valid header value through
+    /// `extra_headers`, which `build_default_headers` puts on every request; a
+    /// second value here would send the header twice. A pinned value
+    /// `build_default_headers` skips as invalid does not count.
+    fn opencode_session_value(&self) -> Option<String> {
+        if crate::opencode_session::operator_pinned_session(&self.extra_headers) {
+            return None;
+        }
+        crate::opencode_session::session_token(&self.responses_url)
+    }
+
+    /// Attach the OpenCode affinity header, for request paths that build in the
+    /// caller's task. The streaming path resolves the value before its spawn.
+    fn apply_opencode_session_header(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match self.opencode_session_value() {
+            Some(session) => req.header(OPENCODE_SESSION_HEADER, session),
+            None => req,
+        }
+    }
+
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
@@ -1148,17 +1206,41 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
         builder.build().unwrap_or_else(|_| Client::new())
+    }
+
+    /// Sibling `/models` endpoint next to the configured `/responses` URL,
+    /// following the same OpenAI-compatible convention used elsewhere in
+    /// this crate (base URL with the wire-specific suffix stripped, plus
+    /// `/models`).
+    fn models_url(&self) -> String {
+        let base = self
+            .responses_url
+            .trim_end_matches('/')
+            .strip_suffix("/responses")
+            .unwrap_or(&self.responses_url)
+            .trim_end_matches('/');
+        format!("{base}/models")
     }
 
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .read_timeout(STREAM_IDLE_TIMEOUT);
+            .read_timeout(super::stream_idle_timeout(self.timeout_secs).duration());
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
         builder.build().unwrap_or_else(|_| Client::new())
     }
 }
@@ -1197,6 +1279,33 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         true
     }
 
+    /// Configured Responses-wire aliases (custom/self-hosted endpoints using
+    /// `wire_api = "responses"`) have no default public fallback the way the
+    /// OpenAI family does, so an unimplemented listing method here silently
+    /// drops the configured endpoint in favor of a generic catalog. Probe
+    /// the sibling `/models` endpoint next to the configured `/responses`
+    /// URL, the same OpenAI-compatible convention `OpenAiCompatibleModelProvider`
+    /// uses, so a credentialed or header-authenticated alias returns its own
+    /// live models instead of an unrelated public list.
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        let url = self.models_url();
+        let mut request = self.http_client().get(&url);
+        if let Some(credential) = self.credential.as_deref() {
+            request = request.header("Authorization", format!("Bearer {credential}"));
+        }
+        let response = request.send().await.map_err(|error| {
+            anyhow::Error::msg(format!(
+                "OpenAI Responses model list request failed: {url}: {error}"
+            ))
+        })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            anyhow::bail!("OpenAI Responses model list failed at {url}: HTTP {status}");
+        }
+        let bytes = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES).await?;
+        crate::compatible::parse_model_ids_from_bytes(&bytes)
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -1220,9 +1329,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         };
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1270,9 +1381,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             );
         }
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1311,10 +1424,14 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let tools_owned = request.tools.map(<[ToolSpec]>::to_vec);
         let model = model.to_string();
         let responses_url = self.responses_url.clone();
+        // Resolved before the spawn: `spawn!` propagates the tracing span but
+        // not task-locals, so the conversation scope is unreadable inside.
+        let opencode_session = self.opencode_session_value();
         let count_tokens = options.count_tokens;
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
         let client = self.streaming_client();
+        let idle_timeout = super::stream_idle_timeout(self.timeout_secs);
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -1363,13 +1480,16 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 );
             }
 
-            let request_builder = client
+            let mut request_builder = client
                 .post(&responses_url)
                 .header("Authorization", format!("Bearer {credential}"))
-                .header("Accept", "text/event-stream")
-                .json(&req);
+                .header("Accept", "text/event-stream");
+            if let Some(session) = opencode_session.as_deref() {
+                request_builder = request_builder.header(OPENCODE_SESSION_HEADER, session);
+            }
+            let request_builder = request_builder.json(&req);
 
-            run_responses_sse(request_builder, &tx, count_tokens).await;
+            run_responses_sse(request_builder, &tx, count_tokens, idle_timeout).await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -1396,6 +1516,202 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_model_listing_parses_normal_body() {
+        use axum::{Json, Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                Json(serde_json::json!({
+                    "data": [{"id": "z-model"}, {"id": "a-model"}]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses model-list test server");
+        let addr = listener
+            .local_addr()
+            .expect("Responses model-list test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses model-list test");
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .credential(Some("test-key"))
+            .build();
+        assert_eq!(
+            provider
+                .list_models()
+                .await
+                .expect("normal Responses catalog must parse"),
+            vec!["a-model", "z-model"]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_model_listing_omits_empty_authorization_header() {
+        use axum::{Json, Router, extract::Request, http::StatusCode, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/models",
+            get(|request: Request| async move {
+                if request.headers().get("authorization").is_some() {
+                    Err(StatusCode::BAD_REQUEST)
+                } else {
+                    Ok(Json(serde_json::json!({
+                        "data": [{"id": "unauthenticated-model"}]
+                    })))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses model-list test server");
+        let addr = listener
+            .local_addr()
+            .expect("Responses model-list test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses model-list test");
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .build();
+        assert_eq!(
+            provider
+                .list_models()
+                .await
+                .expect("unauthenticated Responses catalog must parse"),
+            vec!["unauthenticated-model"]
+        );
+        server.abort();
+    }
+
+    /// A header-only configured Responses profile (a `Cookie`/`X-Auth`
+    /// bridge rather than a credential resolved into `Authorization`) must
+    /// reach `/models` carrying its configured `extra_headers`, and a real
+    /// authorization failure on that path must stay actionable rather than
+    /// being replaced by unrelated public catalog data.
+    #[tokio::test]
+    async fn responses_model_listing_carries_header_only_profile_and_surfaces_auth_failure() {
+        use axum::{Json, Router, extract::Request, http::StatusCode, routing::get};
+        use tokio::net::TcpListener;
+
+        // Success case: the configured X-Auth header must arrive, and no
+        // Authorization header should be synthesized for a header-only profile.
+        let app = Router::new().route(
+            "/models",
+            get(|request: Request| async move {
+                let headers = request.headers();
+                if headers.get("authorization").is_some() {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                match headers.get("x-auth").and_then(|value| value.to_str().ok()) {
+                    Some("bridge-token") => Ok(Json(serde_json::json!({
+                        "data": [{"id": "header-only-model"}]
+                    }))),
+                    // Without the configured header the endpoint rejects the
+                    // request, which is what the failure case below asserts.
+                    _ => Err(StatusCode::FORBIDDEN),
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind header-only Responses test server");
+        let addr = listener
+            .local_addr()
+            .expect("header-only Responses test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve header-only Responses test");
+        });
+
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("X-Auth".to_string(), "bridge-token".to_string());
+        let provider = OpenAiResponsesModelProvider::builder("header-only")
+            .api_url(&format!("http://{addr}"))
+            .extra_headers(headers)
+            .build();
+        assert_eq!(
+            provider
+                .list_models()
+                .await
+                .expect("a header-only Responses profile must reach /models with its headers"),
+            vec!["header-only-model"],
+            "the configured extra_headers must be carried into the catalog request"
+        );
+
+        // Failure case: same endpoint, no configured bridge header. The 403
+        // must surface as an actionable error, not an empty/public fallback.
+        let unauthenticated = OpenAiResponsesModelProvider::builder("header-only-missing")
+            .api_url(&format!("http://{addr}"))
+            .build();
+        let error = unauthenticated
+            .list_models()
+            .await
+            .expect_err("a genuine Responses authorization failure must stay actionable");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("403"),
+            "expected the endpoint's real authorization failure, got: {rendered}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_model_listing_bounds_success_body() {
+        use axum::{Router, body::Body, response::Response, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                Response::builder()
+                    .status(200)
+                    .body(Body::from(vec![
+                        b'x';
+                        (MAX_MODELS_RESPONSE_BYTES as usize) + 1
+                    ]))
+                    .expect("oversized test response")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Responses model-list test server");
+        let addr = listener
+            .local_addr()
+            .expect("Responses model-list test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Responses model-list test");
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{addr}"))
+            .credential(Some("test-key"))
+            .build();
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("oversized Responses catalog must be rejected");
+        assert!(error.to_string().contains("exceeds"));
+        server.abort();
+    }
 
     #[tokio::test]
     async fn responses_completed_ignores_trailing_events_without_eof() {
@@ -1429,7 +1745,12 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            run_responses_sse(request, &tx, false),
+            run_responses_sse(
+                request,
+                &tx,
+                false,
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+            ),
         )
         .await
         .expect("response.completed must finish without waiting for EOF");
@@ -1454,6 +1775,7 @@ mod tests {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
 
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let app = Router::new().route(
             "/responses",
             post(|| async {
@@ -1501,6 +1823,118 @@ mod tests {
         server_handle.abort();
     }
 
+    #[tokio::test]
+    async fn responses_provider_honors_runtime_proxy_config() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        async fn proxy_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "proxied",
+                "output": []
+            }))
+        }
+
+        async fn direct_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "direct",
+                "output": []
+            }))
+        }
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_app = Router::new()
+            .fallback(proxy_response)
+            .with_state(Arc::clone(&proxy_hits));
+        let proxy_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(proxy_listener, proxy_app).await.unwrap();
+        });
+
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        let direct_app = Router::new()
+            .route("/responses", post(direct_response))
+            .with_state(Arc::clone(&direct_hits));
+        let direct_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(direct_listener, direct_app).await.unwrap();
+        });
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(format!("http://{proxy_addr}")),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.openai".to_string()],
+            ..Default::default()
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{direct_addr}"))
+            .credential(Some("test-key"))
+            .build();
+        let client = provider.http_client();
+        let streaming_client = provider.streaming_client();
+        set_runtime_proxy_config(ProxyConfig::default());
+
+        let response = client
+            .post(&provider.responses_url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("responses request should succeed through runtime proxy");
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+        let streaming_response = streaming_client
+            .post(&provider.responses_url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("streaming responses request should succeed through runtime proxy");
+        let streaming_body: serde_json::Value = streaming_response
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+
+        proxy_server.abort();
+        direct_server.abort();
+
+        assert_eq!(
+            body.get("output_text").and_then(serde_json::Value::as_str),
+            Some("proxied"),
+            "Responses requests must use the runtime proxy client path for model_provider.openai"
+        );
+        assert_eq!(
+            streaming_body
+                .get("output_text")
+                .and_then(serde_json::Value::as_str),
+            Some("proxied"),
+            "streaming Responses requests must use the runtime proxy client path for model_provider.openai"
+        );
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            2,
+            "runtime proxy server should receive the Responses request"
+        );
+        assert_eq!(
+            direct_hits.load(Ordering::SeqCst),
+            0,
+            "direct Responses endpoint must not be contacted when the runtime proxy applies"
+        );
+    }
+
     #[test]
     fn creates_with_key() {
         let p = OpenAiModelProvider::builder("test")
@@ -1535,6 +1969,84 @@ mod tests {
     }
 
     #[test]
+    fn opencode_session_header_follows_the_built_request_destination() {
+        // Header selection must agree with the parser that addresses the
+        // request, not with a textual reading of the configured URI.
+        for (api_url, expected_host) in [
+            // `\` ends the authority; `@opencode.ai/zen/v1` is only path.
+            (
+                "https://relay.example\\@opencode.ai/zen/v1",
+                "relay.example",
+            ),
+            // A percent-encoded host decodes to the relay.
+            ("https://%6fpencode.ai/zen/v1", "opencode.ai"),
+        ] {
+            let provider = OpenAiResponsesModelProvider::builder("opencode")
+                .api_url(api_url)
+                .credential(Some("test-key"))
+                .build();
+            let request = provider
+                .apply_opencode_session_header(reqwest::Client::new().post(&provider.responses_url))
+                .build()
+                .expect("request must build");
+            let host = request.url().host_str().expect("request must have a host");
+            assert_eq!(host, expected_host, "{api_url}");
+            assert_eq!(
+                request.headers().contains_key(OPENCODE_SESSION_HEADER),
+                host == "opencode.ai",
+                "{api_url}: header selection must match the request host {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_session_pin_counts_only_when_the_value_is_valid() {
+        let provider_with = |value: &str| {
+            OpenAiResponsesModelProvider::builder("opencode")
+                .api_url("https://opencode.ai/zen/v1")
+                .credential(Some("test-key"))
+                .extra_headers(std::collections::HashMap::from([(
+                    "x-opencode-session".to_string(),
+                    value.to_string(),
+                )]))
+                .build()
+        };
+        assert!(
+            provider_with("pinned-by-operator")
+                .opencode_session_value()
+                .is_none(),
+            "a valid operator pin must win over the derived value"
+        );
+        assert!(
+            provider_with("bad\nvalue")
+                .opencode_session_value()
+                .is_some(),
+            "an invalid pinned value must not suppress the derived token"
+        );
+    }
+
+    #[test]
+    fn opencode_responses_clients_carry_the_cross_host_redirect_policy() {
+        // reqwest's `Debug` names the redirect policy only when it is not the
+        // default, so this checks both clients the Responses provider builds.
+        let has_policy = |client: Client| format!("{client:?}").contains("redirect_policy");
+        let provider = |api_url: &str| {
+            OpenAiResponsesModelProvider::builder("opencode")
+                .api_url(api_url)
+                .credential(Some("test-key"))
+                .build()
+        };
+
+        let opencode = provider("https://opencode.ai/zen/v1");
+        assert!(has_policy(opencode.http_client()));
+        assert!(has_policy(opencode.streaming_client()));
+
+        let other = provider("https://api.openai.com/v1");
+        assert!(!has_policy(other.http_client()));
+        assert!(!has_policy(other.streaming_client()));
+    }
+
+    #[test]
     fn responses_provider_defaults_timeout_to_120() {
         let p = OpenAiResponsesModelProvider::builder("test").build();
         assert_eq!(
@@ -1550,6 +2062,102 @@ mod tests {
             p.extra_headers.is_empty(),
             "fresh provider must default extra_headers to an empty HashMap"
         );
+    }
+
+    #[test]
+    fn models_url_strips_responses_suffix_from_custom_base() {
+        let p = OpenAiResponsesModelProvider::builder("custom")
+            .api_url("https://custom.example.com/v1")
+            .credential(Some("key"))
+            .build();
+        assert_eq!(p.responses_url, "https://custom.example.com/v1/responses");
+        assert_eq!(p.models_url(), "https://custom.example.com/v1/models");
+    }
+
+    #[tokio::test]
+    async fn list_models_probes_configured_endpoint_for_responses_wire_alias() {
+        // A credentialed custom Responses-wire alias (`wire_api = "responses"`)
+        // must list from its own configured `/models` endpoint rather than
+        // silently falling back to a generic public catalog when the trait
+        // default is used.
+        use axum::Router;
+        use axum::routing::get;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured_auth: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_for_route = captured_auth.clone();
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    axum::Json(serde_json::json!({
+                        "data": [{"id": "custom-endpoint-only-model"}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("custom")
+            .api_url(&format!("http://{addr}/v1"))
+            .credential(Some("secret-key"))
+            .build();
+
+        let models = provider
+            .list_models()
+            .await
+            .expect("configured Responses-wire alias must list from its own endpoint");
+        assert_eq!(models, vec!["custom-endpoint-only-model".to_string()]);
+        assert_eq!(
+            captured_auth.lock().unwrap().as_deref(),
+            Some("Bearer secret-key"),
+            "the configured credential must reach the catalog probe"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn list_models_surfaces_a_genuine_responses_endpoint_failure() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("custom")
+            .api_url(&format!("http://{addr}/v1"))
+            .credential(Some("bad-key"))
+            .build();
+
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("a genuine native listing failure must remain actionable");
+        assert!(
+            error.to_string().contains("HTTP 401"),
+            "expected the real endpoint failure, got: {error}"
+        );
+
+        server_handle.abort();
     }
 
     #[test]
@@ -1818,6 +2426,25 @@ mod tests {
     }
 
     #[test]
+    fn string_completion_rejects_empty_and_think_only_text() {
+        for text in ["", "  \n", "<think>internal reasoning</think>"] {
+            let error = require_terminal_text(text.to_string())
+                .expect_err("a string-only semantic-empty completion must fail");
+            assert!(error.chain().any(|cause| {
+                cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+            }));
+        }
+    }
+
+    #[test]
+    fn string_completion_keeps_visible_text() {
+        assert_eq!(
+            require_terminal_text("final answer".to_string()).unwrap(),
+            "final answer"
+        );
+    }
+
+    #[test]
     fn request_serializes_with_system_message() {
         let req = ChatRequest {
             model: "gpt-4o".to_string(),
@@ -1914,18 +2541,18 @@ mod tests {
     // ----------------------------------------------------------
 
     #[test]
-    fn reasoning_content_fallback_empty_content() {
+    fn reasoning_content_does_not_become_empty_final_content() {
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking..."}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+        assert_eq!(resp.choices[0].message.effective_content(), "");
     }
 
     #[test]
-    fn reasoning_content_fallback_null_content() {
+    fn reasoning_content_does_not_become_missing_final_content() {
         let json =
             r#"{"choices":[{"message":{"content":null,"reasoning_content":"Thinking..."}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+        assert_eq!(resp.choices[0].message.effective_content(), "");
     }
 
     #[test]
@@ -1936,12 +2563,12 @@ mod tests {
     }
 
     #[test]
-    fn native_response_reasoning_content_fallback() {
+    fn native_response_reasoning_content_does_not_become_final_text() {
         let json =
             r#"{"choices":[{"message":{"content":"","reasoning_content":"Native thinking"}}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), Some("Native thinking".to_string()));
+        assert_eq!(msg.effective_content(), None);
     }
 
     #[test]
@@ -2067,7 +2694,19 @@ mod tests {
         let message = resp.choices.into_iter().next().unwrap().message;
         let parsed = OpenAiModelProvider::parse_native_response(message);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.text.as_deref(), Some("answer"));
         assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_rejects_reasoning_only_terminal_text() {
+        let json =
+            r#"{"choices":[{"message":{"content":"","reasoning_content":"thinking step"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let message = resp.choices.into_iter().next().unwrap().message;
+        let parsed = OpenAiModelProvider::parse_native_response(message);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert!(parsed.is_semantically_empty_terminal());
     }
 
     #[test]
@@ -2578,6 +3217,93 @@ mod tests {
         assert!(
             wire_tools.is_empty(),
             "empty tools should remain an empty tools array; only tool_choice and parallel_tool_calls are suppressed"
+        );
+    }
+
+    #[test]
+    fn stream_idle_timeout_keeps_300s_floor_when_timeout_secs_is_lower() {
+        assert_eq!(
+            crate::stream_idle_timeout(120),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(300),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn stream_idle_timeout_raises_bound_when_timeout_secs_exceeds_floor() {
+        assert_eq!(
+            crate::stream_idle_timeout(301),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(301))
+        );
+        assert_eq!(
+            crate::stream_idle_timeout(3600),
+            crate::StreamIdleBound::Configurable(std::time::Duration::from_secs(3600))
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_sse_names_idle_bound_when_provider_stalls_before_headers() {
+        // Accept the connection, then never write a byte: the read-idle bound
+        // fires while the streaming client waits for response headers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled Responses test server");
+        let addr = listener
+            .local_addr()
+            .expect("stalled Responses test server address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let (_socket, _) = listener
+                .accept()
+                .await
+                .expect("accept stalled Responses test request");
+            futures_util::future::pending::<()>().await;
+        });
+        let client = reqwest::Client::builder()
+            .read_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("build short-read-timeout Responses test client");
+        let request = client
+            .post(format!("http://{addr}/responses"))
+            .header("Accept", "text/event-stream")
+            .json(&serde_json::json!({}));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_responses_sse(
+                request,
+                &tx,
+                false,
+                crate::StreamIdleBound::Configurable(crate::STREAM_IDLE_TIMEOUT),
+            ),
+        )
+        .await
+        .expect("stalled Responses stream must hit the read-idle bound");
+
+        let item = rx
+            .recv()
+            .await
+            .expect("stalled Responses stream must yield an error");
+        server.abort();
+        let message = match item {
+            Err(StreamError::ModelProvider(message)) => message,
+            Err(other) => panic!("expected a model provider error, got {other:?}"),
+            Ok(_) => panic!("expected an error from the stalled Responses stream"),
+        };
+        assert!(
+            message.contains("no data from provider for 300s"),
+            "idle message must name the bound that fired: {message}"
+        );
+        assert!(
+            message.contains("stream idle timeout"),
+            "idle message must name the idle timeout: {message}"
+        );
+        assert!(
+            message.contains("raise timeout_secs above 300s"),
+            "idle message must name the knob that raises the bound: {message}"
         );
     }
 }

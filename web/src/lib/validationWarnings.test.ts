@@ -13,14 +13,15 @@ async function loadValidationWarningMessage() {
 
 test('known config warnings resolve through the dashboard catalog', async () => {
   const validationWarningMessage = await loadValidationWarningMessage();
-  const message = validationWarningMessage({
-    code: 'skills_prompt_injection_mode_full_deprecated',
-    message: 'unlocalized fallback',
-    path: 'skills.prompt_injection_mode',
+  const auditMessage = validationWarningMessage({
+    code: 'security_audit_disabled_drops_certificate_record',
+    message: 'unlocalized audit fallback',
+    path: 'security.audit.enabled',
   });
 
-  assert.match(message, /full.*deprecated/i);
-  assert.doesNotMatch(message, /unlocalized fallback/);
+  assert.match(auditMessage, /certificate issuance and renewal have no audit-log record/i);
+  assert.match(auditMessage, /command execution is not audited/i);
+  assert.doesNotMatch(auditMessage, /unlocalized audit fallback/);
 });
 
 test('unknown config warnings retain the API fallback message', async () => {

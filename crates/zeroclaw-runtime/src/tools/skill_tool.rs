@@ -2,6 +2,7 @@
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
+use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,30 +15,6 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
-
-#[cfg(not(target_os = "windows"))]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
-#[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "TEMP",
-    "TMP",
-    "TERM",
-    "LANG",
-    "USERNAME",
-];
 
 const MAX_TOOL_NAME_LEN: usize = 64;
 
@@ -237,7 +214,7 @@ impl Tool for SkillShellTool {
         cmd.env_clear();
 
         // Only pass safe environment variables
-        for var in SAFE_ENV_VARS {
+        for var in SAFE_SHELL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
@@ -253,8 +230,8 @@ impl Tool for SkillShellTool {
 
         match result {
             Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let mut stdout = super::shell_output::decode_shell_output(&output.stdout);
+                let mut stderr = super::shell_output::decode_shell_output(&output.stderr);
 
                 if stdout.len() > MAX_OUTPUT_BYTES {
                     let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
@@ -381,6 +358,10 @@ fn narrow_schema(
 
 #[async_trait]
 impl Tool for SkillBuiltinTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.target_tool.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }
@@ -432,6 +413,7 @@ mod tests {
     use crate::platform::DockerRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::skills::SkillTool;
+    use zeroclaw_api::attribution::{Attributable, ToolProvenance};
     use zeroclaw_config::schema::DockerRuntimeConfig;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -641,6 +623,118 @@ mod tests {
         assert!(result.output.contains("hello-skill"));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn skill_shell_preserves_inherited_powershell_cache_path() {
+        const CHILD: &str = "ZEROCLAW_SKILL_CACHE_TEST_CHILD";
+        const KEY: &str = "PSModuleAnalysisCachePath";
+        const VALUE: &str = r"C:\synthetic cache\ModuleAnalysisCache";
+
+        if let Ok(case) = std::env::var(CHILD) {
+            let expected = match case.as_str() {
+                "present" => Some(VALUE),
+                "absent" => None,
+                _ => panic!("unknown cache forwarding test case"),
+            };
+            assert_eq!(std::env::var(KEY).ok().as_deref(), expected);
+            let workspace = tempfile::tempdir().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                workspace_dir: workspace.path().to_path_buf(),
+                allowed_commands: vec!["set".into()],
+                ..SecurityPolicy::default()
+            });
+            let skill = SkillTool {
+                name: "cache_probe".into(),
+                description: "Read the inherited cache variable".into(),
+                kind: "shell".into(),
+                command: format!("set {KEY}"),
+                args: HashMap::new(),
+                target: None,
+                locked_args: HashMap::new(),
+                timeout_secs: None,
+            };
+            let tool = SkillShellTool::new_with_runtime(
+                "test",
+                &skill,
+                security,
+                Arc::new(NativeRuntime::with_shell("cmd".into())),
+            );
+            let result = tool.execute(serde_json::json!({})).await.unwrap();
+            if let Some(value) = expected {
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(result.output.trim(), format!("{KEY}={value}"));
+            } else {
+                assert!(!result.success);
+                assert!(result.output.trim().is_empty());
+                assert!(result.error.as_deref().unwrap_or_default().contains(KEY));
+            }
+            return;
+        }
+
+        // Each case gets its own inherited environment, without racing other tests.
+        for case in ["present", "absent"] {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "tools::skill_tool::tests::skill_shell_preserves_inherited_powershell_cache_path",
+            ]).env(CHILD, case).kill_on_drop(true);
+            if case == "present" {
+                child.env(KEY, VALUE);
+            } else {
+                child.env_remove(KEY);
+            }
+            let output = tokio::time::timeout(Duration::from_secs(120), child.output())
+                .await
+                .expect("isolated cache test timed out")
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{case}: {stdout}");
+            assert!(
+                stdout.contains("1 passed;"),
+                "exact child test was not executed: {stdout}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn skill_shell_tool_executes_powershell_safe_pipeline_with_sanitized_env() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let skill = SkillTool {
+            name: "safe_pipeline".to_string(),
+            description: "Run a safe PowerShell pipeline".to_string(),
+            kind: "shell".to_string(),
+            command: "Write-Output \"quoted safe value\" | Select-Object -First 1".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = SkillShellTool::new_with_runtime("test", &skill, security, runtime);
+
+        let result = tool
+            .execute(serde_json::json!({}))
+            .await
+            .expect("safe PowerShell pipeline should return a tool result");
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result.output.contains("quoted safe value"),
+            "{}",
+            result.output
+        );
+    }
+
     #[tokio::test]
     async fn skill_shell_tool_reports_invalid_docker_workspace_root() {
         let workspace = tempfile::tempdir().expect("workspace tempdir should be created");
@@ -729,6 +823,13 @@ mod tests {
         assert_eq!(spec.parameters["type"], "object");
     }
 
+    #[test]
+    fn manifest_loaded_skill_shell_is_an_extension() {
+        let tool = SkillShellTool::new("browser", &sample_skill_tool(), test_security());
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
+    }
+
     // ─── SkillBuiltinTool tests ──────────────────────────────────────────────
 
     /// Minimal mock tool for testing builtin delegation.
@@ -803,6 +904,55 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(tool.name(), "my_skill__use_shell");
+    }
+
+    #[test]
+    fn skill_builtin_tool_is_extension_even_when_target_is_native() {
+        struct NativeMockBuiltinTool(MockBuiltinTool);
+
+        impl ::zeroclaw_api::attribution::Attributable for NativeMockBuiltinTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                self.0.role()
+            }
+
+            fn alias(&self) -> &str {
+                self.0.alias()
+            }
+
+            fn tool_provenance(&self) -> ToolProvenance {
+                ToolProvenance::Native
+            }
+        }
+
+        #[async_trait]
+        impl Tool for NativeMockBuiltinTool {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+
+            fn description(&self) -> &str {
+                self.0.description()
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                self.0.parameters_schema()
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                self.0.execute(args).await
+            }
+        }
+
+        let target: Arc<dyn Tool> =
+            Arc::new(NativeMockBuiltinTool(MockBuiltinTool::new("browser")));
+        let tool = SkillBuiltinTool::new(
+            "skill_browser",
+            &sample_builtin_skill_tool(),
+            target,
+            HashMap::new(),
+        );
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
     }
 
     #[test]

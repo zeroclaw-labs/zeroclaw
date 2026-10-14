@@ -55,6 +55,9 @@ Cargo.toml text eol=lf
 *.woff2 binary
 *.ttf binary
 *.eot binary
+*.ogg binary
+*.oga binary
+*.opus binary
 *.mp3 binary
 *.mp4 binary
 *.webm binary

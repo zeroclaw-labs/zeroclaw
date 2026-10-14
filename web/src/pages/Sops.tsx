@@ -3,6 +3,7 @@ import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-r
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Badge, Card, PageHeader, HelpTip } from '@/components/ui';
 import SopCanvas from './SopCanvas';
+import { planSopSave, sopErrorText } from './sopSavePlan';
 import MarkdownEditor from '@/components/MarkdownEditor';
 import ToolPicker from '@/components/ToolPicker';
 import { PlannedCallsEditor } from '@/components/SopCalls';
@@ -18,6 +19,11 @@ import {
   runSop,
   createSop,
   saveSop,
+  renameSop,
+  decisionModels,
+  sopDecisionModes,
+  type DecisionModelOption,
+  type SopDecisionSpec,
   deleteSop,
   wireDraft,
   graphDraft,
@@ -307,6 +313,7 @@ function StepEditor({
   onMove,
   agentAliases,
   parentAgent,
+  hasDecision,
 }: {
   step: SopStep;
   index: number;
@@ -317,6 +324,7 @@ function StepEditor({
   onMove: (dir: -1 | 1) => void;
   agentAliases: string[];
   parentAgent?: string | null;
+  hasDecision: boolean;
 }) {
   const rowRef = useRef<HTMLDivElement | null>(null);
   const routing = step.routing ?? {};
@@ -436,6 +444,33 @@ function StepEditor({
           </HelpTip>
         </label>
       </div>
+      {hasDecision || step.decide || step.unless_decided ? (
+        <div className="mb-2 grid grid-cols-3 gap-2 border-t border-pc-border pt-2 text-xs">
+          <div className="col-span-2">
+            <TextField
+              label={t('sops.step_decide')}
+              value={step.decide ?? ''}
+              placeholder={t('sops.step_decide_placeholder')}
+              help={sopFieldHelp('SopStep', 'decide')}
+              onChange={(v) => onChange({ decide: v.trim() === '' ? null : v })}
+            />
+          </div>
+          <Field label={t('sops.step_unless_decided')} help={sopFieldHelp('SopStep', 'unless_decided')}>
+            <input
+              type="number"
+              min={1}
+              value={step.unless_decided ?? ''}
+              onChange={(e) =>
+                onChange({
+                  unless_decided: e.target.value ? parseInt(e.target.value, 10) : null,
+                })
+              }
+              placeholder="—"
+              className={INPUT_CLS}
+            />
+          </Field>
+        </div>
+      ) : null}
       <div className="grid grid-cols-3 gap-2 border-t border-pc-border pt-2 text-xs">
         <TextField
           label={t('sops.routing_depends_on')}
@@ -1122,6 +1157,167 @@ function StepListRow({
   );
 }
 
+function DecisionEditor({
+  decision,
+  deterministic,
+  models,
+  onChange,
+}: {
+  decision: SopDecisionSpec | null | undefined;
+  deterministic: boolean;
+  models: DecisionModelOption[];
+  onChange: (next: SopDecisionSpec | null) => void;
+}) {
+  const help = (field: string) => sopFieldHelp('SopDecisionSpec', field);
+  const enable = () =>
+    onChange({
+      model: models[0]?.alias ?? '',
+      gate: null,
+      gate_threshold: 0.7,
+      gate_on_error: 'run_strict',
+      modes: [],
+      mode_instructions: null,
+      min_confidence: 0.7,
+      part_threshold: 0.5,
+    });
+  const set = (patch: Partial<SopDecisionSpec>) => {
+    if (decision) onChange({ ...decision, ...patch });
+  };
+  const modes = decision?.modes ?? [];
+  const toggleMode = (mode: string, on: boolean) =>
+    set({
+      modes: sopDecisionModes.filter((m) => (m === mode ? on : modes.includes(m))),
+    });
+  const probability = (v: string) => {
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const configured = decision ? models.some((m) => m.alias === decision.model) : true;
+
+  return (
+    <div className="space-y-2 rounded border border-pc-border p-2">
+      <label className="flex items-center gap-2 text-sm font-medium text-pc-text">
+        <input
+          type="checkbox"
+          checked={decision != null}
+          onChange={(e) => (e.target.checked ? enable() : onChange(null))}
+        />
+        <HelpTip text={t('sops.decision_help')}>{t('sops.decision_title')}</HelpTip>
+      </label>
+      {decision ? (
+        <>
+          <SelectField
+            label={t('sops.decision_model')}
+            value={decision.model}
+            onChange={(v) => set({ model: v })}
+            help={help('model')}
+          >
+            {models.length === 0 ? <option value="">{t('sops.decision_no_models')}</option> : null}
+            {!configured && decision.model ? (
+              <option value={decision.model}>
+                {decision.model} {t('sops.decision_not_configured')}
+              </option>
+            ) : null}
+            {models.map((m) => (
+              <option key={m.alias} value={m.alias}>
+                {m.alias} ({m.provider}: {m.model})
+              </option>
+            ))}
+          </SelectField>
+          {!configured ? (
+            <p className="text-xs text-status-warning">{t('sops.decision_not_configured_hint')}</p>
+          ) : null}
+          <TextField
+            label={t('sops.decision_gate')}
+            value={decision.gate ?? ''}
+            placeholder={t('sops.decision_gate_placeholder')}
+            onChange={(v) => set({ gate: v.trim() === '' ? null : v })}
+            help={help('gate')}
+          />
+          <div className="grid grid-cols-2 gap-3">
+            <Field label={t('sops.decision_gate_threshold')} help={help('gate_threshold')}>
+              <input
+                type="number"
+                min={0}
+                max={1}
+                step={0.05}
+                value={decision.gate_threshold ?? 0.7}
+                onChange={(e) => set({ gate_threshold: probability(e.target.value) })}
+                className={INPUT_CLS}
+              />
+            </Field>
+            <SelectField
+              label={t('sops.decision_gate_on_error')}
+              value={decision.gate_on_error ?? 'run_strict'}
+              onChange={(v) => set({ gate_on_error: v as SopDecisionSpec['gate_on_error'] })}
+              help={help('gate_on_error')}
+            >
+              <option value="run_strict">{t('sops.decision_on_error_run_strict')}</option>
+              <option value="skip">{t('sops.decision_on_error_skip')}</option>
+            </SelectField>
+          </div>
+          <Field
+            label={t('sops.decision_modes')}
+            help={help('modes')}
+            hint={deterministic ? t('sops.decision_modes_deterministic') : null}
+          >
+            <div className="flex flex-wrap gap-3 text-sm text-pc-text">
+              {sopDecisionModes.map((mode) => (
+                <label key={mode} className="flex items-center gap-1">
+                  <input
+                    type="checkbox"
+                    disabled={deterministic}
+                    checked={modes.includes(mode)}
+                    onChange={(e) => toggleMode(mode, e.target.checked)}
+                  />
+                  {mode}
+                </label>
+              ))}
+            </div>
+          </Field>
+          {modes.length > 0 ? (
+            <>
+              <TextField
+                label={t('sops.decision_mode_instructions')}
+                value={decision.mode_instructions ?? ''}
+                placeholder={t('sops.decision_mode_instructions_placeholder')}
+                onChange={(v) => set({ mode_instructions: v.trim() === '' ? null : v })}
+                help={help('mode_instructions')}
+              />
+              <Field label={t('sops.decision_min_confidence')} help={help('min_confidence')}>
+                <input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={decision.min_confidence ?? 0.7}
+                  onChange={(e) => set({ min_confidence: probability(e.target.value) })}
+                  className={INPUT_CLS}
+                />
+              </Field>
+            </>
+          ) : null}
+          <Field
+            label={t('sops.decision_part_threshold')}
+            help={help('part_threshold')}
+            hint={t('sops.decision_parts_hint')}
+          >
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={decision.part_threshold ?? 0.5}
+              onChange={(e) => set({ part_threshold: probability(e.target.value) })}
+              className={INPUT_CLS}
+            />
+          </Field>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 function DraftSidebar({
   draft,
   saving,
@@ -1130,6 +1326,7 @@ function DraftSidebar({
   selectedTrigger,
   triggerRegistry,
   agentAliases,
+  decisionModelOptions,
   onSelectStep,
   onField,
   onTrigger,
@@ -1148,6 +1345,7 @@ function DraftSidebar({
   selectedTrigger: number | null;
   triggerRegistry: TriggerSourceRegistry | null;
   agentAliases: string[];
+  decisionModelOptions: DecisionModelOption[];
   onSelectStep: (n: number) => void;
   onField: (patch: Partial<Sop>) => void;
   onTrigger: (i: number, next: SopTrigger) => void;
@@ -1220,6 +1418,12 @@ function DraftSidebar({
         onChange={(v) => onField({ execution_mode: v as Sop['execution_mode'] })}
         options={sopExecutionModes}
         help={sopFieldHelp('Sop', 'execution_mode')}
+      />
+      <DecisionEditor
+        decision={draft.decision}
+        deterministic={draft.deterministic ?? false}
+        models={decisionModelOptions}
+        onChange={(next) => onField({ decision: next })}
       />
       <SelectField
         label={t('sops.field_agent')}
@@ -1330,6 +1534,7 @@ function StepInspector({
       onMove={(dir) => onMoveStep(index, dir)}
       agentAliases={agentAliases}
       parentAgent={draft.agent}
+      hasDecision={draft.decision != null}
     />
   );
 }
@@ -1659,6 +1864,7 @@ export function SopEditor() {
   const [selectedTrigger, setSelectedTrigger] = useState<number | null>(null);
   const [triggerRegistry, setTriggerRegistry] = useState<TriggerSourceRegistry | null>(null);
   const [agentAliases, setAgentAliases] = useState<string[]>([]);
+  const [decisionModelOptions, setDecisionModelOptions] = useState<DecisionModelOption[]>([]);
   const [latestOverlay, setLatestOverlay] = useState<RunOverlay | null>(null);
 
   // Load the draft the route addresses: an existing SOP by name for edit, or a
@@ -1707,6 +1913,18 @@ export function SopEditor() {
     triggerSources()
       .then((reg) => {
         if (active) setTriggerRegistry(reg);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    decisionModels()
+      .then((res) => {
+        if (active) setDecisionModelOptions(res.models);
       })
       .catch(() => {});
     return () => {
@@ -1910,20 +2128,37 @@ export function SopEditor() {
     //   - new draft (no editing name): create, 409 if the name already exists,
     //     so a new SOP can never silently overwrite an existing one.
     //   - edit under the same name: upsert via PUT (never 409s on itself).
-    //   - rename (name diverged from the editing name): rejected. A rename is
-    //     not a save; it must be an explicit operation so it cannot fork or
-    //     clobber an unrelated SOP through a swallowed delete.
-    const isNew = editingName === null;
-    if (!isNew && draft.name !== editingName) {
-      setSaving(false);
-      setSaveError(`rename not supported: '${editingName}' cannot be saved as '${draft.name}'`);
+    //   - rename: save the edits against the name they were made under, then
+    //     ask the daemon to move the SOP. Saving under the new name instead
+    //     would write a second SOP and strand the original, and moving first
+    //     would leave a renamed SOP holding unsaved edits if the save failed.
+    const plan = planSopSave(editingName, draft.name);
+    const message = sopErrorText;
+
+    if (plan.kind === 'save-then-rename') {
+      saveSop({ ...draft, name: plan.from })
+        .then(
+          () =>
+            renameSop(plan.from, plan.to).then(
+              () => close(plan.to),
+              // The edits are on disk under the old name. Say so, rather than
+              // reporting a bare failure the author would read as losing them.
+              (e: unknown) =>
+                setSaveError(
+                  `${t('sops.rename_failed').replace('{name}', plan.from)} ${message(e)}`,
+                ),
+            ),
+          (e: unknown) => setSaveError(message(e)),
+        )
+        .finally(() => setSaving(false));
       return;
     }
-    const write = isNew ? createSop(draft) : saveSop(draft);
+
+    const write = plan.kind === 'create' ? createSop(draft) : saveSop(draft);
     const savedName = draft.name;
     write
       .then(() => close(savedName))
-      .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setSaveError(message(e)))
       .finally(() => setSaving(false));
   }, [draft, editingName, close]);
 
@@ -1992,6 +2227,7 @@ export function SopEditor() {
           selectedTrigger={selectedTrigger}
           triggerRegistry={triggerRegistry}
           agentAliases={agentAliases}
+          decisionModelOptions={decisionModelOptions}
           onSelectStep={setSelectedStep}
           onField={editorHandlers.onField}
           onTrigger={editorHandlers.onTrigger}

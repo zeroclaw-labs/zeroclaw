@@ -11,10 +11,14 @@ pub mod task_store_sqlite;
 
 pub use authority::is_authoritative;
 pub use boot::ControlPlaneHandle;
-pub use global::{control_plane, init_control_plane};
+pub(crate) use boot::ControlPlaneRecoveryOwner;
+pub use global::control_plane;
+pub(crate) use global::{init_control_plane, non_daemon_control_plane, spawn_control_plane_reaper};
 pub use goal_task::{
     GoalBlocker, GoalBlockerKind, GoalPauseReason, GoalPauseState, GoalTaskRecord,
     GoalTaskRegistry, TaskContinuationContext, TaskContinuationConversationScope, TaskGoal,
 };
-pub use task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
+pub use task_registry::{
+    TaskKind, TaskProgress, TaskProgressTool, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus,
+};
 pub use task_store_sqlite::SqliteTaskStore;

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+
+# Classifies changed paths for the plugin backend CI job.
+#
+# Reads one changed path per line on stdin and prints "true" when any path
+# affects the plugin backends or the feature-gated runtime coverage they
+# carry (the live-config plugin regression compiles zeroclaw-runtime with
+# plugins-wasm-cranelift, so runtime-only changes must run the job too).
+# zeroclaw-config is listed for the same reason: it is the canonical home of
+# the operator-facing plugin config surface that zeroclaw-plugins compiles
+# against, so a change there can break this job while nothing under
+# crates/zeroclaw-plugins moves.
+# The root-package channel e2e targets are listed individually because they are
+# the pieces of this job's coverage that live outside a crate directory: they
+# drive zeroclaw-runtime, which zeroclaw-plugins cannot depend on without
+# inverting the crate graph, so they have to be root
+# `zeroclaw` test targets. The root binary's plugin modules are listed for the
+# same reason: `mod plugins` and the plugin registry only compile under
+# `plugins-wasm`, so the default-feature Test job cannot run their tests and
+# this job is where they run. `src/main.rs` holds the plugin CLI itself.
+# Prints "false" otherwise. Always exits 0; the workflow step forwards the
+# printed value to GITHUB_OUTPUT.
+
+set -euo pipefail
+
+run=false
+
+while IFS= read -r path; do
+    case "$path" in
+        crates/zeroclaw-plugins/*|\
+        crates/zeroclaw-runtime/*|\
+        crates/zeroclaw-config/*|\
+        tests/channel_websocket_e2e.rs|\
+        tests/plugin_channel_runtime_e2e.rs|\
+        tests/channel_egress_e2e.rs|\
+        src/plugins/*|src/plugin_registry.rs|src/main.rs|\
+        wit/*|\
+        Cargo.toml|Cargo.lock|\
+        .github/workflows/ci.yml|\
+        scripts/ci/plugin_backend_change_filter*.sh)
+            run=true
+            ;;
+    esac
+done
+
+echo "$run"

@@ -1,22 +1,37 @@
-//! Regression coverage for `zeroclaw config patch --json` output.
+//! Regression coverage for config patch output and standalone execution ownership.
+//!
+//! The CLI/HTTP parity test needs the in-process gateway router, whose
+//! `AppState` and deps only exist under the `gateway` feature. Those items are
+//! gated so the CLI-only tests still compile and run with the feature off.
 
+#[cfg(feature = "gateway")]
 use axum::{Router, routing::patch};
-use parking_lot::RwLock;
+#[cfg(feature = "gateway")]
 use std::collections::HashMap;
 use std::process::{Command, Output, Stdio};
+#[cfg(feature = "gateway")]
 use std::sync::Arc;
+#[cfg(feature = "gateway")]
 use std::time::Duration;
+#[cfg(feature = "gateway")]
 use tower::ServiceExt;
+#[cfg(feature = "gateway")]
 use zeroclaw::gateway::{self, AppState};
+#[cfg(feature = "gateway")]
 use zeroclaw_api::attribution::Attributable;
 use zeroclaw_config::schema::Config;
+#[cfg(feature = "gateway")]
 use zeroclaw_memory::NoneMemory;
+#[cfg(feature = "gateway")]
 use zeroclaw_providers::ModelProvider;
+#[cfg(feature = "gateway")]
 use zeroclaw_runtime::security::PairingGuard;
 
+#[cfg(feature = "gateway")]
 #[derive(Default)]
 struct MockModelProvider;
 
+#[cfg(feature = "gateway")]
 #[async_trait::async_trait]
 impl ModelProvider for MockModelProvider {
     async fn chat_with_system(
@@ -30,6 +45,7 @@ impl ModelProvider for MockModelProvider {
     }
 }
 
+#[cfg(feature = "gateway")]
 impl Attributable for MockModelProvider {
     fn role(&self) -> zeroclaw_api::attribution::Role {
         zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
@@ -42,12 +58,15 @@ impl Attributable for MockModelProvider {
     }
 }
 
+#[cfg(feature = "gateway")]
 fn test_state(config: Config) -> AppState {
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
     let memory: Arc<dyn zeroclaw_memory::Memory> =
         Arc::new(NoneMemory::new("config-patch-cli-test"));
     AppState {
-        config: Arc::new(RwLock::new(config)),
-        config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        config: authority.live_handle(),
+        config_authority: authority.clone(),
+        agent_lifecycle: authority.agent_lifecycle(),
         model_provider: Arc::new(MockModelProvider),
         model: "test-model".into(),
         temperature: None,
@@ -60,8 +79,11 @@ fn test_state(config: Config) -> AppState {
             ),
         ),
         auto_save: false,
-        webhook_secret_hash: None,
-        pairing: Arc::new(PairingGuard::new(false, &[])),
+        pairing: Arc::new(PairingGuard::new(
+            false,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        )),
         trust_forwarded_headers: false,
         rate_limiter: Arc::new(gateway::GatewayRateLimiter::new(100, 100, 100)),
         auth_limiter: Arc::new(gateway::auth_rate_limit::AuthRateLimiter::new()),
@@ -107,6 +129,7 @@ fn test_state(config: Config) -> AppState {
         tui_registry: None,
         sop_engine: None,
         sop_audit: None,
+        sop_driver_handles: None,
     }
 }
 
@@ -206,6 +229,7 @@ fn run_cli_patch_success(config_dir: &std::path::Path, patch_doc: &[u8]) -> serd
     serde_json::from_str(&stdout).expect("stdout should be JSON success envelope")
 }
 
+#[cfg(feature = "gateway")]
 async fn run_http_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
     let config = Config {
         config_path: config_dir.join("config.toml"),
@@ -254,6 +278,7 @@ fn config_patch_json_success_emits_envelope_and_persists_change() {
     assert_eq!(parsed.gateway.host, "127.0.0.2");
 }
 
+#[cfg(feature = "gateway")]
 #[tokio::test]
 async fn config_patch_json_failed_op_matches_http_error_envelope() {
     let patch_doc = br#"[{"op":"replace","path":"/not/a/path","value":"x"}]"#;
@@ -320,6 +345,77 @@ fn config_patch_json_post_apply_validation_emits_structured_error_envelope() {
             .contains("gateway.host must not be empty"),
         "message should describe validation failure: {envelope}"
     );
+}
+
+/// Review follow-up: an out-of-range pairing-code length must be
+/// refused at the write, not clamped later at mint time. `config patch`
+/// runs `Config::validate()` post-apply and before `save_dirty()`, so the
+/// weak value never reaches disk.
+#[test]
+fn config_patch_rejects_a_pairing_code_length_below_the_minimum() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/pairing_code/length","value":5}]"#,
+    );
+
+    assert_eq!(envelope["code"], "invalid_numeric_range", "{envelope}");
+    assert_eq!(
+        envelope["path"], "gateway.pairing_code.length",
+        "{envelope}"
+    );
+    assert!(
+        envelope["message"]
+            .as_str()
+            .expect("message")
+            .contains("out of range"),
+        "message should describe the range violation: {envelope}"
+    );
+
+    // Nothing was written: the file is either absent or still at the default.
+    let written =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).unwrap_or_default();
+    assert!(
+        !written.contains("length = 5"),
+        "a rejected patch must not persist the weak length: {written}"
+    );
+}
+
+#[test]
+fn config_patch_rejects_a_pairing_code_length_above_the_maximum() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/pairing_code/length","value":129}]"#,
+    );
+
+    assert_eq!(envelope["code"], "invalid_numeric_range", "{envelope}");
+    assert_eq!(
+        envelope["path"], "gateway.pairing_code.length",
+        "{envelope}"
+    );
+}
+
+/// The companion positive case: an in-range strengthening is accepted and
+/// persisted, so the rejection above is not just "everything fails".
+#[test]
+fn config_patch_accepts_an_in_range_pairing_code_policy() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let output = run_cli_patch_output(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/pairing_code/length","value":24},
+             {"op":"replace","path":"/gateway/pairing_code/charset","value":"unambiguous"}]"#,
+    );
+    assert!(
+        output.status.success(),
+        "in-range patch must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let written =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("config written");
+    assert!(written.contains("length = 24"), "{written}");
+    assert!(written.contains("charset = \"unambiguous\""), "{written}");
 }
 
 #[test]
@@ -725,6 +821,83 @@ fn run_cli_get(config_dir: &std::path::Path, path: &str) -> serde_json::Value {
     serde_json::from_str(&stdout).expect("stdout should be JSON envelope")
 }
 
+/// Run one non-interactive property write in a fresh CLI process.
+fn run_cli_set(config_dir: &std::path::Path, path: &str, value: &str) {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    let output = Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "set", "--no-interactive", path, value])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeroclaw config set");
+    assert!(
+        output.status.success(),
+        "config set {path} should succeed in a new process: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn required_field_sections_can_be_completed_across_cli_processes() {
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        (
+            "gateway.tls",
+            &[
+                ("gateway.tls.cert_path", "/tmp/zeroclaw-test-cert.pem"),
+                ("gateway.tls.key_path", "/tmp/zeroclaw-test-key.pem"),
+            ],
+        ),
+        (
+            "transcription.local_whisper",
+            &[(
+                "transcription.local_whisper.url",
+                "http://127.0.0.1:8080/v1/transcribe",
+            )],
+        ),
+        (
+            "tunnel.openvpn",
+            &[("tunnel.openvpn.config_file", "/tmp/zeroclaw-test.ovpn")],
+        ),
+    ];
+
+    for (section, writes) in cases {
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let initialized = run_cli_init(config_dir.path(), section);
+        assert!(
+            initialized["initialized"]
+                .as_array()
+                .expect("initialized should be an array")
+                .iter()
+                .any(|value| value == section),
+            "explicit init must include `{section}`: {initialized}",
+        );
+
+        // Each helper invocation launches a new process. Intermediate files may
+        // still be incomplete, so every later write must repair from the
+        // original TOML instead of relying on the resilient in-memory section.
+        for (path, value) in *writes {
+            run_cli_set(config_dir.path(), path, value);
+        }
+
+        let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+            .expect("read completed config");
+        let strict: Config = toml::from_str(&saved).unwrap_or_else(|error| {
+            panic!("completed `{section}` must strictly reload: {error}\n{saved}")
+        });
+        for (path, value) in *writes {
+            assert_eq!(
+                strict
+                    .get_prop(path)
+                    .expect("completed property should exist"),
+                *value,
+                "completed `{section}` property `{path}` must survive strict reload",
+            );
+        }
+    }
+}
+
 #[test]
 fn config_init_materializes_new_map_alias_and_persists() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -774,4 +947,194 @@ fn config_init_channel_alias_survives_config_reload() {
         }),
         "the initialized channel alias must remain addressable after Config reload",
     );
+}
+
+#[cfg(feature = "agent-runtime")]
+#[test]
+fn agent_targeting_config_commands_fail_closed_while_daemon_owns_config() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.7"}]"#,
+    );
+    let data_dir = config_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create resolved config data directory");
+    let _owner = zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(&data_dir)
+        .expect("hold daemon config ownership");
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+
+    let commands: &[(&[&str], Option<&[u8]>)] = &[
+        (
+            &[
+                "config",
+                "set",
+                "--no-interactive",
+                "agents.recreated.enabled",
+                "true",
+            ],
+            None,
+        ),
+        (&["config", "init", "agents.recreated", "--json"], None),
+        (
+            &["config", "patch", "--json", "-"],
+            Some(br#"[{"op":"add","path":"/agents/recreated/enabled","value":true}]"#),
+        ),
+    ];
+
+    for (args, stdin) in commands {
+        let mut child = Command::new(bin)
+            .env("ZEROCLAW_CONFIG_DIR", config_dir.path())
+            .env("RUST_LOG", "off")
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn agent-targeting config command");
+        if let Some(stdin) = stdin {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("child stdin")
+                .write_all(stdin)
+                .expect("write patch body");
+        }
+        let output = child.wait_with_output().expect("wait for config command");
+        assert!(
+            !output.status.success(),
+            "agent-targeting command must fail closed while config is owned: {:?}",
+            args
+        );
+    }
+
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read config after refused commands");
+    let config: Config = toml::from_str(&saved).expect("config should remain valid");
+    assert!(!config.agents.contains_key("recreated"));
+}
+
+#[cfg(feature = "agent-runtime")]
+#[test]
+fn standalone_agent_ownership_uses_resolved_temp_data_dir_and_preserves_alias_validation() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let resolved_data_dir = config_dir.path().join("data");
+    std::fs::create_dir_all(&resolved_data_dir).expect("create resolved data directory");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.8"}]"#,
+    );
+
+    let run_agent = || {
+        Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+            .env("ZEROCLAW_CONFIG_DIR", config_dir.path())
+            .env_remove("ZEROCLAW_DATA_DIR")
+            .env_remove("ZEROCLAW_WORKSPACE")
+            .env("RUST_LOG", "off")
+            .args(["agent", "--agent", "missing", "--message", "should-not-run"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run zeroclaw agent")
+    };
+
+    let owner =
+        zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(&resolved_data_dir)
+            .expect("hold the actual ZEROCLAW_CONFIG_DIR-resolved data directory");
+    let refused = run_agent();
+    assert!(!refused.status.success());
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused_stderr.contains("Cannot run `zeroclaw agent` while another ZeroClaw process owns"),
+        "ownership refusal must be actionable: {refused_stderr}"
+    );
+    assert!(
+        !refused_stderr.contains("is not configured"),
+        "ownership refusal must happen before alias validation or target construction: {refused_stderr}"
+    );
+    drop(owner);
+
+    let validated = run_agent();
+    assert!(!validated.status.success());
+    let validated_stderr = String::from_utf8_lossy(&validated.stderr);
+    assert!(
+        validated_stderr.contains("`zeroclaw agent --agent missing` is not configured"),
+        "after ownership release, the normal alias validation must run: {validated_stderr}"
+    );
+    assert!(
+        !validated_stderr.contains("while another ZeroClaw process owns"),
+        "released ownership must not leave a stale refusal: {validated_stderr}"
+    );
+}
+
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+#[test]
+fn standalone_acp_ownership_refuses_before_store_open_and_retains_stdio_authority() {
+    use zeroclaw::channels::acp_server::{AcpServer, AcpServerConfig};
+    use zeroclaw_runtime::LiveConfigAuthority;
+    use zeroclaw_runtime::live_config_authority::{ConfigOwnershipError, ConfigOwnershipGuard};
+
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let resolved_data_dir = config_dir.path().join("data");
+    std::fs::create_dir_all(&resolved_data_dir).expect("create resolved data directory");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.8"}]"#,
+    );
+    let store_path = resolved_data_dir.join("sessions/acp-sessions.db");
+    assert!(!store_path.exists());
+    let run_acp = || {
+        Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+            .env("ZEROCLAW_CONFIG_DIR", config_dir.path())
+            .env_remove("ZEROCLAW_DATA_DIR")
+            .env_remove("ZEROCLAW_WORKSPACE")
+            .env("RUST_LOG", "off")
+            .arg("acp")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run zeroclaw acp with closed stdin")
+    };
+
+    let owner = ConfigOwnershipGuard::acquire(&resolved_data_dir).expect("hold resolved data dir");
+    let refused = run_acp();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("Cannot run `zeroclaw acp` while another ZeroClaw process owns"),
+        "ownership refusal must name the standalone command: {stderr}"
+    );
+    assert!(
+        !store_path.exists(),
+        "refusal must precede opening the ACP store"
+    );
+    drop(owner);
+
+    let started = run_acp();
+    assert!(
+        started.status.success(),
+        "after ownership release, stdio startup and EOF shutdown must succeed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(
+        store_path.exists(),
+        "successful startup must open the ACP store"
+    );
+
+    // The server must retain ownership even after its construction authority is dropped.
+    let config = Config {
+        data_dir: resolved_data_dir.clone(),
+        ..Config::default()
+    };
+    let authority = LiveConfigAuthority::new_owned(config).expect("own standalone state");
+    let server = AcpServer::new_stdio_with_authority(&authority, AcpServerConfig::default(), None);
+    drop(authority);
+    assert!(matches!(
+        ConfigOwnershipGuard::acquire(&resolved_data_dir),
+        Err(ConfigOwnershipError::AlreadyOwned { .. })
+    ));
+    drop(server);
+    let _released = ConfigOwnershipGuard::acquire(&resolved_data_dir)
+        .expect("dropping the final server owner must release ownership");
 }

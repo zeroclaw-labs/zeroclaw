@@ -48,7 +48,7 @@ ZeroClaw on ESP32 / Raspberry Pi (Edge-Native)
 
 ### Mode 2: Host-Mediated (Development / Debugging)
 
-**Target:** Hardware connected via USB / J-Link / Aardvark to a host (macOS, Linux).
+**Target:** Hardware connected via USB / J-Link to a host (macOS, Linux).
 
 ZeroClaw runs on the **host** and maintains a hardware-aware link to the target. Used for development, introspection, and flashing.
 
@@ -59,7 +59,7 @@ ZeroClaw runs on the **host** and maintains a hardware-aware link to the target.
   - LLM                              - Peripherals (GPIO, ADC, I2C)
   - Hardware probe        ◄────────► - Flash / RAM
   - Flash / debug
-                       USB / J-Link / Aardvark
+                       USB / J-Link
                        VID/PID discovery
 ```
 
@@ -85,7 +85,7 @@ ZeroClaw runs on the **host** and maintains a hardware-aware link to the target.
 | Aspect           | Edge-Native                    | Host-Mediated                    |
 |------------------|--------------------------------|----------------------------------|
 | ZeroClaw runs on | Device (ESP32, RPi)           | Host (Mac, Linux)                |
-| Hardware link    | Local (GPIO, I2C, SPI)        | USB, J-Link, Aardvark            |
+| Hardware link    | Local (GPIO, I2C, SPI)        | USB, J-Link                      |
 | LLM              | On-device or cloud (Gemini)   | Host (cloud or local)            |
 | Use case         | Production, standalone         | Dev, debug, introspection       |
 | Channels         | WhatsApp, etc. (via WiFi)      | Telegram, CLI, etc.              |
@@ -170,8 +170,8 @@ Each connected board is driven over one of the subsystem transports:
 
 {{#include ../_snippets/hardware-transports.md}}
 
-The base tools every board exposes, plus the Aardvark-conditional set, are
-listed in [Hardware subsystem → Runtime tools](./subsystem.md#runtime-tools).
+The base tools every board exposes are listed in
+[Hardware subsystem → Runtime tools](./subsystem.md#runtime-tools).
 
 ## 7. Communication Protocols
 
@@ -271,4 +271,4 @@ tracking phase status here (which drifts as work lands), the layers are:
 
 > *"Boards like ESP, Raspberry Pi, or boards with WiFi can connect to an LLM (Gemini or open-source). ZeroClaw runs on the device, creates its own gRPC, spins it up, and communicates with peripherals. User asks via WhatsApp: 'move X arm' or 'turn on LED'. ZeroClaw gets accurate documentation, writes code, executes it, stores it optimally, runs it, and turns on the LED, all on the development board.*
 >
-> *For STM Nucleo connected via USB/J-Link/Aardvark to my Mac: ZeroClaw from my Mac accesses the hardware, installs or writes what it wants on the device, and returns the result. Example: 'Hey ZeroClaw, what are the available/readable addresses on this USB device?' It can figure out what's connected where and suggest."*
+> *For STM Nucleo connected via USB/J-Link to my Mac: ZeroClaw from my Mac accesses the hardware, installs or writes what it wants on the device, and returns the result. Example: 'Hey ZeroClaw, what are the available/readable addresses on this USB device?' It can figure out what's connected where and suggest."*

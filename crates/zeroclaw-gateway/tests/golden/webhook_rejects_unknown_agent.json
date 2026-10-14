@@ -1,0 +1,34 @@
+{
+  "frames": [
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": {
+          "message": "Route to a missing agent."
+        },
+        "method": "POST",
+        "path": "/webhook?agent=no-such-agent"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "body": {
+          "error": "Unknown agent `no-such-agent` — no [agents.no-such-agent] entry configured."
+        },
+        "content_type": "application/json",
+        "status": 400
+      }
+    },
+    {
+      "channel": "provider",
+      "dir": "meta",
+      "payload": {
+        "requests": 0
+      }
+    }
+  ],
+  "scenario": "webhook_rejects_unknown_agent"
+}

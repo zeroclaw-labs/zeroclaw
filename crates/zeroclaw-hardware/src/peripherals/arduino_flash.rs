@@ -3,16 +3,26 @@
 //! installs the AVR core, compiles and uploads the base firmware.
 
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::process::Command;
 
 /// ZeroClaw Arduino Uno base firmware (capabilities, gpio_read, gpio_write).
 const FIRMWARE_INO: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../firmware/arduino/arduino.ino"
+    "/firmware/arduino/arduino.ino"
 ));
 
 const FQBN: &str = "arduino:avr:uno";
 const SKETCH_NAME: &str = "arduino";
+
+fn with_flash_temp_dir<T>(parent: &Path, operation: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+    let temp_dir = tempfile::Builder::new()
+        .prefix("zeroclaw_flash_")
+        .tempdir_in(parent)
+        .context("Failed to create sketch temp dir")?;
+
+    operation(temp_dir.path())
+}
 
 /// Check if arduino-cli is available.
 pub fn arduino_cli_available() -> bool {
@@ -96,44 +106,44 @@ pub fn flash_arduino_firmware(port: &str) -> Result<()> {
     ensure_arduino_cli()?;
     ensure_avr_core()?;
 
-    let temp_dir = std::env::temp_dir().join(format!("zeroclaw_flash_{}", uuid::Uuid::new_v4()));
-    let sketch_dir = temp_dir.join(SKETCH_NAME);
-    let ino_path = sketch_dir.join(format!("{}.ino", SKETCH_NAME));
+    with_flash_temp_dir(&std::env::temp_dir(), |temp_dir| {
+        let sketch_dir = temp_dir.join(SKETCH_NAME);
+        let ino_path = sketch_dir.join(format!("{}.ino", SKETCH_NAME));
 
-    std::fs::create_dir_all(&sketch_dir).context("Failed to create sketch dir")?;
-    std::fs::write(&ino_path, FIRMWARE_INO).context("Failed to write firmware")?;
+        std::fs::create_dir_all(&sketch_dir).context("Failed to create sketch dir")?;
+        std::fs::write(&ino_path, FIRMWARE_INO).context("Failed to write firmware")?;
 
-    let sketch_path = sketch_dir.to_string_lossy();
+        let sketch_path = sketch_dir.to_string_lossy();
 
-    // Compile
-    println!("Compiling ZeroClaw Arduino firmware...");
-    let compile = Command::new("arduino-cli")
-        .args(["compile", "--fqbn", FQBN, &*sketch_path])
-        .output()
-        .context("arduino-cli compile failed")?;
+        // Compile
+        println!("Compiling ZeroClaw Arduino firmware...");
+        let compile = Command::new("arduino-cli")
+            .args(["compile", "--fqbn", FQBN, &*sketch_path])
+            .output()
+            .context("arduino-cli compile failed")?;
 
-    if !compile.status.success() {
-        let stderr = String::from_utf8_lossy(&compile.stderr);
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        anyhow::bail!("Compile failed:\n{}", stderr);
-    }
+        if !compile.status.success() {
+            let stderr = String::from_utf8_lossy(&compile.stderr);
+            anyhow::bail!("Compile failed:\n{}", stderr);
+        }
 
-    // Upload
-    println!("Uploading to {}...", port);
-    let upload = Command::new("arduino-cli")
-        .args(["upload", "-p", port, "--fqbn", FQBN, &*sketch_path])
-        .output()
-        .context("arduino-cli upload failed")?;
+        // Upload
+        println!("Uploading to {}...", port);
+        let upload = Command::new("arduino-cli")
+            .args(["upload", "-p", port, "--fqbn", FQBN, &*sketch_path])
+            .output()
+            .context("arduino-cli upload failed")?;
 
-    let _ = std::fs::remove_dir_all(&temp_dir);
+        if !upload.status.success() {
+            let stderr = String::from_utf8_lossy(&upload.stderr);
+            anyhow::bail!(
+                "Upload failed:\n{}\n\nEnsure the board is connected and the port is correct (e.g. /dev/cu.usbmodem* on macOS).",
+                stderr
+            );
+        }
 
-    if !upload.status.success() {
-        let stderr = String::from_utf8_lossy(&upload.stderr);
-        anyhow::bail!(
-            "Upload failed:\n{}\n\nEnsure the board is connected and the port is correct (e.g. /dev/cu.usbmodem* on macOS).",
-            stderr
-        );
-    }
+        Ok(())
+    })?;
 
     println!("ZeroClaw firmware flashed successfully.");
     println!("The Arduino now supports: capabilities, gpio_read, gpio_write.");
@@ -154,4 +164,50 @@ pub fn resolve_port(
         .iter()
         .find(|b| b.board == "arduino-uno" && b.transport == "serial")
         .and_then(|b| b.path.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn removes_temp_dir_after_firmware_write_failure() {
+        let parent = tempfile::tempdir().expect("create test temp dir");
+        let flash_dir = RefCell::new(None);
+
+        let error = with_flash_temp_dir(parent.path(), |temp_dir| {
+            flash_dir.replace(Some(temp_dir.to_path_buf()));
+            let sketch_dir = temp_dir.join(SKETCH_NAME);
+            let ino_path = sketch_dir.join(format!("{}.ino", SKETCH_NAME));
+            std::fs::create_dir_all(&ino_path).context("prepare write failure")?;
+
+            std::fs::write(&ino_path, FIRMWARE_INO).context("Failed to write firmware")?;
+            Ok(())
+        })
+        .expect_err("writing firmware to a directory should fail");
+
+        assert!(error.to_string().contains("Failed to write firmware"));
+        assert!(!flash_dir.into_inner().expect("capture flash dir").exists());
+    }
+
+    #[test]
+    fn removes_temp_dir_after_command_spawn_failure() {
+        let parent = tempfile::tempdir().expect("create test temp dir");
+        let flash_dir = RefCell::new(None);
+
+        let error = with_flash_temp_dir(parent.path(), |temp_dir| {
+            flash_dir.replace(Some(temp_dir.to_path_buf()));
+            let missing_command = temp_dir.join("missing-arduino-cli");
+
+            Command::new(missing_command)
+                .output()
+                .context("arduino-cli compile failed")?;
+            Ok(())
+        })
+        .expect_err("spawning a missing command should fail");
+
+        assert!(error.to_string().contains("arduino-cli compile failed"));
+        assert!(!flash_dir.into_inner().expect("capture flash dir").exists());
+    }
 }

@@ -8,9 +8,194 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 
-type PendingApprovalsMap = Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>;
+struct PendingApproval {
+    sender: oneshot::Sender<ChannelApprovalResponse>,
+    alias: String,
+    destination: String,
+}
+
+type PendingApprovalsMap = Mutex<HashMap<String, PendingApproval>>;
 static PENDING_APPROVALS: LazyLock<Arc<PendingApprovalsMap>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// Register a pending WhatsApp approval for a cross-crate boundary test.
+///
+/// This uses the production process-wide registry so gateway tests exercise
+/// the same alias, responder, and destination binding as real approvals.
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub async fn register_pending_approval_for_test(
+    token: &str,
+    alias: &str,
+    destination: &str,
+) -> oneshot::Receiver<ChannelApprovalResponse> {
+    use std::collections::hash_map::Entry;
+
+    let (sender, receiver) = oneshot::channel();
+    match PENDING_APPROVALS.lock().await.entry(token.to_string()) {
+        Entry::Vacant(entry) => {
+            entry.insert(PendingApproval {
+                sender,
+                alias: alias.to_string(),
+                destination: WhatsAppChannel::canonical_approval_destination(destination),
+            });
+        }
+        Entry::Occupied(_) => panic!("test approval token must not replace an existing request"),
+    }
+    receiver
+}
+
+/// Removes a parked approval token when the requesting future goes away.
+///
+/// `request_approval_attributed` registers a token in [`PENDING_APPROVALS`]
+/// before it does anything else, and the token is a bearer credential for a
+/// tool-call decision. The entry binds that token to its channel alias and
+/// destination, and an entry left behind stays resolvable by that approver for
+/// the lifetime of the process. The map is process-global, so it is not bounded
+/// by a channel instance either.
+///
+/// Three exits can leave one behind, and none is exotic.
+///
+/// The send is the first thing after registration, so a transient send failure
+/// propagates out with the entry already in the map and nothing later in the
+/// function runs. That one needs no cancellation at all to reach.
+///
+/// The other two are cancellation. Every explicit cleanup lives inside the async
+/// body, so none of it runs if the future is dropped, which a caller-side
+/// timeout or a shutdown both do. `Drop` is the only hook that survives that,
+/// which is why the entry's lifetime is tied to a guard rather than to any code
+/// path.
+///
+/// The guard is disarmed once a decision has been taken through a normal path,
+/// so the existing removals still own their cleanup and nothing is removed
+/// twice. [`remove_pending_and_disarm`] holds the ordering that makes the
+/// disarm safe.
+struct PendingApprovalGuard {
+    token: Option<String>,
+}
+
+impl PendingApprovalGuard {
+    fn new(token: String) -> Self {
+        Self { token: Some(token) }
+    }
+
+    /// The decision was taken through a normal path; stop guarding.
+    fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+impl Drop for PendingApprovalGuard {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        // `Drop` is not async, and blocking here would stall whichever runtime
+        // thread is unwinding. Spawn the removal instead. That makes cleanup
+        // asynchronous rather than immediate, and the delay is scheduler
+        // dependent rather than bounded, so the honest guarantee is eventual
+        // removal and not prompt removal. What is not weakened by the delay is
+        // the decision itself: a reply arriving inside that window still finds a
+        // receiver whose sender was dropped with this future, so it cannot be
+        // reported as an accepted decision.
+        zeroclaw_spawn::spawn!(async move {
+            PENDING_APPROVALS.lock().await.remove(&token);
+        });
+    }
+}
+
+/// Removes a parked token and then disarms its guard, in that order.
+///
+/// The ordering is the whole point of the helper. Disarming first leaves a
+/// window: acquiring the map lock is an await, so a request future cancelled
+/// while waiting for it drops a guard that is already unarmed, and the removal
+/// below never runs. The entry survives, which is the exact leak this guard
+/// exists to close. Removing first and disarming afterwards means a
+/// cancellation anywhere inside here still drops an *armed* guard, whose `Drop`
+/// completes the removal.
+///
+/// Both runtime-deny arms call this, and the cancellation regression drives
+/// this same function rather than a copy of it, so the test covers the
+/// production path.
+async fn remove_pending_and_disarm(token: &str, guard: &mut PendingApprovalGuard) {
+    let mut map = PENDING_APPROVALS.lock().await;
+    map.remove(token);
+    guard.disarm();
+}
+
+/// Registers an approval token, waits for the operator, and cleans up after
+/// itself however it leaves.
+///
+/// The send is a parameter so this whole lifecycle can be driven without a live
+/// Meta endpoint. `request_approval_attributed` is a thin wrapper that supplies
+/// the real one, so every ownership transition here happens in the code
+/// production runs rather than in a copy of it: a regression that moved the
+/// guard after the send, dropped it, or changed a cleanup arm would fail.
+///
+/// Registration happens first, then the guard is armed, and only then is
+/// anything sent. That order matters because the send is the first thing that
+/// can leave the function, and it leaves through `?` with the entry already in
+/// the map.
+async fn run_approval_lifecycle<F, Fut>(
+    token: String,
+    alias: &str,
+    destination: &str,
+    approval_timeout_secs: u64,
+    send: F,
+) -> anyhow::Result<zeroclaw_api::channel::AttributedApprovalResponse>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let (tx_approval, rx_approval) = oneshot::channel();
+    {
+        let mut map = PENDING_APPROVALS.lock().await;
+        map.insert(
+            token.clone(),
+            PendingApproval {
+                sender: tx_approval,
+                alias: alias.to_string(),
+                destination: WhatsAppChannel::canonical_approval_destination(destination),
+            },
+        );
+    }
+    // Armed immediately after registration rather than later, because the send
+    // below is the first thing that can leave the function.
+    let mut guard = PendingApprovalGuard::new(token.clone());
+
+    // The `?` here is what orphans a live token: it returns with the entry
+    // already registered, and no cleanup below it runs. The guard covers it.
+    send().await?;
+
+    let timeout = std::time::Duration::from_secs(approval_timeout_secs);
+    // Only a real token-echo reply is an operator decision; the dropped-sender
+    // and timeout arms are the runtime denying on its own.
+    let attributed = match tokio::time::timeout(timeout, rx_approval).await {
+        Ok(Ok(response)) => {
+            // The reply arrived, which means the gateway's reply handler has
+            // already removed the entry to take the sender out of the map.
+            // Nothing awaits between here and the disarm, so there is no
+            // cancellation window to cover.
+            guard.disarm();
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+        }
+        Ok(Err(_)) => {
+            remove_pending_and_disarm(&token, &mut guard).await;
+            zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                ChannelApprovalResponse::Deny,
+                zeroclaw_api::channel::ApprovalSource::Unreachable,
+            )
+        }
+        Err(_) => {
+            remove_pending_and_disarm(&token, &mut guard).await;
+            zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                ChannelApprovalResponse::Deny,
+                zeroclaw_api::channel::ApprovalSource::TimedOut,
+            )
+        }
+    };
+    Ok(attributed)
+}
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
     if !url.starts_with("https://") {
@@ -19,6 +204,46 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether a config entry and a phone-like value name the same WhatsApp
+/// account.
+///
+/// A raw number, a `+` number and a JID are three spellings of one account, so
+/// every decision taken against a resolved peer list has to canonicalize before
+/// comparing. Both surfaces admit the same accounts and share this rule: a deny
+/// written as a raw number has to shadow a wildcard grant reached through the
+/// `+E.164` spelling the Cloud webhook produces, and a deny written as a JID has
+/// to shadow a grant written as `+E.164` in the Web path's persistence writer.
+/// An exact comparison here reads the deny as naming a different account and
+/// lets the wildcard admit a sender the operator ignored.
+pub(crate) fn phone_matches(entry: &str, phone: &str) -> bool {
+    match (normalize_phone_token(entry), normalize_phone_token(phone)) {
+        (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
+        _ => false,
+    }
+}
+
+/// Normalize a phone-like token to canonical E.164 (`+<digits>`).
+/// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
+pub(crate) fn normalize_phone_token(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let user_part = trimmed
+        .split_once('@')
+        .map(|(user, _)| user)
+        .unwrap_or(trimmed)
+        .trim();
+
+    let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(format!("+{digits}"))
+    }
 }
 
 pub struct WhatsAppChannel {
@@ -74,11 +299,39 @@ impl WhatsAppChannel {
         self
     }
 
-    /// Access the process-wide pending-approvals map shared across every
-    /// `WhatsAppChannel` instance. See [`PENDING_APPROVALS`] for why this
-    /// must be a static rather than per-instance.
-    pub fn pending_approvals(&self) -> &Arc<PendingApprovalsMap> {
-        &PENDING_APPROVALS
+    /// Resolve a process-wide approval token only for the instance and peer
+    /// that received the original prompt.
+    ///
+    /// `true` means the token belongs to an approval request, including a
+    /// rejected wrong-alias or wrong-destination attempt, so the gateway must
+    /// suppress it instead of dispatching it as ordinary agent input.
+    pub async fn resolve_pending_approval(
+        &self,
+        token: &str,
+        response: ChannelApprovalResponse,
+        responder: &str,
+        reply_target: &str,
+    ) -> bool {
+        let responder = Self::canonical_approval_destination(responder);
+        let reply_target = Self::canonical_approval_destination(reply_target);
+        let mut approvals = PENDING_APPROVALS.lock().await;
+        let Some(pending) = approvals.get(token) else {
+            return false;
+        };
+        if pending.alias != self.alias
+            || pending.destination != responder
+            || pending.destination != reply_target
+            || !self.is_number_allowed(&responder)
+        {
+            return true;
+        }
+
+        let Some(pending) = approvals.remove(token) else {
+            return false;
+        };
+        drop(approvals);
+        let _ = pending.sender.send(response);
+        true
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -182,9 +435,24 @@ impl WhatsAppChannel {
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
+    ///
+    /// Matched with [`phone_matches`] rather than an exact comparison. The
+    /// webhook rewrites Meta's raw `from` to `+E.164` before asking, so an exact
+    /// matcher reads `ignore = ["15551234567"]` as naming a different account
+    /// and the wildcard grant admits a sender the operator ignored.
     fn is_number_allowed(&self, phone: &str) -> bool {
         let peers = (self.peer_resolver)();
-        crate::allowlist::is_user_allowed(&peers, phone, crate::allowlist::Match::Sensitive)
+        crate::allowlist::is_user_allowed_by(&peers, phone, phone_matches)
+    }
+
+    fn canonical_approval_destination(value: &str) -> String {
+        let value = value.trim();
+        if value.is_empty() {
+            return String::new();
+        }
+        value
+            .strip_prefix('+')
+            .map_or_else(|| format!("+{value}"), |digits| format!("+{digits}"))
     }
 
     /// Get the verify token for webhook verification
@@ -812,43 +1080,20 @@ impl Channel for WhatsAppChannel {
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
-        let (tx_approval, rx_approval) = oneshot::channel();
-        {
-            let mut map = PENDING_APPROVALS.lock().await;
-            map.insert(token.clone(), tx_approval);
-        }
-
         let text = crate::util::build_yesno_approval_prompt(
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
-        self.send(&SendMessage::new(text, recipient)).await?;
-
-        let timeout = std::time::Duration::from_secs(self.approval_timeout_secs);
-        // Only a real token-echo reply is an operator decision; the
-        // dropped-sender and timeout arms are the runtime denying on its own.
-        let attributed = match tokio::time::timeout(timeout, rx_approval).await {
-            Ok(Ok(response)) => {
-                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
-            }
-            Ok(Err(_)) => {
-                let mut map = PENDING_APPROVALS.lock().await;
-                map.remove(&token);
-                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                    ChannelApprovalResponse::Deny,
-                    zeroclaw_api::channel::ApprovalSource::Unreachable,
-                )
-            }
-            Err(_) => {
-                let mut map = PENDING_APPROVALS.lock().await;
-                map.remove(&token);
-                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                    ChannelApprovalResponse::Deny,
-                    zeroclaw_api::channel::ApprovalSource::TimedOut,
-                )
-            }
-        };
+        let attributed = run_approval_lifecycle(
+            token,
+            &self.alias,
+            recipient,
+            self.approval_timeout_secs,
+            || async { self.send(&SendMessage::new(text, recipient)).await },
+        )
+        .await?;
         Ok(Some(attributed))
     }
 
@@ -971,6 +1216,128 @@ mod tests {
             Arc::new(Vec::new),
         );
         assert!(!ch.is_number_allowed("+1234567890"));
+    }
+
+    /// Resolve peers the way the gateway does, from config, so these cover the
+    /// config-to-webhook boundary rather than a hand-built vector.
+    fn peers_from_config(toml_src: &str, alias: &str) -> Vec<String> {
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(toml_src).expect("peer-group config should parse");
+
+        config.channel_external_peers("whatsapp", alias)
+    }
+
+    fn channel_with_peers(peers: Vec<String>) -> WhatsAppChannel {
+        WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            "ops",
+            Arc::new(move || peers.clone()),
+        )
+    }
+
+    fn text_webhook_from(from: &str) -> serde_json::Value {
+        serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": from,
+                            "timestamp": "1699999999",
+                            "type": "text",
+                            "text": { "body": "hello" }
+                        }]
+                    }
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn config_wildcard_with_raw_number_ignore_denies_the_webhook_sender() {
+        // Meta sends `from` without a `+`, and the webhook rewrites it to
+        // `+E.164` before asking. An exact matcher therefore read
+        // `ignore = ["15551234567"]` as naming some other account and the
+        // wildcard grant admitted the sender the operator had written down.
+        let ch = channel_with_peers(peers_from_config(
+            r#"
+            [peer_groups.whatsapp_all]
+            channel = "whatsapp"
+            external_peers = ["*"]
+
+            [peer_groups.whatsapp_blocked]
+            channel = "whatsapp.ops"
+            ignore = ["15551234567"]
+            "#,
+            "ops",
+        ));
+
+        assert!(
+            ch.parse_webhook_payload(&text_webhook_from("15551234567"))
+                .is_empty(),
+            "an ignored sender must not ride the wildcard"
+        );
+        assert_eq!(
+            ch.parse_webhook_payload(&text_webhook_from("15559999999"))
+                .len(),
+            1,
+            "an unignored sender still rides the wildcard"
+        );
+    }
+
+    #[test]
+    fn config_ignore_spellings_all_deny_the_same_webhook_sender() {
+        // Raw, `+E.164` and JID are three spellings of one account, so the deny
+        // has to land whichever one the operator reached for.
+        for ignored in ["15551234567", "+15551234567", "15551234567@s.whatsapp.net"] {
+            let ch = channel_with_peers(peers_from_config(
+                &format!(
+                    r#"
+                    [peer_groups.whatsapp_all]
+                    channel = "whatsapp"
+                    external_peers = ["*"]
+
+                    [peer_groups.whatsapp_blocked]
+                    channel = "whatsapp.ops"
+                    ignore = ["{ignored}"]
+                    "#
+                ),
+                "ops",
+            ));
+
+            assert!(
+                ch.parse_webhook_payload(&text_webhook_from("15551234567"))
+                    .is_empty(),
+                "`ignore = [\"{ignored}\"]` must deny the same account"
+            );
+        }
+    }
+
+    #[test]
+    fn config_grant_written_without_a_plus_admits_the_webhook_sender() {
+        // The same identity rule on the grant side. This spelling previously
+        // admitted nobody at all, because the webhook compared `+15551234567`
+        // against the literal `15551234567`.
+        let ch = channel_with_peers(peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["15551234567"]
+            "#,
+            "ops",
+        ));
+
+        assert_eq!(
+            ch.parse_webhook_payload(&text_webhook_from("15551234567"))
+                .len(),
+            1
+        );
+        assert!(
+            ch.parse_webhook_payload(&text_webhook_from("15559999999"))
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2726,6 +3093,329 @@ mod tests {
         assert_eq!(ch2.approval_timeout_secs, 60);
     }
 
+    /// Generous hang guard rather than a timing assertion. The cleanup these
+    /// tests wait on is a spawned task, so the only honest failure is "it never
+    /// happened", not "it took longer than some scheduling budget".
+    const APPROVAL_CLEANUP_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+    const TEST_APPROVAL_ALIAS: &str = "whatsapp_test_alias";
+    const TEST_APPROVAL_DESTINATION: &str = "+1234567890";
+
+    fn test_pending_approval(sender: oneshot::Sender<ChannelApprovalResponse>) -> PendingApproval {
+        PendingApproval {
+            sender,
+            alias: TEST_APPROVAL_ALIAS.to_string(),
+            destination: TEST_APPROVAL_DESTINATION.to_string(),
+        }
+    }
+
+    async fn run_test_approval_lifecycle<F, Fut>(
+        token: String,
+        approval_timeout_secs: u64,
+        send: F,
+    ) -> anyhow::Result<zeroclaw_api::channel::AttributedApprovalResponse>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        run_approval_lifecycle(
+            token,
+            TEST_APPROVAL_ALIAS,
+            TEST_APPROVAL_DESTINATION,
+            approval_timeout_secs,
+            send,
+        )
+        .await
+    }
+
+    /// Park a token the way `request_approval_attributed` does, and hand back
+    /// the guard so a test can decide when the requesting future goes away.
+    async fn park_guarded_token(
+        token: &str,
+    ) -> (
+        PendingApprovalGuard,
+        oneshot::Receiver<ChannelApprovalResponse>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        PENDING_APPROVALS
+            .lock()
+            .await
+            .insert(token.to_string(), test_pending_approval(tx));
+        (PendingApprovalGuard::new(token.to_string()), rx)
+    }
+
+    /// Wait for the guard's spawned removal rather than assuming it has landed.
+    /// `Drop` cannot await, so the removal is a spawned task and a bare assert
+    /// straight after the drop would race it and pass or fail on scheduling.
+    async fn assert_token_cleared(token: &str) {
+        tokio::time::timeout(APPROVAL_CLEANUP_HANG_GUARD, async {
+            while PENDING_APPROVALS.lock().await.contains_key(token) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("token {token} was still registered after its request went away")
+        });
+    }
+
+    /// Block until the lifecycle under test has registered its token, so a
+    /// later assertion cannot pass vacuously against an entry that was never
+    /// there.
+    async fn wait_until_registered(token: &str) {
+        tokio::time::timeout(APPROVAL_CLEANUP_HANG_GUARD, async {
+            while !PENDING_APPROVALS.lock().await.contains_key(token) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("token {token} was never registered"));
+    }
+
+    /// The send is the first thing after registration, so a transient send
+    /// failure returns with the entry already in the map. That path needs no
+    /// cancellation to reach, which is what makes it the cheapest to exploit.
+    ///
+    /// Drives the production lifecycle with a failing send rather than dropping
+    /// a hand-built guard, so moving the guard after the send or removing it
+    /// from the lifecycle would fail this test.
+    #[tokio::test]
+    async fn send_failure_leaves_no_live_token() {
+        let token = "sendfl";
+
+        let result = run_test_approval_lifecycle(token.to_string(), 300, || async {
+            anyhow::bail!("simulated transport failure")
+        })
+        .await;
+
+        assert!(result.is_err(), "a failing send must propagate");
+        assert_token_cleared(token).await;
+    }
+
+    /// Cancellation is the exit no in-body cleanup can cover, because none of
+    /// that code runs once the future is dropped. The runtime wraps
+    /// `request_approval` in its own timeout, so a caller-side drop of this
+    /// future is an ordinary production event rather than a test-only one.
+    #[tokio::test]
+    async fn cancelled_request_leaves_no_live_token() {
+        let token = "cancel";
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            // A send that succeeds, then a wait long enough that the abort
+            // below lands while the lifecycle is parked on the receiver.
+            run_test_approval_lifecycle("cancel".to_string(), 300, || async { Ok(()) }).await
+        });
+
+        wait_until_registered(token).await;
+        task.abort();
+        let _ = task.await;
+
+        assert_token_cleared(token).await;
+    }
+
+    /// The narrow window the guard did not originally cover: a cancellation
+    /// that lands while the cleanup is *waiting for the map lock*.
+    ///
+    /// Disarming before acquiring that lock made the window real, because the
+    /// guard would then drop already-unarmed and the removal never ran.
+    ///
+    /// This drives `remove_pending_and_disarm`, which is the function the two
+    /// runtime-deny arms call, and cancels it while it is provably parked on
+    /// the contended lock. Driving the whole lifecycle here instead was tried
+    /// and rejected: there is no way to observe from outside that the spawned
+    /// task has reached the lock rather than an earlier await, so the
+    /// cancellation landed early, the guard dropped still-armed, and the test
+    /// passed against the defect it exists to catch. A racy test that cannot
+    /// fail is worse than a focused one that can.
+    #[tokio::test]
+    async fn cancellation_while_awaiting_the_map_lock_leaves_no_live_token() {
+        let token = "lockct";
+        let (guard, _rx) = park_guarded_token(token).await;
+
+        // Hold the map lock so the helper cannot get past its first await.
+        let held = PENDING_APPROVALS.lock().await;
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            let mut guard = guard;
+            remove_pending_and_disarm("lockct", &mut guard).await;
+        });
+
+        // Let the task reach the contended lock before cancelling it, so the
+        // cancellation lands inside the await rather than before the call.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+
+        // Release, so both the aborted task's guard cleanup and the assertion
+        // below can acquire the map.
+        drop(held);
+
+        assert_token_cleared(token).await;
+    }
+
+    /// The control for the three above. A guard that removed unconditionally
+    /// would pass all of them while breaking the normal path, where the reply
+    /// handler has already taken the sender out of the map and a second removal
+    /// would be removing whatever registered next.
+    #[tokio::test]
+    async fn a_disarmed_guard_removes_nothing() {
+        let token = "disarm";
+        let (mut guard, _rx) = park_guarded_token(token).await;
+        guard.disarm();
+        drop(guard);
+
+        // Give a spawned removal every chance to run before concluding it did not.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            PENDING_APPROVALS.lock().await.contains_key(token),
+            "a disarmed guard must not remove an entry the normal path owns"
+        );
+        PENDING_APPROVALS.lock().await.remove(token);
+    }
+
+    /// A real operator reply must come back attributed to the operator.
+    ///
+    /// No earlier test reached this arm, and none asserted a return value at
+    /// all, so the whole attribution was uncovered on both sides of the
+    /// refactor. It resolves the token exactly as the gateway does, taking the
+    /// sender out of the map before sending, and asserts the decision AND its
+    /// source: the decision alone would pass against a runtime deny that
+    /// happened to carry the same value.
+    #[tokio::test]
+    async fn an_operator_reply_is_attributed_to_the_operator() {
+        let token = "opappr";
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            run_test_approval_lifecycle("opappr".to_string(), 300, || async { Ok(()) }).await
+        });
+
+        wait_until_registered(token).await;
+
+        let pending = PENDING_APPROVALS
+            .lock()
+            .await
+            .remove(token)
+            .expect("the lifecycle must register before a reply can resolve it");
+        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+
+        let attributed = task
+            .await
+            .expect("task should not panic")
+            .expect("a resolved approval is not an error");
+
+        assert_eq!(attributed.response, ChannelApprovalResponse::Approve);
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::Operator,
+            "a human answered, so this must not be reported as a runtime fail-closed"
+        );
+        assert!(
+            !PENDING_APPROVALS.lock().await.contains_key(token),
+            "the reply handler removed the entry; the guard must not re-add one"
+        );
+    }
+
+    /// The success arm must DISARM, not merely finish.
+    ///
+    /// A guard still armed after a resolved approval spawns a removal for a
+    /// token the reply handler has already taken. In isolation that is a no-op,
+    /// which is why asserting the entry is absent cannot see the difference. It
+    /// stops being a no-op the moment the token has been reused: the stale
+    /// removal then deletes the NEWER request. That is the same window the
+    /// documented token-reuse residual names, so this reproduces it directly.
+    ///
+    /// The map lock is held across the whole handover deliberately. A stale
+    /// removal is a spawned task that must take that lock, so a version of this
+    /// test that releases it between the resolution and the re-registration
+    /// lets the removal run first, delete nothing, and report success. That
+    /// version was written, and its mutation control caught it passing against
+    /// a deliberately undisarmed guard. Holding the lock orders the removal
+    /// after the re-registration, which is the sequence the residual describes.
+    #[tokio::test]
+    async fn a_resolved_approval_does_not_delete_a_later_registration() {
+        let token = "reuse1";
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            run_test_approval_lifecycle("reuse1".to_string(), 300, || async { Ok(()) }).await
+        });
+        wait_until_registered(token).await;
+
+        let mut map = PENDING_APPROVALS.lock().await;
+
+        // The reply handler takes the sender out and resolves the request. The
+        // success arm touches no lock, so the lifecycle still completes here.
+        let pending = map.remove(token).expect("registered");
+        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+        let _ = task.await.expect("task").expect("lifecycle");
+
+        // A later request reuses the same six-character token.
+        let (tx_next, _rx_next) = oneshot::channel();
+        map.insert(token.to_string(), test_pending_approval(tx_next));
+        drop(map);
+
+        // Give any spawned removal every chance to run before concluding none did.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            PENDING_APPROVALS.lock().await.contains_key(token),
+            "a resolved approval must not delete a later request that reused its token"
+        );
+        PENDING_APPROVALS.lock().await.remove(token);
+    }
+
+    /// A sender dropped without a decision is the runtime failing closed, and
+    /// must be attributed `Unreachable` rather than presented as an operator
+    /// denial.
+    #[tokio::test]
+    async fn a_dropped_sender_is_attributed_unreachable() {
+        let token = "unrch";
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            run_test_approval_lifecycle("unrch".to_string(), 300, || async { Ok(()) }).await
+        });
+
+        wait_until_registered(token).await;
+        drop(
+            PENDING_APPROVALS
+                .lock()
+                .await
+                .remove(token)
+                .expect("registered"),
+        );
+
+        let attributed = task.await.expect("task").expect("lifecycle");
+
+        assert_eq!(attributed.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::Unreachable
+        );
+        assert_token_cleared(token).await;
+    }
+
+    /// An unanswered prompt must be attributed `TimedOut`, which is a different
+    /// fact about the world from `Unreachable` and from an operator denial.
+    #[tokio::test]
+    async fn an_unanswered_prompt_is_attributed_timed_out() {
+        let token = "tmout";
+
+        let attributed = run_test_approval_lifecycle(token.to_string(), 0, || async { Ok(()) })
+            .await
+            .expect("a timeout is a decision, not an error");
+
+        assert_eq!(attributed.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::TimedOut
+        );
+        assert_token_cleared(token).await;
+    }
+
     #[tokio::test]
     async fn pending_approvals_are_shared_across_instances() {
         // Two independent WhatsAppChannel instances — the orchestrator's and
@@ -2749,22 +3439,75 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
         {
-            let mut map = orchestrator_ch.pending_approvals().lock().await;
-            map.insert("test_share_tok".to_string(), tx);
+            let mut map = PENDING_APPROVALS.lock().await;
+            map.insert("test_share_tok".to_string(), test_pending_approval(tx));
         }
         {
-            let map = gateway_ch.pending_approvals().lock().await;
+            let map = PENDING_APPROVALS.lock().await;
             assert!(
                 map.contains_key("test_share_tok"),
                 "gateway instance must see orchestrator's registration"
             );
         }
         // Cleanup so later tests aren't polluted by this entry.
-        gateway_ch
-            .pending_approvals()
-            .lock()
+        PENDING_APPROVALS.lock().await.remove("test_share_tok");
+        drop((orchestrator_ch, gateway_ch));
+    }
+
+    #[tokio::test]
+    async fn pending_approval_is_bound_to_alias_responder_and_destination() {
+        let token = "bound1";
+        let correct = WhatsAppChannel::new(
+            "test-token".into(),
+            "123456789".into(),
+            "verify-me".into(),
+            "ops",
+            Arc::new(|| vec!["+111".into()]),
+        );
+        let wrong_alias = WhatsAppChannel::new(
+            "test-token".into(),
+            "987654321".into(),
+            "verify-other".into(),
+            "other",
+            Arc::new(|| vec!["+111".into()]),
+        );
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            run_approval_lifecycle("bound1".to_string(), "ops", "+111", 300, || async {
+                Ok(())
+            })
             .await
-            .remove("test_share_tok");
+        });
+        wait_until_registered(token).await;
+
+        assert!(
+            wrong_alias
+                .resolve_pending_approval(token, ChannelApprovalResponse::Approve, "+111", "+111",)
+                .await,
+            "a known token from the wrong alias must be suppressed"
+        );
+        assert!(PENDING_APPROVALS.lock().await.contains_key(token));
+
+        assert!(
+            correct
+                .resolve_pending_approval(token, ChannelApprovalResponse::Approve, "+222", "+222",)
+                .await,
+            "a known token from the wrong destination must be suppressed"
+        );
+        assert!(PENDING_APPROVALS.lock().await.contains_key(token));
+
+        assert!(
+            correct
+                .resolve_pending_approval(token, ChannelApprovalResponse::Approve, "111", "+111",)
+                .await
+        );
+        let attributed = task.await.expect("task").expect("approval lifecycle");
+        assert_eq!(attributed.response, ChannelApprovalResponse::Approve);
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::Operator
+        );
+        assert!(!PENDING_APPROVALS.lock().await.contains_key(token));
     }
 
     // ══════════════════════════════════════════════════════════

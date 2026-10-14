@@ -116,6 +116,7 @@ impl MarkdownMemory {
                 let trimmed = line.trim();
                 let clean = trimmed.strip_prefix("- ").unwrap_or(trimmed);
                 MemoryEntry {
+                    principal_id: None,
                     id: format!("{filename}:{i}"),
                     key: format!("{filename}:{i}"),
                     content: clean.to_string(),

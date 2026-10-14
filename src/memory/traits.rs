@@ -40,6 +40,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_optional_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "id-1".into(),
             key: "favorite_language".into(),
             content: "Rust".into(),

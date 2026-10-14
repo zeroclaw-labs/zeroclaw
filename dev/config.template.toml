@@ -25,6 +25,9 @@ host = "[::]"
 allow_public_bind = true
 require_pairing = false
 web_dist_dir = "/usr/share/zeroclawlabs/web/dist"
+# Send WebSocket keepalive pings every 30 seconds; set to 0 to disable.
+# Applied when each chat WebSocket opens; reconnect clients after changing it.
+websocket_ping_interval_secs = 30
 
 # Cost tracking and budget enforcement configuration
 # Enable to track API usage costs and enforce spending limits

@@ -9,6 +9,10 @@ import {
   type VersionCheckResponse,
   type UpgradeStatusResponse,
 } from '@/lib/api';
+import {
+  canAutoRestart,
+  type UpgradeRestartMode,
+} from './UpgradeDialog.logic';
 
 export interface UpgradeDialogProps {
   /** Whether the dialog is mounted/visible. */
@@ -25,9 +29,9 @@ export interface UpgradeDialogProps {
   checkUpdatesEnabled: boolean;
   /** `gateway.allow_self_upgrade` — gates the Upgrade button. */
   allowSelfUpgrade: boolean;
-  /** How a restart is achieved here; `supervised` and `self_respawn` can
-   *  auto-restart, `manual` cannot. */
-  restartMode?: 'supervised' | 'self_respawn' | 'manual';
+  /** How a restart is achieved here; desktop/system supervisors and
+   *  `self_respawn` can auto-restart, `manual` cannot. */
+  restartMode?: UpgradeRestartMode;
   /** Manual-restart command to show after a swap. */
   restartHint?: string;
   /** Trigger a forced re-check against the upstream release feed, bypassing
@@ -96,8 +100,7 @@ export function UpgradeDialog({
    *  itself is not used — only the re-render it triggers matters. */
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [, setRestartTick] = useState(0);
-  const canAutoRestart =
-    restartMode === 'supervised' || restartMode === 'self_respawn';
+  const autoRestartAvailable = canAutoRestart(restartMode);
   const [autoRestart, setAutoRestart] = useState(true);
   /** Version that was running when the upgrade started (or when we re-attached
    *  to an in-progress restart). Kept as both a ref (stable closure capture in
@@ -118,7 +121,7 @@ export function UpgradeDialog({
     setError(null);
     setReconciled(false);
     setPollTimedOut(false);
-    setAutoRestart(canAutoRestart);
+    setAutoRestart(autoRestartAvailable);
     restartStartedAtRef.current = null;
     setBaseline(null);
     getUpgradeStatus()
@@ -137,7 +140,7 @@ export function UpgradeDialog({
         }
       })
       .catch(() => setView('info'));
-  }, [open, canAutoRestart]);
+  }, [open, autoRestartAvailable]);
 
   useEffect(() => {
     if (!open) return;
@@ -273,7 +276,7 @@ export function UpgradeDialog({
     try {
       const res = await startUpgrade({
         version: info?.latest_version ?? null,
-        auto_restart: autoRestart && canAutoRestart,
+        auto_restart: autoRestart && autoRestartAvailable,
       });
       setHandoffId(res.handoff_id);
       // Capture baseline before setStatus(null) — info?.current_version is the
@@ -374,7 +377,7 @@ export function UpgradeDialog({
                 {isNewer && !allowSelfUpgrade && (
                   <div className="text-xs text-pc-text-muted">{t('upgrade.disabled')}</div>
                 )}
-                {isNewer && allowSelfUpgrade && canAutoRestart && view === 'info' && (
+                {isNewer && allowSelfUpgrade && autoRestartAvailable && view === 'info' && (
                   <div className="flex flex-col gap-1">
                     <label className="flex items-center gap-2 text-xs text-pc-text-muted">
                       <input
@@ -391,7 +394,7 @@ export function UpgradeDialog({
                     )}
                   </div>
                 )}
-                {isNewer && allowSelfUpgrade && !canAutoRestart && view === 'info' && (
+                {isNewer && allowSelfUpgrade && !autoRestartAvailable && view === 'info' && (
                   <div className="text-xs text-pc-text-muted">
                     {t('upgrade.manual_note')}
                     {restartHint && (

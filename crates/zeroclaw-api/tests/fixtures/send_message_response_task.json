@@ -1,0 +1,17 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "task": {
+      "id": "task-fixture-1",
+      "contextId": "ctx-fixture-1",
+      "status": { "state": "TASK_STATE_COMPLETED" },
+      "artifacts": [
+        {
+          "artifactId": "art-fixture-1",
+          "parts": [{ "text": "Fixture reply" }]
+        }
+      ]
+    }
+  }
+}

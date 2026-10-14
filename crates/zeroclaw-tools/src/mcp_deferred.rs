@@ -8,6 +8,7 @@ use crate::mcp_protocol::McpToolDef;
 use crate::mcp_tool::McpToolWrapper;
 use crate::tool_search::ToolAccessPolicy;
 use zeroclaw_api::tool::{Tool, ToolSpec};
+use zeroclaw_config::policy::SecurityPolicy;
 
 // ── DeferredMcpToolStub ──────────────────────────────────────────────────
 
@@ -38,8 +39,21 @@ impl DeferredMcpToolStub {
     }
 
     /// Materialize this stub into a live [`McpToolWrapper`].
-    pub fn activate(&self, registry: Arc<McpRegistry>) -> McpToolWrapper {
-        McpToolWrapper::new(self.prefixed_name.clone(), self.def.clone(), registry)
+    ///
+    /// `security` is the execution-scope [`SecurityPolicy`] snapshot (source of
+    /// truth for the workspace path used when materializing MCP `resource`+`blob`
+    /// results) — an immutable `Arc`, not a reloadable live handle.
+    pub fn activate(
+        &self,
+        registry: Arc<McpRegistry>,
+        security: Arc<SecurityPolicy>,
+    ) -> McpToolWrapper {
+        McpToolWrapper::new(
+            self.prefixed_name.clone(),
+            self.def.clone(),
+            registry,
+            security,
+        )
     }
 }
 
@@ -53,11 +67,13 @@ pub struct DeferredMcpToolSet {
     pub stubs: Vec<DeferredMcpToolStub>,
     /// Shared registry — exposed for test construction.
     pub registry: Arc<McpRegistry>,
+    /// Security policy handle for activated wrappers (workspace at use time).
+    pub security: Arc<SecurityPolicy>,
 }
 
 impl DeferredMcpToolSet {
     /// Build the set from a connected [`McpRegistry`].
-    pub async fn from_registry(registry: Arc<McpRegistry>) -> Self {
+    pub async fn from_registry(registry: Arc<McpRegistry>, security: Arc<SecurityPolicy>) -> Self {
         let names = registry.tool_names();
         let mut stubs = Vec::with_capacity(names.len());
         for name in names {
@@ -65,7 +81,11 @@ impl DeferredMcpToolSet {
                 stubs.push(DeferredMcpToolStub::new(name, def));
             }
         }
-        Self { stubs, registry }
+        Self {
+            stubs,
+            registry,
+            security,
+        }
     }
 
     /// All stub names (for rendering in the system prompt).
@@ -103,6 +123,7 @@ impl DeferredMcpToolSet {
         Self {
             stubs: filtered_stubs,
             registry: Arc::clone(&self.registry),
+            security: Arc::clone(&self.security),
         }
     }
 
@@ -151,7 +172,7 @@ impl DeferredMcpToolSet {
     /// Activate a stub by name, returning a boxed [`Tool`].
     pub fn activate(&self, name: &str) -> Option<Box<dyn Tool>> {
         self.get_by_name(name).map(|stub| {
-            let wrapper = stub.activate(Arc::clone(&self.registry));
+            let wrapper = stub.activate(Arc::clone(&self.registry), Arc::clone(&self.security));
             Box::new(wrapper) as Box<dyn Tool>
         })
     }
@@ -159,7 +180,7 @@ impl DeferredMcpToolSet {
     /// Return the full [`ToolSpec`] for a stub (for inclusion in `tool_search` results).
     pub fn tool_spec(&self, name: &str) -> Option<ToolSpec> {
         self.get_by_name(name).map(|stub| {
-            let wrapper = stub.activate(Arc::clone(&self.registry));
+            let wrapper = stub.activate(Arc::clone(&self.registry), Arc::clone(&self.security));
             wrapper.spec()
         })
     }
@@ -227,6 +248,14 @@ impl ActivatedToolSet {
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.keys().map(|s| s.as_str()).collect()
     }
+
+    /// Remove activated deferred tools that a newly narrowed principal may no
+    /// longer invoke. Callers resolve the principal policy from its canonical
+    /// source at the prompt boundary; this set retains no independent policy.
+    pub fn retain_allowed(&mut self, allowed: &[String]) {
+        self.tools
+            .retain(|name, _| allowed.iter().any(|allowed_name| allowed_name == name));
+    }
 }
 
 impl Default for ActivatedToolSet {
@@ -237,10 +266,39 @@ impl Default for ActivatedToolSet {
 
 // ── System prompt helper ─────────────────────────────────────────────────
 
+/// Longest one-line summary the deferred index carries per tool, in chars.
+const DEFERRED_SUMMARY_MAX_CHARS: usize = 200;
+
+/// The one-line summary the index shows for a deferred tool: the first
+/// non-empty line of its description, capped at
+/// [`DEFERRED_SUMMARY_MAX_CHARS`] on a char boundary.
+///
+/// MCP servers routinely ship multi-paragraph docstrings with `Args:` and
+/// `Returns:` blocks. Those still drive `tool_search` keyword matching through
+/// the full [`DeferredMcpToolStub::description`], but they have no place in a
+/// prompt section whose only job is to say which names exist: with a couple
+/// of hundred deferred tools the bodies alone cost more context per turn than
+/// every activated schema combined.
+fn deferred_summary_line(description: &str) -> String {
+    let line = description
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() <= DEFERRED_SUMMARY_MAX_CHARS {
+        return line.to_string();
+    }
+    let mut cut: String = line.chars().take(DEFERRED_SUMMARY_MAX_CHARS).collect();
+    cut.push_str("...");
+    cut
+}
+
 /// Build the `<available-deferred-tools>` section for the system prompt.
-/// Lists only tool names so the LLM knows what is available without
-/// consuming context window on full schemas. Includes an instruction
-/// block that tells the LLM to call `tool_search` to activate them.
+/// Lists tool names with a one-line summary each (the first non-empty line
+/// of the description, capped) so the LLM knows what is available without
+/// consuming context window on full schemas or full docstrings. Includes an
+/// instruction block that tells the LLM to call `tool_search` to activate
+/// them.
 pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
     build_deferred_tools_section_filtered(deferred, None)
 }
@@ -282,7 +340,7 @@ pub fn build_deferred_tools_section_excluding(
         }
         out.push_str(&stub.prefixed_name);
         out.push_str(" - ");
-        out.push_str(&stub.description);
+        out.push_str(&deferred_summary_line(&stub.description));
         out.push('\n');
         count += 1;
     }
@@ -296,6 +354,10 @@ pub fn build_deferred_tools_section_excluding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
 
     fn make_stub(name: &str, desc: &str) -> DeferredMcpToolStub {
         let def = McpToolDef {
@@ -466,6 +528,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         assert!(build_deferred_tools_section(&set).is_empty());
     }
@@ -484,12 +547,85 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("<available-deferred-tools>"));
         assert!(section.contains("fs__read_file - Read a file"));
         assert!(section.contains("git__status - Git status"));
         assert!(section.contains("</available-deferred-tools>"));
+    }
+
+    fn make_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
+        DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+            security: test_security(),
+        }
+    }
+
+    /// A docstring-style description contributes only its first line to the
+    /// index; the `Args:` and `Returns:` body must not reach the prompt.
+    #[test]
+    fn build_deferred_section_uses_first_line_of_multiline_description() {
+        let desc = "Fetch the food diary for a day.\n\n    Args:\n        date: YYYY-MM-DD, defaults to today.\n\n    Returns:\n        Every entry logged for the day.";
+        let set = make_set(vec![make_stub("cronometer__get_diary", desc)]);
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("cronometer__get_diary - Fetch the food diary for a day.\n"));
+        assert!(!section.contains("Args:"));
+        assert!(!section.contains("Returns:"));
+        assert!(!section.contains("defaults to today"));
+    }
+
+    /// Leading blank lines and indentation are skipped so a description that
+    /// starts with a newline still yields its real first sentence.
+    #[test]
+    fn build_deferred_section_skips_leading_blank_lines() {
+        let set = make_set(vec![make_stub(
+            "wger__get_routine",
+            "\n\n   Fetch a routine.  \nMore.",
+        )]);
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("wger__get_routine - Fetch a routine.\n"));
+        assert!(!section.contains("More."));
+    }
+
+    /// A single very long first line is capped on a char boundary, so a
+    /// multi-byte character straddling the cap cannot split.
+    #[test]
+    fn build_deferred_section_caps_long_first_line_on_char_boundary() {
+        let long: String = "é".repeat(DEFERRED_SUMMARY_MAX_CHARS + 50);
+        let set = make_set(vec![make_stub("fs__read", &long)]);
+        let section = build_deferred_tools_section(&set);
+        let line = section
+            .lines()
+            .find(|l| l.starts_with("fs__read - "))
+            .expect("tool line present");
+        let summary = &line["fs__read - ".len()..];
+        assert!(summary.ends_with("..."));
+        assert_eq!(
+            summary.trim_end_matches("...").chars().count(),
+            DEFERRED_SUMMARY_MAX_CHARS
+        );
+    }
+
+    /// The summary is a rendering concern only: keyword search still matches
+    /// terms that appear solely in the body of a multi-line description.
+    #[test]
+    fn deferred_search_still_matches_description_body() {
+        let set = make_set(vec![make_stub(
+            "cronometer__get_diary",
+            "Fetch the food diary for a day.\n\nReturns:\n    total_target_kcal for the day.",
+        )]);
+        let hits = set.search("target_kcal", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].prefixed_name, "cronometer__get_diary");
+        assert!(!build_deferred_tools_section(&set).contains("target_kcal"));
     }
 
     #[test]
@@ -503,6 +639,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let section = build_deferred_tools_section(&set);
         assert!(
@@ -530,6 +667,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("server_a__list"));
@@ -555,6 +693,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
         let section = build_deferred_tools_section_excluding(&set, None, &exclude);
@@ -576,6 +715,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
         assert!(build_deferred_tools_section_excluding(&set, None, &exclude).is_empty());
@@ -596,6 +736,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
 
         // "file read" should rank fs__read_file highest (2 hits vs 1)
@@ -618,6 +759,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         assert!(set.get_by_name("a__one").is_some());
         assert!(set.get_by_name("nonexistent").is_none());
@@ -637,6 +779,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
 
         // "read" should match stubs from both servers
@@ -666,6 +809,7 @@ mod tests {
         let set = DeferredMcpToolSet {
             stubs: stubs.clone(),
             registry: std::sync::Arc::new(empty_registry()),
+            security: test_security(),
         };
         let filtered = set.filter_by_policy(None);
         assert_eq!(filtered.stubs.len(), stubs.len());
@@ -684,6 +828,7 @@ mod tests {
         let set = DeferredMcpToolSet {
             stubs,
             registry: std::sync::Arc::new(empty_registry()),
+            security: test_security(),
         };
         let policy = ToolAccessPolicy {
             denied: Some(vec!["srv__hidden".into()]),

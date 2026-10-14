@@ -20,6 +20,17 @@ type ServerDefaultedSopFields = 'admission_policy' | 'max_pending_approvals';
 export type Sop = Omit<Schemas['Sop'], ServerDefaultedSopFields> &
   Partial<Pick<Schemas['Sop'], ServerDefaultedSopFields>>;
 export type SopStep = Schemas['SopStep'];
+export type SopDecisionSpec = NonNullable<Schemas['Sop']['decision']>;
+export type SopDecisionMode = 'auto' | 'supervised' | 'step_by_step';
+/// Execution modes a decision model may choose between.
+export const sopDecisionModes: readonly SopDecisionMode[] = ['auto', 'supervised', 'step_by_step'];
+/// A configured `[decision_models.<alias>]` entry, as listed by the gateway.
+export interface DecisionModelOption {
+  alias: string;
+  provider: 'jev' | 'laya' | 'custom';
+  model: string;
+  base_url: string;
+}
 export type SopTrigger = Schemas['SopTrigger'];
 export type SopPriority = Schemas['SopPriority'];
 export type SopExecutionMode = Schemas['SopExecutionMode'];
@@ -155,6 +166,21 @@ export function saveSop(sop: Sop): Promise<{ saved: string }> {
   });
 }
 
+/// Move a SOP to a new name. Separate from `saveSop` because a save writes to
+/// the path its own payload names, so a name change sent through a save would
+/// create a second SOP rather than move the one being edited. The daemon
+/// collision-checks the target and moves the definition; 409 means the name is
+/// already taken.
+export function renameSop(from: string, to: string): Promise<{ renamed: string; from: string }> {
+  return apiFetch<{ renamed: string; from: string }>(
+    `/api/sops/${encodeURIComponent(from)}/rename`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ to }),
+    },
+  );
+}
+
 export function deleteSop(name: string): Promise<{ deleted: string }> {
   return apiFetch<{ deleted: string }>(`/api/sops/${encodeURIComponent(name)}`, {
     method: 'DELETE',
@@ -200,6 +226,10 @@ export function graphDraft(sop: Sop): Promise<SopGraph> {
 /// The trigger-source registry: bound sources plus every inbound-capable
 /// channel kind with its configured aliases. Walked from the backend registry;
 /// the surface renders whatever it returns and never hardcodes a channel list.
+export function decisionModels(): Promise<{ models: DecisionModelOption[] }> {
+  return apiFetch<{ models: DecisionModelOption[] }>('/api/sops/decision-models');
+}
+
 export function triggerSources(): Promise<TriggerSourceRegistry> {
   return apiFetch<TriggerSourceRegistry>('/api/sops/trigger-sources');
 }
@@ -297,6 +327,33 @@ export function decideSop(
   );
 }
 
+export interface SopCancelResult {
+  run_id: string;
+  sop_name: string;
+  status: SopRunStatus;
+  already_terminal: boolean;
+  run: SopRunSummary;
+}
+
+/// Request a durable operator cancellation of a running SOP. Safe cancel: the
+/// step in flight finishes on its own and the run stops at the next step
+/// boundary, not mid-step. Idempotent - cancelling an already-terminal run
+/// (completed, failed, or already cancelled) returns 200 with
+/// `already_terminal: true` rather than erroring.
+export function cancelSop(
+  name: string,
+  runId: string,
+  reason?: string,
+): Promise<SopCancelResult> {
+  return apiFetch<SopCancelResult>(
+    `/api/sops/${encodeURIComponent(name)}/runs/${encodeURIComponent(runId)}/cancel`,
+    {
+      method: 'POST',
+      body: JSON.stringify(reason ? { reason } : {}),
+    },
+  );
+}
+
 /// Index a run overlay's node states by step number. Shared by every view
 /// that projects run state onto graph nodes.
 export function overlayStateByStep(
@@ -373,6 +430,7 @@ export function runStatusTone(status: SopRunStatus | undefined): RunStateTone {
       return 'error';
     case 'waiting_approval':
     case 'paused_checkpoint':
+    case 'cancel_requested':
       return 'warning';
     default:
       return 'neutral';

@@ -30,7 +30,6 @@
     clippy::unnecessary_literal_bound,
     clippy::unnecessary_map_or,
     clippy::unnecessary_wraps,
-    dead_code,
     unused_variables,
     unused_imports
 )]
@@ -42,6 +41,15 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{BufRead, ErrorKind, Read, Write};
 
+#[cfg(feature = "agent-runtime")]
+use crossterm::{
+    cursor::{Hide, MoveTo, Show},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+};
+
+#[cfg(any(not(feature = "agent-runtime"), windows))]
 const STDIN_LINE_CAP: usize = 1024 * 1024;
 
 /// Result of [`read_capped_line`].
@@ -80,6 +88,7 @@ fn read_capped_line<R: std::io::BufRead>(reader: R, cap: usize) -> std::io::Resu
 /// UTF-8 char boundary. `String::truncate` panics when the byte index lands
 /// inside a multi-byte character, so a raw `line.truncate(cap)` on piped input
 /// is a latent panic. No-op when the string already fits.
+#[cfg(any(windows, test))]
 fn cap_line_utf8_safe(line: &mut String, cap: usize) {
     if line.len() > cap {
         line.truncate(line.floor_char_boundary(cap));
@@ -109,6 +118,7 @@ fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "agent-runtime")]
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
@@ -128,14 +138,23 @@ fn t(key: &str, fallback: &str) -> String {
 
 /// `t` with `{$name}` arguments.
 #[allow(unused_variables)]
-fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+fn ta(key: &str, args: &[(&str, &str)], fallback: impl Into<String>) -> String {
     #[cfg(feature = "agent-runtime")]
     {
         zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
-        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+        // i18n-exempt: English fallback when Fluent (agent-runtime) is
+        // disabled. The fallback still carries `{$name}` placeholders, so
+        // substitute them here — without this, every argument-bearing
+        // message prints its placeholder literally (e.g. "Initialized
+        // {$count} section(s)").
+        let mut rendered = fallback.into();
+        for (name, value) in args {
+            rendered = rendered.replace(&format!("{{${name}}}"), value);
+        }
+        rendered
     }
 }
 
@@ -176,6 +195,516 @@ fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
 }
 
 #[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_MIN_WIDTH: usize = 20;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_ROW_OVERHEAD: usize = 3;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_VERTICAL_OVERHEAD: usize = 2;
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_row_budget(terminal_width: usize) -> Option<usize> {
+    if terminal_width < QUICKSTART_SELECTOR_MIN_WIDTH {
+        return None;
+    }
+    terminal_width.checked_sub(QUICKSTART_SELECTOR_ROW_OVERHEAD)
+}
+
+/// Resolve the terminal dimensions the Quickstart checklist will be fitted to.
+///
+/// A narrow terminal whose size is unavailable must not get rows fitted against
+/// a guessed geometry — that would reintroduce the exact overflow class this
+/// change exists to prevent. Unknown dimensions therefore take the same
+/// fail-closed path as a too-narrow terminal.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_terminal_size<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+) -> Option<(u16, u16)> {
+    term.size_checked()
+}
+
+/// Whether a sampled terminal size is usable for fitting the checklist.
+#[cfg(all(feature = "agent-runtime", test))]
+fn quickstart_selector_size_is_usable(size: Option<(u16, u16)>) -> bool {
+    size.is_some()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_min_height(item_count: usize) -> usize {
+    item_count.saturating_add(QUICKSTART_SELECTOR_VERTICAL_OVERHEAD)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_fits_height(terminal_height: usize, item_count: usize) -> bool {
+    terminal_height >= quickstart_selector_min_height(item_count)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn fit_quickstart_selector_row(row: &str, budget: usize) -> String {
+    let normalized: String = row
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if normalized.len() <= budget && console::measure_text_width(&normalized) <= budget {
+        return normalized;
+    }
+    if budget == 0 {
+        return String::new();
+    }
+
+    let marker = if budget >= "…".len() { "…" } else { "." };
+    let byte_budget = budget - marker.len();
+    let width_budget = budget - console::measure_text_width(marker);
+    let mut fitted = String::with_capacity(budget);
+    for ch in normalized.chars() {
+        fitted.push(ch);
+        if fitted.len() > byte_budget || console::measure_text_width(&fitted) > width_budget {
+            fitted.pop();
+            break;
+        }
+    }
+    fitted.push_str(marker);
+    fitted
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_resize_error(
+    initial_size: (u16, u16),
+    current_size: (u16, u16),
+) -> anyhow::Error {
+    let (initial_height, initial_width) = initial_size;
+    let (current_height, current_width) = current_size;
+    anyhow::Error::msg(qta(
+        "cli-quickstart-terminal-resized",
+        &[
+            ("initial_width", &initial_width.to_string()),
+            ("initial_height", &initial_height.to_string()),
+            ("current_width", &current_width.to_string()),
+            ("current_height", &current_height.to_string()),
+        ],
+    ))
+}
+
+/// Decide whether an interaction may continue at the size sampled now.
+///
+/// Returns `Err` both when the terminal changed size and when its size became
+/// unavailable: an unknown size is not evidence that the geometry still
+/// matches, and `Term::size()`'s fabricated `(24, 80)` fallback could even
+/// compare *equal* to the initial sample on an 80x24 terminal that has since
+/// lost its size query. Unknown therefore fails closed, like a resize.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_recheck_size(
+    initial_size: (u16, u16),
+    current_size: Option<(u16, u16)>,
+) -> Result<()> {
+    match current_size {
+        Some(current) if current == initial_size => Ok(()),
+        Some(current) => Err(quickstart_selector_resize_error(initial_size, current)),
+        None => Err(anyhow::Error::msg(qta(
+            "cli-quickstart-terminal-size-unknown",
+            &[],
+        ))),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_frame_lines(
+    labels: &[String],
+    prompt: &str,
+    selected: usize,
+) -> Vec<String> {
+    std::iter::once(format!("? {prompt}"))
+        .chain(labels.iter().enumerate().map(|(index, label)| {
+            let marker = if index == selected { ">" } else { " " };
+            format!("{marker} {label}")
+        }))
+        .collect()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn render_quickstart_selector<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+    lines: &[String],
+) -> std::io::Result<()> {
+    for line in lines {
+        term.write_line(line)?;
+    }
+    term.flush()
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartSelectorKey {
+    Down,
+    Up,
+    Select,
+    Cancel,
+    Interrupt,
+    Other,
+}
+
+#[cfg(feature = "agent-runtime")]
+trait QuickstartSelectorTerminal {
+    /// Geometry of the terminal that receives `write_line` output, as
+    /// `(rows, columns)`, or `None` when it cannot be determined.
+    fn size_checked(&mut self) -> Option<(u16, u16)>;
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn clear_screen(&mut self) -> std::io::Result<()>;
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()>;
+    fn hide_cursor(&mut self) -> std::io::Result<()>;
+    fn show_cursor(&mut self) -> std::io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn write_line(&mut self, line: &str) -> std::io::Result<()>;
+    fn flush(&mut self) -> std::io::Result<()>;
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
+}
+
+/// The input half of the Crossterm selector: raw-mode ownership plus key
+/// decoding. It is separate from the output half so a regression can drive the
+/// production output adapter with injected keys.
+#[cfg(feature = "agent-runtime")]
+trait QuickstartSelectorInput {
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
+}
+
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartInput {
+    restore_cooked_mode: bool,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl CrosstermQuickstartInput {
+    fn new() -> std::io::Result<Self> {
+        let raw_mode_was_enabled = terminal::is_raw_mode_enabled()?;
+        if !raw_mode_was_enabled {
+            terminal::enable_raw_mode()?;
+        }
+        Ok(Self {
+            restore_cooked_mode: !raw_mode_was_enabled,
+        })
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl Drop for CrosstermQuickstartInput {
+    fn drop(&mut self) {
+        if self.restore_cooked_mode {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl QuickstartSelectorInput for CrosstermQuickstartInput {
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+        loop {
+            match event::read()? {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+                {
+                    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let modified = key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META);
+                    return Ok(match key.code {
+                        KeyCode::Char('c') if control => QuickstartSelectorKey::Interrupt,
+                        KeyCode::Down | KeyCode::Tab => QuickstartSelectorKey::Down,
+                        KeyCode::Char('j') if !modified => QuickstartSelectorKey::Down,
+                        KeyCode::Up | KeyCode::BackTab => QuickstartSelectorKey::Up,
+                        KeyCode::Char('k') if !modified => QuickstartSelectorKey::Up,
+                        KeyCode::Enter => QuickstartSelectorKey::Select,
+                        KeyCode::Char(' ') if !modified => QuickstartSelectorKey::Select,
+                        KeyCode::Esc => QuickstartSelectorKey::Cancel,
+                        KeyCode::Char('q') if !modified => QuickstartSelectorKey::Cancel,
+                        _ => QuickstartSelectorKey::Other,
+                    });
+                }
+                // A resize is returned to the loop so the checked geometry is
+                // sampled immediately rather than waiting for another key.
+                Event::Resize(_, _) => return Ok(QuickstartSelectorKey::Other),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A frame destination whose own terminal geometry can be measured.
+///
+/// Quickstart requires stdin and stderr to be terminals, not the same
+/// terminal. The frame is therefore fitted to the descriptor it is written to
+/// rather than to whichever terminal a process-global query describes.
+#[cfg(all(feature = "agent-runtime", unix))]
+trait QuickstartSelectorOutput: Write + std::os::fd::AsFd {}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl<W: Write + std::os::fd::AsFd> QuickstartSelectorOutput for W {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+trait QuickstartSelectorOutput: Write {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+impl<W: Write> QuickstartSelectorOutput for W {}
+
+/// Measure the terminal behind `output` as `(rows, columns)`.
+///
+/// A zero dimension means the driver holds no geometry for that terminal. It
+/// is reported as unknown so the caller fails closed instead of fitting rows
+/// to a zero-width frame.
+#[cfg(all(feature = "agent-runtime", unix))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(output: &W) -> Option<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+    // SAFETY: `size` points to writable `winsize` storage and the borrowed
+    // descriptor stays open for the duration of the call.
+    let result = unsafe {
+        libc::ioctl(
+            output.as_fd().as_raw_fd(),
+            libc::TIOCGWINSZ,
+            size.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: a successful `TIOCGWINSZ` initialized `size`.
+    let size = unsafe { size.assume_init() };
+    (size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
+}
+
+/// Measure the active console screen buffer as `(rows, columns)`.
+///
+/// Crossterm offers no per-handle geometry query here. A native console
+/// shares one screen buffer between stdout and stderr, so the measured
+/// surface is the one that receives the frame. Native-console rendering is
+/// not exercised by hosted checks and remains a documented verification gap.
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(_output: &W) -> Option<(u16, u16)> {
+    terminal::size().ok().map(|(columns, rows)| (rows, columns))
+}
+
+/// Crossterm-backed selector terminal: frames go to `output`, keys come from
+/// `input`, and geometry is always read from `output`.
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartTerminal<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> {
+    output: W,
+    input: K,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl CrosstermQuickstartTerminal<std::io::Stderr, CrosstermQuickstartInput> {
+    fn stderr() -> std::io::Result<Self> {
+        Ok(Self {
+            output: std::io::stderr(),
+            input: CrosstermQuickstartInput::new()?,
+        })
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> QuickstartSelectorTerminal
+    for CrosstermQuickstartTerminal<W, K>
+{
+    fn size_checked(&mut self) -> Option<(u16, u16)> {
+        quickstart_output_terminal_size(&self.output)
+    }
+
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, EnterAlternateScreen)
+    }
+
+    fn clear_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Clear(ClearType::All))
+    }
+
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+        execute!(self.output, MoveTo(0, 0))
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Hide)
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Show)
+    }
+
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+        // Crossterm uses the native screen-buffer API on legacy Windows
+        // consoles and the ANSI sequence on terminals that support it.
+        execute!(self.output, LeaveAlternateScreen)
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        // Raw mode disables the Unix terminal driver's LF-to-CRLF mapping.
+        // Emit both controls explicitly so every row begins in column zero.
+        write!(self.output, "{line}\r\n")
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+        self.input.read_key()
+    }
+}
+
+/// Own the alternate screen from before its first fallible operation.
+///
+/// Claiming ownership before `enter_alternate_screen` means a partial write or
+/// flush failure still triggers a best-effort restore. Cleanup attempts are
+/// independent: a cursor error must never strand the alternate screen.
+#[cfg(feature = "agent-runtime")]
+struct QuickstartSelectorScreen<'a, T: QuickstartSelectorTerminal> {
+    term: &'a mut T,
+    restore_needed: bool,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<'a, T: QuickstartSelectorTerminal> QuickstartSelectorScreen<'a, T> {
+    fn enter(term: &'a mut T) -> std::io::Result<Self> {
+        let screen = Self {
+            term,
+            restore_needed: true,
+        };
+        screen.term.enter_alternate_screen()?;
+        screen.term.clear_screen()?;
+        screen.term.move_cursor_to_origin()?;
+        screen.term.hide_cursor()?;
+        screen.term.flush()?;
+        Ok(screen)
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        if !self.restore_needed {
+            return Ok(());
+        }
+        self.restore_needed = false;
+
+        let mut first_error = None;
+        for result in [
+            self.term.show_cursor(),
+            self.term.leave_alternate_screen(),
+            self.term.flush(),
+        ] {
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<T: QuickstartSelectorTerminal> Drop for QuickstartSelectorScreen<'_, T> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartSelectorOutcome {
+    Pick(Option<usize>),
+    Interrupt,
+}
+
+/// Render the fixed-size Quickstart checklist without dialoguer paging.
+///
+/// The terminal dimensions sampled for fitting are part of this interaction's
+/// contract. They describe the terminal that receives the frame, and every
+/// input event rechecks them before navigation or selection; a resize exits
+/// the selector-owned alternate screen instead of trying to erase a
+/// main-screen frame whose physical rows the terminal may have reflowed. A
+/// resize of the output terminal alone raises no input event, so it is caught
+/// at the next key. Leaving the alternate screen atomically restores
+/// unrelated output.
+#[cfg(feature = "agent-runtime")]
+fn interact_quickstart_selector<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+    labels: &[String],
+    prompt: &str,
+    initial_size: (u16, u16),
+) -> Result<QuickstartSelectorOutcome> {
+    if labels.is_empty() {
+        bail!(qta("cli-quickstart-empty-checklist", &[]));
+    }
+    let current_size = quickstart_selector_terminal_size(term);
+    quickstart_selector_recheck_size(initial_size, current_size)?;
+
+    let mut screen = QuickstartSelectorScreen::enter(term)?;
+    let interaction = (|| -> Result<QuickstartSelectorOutcome> {
+        let mut selected = 0;
+        let mut frame = quickstart_selector_frame_lines(labels, prompt, selected);
+        render_quickstart_selector(screen.term, &frame)?;
+
+        loop {
+            let key = screen.term.read_key()?;
+            let current_size = quickstart_selector_terminal_size(screen.term);
+            quickstart_selector_recheck_size(initial_size, current_size)?;
+
+            match key {
+                QuickstartSelectorKey::Down => {
+                    selected = (selected + 1) % labels.len();
+                    frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
+                    render_quickstart_selector(screen.term, &frame)?;
+                }
+                QuickstartSelectorKey::Up => {
+                    selected = selected.checked_sub(1).unwrap_or(labels.len() - 1);
+                    frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
+                    render_quickstart_selector(screen.term, &frame)?;
+                }
+                QuickstartSelectorKey::Select => {
+                    return Ok(QuickstartSelectorOutcome::Pick(Some(selected)));
+                }
+                QuickstartSelectorKey::Cancel => {
+                    return Ok(QuickstartSelectorOutcome::Pick(None));
+                }
+                QuickstartSelectorKey::Interrupt => {
+                    return Ok(QuickstartSelectorOutcome::Interrupt);
+                }
+                QuickstartSelectorKey::Other => {}
+            }
+        }
+    })();
+    let cleanup = screen.restore();
+    match (interaction, cleanup) {
+        (Ok(QuickstartSelectorOutcome::Interrupt), _) => Ok(QuickstartSelectorOutcome::Interrupt),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(selection), Ok(())) => Ok(selection),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartChecklistAction {
+    Provider,
+    Risk,
+    Memory,
+    Channels,
+    PeerGroups,
+    Agent,
+    Create,
+    Quit,
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_action_for_pick(
+    choices: &[(QuickstartChecklistAction, String)],
+    pick: Option<usize>,
+) -> QuickstartChecklistAction {
+    pick.and_then(|index| choices.get(index).map(|(action, _)| *action))
+        .unwrap_or(QuickstartChecklistAction::Quit)
+}
+
+#[cfg(feature = "agent-runtime")]
 fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> String {
     t(step.label_key(), step.label())
 }
@@ -184,6 +713,7 @@ fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> 
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
 /// `apply_comments`. Best-effort — silently bails on parse errors so a
 /// successful set isn't downgraded to a failure for a metadata problem.
+#[cfg(feature = "agent-runtime")]
 async fn apply_comment_inline(
     config_path: &std::path::Path,
     path: &str,
@@ -197,6 +727,7 @@ async fn apply_comment_inline(
     .context("failed to write comment annotation")
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::PropKind> {
     config
         .prop_fields()
@@ -205,6 +736,7 @@ fn config_patch_prop_kind(config: &Config, path: &str) -> Option<crate::config::
         .map(|f| f.kind)
 }
 
+#[cfg(feature = "agent-runtime")]
 fn json_value_to_setprop_string(
     value: &serde_json::Value,
     config: &Config,
@@ -230,6 +762,7 @@ fn json_value_to_setprop_string(
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) -> ConfigApiError {
     let msg = err.to_string();
     if msg.starts_with("Unknown property") {
@@ -241,11 +774,13 @@ fn config_patch_map_prop_error(err: anyhow::Error, path: &str, op_index: usize) 
     }
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_json_error(err: &ConfigApiError) -> Result<()> {
     eprintln!("{}", serde_json::to_string_pretty(err)?);
     std::process::exit(1);
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_json_value_type_error(
     message: impl Into<String>,
     path: Option<String>,
@@ -261,6 +796,7 @@ fn config_patch_json_value_type_error(
     err
 }
 
+#[cfg(feature = "agent-runtime")]
 fn config_patch_fail_json_or_human<T>(
     json: bool,
     err: ConfigApiError,
@@ -344,6 +880,7 @@ fn pause_after_no_command_help() {
 
 #[cfg(feature = "agent-runtime")]
 mod agent;
+#[cfg(feature = "agent-runtime")]
 mod alias_cli;
 #[cfg(feature = "agent-runtime")]
 mod approval;
@@ -385,6 +922,7 @@ mod i18n;
 mod identity;
 #[cfg(feature = "agent-runtime")]
 mod integrations;
+#[cfg(feature = "agent-runtime")]
 mod memory;
 #[cfg(feature = "agent-runtime")]
 mod migration;
@@ -397,18 +935,20 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_catalog;
+#[cfg(feature = "plugins-wasm")]
 mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
+#[cfg(feature = "agent-runtime")]
+mod relay_cli;
 #[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
 mod security_status;
 #[cfg(feature = "agent-runtime")]
 mod service;
-#[cfg(feature = "agent-runtime")]
-mod skillforge;
 #[cfg(feature = "agent-runtime")]
 mod skills;
 #[cfg(feature = "agent-runtime")]
@@ -428,10 +968,10 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
-    HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands, SopCommands,
-    SopGraphFormat,
+    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, CronDeliveryArgs,
+    GatewayCommands, HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands,
+    ProvidersCommands, ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands,
+    SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -460,11 +1000,15 @@ enum EstopLevelArg {
     ToolFreeze,
 }
 
+/// Package version and `git describe` build id stamped by `build.rs`, so
+/// `--version` and `status` name the commit this binary was built from.
+const VERSION: &str = env!("ZEROCLAW_VERSION");
+
 /// `ZeroClaw` - Zero overhead. Zero compromise. 100% Rust.
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version)]
+#[command(version = VERSION)]
 // i18n-exempt: clap derive help — framework requires a compile-time literal
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
@@ -518,7 +1062,7 @@ impl LogLevel {
 enum EvalCommands {
     /// Run a suite of evaluation cases.
     Run {
-        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        /// Directory of `*.json` trace fixtures (defaults to `evals/regression`).
         #[arg(long)]
         suite: Option<String>,
 
@@ -688,8 +1232,13 @@ Methods: initialize, session/new, session/prompt, session/stop.
 
 Examples:
   zeroclaw acp                        # start ACP server
+  zeroclaw acp --agent fable         # default new sessions to agent fable
   zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
     Acp {
+        /// Process-scoped default agent for alias-less session/new requests
+        #[arg(long)]
+        agent: Option<String>,
+
         /// Maximum concurrent sessions (default: 10)
         #[arg(long)]
         max_sessions: Option<usize>,
@@ -767,6 +1316,13 @@ Examples:
         security_command: SecurityCommands,
     },
 
+    /// Bind this daemon to a ZeroRelay account (self-serve enrollment)
+    #[cfg(feature = "agent-runtime")]
+    Relay {
+        #[command(subcommand)]
+        relay_command: RelayCommands,
+    },
+
     Estop {
         #[command(subcommand)]
         estop_command: Option<EstopSubcommands>,
@@ -803,9 +1359,9 @@ Examples:
   zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
   zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
   zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-  zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+  zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+  zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
   zeroclaw cron pause TASK_ID
   zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London")]
     Cron {
@@ -904,6 +1460,13 @@ Examples:
     Auth {
         #[command(subcommand)]
         auth_command: AuthCommands,
+    },
+
+    /// Enroll with an inbound OIDC identity provider to obtain an RPC auth token
+    #[cfg(feature = "agent-runtime")]
+    Oidc {
+        #[command(subcommand)]
+        oidc_command: OidcCommands,
     },
 
     /// Discover and introspect USB hardware
@@ -1058,8 +1621,8 @@ expectations. No network calls, fully deterministic. Exits non-zero if any case 
 so it can gate CI.
 
 Examples:
-  zeroclaw eval run                                  # replay ./evals
-  zeroclaw eval run --suite evals --format json")]
+  zeroclaw eval run                                  # replay ./evals/regression
+  zeroclaw eval run --suite evals/regression --format json")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -1094,7 +1657,7 @@ Examples (Windows PowerShell):
     #[command(hide = true)]
     MarkdownSchema,
 
-    /// Launch or install the companion desktop app
+    /// Launch the companion desktop app, or open its download page
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Launch the ZeroClaw companion desktop app.
@@ -1103,13 +1666,14 @@ The companion app is a lightweight menu bar / system tray application \
 that connects to the same gateway as the CLI. It provides quick access \
 to the dashboard, status monitoring, and device pairing.
 
-Use --install to download the pre-built companion app for your platform.
+Use --install to open the download page for your platform. It does not \
+install anything itself.
 
 Examples:
   zeroclaw desktop              # launch the companion app
-  zeroclaw desktop --install    # download and install it")]
+  zeroclaw desktop --install    # open the download page")]
     Desktop {
-        /// Download and install the companion app
+        /// Open the companion app's download page
         #[arg(long)]
         install: bool,
     },
@@ -1168,62 +1732,6 @@ enum LocalesCommands {
 enum DeprecatedPropsCommands {
     #[command(external_subcommand)]
     Any(Vec<String>),
-}
-
-#[cfg(feature = "agent-runtime")]
-fn runtime_dir_env_is_explicit(name: &str, value: &str) -> bool {
-    match name {
-        "ZEROCLAW_CONFIG_DIR" | "ZEROCLAW_DATA_DIR" => !value.trim().is_empty(),
-        "ZEROCLAW_WORKSPACE" => !value.is_empty(),
-        _ => false,
-    }
-}
-
-#[cfg(feature = "agent-runtime")]
-fn resolve_homebrew_onboard_config_dir(
-    exe: &Path,
-    env_lookup: impl Fn(&str) -> Option<String>,
-) -> Option<PathBuf> {
-    let explicit_runtime_dir = [
-        "ZEROCLAW_CONFIG_DIR",
-        "ZEROCLAW_DATA_DIR",
-        "ZEROCLAW_WORKSPACE",
-    ]
-    .iter()
-    .any(|name| env_lookup(name).is_some_and(|value| runtime_dir_env_is_explicit(name, &value)));
-
-    if explicit_runtime_dir {
-        return None;
-    }
-
-    zeroclaw_runtime::service::homebrew_var_dir_from_exe(exe)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn apply_homebrew_onboard_config_dir_with(
-    exe: &Path,
-    env_lookup: impl Fn(&str) -> Option<String>,
-    mut set_env: impl FnMut(&'static str, &Path),
-) -> Option<PathBuf> {
-    let config_dir = resolve_homebrew_onboard_config_dir(exe, env_lookup)?;
-    set_env("ZEROCLAW_CONFIG_DIR", &config_dir);
-    Some(config_dir)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn apply_homebrew_onboard_config_dir() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-
-    apply_homebrew_onboard_config_dir_with(
-        &exe,
-        |name| std::env::var(name).ok(),
-        |name, value| {
-            // SAFETY: called early in the onboard command path before new threads are spawned.
-            unsafe { std::env::set_var(name, value) };
-        },
-    );
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -1336,7 +1844,6 @@ async fn run_quickstart_cli(
     enum ChannelChoice {
         Fresh {
             kind: String,
-            display_name: String,
             alias: String,
             extras: std::collections::BTreeMap<String, String>,
         },
@@ -1435,19 +1942,6 @@ async fn run_quickstart_cli(
         }
     }
 
-    // ── Main checklist loop ─────────────────────────────────────
-    #[derive(Clone, Copy)]
-    enum Action {
-        Provider,
-        Risk,
-        Memory,
-        Channels,
-        PeerGroups,
-        Agent,
-        Create,
-        Quit,
-    }
-
     println!();
     println!(
         "{}",
@@ -1537,74 +2031,127 @@ async fn run_quickstart_cli(
         };
 
         let risk_summary = preset_summary(&form.risk);
-        let mut labels: Vec<String> = vec![
-            quickstart_row(
-                "cli-quickstart-row-model-provider",
-                glyph(form.provider_done()),
-                &provider_summary,
+        let mut choices: Vec<(QuickstartChecklistAction, String)> = vec![
+            (
+                QuickstartChecklistAction::Provider,
+                quickstart_row(
+                    "cli-quickstart-row-model-provider",
+                    glyph(form.provider_done()),
+                    &provider_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-risk-profile",
-                glyph(form.risk_done()),
-                &risk_summary,
+            (
+                QuickstartChecklistAction::Risk,
+                quickstart_row(
+                    "cli-quickstart-row-risk-profile",
+                    glyph(form.risk_done()),
+                    &risk_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-memory",
-                glyph(form.memory_done()),
-                &memory_summary,
+            (
+                QuickstartChecklistAction::Memory,
+                quickstart_row(
+                    "cli-quickstart-row-memory",
+                    glyph(form.memory_done()),
+                    &memory_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-channels",
-                glyph(form.channels_done()),
-                &channels_summary,
+            (
+                QuickstartChecklistAction::Channels,
+                quickstart_row(
+                    "cli-quickstart-row-channels",
+                    glyph(form.channels_done()),
+                    &channels_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-peer-groups",
-                glyph(form.peer_groups_done()),
-                &peer_groups_summary,
+            (
+                QuickstartChecklistAction::PeerGroups,
+                quickstart_row(
+                    "cli-quickstart-row-peer-groups",
+                    glyph(form.peer_groups_done()),
+                    &peer_groups_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-agent-identity",
-                glyph(form.agent_done()),
-                &agent_summary,
+            (
+                QuickstartChecklistAction::Agent,
+                quickstart_row(
+                    "cli-quickstart-row-agent-identity",
+                    glyph(form.agent_done()),
+                    &agent_summary,
+                ),
             ),
         ];
         let create_enabled = form.all_done();
-        labels.push(if create_enabled {
-            t("cli-quickstart-create-agent", "── Create agent")
-        } else {
-            t(
-                "cli-quickstart-create-agent-locked",
-                "── Create agent (locked — fill every selector first)",
-            )
-        });
+        choices.push((
+            QuickstartChecklistAction::Create,
+            if create_enabled {
+                t("cli-quickstart-create-agent", "── Create agent")
+            } else {
+                t(
+                    "cli-quickstart-create-agent-locked",
+                    "── Create agent (locked — fill every selector first)",
+                )
+            },
+        ));
 
-        let actions = [
-            Action::Provider,
-            Action::Risk,
-            Action::Memory,
-            Action::Channels,
-            Action::PeerGroups,
-            Action::Agent,
-            Action::Create,
-        ];
+        let mut term = CrosstermQuickstartTerminal::stderr()?;
+        // Fail closed when the terminal API cannot report its dimensions;
+        // fitting against a guessed size would reintroduce row overflow.
+        let Some(terminal_size) = quickstart_selector_terminal_size(&mut term) else {
+            anyhow::bail!("{}", qta("cli-quickstart-terminal-size-unknown", &[]));
+        };
+        let (terminal_height, terminal_width) = terminal_size;
+        let terminal_height = usize::from(terminal_height);
+        let terminal_width = usize::from(terminal_width);
+        let Some(row_budget) = quickstart_selector_row_budget(terminal_width) else {
+            let terminal_width = terminal_width.to_string();
+            let min_width = QUICKSTART_SELECTOR_MIN_WIDTH.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-narrow",
+                    &[("width", &terminal_width), ("min_width", &min_width)],
+                )
+            );
+        };
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, row_budget))
+            .collect();
+        let min_height = quickstart_selector_min_height(labels.len());
+        if !quickstart_selector_fits_height(terminal_height, labels.len()) {
+            let terminal_height = terminal_height.to_string();
+            let min_height = min_height.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-short",
+                    &[("height", &terminal_height), ("min_height", &min_height)],
+                )
+            );
+        }
 
-        let pick = FuzzySelect::new()
-            .with_prompt(t(
+        let prompt = fit_quickstart_selector_row(
+            &t(
                 "cli-quickstart-open-selector-prompt",
                 "Open a selector (Enter), or pick Create. Esc to quit.",
-            ))
-            .items(&labels)
-            .default(0)
-            .max_length(labels.len())
-            .interact_opt()?;
-        let action = match pick {
-            Some(i) => actions[i],
-            None => Action::Quit, // Esc on the main checklist quits.
+            ),
+            row_budget,
+        );
+        // Keep this checklist non-searchable and non-paged, and fail closed if
+        // its fitted terminal dimensions change while it is active.
+        let outcome = interact_quickstart_selector(&mut term, &labels, &prompt, terminal_size)?;
+        // `process::exit` does not run destructors. Restore cooked mode before
+        // preserving the selector's historical Ctrl+C exit semantics.
+        drop(term);
+        let pick = match outcome {
+            QuickstartSelectorOutcome::Pick(pick) => pick,
+            QuickstartSelectorOutcome::Interrupt => std::process::exit(130),
         };
+        let action = quickstart_action_for_pick(&choices, pick);
 
         match action {
-            Action::Quit => {
+            QuickstartChecklistAction::Quit => {
                 println!(
                     "{}",
                     t(
@@ -1614,7 +2161,7 @@ async fn run_quickstart_cli(
                 );
                 return Ok(());
             }
-            Action::Create => {
+            QuickstartChecklistAction::Create => {
                 if !create_enabled {
                     println!(
                         "{}",
@@ -1627,7 +2174,7 @@ async fn run_quickstart_cli(
                 }
                 break;
             }
-            Action::Provider => {
+            QuickstartChecklistAction::Provider => {
                 // Step 1: pick Existing or Fresh, when there are
                 // existing providers to choose from.
                 let mut mode_labels: Vec<String> = Vec::new();
@@ -1793,7 +2340,7 @@ async fn run_quickstart_cli(
                     fields: field_buf,
                 });
             }
-            Action::Risk => {
+            QuickstartChecklistAction::Risk => {
                 let chosen = pick_preset(
                     &t("cli-quickstart-risk-profile-prompt", "Risk profile"),
                     RISK_PRESETS
@@ -1809,7 +2356,7 @@ async fn run_quickstart_cli(
                     });
                 }
             }
-            Action::Memory => {
+            QuickstartChecklistAction::Memory => {
                 let kinds: [MemoryChoice; 6] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
@@ -1847,7 +2394,7 @@ async fn run_quickstart_cli(
                 };
                 form.memory = Some(kinds[i]);
             }
-            Action::Channels => {
+            QuickstartChecklistAction::Channels => {
                 // Channels sub-flow: list current drafts + Add / Done.
                 loop {
                     let mut items: Vec<String> = form
@@ -1992,7 +2539,6 @@ async fn run_quickstart_cli(
                         }
                         form.channels.push(ChannelChoice::Fresh {
                             kind: chosen.kind.clone(),
-                            display_name: chosen.display_name.clone(),
                             alias,
                             extras,
                         });
@@ -2003,7 +2549,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::PeerGroups => {
+            QuickstartChecklistAction::PeerGroups => {
                 // Available channel refs: staged channels (this run) +
                 // unassigned channels already in config. Refs already
                 // covered by a staged peer-group are filtered out.
@@ -2119,7 +2665,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::Agent => {
+            QuickstartChecklistAction::Agent => {
                 let default_name = form
                     .agent
                     .as_ref()
@@ -2411,7 +2957,7 @@ async fn run_quickstart_cli(
     };
 
     match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
-        Ok(applied) => {
+        Ok(zeroclaw_runtime::quickstart::QuickstartApplyOutcome::Applied(applied)) => {
             println!();
             println!(
                 "{}",
@@ -2437,6 +2983,45 @@ async fn run_quickstart_cli(
                 println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
             }
             Ok(())
+        }
+        Ok(
+            zeroclaw_runtime::quickstart::QuickstartApplyOutcome::CommittedWithSideEffectErrors {
+                agent: applied,
+                errors,
+            },
+        ) => {
+            // The config was persisted (the agent exists) but a
+            // post-commit side effect — the personality files — failed.
+            // The committed config is not rolled back: report the partial
+            // success truthfully (no "complete" line), and preserve the
+            // historical nonzero failure result for this outcome.
+            eprintln!();
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-quickstart-partial-personality-failure",
+                    &[("alias", &applied.alias)],
+                    "The agent config for {$alias} was saved, but installing its \
+                     personality files failed. Repair the reported paths or permissions, \
+                     then create or edit the intended personality files in this existing \
+                     agent's workspace. Do not rerun Quickstart for this saved alias.",
+                )
+            );
+            eprintln!();
+            for err in &errors {
+                eprintln!("  • {}: {}", quickstart_step_label(err.step), err.message);
+            }
+            if let Some(auth) = inline_auth {
+                Box::pin(run_inline_provider_auth(auth, &mut cfg)).await;
+            }
+            eprintln!();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-could-not-finish",
+                    &[("count", &errors.len().to_string())],
+                )
+            )
         }
         Err(errs) => {
             eprintln!();
@@ -2483,6 +3068,7 @@ fn model_path_provider_type(path: &str) -> Option<&'static str> {
         .map(|p| p.name)
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&'a str> {
     let tail = prop_path.strip_prefix(section_path)?.strip_prefix('.')?;
     let mut parts = tail.split('.');
@@ -2493,6 +3079,7 @@ fn map_key_for_prop_path<'a>(section_path: &str, prop_path: &'a str) -> Option<&
 
 /// Split `section_arg` into the map key under `section_path` with NOTHING after
 /// it, the `config init <section>.<alias>` shape.
+#[cfg(any(feature = "agent-runtime", test))]
 fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Option<&'a str> {
     let tail = section_arg.strip_prefix(section_path)?.strip_prefix('.')?;
     (!tail.is_empty() && !tail.contains('.')).then_some(tail)
@@ -2502,6 +3089,7 @@ fn map_key_for_section_arg<'a>(section_path: &str, section_arg: &'a str) -> Opti
 /// alias `split` extracts. `#[resource_key]` sections are excluded: their keys
 /// are values from another domain (model id, voice, tool name) and may
 /// themselves contain dots, so a dot split would yield a bogus alias.
+#[cfg(any(feature = "agent-runtime", test))]
 fn alias_target_for_path<'a>(
     path: &'a str,
     split: impl Fn(&str, &'a str) -> Option<&'a str>,
@@ -2520,6 +3108,7 @@ fn alias_target_for_path<'a>(
 /// exists, the section is resource-keyed or a natural-key list, or the argument
 /// is a plain nested prefix that `init_defaults` already handles). A reserved
 /// alias is an error, not a silent no-op.
+#[cfg(any(feature = "agent-runtime", test))]
 fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<String>> {
     let Some((section_path, alias)) = alias_target_for_path(section_arg, map_key_for_section_arg)
     else {
@@ -2534,6 +3123,7 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
 
 /// Dirty every generated leaf under a newly created map alias so required
 /// default-valued fields survive the incremental writer's empty-leaf pruning.
+#[cfg(feature = "agent-runtime")]
 fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
     let prefix = format!("{alias_path}.");
     let leaf_paths: Vec<String> = config
@@ -2551,6 +3141,7 @@ fn mark_new_map_alias_dirty(config: &mut Config, alias_path: &str) {
     }
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<bool> {
     let Some((section_path, key)) = alias_target_for_path(prop_path, map_key_for_prop_path) else {
         return Ok(false);
@@ -2596,7 +3187,7 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         // when `created == false`, or a bogus tail-field on an
         // ALREADY-EXISTING alias would delete a legitimate, pre-existing
         // config entry that has nothing to do with this call.
-        if config.get_prop(prop_path).is_err() {
+        if config.get_prop(prop_path).is_err() && !Config::prop_is_secret(prop_path) {
             let _ = config.delete_map_key(section_path, key);
             return Ok(false);
         }
@@ -2755,8 +3346,15 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed plugins
-    List,
+    /// List installed and cached-registry plugins. With `--verify`, list the
+    /// installed packages with their host-load verdicts.
+    List {
+        /// Also load-check each plugin against this host's WIT ABI and
+        /// annotate whether it would actually load (slower: this compiles and
+        /// instantiates every installed component)
+        #[arg(long)]
+        verify: bool,
+    },
     /// Search an installable plugin registry
     Search {
         /// Query to match against plugin names and descriptions
@@ -2772,6 +3370,23 @@ enum PluginCommands {
         /// Registry JSON URL used for install-by-name
         #[arg(long)]
         registry: Option<String>,
+        /// Install even if the plugin fails to load against this host's WIT ABI
+        /// (skips the install-time load-check)
+        #[arg(long)]
+        no_verify: bool,
+        /// Also bind the installed channel package to a
+        /// `[channels.plugin.<alias>]` instance and create its config entry,
+        /// as `plugin bind` does, in the same transaction as the install
+        #[arg(long)]
+        channel_alias: Option<String>,
+        /// Egress for the bound instance's new config entry: `declared` grants
+        /// the destinations the package manifest declares, `none` binds with
+        /// no network reach. Required with `--channel-alias` when the manifest
+        /// declares destinations the channel can reach and the entry does not
+        /// exist yet. It governs only the channel instance's entry; a tool
+        /// entry of the same package is seeded by install as always.
+        #[arg(long, value_enum, requires = "channel_alias")]
+        egress: Option<EgressDecisionArg>,
     },
     /// Remove an installed plugin
     Remove {
@@ -2783,8 +3398,325 @@ enum PluginCommands {
         /// Plugin name
         name: String,
     },
+    /// Bind an installed channel package to a `[channels.plugin.<alias>]`
+    /// instance and create the instance's config entry, which holds its
+    /// config and its egress grant. Re-running it repairs a missing binding
+    /// or entry and never changes one that exists.
+    Bind {
+        /// Installed plugin package that provides the channel
+        package: String,
+        /// Alias of the channel instance, which runs as `plugin.<alias>`
+        #[arg(long)]
+        channel_alias: String,
+        /// Egress for the instance's new config entry: `declared` grants the
+        /// destinations the package manifest declares, `none` binds with no
+        /// network reach. It matters only when this command creates the
+        /// config entry, and it is required when the manifest declares
+        /// destinations the channel can reach and the entry does not exist
+        /// yet.
+        #[arg(long, value_enum)]
+        egress: Option<EgressDecisionArg>,
+    },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+/// `--egress`: the operator's decision on the destinations a channel
+/// package's manifest declares, taken when its instance's config entry is
+/// created.
+#[cfg(feature = "plugins-wasm")]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum EgressDecisionArg {
+    /// Grant the destinations the manifest declares
+    Declared,
+    /// Grant nothing: the instance has no network reach
+    #[value(name = "none")]
+    Withhold,
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl From<EgressDecisionArg> for crate::plugins::channel_instance::EgressDecision {
+    fn from(arg: EgressDecisionArg) -> Self {
+        match arg {
+            EgressDecisionArg::Declared => Self::SeedDeclared,
+            EgressDecisionArg::Withhold => Self::Withhold,
+        }
+    }
+}
+
+/// Run the install-time load-check on an admitted source and decide whether
+/// the install may proceed. A plugin that does not instantiate against this
+/// host's WIT world would install cleanly and then be silently skipped at
+/// daemon startup; this surfaces that failure at the CLI with its full
+/// diagnostic. The check runs against the exact bytes admission read,
+/// which are the bytes [`PluginHost::install_admitted`] then installs, so what
+/// was verified is what gets installed. With `--no-verify` the check is not
+/// run at all (nothing is compiled or instantiated) and a note says so; a
+/// source with no WASM component has nothing to instantiate and passes.
+#[cfg(feature = "plugins-wasm")]
+async fn verify_plugin_loads_or_bail(
+    admitted: &zeroclaw::plugins::host::AdmittedSource,
+    limits: zeroclaw::plugins::component::PluginLimits,
+    no_verify: bool,
+) -> Result<()> {
+    let manifest = admitted.manifest();
+    let Some(component) = admitted.component() else {
+        return Ok(());
+    };
+    if no_verify {
+        eprintln!(
+            "{}",
+            ta(
+                "cli-plugin-install-verify-bypassed",
+                &[("name", manifest.name.as_str())],
+                format!(
+                    "note: skipping the install-time load check for '{}' (--no-verify); if it does not load against this host it will be skipped at startup",
+                    manifest.name
+                ),
+            )
+        );
+        return Ok(());
+    }
+    match zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let detail = format!("{error:#}");
+            bail!(ta(
+                "cli-plugin-install-verify-failed",
+                &[("name", manifest.name.as_str()), ("error", detail.as_str())],
+                format!(
+                    "install failed: '{}' does not load against this host:\n{detail}\nOverride with --no-verify to install anyway.",
+                    manifest.name
+                ),
+            ))
+        }
+    }
+}
+
+/// The load verdict for one *installed* plugin.
+///
+/// `PluginInfo::loaded` only reports that a package was discovered, so a plugin
+/// the daemon will type-check and silently skip still lists as if it worked.
+/// This is the verdict that separates the two, and it comes from the same
+/// `verify_component_loads` check `plugin install` gates on: a plugin that
+/// predates that gate, was installed with `--no-verify`, or outlived a host
+/// upgrade is exactly the case the install gate cannot cover.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+enum PluginLoadStatus {
+    /// The component instantiates against this host's WIT world.
+    Loads,
+    /// It does not. Carries the full wasmtime cause chain, including the
+    /// WIT-drift rebuild hint when instantiation was what failed.
+    Fails(String),
+    /// A skill-only package ships no component, so there is nothing to load.
+    NoComponent,
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl PluginLoadStatus {
+    /// Whether `plugin info` should exit non-zero, so a script can branch on
+    /// it. Only a real load failure qualifies: a skill-only package has
+    /// nothing to instantiate, which is not evidence that anything is broken.
+    const fn is_load_failure(&self) -> bool {
+        matches!(self, Self::Fails(_))
+    }
+}
+
+/// Run the load-check for one installed plugin.
+#[cfg(feature = "plugins-wasm")]
+async fn installed_plugin_load_status(
+    host: &zeroclaw::plugins::host::PluginHost,
+    info: &zeroclaw::plugins::PluginInfo,
+    limits: zeroclaw::plugins::component::PluginLimits,
+) -> Result<PluginLoadStatus> {
+    // The host's admitted bytes, not a reread of `wasm_path`: these are what
+    // the daemon compiles, so the verdict describes what will actually run.
+    let Some(component) = host.admitted_component(&info.name) else {
+        return Ok(PluginLoadStatus::NoComponent);
+    };
+    let manifest = host
+        .manifest(&info.name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    match zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await {
+        Ok(()) => Ok(PluginLoadStatus::Loads),
+        Err(error) => Ok(PluginLoadStatus::Fails(format!("{error:#}"))),
+    }
+}
+
+/// The first line of a diagnostic. A list row annotates each plugin with just
+/// enough to tell one failure from another; `plugin info` prints the whole
+/// chain.
+#[cfg(feature = "plugins-wasm")]
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or(text).trim()
+}
+
+/// Render the body of `zeroclaw plugin list`.
+///
+/// Each entry carries its load verdict only when `--verify` ran, so the default
+/// listing stays a directory read and costs no compilation.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_list_lines(
+    entries: &[(zeroclaw::plugins::PluginInfo, Option<PluginLoadStatus>)],
+) -> Vec<String> {
+    if entries.is_empty() {
+        return vec![t("cli-plugins-none", "No plugins installed.")];
+    }
+
+    let mut lines = vec![t("cli-plugins-installed", "Installed plugins:")];
+    for (info, status) in entries {
+        let description = info
+            .description
+            .clone()
+            .unwrap_or_else(|| t("cli-plugin-no-description", "(no description)"));
+        let Some(status) = status else {
+            lines.push(format!("  {} v{} — {description}", info.name, info.version));
+            continue;
+        };
+        // The row is indented in code, not in Fluent: Fluent trims the leading
+        // whitespace of a single-line value, so an indent written there is lost.
+        let identity = format!("{} v{} — {description}", info.name, info.version);
+        let args = [
+            ("name", info.name.as_str()),
+            ("version", info.version.as_str()),
+            ("description", description.as_str()),
+        ];
+        let row = match status {
+            PluginLoadStatus::Loads => ta(
+                "cli-plugin-list-entry-loads",
+                &args,
+                format!("{identity} [loads]"),
+            ),
+            PluginLoadStatus::Fails(error) => {
+                let cause = first_line(error);
+                let mut args = args.to_vec();
+                args.push(("error", cause));
+                ta(
+                    "cli-plugin-list-entry-failed",
+                    &args,
+                    format!("{identity} [does not load: {cause}]"),
+                )
+            }
+            PluginLoadStatus::NoComponent => ta(
+                "cli-plugin-list-entry-no-component",
+                &args,
+                format!("{identity} [no component to load]"),
+            ),
+        };
+        lines.push(format!("  {row}"));
+    }
+    lines
+}
+
+/// Render `zeroclaw plugin info`. The load verdict is always the last line:
+/// "does this plugin work here" is the question the command exists to answer,
+/// and the manifest alone cannot answer it.
+///
+/// One config entry key line per instance row: the default tool binding's in
+/// the form it has always had, then one per bound channel alias, which names
+/// the `plugin.<alias>` binding the key belongs to.
+///
+/// `channel_readiness` holds each bound alias's readiness block
+/// ([`channel_instance_readiness_lines`]), which follows that alias's key
+/// line; an instance that owns no row has no key line, so its block follows
+/// the key lines. `bind_hint` is the lines a channel package with no bound
+/// alias gets instead ([`channel_bind_hint_lines`]).
+#[cfg(feature = "plugins-wasm")]
+fn plugin_info_lines(
+    info: &zeroclaw::plugins::PluginInfo,
+    instance_rows: &[crate::plugins::channel_instance::PluginInstanceRow],
+    channel_readiness: &[(String, Vec<String>)],
+    bind_hint: &[String],
+    status: &PluginLoadStatus,
+) -> Vec<String> {
+    let readiness_of = |alias: &str| {
+        channel_readiness
+            .iter()
+            .find(|(bound, _)| bound == alias)
+            .map(|(_, lines)| lines.as_slice())
+            .unwrap_or_default()
+    };
+    let mut lines = vec![ta(
+        "cli-plugin-name-version",
+        &[("name", &info.name), ("version", &info.version)],
+        "Plugin",
+    )];
+    if let Some(desc) = &info.description {
+        lines.push(ta(
+            "cli-plugin-description",
+            &[("desc", desc)],
+            "Description",
+        ));
+    }
+    lines.push(ta(
+        "cli-plugin-capabilities",
+        &[("v", &format!("{:?}", info.capabilities))],
+        "Capabilities",
+    ));
+    lines.push(ta(
+        "cli-plugin-permissions",
+        &[("v", &format!("{:?}", info.permissions))],
+        "Permissions",
+    ));
+    for row in instance_rows {
+        lines.push(if row.is_channel() {
+            // The alias is config text that validation only warns about.
+            let alias = row.binding.escape_debug().to_string();
+            ta(
+                "cli-plugin-config-entry-key-channel",
+                &[("alias", &alias), ("key", &row.key)],
+                format!("Config entry key (channel plugin.{alias}): {}", row.key),
+            )
+        } else {
+            ta(
+                "cli-plugin-config-entry-key",
+                &[
+                    ("capability", &format!("{:?}", row.capability)),
+                    ("key", &row.key),
+                ],
+                "Config entry key",
+            )
+        });
+        if row.is_channel() {
+            lines.extend(readiness_of(&row.binding).iter().cloned());
+        }
+    }
+    for (alias, readiness) in channel_readiness {
+        let has_key_line = instance_rows
+            .iter()
+            .any(|row| row.is_channel() && row.binding == *alias);
+        if !has_key_line {
+            lines.extend(readiness.iter().cloned());
+        }
+    }
+    lines.extend(bind_hint.iter().cloned());
+    match &info.wasm_path {
+        Some(path) => lines.push(ta(
+            "cli-plugin-wasm",
+            &[("path", &path.display().to_string())],
+            "WASM",
+        )),
+        None => lines.push(t("cli-plugin-wasm-none", "WASM: (skill-only plugin)")),
+    }
+    lines.push(match status {
+        PluginLoadStatus::Loads => t(
+            "cli-plugin-info-load-ok",
+            "Loads: yes. The component instantiates against this host's WIT world.",
+        ),
+        PluginLoadStatus::Fails(error) => ta(
+            "cli-plugin-info-load-failed",
+            &[("error", error)],
+            format!(
+                "Loads: no. {error}\nRebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it."
+            ),
+        ),
+        PluginLoadStatus::NoComponent => t(
+            "cli-plugin-info-load-not-applicable",
+            "Loads: not applicable. This is a skill-only plugin, so there is no component to instantiate.",
+        ),
+    });
+    lines
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -2804,60 +3736,2101 @@ fn plugin_host_with_configured_security(
     )
 }
 
+/// The `[[plugins.entries]]` instance rows `plugin_name`'s installed manifest
+/// owns: the default tool binding's, then one per `[channels.plugin.<alias>]`
+/// binding that names the package, as
+/// [`crate::plugins::channel_instance::instance_rows`] enumerates them.
+///
+/// One row per instance. The key is
+/// [`PluginInstanceScope::config_entry_key`][k] — `zpi1_` + Base64URL of the
+/// canonical `(package, capability, binding)` tuple — and it is the *only* key
+/// for that instance's host-owned state: the private `config` map and the
+/// `egress_hosts` grant live in the same row, resolved by the same key.
+/// Deriving it in one place rather than at each call site is what keeps that
+/// true.
+///
+/// [k]: zeroclaw::plugins::instance::PluginInstanceScope::config_entry_key
 #[cfg(feature = "plugins-wasm")]
-async fn seed_plugin_config_entry(
-    config: &mut crate::config::schema::Config,
+fn installed_instance_rows(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
     plugin_name: &str,
+) -> Result<Vec<crate::plugins::channel_instance::PluginInstanceRow>> {
+    let manifest = host
+        .manifest(plugin_name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    Ok(crate::plugins::channel_instance::instance_rows(
+        config, manifest,
+    )?)
+}
+
+/// The rows `plugin install` seeds through [`stage_plugin_config_entries`], in
+/// the shape it takes: the default tool binding's row, never a channel row.
+///
+/// Install splits the work. It seeds the package's tool row here, by the rule
+/// the tool ceremony has always applied. A channel instance's row belongs to
+/// its binding: with `--channel-alias`, install binds that alias and seeds the
+/// instance's row through the binding ceremony, in the same save. Without the
+/// flag no channel row is created, even for an alias bound before the
+/// install: `plugin bind` creates it, `plugin info` prints its key, and
+/// `plugin list` reports any declared destination it lacks with the command
+/// that creates the row.
+#[cfg(feature = "plugins-wasm")]
+fn tool_binding_entries(
+    rows: Vec<crate::plugins::channel_instance::PluginInstanceRow>,
+) -> Vec<(zeroclaw::plugins::PluginCapability, String)> {
+    rows.into_iter()
+        .filter(|row| !row.is_channel())
+        .map(|row| (row.capability, row.key))
+        .collect()
+}
+
+/// Print the destinations a freshly seeded instance row was granted, one line
+/// each, plus the exact command that edits the grant later.
+///
+/// The grant ceremony: installation is an explicit operator act, and the
+/// printed, persisted allowlist is its record. `package` is what the operator
+/// recognizes; `instance_key` is the opaque `zpi1_` row the grant actually
+/// lives on, and it reaches the operator inside the printed command rather than
+/// as a bare token they would have to transcribe. A manifest that declares
+/// nothing prints nothing.
+#[cfg(feature = "plugins-wasm")]
+fn print_egress_grant_ceremony(
+    config_dir: &std::path::Path,
+    package: &str,
+    instance_key: &str,
+    granted: &[String],
+) {
+    for line in egress_grant_ceremony_lines(config_dir, package, instance_key, granted) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_egress_grant_ceremony`] prints, which the channel
+/// binding ceremony prints for the row it creates as well.
+#[cfg(feature = "plugins-wasm")]
+fn egress_grant_ceremony_lines(
+    config_dir: &std::path::Path,
+    package: &str,
+    instance_key: &str,
+    granted: &[String],
+) -> Vec<String> {
+    use crate::plugins::egress_ceremony::egress_set_command;
+    if granted.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![ta(
+        "cli-plugin-egress-seeded",
+        &[("name", package), ("count", &granted.len().to_string())],
+        "Granted egress from the manifest declaration.",
+    )];
+    for host in granted {
+        // The literal carries indentation only; the prose is the Fluent value.
+        lines.push(format!(
+            "  {}",
+            ta(
+                "cli-plugin-egress-destination",
+                &[("host", host)],
+                "-> host"
+            )
+        ));
+    }
+    lines.push(ta(
+        "cli-plugin-egress-edit-command",
+        &[(
+            "command",
+            &egress_set_command(config_dir, instance_key, granted),
+        )],
+        "Edit this grant later with the printed command.",
+    ));
+    lines
+}
+
+/// Print the declaration-versus-grant difference for an instance row that
+/// already exists, and change nothing. [`existing_egress_grant_lines`] builds
+/// what this prints.
+#[cfg(feature = "plugins-wasm")]
+fn report_existing_egress_grant(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_key: &str,
+    declared_egress: &[String],
+) {
+    for line in existing_egress_grant_lines(config, package, instance_key, declared_egress) {
+        println!("{line}");
+    }
+}
+
+/// The lines `plugin install` prints for an instance row that already exists.
+///
+/// This is the security invariant of the ceremony: a package upgrade whose
+/// declaration grew must not extend an existing grant. The operator applies the
+/// difference deliberately, with the exact command printed here. The comparison
+/// reads the same `zpi1_` row `entry_config` resolves against, so "granted"
+/// means the one allowlist the runtime enforces.
+///
+/// Install and `plugin list` answer the same question — is this grant usable?
+/// — so they consult the same runtime-backed planner. If the runtime would
+/// refuse the row as it stands, the same verdict line `plugin list` prints
+/// comes first, with the runtime's own reason and the repair command; the
+/// upgrade difference is then computed over the entries the runtime accepts,
+/// so the apply-command never carries a rejected entry forward; and if a
+/// private carve-out would still be refused after that command, the same
+/// incomplete-repair line follows. Under a deployment-wide refusal nothing is
+/// printed here: the caller reports that once, with its own paths, and a
+/// per-row command would imply the grant could take effect when it cannot.
+#[cfg(feature = "plugins-wasm")]
+fn existing_egress_grant_lines(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_key: &str,
+    declared_egress: &[String],
+) -> Vec<String> {
+    use crate::plugins::egress_ceremony::{
+        EgressGapPlan, EgressGrantState, deployment_rejection, diff_declaration,
+        egress_set_command, partition_valid_hosts, plan_egress_gap, should_report_diff,
+    };
+    let runtime = egress_runtime_inputs(config);
+    if deployment_rejection(&runtime).is_some() {
+        return Vec::new();
+    }
+    let (granted, allow_private) = config.plugins.entry_egress(instance_key);
+    // Called only for rows the install just found, so the row exists.
+    let state = EgressGrantState::Enforced {
+        granted: granted.clone(),
+        allow_private: allow_private.clone(),
+        row_exists: true,
+    };
+    let plan = plan_egress_gap(
+        egress_command_config_dir(config),
+        instance_key,
+        declared_egress,
+        &state,
+        &runtime,
+    );
+    let mut lines = Vec::new();
+
+    // The runtime's verdict on the row as it stands, in the same words
+    // `plugin list` uses.
+    let (rejected, repair_incomplete) = match &plan {
+        EgressGapPlan::Grant {
+            rejected,
+            repair_incomplete,
+            ..
+        } => (rejected.clone(), repair_incomplete.clone()),
+        EgressGapPlan::Nothing | EgressGapPlan::Migrate { .. } => (None, None),
+    };
+    if let (Some(reason), EgressGapPlan::Grant { command, .. }) = (&rejected, &plan) {
+        lines.push(egress_invalid_grant_line(package, reason, command));
+    }
+
+    // The upgrade difference, over the entries the runtime accepts.
+    let (accepted, _rejected_entries) = partition_valid_hosts(&granted);
+    let diff = diff_declaration(declared_egress, &accepted);
+    if should_report_diff(&diff) {
+        if !diff.declared_not_granted.is_empty() {
+            lines.push(ta(
+                "cli-plugin-egress-declared-not-granted",
+                &[
+                    ("name", package),
+                    ("count", &diff.declared_not_granted.len().to_string()),
+                ],
+                "This plugin declares destinations its config entry does not grant.",
+            ));
+            for host in &diff.declared_not_granted {
+                lines.push(format!(
+                    "  {}",
+                    ta("cli-plugin-egress-added", &[("host", host)], "+ host")
+                ));
+            }
+            lines.push(ta(
+                "cli-plugin-egress-apply-command",
+                &[(
+                    "command",
+                    &egress_set_command(
+                        egress_command_config_dir(config),
+                        instance_key,
+                        &diff.union(),
+                    ),
+                )],
+                "Grant them with the printed command.",
+            ));
+        }
+        if !diff.granted_not_declared.is_empty() {
+            lines.push(ta(
+                "cli-plugin-egress-granted-not-declared",
+                &[
+                    ("name", package),
+                    ("count", &diff.granted_not_declared.len().to_string()),
+                ],
+                "This entry grants destinations the manifest no longer declares.",
+            ));
+            for host in &diff.granted_not_declared {
+                lines.push(format!(
+                    "  {}",
+                    ta("cli-plugin-egress-removed", &[("host", host)], "- host")
+                ));
+            }
+        }
+        lines.push(ta(
+            "cli-plugin-egress-never-extended",
+            &[("name", package)],
+            "Installing a package never extends an existing egress grant.",
+        ));
+    }
+
+    // A manifest with no `[egress]` table stays quiet about operator-authored
+    // grants (see `should_report_diff`), but the row survives `plugin remove`
+    // and is keyed by package name alone, so a reinstalled package, possibly
+    // from another publisher, inherits whatever it grants. Say so once, here,
+    // where the package takes that reach over.
+    if declared_egress.is_empty()
+        && let Some(grants) = egress_grant_summary(&granted, &allow_private)
+    {
+        lines.push(ta(
+            "cli-plugin-egress-inherited",
+            &[
+                ("name", package),
+                ("grants", &grants),
+                ("key", instance_key),
+            ],
+            "This plugin declares no egress but inherits its existing config entry's grant.",
+        ));
+    }
+
+    if let Some(reason) = &repair_incomplete {
+        lines.push(egress_repair_incomplete_line(package, reason, instance_key));
+    }
+    lines
+}
+
+/// What an instance row grants, for the lines that warn a grant outlives or
+/// is inherited by a package: its hosts, then its private carve-outs. `None`
+/// when the row grants nothing.
+#[cfg(feature = "plugins-wasm")]
+fn egress_grant_summary(granted: &[String], allow_private: &[String]) -> Option<String> {
+    let mut parts = Vec::new();
+    if !granted.is_empty() {
+        parts.push(granted.join(", "));
+    }
+    if !allow_private.is_empty() {
+        parts.push(format!("private: {}", allow_private.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// The rows `plugin remove` checks for a grant the removal leaves behind,
+/// derived from the removed package's `manifest` before it goes: the default
+/// tool binding's row, by the rule [`instance_rows`] applies to it, then, when
+/// the installed version provides a channel, the row under every bound alias's
+/// key, whatever else that version owns ([`bound_channel_rows`]). A row an
+/// earlier version owned keeps its grant after a version that owns no
+/// instance state is installed over it, and a package bound to that alias
+/// later inherits the grant.
+///
+/// [`instance_rows`]: crate::plugins::channel_instance::instance_rows
+/// [`bound_channel_rows`]: crate::plugins::channel_instance::bound_channel_rows
+#[cfg(feature = "plugins-wasm")]
+fn removed_plugin_grant_rows(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+) -> Vec<crate::plugins::channel_instance::PluginInstanceRow> {
+    use crate::plugins::channel_instance::{bound_channel_rows, instance_rows};
+
+    let mut rows: Vec<_> = instance_rows(config, manifest)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| !row.is_channel())
+        .collect();
+    rows.extend(bound_channel_rows(config, manifest));
+    rows
+}
+
+/// The lines `plugin remove` prints for the package's config rows that keep an
+/// egress grant. `plugin remove` deletes the package, not its configuration,
+/// and a package installed later under the same name inherits these rows: the
+/// default tool binding's row at once, a channel row once the package is bound
+/// to that alias again. The tool line names the bare package as it always has;
+/// a channel line names its `plugin.<alias>` binding, with the alias escaped
+/// as config text.
+#[cfg(feature = "plugins-wasm")]
+fn removed_plugin_kept_grant_lines(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_rows: &[crate::plugins::channel_instance::PluginInstanceRow],
+) -> Vec<String> {
+    instance_rows
+        .iter()
+        .filter_map(|row| {
+            let (granted, allow_private) = config.plugins.entry_egress(&row.key);
+            egress_grant_summary(&granted, &allow_private).map(|grants| {
+                if row.is_channel() {
+                    let alias = row.binding.escape_debug().to_string();
+                    ta(
+                        "cli-plugin-removed-channel-grant-kept",
+                        &[
+                            ("name", package),
+                            ("alias", &alias),
+                            ("key", &row.key),
+                            ("grants", &grants),
+                        ],
+                        format!(
+                            "The config entry '{}' for plugin.{alias} is kept, with its egress \
+                             grant ({grants}): a package installed later as '{package}' and bound \
+                             to that alias inherits it. Delete the [[plugins.entries]] row named \
+                             '{}' to drop the grant.",
+                            row.key, row.key
+                        ),
+                    )
+                } else {
+                    ta(
+                        "cli-plugin-removed-grant-kept",
+                        &[("name", package), ("key", &row.key), ("grants", &grants)],
+                        "The plugin's config entry keeps its egress grant.",
+                    )
+                }
+            })
+        })
+        .collect()
+}
+
+/// The lines `plugin remove` prints for each `[channels.plugin.<alias>]`
+/// binding that still names the removed package, one per alias in `aliases`.
+///
+/// `plugin remove` deletes the package, not configuration, so the binding
+/// stays. The activation plan skips a binding whose package is not installed,
+/// so it is inert until a package of that name is installed again; that
+/// package is then bound to the alias, and to the alias's row. The line names
+/// the table to delete to drop it.
+///
+/// The alias is config text that validation only warns about, so it is
+/// printed escaped: a control character in it reaches the terminal as its
+/// escape sequence.
+#[cfg(feature = "plugins-wasm")]
+fn removed_plugin_binding_lines(package: &str, aliases: &[String]) -> Vec<String> {
+    aliases
+        .iter()
+        .map(|alias| {
+            let table = channel_table_header(alias);
+            let alias = alias.escape_debug().to_string();
+            ta(
+                "cli-plugin-removed-binding-kept",
+                &[("name", package), ("alias", &alias), ("table", &table)],
+                format!(
+                    "The channel binding plugin.{alias} still names '{package}'. It stays inert \
+                     until a package of that name is installed again; remove the {table} table \
+                     to drop it."
+                ),
+            )
+        })
+        .collect()
+}
+
+/// `zeroclaw plugin bind`: bind the installed `package` to
+/// `[channels.plugin.<alias>]` and create the instance's row.
+///
+/// A config file on an older schema is refused first, as `config set`
+/// refuses it: the save would stamp the current schema version onto sections
+/// still in the older shape, which would then stop taking effect. Then
+/// [`crate::plugins::channel_instance::plan_channel_binding`] decides
+/// everything before anything is written, so a refusal is an error carrying
+/// the matching Fluent line and leaves config untouched. The plan is applied
+/// and saved with one `save_dirty`, and only when it writes something: a
+/// repeated run that finds the binding and its row in place leaves the config
+/// file byte-identical. Returns the lines to print.
+#[cfg(feature = "plugins-wasm")]
+async fn bind_channel_instance(
+    config: &mut crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    package: &str,
+    alias: &str,
+    decision: Option<crate::plugins::channel_instance::EgressDecision>,
+) -> Result<Vec<String>> {
+    use crate::plugins::channel_instance::{apply_channel_binding, plan_channel_binding};
+    crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+    let Some(manifest) = host.manifest(package) else {
+        bail!(ta(
+            "cli-plugin-not-found",
+            &[("name", package)],
+            "Plugin not found"
+        ));
+    };
+    let plan = plan_channel_binding(config, manifest, alias, decision).map_err(|refusal| {
+        anyhow::Error::msg(binding_refusal_line(&manifest.name, alias, &refusal))
+    })?;
+    apply_channel_binding(config, &manifest.name, &plan)?;
+    if plan.writes_config() {
+        Box::pin(config.save_dirty()).await?;
+    }
+    Ok(channel_binding_report_lines(
+        config, host, manifest, &plan, decision,
+    ))
+}
+
+/// The line that explains why the binding ceremony refused to bind `alias` to
+/// `package`.
+#[cfg(feature = "plugins-wasm")]
+fn binding_refusal_line(
+    package: &str,
+    alias: &str,
+    refusal: &crate::plugins::channel_instance::BindingRefusal,
+) -> String {
+    use crate::plugins::channel_instance::BindingRefusal;
+    match refusal {
+        // These two refusals come before the alias grammar is checked, so the
+        // alias is printed escaped, inside the grammar's reason as well; every
+        // later refusal names an alias the grammar accepted.
+        BindingRefusal::NotAChannelPackage => {
+            let alias = alias.escape_debug().to_string();
+            ta(
+                "cli-plugin-channel-not-provided",
+                &[("name", package), ("alias", &alias)],
+                format!(
+                    "Package '{package}' does not provide a channel, so it cannot be bound to \
+                     plugin.{alias}."
+                ),
+            )
+        }
+        BindingRefusal::InvalidAlias(reason) => {
+            let (alias, reason) = escaped_alias_and_reason(alias, reason);
+            ta(
+                "cli-plugin-channel-invalid-alias",
+                &[("alias", &alias), ("reason", &reason)],
+                format!("'{alias}' is not a valid channel alias: {reason}"),
+            )
+        }
+        BindingRefusal::DegradedConfig { section } => ta(
+            "cli-plugin-channel-config-degraded",
+            &[("alias", alias), ("section", section)],
+            format!(
+                "Refusing to bind plugin.{alias}: the [{section}] section on disk is malformed \
+                 and was not loaded. Repair it and retry."
+            ),
+        ),
+        // The other binding's `package` is config text that validation only
+        // warns about, so it is printed escaped.
+        BindingRefusal::AliasOwnedByOtherPackage { owner } => {
+            let owner = owner.escape_debug().to_string();
+            ta(
+                "cli-plugin-channel-alias-owned",
+                &[("alias", alias), ("owner", &owner), ("name", package)],
+                format!(
+                    "Channel alias plugin.{alias} is bound to package '{owner}', not \
+                     '{package}'. Choose another alias, or remove the \
+                     [channels.plugin.{alias}] table first."
+                ),
+            )
+        }
+        BindingRefusal::EgressDecisionRequired { declared } => {
+            let hosts = declared.join(", ");
+            ta(
+                "cli-plugin-channel-egress-decision-required",
+                &[
+                    ("name", package),
+                    ("alias", alias),
+                    ("count", &declared.len().to_string()),
+                    ("hosts", &hosts),
+                ],
+                format!(
+                    "Package '{package}' declares {} destination(s) for plugin.{alias}: {hosts}. \
+                     Re-run with `--egress declared` to grant them, or `--egress none` to bind \
+                     with no network reach.",
+                    declared.len()
+                ),
+            )
+        }
+    }
+}
+
+/// What the binding ceremony prints once `plan` is applied and saved: the
+/// binding line, then what happened to the instance's row, then the
+/// instance's readiness ([`channel_instance_readiness_lines`]).
+///
+/// A row the ceremony created gets the seeded line install prints, then the
+/// grant ceremony when it granted the declaration, the withheld line with the
+/// command that grants it later under `--egress none`, or, when the manifest
+/// declares nothing but holds a governed transport, the line with the
+/// `config set --no-interactive` command for the row's `egress_hosts`,
+/// printed without a value for the operator to complete with the
+/// deployment's own hosts. A row that already existed gets
+/// install's existing-row report, never a write, and a note when an
+/// `--egress` flag was given for it. Either way the row's egress is reported
+/// here, with its command, so the readiness block that follows leaves out the
+/// row's egress gap rather than print the same command twice.
+#[cfg(feature = "plugins-wasm")]
+fn channel_binding_report_lines(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    manifest: &zeroclaw::plugins::PluginManifest,
+    plan: &crate::plugins::channel_instance::ChannelBindingPlan,
+    decision: Option<crate::plugins::channel_instance::EgressDecision>,
+) -> Vec<String> {
+    use crate::plugins::channel_instance::{
+        EgressDecision, PluginInstanceRow, config_set_command_to_complete_for,
+        manifest_has_governed_transport,
+    };
+    use crate::plugins::egress_ceremony::{
+        ShellDialect, canonical_hosts, egress_hosts_path, egress_set_command,
+    };
+
+    let package = manifest.name.as_str();
+    let alias = plan.alias.as_str();
+    let config_dir = egress_command_config_dir(config);
+    let mut lines = vec![if plan.create_binding {
+        ta(
+            "cli-plugin-channel-bound",
+            &[("alias", alias), ("name", package)],
+            format!("Bound channel instance plugin.{alias} to package '{package}'."),
+        )
+    } else {
+        ta(
+            "cli-plugin-channel-binding-kept",
+            &[("alias", alias), ("name", package)],
+            format!(
+                "Channel instance plugin.{alias} is already bound to '{package}'; the binding \
+                 was left unchanged."
+            ),
+        )
+    }];
+
+    if let Some(row) = &plan.row {
+        let display_name = PluginInstanceRow {
+            capability: zeroclaw::plugins::PluginCapability::Channel,
+            binding: alias.to_string(),
+            key: row.key.clone(),
+        }
+        .display_name(package);
+        if row.create {
+            lines.push(ta(
+                "cli-plugin-config-entry-seeded",
+                &[("name", &row.key)],
+                "Seeded config entry. Set plugin config values with \
+                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`.",
+            ));
+            if !row.seed.is_empty() {
+                lines.extend(egress_grant_ceremony_lines(
+                    config_dir,
+                    &display_name,
+                    &row.key,
+                    &row.seed,
+                ));
+            } else if decision == Some(EgressDecision::Withhold) && !row.declared.is_empty() {
+                let declared = canonical_hosts(&row.declared);
+                let hosts = declared.join(", ");
+                let command = egress_set_command(config_dir, &row.key, &declared);
+                lines.push(ta(
+                    "cli-plugin-channel-egress-withheld",
+                    &[("alias", alias), ("hosts", &hosts), ("command", &command)],
+                    format!(
+                        "No egress was granted to plugin.{alias} (--egress none). Its manifest \
+                         declares {hosts}. Grant them later with: {command}"
+                    ),
+                ));
+            } else if row.declared.is_empty() && manifest_has_governed_transport(manifest) {
+                // No placeholder host: run as printed, a command carrying one
+                // would write it into the grant, which the runtime then
+                // refuses along with the whole allowlist. This one carries no
+                // value, and refuses until the operator appends the hosts.
+                let command = config_set_command_to_complete_for(
+                    ShellDialect::host(),
+                    config_dir,
+                    &egress_hosts_path(&row.key),
+                );
+                lines.push(ta(
+                    "cli-plugin-channel-egress-nothing-declared",
+                    &[("name", package), ("alias", alias), ("command", &command)],
+                    format!(
+                        "Package '{package}' declares no destinations. To grant plugin.{alias} \
+                         the hosts your deployment uses, append them to this command as one \
+                         comma-separated value: {command}"
+                    ),
+                ));
+            }
+        } else {
+            lines.extend(existing_egress_grant_lines(
+                config,
+                &display_name,
+                &row.key,
+                &row.declared,
+            ));
+            if row.decision_ignored {
+                lines.push(ta(
+                    "cli-plugin-channel-egress-flag-ignored",
+                    &[("alias", alias)],
+                    format!(
+                        "--egress was not applied: the config entry for plugin.{alias} already \
+                         exists, and this command never extends an existing grant."
+                    ),
+                ));
+            }
+        }
+    }
+
+    lines.extend(channel_instance_readiness_lines(
+        config, host, manifest, alias, false,
+    ));
+    lines
+}
+
+/// Whether the channel instance `alias` of `manifest`'s package is ready to
+/// run, as a derived view of live config computed on demand. `plugin bind`
+/// prints it after binding, `plugin install` after installing a package with
+/// a bound alias, and `plugin info` for each bound alias, through
+/// [`bound_channel_readiness`], which asks the runtime about a package's bound
+/// aliases together; `plugin install` reports the aliases already bound to the
+/// package the same way.
+///
+/// In order: the permissions the manifest requests, which the instance holds
+/// as requested; the keys its `config_schema` requires, each set or missing,
+/// with the command that sets a missing one; the runtime's own verdict on its
+/// configuration; its egress gap, which is `plugin list`'s report for this
+/// row, unless `report_egress_gap` is false because the caller has just
+/// reported the row's egress itself; the activation plan's verdict on the
+/// binding; and the note that a running daemon picks the instance up only
+/// after a restart or reload.
+///
+/// Nothing here writes. The ceremony never enables the plugin system, never
+/// edits an agent's `channels`, and never grants a private-address carve-out:
+/// it names what is missing and the command or config path that supplies it.
+/// Config values are never printed, only property names.
+#[cfg(feature = "plugins-wasm")]
+fn channel_instance_readiness_lines(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    manifest: &zeroclaw::plugins::PluginManifest,
+    alias: &str,
+    report_egress_gap: bool,
+) -> Vec<String> {
+    let admission =
+        zeroclaw_runtime::plugin_runtime::channel_binding_admission(config, host, &[alias]);
+    channel_instance_readiness_lines_with_admission(
+        config,
+        manifest,
+        alias,
+        report_egress_gap,
+        // One verdict per alias asked, so the one binding's is the first.
+        admission.as_ref().map(|verdicts| &verdicts[0]),
+    )
+}
+
+/// The readiness block of `alias` given `admission`, the activation plan's
+/// verdict on its binding from
+/// `zeroclaw_runtime::plugin_runtime::channel_binding_admission`.
+/// [`channel_instance_readiness_lines`] asks for the one binding it reports;
+/// [`bound_channel_readiness`] asks for every bound alias of a package at
+/// once, so a `plugin info` report builds the activation plan once when it
+/// can be built, and asks about each alias alone when it cannot.
+#[cfg(feature = "plugins-wasm")]
+fn channel_instance_readiness_lines_with_admission(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+    alias: &str,
+    report_egress_gap: bool,
+    admission: Result<
+        &zeroclaw_runtime::plugin_runtime::ChannelBindingAdmission,
+        &zeroclaw::plugins::error::PluginError,
+    >,
+) -> Vec<String> {
+    use crate::plugins::channel_instance::{
+        channel_instance_key, channel_instance_row, config_verdict, declared_hosts_for_row,
+        manifest_has_governed_transport, plugin_bind_command_for,
+        plugin_bind_decision_commands_for, required_keys,
+    };
+    use crate::plugins::egress_ceremony::{ShellDialect, canonical_hosts};
+
+    let package = manifest.name.as_str();
+    let config_dir = egress_command_config_dir(config);
+    let mut lines = Vec::new();
+    // The alias as every line below prints it. It is config text that
+    // validation only warns about, so it is escaped for display; lookups use
+    // it as written, and a command quotes it.
+    let shown = alias.escape_debug().to_string();
+
+    // The permissions are shown, not decided: the activation plan grants an
+    // instance exactly what its manifest requests.
+    let permissions: Vec<String> = manifest
+        .permissions
+        .iter()
+        .filter_map(|permission| {
+            serde_json::to_value(permission)
+                .ok()?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    lines.push(if permissions.is_empty() {
+        ta(
+            "cli-plugin-channel-permissions-none",
+            &[("alias", &shown)],
+            format!("plugin.{shown} requests no permissions."),
+        )
+    } else {
+        let permissions = permissions.join(", ");
+        ta(
+            "cli-plugin-channel-permissions",
+            &[("alias", &shown), ("permissions", &permissions)],
+            format!("plugin.{shown} holds the permissions its manifest requests: {permissions}"),
+        )
+    });
+
+    let row = channel_instance_row(manifest, alias).ok().flatten();
+    // Looked up by the instance's key whether or not the manifest owns a row:
+    // a row outlives `plugin remove`, so a reinstall whose manifest owns no
+    // state can meet one that still holds config values, and the runtime
+    // reads that row and refuses them when it constructs the instance.
+    let entry = channel_instance_key(manifest, alias).ok().and_then(|key| {
+        config
+            .plugins
+            .entries
+            .iter()
+            .find(|entry| entry.name == key)
+    });
+
+    if let Some(row) = &row {
+        if entry.is_none() {
+            // `config set plugins.entries.<key>...` resolves only a row that
+            // exists, so a per-key command would fail; the ceremony creates
+            // the row. It refuses to without an egress decision when the
+            // manifest declares destinations the row can use, so then the
+            // line names them and one command per decision follows it.
+            let declared = canonical_hosts(&declared_hosts_for_row(manifest, row));
+            if let Some(line) = invalid_alias_row_missing_line(alias) {
+                // A bind command for this alias would be refused as printed.
+                lines.push(line);
+            } else if declared.is_empty() {
+                let command = plugin_bind_command_for(
+                    ShellDialect::host(),
+                    config_dir,
+                    package,
+                    Some(alias),
+                    None,
+                );
+                lines.push(ta(
+                    "cli-plugin-channel-row-missing",
+                    &[("alias", &shown), ("command", &command)],
+                    format!(
+                        "plugin.{shown} has no config entry yet, so its configuration cannot be \
+                         set. Create it with: {command}"
+                    ),
+                ));
+            } else {
+                let hosts = declared.join(", ");
+                lines.push(ta(
+                    "cli-plugin-channel-row-missing-declared",
+                    &[("alias", &shown), ("hosts", &hosts)],
+                    format!(
+                        "plugin.{shown} has no config entry yet, so its configuration cannot be \
+                         set, and its manifest declares {hosts}. Create the entry with one of the \
+                         commands below: `--egress none` creates it with no network reach, and \
+                         `--egress declared` grants them."
+                    ),
+                ));
+                lines.extend(command_lines(plugin_bind_decision_commands_for(
+                    ShellDialect::host(),
+                    config_dir,
+                    package,
+                    Some(alias),
+                )));
+            }
+        } else {
+            let keys = required_keys(manifest, entry);
+            if !keys.is_empty() {
+                lines.push(ta(
+                    "cli-plugin-channel-required-config",
+                    &[("alias", &shown), ("count", &keys.len().to_string())],
+                    format!(
+                        "Required configuration for plugin.{shown} ({} key(s)):",
+                        keys.len()
+                    ),
+                ));
+                for key in &keys {
+                    // Indented in code: Fluent trims a value's leading
+                    // whitespace.
+                    lines.push(format!(
+                        "  {}",
+                        required_key_line(config_dir, &row.key, key)
+                    ));
+                }
+            }
+        }
+    }
+
+    // A manifest without a schema has nothing to validate, unless the row
+    // carries values anyway, which the runtime refuses.
+    let verdict = config_verdict(manifest, alias, entry);
+    if manifest.config_schema.is_some() || verdict.is_err() {
+        lines.push(match &verdict {
+            Ok(()) => ta(
+                "cli-plugin-channel-config-valid",
+                &[("alias", &shown)],
+                format!("plugin.{shown} configuration validates against the package schema."),
+            ),
+            Err(error) => ta(
+                "cli-plugin-channel-config-invalid",
+                &[("alias", &shown), ("error", error)],
+                format!("plugin.{shown} configuration does not validate yet: {error}"),
+            ),
+        });
+    }
+    // Without a `config_schema` the runtime refuses any configured value, and
+    // the resolver's message names only the package, so the row holding the
+    // values is named here, with the remedy that fits it. A row the manifest
+    // owns no state for is not in the package's enumeration, so `plugin info`
+    // prints no key line for it, and it can go. A row the instance still owns
+    // holds its egress grant, so only the values go.
+    if manifest.config_schema.is_none()
+        && verdict.is_err()
+        && let Some(entry) = entry
+    {
+        lines.push(if row.is_none() {
+            ta(
+                "cli-plugin-channel-retained-row",
+                &[("alias", &shown), ("key", &entry.name)],
+                format!(
+                    "The refused values are on the [[plugins.entries]] row named '{}'. The \
+                     installed package declares no configuration, so delete that row from the \
+                     config file to clear the refusal for plugin.{shown}.",
+                    entry.name
+                ),
+            )
+        } else {
+            ta(
+                "cli-plugin-channel-retained-values",
+                &[("alias", &shown), ("key", &entry.name)],
+                format!(
+                    "The refused values are in the `config` map of the [[plugins.entries]] row \
+                     named '{}'. The installed package declares no configuration, so remove \
+                     those values from the config file to clear the refusal for plugin.{shown}, \
+                     and keep the row: it holds the instance's egress grant.",
+                    entry.name
+                ),
+            )
+        });
+    }
+
+    // The same report `plugin list` prints for this row, so bind, install and
+    // list agree. A deployment-wide refusal is reported on its own instead,
+    // as `plugin list` reports it, whatever the caller reported: no row
+    // report names it. A missing row gets no gap line: the line above names
+    // its declaration and the decision it needs, and the gap's `config patch`
+    // command would create the row already granted, skipping that decision.
+    if manifest_has_governed_transport(manifest) {
+        if let Some(line) = egress_deployment_gap_line(config) {
+            lines.push(line);
+        } else if report_egress_gap
+            && entry.is_some()
+            && let Some(row) = &row
+        {
+            lines.extend(instance_row_egress_gap_lines(
+                config,
+                manifest,
+                row,
+                &egress_runtime_inputs(config),
+            ));
+        }
+    }
+
+    lines.extend(channel_activation_line(config, alias, admission));
+    lines.push(ta(
+        "cli-plugin-channel-restart-note",
+        &[("alias", &shown)],
+        format!("A running daemon picks up plugin.{shown} after a restart or reload."),
+    ));
+    lines
+}
+
+/// The line for a binding whose alias the config alias grammar rejects and
+/// whose instance has no row yet, or `None` for an alias the grammar accepts.
+///
+/// A hand-written binding can hold such an alias, because config validation
+/// only warns about it, and neither repair can then create the row: the
+/// binding ceremony refuses the alias, and `config patch` validates the whole
+/// config, which refuses it too. So the line names the table to rename
+/// instead of printing a command. The alias is config text, printed escaped,
+/// inside the grammar's reason as well, which quotes it as written.
+#[cfg(feature = "plugins-wasm")]
+fn invalid_alias_row_missing_line(alias: &str) -> Option<String> {
+    let reason = zeroclaw_config::helpers::validate_alias_key(alias).err()?;
+    let (shown, reason) = escaped_alias_and_reason(alias, &reason);
+    let table = channel_table_header(alias);
+    Some(ta(
+        "cli-plugin-channel-row-missing-invalid-alias",
+        &[("alias", &shown), ("reason", &reason), ("table", &table)],
+        format!(
+            "plugin.{shown} has no config entry yet, and `plugin bind` cannot create one because \
+             the config alias grammar rejects the alias ({reason}). Rename the {table} table to \
+             a valid alias, then bind that alias."
+        ),
+    ))
+}
+
+/// The `[channels.plugin.<alias>]` table header for `alias`, as a line prints
+/// it: the alias escaped for the terminal, as config text is, and quoted when
+/// it is not a bare TOML key, so a dotted alias such as `a.b` reads as the one
+/// table `[channels.plugin."a.b"]` it names rather than as a nested table.
+#[cfg(feature = "plugins-wasm")]
+fn channel_table_header(alias: &str) -> String {
+    let bare = !alias.is_empty()
+        && alias
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'));
+    if bare {
+        return format!("[channels.plugin.{alias}]");
+    }
+    let mut key = String::with_capacity(alias.len());
+    for character in alias.chars() {
+        // A quoted TOML key takes a single quote as it is.
+        if character == '\'' {
+            key.push(character);
+        } else {
+            key.extend(character.escape_debug());
+        }
+    }
+    format!("[channels.plugin.\"{key}\"]")
+}
+
+/// `alias` escaped for the terminal, as config text is, and `reason`, which
+/// quotes the alias as written, with that alias escaped the same way. An alias
+/// `escape_debug` leaves unchanged leaves `reason` unchanged.
+#[cfg(feature = "plugins-wasm")]
+fn escaped_alias_and_reason(alias: &str, reason: &str) -> (String, String) {
+    let shown = alias.escape_debug().to_string();
+    let reason = if shown == alias {
+        reason.to_string()
+    } else {
+        reason.replace(alias, &shown)
+    };
+    (shown, reason)
+}
+
+/// One required key's readiness line. Only a name the portable key grammar
+/// accepts is printed inside a command; any other name is printed escaped,
+/// with the row to edit in the config file. A secret's command prompts for
+/// the value without echoing it.
+#[cfg(feature = "plugins-wasm")]
+fn required_key_line(
+    config_dir: &std::path::Path,
+    instance_key: &str,
+    key: &crate::plugins::channel_instance::RequiredKey,
+) -> String {
+    use crate::plugins::channel_instance::config_set_command_for;
+    use crate::plugins::egress_ceremony::ShellDialect;
+
+    // A no-op for every addressable name, whose grammar has nothing to escape.
+    let name = key.name.escape_debug().to_string();
+    if key.set {
+        return ta(
+            "cli-plugin-channel-required-key-set",
+            &[("key", &name)],
+            format!("{name}: set"),
+        );
+    }
+    if !key.addressable {
+        return ta(
+            "cli-plugin-channel-required-key-unaddressable",
+            &[("key", &name), ("row", instance_key)],
+            format!(
+                "{name}: missing. No command is printed for a property name outside the \
+                 portable key grammar; set it in the [[plugins.entries]] row named \
+                 '{instance_key}' in the config file."
+            ),
+        );
+    }
+    let command = config_set_command_for(
+        ShellDialect::host(),
+        config_dir,
+        &format!("plugins.entries.{instance_key}.config.{}", key.name),
+        None,
+    );
+    if key.secret {
+        ta(
+            "cli-plugin-channel-required-secret-missing",
+            &[("key", &name), ("command", &command)],
+            format!(
+                "{name}: missing (secret; the command prompts without echo). Set it with: \
+                 {command}"
+            ),
+        )
+    } else {
+        ta(
+            "cli-plugin-channel-required-key-missing",
+            &[("key", &name), ("command", &command)],
+            format!("{name}: missing. Set it with: {command}"),
+        )
+    }
+}
+
+/// The line for `verdict`, the activation plan's verdict on the binding
+/// `alias` from `zeroclaw_runtime::plugin_runtime::channel_binding_admission`,
+/// so the report cannot drift from what the runtime does with the same config
+/// and installed packages. Each unmet precondition names what supplies it; an
+/// error is the plan's own failure to build.
+#[cfg(feature = "plugins-wasm")]
+fn channel_activation_line(
+    config: &crate::config::schema::Config,
+    alias: &str,
+    verdict: Result<
+        &zeroclaw_runtime::plugin_runtime::ChannelBindingAdmission,
+        &zeroclaw::plugins::error::PluginError,
+    >,
+) -> Option<String> {
+    use crate::plugins::channel_instance::config_set_command_for;
+    use crate::plugins::egress_ceremony::ShellDialect;
+    use zeroclaw_runtime::plugin_runtime::ChannelBindingAdmission;
+
+    let config_dir = egress_command_config_dir(config);
+    // Printed escaped, as the rest of the readiness block prints it; the
+    // lookup and the config path inside a command use it as written.
+    let shown = alias.escape_debug().to_string();
+    let verdict = match verdict {
+        Ok(verdict) => verdict,
+        // The runtime's own plan fails the same way, so it starts no plugin
+        // instance at all.
+        Err(error) => {
+            let error = error.to_string();
+            return Some(ta(
+                "cli-plugin-channel-activation-plan-failed",
+                &[("alias", &shown), ("error", &error)],
+                format!(
+                    "plugin.{shown} will not activate: the runtime cannot build its plugin \
+                     activation plan ({error})."
+                ),
+            ));
+        }
+    };
+    Some(match verdict {
+        // Admission, not construction: the loader can still refuse the
+        // instance, for example when its component does not load.
+        ChannelBindingAdmission::Admitted => ta(
+            "cli-plugin-channel-activation-ready",
+            &[("alias", &shown)],
+            format!(
+                "The activation plan admits plugin.{shown}: it starts at the next daemon start \
+                 or reload if its component loads."
+            ),
+        ),
+        ChannelBindingAdmission::PluginsDisabled => {
+            let command = config_set_command_for(
+                ShellDialect::host(),
+                config_dir,
+                "plugins.enabled",
+                Some("true"),
+            );
+            ta(
+                "cli-plugin-channel-activation-plugins-disabled",
+                &[("alias", &shown), ("command", &command)],
+                format!(
+                    "plugin.{shown} will not activate: plugins.enabled is false. Enable the \
+                     plugin system with: {command}"
+                ),
+            )
+        }
+        // Every caller reports an alias it has just bound or found bound in
+        // the same config, so the declaration exists and this is unreachable.
+        // Nothing is printed rather than a claim about a binding that is not
+        // there.
+        ChannelBindingAdmission::Undeclared => return None,
+        // No command is printed for an alias outside the config alias
+        // grammar. For a dotted alias `config set` would create another
+        // binding, since it splits the path at the dot, and withholding the
+        // command for every such alias also keeps format characters out of a
+        // printed command. The line names the table to edit by hand instead.
+        ChannelBindingAdmission::BindingDisabled
+            if zeroclaw_config::helpers::validate_alias_key(alias).is_err() =>
+        {
+            let table = channel_table_header(alias);
+            ta(
+                "cli-plugin-channel-activation-binding-disabled-manual",
+                &[("alias", &shown), ("table", &table)],
+                format!(
+                    "plugin.{shown} will not activate: its binding is disabled. Set \
+                     `enabled = true` in the {table} table of the config file by hand. No command \
+                     is printed for an alias outside the config alias grammar; for a dotted \
+                     alias, `config set` would create another binding."
+                ),
+            )
+        }
+        ChannelBindingAdmission::BindingDisabled => {
+            let command = config_set_command_for(
+                ShellDialect::host(),
+                config_dir,
+                &format!("channels.plugin.{alias}.enabled"),
+                Some("true"),
+            );
+            ta(
+                "cli-plugin-channel-activation-binding-disabled",
+                &[("alias", &shown), ("command", &command)],
+                format!(
+                    "plugin.{shown} will not activate: its binding is disabled. Enable it with: \
+                     {command}"
+                ),
+            )
+        }
+        // No command: `channels` is a list, and `config set` would replace
+        // it rather than add to it.
+        ChannelBindingAdmission::NoEnabledOwner => ta(
+            "cli-plugin-channel-activation-no-owner",
+            &[("alias", &shown)],
+            format!(
+                "plugin.{shown} will not activate: no enabled agent lists plugin.{shown} in its \
+                 channels. Add plugin.{shown} to an enabled agent's `channels` list \
+                 (agents.<agent>.channels)."
+            ),
+        ),
+        ChannelBindingAdmission::PackageNotInstalled { package } => ta(
+            "cli-plugin-channel-activation-package-missing",
+            &[("alias", &shown), ("name", package)],
+            format!("plugin.{shown} will not activate: package '{package}' is not installed."),
+        ),
+        ChannelBindingAdmission::NotAChannelPackage { package } => ta(
+            "cli-plugin-channel-activation-not-a-channel",
+            &[("alias", &shown), ("name", package)],
+            format!(
+                "plugin.{shown} will not activate: package '{package}' does not provide a channel."
+            ),
+        ),
+        ChannelBindingAdmission::OverInstanceCeiling => ta(
+            "cli-plugin-channel-activation-over-ceiling",
+            &[("alias", &shown)],
+            format!(
+                "plugin.{shown} will not activate: plugins.max_active_instances leaves no slot \
+                 for it."
+            ),
+        ),
+    })
+}
+
+/// The lines naming the commands that bind a channel instance of
+/// `manifest`'s package, or none for a package without the `channel`
+/// capability. Each command is complete, with
+/// [`crate::plugins::channel_instance::ALIAS_PLACEHOLDER`] where the alias the
+/// operator chooses goes, which the ceremony refuses until it is replaced.
+///
+/// When the manifest declares destinations a channel instance can reach, the
+/// ceremony refuses to create the instance's row without an egress decision,
+/// so the line that names the choice is followed by one command per decision.
+/// Otherwise one line names the one command.
+#[cfg(feature = "plugins-wasm")]
+fn channel_bind_hint_lines(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+) -> Vec<String> {
+    use crate::plugins::channel_instance::{
+        manifest_has_governed_transport, plugin_bind_command_for, plugin_bind_decision_commands_for,
+    };
+    use crate::plugins::egress_ceremony::{ShellDialect, canonical_hosts};
+
+    if !manifest
+        .capabilities
+        .contains(&zeroclaw::plugins::PluginCapability::Channel)
+    {
+        return Vec::new();
+    }
+    let package = manifest.name.as_str();
+    let config_dir = egress_command_config_dir(config);
+    if manifest_has_governed_transport(manifest) && !manifest.egress.hosts.is_empty() {
+        // What a channel instance's row would be offered: the declaration in
+        // canonical form, as the row-missing line names it.
+        let hosts = canonical_hosts(&manifest.egress.hosts).join(", ");
+        let mut lines = vec![ta(
+            "cli-plugin-channel-bind-hint-egress",
+            &[("name", package), ("hosts", &hosts)],
+            format!(
+                "Package '{package}' provides a channel, and its manifest declares {hosts}. To \
+                 bind an instance, replace ALIAS with the alias you choose and run one of the \
+                 commands below: `--egress none` binds with no network reach, and \
+                 `--egress declared` grants those destinations."
+            ),
+        )];
+        lines.extend(command_lines(plugin_bind_decision_commands_for(
+            ShellDialect::host(),
+            config_dir,
+            package,
+            None,
+        )));
+        lines
+    } else {
+        let command =
+            plugin_bind_command_for(ShellDialect::host(), config_dir, package, None, None);
+        vec![ta(
+            "cli-plugin-channel-bind-hint",
+            &[("name", package), ("command", &command)],
+            format!(
+                "Package '{package}' provides a channel. To bind an instance, replace ALIAS with \
+                 the alias you choose and run: {command}"
+            ),
+        )]
+    }
+}
+
+/// `commands` as printed under the line that introduces them: each on a line
+/// of its own, indented, so any one of them can be copied whole.
+#[cfg(feature = "plugins-wasm")]
+fn command_lines(commands: impl IntoIterator<Item = String>) -> impl Iterator<Item = String> {
+    commands.into_iter().map(|command| format!("  {command}"))
+}
+
+/// The line that says the binding `alias` of `package` names no instance, so
+/// the enumeration of the package's rows skipped it: the instance identity
+/// rules reject the alias, for `reason`. The alias is config text that
+/// validation only warns about, so it is printed escaped.
+#[cfg(feature = "plugins-wasm")]
+fn unkeyed_alias_line(package: &str, alias: &str, reason: &str) -> String {
+    let table = channel_table_header(alias);
+    let alias = alias.escape_debug().to_string();
+    ta(
+        "cli-plugin-channel-alias-unkeyed",
+        &[
+            ("name", package),
+            ("alias", &alias),
+            ("reason", reason),
+            ("table", &table),
+        ],
+        format!(
+            "The channel binding plugin.{alias} of package '{package}' is skipped: no plugin \
+             instance can be named by that alias ({reason}). Rename or remove the {table} table."
+        ),
+    )
+}
+
+/// The readiness block of every alias bound to `manifest`'s channel package,
+/// in alias order, as `plugin info` and `plugin install` report the package's
+/// channel instances. An alias no instance can be keyed by gets the line
+/// that says so in place of a block. Empty for a package without the
+/// `channel` capability, and for one no binding names.
+///
+/// The runtime is asked about every alias that gets a block in one query, so
+/// the report builds at most one activation plan however many aliases it
+/// covers. When that plan cannot be built, the aliases are asked about alone
+/// instead, as `plugin bind` asks, so each block is what the one-alias
+/// report prints: a binding that fails a precondition before the plan keeps
+/// its own line, and only a binding the plan would have judged reports the
+/// plan's failure.
+#[cfg(feature = "plugins-wasm")]
+fn bound_channel_readiness(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    manifest: &zeroclaw::plugins::PluginManifest,
+) -> Vec<(String, Vec<String>)> {
+    use crate::plugins::channel_instance::{bound_channel_aliases, unkeyed_channel_aliases};
+    use zeroclaw_runtime::plugin_runtime::channel_binding_admission;
+
+    if !manifest
+        .capabilities
+        .contains(&zeroclaw::plugins::PluginCapability::Channel)
+    {
+        return Vec::new();
+    }
+    let unkeyed = unkeyed_channel_aliases(config, manifest);
+    let aliases = bound_channel_aliases(config, &manifest.name);
+
+    /// What an alias gets: the reason no instance can be keyed by it, or a
+    /// readiness block, by its position among the aliases asked about.
+    enum Block<'a> {
+        Unkeyed(&'a str),
+        Readiness(usize),
+    }
+    let mut asked: Vec<&str> = Vec::new();
+    let blocks: Vec<Block<'_>> = aliases
+        .iter()
+        .map(
+            |alias| match unkeyed.iter().find(|(skipped, _)| skipped == alias) {
+                Some((_, reason)) => Block::Unkeyed(reason),
+                None => {
+                    asked.push(alias);
+                    Block::Readiness(asked.len() - 1)
+                }
+            },
+        )
+        .collect();
+    let together = channel_binding_admission(config, host, &asked);
+
+    aliases
+        .iter()
+        .zip(blocks)
+        .map(|(alias, block)| {
+            let lines = match (block, &together) {
+                (Block::Unkeyed(reason), _) => {
+                    vec![unkeyed_alias_line(&manifest.name, alias, reason)]
+                }
+                // One verdict per alias asked, in the order asked.
+                (Block::Readiness(index), Ok(verdicts)) => {
+                    channel_instance_readiness_lines_with_admission(
+                        config,
+                        manifest,
+                        alias,
+                        true,
+                        Ok(&verdicts[index]),
+                    )
+                }
+                // The plan could not be built, which leaves no binding a
+                // verdict. Asked about alone, a binding that fails a
+                // precondition before the plan still gets its own line, and
+                // only one the plan would have judged reports the plan's
+                // failure. The plan is then attempted once per such binding,
+                // as every report did before it asked about them together.
+                (Block::Readiness(_), Err(_)) => {
+                    channel_instance_readiness_lines(config, host, manifest, alias, true)
+                }
+            };
+            (alias.clone(), lines)
+        })
+        .collect()
+}
+
+/// The one line both surfaces print when the runtime refuses a canonical row:
+/// the runtime's reason, and the command that replaces the grant with only
+/// the entries it accepts.
+#[cfg(feature = "plugins-wasm")]
+fn egress_invalid_grant_line(package: &str, reason: &str, command: &str) -> String {
+    format!(
+        "  {}",
+        ta(
+            "cli-plugin-egress-invalid-grant",
+            &[("name", package), ("reason", reason), ("command", command)],
+            "The runtime rejects this plugin's egress grant; replace it with the printed \
+             command."
+        )
+    )
+}
+
+/// The one line both surfaces print when the printed command repairs the
+/// hosts but a private carve-out would still be refused.
+#[cfg(feature = "plugins-wasm")]
+fn egress_repair_incomplete_line(package: &str, reason: &str, instance_key: &str) -> String {
+    format!(
+        "    {}",
+        ta(
+            "cli-plugin-egress-repair-incomplete",
+            &[("name", package), ("reason", reason), ("key", instance_key)],
+            "After the printed command the runtime would still reject the grant; fix \
+             egress_allow_private by hand."
+        )
+    )
+}
+
+/// The migration diagnostic, on the surface an operator already
+/// runs: for every instance of an installed plugin whose transport can use a
+/// declaration (`http_client` for the default tool binding, any governed
+/// transport for a bound channel alias), a terse report of the destinations
+/// it declares that its instance row does not grant — denials waiting to
+/// happen — and the exact command that closes the gap.
+///
+/// Only declared-but-not-granted is flagged. The reverse (granted but not
+/// declared) is the operator's own authored grant, which is a first-class
+/// grant path, not a finding.
+///
+/// A channel package with no `[channels.plugin.<alias>]` binding has no
+/// instance, so it yields no rows and is skipped in silence: there is no row
+/// to compare against, and inventing one would report a gap against a key
+/// nothing reads.
+///
+/// [`egress_grant_gap_lines`] builds what this prints, including the ordering
+/// rule for an install whose grant is still on a legacy row.
+#[cfg(feature = "plugins-wasm")]
+fn print_egress_grant_gaps(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    plugins: &[zeroclaw::plugins::PluginInfo],
 ) -> Result<()> {
+    if let Some(line) = egress_deployment_gap_line(config) {
+        // Every plugin's policy is refused alike, and no per-plugin command
+        // can take effect until this is fixed, so no per-plugin lines follow.
+        println!("{line}");
+        return Ok(());
+    }
+    for p in plugins {
+        let Some(manifest) = host.manifest(&p.name) else {
+            continue;
+        };
+        for line in egress_grant_gap_lines(config, manifest)? {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// The runtime's inputs to a plugin egress policy that live outside any one
+/// row: the same values `plugin_egress_policy` hands the constructor, so the
+/// diagnostic's verdict is the runtime's.
+#[cfg(feature = "plugins-wasm")]
+fn egress_runtime_inputs(
+    config: &crate::config::schema::Config,
+) -> crate::plugins::egress_ceremony::EgressRuntimeInputs {
+    crate::plugins::egress_ceremony::EgressRuntimeInputs {
+        nat64_prefixes: config.security.nat64_prefixes.clone(),
+        max_connections_per_instance: config.plugins.limits.max_connections_per_instance,
+    }
+}
+
+/// The configuration directory every printed grant command addresses. The
+/// loaded config's path is the resolved one — `--config-dir` and
+/// `ZEROCLAW_CONFIG_DIR` are already folded in — so a command copied from this
+/// process acts on the profile the operator inspected, not on whichever one
+/// their shell resolves by default.
+#[cfg(feature = "plugins-wasm")]
+fn egress_command_config_dir(config: &crate::config::schema::Config) -> &std::path::Path {
+    config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+/// One line, printed once, when the runtime would refuse *every* plugin
+/// egress policy in this deployment: a malformed `security.nat64_prefixes`
+/// or a zero `plugins.limits.max_connections_per_instance`. No row edit
+/// changes that, so it is reported here with its own paths and never as a
+/// per-plugin grant repair.
+#[cfg(feature = "plugins-wasm")]
+fn egress_deployment_gap_line(config: &crate::config::schema::Config) -> Option<String> {
+    let reason =
+        crate::plugins::egress_ceremony::deployment_rejection(&egress_runtime_inputs(config))?;
+    Some(format!(
+        "  {}",
+        ta(
+            "cli-plugin-egress-deployment-rejected",
+            &[("reason", &reason)],
+            "The runtime rejects every plugin egress policy in this deployment; check \
+             security.nat64_prefixes and plugins.limits.max_connections_per_instance."
+        )
+    ))
+}
+
+/// The lines [`print_egress_grant_gaps`] emits for one installed package,
+/// already rendered through Fluent and indented. Empty when the package has
+/// nothing to report.
+///
+/// Split out from the printing so the diagnostic's *ordering* is assertable:
+/// on a legacy install the migration step has to come before the grant
+/// command, and a test that could only inspect stdout could not pin that.
+///
+/// The decision itself lives in [`crate::plugins::egress_ceremony`]:
+/// `resolve_grant_state` separates the grant the runtime enforces (the
+/// canonical `zpi1_` row, and only that) from the grant the operator authored
+/// (stranded on a package-name row on a pre-typed-config install), and
+/// `plan_egress_gap` derives the report from that split. A stranded row always
+/// gets the rename printed, because nothing is enforced until it happens; the
+/// grant command follows only when the declaration still lacks destinations
+/// after the rename, and it always carries the authored grant forward because
+/// `config set` replaces the list. This function only renders the plan.
+///
+/// Every instance row of the package is reported on its own, in the order
+/// [`crate::plugins::channel_instance::instance_rows`] yields them, and under
+/// its own transport rule: the default tool binding first, named by the bare
+/// package exactly as before, then each bound channel alias, named
+/// `package (plugin.<alias>)`.
+#[cfg(feature = "plugins-wasm")]
+fn egress_grant_gap_lines(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+) -> Result<Vec<String>> {
+    use crate::plugins::channel_instance::{instance_rows, manifest_has_governed_transport};
+    use crate::plugins::egress_ceremony::deployment_rejection;
+
+    // No row of a package without a governed transport can use a
+    // declaration, so there is nothing to report and no key to derive.
+    if !manifest_has_governed_transport(manifest) {
+        return Ok(Vec::new());
+    }
+    // The same inputs `plugin_egress_policy` hands the policy constructor at
+    // request time, so the diagnostic's verdict on a row is the runtime's.
+    // Under a deployment-wide refusal this prints nothing: the caller reports
+    // that once, with its own paths, and a per-row command would imply the
+    // grant could take effect when it cannot. This report only ever
+    // attributes a refusal to the row itself.
+    let runtime = egress_runtime_inputs(config);
+    if deployment_rejection(&runtime).is_some() {
+        return Ok(Vec::new());
+    }
+
+    let mut lines = Vec::new();
+    for row in instance_rows(config, manifest)? {
+        lines.extend(instance_row_egress_gap_lines(
+            config, manifest, &row, &runtime,
+        ));
+    }
+    Ok(lines)
+}
+
+/// [`egress_grant_gap_lines`] for one instance row, under an accepted
+/// deployment. The channel readiness report prints it for its own row, so
+/// `plugin bind`, `plugin install --channel-alias` and `plugin list` report
+/// that row in the same words.
+#[cfg(feature = "plugins-wasm")]
+fn instance_row_egress_gap_lines(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+    row: &crate::plugins::channel_instance::PluginInstanceRow,
+    runtime: &crate::plugins::egress_ceremony::EgressRuntimeInputs,
+) -> Vec<String> {
+    use crate::plugins::channel_instance::{declared_hosts_for_row, row_has_usable_transport};
+    use crate::plugins::egress_ceremony::{plan_egress_gap, resolve_grant_state};
+
+    // Each row applies its own transport rule: `http_client` for the
+    // default tool binding, any governed transport for a channel row. A
+    // row whose transport cannot use a declaration is skipped, as a tool
+    // package without `http_client` always was.
+    if !row_has_usable_transport(manifest, row) {
+        return Vec::new();
+    }
+    let package = manifest.name.as_str();
+    let row_names: Vec<String> = config
+        .plugins
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    let declared = declared_hosts_for_row(manifest, row);
+    // An absent row with a declaration gets a `config patch` repair that
+    // creates it, and `config patch` refuses an alias outside the config alias
+    // grammar, so such an alias gets the line that names the table to rename
+    // in its place, as in the instance's readiness report. With nothing
+    // declared there is no repair to print, for any alias.
+    if row.is_channel()
+        && !declared.is_empty()
+        && !row_names.contains(&row.key)
+        && let Some(line) = invalid_alias_row_missing_line(&row.binding)
+    {
+        return vec![format!("  {line}")];
+    }
+    // The names a pre-typed-config row could carry for this instance: the
+    // package name for the default tool binding, none for a channel row.
+    let legacy_candidates = row.legacy_candidates(package);
+    // `resolve_grant_state` answers the two questions this diagnostic must
+    // keep apart — what the runtime enforces (the canonical `zpi1_` row,
+    // and only that) versus what the operator authored (which, on a
+    // pre-typed-config install, is stranded on a package-name row the
+    // runtime never reads). `plan_egress_gap` turns the answer into the
+    // report, asking the runtime's own policy constructor whether it
+    // accepts the row; this function only renders the plan.
+    let state = resolve_grant_state(&row.key, &legacy_candidates, &row_names, |name| {
+        config.plugins.entry_egress(name)
+    });
+    render_egress_gap_plan(
+        &row.display_name(package),
+        &row.key,
+        &plan_egress_gap(
+            egress_command_config_dir(config),
+            &row.key,
+            &declared,
+            &state,
+            runtime,
+        ),
+    )
+}
+
+/// Render one instance's plan as the lines `plugin list` prints. Shared with
+/// the install-time existing-row report through the two line helpers below,
+/// so both surfaces describe a refused row in exactly the same words.
+///
+/// `package` is the name printed for the instance: the bare package for the
+/// default tool binding, `package (plugin.<alias>)` for a channel row. Only a
+/// tool row can be stranded on a legacy row, so the migration lines, which
+/// print `zeroclaw plugin info {$name}`, always receive a bare package.
+#[cfg(feature = "plugins-wasm")]
+fn render_egress_gap_plan(
+    package: &str,
+    instance_key: &str,
+    plan: &crate::plugins::egress_ceremony::EgressGapPlan,
+) -> Vec<String> {
+    use crate::plugins::egress_ceremony::EgressGapPlan;
+    let mut lines = Vec::new();
+    match plan {
+        EgressGapPlan::Nothing => {}
+        EgressGapPlan::Grant {
+            missing,
+            rejected,
+            repair_incomplete,
+            command,
+            ..
+        } => {
+            if let Some(reason) = rejected {
+                // The runtime refuses the row as it stands, so every request
+                // is denied. The command is the repair, because it carries
+                // only the entries the runtime accepts.
+                lines.push(egress_invalid_grant_line(package, reason, command));
+            }
+            if !missing.is_empty() {
+                let hosts = missing.join(", ");
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-gap",
+                        &[("name", package), ("hosts", &hosts), ("command", command)],
+                        "This plugin declares destinations its entry does not grant."
+                    )
+                ));
+            }
+            if let Some(reason) = repair_incomplete {
+                lines.push(egress_repair_incomplete_line(package, reason, instance_key));
+            }
+        }
+        EgressGapPlan::Migrate {
+            legacy_row,
+            missing,
+            rejected,
+            repair_incomplete,
+            grant: Some(command),
+            ..
+        } => {
+            // Something still has to change after the rename — an uncovered
+            // destination, a row the runtime refuses, or both — so this is the
+            // numbered two-step: rename first so the grant command addresses a
+            // row that exists. Neither headline carries the command, because
+            // it only resolves after the rename.
+            if let Some(reason) = rejected {
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-invalid-grant-legacy",
+                        &[("name", package), ("reason", reason)],
+                        "The runtime rejects this plugin's egress grant, and its grant is \
+                         still on a legacy config row."
+                    )
+                ));
+            }
+            if !missing.is_empty() {
+                let hosts = missing.join(", ");
+                lines.push(format!(
+                    "  {}",
+                    ta(
+                        "cli-plugin-egress-gap-legacy",
+                        &[("name", package), ("hosts", &hosts)],
+                        "This plugin declares destinations its entry does not grant, and \
+                         its grant is still on a legacy config row."
+                    )
+                ));
+            }
+            lines.push(format!(
+                "    {}",
+                ta(
+                    "cli-plugin-egress-migrate-step",
+                    &[
+                        ("name", package),
+                        ("legacy", legacy_row),
+                        ("key", instance_key),
+                    ],
+                    "1) migrate the row: rename it to the instance key, then save."
+                )
+            ));
+            lines.push(format!(
+                "    {}",
+                ta(
+                    "cli-plugin-egress-grant-step",
+                    &[("command", command)],
+                    "2) grant the destinations with the printed command."
+                )
+            ));
+            if let Some(reason) = repair_incomplete {
+                lines.push(egress_repair_incomplete_line(package, reason, instance_key));
+            }
+        }
+        EgressGapPlan::Migrate {
+            legacy_row,
+            grant: None,
+            ..
+        } => {
+            // The rename alone yields a row the runtime accepts that covers the
+            // declaration: no grant command is offered, because one would only
+            // replace a list the operator already has right.
+            lines.push(format!(
+                "  {}",
+                ta(
+                    "cli-plugin-egress-legacy-inert",
+                    &[
+                        ("name", package),
+                        ("legacy", legacy_row),
+                        ("key", instance_key),
+                    ],
+                    "This plugin's egress grant is on a legacy config row the runtime does \
+                     not read; rename the row to the instance key to put it in effect."
+                )
+            ));
+        }
+    }
+    lines
+}
+
+/// What [`stage_plugin_config_entries`] staged for the save that follows it.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug, Default)]
+struct StagedPluginConfigEntries {
+    /// Rows this install created and marked dirty.
+    created: Vec<String>,
+    /// Rows that already existed. Nothing about them was written.
+    existing: Vec<String>,
+    /// The canonical declaration each created row was granted.
+    granted: Vec<String>,
+}
+
+/// Stage `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
+/// default instance keys, carrying the manifest's declared egress destinations
+/// into each row this call creates. `config set
+/// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
+/// resolution, which only matches entries already present in live config.
+/// Idempotent: existing entries and operator values remain untouched — an
+/// existing row's `egress_hosts` is reported against, never rewritten.
+/// A pre-typed-config row keyed by the package name is unsupported beta state:
+/// refuse before creating a canonical row and print the same ordered update
+/// guidance as `plugin list` — including its rule that a deployment-wide
+/// refusal is reported once, on its own, with no row steps that could not
+/// take effect. The operator's old row remains untouched.
+///
+/// Nothing is saved here. The created rows are marked dirty for the caller's
+/// one `save_dirty`, which `plugin install --channel-alias` shares with the
+/// channel instance it binds, and [`report_seeded_plugin_config_entries`]
+/// prints the outcome once that save has succeeded.
+#[cfg(feature = "plugins-wasm")]
+fn stage_plugin_config_entries(
+    config: &mut crate::config::schema::Config,
+    package: &str,
+    entries: &[(zeroclaw::plugins::PluginCapability, String)],
+    declared_egress: &[String],
+) -> Result<StagedPluginConfigEntries> {
+    if entries.is_empty() {
+        return Ok(StagedPluginConfigEntries::default());
+    }
+
     let whole_config_degraded = config
         .degraded_security
         .iter()
         .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
     if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
-        eprintln!(
+        for (_, instance_key) in entries {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-plugin-config-entry-seed-skipped",
+                    &[("name", instance_key)],
+                    "warning: skipped seeding the plugin config entry: the \
+                     [plugins] section on disk is malformed. Repair it, add \
+                     `[[plugins.entries]]` with the instance key, then set values \
+                     with `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+                )
+            );
+        }
+        return Ok(StagedPluginConfigEntries::default());
+    }
+
+    let mut created = Vec::new();
+    let mut existing = Vec::new();
+    let legacy_candidates = [package.to_string()];
+    for (_, instance_key) in entries {
+        let row_names: Vec<String> = config
+            .plugins
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let state = crate::plugins::egress_ceremony::resolve_grant_state(
+            instance_key,
+            &legacy_candidates,
+            &row_names,
+            |row| config.plugins.entry_egress(row),
+        );
+        if matches!(
+            state,
+            crate::plugins::egress_ceremony::EgressGrantState::Stranded { .. }
+        ) {
+            // Same contract as `plugin list` and the existing-row report: under
+            // a deployment-wide refusal no per-row command can take effect, so
+            // the refusal is reported once, with its own paths, and the
+            // rename-then-grant steps wait until it is fixed. The install is
+            // still refused: the stranded row is unsupported state either way.
+            if let Some(line) = egress_deployment_gap_line(config) {
+                anyhow::bail!("{line}");
+            }
+            let plan = crate::plugins::egress_ceremony::plan_egress_gap(
+                egress_command_config_dir(config),
+                instance_key,
+                declared_egress,
+                &state,
+                &egress_runtime_inputs(config),
+            );
+            let guidance = render_egress_gap_plan(package, instance_key, &plan);
+            anyhow::bail!("{}", guidance.join("\n"));
+        }
+        if config
+            .create_map_key("plugins.entries", instance_key)
+            .map_err(anyhow::Error::msg)?
+        {
+            config.mark_dirty(&format!("plugins.entries.{instance_key}"));
+            created.push(instance_key.clone());
+        } else {
+            existing.push(instance_key.clone());
+        }
+    }
+
+    // Seed the declaration into the rows just created, before the save, so the
+    // grant lands through the same dirty-path persistence the entry itself
+    // uses — one row per instance carrying both `config` and `egress_hosts`.
+    // `egress_hosts` is a plaintext sibling of the `#[secret]` `config` map, so
+    // `encrypt_secrets` leaves it readable in the file the operator audits
+    // (asserted by `seeded_egress_is_written_plaintext_beside_encrypted_config`).
+    let granted = crate::plugins::egress_ceremony::canonical_hosts(declared_egress);
+    if !granted.is_empty() {
+        for instance_key in &created {
+            config
+                .set_prop(
+                    &crate::plugins::egress_ceremony::egress_hosts_path(instance_key),
+                    &granted.join(","),
+                )
+                .with_context(|| {
+                    format!("failed to seed the declared egress allowlist for '{package}'")
+                })?;
+        }
+    }
+
+    Ok(StagedPluginConfigEntries {
+        created,
+        existing,
+        granted,
+    })
+}
+
+/// Print what [`stage_plugin_config_entries`] staged, once the save has
+/// succeeded, in the order install has always printed it: each created row
+/// with the grant it was given, then the rows that already existed.
+#[cfg(feature = "plugins-wasm")]
+fn report_seeded_plugin_config_entries(
+    config: &crate::config::schema::Config,
+    package: &str,
+    staged: &StagedPluginConfigEntries,
+    declared_egress: &[String],
+) {
+    for instance_key in &staged.created {
+        println!(
             "{}",
             ta(
-                "cli-plugin-config-entry-seed-skipped",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the \
-                 [plugins] section on disk is malformed. Repair it, add \
-                 `[[plugins.entries]]` with the plugin name, then set values \
-                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
+                "cli-plugin-config-entry-seeded",
+                &[("name", instance_key)],
+                "Seeded config entry. Set plugin config values with \
+                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
             )
         );
-        return Ok(());
-    }
-    if plugin_name.is_empty() || plugin_name.contains('.') {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seed-unaddressable",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the plugin \
-                 name cannot be addressed by a dotted config path. Add a \
-                 `[[plugins.entries]]` block to the config file by hand."
-            )
+        print_egress_grant_ceremony(
+            egress_command_config_dir(config),
+            package,
+            instance_key,
+            &staged.granted,
         );
-        return Ok(());
     }
-    let created = config
-        .create_map_key("plugins.entries", plugin_name)
-        .map_err(anyhow::Error::msg)?;
-    if !created {
-        return Ok(());
+
+    // Rows that already existed — an upgrade, a reinstall, or an
+    // operator-authored row. Never auto-extend: report the difference
+    // and leave `egress_hosts` exactly as the operator left it. A
+    // deployment-wide refusal is reported once, here, and the per-row report
+    // then stays silent for the same reason `plugin list` does.
+    if !staged.existing.is_empty()
+        && let Some(line) = egress_deployment_gap_line(config)
+    {
+        println!("{line}");
     }
-    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
-    Box::pin(config.save_dirty()).await?;
-    println!(
-        "{}",
-        ta(
-            "cli-plugin-config-entry-seeded",
-            &[("name", plugin_name)],
-            "Seeded config entry. Set plugin config values with \
-             `zeroclaw config set plugins.entries.<name>.config.<key>`."
+    for instance_key in &staged.existing {
+        report_existing_egress_grant(config, package, instance_key, declared_egress);
+    }
+}
+
+/// Publish a plugin and seed its config entries as one transaction.
+///
+/// `host.install_admitted` either performs a *fresh publish* — copying the package into
+/// the plugins directory and inserting it into the loaded set — or, when the
+/// package is already loaded, fails with `AlreadyLoaded` *before* copying
+/// anything. So the only half-installed window is a fresh publish whose config
+/// seeding then fails: the package is on disk and in the loaded set, yet the
+/// command reports an error and a naive retry would hit `AlreadyLoaded`,
+/// forcing a manual removal.
+///
+/// This closes that window. On any failure after a fresh publish the
+/// just-published package is rolled back with `host.remove` — the same removal
+/// `plugin remove` performs — so the plugins directory and the loaded set are
+/// left clean and a retry is a normal fresh install. The original seeding error
+/// is preserved and returned; if the rollback itself fails, both errors are
+/// surfaced and the package is left in place with a manual-removal instruction,
+/// never silently swallowed.
+///
+/// `announce_installed` prints the call site's own "installed" message once the
+/// publish *and* the seeding have both succeeded, so the two install paths keep
+/// their distinct user-facing text and a rolled-back install never reports
+/// success first. The seeded rows' report comes before it, as it always has.
+///
+/// With `channel`, the same transaction binds a channel instance of the
+/// package, exactly as `plugin bind` does: the tool rows are staged, the
+/// binding and its row are planned against the published manifest and
+/// applied, and one `save_dirty` persists them together, so a failure anywhere
+/// rolls the package back with nothing persisted. Without one, a package that
+/// provides a channel still binds nothing.
+///
+/// Returns the channel lines the caller prints after the announcement. With
+/// `channel`: the binding report and readiness, then the line for each other
+/// bound alias no instance can be named by. Without one: the readiness of
+/// each alias that already binds the package, or, when none does, the lines
+/// naming the commands that bind an instance. A package without the channel
+/// capability returns none, so a tool install prints exactly what it always
+/// has.
+#[cfg(feature = "plugins-wasm")]
+async fn publish_and_seed_plugin(
+    host: &mut zeroclaw::plugins::host::PluginHost,
+    config: &mut crate::config::schema::Config,
+    admitted: zeroclaw::plugins::host::AdmittedSource,
+    channel: Option<ChannelBindingRequest>,
+    announce_installed: impl FnOnce(&str),
+) -> Result<Vec<String>> {
+    use crate::plugins::channel_instance::{
+        apply_channel_binding, declared_hosts_for_row, instance_rows, plan_channel_binding,
+        unkeyed_channel_aliases,
+    };
+
+    // A fresh publish: the package is now on disk and in the loaded set. An
+    // already-present package fails here, before any copy, so nothing past this
+    // point ever runs against a package this call did not itself publish.
+    let name = host.install_admitted(admitted)?;
+
+    let seed_result: Result<Vec<String>> = async {
+        let manifest = host
+            .manifest(&name)
+            .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+        let rows = instance_rows(config, manifest)?;
+        // The default tool binding's declaration, under that row's own
+        // transport rule.
+        let declared = rows
+            .iter()
+            .find(|row| !row.is_channel())
+            .map(|row| declared_hosts_for_row(manifest, row))
+            .unwrap_or_default();
+        let staged =
+            stage_plugin_config_entries(config, &name, &tool_binding_entries(rows), &declared)?;
+        let binding = match &channel {
+            Some(request) => {
+                let plan = plan_channel_binding(config, manifest, &request.alias, request.egress)
+                    .map_err(|refusal| {
+                    anyhow::Error::msg(binding_refusal_line(&name, &request.alias, &refusal))
+                })?;
+                apply_channel_binding(config, &name, &plan)?;
+                Some((plan, request.egress))
+            }
+            None => None,
+        };
+        if !staged.created.is_empty()
+            || binding
+                .as_ref()
+                .is_some_and(|(plan, _)| plan.writes_config())
+        {
+            Box::pin(config.save_dirty()).await?;
+        }
+        // Reports only from here on: nothing past the save may fail, or the
+        // rollback would remove a package whose config is already saved. The
+        // seeded rows are reported first, as install has always printed them.
+        report_seeded_plugin_config_entries(config, &name, &staged, &declared);
+        // Only now is the install committed: a seed refusal below rolls the
+        // publish back, and an install that is about to be undone must never
+        // have announced success.
+        announce_installed(&name);
+        Ok(match &binding {
+            // The requested alias passed the alias grammar, so no other
+            // binding's skip line can be about it.
+            Some((plan, decision)) => {
+                let mut lines =
+                    channel_binding_report_lines(config, host, manifest, plan, *decision);
+                lines.extend(
+                    unkeyed_channel_aliases(config, manifest)
+                        .iter()
+                        .map(|(alias, reason)| unkeyed_alias_line(&name, alias, reason)),
+                );
+                lines
+            }
+            // Bindings that already name the package, such as those a
+            // `plugin remove` left behind, now bind this install and its rows
+            // to their aliases, so each one's readiness is reported, as
+            // `plugin info` reports it. Only with none bound is the hint
+            // printed.
+            None => {
+                let readiness = bound_channel_readiness(config, host, manifest);
+                if readiness.is_empty() {
+                    channel_bind_hint_lines(config, manifest)
+                } else {
+                    readiness.into_iter().flat_map(|(_, lines)| lines).collect()
+                }
+            }
+        })
+    }
+    .await;
+
+    let seed_err = match seed_result {
+        Ok(channel_lines) => return Ok(channel_lines),
+        Err(seed_err) => seed_err,
+    };
+
+    // Seeding failed after a fresh publish: undo the publish so the state is
+    // clean and the operator can simply re-run the install.
+    match host.remove(&name) {
+        Ok(()) => Err(seed_err.context(format!(
+            "the plugin package '{name}' was rolled back after its configuration \
+             could not be seeded; re-run the install once the cause above is resolved"
+        ))),
+        Err(rollback_err) => Err(seed_err.context(format!(
+            "the plugin package '{name}' could not be seeded and rolling it back \
+             ALSO failed ({rollback_err}); the package is still installed — remove \
+             it with `zeroclaw plugin remove {name}` before retrying"
+        ))),
+    }
+}
+
+/// `plugin install --channel-alias <alias> [--egress declared|none]`: the
+/// channel instance to bind in the install transaction, and the decision on
+/// its new row's declared destinations.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug, Clone)]
+struct ChannelBindingRequest {
+    alias: String,
+    egress: Option<crate::plugins::channel_instance::EgressDecision>,
+}
+
+/// Install an admitted source: refuse a channel request the binding ceremony
+/// would refuse, run the install-time load check, then publish and seed as one
+/// transaction ([`publish_and_seed_plugin`]).
+///
+/// The channel refusal comes first, before the load check and before anything
+/// is published, so it leaves nothing to roll back. It includes the refusal
+/// of a config file on an older schema, as `plugin bind` refuses it. The plan
+/// is made again inside the transaction against the published manifest,
+/// which is the one admitted here, so the two agree.
+#[cfg(feature = "plugins-wasm")]
+async fn install_admitted_source(
+    host: &mut zeroclaw::plugins::host::PluginHost,
+    config: &mut crate::config::schema::Config,
+    admitted: zeroclaw::plugins::host::AdmittedSource,
+    channel: Option<ChannelBindingRequest>,
+    limits: zeroclaw::plugins::component::PluginLimits,
+    no_verify: bool,
+    announce_installed: impl FnOnce(&str),
+) -> Result<Vec<String>> {
+    if let Some(request) = &channel {
+        crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+        let manifest = admitted.manifest();
+        crate::plugins::channel_instance::plan_channel_binding(
+            config,
+            manifest,
+            &request.alias,
+            request.egress,
         )
-    );
-    Ok(())
+        .map_err(|refusal| {
+            anyhow::Error::msg(binding_refusal_line(
+                &manifest.name,
+                &request.alias,
+                &refusal,
+            ))
+        })?;
+    }
+    verify_plugin_loads_or_bail(&admitted, limits, no_verify).await?;
+    Box::pin(publish_and_seed_plugin(
+        host,
+        config,
+        admitted,
+        channel,
+        announce_installed,
+    ))
+    .await
 }
 
 #[derive(Subcommand, Debug)]
@@ -2962,6 +5935,1090 @@ enum SecurityCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Issue a client certificate from the daemon's mTLS CA for connecting over WSS.
+    ///
+    /// Reads the per-daemon CA at `<data_dir>/tls/ca.{crt,key}` (auto-generated on
+    /// first run when `[wss]` is enabled) and writes a `clientAuth` certificate +
+    /// key that zerocode (or any client) can present to the mutually-authenticated
+    /// WSS plane.
+    IssueClientCert {
+        /// Subject/device identity stamped into the certificate (CN).
+        #[arg(long, default_value = "zerocode")]
+        name: String,
+
+        /// Directory to write the certificate / key. Defaults to `<data_dir>/tls`.
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+
+        /// Overwrite an existing certificate/key for this name.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Revoke an issued client certificate so the daemon refuses it at the next
+    /// WSS handshake (threat A5). The revoke is written to the issued-cert ledger,
+    /// which materializes `<data_dir>/tls/revoked` for the verifier - no daemon
+    /// restart needed. Identify the cert by `--fingerprint` (its SHA-256 hex) or
+    /// `--device` (revokes every active cert that device holds).
+    RevokeClientCert {
+        /// SHA-256 fingerprint (hex) of the certificate to revoke.
+        #[arg(long, conflicts_with = "device", required_unless_present = "device")]
+        fingerprint: Option<String>,
+
+        /// Device id whose active certificates should ALL be revoked.
+        #[arg(
+            long,
+            conflicts_with = "fingerprint",
+            required_unless_present = "fingerprint"
+        )]
+        device: Option<String>,
+    },
+
+    /// List the still-active client certificates issued by this daemon's CA
+    /// (device id, fingerprint, validity) by reading the issued-cert ledger.
+    ListClientCerts {
+        /// Emit machine-readable JSON instead of a text table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Ask the running daemon to mint another enrollment pairing code.
+    ///
+    /// This adds another browser/zerocode device without restarting the daemon.
+    /// It is a local operator command: the request is exchanged through the
+    /// daemon's data dir, not through the public enrollment route.
+    EnrollPaircode {
+        /// Mint a new one-time enrollment code.
+        #[arg(long)]
+        new: bool,
+
+        /// Seconds to wait for the running daemon to answer.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
+
+    /// Request an on-demand relay node-id rotation. The running daemon mints a
+    /// fresh id, registers it alongside the old one for a grace window, then
+    /// retires the old id; the new id reaches clients in-band on their next
+    /// certificate renewal. Only applies when `[relay].node_id` is auto-minted.
+    RelayRotateNodeId,
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum RelayCommands {
+    /// Claim this daemon into your ZeroRelay account with a one-time token.
+    ///
+    /// Derives the daemon's relay-registration identity, proves control of it
+    /// with an Ed25519 signature over the claim token, and POSTs the proof to the
+    /// control plane's `/v1/claim` endpoint. On success it writes `[relay]`
+    /// (enabled, url, node-id) so the daemon registers against the now-allowlisted
+    /// relay on its next start. The signing key is the same one the daemon
+    /// registers with, so the fingerprint proven here is the one the relay admits.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Claim this daemon into your ZeroRelay account with a one-time token.
+
+Derives the daemon's relay-registration identity, signs the claim token with it, \
+and POSTs the proof to the control plane. On success, writes [relay] so the daemon \
+registers against the relay on next start.
+
+Examples:
+  zeroclaw relay claim clm_XXXX --control https://control.zerorelay.net")]
+    Claim {
+        /// One-time claim token issued by your ZeroRelay account.
+        token: String,
+
+        /// Control-plane base URL, e.g. https://control.zerorelay.net.
+        #[arg(long)]
+        control: String,
+    },
+}
+
+/// Issue a WSS client certificate signed by the daemon's per-daemon mTLS CA.
+/// CA private-key at-rest protection sourced from the environment (decision:
+/// opt-in passphrase, 0600 floor; threat A4). `ZEROCLAW_CA_PASSPHRASE` (or a file
+/// referenced by `ZEROCLAW_CA_PASSPHRASE_FILE`) enables scrypt + XChaCha20-Poly1305
+/// encryption of the CA key at rest; unset keeps the plaintext-0600 default so
+/// zero-config and headless bring-up are unaffected. The daemon sources it
+/// identically at CA generation (the WSS path) and at every CA read (enrollment
+/// + this CLI), so the on-disk form always matches.
+#[cfg(feature = "agent-runtime")]
+fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
+    zeroclaw_tls::CaKeyProtection::from_env()
+}
+
+/// Resolve the WSS mTLS policy without conflating the auto-CA and BYO-CA modes.
+///
+/// The WSS plane is always mTLS. `enabled` controls only whether the configured
+/// CA replaces the daemon-generated CA; certificate pins apply in either mode.
+#[cfg(feature = "agent-runtime")]
+fn resolve_wss_client_auth(
+    client_auth: Option<&zeroclaw_config::schema::WssClientAuthConfig>,
+) -> Result<(Option<String>, Vec<String>)> {
+    if let Some(config) = client_auth
+        && !config.ca_cert_path.is_empty()
+        && !config.enabled
+    {
+        anyhow::bail!(
+            "[wss.client_auth].ca_cert_path is set but [wss.client_auth].enabled is false. \
+             Set enabled = true to use your CA, or clear ca_cert_path to auto-generate one."
+        );
+    }
+
+    let pinned = client_auth
+        .map(|config| config.pinned_certs.clone())
+        .unwrap_or_default();
+    let byo_ca = client_auth
+        .and_then(zeroclaw_config::schema::WssClientAuthConfig::external_ca_path)
+        .map(str::to_string);
+    Ok((byo_ca, pinned))
+}
+
+#[cfg(feature = "agent-runtime")]
+/// Server-certificate SANs shared by the WSS listener and the enrollment
+/// endpoint: `localhost`/`127.0.0.1`, the operator's `[wss].sans`, then
+/// `tailnet_sans` (resolved by `zeroclaw_runtime::tunnel::tailscale_server_sans`).
+/// Empty when there is nothing beyond the defaults, which keeps the
+/// default-SAN leaf reuse path in `ensure_server_materials_protected`.
+fn wss_server_sans(
+    wss_cfg: &zeroclaw_config::schema::WssConfig,
+    tailnet_sans: &[String],
+) -> Vec<String> {
+    if wss_cfg.sans.is_empty() && tailnet_sans.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    sans.extend(
+        wss_cfg
+            .sans
+            .iter()
+            .chain(tailnet_sans)
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+    );
+    sans
+}
+
+#[cfg(feature = "agent-runtime")]
+/// The server-certificate SAN set for one daemon generation (one pass of the
+/// config-reload loop), shared by the WSS listener and the enrollment endpoint.
+///
+/// Both listeners materialize the same `<data_dir>/tls/server.*` leaf and each
+/// loads it into its own TLS acceptor, so they must agree on its SANs. The
+/// tailnet identity is therefore resolved once per generation and every
+/// listener receives that one answer; resolving it per listener let two
+/// `tailscale status` queries disagree (one failing, or a rename in between)
+/// and leave the listeners serving different leaves. A reload builds a fresh
+/// value, so a renamed node or reassigned tailnet IP is picked up then. This
+/// is the materialization the acceptors consume, not a second copy of config:
+/// the inputs are still read from live config and tailscaled at startup.
+#[derive(Clone, Default)]
+struct DaemonServerTls {
+    sans: Arc<tokio::sync::OnceCell<Vec<String>>>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl DaemonServerTls {
+    /// Generate or reuse the server leaf under `tls_dir` with this
+    /// generation's SAN set. `discover` runs only for the first listener to
+    /// get here; later listeners reuse its outcome.
+    async fn materialize<F, Fut>(
+        &self,
+        tls_dir: &Path,
+        wss_cfg: &zeroclaw_config::schema::WssConfig,
+        protection: &zeroclaw_tls::CaKeyProtection,
+        discover: F,
+    ) -> Result<zeroclaw_tls::ServerMaterials>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = zeroclaw_runtime::tunnel::TailnetSans>,
+    {
+        let sans = self
+            .sans
+            .get_or_try_init(|| async { effective_server_sans(tls_dir, wss_cfg, discover().await) })
+            .await?;
+        zeroclaw_tls::ensure_server_materials_protected(tls_dir, sans, protection)
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+/// The SAN set to request for the server leaf given the tailnet outcome.
+///
+/// When tailscaled cannot be queried the tailnet names are unknown, not
+/// absent, so the result never drops a name the existing leaf carries: it is
+/// the configured set plus every name already on the leaf. Configured
+/// additions still apply; a configured removal waits for the next start that
+/// can query tailscaled. An empty result keeps the generator's reuse path.
+fn effective_server_sans(
+    tls_dir: &Path,
+    wss_cfg: &zeroclaw_config::schema::WssConfig,
+    tailnet: zeroclaw_runtime::tunnel::TailnetSans,
+) -> Result<Vec<String>> {
+    use zeroclaw_runtime::tunnel::TailnetSans;
+    match tailnet {
+        TailnetSans::NotApplicable => Ok(wss_server_sans(wss_cfg, &[])),
+        TailnetSans::Resolved(names) => Ok(wss_server_sans(wss_cfg, &names)),
+        TailnetSans::Unavailable { hostname_override } => {
+            let known: Vec<String> = hostname_override.into_iter().collect();
+            let mut sans = wss_server_sans(wss_cfg, &known);
+            let existing = zeroclaw_tls::server_leaf_sans(tls_dir)
+                .context("reading the existing WSS server certificate's SANs")?;
+            if let Some(existing) = existing
+                && !sans.is_empty()
+            {
+                for name in existing {
+                    if !sans.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                        sans.push(name);
+                    }
+                }
+            }
+            Ok(sans)
+        }
+    }
+}
+
+#[cfg(all(test, feature = "agent-runtime"))]
+mod wss_client_auth_tests {
+    use super::*;
+
+    #[test]
+    fn auto_ca_honors_configured_client_certificate_pins() {
+        let auth = zeroclaw_config::schema::WssClientAuthConfig {
+            pinned_certs: vec!["a".repeat(64)],
+            ..Default::default()
+        };
+
+        let (byo_ca, pinned) = resolve_wss_client_auth(Some(&auth)).expect("valid auto-CA policy");
+        assert!(byo_ca.is_none(), "the daemon CA remains selected");
+        assert_eq!(
+            pinned, auth.pinned_certs,
+            "pins must reach the mTLS acceptor"
+        );
+    }
+
+    #[test]
+    fn disabled_byo_ca_is_rejected_before_listener_startup() {
+        let auth = zeroclaw_config::schema::WssClientAuthConfig {
+            ca_cert_path: "/etc/zeroclaw/client-ca.pem".into(),
+            ..Default::default()
+        };
+
+        let err =
+            resolve_wss_client_auth(Some(&auth)).expect_err("disabled BYO CA must fail closed");
+        assert!(err.to_string().contains("enabled is false"));
+    }
+
+    #[test]
+    fn wss_server_sans_adds_local_and_configured_sans() {
+        let cfg = zeroclaw_config::schema::WssConfig {
+            sans: vec!["relay.example.test".into(), " ".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            wss_server_sans(&cfg, &[]),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "relay.example.test".to_string(),
+            ]
+        );
+        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]).is_empty());
+    }
+
+    #[test]
+    fn wss_server_sans_appends_tailnet_names_after_configured_sans() {
+        let cfg = zeroclaw_config::schema::WssConfig {
+            sans: vec!["zero".into()],
+            ..Default::default()
+        };
+        let tailnet = vec![
+            "node.tail1234.ts.net".to_string(),
+            "100.101.102.103".to_string(),
+        ];
+
+        assert_eq!(
+            wss_server_sans(&cfg, &tailnet),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "zero".to_string(),
+                "node.tail1234.ts.net".to_string(),
+                "100.101.102.103".to_string(),
+            ]
+        );
+    }
+
+    use zeroclaw_runtime::tunnel::TailnetSans;
+
+    fn tailnet_names() -> Vec<String> {
+        vec![
+            "node.tail1234.ts.net".to_string(),
+            "node".to_string(),
+            "100.101.102.103".to_string(),
+        ]
+    }
+
+    fn wss_with_sans(sans: &[&str]) -> zeroclaw_config::schema::WssConfig {
+        zeroclaw_config::schema::WssConfig {
+            enabled: true,
+            sans: sans.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn leaf_fingerprint(tls_dir: &Path) -> String {
+        let der = zeroclaw_tls::load_certs(&tls_dir.join("server.crt").to_string_lossy())
+            .expect("server leaf");
+        zeroclaw_tls::cert_sha256_fingerprint(der[0].as_ref())
+    }
+
+    fn leaf_sans(tls_dir: &Path) -> Vec<String> {
+        zeroclaw_tls::server_leaf_sans(tls_dir)
+            .expect("read leaf")
+            .expect("leaf exists")
+    }
+
+    /// Run one listener's certificate step the way the WSS and enrollment
+    /// starters do, recording whether its discovery ran.
+    async fn materialize_as_listener(
+        shared: &DaemonServerTls,
+        tls_dir: &Path,
+        wss_cfg: &zeroclaw_config::schema::WssConfig,
+        outcome: TailnetSans,
+        calls: &std::sync::atomic::AtomicUsize,
+    ) -> zeroclaw_tls::ServerMaterials {
+        shared
+            .materialize(
+                tls_dir,
+                wss_cfg,
+                &zeroclaw_tls::CaKeyProtection::None,
+                || async {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    outcome
+                },
+            )
+            .await
+            .expect("materialize server TLS")
+    }
+
+    #[tokio::test]
+    async fn listeners_share_one_tailnet_resolution_when_queries_would_differ() {
+        // WSS and enrollment share one tailnet resolution. Here the second
+        // listener's query would fail where the first succeeded: both must
+        // still load the same leaf, and it must carry the tailnet names.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&[]);
+        let shared = DaemonServerTls::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let wss = materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let wss_leaf = leaf_fingerprint(&tls_dir);
+
+        let enroll = materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(wss.server_cert_path, enroll.server_cert_path);
+        assert_eq!(
+            wss_leaf,
+            leaf_fingerprint(&tls_dir),
+            "the second listener replaced the leaf the first one loaded"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} missing from {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn listeners_share_one_resolution_when_the_first_query_fails() {
+        // Opposite order on fresh TLS state: the first listener's query fails
+        // and a later one would succeed. Both listeners must load the same
+        // leaf instead of the second regenerating it under the first.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&[]);
+        let shared = DaemonServerTls::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+        let first = leaf_fingerprint(&tls_dir);
+        materialize_as_listener(
+            &shared,
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(first, leaf_fingerprint(&tls_dir));
+    }
+
+    #[tokio::test]
+    async fn tailnet_outage_keeps_names_the_existing_leaf_carries() {
+        // With configured SANs, a failed query must not regenerate the leaf
+        // without the previously discovered tailnet names.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        // Generation 1: tailscaled reachable.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let before = leaf_fingerprint(&tls_dir);
+
+        // Generation 2 (restart): tailscaled unreachable.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+
+        assert_eq!(
+            before,
+            leaf_fingerprint(&tls_dir),
+            "an outage must not regenerate the leaf"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    /// `tailscale status --json` as tailscaled reports it before receiving
+    /// its network map: exit status 0, OS hostname only, empty DNSName, null
+    /// TailscaleIPs, InNetworkMap false.
+    const NOT_READY_STATUS_JSON: &[u8] = br#"{
+        "BackendState": "Starting",
+        "Self": {
+            "HostName": "zcnode",
+            "DNSName": "",
+            "TailscaleIPs": null,
+            "InNetworkMap": false
+        }
+    }"#;
+
+    /// Discovery as production classifies a successful-but-not-ready status.
+    fn not_ready_status(hostname_override: Option<&str>) -> TailnetSans {
+        zeroclaw_runtime::tunnel::tailnet_sans_from_status(
+            Ok(zeroclaw_runtime::tunnel::parse_tailscale_self(
+                NOT_READY_STATUS_JSON,
+            )),
+            hostname_override.map(Into::into),
+        )
+    }
+
+    #[tokio::test]
+    async fn status_before_network_map_keeps_names_the_existing_leaf_carries() {
+        // A successful status with an empty identity is "not known yet"; with
+        // configured SANs it must not regenerate the leaf without its tailnet
+        // names, for either listener sharing this generation.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        // Generation 1: tailscaled ready.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+        let before = leaf_fingerprint(&tls_dir);
+
+        // Generation 2 (restart): tailscaled answers before its network map.
+        let shared = DaemonServerTls::default();
+        let wss =
+            materialize_as_listener(&shared, &tls_dir, &wss_cfg, not_ready_status(None), &calls)
+                .await;
+        let enroll =
+            materialize_as_listener(&shared, &tls_dir, &wss_cfg, not_ready_status(None), &calls)
+                .await;
+
+        assert_eq!(wss.server_cert_path, enroll.server_cert_path);
+        assert_eq!(
+            before,
+            leaf_fingerprint(&tls_dir),
+            "a not-ready status must not regenerate the leaf"
+        );
+        let sans = leaf_sans(&tls_dir);
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn status_before_network_map_with_override_keeps_discovered_names() {
+        // With a hostname override the not-ready path must keep the
+        // previously discovered names alongside it, not just the override.
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let wss_cfg = wss_with_sans(&["zero"]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_cfg,
+            not_ready_status(Some("zero.tail1234.ts.net")),
+            &calls,
+        )
+        .await;
+
+        let sans = leaf_sans(&tls_dir);
+        assert!(
+            sans.contains(&"zero.tail1234.ts.net".to_string()),
+            "{sans:?}"
+        );
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tailnet_outage_applies_configured_additions_without_stripping() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls_dir = dir.path().join("tls");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_with_sans(&["zero"]),
+            TailnetSans::Resolved(tailnet_names()),
+            &calls,
+        )
+        .await;
+
+        // Operator adds a SAN while tailscaled is down.
+        materialize_as_listener(
+            &DaemonServerTls::default(),
+            &tls_dir,
+            &wss_with_sans(&["zero", "shard"]),
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+            &calls,
+        )
+        .await;
+
+        let sans = leaf_sans(&tls_dir);
+        assert!(sans.contains(&"shard".to_string()), "{sans:?}");
+        for name in tailnet_names() {
+            assert!(sans.contains(&name), "{name} stripped: {sans:?}");
+        }
+    }
+
+    #[test]
+    fn effective_server_sans_on_fresh_state_outage_uses_known_names() {
+        // No leaf yet and tailscaled down: only names known without it -
+        // loopback, [wss].sans, and the hostname override.
+        let dir = tempfile::tempdir().unwrap();
+        let sans = effective_server_sans(
+            dir.path(),
+            &wss_with_sans(&[]),
+            TailnetSans::Unavailable {
+                hostname_override: Some("zero.tail1234.ts.net".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(sans, vec!["localhost", "127.0.0.1", "zero.tail1234.ts.net"]);
+        // Default config, nothing known: empty keeps the default leaf path.
+        assert!(
+            effective_server_sans(
+                dir.path(),
+                &wss_with_sans(&[]),
+                TailnetSans::Unavailable {
+                    hostname_override: None
+                },
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn wss_server_sans_tailnet_names_alone_still_keep_loopback() {
+        // No [wss].sans: tailnet names must not drop localhost/127.0.0.1,
+        // which local clients and the relay bridge dial.
+        let tailnet = vec!["node.tail1234.ts.net".to_string()];
+        assert_eq!(
+            wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &tailnet),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "node.tail1234.ts.net".to_string(),
+            ]
+        );
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn issue_wss_client_cert(
+    config: &Config,
+    name: &str,
+    out_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
+    let tls_dir = config.data_dir.join("tls");
+    let ca_cert = tls_dir.join("ca.crt");
+    let ca_key = tls_dir.join("ca.key");
+    if !ca_cert.exists() || !ca_key.exists() {
+        anyhow::bail!(
+            "no daemon mTLS CA found at {}. Start the daemon once with [wss] enabled to \
+             auto-generate it, or configure a bring-your-own CA.",
+            tls_dir.display()
+        );
+    }
+
+    // Per-device file names so issuing certs for multiple devices does not clobber.
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let has_out_dir = out_dir.is_some();
+    let dest = out_dir.unwrap_or(tls_dir);
+    let cert_path = dest.join(format!("client-{slug}.crt"));
+    let key_path = dest.join(format!("client-{slug}.key"));
+    let cert_tmp_path = dest.join(format!(".client-{slug}.crt.tmp"));
+    let key_tmp_path = dest.join(format!(".client-{slug}.key.tmp"));
+    if !force && (cert_path.exists() || key_path.exists()) {
+        anyhow::bail!(
+            "{} already exists. Pass --force to overwrite, or --out-dir / --name for a new one.",
+            key_path.display()
+        );
+    }
+
+    let ca_cert_pem = std::fs::read_to_string(&ca_cert)?;
+    // Read the CA key honoring any at-rest passphrase, so an encrypted CA still
+    // signs from the CLI (the key never leaves this process).
+    let ca_key_pem = zeroclaw_tls::load_ca_key_pem(&ca_key, &ca_key_protection_from_env())?;
+    let issued = zeroclaw_tls::issue_client_cert(&ca_cert_pem, &ca_key_pem, name)?;
+
+    // Directory 0700, private key written 0600 atomically (no world-readable window).
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).ok();
+        }
+    }
+    std::fs::write(&cert_tmp_path, issued.cert_pem.as_bytes())
+        .with_context(|| format!("write staged certificate {}", cert_tmp_path.display()))?;
+    if let Err(e) = zeroclaw_tls::certgen::write_private_pem(&key_tmp_path, &issued.key_pem) {
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        return Err(e)
+            .with_context(|| format!("write staged private key {}", key_tmp_path.display()));
+    }
+
+    // Record the issuance in the daemon-owned ledger so this cert is revocable and
+    // appears in the canonical "who holds which cert" record (actor = operator).
+    //
+    // Deliberately BEFORE the staged files are published: a ledger this command
+    // could not write must not leave certificate material on disk, and an
+    // over-recorded credential is recoverable where an unrecorded one is not
+    // (see CertLedger::record_issued). The row is therefore active-but-
+    // undelivered until the renames below succeed.
+    use zeroclaw_runtime::security::cert_ledger::{
+        CertLedger, CertStatus, IssuanceActor, LedgerEntry,
+    };
+    let ledger_result = (|| -> Result<(CertLedger, String)> {
+        let fingerprint = zeroclaw_tls::single_cert_pem_sha256_fingerprint(&issued.cert_pem)
+            .context("parse staged issued certificate")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let ledger = CertLedger::open_at(&config.data_dir, None, effective_crl_path(config))?;
+        ledger.record_issued(
+            &LedgerEntry {
+                device_id: name.to_string(),
+                fingerprint: fingerprint.clone(),
+                not_before: now - 300,
+                not_after: now + 30 * 86_400,
+                status: CertStatus::Active,
+                token_hash: String::new(),
+                actor: IssuanceActor::Operator.label(),
+                issued_at: now,
+            },
+            false,
+        )?;
+        Ok((ledger, fingerprint))
+    })();
+    let (ledger, fingerprint) = match ledger_result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&cert_tmp_path);
+            let _ = std::fs::remove_file(&key_tmp_path);
+            return Err(e);
+        }
+    };
+
+    // Publication. A rename that fails leaves the ledger row undelivered, which
+    // is exactly what the undelivered sweep needs to see: the operator never
+    // got a usable pair, so the certificate is revoked at the next ledger open
+    // rather than sitting active forever for a credential nobody holds.
+    //
+    // Both failure paths name the STAGED path as well as the destination - the
+    // destination alone does not tell an operator which half of the operation
+    // got where - and clear the staged material, so a private key never
+    // survives a failed publish as a stray dotfile.
+    if let Err(e) = std::fs::rename(&key_tmp_path, &key_path).with_context(|| {
+        format!(
+            "publish private key {} from staged {}",
+            key_path.display(),
+            key_tmp_path.display()
+        )
+    }) {
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        let _ = std::fs::remove_file(&key_tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&cert_tmp_path, &cert_path).with_context(|| {
+        format!(
+            "publish certificate {} from staged {}",
+            cert_path.display(),
+            cert_tmp_path.display()
+        )
+    }) {
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        return Err(e);
+    }
+
+    // Published: the operator now holds both halves, so the credential is
+    // delivered. Marking BEFORE this point would have recorded a delivery the
+    // filesystem never made.
+    ledger.mark_delivered(&fingerprint).with_context(|| {
+        format!(
+            "record delivery of certificate {fingerprint}; the files were published but the \
+             ledger could not record it, so this certificate will be revoked as undelivered - \
+             re-issue it with --force"
+        )
+    })?;
+
+    // When issuing into a separate out-dir, also lay it out as a drop-in client
+    // `tls/` directory (ca.crt + client.crt + client.key). zerocode looks for
+    // exactly these names under its <config-dir>/tls, so a client that copies this
+    // directory needs no --tls-* flags at all.
+    if has_out_dir {
+        // The primary publish above already succeeded; a failure here must
+        // still fail the command loudly - reporting success while the drop-in
+        // directory is missing or stale hands the operator dead credentials.
+        std::fs::copy(&ca_cert, dest.join("ca.crt")).with_context(|| {
+            format!(
+                "copy ca.crt into {}; the primary credentials were issued but this \
+                 drop-in directory is incomplete - fix the directory and re-run with \
+                 --force, or copy the published files by hand",
+                dest.display()
+            )
+        })?;
+        std::fs::write(dest.join("client.crt"), issued.cert_pem.as_bytes()).with_context(|| {
+            format!(
+                "write client.crt into {}; the primary credentials were issued but \
+                 this drop-in directory is incomplete",
+                dest.display()
+            )
+        })?;
+        zeroclaw_tls::certgen::write_private_pem(&dest.join("client.key"), &issued.key_pem)
+            .with_context(|| {
+                format!(
+                    "write client.key into {}; the primary credentials were issued but \
+                     this drop-in directory is incomplete",
+                    dest.display()
+                )
+            })?;
+    }
+
+    let cert_path_display = cert_path.display().to_string();
+    let key_path_display = key_path.display().to_string();
+    let ca_cert_display = ca_cert.display().to_string();
+    println!(
+        "{}",
+        ta("cli-mtls-issued-client-cert", &[("name", name)], "issued")
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-cert-path",
+            &[("path", &cert_path_display)],
+            "cert"
+        )
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-key-path",
+            &[("path", &key_path_display)],
+            "key"
+        )
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-ca-path",
+            &[("path", &ca_cert_display)],
+            "CA"
+        )
+    );
+
+    let relay = &config.relay;
+    // node_id is auto-minted when unset, so resolve the real one (persisted) for
+    // the guidance rather than requiring the operator to have pinned it.
+    let relay_ready = relay.enabled && !relay.url.is_empty();
+    let relay_node = if relay_ready {
+        zeroclaw_runtime::relay::ensure_node_id(&config.data_dir, &relay.node_id)
+            .unwrap_or_else(|_| relay.node_id.clone())
+    } else {
+        relay.node_id.clone()
+    };
+    if has_out_dir {
+        println!();
+        println!("{}", t("cli-mtls-dropin-line-1", "drop-in TLS dir"));
+        println!("{}", t("cli-mtls-dropin-line-2", "client key"));
+        println!("{}", t("cli-mtls-dropin-line-3", "automatic TLS material"));
+    }
+    println!();
+    if relay_ready {
+        // The relay tunnels to the daemon's loopback listener, so the client does
+        // not name a host: --connect defaults to wss://127.0.0.1 in relay mode.
+        // The OUTER hop to the relay needs the relay's OWN ca (--relay-ca), which
+        // is a different trust root from the daemon CA (--tls-ca-cert).
+        let mut relay_flags = String::new();
+        if !relay.relay_host.is_empty() {
+            let _ = write!(relay_flags, " --relay-host {}", relay.relay_host);
+        }
+        if relay.relay_insecure {
+            relay_flags.push_str(" --relay-insecure");
+        } else if !relay.relay_ca_path.is_empty() {
+            let _ = write!(relay_flags, " --relay-ca {}", relay.relay_ca_path);
+        } else {
+            relay_flags.push_str(" --relay-ca <relay-ca.crt>");
+        }
+        println!("{}", t("cli-mtls-relay-connect-header", "relay connect"));
+        if has_out_dir {
+            // i18n-exempt: literal zerocode command line; the flags are not translatable
+            println!(
+                "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
+                relay.url, relay_node, relay_flags
+            );
+        } else {
+            // i18n-exempt: literal zerocode command line; the flags are not translatable
+            println!(
+                "  zerocode --relay {} --relay-node {}{} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+                relay.url,
+                relay_node,
+                relay_flags,
+                ca_cert.display(),
+                cert_path.display(),
+                key_path.display()
+            );
+        }
+        println!("{}", t("cli-mtls-relay-ca-note-1", "relay CA note"));
+        println!("{}", t("cli-mtls-relay-ca-note-2", "daemon CA note"));
+    } else {
+        println!("{}", t("cli-mtls-direct-connect-header", "direct connect"));
+        // i18n-exempt: literal zerocode command line; the flags are not translatable
+        println!(
+            "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+            ca_cert.display(),
+            cert_path.display(),
+            key_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Revoke an issued client certificate (or every active cert a device holds) in
+/// the daemon ledger, which materializes `<data_dir>/tls/revoked` so the WSS
+/// verifier refuses it at the next handshake (threat A5). The operator-driven
+/// counterpart to `issue-client-cert`.
+#[cfg(feature = "agent-runtime")]
+fn revoke_wss_client_cert(
+    config: &Config,
+    fingerprint: Option<String>,
+    device: Option<String>,
+) -> Result<()> {
+    use zeroclaw_runtime::security::cert_ledger::CertLedger;
+    // `operator` matches the issuance actor `issue-client-cert` records.
+    const ACTOR: &str = "operator";
+    let ledger = CertLedger::open_at(&config.data_dir, None, effective_crl_path(config))?;
+    let changed = if let Some(fp) = fingerprint {
+        let fp = fp.trim().to_ascii_lowercase();
+        if ledger.mark_revoked(&fp, ACTOR)? {
+            println!(
+                "{}",
+                ta(
+                    "cli-mtls-revoked-certificate",
+                    &[("fingerprint", &fp)],
+                    "revoked"
+                )
+            );
+            true
+        } else {
+            println!(
+                "{}",
+                ta(
+                    "cli-mtls-revoke-no-active-fingerprint",
+                    &[("fingerprint", &fp)],
+                    "not found"
+                )
+            );
+            false
+        }
+    } else if let Some(device_id) = device {
+        let n = ledger.revoke_device(&device_id, ACTOR)?;
+        let n_s = n.to_string();
+        println!(
+            "{}",
+            ta(
+                "cli-mtls-revoked-device-certs",
+                &[("count", &n_s), ("device", &device_id)],
+                "revoked"
+            )
+        );
+        n > 0
+    } else {
+        // clap requires exactly one of --fingerprint / --device; defensive only.
+        anyhow::bail!("provide --fingerprint <hex> or --device <id>");
+    };
+    if changed {
+        // Report the path the verifier ACTUALLY reads - the same one the ledger
+        // materialized to above. Printing the ledger default here would name a
+        // file the verifier never consults whenever `[wss.client_auth].crl_path`
+        // is set, which is exactly the moment (incident response) the operator
+        // needs the real path.
+        let revoked_path = effective_crl_path(config).display().to_string();
+        println!(
+            "{}",
+            ta(
+                "cli-mtls-revoked-list-updated",
+                &[("path", &revoked_path)],
+                "updated"
+            )
+        );
+    }
+    Ok(())
+}
+
+/// The revoked-fingerprint list this daemon's WSS verifier actually reads:
+/// `[wss.client_auth].crl_path` when set, else the ledger default. Operator
+/// commands must materialize to this path or a revocation is reported but never
+/// enforced.
+#[cfg(feature = "agent-runtime")]
+fn effective_crl_path(config: &Config) -> std::path::PathBuf {
+    zeroclaw_runtime::security::cert_ledger::effective_revoked_list_path(
+        &config.data_dir,
+        config.wss.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+    )
+}
+
+/// List the still-active client certificates this daemon's CA has issued, read
+/// from the issued-cert ledger. Read-only operator visibility into who holds a
+/// live certificate.
+#[cfg(feature = "agent-runtime")]
+fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
+    use zeroclaw_runtime::security::cert_ledger::CertLedger;
+    let ledger = CertLedger::open_at(&config.data_dir, None, effective_crl_path(config))?;
+    let active = ledger.list_active()?;
+    if json {
+        let rows: Vec<serde_json::Value> = active
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "device_id": e.device_id,
+                    "fingerprint": e.fingerprint,
+                    "not_before": e.not_before,
+                    "not_after": e.not_after,
+                    "issued_at": e.issued_at,
+                    "actor": e.actor,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if active.is_empty() {
+        println!("{}", t("cli-mtls-list-no-active-certs", "no active certs"));
+        return Ok(());
+    }
+    let active_len = active.len().to_string();
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-list-active-header",
+            &[("count", &active_len)],
+            "active certs"
+        )
+    );
+    for e in &active {
+        // i18n-exempt: structured cert row; device/not_after/actor are field identifiers
+        println!(
+            "  {}  device={}  not_after={}  actor={}",
+            e.fingerprint, e.device_id, e.not_after, e.actor
+        );
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -3078,6 +7135,28 @@ enum AuthCommands {
         /// Profile name (default: default)
         #[arg(long, default_value = "default")]
         profile: String,
+    },
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum OidcCommands {
+    /// Sign in interactively: shows a verification code (device grant) or
+    /// opens your browser (--browser), then prints the access token on stdout
+    Login {
+        /// Alias of the [oidc.<alias>] config entry to enroll against
+        alias: String,
+        /// Sign in with the system browser via Authorization Code + PKCE (RFC 8252
+        /// loopback) instead of the device grant; the browser is opened automatically
+        /// on macOS and Linux, and the sign-in URL is always printed for manual opening
+        #[arg(long)]
+        browser: bool,
+    },
+    /// Obtain a service token via the client_credentials grant (requires the
+    /// entry's client_secret); prints the access token on stdout
+    Token {
+        /// Alias of the [oidc.<alias>] config entry to enroll against
+        alias: String,
     },
 }
 
@@ -3387,6 +7466,29 @@ async fn fetch_locales(locale: &str, catalog: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn install_daemon_sigbus_reset() -> Result<()> {
+    let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+    // SAFETY: a successful sigaction call initializes the output structure.
+    if unsafe { libc::sigaction(libc::SIGBUS, std::ptr::null(), action.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("reading the SIGBUS action");
+    }
+    // SAFETY: the preceding sigaction call succeeded.
+    let mut action = unsafe { action.assume_init() };
+    if action.sa_sigaction == libc::SIG_DFL || action.sa_sigaction == libc::SIG_IGN {
+        return Ok(());
+    }
+
+    // Rust's handler may live on the same volume as the daemon. If that volume
+    // disappears, the kernel must restore SIG_DFL before entering the handler.
+    action.sa_flags |= libc::SA_RESETHAND;
+    // SAFETY: preserve the installed handler and mask; change only SA_RESETHAND.
+    if unsafe { libc::sigaction(libc::SIGBUS, &raw const action, std::ptr::null_mut()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("installing the SIGBUS reset action");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let command = Cli::command();
 
@@ -3404,9 +7506,516 @@ fn main() -> Result<()> {
     async_main(command)
 }
 
-#[tokio::main]
+/// Explicit runtime construction instead of `#[tokio::main]` so worker
+/// threads get an 8 MiB stack. Debug builds of the deepest inline RPC
+/// handlers (quickstart apply walks the whole config tree with several
+/// `Config`-sized temporaries) overflow tokio's 2 MiB worker default and
+/// abort the daemon. The size matches the 8 MiB main-thread stacks the
+/// workspace already requests via linker args on other targets.
+fn async_main(command: clap::Command) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main_inner(command))
+}
+
+/// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
+/// exactly "ZeroClaw" or "ZeroClaw" followed by a separator (e.g. "ZeroClaw
+/// Companion"), case-insensitively. Matching the visible application name — not
+/// any field that merely contains the substring "zeroclaw" — is what stops an
+/// unrelated entry (or a lookalike like `not-zeroclaw-helper`) from qualifying.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_zeroclaw_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    match lower.strip_prefix("zeroclaw") {
+        Some("") => true,
+        Some(rest) => rest.starts_with([' ', '-', '_']),
+        None => false,
+    }
+}
+
+/// Reserved characters that the Desktop Entry Specification requires to be
+/// double-quoted in an `Exec` value. Encountering one outside quotes means the
+/// value is malformed, so parsing fails closed rather than launching a partially
+/// interpreted path.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+const EXEC_RESERVED_CHARS: &[char] = &[
+    '"', '`', '$', '\\', '>', '<', '~', '|', '&', ';', '*', '?', '#', '(', ')', '\'',
+];
+
+/// Apply the Desktop Entry Specification's general string-value unescape rules
+/// (`\s \n \t \r \\`) to the raw `Exec` value. The spec applies this layer
+/// *before* the `Exec` quoting rules, so e.g. a literal `$` in a quoted path is
+/// written `\\$`: the general layer turns `\\` into `\`, leaving `\$` for the
+/// quoting layer. Any other escape, or a dangling backslash, is malformed and
+/// fails closed (`None`).
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn unescape_desktop_value(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    // An escape consumes the following char too; the `while let` body advances
+    // the same iterator, so it can't be a `for` loop.
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('s') => out.push(' '),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A `%X` token is a known desktop-entry field code (or `%%`, a literal percent).
+/// An unknown field code invalidates the whole `Exec` command line per the spec.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_known_field_code(token: &str) -> bool {
+    token == "%%"
+        || matches!(
+            token,
+            "%f" | "%F"
+                | "%u"
+                | "%U"
+                | "%i"
+                | "%c"
+                | "%k"
+                | "%d"
+                | "%D"
+                | "%n"
+                | "%N"
+                | "%v"
+                | "%m"
+        )
+}
+
+/// Tokenize a (general-unescaped) desktop-entry `Exec` value into its whitespace-
+/// separated arguments, applying the `Exec` quoting rules to each. Each token is
+/// returned with a flag recording whether it was quoted, so field-code
+/// validation can reject a field code that appears inside a quoted argument (the
+/// Desktop Entry Specification forbids that). Fails closed (`None`) on any
+/// malformed token: an unterminated quote, a dangling or invalid escape, a raw
+/// reserved character (`"`, `` ` ``, `$`, `\` unquoted or an unescaped `$`/`` ` ``
+/// inside quotes), or text directly adjacent to a closing quote (e.g. `"…"junk`).
+/// Validating the whole line — not just the first token — is what keeps a
+/// malformed entry from launching its first argument.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn tokenize_exec_line(line: &str) -> Option<Vec<(String, bool)>> {
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut token = String::new();
+        let quoted = chars.peek() == Some(&'"');
+        if quoted {
+            chars.next(); // opening quote
+            loop {
+                match chars.next() {
+                    Some('"') => break, // closing quote
+                    Some('\\') => match chars.next() {
+                        Some(esc @ ('"' | '`' | '$' | '\\')) => token.push(esc),
+                        _ => return None, // invalid or dangling escape inside quotes
+                    },
+                    // An unterminated quote, or an unescaped reserved character
+                    // (`$`/`` ` ``) inside quotes: fail closed.
+                    None | Some('$' | '`') => return None,
+                    Some(c) => token.push(c),
+                }
+            }
+            // A closing quote must end the token; adjacent text is malformed.
+            if matches!(chars.peek(), Some(c) if !c.is_whitespace()) {
+                return None;
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                if EXEC_RESERVED_CHARS.contains(&c) {
+                    return None; // a reserved character must be quoted
+                }
+                token.push(c);
+                chars.next();
+            }
+        }
+        tokens.push((token, quoted));
+    }
+    Some(tokens)
+}
+
+/// Validate the field codes carried by a single tokenized `Exec` argument per the
+/// Desktop Entry Specification. Inside a token, the only permitted `%` is the
+/// escaped literal `%%`; a bare, embedded, or unknown field code (`%U`, `%Z`,
+/// `ZeroClaw-%Z.AppImage`, `--flag=%U`) invalidates the command line. The one
+/// exception is that an *argument* (never the program) that was *not* quoted may
+/// be exactly one known standalone field code such as `%U`. A field code inside a
+/// quoted argument is always rejected.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn exec_token_field_codes_ok(token: &str, quoted: bool, is_program: bool) -> bool {
+    // A lone, unquoted, standalone known field code is a valid argument — but the
+    // program (executable) can never be a field code, so it has no exception.
+    if !is_program && !quoted && is_known_field_code(token) {
+        return true;
+    }
+    // Otherwise every `%` must be the escaped literal `%%`.
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' && chars.next() != Some('%') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse the program token (first argument) from a desktop-entry `Exec=` value,
+/// per the Desktop Entry Specification. The general string-unescape layer is
+/// applied first (see [`unescape_desktop_value`]), then the whole command line is
+/// tokenized with the `Exec` quoting rules (see [`tokenize_exec_line`]). Parsing
+/// fails closed (`None`) on malformed input anywhere on the line — an unterminated
+/// quote, a dangling/invalid escape, an unquoted reserved character, text adjacent
+/// to a closing quote, an unknown field code (e.g. `%Z`), an `=` in the program
+/// token, or a program token that is empty or itself a field code — rather than
+/// launching a partially interpreted path.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn parse_exec_program(exec: &str) -> Option<String> {
+    let unescaped = unescape_desktop_value(exec)?;
+    let mut tokens = tokenize_exec_line(&unescaped)?.into_iter();
+    let (program, program_quoted) = tokens.next()?;
+    // The executable may not be empty, carry an `=`, or contain any field code
+    // (bare or embedded — only an escaped `%%` literal is allowed). This rejects
+    // a program like `ZeroClaw-%Z.AppImage` whose basename would otherwise pass
+    // the AppImage-name check.
+    if program.is_empty()
+        || program.contains('=')
+        || !exec_token_field_codes_ok(&program, program_quoted, true)
+    {
+        return None;
+    }
+    // Every argument token must likewise carry no field code, except a single
+    // unquoted standalone known field code. An unknown, embedded, or quoted field
+    // code anywhere on the line invalidates it.
+    for (token, quoted) in tokens {
+        if !exec_token_field_codes_ok(&token, quoted, false) {
+            return None;
+        }
+    }
+    Some(program)
+}
+
+/// The published companion-app binary name (the `Exec` of `ZeroClaw.desktop` in
+/// the v0.8.3 Debian package). This is the single source of truth for the
+/// supported non-AppImage executable, so discovery cannot select a lookalike
+/// such as `zeroclaw-helper` or `zeroclaw-evil`.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+const ZEROCLAW_DESKTOP_BIN: &str = "zeroclaw-desktop";
+
+/// True when a desktop entry's resolved `Exec` program is a supported ZeroClaw
+/// executable: either the exact published binary `zeroclaw-desktop`, or a
+/// ZeroClaw AppImage in the published `ZeroClaw-*.AppImage` form. It is bound to
+/// those forms — not to any `zeroclaw*` basename — so a deliberate ZeroClaw
+/// `Name` cannot be paired with a lookalike (`zeroclaw-helper`, `zeroclaw-evil`)
+/// to preempt the real app.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_zeroclaw_program(program: &str) -> bool {
+    let Some(name) = Path::new(program).file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == ZEROCLAW_DESKTOP_BIN || is_zeroclaw_appimage_name(name)
+}
+
+/// True when a bare file name is a supported ZeroClaw AppImage in the published
+/// `ZeroClaw-*.AppImage` form: it begins with "zeroclaw-" (the separator is
+/// required) and ends with ".appimage", case-insensitively. Requiring the
+/// separator rejects lookalikes with no boundary such as `ZeroClawevil.AppImage`
+/// as well as `not-zeroclaw-helper.AppImage`.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_zeroclaw_appimage_name(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.starts_with("zeroclaw-") && lower.ends_with(".appimage")
+}
+
+/// Read the `Exec` target from a desktop entry, but only when the entry is a
+/// ZeroClaw application, so an unrelated `.desktop` file is never launched.
+/// Identity is a bounded combination, not a display name alone: the entry must
+/// be `Type=Application`, its `Name` must deliberately identify ZeroClaw (see
+/// [`is_zeroclaw_name`]), and its resolved `Exec` program must be a ZeroClaw
+/// executable (see [`is_zeroclaw_program`]). Only the `[Desktop Entry]` group is
+/// consulted, a `Hidden=true` ("masked") entry is ignored, and the `Exec` value
+/// is parsed with the desktop-entry quoting grammar (see [`parse_exec_program`]).
+///
+/// Gated with the `desktop` command's `which` dependency (`agent-runtime`) on
+/// Linux, matching its sole caller and the desktop-entry tests.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn zeroclaw_desktop_exec(contents: &str) -> Option<String> {
+    let mut in_entry = false;
+    let mut name: Option<String> = None;
+    let mut exec: Option<String> = None;
+    let mut entry_type: Option<String> = None;
+    let mut hidden = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_entry || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // Only the default (non-localized) key matters; first occurrence wins.
+        match key.trim() {
+            "Name" if name.is_none() => name = Some(value.trim().to_string()),
+            "Exec" if exec.is_none() => exec = Some(value.trim().to_string()),
+            "Type" if entry_type.is_none() => entry_type = Some(value.trim().to_string()),
+            "Hidden" if value.trim().eq_ignore_ascii_case("true") => hidden = true,
+            _ => {}
+        }
+    }
+    if hidden {
+        return None;
+    }
+    // A launchable app entry only: `Type` must be `Application`, per the
+    // published `ZeroClaw.desktop` contract. A non-`Application` entry (e.g.
+    // `Link`/`Directory`) never resolves.
+    if !entry_type
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("Application"))
+    {
+        return None;
+    }
+    if !is_zeroclaw_name(&name?) {
+        return None;
+    }
+    let program = parse_exec_program(&exec?)?;
+    if !is_zeroclaw_program(&program) {
+        return None;
+    }
+    Some(program)
+}
+
+/// True when `path` is a regular file with an execute bit set.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Resolve a desktop-entry command to an executable file: an absolute path is
+/// taken as-is (and must be executable), a bare command name is resolved through
+/// `PATH`. Non-executable candidates are rejected so a broken entry is skipped.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn resolve_executable(command: &str) -> Option<PathBuf> {
+    let candidate = Path::new(command);
+    if candidate.is_absolute() {
+        return is_executable(candidate).then(|| candidate.to_path_buf());
+    }
+    // A relative value containing a path separator (e.g. `./zeroclaw-helper`) would be
+    // resolved by `which` against the current working directory, letting a desktop entry
+    // launch a binary from wherever `zeroclaw desktop` happened to run. Per the Desktop
+    // Entry spec `Exec` must be an absolute path or a bare executable name resolved on
+    // `PATH`, so reject any relative value that carries a separator.
+    if command.contains('/') {
+        return None;
+    }
+    which::which(command).ok()
+}
+
+/// Maximum accepted size of one XDG desktop entry. Desktop files are small
+/// metadata documents; bounding ambient entries prevents one unrelated file
+/// from consuming unbounded memory before a valid ZeroClaw entry is reached.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+const DESKTOP_ENTRY_MAX_BYTES: u64 = 256 * 1024;
+
+/// Open and read a desktop entry without following its final symlink, blocking
+/// on a FIFO, or trusting pathname metadata that can change before the open.
+/// Classification and the byte limit are both applied to the opened handle.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn read_desktop_entry(path: &Path) -> Option<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > DESKTOP_ENTRY_MAX_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    let mut limited = file.take(DESKTOP_ENTRY_MAX_BYTES + 1);
+    limited.read_to_end(&mut bytes).ok()?;
+    if u64::try_from(bytes.len()).ok()? > DESKTOP_ENTRY_MAX_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Recursively collect `.desktop` entries under `root` (an `applications`
+/// directory) as `(desktop-file-id, path)` pairs. Per the Desktop Entry
+/// Specification the ID is the path relative to `root` with directory
+/// separators replaced by `-`, so a nested `kde/foo.desktop` has ID
+/// `kde-foo.desktop`. Deriving IDs recursively (rather than from top-level
+/// basenames only) is what lets a nested higher-precedence entry correctly
+/// mask the same ID in a lower-precedence directory.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn collect_desktop_entries(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) {
+    // Guard against directory cycles (e.g. a bind mount pointing back up the tree) by
+    // tracking canonical paths already scanned.
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !visited.insert(canonical) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `entry.file_type()` does not follow symlinks, so a directory symlink such as
+        // `applications/loop -> .` is not treated as a directory and is never recursed
+        // into — preventing an unbounded traversal.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_desktop_entries(root, &path, out, visited);
+        } else if file_type.is_file()
+            && path.extension().and_then(|e| e.to_str()) == Some("desktop")
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            let id = rel.to_string_lossy().replace('/', "-");
+            out.push((id, path));
+        }
+    }
+}
+
+/// Scan `applications` subdirectories of the given XDG base dirs (already in
+/// precedence order) for a ZeroClaw desktop entry and return its executable
+/// `Exec` target. The first occurrence of a desktop-file ID wins and shadows the
+/// same ID in later (lower-precedence) directories, matching XDG masking.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn discover_desktop_app(data_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for base in data_dirs {
+        let root = base.join("applications");
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        collect_desktop_entries(&root, &root, &mut files, &mut visited);
+        files.sort(); // deterministic order by desktop-file ID within a directory
+        for (id, path) in files {
+            if !seen_ids.insert(id) {
+                continue; // shadowed by a higher-precedence entry with the same ID
+            }
+            let Some(contents) = read_desktop_entry(&path) else {
+                continue;
+            };
+            if let Some(target) =
+                zeroclaw_desktop_exec(&contents).and_then(|cmd| resolve_executable(&cmd))
+            {
+                return Some(target);
+            }
+        }
+    }
+    None
+}
+
+/// Discover an installed companion app on Linux that is not on `PATH`, such as
+/// an AppImage registered in the application menu. Reads the `Exec` target from
+/// a ZeroClaw XDG desktop entry (honouring `$XDG_DATA_HOME`/`$XDG_DATA_DIRS`
+/// precedence), then falls back to scanning common AppImage install locations.
+/// Returns the launchable binary/AppImage path.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn find_linux_desktop_app() -> Option<PathBuf> {
+    let home = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf());
+
+    // XDG application dirs in precedence order: $XDG_DATA_HOME first, then each
+    // $XDG_DATA_DIRS entry. Unset or empty falls back to the spec defaults. Per
+    // the Base Directory Specification a relative value is invalid and must be
+    // ignored, so it is never searched from the process working directory.
+    let mut data_dirs: Vec<PathBuf> = Vec::new();
+    match std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        Some(v) => data_dirs.push(v),
+        None => {
+            if let Some(home) = &home {
+                data_dirs.push(home.join(".local/share"));
+            }
+        }
+    }
+    let extra = std::env::var_os("XDG_DATA_DIRS")
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    for dir in extra.split(':').filter(|s| !s.is_empty()) {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            data_dirs.push(path);
+        }
+    }
+
+    if let Some(target) = discover_desktop_app(&data_dirs) {
+        return Some(target);
+    }
+
+    // Fall back to scanning common AppImage locations for a ZeroClaw image that
+    // was made executable but never registered on PATH. `read_dir` order is
+    // unspecified, so collect every match and pick deterministically: within
+    // a directory the lexicographically greatest file name (so a higher version
+    // like `ZeroClaw-2...` is preferred over `ZeroClaw-1...`); earlier
+    // directories in the list keep priority.
+    if let Some(home) = &home {
+        for dir in [home.join("Applications"), home.join(".local/bin")] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut matches: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    is_zeroclaw_appimage_name(name) && is_executable(path)
+                })
+                .collect();
+            if !matches.is_empty() {
+                matches.sort();
+                return matches.pop();
+            }
+        }
+    }
+
+    None
+}
+
 #[allow(clippy::too_many_lines)]
-async fn async_main(command: clap::Command) -> Result<()> {
+async fn async_main_inner(command: clap::Command) -> Result<()> {
     // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -3434,6 +8043,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
         && config_dir.trim().is_empty()
     {
         bail!("--config-dir cannot be empty");
+    }
+
+    #[cfg(target_os = "macos")]
+    if matches!(&cli.command, Commands::Daemon { .. }) {
+        install_daemon_sigbus_reset()?;
     }
 
     #[cfg(feature = "agent-runtime")]
@@ -3562,6 +8176,29 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunWindowsDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("Windows task runner requires --config-dir")?;
+        return service::run_windows_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunDesktopDaemon { port },
+        ..
+    } = &cli.command
+    {
+        return service::run_desktop_daemon(*port).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunOpenrcLogWriter { stream },
         ..
     } = &cli.command
@@ -3569,27 +8206,183 @@ async fn async_main(command: clap::Command) -> Result<()> {
         return service::run_openrc_log_writer(matches!(stream, ServiceLogStream::Stderr));
     }
 
+    // Standalone execution must resolve and acquire the actual runtime
+    // data directory before loading the executable config. This avoids both a
+    // stale pre-lock snapshot and refusing an independent ZEROCLAW_DATA_DIR
+    // merely because the default instance is running.
+    #[cfg(feature = "agent-runtime")]
+    let standalone_command = match &cli.command {
+        Commands::Agent { .. } => Some("agent"),
+        #[cfg(feature = "channel-acp-server")]
+        Commands::Acp { .. } => Some("acp"),
+        _ => None,
+    };
+    #[cfg(feature = "agent-runtime")]
+    let standalone_ownership_path = if standalone_command.is_some() {
+        let (_, data_dir) = zeroclaw_config::schema::resolve_runtime_dirs().await?;
+        Some(data_dir)
+    } else {
+        None
+    };
+    #[cfg(feature = "agent-runtime")]
+    let standalone_ownership = if let (Some(command), Some(data_dir)) =
+        (standalone_command, standalone_ownership_path.as_ref())
+    {
+        Some(
+            zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(data_dir)
+                .map_err(|error| {
+                    if !matches!(
+                        error,
+                        zeroclaw_runtime::live_config_authority::ConfigOwnershipError::AlreadyOwned { .. }
+                    ) {
+                        return anyhow::Error::from(error);
+                    }
+                    let message = ta(
+                        "cli-standalone-daemon-owned",
+                        &[("command", command), ("path", &data_dir.display().to_string())],
+                        format!(
+                            "Cannot run `zeroclaw {command}` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
+                            data_dir.display()
+                        ),
+                    );
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Reject
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "command": command,
+                            "path": data_dir.display().to_string(),
+                        })),
+                        "standalone command refused because config state is already owned"
+                    );
+                    anyhow::Error::msg(message)
+                })?,
+        )
+    } else {
+        None
+    };
+
+    // The daemon must own the config lifecycle before the executable config is
+    // loaded: a supported offline mutation committing between the config read
+    // and a post-load lock acquisition would otherwise be silently shadowed by
+    // the stale startup snapshot. Resolve the runtime identity first, acquire
+    // process ownership, then load the fresh protected snapshot. The guard
+    // transfers continuously across reload generations in the daemon loop.
+    #[cfg(feature = "agent-runtime")]
+    let mut daemon_ownership = if matches!(&cli.command, Commands::Daemon { .. }) {
+        let (_, data_dir) = zeroclaw_config::schema::resolve_runtime_dirs().await?;
+        Some((
+            data_dir.clone(),
+            zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(&data_dir)
+                .map_err(|error| {
+                    if !matches!(
+                        error,
+                        zeroclaw_runtime::live_config_authority::ConfigOwnershipError::AlreadyOwned { .. }
+                    ) {
+                        return anyhow::Error::from(error);
+                    }
+                    let message = ta(
+                        "cli-standalone-daemon-owned",
+                        &[("command", "daemon"), ("path", &data_dir.display().to_string())],
+                        format!(
+                            "Cannot run `zeroclaw daemon` while another ZeroClaw process owns the config state at {}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.",
+                            data_dir.display()
+                        ),
+                    );
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Reject
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "command": "daemon",
+                            "path": data_dir.display().to_string(),
+                        })),
+                        "daemon refused because config state is already owned"
+                    );
+                    anyhow::Error::msg(message)
+                })?,
+        ))
+    } else {
+        None
+    };
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    #[cfg(feature = "agent-runtime")]
+    if let Some((expected_data_dir, _)) = daemon_ownership.as_ref() {
+        anyhow::ensure!(
+            config.data_dir == *expected_data_dir,
+            "resolved config data directory changed during daemon startup: locked {}, loaded {}",
+            expected_data_dir.display(),
+            config.data_dir.display()
+        );
+    }
+    #[cfg(feature = "agent-runtime")]
+    let standalone_authority = if let Some(expected_data_dir) = standalone_ownership_path.as_ref() {
+        anyhow::ensure!(
+            config.data_dir == *expected_data_dir,
+            "resolved config data directory changed during standalone startup: locked {}, loaded {}",
+            expected_data_dir.display(),
+            config.data_dir.display()
+        );
+        let ownership = standalone_ownership.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": expected_data_dir.display().to_string(),
+                    })),
+                "standalone config ownership invariant failed"
+            );
+            anyhow::Error::msg("standalone ownership was not acquired")
+        })?;
+        Some(zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
+            config.clone(),
+            ownership,
+        ))
+    } else {
+        None
+    };
+    let running_executable =
+        running_executable_for_remediation().map(|path| path.display().to_string());
     for section in config
         .degraded_sections
         .iter()
         .chain(config.degraded_security.iter())
     {
-        eprintln!(
-            "{}",
+        let path = config.config_path.display().to_string();
+        let warning = if let Some(executable) = running_executable.as_deref() {
+            let fallback = format!(
+                "warning: config section `{section}` in {path} is malformed and was reset to \
+                 defaults for this run. Values in that section are NOT in effect. Use the \
+                 running executable at `{executable}` with `config migrate` to see the parse \
+                 error, then repair the file."
+            );
             ta(
-                "cli-config-section-degraded",
+                "cli-config-section-degraded-executable",
                 &[
                     ("section", section),
-                    ("path", &config.config_path.display().to_string()),
+                    ("path", &path),
+                    ("executable", executable),
                 ],
-                "warning: config section is malformed and was reset to defaults \
-                 for this run. Values in that section are NOT in effect. Run \
-                 `zeroclaw config migrate` to see the parse error, then repair \
-                 the file."
+                &fallback,
             )
-        );
+        } else {
+            format!(
+                "warning: config section `{section}` in {path} is malformed and was reset to \
+                 defaults for this run. Values in that section are NOT in effect. The running \
+                 executable path could not be resolved; repair the file through a daemon-owned \
+                 config surface instead of an unqualified PATH command."
+            )
+        };
+        eprintln!("{warning}");
     }
     for section in &config.retired_wati_config_sections {
         let fallback = format!(
@@ -3604,12 +8397,33 @@ async fn async_main(command: clap::Command) -> Result<()> {
             )
         );
     }
+    if config.retired_node_transport_config {
+        eprintln!(
+            "{}",
+            t(
+                "cli-config-section-retired-node-transport",
+                "warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml."
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     // Must follow the trace sink init above, or the record has no destination.
     // The daemon reload arm calls the same helper against its reloaded config.
     #[cfg(feature = "agent-runtime")]
     warn_verifiable_intent_withheld(&config);
+    // Enrollment's contract is that stdout carries exactly the token and
+    // nothing else, so the `oidc` commands are dispatched before any
+    // startup prelude that may print: the OTP prelude below discloses a
+    // freshly minted seed's enrollment URI on stdout, which must never be
+    // captured alongside an access token by a command substitution.
+    #[cfg(feature = "agent-runtime")]
+    if matches!(cli.command, Commands::Oidc { .. }) {
+        let Commands::Oidc { oidc_command } = cli.command else {
+            unreachable!("matched the Oidc variant above")
+        };
+        return handle_oidc_command(oidc_command, &config).await;
+    }
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -3746,7 +8560,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 return Ok(());
             }
             Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
-                unreachable!()
+                anyhow::bail!("documentation command was not handled before runtime dispatch")
+            }
+            Commands::Props { props_command } => {
+                let DeprecatedPropsCommands::Any(args) = props_command;
+                drop(args);
+                anyhow::bail!(
+                    "`zeroclaw props` has been renamed to `zeroclaw config`. \
+                     Replace `props` with `config` in your command and try again."
+                );
             }
             _ => {
                 anyhow::bail!(
@@ -3775,7 +8597,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
         Commands::Onboard { .. }
         | Commands::Completions { .. }
         | Commands::MarkdownHelp
-        | Commands::MarkdownSchema => unreachable!(),
+        | Commands::MarkdownSchema => {
+            anyhow::bail!("pre-runtime command was not handled before runtime dispatch")
+        }
 
         Commands::Quickstart {
             model_provider,
@@ -3826,9 +8650,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }));
 
             // Register channel map factory for late-bound tool handle population.
-            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new({
-                let config_clone = config.clone();
-                move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new(
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::build_channel_map_for_agent(
+                        config,
+                        agent_alias,
+                    )
+                },
+            ));
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|config| {
+                zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
             Box::pin(agent::run(
@@ -3843,18 +8674,33 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 session_state_file,
                 None,
                 zeroclaw_api::ingress::TurnOrigin::Interactive,
-                zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
+                zeroclaw_runtime::agent::loop_::AgentRunOverrides {
+                    execution_capability: standalone_authority
+                        .as_ref()
+                        .map(|authority| authority.execution_capability()),
+                    ..Default::default()
+                },
             ))
             .await
             .map(|_| ())
         }
 
         Commands::Acp {
+            agent,
             max_sessions,
             session_timeout,
         } => {
             #[cfg(feature = "channel-acp-server")]
             {
+                let authority = standalone_authority.ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "standalone ACP config ownership invariant failed"
+                    );
+                    anyhow::Error::msg("standalone ACP ownership was not acquired")
+                })?;
                 let mut acp_config = channels::acp_server::AcpServerConfig {
                     max_sessions: config.acp.max_sessions,
                     session_timeout_secs: config.acp.session_timeout_secs,
@@ -3881,18 +8727,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             );
                         })
                         .ok();
-                let server = if let Some(store) = store {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
-                        config, acp_config, store,
-                    ))
-                } else {
-                    std::sync::Arc::new(channels::acp_server::AcpServer::new(config, acp_config))
-                };
-                server.run().await
+                let server = channels::acp_server::AcpServer::new_stdio_with_authority(
+                    &authority, acp_config, store,
+                )
+                .with_connection_default_agent(agent);
+                std::sync::Arc::new(server).run().await
             }
             #[cfg(not(feature = "channel-acp-server"))]
             {
-                let _ = (max_sessions, session_timeout);
+                let _ = (agent, max_sessions, session_timeout);
                 anyhow::bail!("ACP server requires the `channel-acp-server` feature")
             }
         }
@@ -3975,8 +8818,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     rotate_device,
                     port,
                     host,
+                    json,
                 }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
+                    let endpoint = format!("{host}:{port}");
 
                     let action = if rotate {
                         PaircodeAction::RotateAll
@@ -3989,14 +8834,26 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     };
                     let rotating = action.is_rotation();
 
-                    match fetch_paircode(
+                    let fetched = fetch_paircode(
                         &host,
                         port,
                         config.gateway.path_prefix.as_deref(),
+                        &config.data_dir,
                         &action,
                     )
-                    .await
-                    {
+                    .await;
+                    if json {
+                        let (code, message) = match fetched? {
+                            PaircodeResult::Code { code, message } => (Some(code), message),
+                            PaircodeResult::NoCode { message } => (None, message),
+                        };
+                        println!(
+                            "{}",
+                            serde_json::json!({ "pairing_code": code, "message": message })
+                        );
+                        return Ok(());
+                    }
+                    match fetched {
                         Ok(PaircodeResult::Code { code, message }) => {
                             println!(
                                 "{}",
@@ -4045,7 +8902,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         }
                         Err(e) => {
                             println!(
-                                "❌ Failed to fetch pairing code from gateway at {host}:{port}"
+                                "{}",
+                                ta(
+                                    "cli-pairing-fetch-failed",
+                                    &[("endpoint", &endpoint)],
+                                    format!(
+                                        "❌ Failed to fetch pairing code from gateway at {endpoint}"
+                                    ),
+                                )
                             );
                             println!(
                                 "{}",
@@ -4196,6 +9060,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // Cron delivery is registered earlier (before the command match)
             // so it works for both `daemon` and `gateway start`.
 
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new(
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::live_channel_map_for_agent(config, agent_alias)
+                },
+            ));
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|_| {
+                zeroclaw_channels::orchestrator::live_channel_map()
+            }));
+
             let canvas_store = zeroclaw_runtime::tools::CanvasStore::new();
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
@@ -4217,6 +9092,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
             let startup_feedback_enabled = !cli.verbose;
+            // Cron drivers a generation aborted that had not stopped by the time
+            // its teardown returned. Held across the reload boundary so the next
+            // generation adopts them instead of the process losing track of a
+            // task that is still doing work under superseded config.
+            let mut carried_sop_drivers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            // Runs whose aborted driver the previous generation could not settle.
+            // The next engine restores them as active, so it has to own their
+            // terminal write too; see `SopDriverTeardown::unsettled_runs`.
+            let mut carried_unsettled_sop_runs: Vec<String> = Vec::new();
+            let mut carried_sop_settlements = None;
             loop {
                 if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
                     let mut stderr = std::io::stderr().lock();
@@ -4229,43 +9114,161 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+                #[cfg(feature = "agent-runtime")]
+                registry.register_channel_registry_clearer(std::sync::Arc::new(|| {
+                    zeroclaw_channels::orchestrator::prepare_live_channel_registry(true);
+                }));
 
-                // SOP loading is gated on `[sop] sops_dir`: unset disables all
-                // SOP runtime behavior, matching the documented rollback path.
-                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                let mut iteration_config = current_config.clone();
+                iteration_config.gateway.host = host.clone();
+                if port != 0 {
+                    iteration_config.gateway.port = port;
+                }
+                // The ownership guard was acquired before the config load (and
+                // is transferred back here on every reload), so this generation
+                // adopts a snapshot that no offline mutation can have raced.
+                let (expected_data_dir, ownership) = daemon_ownership.take().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "daemon config ownership invariant failed"
+                    );
+                    anyhow::Error::msg("daemon config ownership was not held for this generation")
+                })?;
+                let authority = zeroclaw_runtime::LiveConfigAuthority::new_with_ownership(
+                    iteration_config,
+                    ownership,
+                );
+                #[cfg(feature = "gateway")]
+                let plugin_webhooks = Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new());
+                #[cfg(feature = "gateway")]
+                let channel_plugin_webhooks = Some(Arc::clone(&plugin_webhooks));
+                #[cfg(not(feature = "gateway"))]
+                let channel_plugin_webhooks: Option<
+                    Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+                > = None;
+
+                // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
+                // (or empty) by default, so SOP runtime behavior is off until an
+                // operator opts in by setting a directory.
+                let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
                     let sop_adapters = build_sop_adapters(&current_config);
-                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
                         current_config.sop.clone(),
+                        &current_config.decision_models,
                         &current_config.data_dir,
+                        &current_config.install_root_dir(),
                         mem,
                         sop_adapters,
+                        Some(authority.execution_capability()),
                     );
+                    let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
+                    let pending = carried_sop_settlements.take();
+                    if !unsettled.is_empty() || pending.is_some() {
+                        let mut guard = match engine.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        if let Some(queue) = pending {
+                            guard.adopt_orphaned_run_settlement_queue(queue);
+                        }
+                        guard.adopt_orphaned_run_settlements(unsettled.into_iter().map(|run_id| {
+                            (
+                                run_id,
+                                zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                            )
+                        }));
+                    }
                     (Some(engine), Some(audit))
                 } else {
+                    let unsettled = std::mem::take(&mut carried_unsettled_sop_runs);
+                    if !unsettled.is_empty() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "run_ids": unsettled })),
+                            "SOP runtime is disabled after reload, so runs whose driver was \
+                             aborted at teardown cannot be settled; they stay Running in the \
+                             store until the SOP runtime is enabled again"
+                        );
+                    }
                     (None, None)
                 };
 
                 // EPIC A1 + SOP cron: drive periodic maintenance and cron
                 // triggers against the shared engine for this daemon iteration.
+                // The generation-owned driver supervisor: exists whenever the
+                // SOP engine does, whether or not the maintenance tick runs.
+                let sop_driver_supervisor = if let Some(engine) = sop_engine.as_ref() {
+                    Some(SopDriverSupervisor::new(
+                        std::mem::take(&mut carried_sop_drivers),
+                        engine,
+                    ))
+                } else {
+                    let carried = std::mem::take(&mut carried_sop_drivers);
+                    if !carried.is_empty() {
+                        // No generation to adopt them: re-aborted and reported
+                        // rather than silently dropped. Production drops the
+                        // reaper's handle; the reaper owns the drivers.
+                        drop(reap_orphaned_sop_drivers(carried));
+                    }
+                    None
+                };
                 let sop_maintenance = spawn_sop_maintenance(
+                    &current_config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     current_config.sop.maintenance_interval_secs,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            current_config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            supervisor.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
 
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
+                    let sop_dh = sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone());
+                    let plugin_webhooks = Arc::clone(&plugin_webhooks);
+                    move |host,
+                          port,
+                          config,
+                          authority,
+                          tx,
+                          reload_controls,
+                          tui_registry,
+                          daemon_authority,
+                          ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_handles = sop_dh.clone();
+                        let plugin_webhooks = Arc::clone(&plugin_webhooks);
                         Box::pin(async move {
-                            Box::pin(zeroclaw_gateway::run_gateway(
+                            Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
                                 port,
                                 config,
@@ -4275,7 +9278,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
-                                ready_tx,
+                                daemon_authority,
+                                zeroclaw_gateway::GatewaySupervision::new(
+                                    ready_tx,
+                                    plugin_webhooks,
+                                    authority,
+                                    sop_driver_handles,
+                                ),
                             ))
                             .await
                         })
@@ -4285,18 +9294,26 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |config, cancel| {
+                    let sop_ds = sop_driver_sink.clone();
+                    let plugin_webhooks = channel_plugin_webhooks.clone();
+                    move |authority, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_sink = sop_ds.clone();
+                        let plugin_webhooks = plugin_webhooks.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
-                                config,
-                                Some(canvas_store),
-                                cancel,
-                                sop_engine,
-                                sop_audit,
-                            ))
+                            Box::pin(
+                                zeroclaw_channels::orchestrator::start_channels_with_authority_and_plugin_webhooks(
+                                    authority,
+                                    Some(canvas_store),
+                                    cancel,
+                                    sop_engine,
+                                    sop_audit,
+                                    plugin_webhooks,
+                                    sop_driver_sink,
+                                ),
+                            )
                             .await
                         })
                     }
@@ -4306,15 +9323,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_mqtt(Box::new({
                     let engine = sop_engine.clone();
                     let audit = sop_audit.clone();
+                    let driver_sink = sop_driver_sink.clone();
                     move |mqtt_config| {
                         let engine = engine.clone();
                         let audit = audit.clone();
+                        let driver_sink = driver_sink.clone();
                         Box::pin(async move {
                             if let (Some(engine), Some(audit)) = (engine, audit) {
                                 zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
                                     &mqtt_config,
                                     engine,
                                     audit,
+                                    driver_sink,
                                 )
                                 .await
                             } else {
@@ -4335,49 +9355,525 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
+                let local_session_channel_factory: zeroclaw_runtime::rpc::dispatch::LocalRpcSessionChannelFactory =
+                    std::sync::Arc::new(|config, agent_alias| {
+                        zeroclaw_channels::orchestrator::build_local_rpc_session_channels(
+                            config,
+                            agent_alias,
+                        )
+                    });
+                registry.register_socket(Box::new(move |ctx, cancel, client_count, ready_tx| {
+                    let local_session_channel_factory =
+                        std::sync::Arc::clone(&local_session_channel_factory);
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(
+                        zeroclaw_runtime::rpc::local::run_local_listener_with_factory(
                             ctx,
                             cancel,
                             client_count,
                             ready_tx,
+                            Some(local_session_channel_factory),
                         )
                         .await
                     })
                 }));
 
-                registry.register_wss(Box::new(|ctx, cancel, client_count| {
+                // One server-certificate SAN resolution per generation, shared
+                // by the WSS listener and the enrollment endpoint.
+                let daemon_server_tls = DaemonServerTls::default();
+                let daemon_server_tls_for_wss = daemon_server_tls.clone();
+                let daemon_server_tls_for_enroll = daemon_server_tls;
+                registry.register_wss(Box::new(move |ctx, cancel, client_count| {
+                    let daemon_server_tls = daemon_server_tls_for_wss.clone();
                     Box::pin(async move {
-                        let wss_cfg = ctx.config.read().wss.clone();
+                        let (wss_cfg, enroll_cfg, tunnel_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (
+                                cfg.wss.clone(),
+                                cfg.enroll.clone(),
+                                cfg.tunnel.clone(),
+                                cfg.data_dir.clone(),
+                            )
+                        };
                         if !wss_cfg.enabled {
                             // WSS disabled — park until cancelled.
                             cancel.cancelled().await;
                             return Ok(());
                         }
+                        // The remote WSS plane is ALWAYS mutually authenticated; there
+                        // is no server-only / plaintext fallback. In auto-CA mode the
+                        // same generated CA verifies client certificates, and any
+                        // configured pin allowlist remains enforced.
+                        let (byo_ca, pinned) =
+                            resolve_wss_client_auth(wss_cfg.client_auth.as_ref())?;
+                        // Bring-your-own mTLS when an operator CA is configured;
+                        // otherwise auto-generate a per-daemon CA + server certificate
+                        // under the data dir (secure by default, zero config).
+                        let (cert_path, key_path, ca_cert_path) = match byo_ca {
+                            Some(ca_cert_path) => {
+                                if wss_cfg.cert_path.is_empty() || wss_cfg.key_path.is_empty() {
+                                    anyhow::bail!(
+                                        "[wss.client_auth].ca_cert_path is set (bring-your-own mTLS) \
+                                         but [wss].cert_path/key_path are not. Provide the server \
+                                         certificate and key, or clear ca_cert_path to auto-generate \
+                                         the CA and server certificate."
+                                    );
+                                }
+                                (wss_cfg.cert_path.clone(), wss_cfg.key_path.clone(), ca_cert_path)
+                            }
+                            None => {
+                                // Generate (or reuse) the per-daemon CA + server
+                                // cert. The CA key is encrypted at rest when a
+                                // passphrase is configured (same source the
+                                // enrollment + CLI read paths use), else 0600.
+                                // [wss].sans adds the hostnames/IPs a remote client
+                                // uses to reach the daemon to the server cert. The
+                                // enrollment endpoint shares this generation's
+                                // DaemonServerTls, so both TLS surfaces present
+                                // the same leaf. When reached over the tailnet,
+                                // the node's MagicDNS name and tailnet IPs are
+                                // added too.
+                                let mats = daemon_server_tls
+                                    .materialize(
+                                        &data_dir.join("tls"),
+                                        &wss_cfg,
+                                        &ca_key_protection_from_env(),
+                                        || {
+                                            zeroclaw_runtime::tunnel::tailscale_server_sans(
+                                                &tunnel_cfg,
+                                                &wss_cfg,
+                                                &enroll_cfg,
+                                            )
+                                        },
+                                    )
+                                    .await?;
+                                (
+                                    mats.server_cert_path.to_string_lossy().into_owned(),
+                                    mats.server_key_path.to_string_lossy().into_owned(),
+                                    mats.ca_cert_path.to_string_lossy().into_owned(),
+                                )
+                            }
+                        };
+                        // Connect-time revocation refusal (A5): default to the
+                        // ledger-materialized list under <data_dir>/tls/revoked
+                        // (the daemon rewrites it on every revoke), overridable by
+                        // [wss.client_auth].crl_path.
+                        // Resolve the effective CRL path exactly once, with the
+                        // SAME normalization the ledger and operator CLI use
+                        // (trim; blank means unset), and hand that one value to
+                        // both the ledger and the TLS acceptor below. Selecting
+                        // the raw string here let a whitespace spelling install
+                        // no revocation verifier while the ledger materialized
+                        // the default file - revocation must never be split or
+                        // disabled by an accepted configuration spelling.
+                        let crl_path =
+                            zeroclaw_runtime::security::cert_ledger::effective_revoked_list_path(
+                                &data_dir,
+                                wss_cfg.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+                            )
+                            .to_string_lossy()
+                            .into_owned();
+                        // Materialize to the path the verifier will read,
+                        // including a configured override. Skipping this when an
+                        // override is set left `revoke-client-cert` writing to
+                        // the default file while the handshake honoured a stale
+                        // one, so a revoked cert kept authenticating.
+                        {
+                            let ledger =
+                                zeroclaw_runtime::security::cert_ledger::CertLedger::open_at(
+                                    &data_dir,
+                                    None,
+                                    std::path::PathBuf::from(&crl_path),
+                                )
+                                .context(
+                                    "open cert ledger before starting WSS revocation checks",
+                                )?;
+                            ledger.materialize_revocations().context(
+                                "materialize cert revocations before starting WSS listener",
+                            )?;
+                        }
                         let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
-                            &wss_cfg.cert_path,
-                            &wss_cfg.key_path,
+                            &cert_path,
+                            &key_path,
+                            &ca_cert_path,
+                            &pinned,
+                            &crl_path,
                         )?;
                         let bind_addr: std::net::SocketAddr =
                             format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
+                        let wss_limits = zeroclaw_runtime::rpc::wss::WssLimits {
+                            max_pending_handshakes: wss_cfg.max_pending_handshakes,
+                            handshake_timeout: std::time::Duration::from_secs(
+                                wss_cfg.handshake_timeout_secs,
+                            ),
+                            max_sessions: wss_cfg.max_sessions,
+                            max_sessions_per_client: wss_cfg.max_sessions_per_client,
+                            incomplete_message_timeout: std::time::Duration::from_secs(
+                                wss_cfg.incomplete_message_timeout_secs,
+                            ),
+                        };
                         zeroclaw_runtime::rpc::wss::run_wss_listener(
                             ctx,
                             cancel,
                             client_count,
                             tls_acceptor,
                             bind_addr,
+                            wss_limits,
                         )
                         .await
                     })
                 }));
 
+                // Shared between the relay bridge and the enrollment endpoint:
+                // the bridge registers its enroll-dial source ports here so the
+                // endpoint can classify those loopback connections as
+                // relay-routed rather than direct (finding: relay enrollment
+                // collapsed every client to the bridge's loopback identity, so
+                // one hostile client's failures locked out all relay enrollees).
+                let enroll_bridge_ports: zeroclaw_runtime::enroll::BridgePortSet =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+                let enroll_bridge_ports_for_bridge = enroll_bridge_ports.clone();
+                let enroll_bridge_ports_for_endpoint = enroll_bridge_ports.clone();
+                // Relay bridge: keep an outbound connection to a nominated relay
+                // so clients behind NAT can reach this daemon through it. The
+                // relay forwards to the local WSS listener (loopback), where the
+                // inner mTLS terminates; it never decrypts anything.
+                registry.register_relay(Box::new(move |ctx, cancel, _client_count| {
+                    let enroll_bridge_ports_for_bridge = enroll_bridge_ports_for_bridge.clone();
+                    Box::pin(async move {
+                        let (relay_cfg, wss_cfg, enroll_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (
+                                cfg.relay.clone(),
+                                cfg.wss.clone(),
+                                cfg.enroll.clone(),
+                                cfg.data_dir.clone(),
+                            )
+                        };
+                        if !relay_cfg.enabled {
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        if !wss_cfg.enabled {
+                            return Err(anyhow::Error::msg(
+                                "[relay] is enabled but [wss] is not. The relay forwards clients to \
+                                 the local WSS listener, so enable [wss] (it provides the mutually \
+                                 authenticated plane the relay tunnels).",
+                            ));
+                        }
+                        if relay_cfg.url.is_empty() {
+                            return Err(anyhow::Error::msg(
+                                "[relay] is enabled but relay.url is required.",
+                            ));
+                        }
+                        // Persistent Ed25519 identity the relay binds the node-id to.
+                        let signing_key_pkcs8 =
+                            zeroclaw_runtime::relay::ensure_signing_key(&data_dir)?;
+                        // node_id is an unguessable 128-bit capability: auto-minted +
+                        // persisted unless the operator pinned one in [relay].node_id.
+                        let node_id = zeroclaw_runtime::relay::ensure_node_id(
+                            &data_dir,
+                            &relay_cfg.node_id,
+                        )?;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "node_id": node_id,
+                                "relay": relay_cfg.url,
+                            })),
+                            "relay bridge: node_id (give clients this as --relay-node)"
+                        );
+                        // Default the relay's expected cert name to its host:port host.
+                        let relay_host = if relay_cfg.relay_host.is_empty() {
+                            relay_cfg
+                                .url
+                                .rsplit_once(':')
+                                .map(|(h, _)| h.to_string())
+                                .unwrap_or_else(|| relay_cfg.url.clone())
+                        } else {
+                            relay_cfg.relay_host.clone()
+                        };
+                        // Rotation is permitted only for an auto-minted id (a
+                        // pinned [relay].node_id is fixed).
+                        let rotation_allowed = relay_cfg.node_id.trim().is_empty();
+                        let node_id_rotation_days = relay_cfg.node_id_rotation_days;
+                        let bridge_cfg = zeroclaw_runtime::relay::RelayBridgeConfig {
+                            relay_addr: relay_cfg.url,
+                            relay_host,
+                            node_id,
+                            relay_token: Some(relay_cfg.token).filter(|t| !t.is_empty()),
+                            local_wss_addr: format!("127.0.0.1:{}", wss_cfg.port),
+                            local_enroll_addr: enroll_cfg
+                                .enabled
+                                .then(|| format!("127.0.0.1:{}", enroll_cfg.port)),
+                            enroll_bridge_ports: Some(enroll_bridge_ports_for_bridge.clone()),
+                            signing_key_pkcs8,
+                            relay_ca_path: Some(relay_cfg.relay_ca_path)
+                                .filter(|p| !p.is_empty()),
+                            relay_insecure: relay_cfg.relay_insecure,
+                            relay_tofu: relay_cfg.tofu,
+                            outer_client_cert: Some(relay_cfg.outer_client_cert)
+                                .filter(|p| !p.is_empty()),
+                            outer_client_key: Some(relay_cfg.outer_client_key)
+                                .filter(|p| !p.is_empty()),
+                            max_conns: 256,
+                            // Bridge-side OPEN-flood cap (A6): fast-reject beyond
+                            // ~20 new conns/sec (burst 60) so an OPEN flood cannot
+                            // force unbounded loopback mTLS handshakes.
+                            open_burst: 60,
+                            open_rate_per_sec: 20.0,
+                            data_dir: data_dir.clone(),
+                            node_id_rotation_days,
+                            rotation_allowed,
+                        };
+                        zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
+                    })
+                }));
+
+                // Certificate enrollment endpoint: the bootstrap surface a
+                // certless client reaches for its FIRST cert (server-auth TLS +
+                // one-time pairing code, CSR-only). The daemon owns the CA, so
+                // this works with no gateway. It is NOT the mTLS RPC plane.
+                registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
+                    let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
+                    let daemon_server_tls = daemon_server_tls_for_enroll.clone();
+                    Box::pin(async move {
+                        let (
+                            enroll_cfg,
+                            wss_cfg,
+                            relay_cfg,
+                            tunnel_cfg,
+                            data_dir,
+                            startup_pairing_code_policy,
+                        ) = {
+                            let cfg = ctx.config.read();
+                            (
+                                cfg.enroll.clone(),
+                                cfg.wss.clone(),
+                                cfg.relay.clone(),
+                                cfg.tunnel.clone(),
+                                cfg.data_dir.clone(),
+                                cfg.gateway.pairing_code,
+                            )
+                        };
+                        if !enroll_cfg.enabled {
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        if !wss_cfg.enabled {
+                            return Err(anyhow::Error::msg(
+                                "[enroll] is enabled but [wss] is not. Enrollment issues client \
+                                 certificates for the mutually authenticated WSS plane; enable [wss].",
+                            ));
+                        }
+                        // Issuance needs the daemon CA *private key*. Two
+                        // bring-your-own forms exist:
+                        //   1. BYO-CA with key (in-band): the operator drops
+                        //      ca.crt + ca.key into <data_dir>/tls; the issuer
+                        //      loads and signs against them (handled below by
+                        //      ensure_server_materials_protected's load path).
+                        //   2. BYO-CA without key (external CA): the WSS verifier
+                        //      trusts an external CA cert whose key the daemon does
+                        //      not hold. It cannot sign - fail closed: do not open
+                        //      the endpoint (provision client certs out of band).
+                        // Same predicate the tunnel uses to decide whether to
+                        // publish this endpoint (`daemon_tcp_services`).
+                        if wss_cfg.external_client_ca().is_some() {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                ),
+                                "enrollment endpoint disabled: a bring-your-own CA has no signing \
+                                 key; provision client certs out of band"
+                            );
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        // Per-daemon CA + server cert. Loaded when the operator has
+                        // provisioned their own ca.{crt,key} (BYO-CA with key),
+                        // otherwise auto-generated (secure by default). Same
+                        // passphrase source as the WSS gen + CLI read paths, so the
+                        // on-disk CA-key form always matches.
+                        let tls_dir = data_dir.join("tls");
+                        let ca_provided =
+                            tls_dir.join("ca.crt").exists() && tls_dir.join("ca.key").exists();
+                        let protection = ca_key_protection_from_env();
+                        let mats = daemon_server_tls
+                            .materialize(&tls_dir, &wss_cfg, &protection, || {
+                                zeroclaw_runtime::tunnel::tailscale_server_sans(
+                                    &tunnel_cfg,
+                                    &wss_cfg,
+                                    &enroll_cfg,
+                                )
+                            })
+                            .await?;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            ),
+                            if ca_provided {
+                                "enrollment signing against an operator-provided CA \
+                                 (<data_dir>/tls/ca.*)"
+                            } else {
+                                "enrollment signing against the auto-generated per-daemon CA"
+                            }
+                        );
+                        let ca_cert_pem = std::fs::read_to_string(&mats.ca_cert_path)?;
+                        let ca_key_pem =
+                            zeroclaw_tls::load_ca_key_pem(&mats.ca_key_path, &protection)?;
+                        let ca_fingerprint = {
+                            let ders =
+                                zeroclaw_tls::load_certs(&mats.ca_cert_path.to_string_lossy())?;
+                            zeroclaw_tls::cert_sha256_fingerprint(ders[0].as_ref())
+                        };
+
+                        // Server-authentication-only TLS (no client cert; this is
+                        // the bootstrap surface, explicitly not the mTLS plane).
+                        let acceptor =
+                            zeroclaw_tls::build_tls_acceptor(&zeroclaw_tls::ServerConfigParams {
+                                cert_path: mats.server_cert_path.to_string_lossy().into_owned(),
+                                key_path: mats.server_key_path.to_string_lossy().into_owned(),
+                                client_auth: None,
+                            })?;
+
+                        // Relay coordinates handed to the enrolled client (shared
+                        // with the renew path). The pin (relay LEAF sha256) is
+                        // sourced from the relay bridge's pin store when present.
+                        let relay_profile =
+                            zeroclaw_runtime::enroll::relay_profile(&data_dir, &relay_cfg);
+
+                        // One-time pairing code gates enrollment. Print it AND the
+                        // CA-bound short-auth-string so the operator reads both to
+                        // the client out of band (no blind trust-on-first-use).
+                        let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+                            true,
+                            &[],
+                            startup_pairing_code_policy,
+                        ));
+                        if let Some(code) = pairing.pairing_code() {
+                            let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
+                            let enroll_bind = enroll_cfg.bind.to_string();
+                            let enroll_port = enroll_cfg.port.to_string();
+                            println!();
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-enroll-endpoint-ready",
+                                    &[("bind", &enroll_bind), ("port", &enroll_port)],
+                                    "enrollment ready"
+                                )
+                            );
+                            println!(
+                                "{}",
+                                t("cli-enroll-confirm-sas-line-1", "confirm SAS")
+                            );
+                            println!("{}", t("cli-enroll-confirm-sas-line-2", "match SAS"));
+                            println!(
+                                "{}",
+                                ta("cli-enroll-pairing-code", &[("code", &code)], "code")
+                            );
+                            println!("{}", ta("cli-enroll-sas", &[("sas", &sas)], "SAS"));
+                            println!();
+                        }
+
+                        // Reserved migration knob. Code-less enrollment needs a
+                        // separate client trust anchor before certs can be cached.
+                        let allow_unpaired_until = {
+                            let s = enroll_cfg.allow_unpaired_enrollment.trim();
+                            if !s.is_empty() {
+                                anyhow::bail!(
+                                    "[enroll].allow_unpaired_enrollment is reserved for a future \
+                                     no-code enrollment flow and is not supported in this release. \
+                                     Clear it and use the printed pairing code."
+                                );
+                            }
+                            None
+                        };
+
+                        // The daemon's shared certificate audit logger, built
+                        // once in `daemon::run` and handed to every certificate
+                        // path through the RPC context. Enrollment must not
+                        // build its own: a second logger over the same file
+                        // recovers the same Merkle-chain tip as the renewal
+                        // path and races it into duplicate sequence numbers,
+                        // which makes `verify_chain` reject the trail.
+                        let audit = ctx
+                            .cert_audit
+                            .clone()
+                            .context(
+                                "the enrollment endpoint requires the daemon's certificate \
+                                 audit logger; it failed to initialize at startup (see the \
+                                 startup error) and enrollment will not issue certificates \
+                                 without an audit trail",
+                            )?;
+                        // Materialize revocations to the file the WSS verifier
+                        // ACTUALLY reads - the same `[wss.client_auth].crl_path`
+                        // resolution the acceptor above performs. Opening on the
+                        // ledger default instead meant an enrollment-path
+                        // revocation (including the undelivered sweep, which
+                        // runs on this long-lived handle) rewrote
+                        // `<data_dir>/tls/revoked` while the verifier kept
+                        // reading an unchanged operator-managed file: revoked in
+                        // SQLite, still accepted at the handshake.
+                        let ledger = std::sync::Arc::new(
+                            zeroclaw_runtime::security::cert_ledger::CertLedger::open_at(
+                                &data_dir,
+                                Some(audit),
+                                zeroclaw_runtime::security::cert_ledger::effective_revoked_list_path(
+                                    &data_dir,
+                                    wss_cfg.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+                                ),
+                            )?,
+                        );
+
+                        let bind_addr: std::net::SocketAddr =
+                            format!("{}:{}", enroll_cfg.bind, enroll_cfg.port).parse()?;
+                        let server = std::sync::Arc::new(zeroclaw_runtime::enroll::EnrollServer {
+                            bind_addr,
+                            acceptor,
+                            ca_cert_pem,
+                            ca_key_pem,
+                            ledger,
+                            pairing,
+                            pairing_code_policy: {
+                                let config = ctx.config.clone();
+                                std::sync::Arc::new(move || config.read().gateway.pairing_code)
+                            },
+                            static_client_pins_configured: wss_cfg
+                                .client_auth
+                                .as_ref()
+                                .map(|auth| !auth.pinned_certs.is_empty())
+                                .unwrap_or(false),
+                            allow_unpaired_until,
+                            relay_profile,
+                            bridge_ports: Some(enroll_bridge_ports.clone()),
+                            relay_attempt_bucket:
+                                zeroclaw_runtime::enroll::RelayAttemptBucket::default(),
+                            paircode_admin_data_dir: Some(data_dir.clone()),
+                        });
+                        zeroclaw_runtime::enroll::serve(server, cancel).await
+                    })
+                }));
+
                 // Pass the shared SOP engine through the registry so
                 // RpcContext (RPC/TUI agent sessions) can share it.
-                registry.set_sop_engine(sop_engine, sop_audit);
+                registry.set_sop_engine(
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
+                );
 
-                let exit = Box::pin(daemon::run(
-                    current_config.clone(),
+                let exit = Box::pin(daemon::run_with_authority(
+                    authority,
                     host.clone(),
                     port,
                     registry,
@@ -4385,10 +9881,24 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     startup_feedback_enabled,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+                // Before the loop re-reads config and builds a fresh SOP
+                // engine: in-flight cron drivers hold this generation's config
+                // and engine, so they must not straddle the rebuild.
+                if let Some(maintenance) = sop_maintenance {
+                    // Producer first: no new driver can register while the
+                    // supervisor's drain runs.
+                    maintenance.stop().await;
                 }
-                let exit = exit?;
+                if let Some(supervisor) = sop_driver_supervisor {
+                    // Anything still running is carried into the next
+                    // generation rather than detached, so a driver that has not
+                    // yet reached an await point stays owned and observable.
+                    let teardown = supervisor.shutdown().await;
+                    carried_sop_drivers = teardown.still_running;
+                    carried_unsettled_sop_runs = teardown.unsettled_runs;
+                    carried_sop_settlements = teardown.pending_settlements;
+                }
+                let (exit, transferred_ownership) = exit?;
                 match exit {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
@@ -4400,6 +9910,25 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             ),
                             "🔄 Daemon reload — re-reading config from disk"
                         );
+                        // Continuous ownership: the previous generation drained
+                        // with the guard retained and returned it; the fresh
+                        // snapshot below is loaded while this process still owns
+                        // the config lifecycle.
+                        daemon_ownership = Some((
+                            expected_data_dir,
+                            transferred_ownership.ok_or_else(|| {
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                    "daemon reload ownership transfer invariant failed"
+                                );
+                                anyhow::Error::msg("daemon reload did not retain config ownership")
+                            })?,
+                        ));
                         current_config = Box::pin(Config::load_or_init()).await?;
                         #[cfg(feature = "agent-runtime")]
                         observability::runtime_trace::init_from_config(
@@ -4422,6 +9951,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
+            }
+            if zeroclaw_runtime::restart::desktop_restart_requested() {
+                std::process::exit(zeroclaw_runtime::restart::DESKTOP_RESTART_EXIT_CODE);
             }
             // Bare-process auto-restart: the daemon has now torn down (the
             // gateway listener is released), so launch the upgraded binary as a
@@ -4457,14 +9989,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
             println!("{}", t("cli-status-title", "🦀 ZeroClaw Status"));
             println!();
-            println!(
-                "{}",
-                ta(
-                    "cli-status-version",
-                    &[("v", env!("CARGO_PKG_VERSION"))],
-                    "Version"
-                )
-            );
+            println!("{}", ta("cli-status-version", &[("v", VERSION)], "Version"));
             println!(
                 "{}",
                 ta(
@@ -4560,8 +10085,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let summary: Vec<String> = agent_aliases
                     .iter()
                     .map(|alias| match config.risk_profile_for_agent(alias) {
-                        Some(p) => format!("{alias}={:?}", p.level),
-                        None => format!("{alias}=<no risk_profile>"),
+                        Some(p) => {
+                            let level = format!("{:?}", p.level);
+                            let fallback = format!("{alias}={level}");
+                            ta(
+                                "cli-status-agent-risk-profile",
+                                &[("alias", alias), ("level", &level)],
+                                &fallback,
+                            )
+                        }
+                        None => {
+                            let fallback = format!("{alias}=<no risk_profile>");
+                            ta(
+                                "cli-status-agent-no-risk-profile-summary",
+                                &[("alias", alias)],
+                                &fallback,
+                            )
+                        }
                     })
                     .collect();
                 println!(
@@ -4587,6 +10127,33 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     "{}",
                     t("cli-status-service-stopped", "🔴 Service:       stopped")
                 );
+            }
+            #[cfg(feature = "gateway")]
+            {
+                match zeroclaw_gateway::resolve_web_dashboard_availability(&config) {
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Embedded) => {
+                        let path = "embedded";
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", path)], &fallback)
+                        );
+                    }
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Filesystem(web_dist_dir)) => {
+                        let path = web_dist_dir.display().to_string();
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", &path)], &fallback)
+                        );
+                    }
+                    None => {
+                        println!(
+                            "{}",
+                            t("cli-status-web-ui-missing", "🌐 Web UI:        MISSING")
+                        );
+                    }
+                }
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
@@ -4752,6 +10319,64 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
+                            // Pricing provenance is recorded per usage row.
+                            // The warning qualifies the monthly spend line,
+                            // so it reads the current-UTC-month model rollup
+                            // rather than `summary.by_model`, which stays
+                            // daily-scoped for other consumers; unpriced usage
+                            // from an earlier day this month must not vanish
+                            // at day rollover. Surface any explicitly unpriced
+                            // subset loudly rather than let an understated
+                            // dollar total reassure the operator. Configured
+                            // zero rates and legacy rows without provenance
+                            // remain compatible and do not trigger this
+                            // warning.
+                            let month_by_model = match tracker.get_current_month_model_stats() {
+                                Ok(by_model) => by_model,
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        ta(
+                                            "cli-warn-cost-usage",
+                                            &[("err", &e.to_string())],
+                                            "Could not load cost usage"
+                                        )
+                                    );
+                                    std::collections::HashMap::new()
+                                }
+                            };
+                            let unpriced =
+                                zeroclaw_runtime::agent::cost::unpriced_models_in_summary(
+                                    &month_by_model,
+                                );
+                            if !unpriced.is_empty() {
+                                let uncosted_tokens: u64 =
+                                    unpriced.iter().map(|m| m.unpriced_tokens).sum();
+                                let count = unpriced.len().to_string();
+                                let tokens = uncosted_tokens.to_string();
+                                let models = unpriced
+                                    .iter()
+                                    .map(|m| m.model.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let warn_fallback = format!(
+                                    "  ⚠ Pricing unavailable for {count} model(s) ({tokens} tokens uncosted): {models}. \
+Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. \
+Add pricing to the active provider profile or supply a catalog entry."
+                                );
+                                eprintln!(
+                                    "{}",
+                                    ta(
+                                        "cli-status-pricing-unavailable",
+                                        &[
+                                            ("count", &count),
+                                            ("tokens", &tokens),
+                                            ("models", &models),
+                                        ],
+                                        &warn_fallback
+                                    )
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -4801,15 +10426,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 } else {
                     t("cli-status-word-not-configured", "not configured")
                 };
-                println!(
-                    "  {:9} {}",
-                    entry.name,
-                    if entry.configured {
-                        format!("✅ {}", channel_status)
-                    } else {
-                        format!("❌ {}", channel_status)
-                    }
-                );
+                let status = if entry.configured {
+                    ta(
+                        "cli-status-channel-configured",
+                        &[("status", &channel_status)],
+                        format!("✅ {channel_status}"),
+                    )
+                } else {
+                    ta(
+                        "cli-status-channel-not-configured",
+                        &[("status", &channel_status)],
+                        format!("❌ {channel_status}"),
+                    )
+                };
+                println!("  {:9} {}", entry.name, status);
             }
             let uncompiled =
                 zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
@@ -4822,14 +10452,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     )
                 );
                 for entry in &uncompiled {
-                    println!(
-                        "  {:9} {}",
-                        entry.name,
-                        t(
-                            "cli-status-channel-not-compiled",
-                            "🚫 configured, not compiled"
-                        )
+                    let status = t(
+                        "cli-status-channel-not-compiled",
+                        "🚫 configured, not compiled",
                     );
+                    println!("  {:9} {}", entry.name, status);
                 }
                 println!(
                     "{}",
@@ -4868,17 +10495,76 @@ async fn async_main(command: clap::Command) -> Result<()> {
         }
 
         #[cfg(feature = "agent-runtime")]
-        Commands::Security {
-            security_command: SecurityCommands::Status { agent, json },
-        } => {
-            let report = security_status::build_report(&config, &agent)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                security_status::print_report(&report);
+        Commands::Security { security_command } => match security_command {
+            SecurityCommands::Status { agent, json } => {
+                let report = security_status::build_report(&config, &agent)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    security_status::print_report(&report);
+                }
+                Ok(())
             }
-            Ok(())
-        }
+            SecurityCommands::IssueClientCert {
+                name,
+                out_dir,
+                force,
+            } => issue_wss_client_cert(&config, &name, out_dir, force),
+            SecurityCommands::RevokeClientCert {
+                fingerprint,
+                device,
+            } => revoke_wss_client_cert(&config, fingerprint, device),
+            SecurityCommands::ListClientCerts { json } => list_wss_client_certs(&config, json),
+            SecurityCommands::EnrollPaircode { new, timeout_secs } => {
+                if !new {
+                    anyhow::bail!("pass --new to mint a fresh enrollment pairing code");
+                }
+                let generated = zeroclaw_runtime::enroll::request_new_paircode(
+                    &config.data_dir,
+                    std::time::Duration::from_secs(timeout_secs),
+                )
+                .await?;
+                println!(
+                    "{}",
+                    ta(
+                        "cli-enroll-pairing-code",
+                        &[("code", &generated.pairing_code)],
+                        "pairing code"
+                    )
+                );
+                println!(
+                    "{}",
+                    ta("cli-enroll-sas", &[("sas", &generated.sas)], "SAS")
+                );
+                Ok(())
+            }
+            SecurityCommands::RelayRotateNodeId => {
+                if !config.relay.node_id.trim().is_empty() {
+                    anyhow::bail!(
+                        "[relay].node_id is pinned, so the node-id is fixed and not rotatable. \
+                         Clear it to auto-mint (and enable rotation)."
+                    );
+                }
+                zeroclaw_runtime::relay::request_node_id_rotation(&config.data_dir)?;
+                let rotate_secs = 15.to_string();
+                println!(
+                    "{}",
+                    ta(
+                        "cli-relay-rotation-requested",
+                        &[("secs", &rotate_secs)],
+                        "relay node-id rotation requested"
+                    )
+                );
+                Ok(())
+            }
+        },
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::Relay { relay_command } => match relay_command {
+            RelayCommands::Claim { token, control } => {
+                Box::pin(relay_cli::handle_claim(&mut config, &token, &control)).await
+            }
+        },
 
         Commands::Estop {
             estop_command,
@@ -5007,32 +10693,82 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+                let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
+                // Single SIGINT consumer for the CLI path: cancel the
+                // shared lifecycle token. Channels subscribe via
+                // set_cancel_token so the same signal reaches all
+                // listeners deterministically.
+                let ctrlc_cancel = cancel.clone();
+                let _ctrlc_guard = ::zeroclaw_spawn::spawn!(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    ctrlc_cancel.cancel();
+                });
+                let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
                     let sop_adapters = build_sop_adapters(&config);
-                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine_with_capability(
                         config.sop.clone(),
+                        &config.decision_models,
                         &config.data_dir,
+                        &config.install_root_dir(),
                         mem,
                         sop_adapters,
+                        Some(authority.execution_capability()),
                     );
                     (Some(engine), Some(audit))
                 } else {
                     (None, None)
                 };
                 // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_driver_supervisor = sop_engine
+                    .as_ref()
+                    .map(|engine| SopDriverSupervisor::new(Vec::new(), engine));
                 let sop_maintenance = spawn_sop_maintenance(
+                    &config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     config.sop.maintenance_interval_secs,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
-                let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            supervisor.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
+                // Standalone channel mode owns the live-pricing refresher.
+                zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
+
+                let result = Box::pin(channels::start_channels_with_authority(
+                    authority,
+                    None,
+                    cancel,
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_sink,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+
+                // `channel start` runs one configuration generation and exits,
+                // but drivers still hold the engine; drain them before the
+                // process tears the subsystem down.
+                if let Some(maintenance) = sop_maintenance {
+                    maintenance.stop().await;
+                }
+                if let Some(supervisor) = sop_driver_supervisor {
+                    // No next generation on this path: the process exits after
+                    // `channel start` returns, which ends any straggler.
+                    drop(supervisor.shutdown().await);
                 }
                 result
             }
@@ -5061,7 +10797,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // engine). List/Validate/Show stay local + synchronous.
             cmd @ (SopCommands::Approve { .. }
             | SopCommands::Deny { .. }
-            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
+            | SopCommands::Pending
+            | SopCommands::Logs { .. }) => sop_admin_dispatch(cmd, &config).await,
             other => sop::handle_command(other, &config),
         },
 
@@ -5074,6 +10811,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
         }
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::Oidc { oidc_command } => handle_oidc_command(oidc_command, &config).await,
 
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
@@ -5090,14 +10830,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
         Commands::Desktop {
             install: do_install,
         } => {
-            let download_url = "https://www.zeroclawlabs.ai/download";
+            // The marketing download page is not live; point at the GitHub
+            // releases page, which hosts the desktop download assets (.deb /
+            // .AppImage / .dmg) for the latest release.
+            let download_url = "https://github.com/zeroclaw-labs/zeroclaw/releases/latest";
 
             if do_install {
                 println!(
                     "{}",
                     t(
                         "cli-desktop-download",
-                        "Download the ZeroClaw companion app:"
+                        "Opening the ZeroClaw companion app download page:"
                     )
                 );
                 println!();
@@ -5122,7 +10865,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         "{}",
                         t(
                             "cli-desktop-linux-pkg",
-                            "  Download the .deb or .AppImage for your architecture."
+                            "  The page provides .deb and .AppImage downloads by architecture."
                         )
                     );
                 }
@@ -5211,6 +10954,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     && let Ok(path) = which::which("zeroclaw-desktop")
                 {
                     found = Some(path);
+                }
+
+                // 5. Linux: an AppImage registered in the application menu is
+                //    not on PATH and has no fixed binary name, so discover it
+                //    from its desktop entry or common AppImage locations.
+                #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+                if found.is_none() {
+                    found = find_linux_desktop_app();
                 }
 
                 found
@@ -5349,10 +11100,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
                 let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                if !report.all_passed() {
-                    std::process::exit(1);
+                // Only a failing suite needs the hard exit to carry a non-zero
+                // status; a passing run returns normally so shutdown runs.
+                match report.exit_code() {
+                    0 => Ok(()),
+                    code => std::process::exit(code),
                 }
-                Ok(())
             }
         },
 
@@ -5506,7 +11259,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 comment,
                 json,
             } => {
-                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let known_paths: Vec<String> =
                     config.prop_fields().into_iter().map(|f| f.name).collect();
                 let mut path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
@@ -5515,8 +11267,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         config.prop_fields().into_iter().map(|f| f.name).collect();
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
-                if no_interactive {
-                    let val = value.ok_or_else(|| {
+                let selected_value = if no_interactive {
+                    value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -5527,8 +11279,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         anyhow::Error::msg(format!(
                             "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         ))
-                    })?;
-                    config.set_prop_persistent(&path, &val)?;
+                    })?
                 } else if Config::prop_is_secret(&path) {
                     if value.is_some() {
                         eprintln!(
@@ -5544,9 +11295,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
-                    config.set_prop_persistent(&path, &secret_value)?;
+                    secret_value
                 } else if let Some(val) = value {
-                    config.set_prop_persistent(&path, &val)?;
+                    val
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
                     let provider_ref = path
@@ -5554,12 +11305,28 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         .nth(3)
                         .map(|alias| format!("{provider_type}.{alias}"));
                     let catalog_selector = provider_ref.as_deref().unwrap_or(provider_type);
-                    let (models, _pricing, live) =
-                        zeroclaw_runtime::quickstart::model_catalog_with_config(
-                            Some(&config),
-                            catalog_selector,
-                        )
-                        .await;
+                    let catalog = zeroclaw_runtime::quickstart::model_catalog_with_config_result(
+                        Some(&config),
+                        catalog_selector,
+                    )
+                    .await;
+                    let (models, _pricing, live) = match catalog {
+                        Ok(catalog) => catalog,
+                        Err(error) => {
+                            let error = error.to_string();
+                            eprintln!(
+                                "{}",
+                                ta(
+                                    "cli-config-catalog-unavailable-manual",
+                                    &[("provider", catalog_selector), ("error", &error)],
+                                    format!(
+                                        "  ⚠ Catalog for {catalog_selector} is unavailable ({error}); enter the model ID manually."
+                                    ),
+                                )
+                            );
+                            (Vec::new(), None, false)
+                        }
+                    };
                     if live && !models.is_empty() {
                         let current = config.get_prop(&path).unwrap_or_default();
                         let default = models.iter().position(|m| m == &current).unwrap_or(0);
@@ -5572,17 +11339,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         else {
                             anyhow::bail!("cancelled");
                         };
-                        config.set_prop_persistent(&path, &models[idx])?;
+                        models[idx].clone()
                     } else {
                         eprintln!(
                             "  no live catalog for `{provider_type}` — \
                              enter the model id manually."
                         );
-                        let m = Input::<String>::new()
+                        Input::<String>::new()
                             .with_prompt(format!("Model id for {provider_type}"))
                             .allow_empty(false)
-                            .interact_text()?;
-                        config.set_prop_persistent(&path, &m)?;
+                            .interact_text()?
                     }
                 } else {
                     let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
@@ -5601,7 +11367,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .items(&variants)
                             .default(current_index)
                             .interact()?;
-                        config.set_prop_persistent(&path, &variants[selected])?;
+                        variants[selected].clone()
                     } else if field_info
                         .as_ref()
                         .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
@@ -5631,17 +11397,62 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let edited = dialoguer::Editor::new()
                             .edit(&editor_content)?
                             .unwrap_or(editor_content);
-                        let val = edited
+                        edited
                             .lines()
                             .map(|l| l.trim())
                             .filter(|l| !l.is_empty())
                             .collect::<Vec<_>>()
-                            .join(", ");
-                        config.set_prop_persistent(&path, &val)?;
+                            .join(", ")
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
+                };
+
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership =
+                    if zeroclaw_config::alias_refs::agent_alias_for_prop_path(&path).is_some() {
+                        match crate::alias_cli::route_agent_mutation(
+                            &mut config,
+                            "config/set",
+                            serde_json::json!({
+                                "prop": path,
+                                "value": selected_value,
+                                "comment": comment,
+                            }),
+                        )
+                        .await?
+                        {
+                            crate::alias_cli::AgentMutationRoute::Daemon(_) => {
+                                if json {
+                                    let envelope = if Config::prop_is_secret(&path) {
+                                        serde_json::json!({"path": path, "populated": true})
+                                    } else {
+                                        serde_json::json!({"path": path, "value": selected_value})
+                                    };
+                                    println!("{}", serde_json::to_string_pretty(&envelope)?);
+                                } else {
+                                    println!(
+                                        "{}",
+                                        ta("cli-config-updated", &[("path", &path)], "updated")
+                                    );
+                                }
+                                return Ok(());
+                            }
+                            crate::alias_cli::AgentMutationRoute::Offline(ownership) => {
+                                Some(ownership)
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+                if ensure_map_key_for_prop_path(&mut config, &path)? {
+                    let known_paths: Vec<String> =
+                        config.prop_fields().into_iter().map(|f| f.name).collect();
+                    path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
+                config.set_prop_persistent(&path, &selected_value)?;
                 Box::pin(config.save_dirty()).await?;
                 if let Some(c) = comment.as_ref()
                     && !c.is_empty()
@@ -5665,6 +11476,60 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Init { section, json } => {
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership = if let Some(("agents", alias)) = section
+                    .as_deref()
+                    .and_then(|arg| alias_target_for_path(arg, map_key_for_section_arg))
+                {
+                    match crate::alias_cli::route_agent_mutation(
+                        &mut config,
+                        "config/map-key-create",
+                        serde_json::json!({ "path": "agents", "key": alias }),
+                    )
+                    .await?
+                    {
+                        crate::alias_cli::AgentMutationRoute::Daemon(value) => {
+                            let result: zeroclaw_runtime::rpc::types::ConfigMapKeyCreateResult =
+                                serde_json::from_value(value)
+                                    .context("decode daemon config-init response")?;
+                            let initialized = result
+                                .created
+                                .then(|| format!("{}.{}", result.path, result.key))
+                                .into_iter()
+                                .collect::<Vec<_>>();
+                            if json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(
+                                        &serde_json::json!({"initialized": initialized})
+                                    )?
+                                );
+                            } else if initialized.is_empty() {
+                                println!(
+                                    "{}",
+                                    t(
+                                        "cli-config-all-configured",
+                                        "All sections already configured."
+                                    )
+                                );
+                            } else {
+                                println!(
+                                    "{}",
+                                    ta(
+                                        "cli-config-initialized-sections",
+                                        &[("count", "1")],
+                                        "Initialized {$count} section(s) with defaults:"
+                                    )
+                                );
+                                println!("  {}", initialized[0]);
+                            }
+                            return Ok(());
+                        }
+                        crate::alias_cli::AgentMutationRoute::Offline(ownership) => Some(ownership),
+                    }
+                } else {
+                    None
+                };
                 crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let mut initialized: Vec<String> = config
                     .init_defaults(section.as_deref())
@@ -5699,8 +11564,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     );
                 } else {
                     println!(
-                        "Initialized {} section(s) with defaults:",
-                        initialized.len()
+                        "{}",
+                        ta(
+                            "cli-config-initialized-sections",
+                            &[("count", &initialized.len().to_string())],
+                            "Initialized {$count} section(s) with defaults:"
+                        )
                     );
                     for name in &initialized {
                         println!("  {name}");
@@ -5782,7 +11651,6 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Ok(())
             }
             ConfigCommands::Patch { input, json } => {
-                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
                 let body = match input.as_deref() {
                     None | Some("-") => {
                         use std::io::Read;
@@ -5847,6 +11715,45 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 };
 
+                // The withheld-capability notice is recorded once per config
+                // application, and the record written during startup describes
+                // the config as it was loaded. A patch that turns the section on
+                // is a new application of that setting, so the state before the
+                // ops run is captured here to tell that transition apart from a
+                // patch that leaves an already-enabled section alone.
+                #[cfg(feature = "agent-runtime")]
+                let verifiable_intent_was_enabled = config.verifiable_intent.enabled;
+
+                #[cfg(feature = "agent-runtime")]
+                let _offline_ownership = if ops.iter().any(|op| {
+                    let op_name = op.get("op").and_then(|value| value.as_str());
+                    let path = op.get("path").and_then(|value| value.as_str()).map(|path| {
+                        path.strip_prefix('/')
+                            .map_or_else(|| path.to_string(), |path| path.replace('/', "."))
+                    });
+                    matches!(op_name, Some("add" | "replace" | "remove"))
+                        && path.as_deref().is_some_and(|path| {
+                            zeroclaw_config::alias_refs::agent_alias_for_prop_path(path).is_some()
+                        })
+                }) {
+                    match crate::alias_cli::route_agent_mutation(
+                        &mut config,
+                        "config/get",
+                        serde_json::json!({}),
+                    )
+                    .await?
+                    {
+                        crate::alias_cli::AgentMutationRoute::Daemon(_) => anyhow::bail!(
+                            "refusing agent-targeting config patch while the daemon owns config; use the daemon-backed config API"
+                        ),
+                        crate::alias_cli::AgentMutationRoute::Offline(ownership) => Some(ownership),
+                    }
+                } else {
+                    None
+                };
+
+                crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
+
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
                 for (idx, op) in ops.iter().enumerate() {
@@ -5893,7 +11800,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     } else {
                         raw_path.to_string()
                     };
-                    if matches!(op_name, "add" | "replace") && config.ensure_map_key_for_path(&path)
+                    if matches!(op_name, "add" | "replace")
+                        && config.ensure_map_or_list_key_for_path(&path)
                     {
                         let err = ConfigApiError::new(
                             ConfigApiCode::ValidationFailed,
@@ -6113,6 +12021,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }
                 Box::pin(config.save_dirty()).await?;
 
+                // Report the withheld tool when this patch is what enabled the
+                // section. The helper returns early while it stays disabled, so
+                // the guard is only about the already-enabled case: the startup
+                // call has recorded that one for this process, and recording it
+                // again here would restore the second copy this command used to
+                // write. The trace sink was installed before the command
+                // dispatched, so the record has somewhere to go.
+                #[cfg(feature = "agent-runtime")]
+                if !verifiable_intent_was_enabled {
+                    warn_verifiable_intent_withheld(&config);
+                }
+
                 if json {
                     let body = serde_json::json!({"saved": true, "results": results});
                     println!("{}", serde_json::to_string_pretty(&body)?);
@@ -6195,7 +12115,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
             }
         },
 
-        Commands::Props { .. } => {
+        Commands::Props { props_command } => {
+            let DeprecatedPropsCommands::Any(args) = props_command;
+            drop(args);
             anyhow::bail!(
                 "`zeroclaw props` has been renamed to `zeroclaw config`. \
                  Replace `props` with `config` in your command and try again."
@@ -6204,22 +12126,38 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
-            PluginCommands::List => {
+            PluginCommands::List { verify } => {
                 let host = plugin_host_with_configured_security(&config)?;
                 let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
+                if verify {
+                    let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
+                    let mut entries = Vec::new();
+                    for info in &plugins {
+                        entries.push((
+                            info.clone(),
+                            Some(installed_plugin_load_status(&host, info, limits).await?),
+                        ));
+                    }
+                    for line in plugin_list_lines(&entries) {
+                        println!("{line}");
+                    }
                 } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
+                    plugin_catalog::print(&config, &host);
+                }
+                // A binding whose alias names no instance is skipped by every
+                // row enumeration; say so once per alias rather than fail.
+                for info in &plugins {
+                    if let Some(manifest) = host.manifest(&info.name) {
+                        for (alias, reason) in
+                            crate::plugins::channel_instance::unkeyed_channel_aliases(
+                                &config, manifest,
+                            )
+                        {
+                            println!("  {}", unkeyed_alias_line(&info.name, &alias, &reason));
+                        }
                     }
                 }
+                print_egress_grant_gaps(&config, &host, &plugins)?;
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
@@ -6286,24 +12224,45 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }
                 Ok(())
             }
-            PluginCommands::Install { source, registry } => {
+            PluginCommands::Install {
+                source,
+                registry,
+                no_verify,
+                channel_alias,
+                egress,
+            } => {
                 if plugin_registry::looks_like_url(&source) {
                     bail!(
                         "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
                     );
                 }
+                let channel = channel_alias.map(|alias| ChannelBindingRequest {
+                    alias,
+                    egress: egress.map(Into::into),
+                });
                 let mut host = plugin_host_with_configured_security(&config)?;
-                if plugin_registry::is_local_plugin_source(&source) {
-                    let name = host.install(&source)?;
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-installed-from",
-                            &[("source", &source)],
-                            "Plugin installed"
-                        )
-                    );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
+                let channel_lines = if plugin_registry::is_local_plugin_source(&source) {
+                    let admitted = host.admit_source(&source)?;
+                    Box::pin(install_admitted_source(
+                        &mut host,
+                        &mut config,
+                        admitted,
+                        channel,
+                        limits,
+                        no_verify,
+                        |_name| {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-installed-from",
+                                    &[("source", &source)],
+                                    "Plugin installed"
+                                )
+                            );
+                        },
+                    ))
+                    .await?
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -6321,88 +12280,141 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    let name = host.install(&plugin_dir)?;
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-installed-name-version",
-                            &[
-                                ("name", &downloaded.manifest().name),
-                                ("version", &downloaded.manifest().version),
-                            ],
-                            "Plugin installed"
-                        )
-                    );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    let admitted = host.admit_source(&plugin_dir)?;
+                    Box::pin(install_admitted_source(
+                        &mut host,
+                        &mut config,
+                        admitted,
+                        channel,
+                        limits,
+                        no_verify,
+                        |_name| {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-installed-name-version",
+                                    &[
+                                        ("name", &downloaded.manifest().name),
+                                        ("version", &downloaded.manifest().version),
+                                    ],
+                                    "Plugin installed"
+                                )
+                            );
+                        },
+                    ))
+                    .await?
+                };
+                for line in channel_lines {
+                    println!("{line}");
                 }
                 Ok(())
             }
             PluginCommands::Remove { name } => {
                 let mut host = plugin_host_with_configured_security(&config)?;
+                // The rows to check for a kept grant derive from the
+                // package's manifest, which the removal takes with it, so
+                // they are enumerated first.
+                #[cfg(feature = "plugins-wasm")]
+                let grant_rows = host
+                    .manifest(&name)
+                    .map(|manifest| removed_plugin_grant_rows(&config, manifest))
+                    .unwrap_or_default();
+                #[cfg(feature = "plugins-wasm")]
+                let bound_aliases =
+                    crate::plugins::channel_instance::bound_channel_aliases(&config, &name);
+                #[cfg(feature = "plugins-wasm")]
+                let unkeyed_aliases = host
+                    .manifest(&name)
+                    .map(|manifest| {
+                        crate::plugins::channel_instance::unkeyed_channel_aliases(&config, manifest)
+                    })
+                    .unwrap_or_default();
                 host.remove(&name)?;
                 println!(
                     "{}",
                     ta("cli-plugin-removed", &[("name", &name)], "Plugin removed")
                 );
+                #[cfg(feature = "plugins-wasm")]
+                for line in removed_plugin_kept_grant_lines(&config, &name, &grant_rows) {
+                    println!("{line}");
+                }
+                #[cfg(feature = "plugins-wasm")]
+                for line in removed_plugin_binding_lines(&name, &bound_aliases) {
+                    println!("{line}");
+                }
+                #[cfg(feature = "plugins-wasm")]
+                for (alias, reason) in &unkeyed_aliases {
+                    println!("{}", unkeyed_alias_line(&name, alias, reason));
+                }
                 Ok(())
             }
             PluginCommands::Info { name } => {
                 let host = plugin_host_with_configured_security(&config)?;
+                let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
                 match host.get_plugin(&name) {
                     Some(info) => {
-                        println!(
-                            "{}",
-                            ta(
-                                "cli-plugin-name-version",
-                                &[("name", &info.name), ("version", &info.version)],
-                                "Plugin"
-                            )
-                        );
-                        if let Some(desc) = &info.description {
-                            println!(
-                                "{}",
-                                ta("cli-plugin-description", &[("desc", desc)], "Description")
-                            );
+                        let instance_rows = installed_instance_rows(&config, &host, &info.name)?;
+                        let manifest = host.manifest(&info.name).ok_or_else(|| {
+                            anyhow::Error::msg("installed plugin manifest is unavailable")
+                        })?;
+                        // A channel package reports each bound alias's
+                        // readiness, or, with none bound, how to bind one.
+                        let channel_readiness = bound_channel_readiness(&config, &host, manifest);
+                        let bind_hint = if channel_readiness.is_empty() {
+                            channel_bind_hint_lines(&config, manifest)
+                        } else {
+                            Vec::new()
+                        };
+                        // The load-check always runs here. "Why does my plugin
+                        // not show up?" is the question this command is reached
+                        // for, and discovery metadata cannot answer it.
+                        let status = installed_plugin_load_status(&host, &info, limits).await?;
+                        for line in plugin_info_lines(
+                            &info,
+                            &instance_rows,
+                            &channel_readiness,
+                            &bind_hint,
+                            &status,
+                        ) {
+                            println!("{line}");
                         }
-                        println!(
-                            "{}",
-                            ta(
-                                "cli-plugin-capabilities",
-                                &[("v", &format!("{:?}", info.capabilities))],
-                                "Capabilities"
-                            )
-                        );
-                        println!(
-                            "{}",
-                            ta(
-                                "cli-plugin-permissions",
-                                &[("v", &format!("{:?}", info.permissions))],
-                                "Permissions"
-                            )
-                        );
-                        match &info.wasm_path {
-                            Some(path) => println!(
-                                "{}",
-                                ta(
-                                    "cli-plugin-wasm",
-                                    &[("path", &path.display().to_string())],
-                                    "WASM"
-                                )
-                            ),
-                            None => println!(
-                                "{}",
-                                t("cli-plugin-wasm-none", "WASM: (skill-only plugin)")
-                            ),
+                        if status.is_load_failure() {
+                            // The diagnostic is already on stdout; this is the
+                            // non-zero exit a script can branch on.
+                            bail!(ta(
+                                "cli-plugin-info-load-failed-exit",
+                                &[("name", &info.name)],
+                                format!("plugin '{}' does not load against this host", info.name),
+                            ));
                         }
                     }
-                    None => println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-not-found",
-                            &[("name", &name)],
-                            "Plugin not found"
-                        )
-                    ),
+                    // A name that is not installed is an error, not a report:
+                    // a script asking about a plugin must not read exit 0 as
+                    // "it is here and loads".
+                    None => bail!(ta(
+                        "cli-plugin-not-found",
+                        &[("name", &name)],
+                        "Plugin not found"
+                    )),
+                }
+                Ok(())
+            }
+            PluginCommands::Bind {
+                package,
+                channel_alias,
+                egress,
+            } => {
+                let host = plugin_host_with_configured_security(&config)?;
+                let lines = Box::pin(bind_channel_instance(
+                    &mut config,
+                    &host,
+                    &package,
+                    &channel_alias,
+                    egress.map(Into::into),
+                ))
+                .await?;
+                for line in lines {
+                    println!("{line}");
                 }
                 Ok(())
             }
@@ -6715,6 +12727,7 @@ fi"#
 // ─── Gateway helper functions ───────────────────────────────────────────────
 
 /// Resolve gateway host and port from CLI args or config.
+#[cfg(feature = "agent-runtime")]
 fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>) -> (u16, String) {
     let port = port.unwrap_or(config.gateway.port);
     let host = host.unwrap_or_else(|| config.gateway.host.clone());
@@ -6722,6 +12735,7 @@ fn resolve_gateway_addr(config: &Config, port: Option<u16>, host: Option<String>
 }
 
 /// Log gateway startup message.
+#[cfg(feature = "agent-runtime")]
 fn log_gateway_start(host: &str, port: u16) {
     if port == 0 {
         ::zeroclaw_log::record!(
@@ -6784,18 +12798,9 @@ async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> R
 /// Dispatch the gateway-backed SOP verbs. Requires the `agent-runtime` build (the
 /// gateway HTTP client + `gateway_admin_url` live behind it, like `shutdown_gateway`);
 /// without it these verbs cannot reach the daemon, so they error clearly.
+#[cfg(feature = "agent-runtime")]
 async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) -> Result<()> {
-    #[cfg(feature = "agent-runtime")]
-    {
-        sop_admin_request(cmd, config).await
-    }
-    #[cfg(not(feature = "agent-runtime"))]
-    {
-        let _ = (cmd, config);
-        anyhow::bail!(
-            "`zeroclaw sop approve/deny/pending` requires the agent-runtime build (the gateway client)"
-        )
-    }
+    sop_admin_request(cmd, config).await
 }
 
 /// CLI -> daemon dispatch for the out-of-band SOP approval verbs (EPIC C, C8).
@@ -6870,6 +12875,119 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             }
             Ok(())
         }
+        SopCommands::Logs {
+            run_id,
+            limit,
+            json,
+        } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/logs");
+            let resp = client
+                .get(&url)
+                .query(&[("run_id", run_id.as_str()), ("limit", &limit.to_string())])
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                anyhow::bail!("Gateway responded {status}: {err}");
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&body)?);
+                return Ok(());
+            }
+
+            if body
+                .get("persistence_enabled")
+                .and_then(|value| value.as_bool())
+                == Some(false)
+            {
+                println!(
+                    "{}",
+                    t("cli-sop-logs-disabled", "Log persistence is not enabled.")
+                );
+                return Ok(());
+            }
+
+            let events = body
+                .get("events")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if events.is_empty() {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-sop-logs-none",
+                        &[("run_id", run_id.as_str())],
+                        "No persisted logs found for this SOP run."
+                    )
+                );
+                return Ok(());
+            }
+            println!(
+                "{}",
+                ta(
+                    "cli-sop-logs-header",
+                    &[("run_id", run_id.as_str())],
+                    "SOP run logs:"
+                )
+            );
+            for event in events.iter().rev() {
+                let timestamp = event
+                    .get("@timestamp")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let severity = event
+                    .get("severity_text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let category = event
+                    .pointer("/event/category")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let action = event
+                    .pointer("/event/action")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let message = event
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                println!(
+                    "{}",
+                    ta(
+                        "cli-sop-logs-row",
+                        &[
+                            ("timestamp", timestamp),
+                            ("severity", severity),
+                            ("category", category),
+                            ("action", action),
+                            ("message", message),
+                        ],
+                        "  (log event)",
+                    )
+                );
+            }
+            // A retained segment the daemon could not read was left out, so the
+            // rows above are not the run's full history. Say so instead of
+            // presenting a partial timeline as complete.
+            if body.get("incomplete").and_then(|value| value.as_bool()) == Some(true) {
+                println!(
+                    "{}",
+                    t(
+                        "cli-sop-logs-incomplete",
+                        "Some retained log segments could not be read; this history may be incomplete."
+                    )
+                );
+            }
+            Ok(())
+        }
         SopCommands::Approve { run_id } => {
             let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
             sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
@@ -6883,8 +13001,8 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             )
             .await
         }
-        // List/Validate/Show are dispatched on the local synchronous path.
-        _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
+        // List/Validate/Show/Graph/Delete are dispatched on the local path.
+        _ => anyhow::bail!("local SOP verb reached the gateway dispatch path"),
     }
 }
 
@@ -6978,8 +13096,19 @@ async fn fetch_paircode(
     host: &str,
     port: u16,
     path_prefix: Option<&str>,
+    data_dir: &std::path::Path,
     action: &PaircodeAction,
 ) -> Result<PaircodeResult> {
+    // The pairing-code admin routes accept only this run's admin token, which
+    // the gateway writes owner-only into its data directory at startup.
+    let admin_token =
+        zeroclaw_config::pairing::read_gateway_admin_token(data_dir).ok_or_else(|| {
+            anyhow::Error::msg(format!(
+                "No gateway admin token at {}. Run this on the gateway host, as the user that \
+             runs the gateway, while the gateway is running.",
+                zeroclaw_config::pairing::gateway_admin_token_path(data_dir).display()
+            ))
+        })?;
     let client = reqwest::Client::new();
 
     let response = if action.mints_code() {
@@ -6990,6 +13119,10 @@ async fn fetch_paircode(
         }
         client
             .post(&url)
+            .header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -6997,6 +13130,10 @@ async fn fetch_paircode(
         let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
+            .header(
+                zeroclaw_config::pairing::GATEWAY_ADMIN_TOKEN_HEADER,
+                &admin_token,
+            )
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
@@ -7026,6 +13163,12 @@ async fn fetch_paircode(
         );
         anyhow::Error::msg(format!("Gateway responded with status {status}: {e}"))
     })?;
+
+    if status == reqwest::StatusCode::FORBIDDEN
+        && let Some(error) = json.get("error").and_then(|v| v.as_str())
+    {
+        anyhow::bail!("{error}");
+    }
 
     let message = json
         .get("message")
@@ -7075,26 +13218,37 @@ fn paircode_no_code_message(
     if let Some(message) = gateway_message.filter(|m| !m.trim().is_empty()) {
         lines.push(format!("⚠️  {message}"));
     } else if require_pairing {
-        lines
-            .push("🔐 Gateway pairing is enabled, but no active pairing code is available.".into());
+        lines.push(t(
+            "cli-pairing-no-code",
+            "🔐 Gateway pairing is enabled, but no active pairing code is available.",
+        ));
     } else {
         lines.push(t(
             "cli-pairing-disabled",
             "⚠️  Gateway pairing is disabled in config.",
         ));
-        lines.push("All requests will be accepted without authentication.".into());
-        lines.push("To enable pairing, set [gateway] require_pairing = true.".into());
+        lines.push(t(
+            "cli-pairing-requests-accepted",
+            "All requests will be accepted without authentication.",
+        ));
+        lines.push(t(
+            "cli-pairing-enable-config",
+            "To enable pairing, set [gateway] require_pairing = true.",
+        ));
         return indent_paircode_lines(lines);
     }
 
     lines.push(String::new());
     match action {
         PaircodeAction::Show => {
-            lines.push(
-                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one."
-                    .into(),
-            );
-            lines.push("To pair another device, run:".into());
+            lines.push(t(
+                "cli-pairing-show-only",
+                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.",
+            ));
+            lines.push(t(
+                "cli-pairing-pair-another",
+                "To pair another device, run:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -7103,7 +13257,10 @@ fn paircode_no_code_message(
                 Some("--new"),
             ));
             lines.push(String::new());
-            lines.push("To revoke existing pairings and mint a replacement code, run:".into());
+            lines.push(t(
+                "cli-pairing-revoke-replace",
+                "To revoke existing pairings and mint a replacement code, run:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -7113,14 +13270,14 @@ fn paircode_no_code_message(
             ));
         }
         PaircodeAction::AddClient => {
-            lines.push(
-                "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset."
-                    .into(),
-            );
-            lines.push(
-                "Try again shortly, or revoke existing pairings and mint a replacement code:"
-                    .into(),
-            );
+            lines.push(t(
+                "cli-pairing-new-code-unavailable",
+                "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.",
+            ));
+            lines.push(t(
+                "cli-pairing-retry-or-rotate",
+                "Try again shortly, or revoke existing pairings and mint a replacement code:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -7130,8 +13287,14 @@ fn paircode_no_code_message(
             ));
         }
         PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_) => {
-            lines.push("The rotate request completed without returning a replacement code.".into());
-            lines.push("Check whether pairing is enabled, then request a new device code:".into());
+            lines.push(t(
+                "cli-pairing-rotate-no-code",
+                "The rotate request completed without returning a replacement code.",
+            ));
+            lines.push(t(
+                "cli-pairing-check-enabled",
+                "Check whether pairing is enabled, then request a new device code:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -7143,7 +13306,7 @@ fn paircode_no_code_message(
     }
 
     lines.push(String::new());
-    lines.push("To inspect the running gateway:".into());
+    lines.push(t("cli-pairing-inspect", "To inspect the running gateway:"));
     lines.push(format!(
         "    open http://{}:{port}",
         gateway_browser_host(host)
@@ -7379,6 +13542,257 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
             "  Saved Claude setup token.",
         )
     );
+    Ok(())
+}
+
+/// Spawn `program` with `args` detached from this process's standard streams.
+///
+/// `oidc login` prints the access token on stdout and callers capture that
+/// stdout, so a helper process must stay out of it: a detached child can
+/// neither write into the stdout that carries the token nor hold that pipe
+/// open after the command finishes. Fire and forget — the child is never
+/// waited on.
+#[cfg(feature = "agent-runtime")]
+fn spawn_detached(program: &str, args: &[&str]) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+/// Launch the system browser at `url`, reporting whether an opener started.
+///
+/// Platforms other than macOS and Linux have no opener here and rely on the
+/// sign-in URL the caller prints for manual opening.
+#[cfg(feature = "agent-runtime")]
+fn open_url_in_system_browser(url: &str) -> bool {
+    if cfg!(target_os = "macos") {
+        spawn_detached("open", &[url]).is_ok()
+    } else if cfg!(target_os = "linux") {
+        spawn_detached("xdg-open", &[url]).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Longest device-code lifetime this client will wait for approval. RFC 8628
+/// puts no ceiling on `expires_in`, so an issuer advertising hours would
+/// otherwise park the enrollment loop for that long; an hour is far above any
+/// real device code and still refuses the pathological values that make
+/// `Instant + Duration` meaningless.
+#[cfg(feature = "agent-runtime")]
+const MAX_DEVICE_CODE_LIFETIME_SECS: u64 = 3600;
+
+/// Longest advertised poll interval this client will honor, for the same
+/// reason: RFC 8628 puts no ceiling on `interval` either, and one measured in
+/// hours turns the flow into an indefinite sleep.
+#[cfg(feature = "agent-runtime")]
+const MAX_DEVICE_POLL_INTERVAL_SECS: u64 = 300;
+
+/// RFC 8628 section 3.5 default interval, used here as the floor: polling
+/// faster than this earns `slow_down` at best and a rate limit at worst, so a
+/// smaller (or absent, or zero) advertised value is raised to it.
+#[cfg(feature = "agent-runtime")]
+const MIN_DEVICE_POLL_INTERVAL_SECS: u64 = 5;
+
+/// Bound the timings the identity provider can put this client on.
+///
+/// RFC 8628 lets a server advertise any `expires_in` and `interval`, and the
+/// client is otherwise obliged to follow both; without a ceiling a remote
+/// value can leave the CLI sleeping between polls, or waiting for approval,
+/// for as long as the remote side likes. Mirrors zerocode's gateway-side
+/// bounds so both surfaces refuse the same responses.
+#[cfg(feature = "agent-runtime")]
+fn device_grant_bounds(expires_in: u64, interval: u64) -> Result<()> {
+    if expires_in == 0 {
+        bail!("the identity provider advertised an already-expired device code (expires_in = 0)");
+    }
+    if expires_in > MAX_DEVICE_CODE_LIFETIME_SECS {
+        bail!(
+            "the identity provider advertised a device code lifetime of {expires_in}s, above \
+             the {MAX_DEVICE_CODE_LIFETIME_SECS}s this client will wait for approval"
+        );
+    }
+    if interval > MAX_DEVICE_POLL_INTERVAL_SECS {
+        bail!(
+            "the identity provider advertised a poll interval of {interval}s, above the \
+             {MAX_DEVICE_POLL_INTERVAL_SECS}s this client will wait between polls"
+        );
+    }
+    Ok(())
+}
+
+/// How long to wait before the next poll: the advertised interval raised to
+/// [`MIN_DEVICE_POLL_INTERVAL_SECS`] and then clipped to what is left of the
+/// device code's lifetime, so a sleep never outlives the code it is waiting
+/// on and the loop always gets back to the deadline check.
+#[cfg(feature = "agent-runtime")]
+fn device_poll_wait(interval_secs: u64, remaining: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(interval_secs.max(MIN_DEVICE_POLL_INTERVAL_SECS)).min(remaining)
+}
+
+#[cfg(feature = "agent-runtime")]
+async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Result<()> {
+    use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment};
+
+    enum OidcFlow {
+        Device,
+        Browser,
+        ClientCredentials,
+    }
+    let (alias, flow) = match &oidc_command {
+        OidcCommands::Login {
+            alias,
+            browser: false,
+        } => (alias.clone(), OidcFlow::Device),
+        OidcCommands::Login {
+            alias,
+            browser: true,
+        } => (alias.clone(), OidcFlow::Browser),
+        OidcCommands::Token { alias } => (alias.clone(), OidcFlow::ClientCredentials),
+    };
+    let Some(entry) = config.oidc.get(&alias) else {
+        let mut known: Vec<&str> = config.oidc.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        let known = if known.is_empty() {
+            "(none)".to_string()
+        } else {
+            known.join(", ")
+        };
+        bail!(ta(
+            "cli-oidc-unknown-alias",
+            &[("alias", &alias), ("known", &known)],
+            format!("No [oidc.{alias}] entry in the config. Configured entries: {known}"),
+        ));
+    };
+    let enrollment = Enrollment::new(&alias, entry.clone())?;
+
+    let token = match flow {
+        OidcFlow::ClientCredentials => enrollment.client_credentials().await?,
+        OidcFlow::Browser => {
+            use zeroclaw_runtime::security::auth_provider::LoopbackListener;
+            let listener = LoopbackListener::bind().await?;
+            let pkce = enrollment.pkce_start(&listener.redirect_uri()).await?;
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-browser-open",
+                    &[("uri", &pkce.authorize_url)],
+                    format!(
+                        "Opening your browser to sign in. If nothing opens, visit:\n{}",
+                        pkce.authorize_url
+                    ),
+                )
+            );
+            // The URL was printed above, so failing to launch an opener (or
+            // having none on this platform) only means opening it by hand.
+            let _ = open_url_in_system_browser(&pkce.authorize_url);
+            eprintln!(
+                "{}",
+                t(
+                    "cli-oidc-browser-waiting",
+                    "Waiting for the browser sign-in to complete...",
+                )
+            );
+            let code = listener
+                .wait_for_code(&pkce, std::time::Duration::from_mins(5))
+                .await?;
+            enrollment.pkce_exchange(&pkce, &code).await?
+        }
+        OidcFlow::Device => {
+            let start = enrollment.device_grant_start().await?;
+            // Before the user is sent anywhere: a code that is already dead,
+            // or timings that would park this loop for as long as the issuer
+            // likes, are refused rather than acted on.
+            device_grant_bounds(start.expires_in, start.interval)?;
+            let uri = start
+                .verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| start.verification_uri.clone());
+            let expires = start.expires_in.to_string();
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-device-visit",
+                    &[("uri", &uri), ("code", &start.user_code)],
+                    format!("To sign in, visit {uri} and enter code {}", start.user_code),
+                )
+            );
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-device-waiting",
+                    &[("seconds", &expires)],
+                    format!(
+                        "Waiting for identity-provider approval (the code expires in {expires} seconds)..."
+                    ),
+                )
+            );
+            let expired = || {
+                t(
+                    "cli-oidc-device-expired",
+                    "The device code expired before approval; run the command again.",
+                )
+            };
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(start.expires_in))
+                .ok_or_else(|| {
+                    anyhow::Error::msg(
+                        "the advertised device code lifetime does not fit this platform's clock",
+                    )
+                })?;
+            // Seeded at the floor so an RFC 8628 `slow_down` backs off from a
+            // legal interval rather than from an advertised zero.
+            let mut interval = start.interval.max(MIN_DEVICE_POLL_INTERVAL_SECS);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    bail!(expired());
+                }
+                tokio::time::sleep(device_poll_wait(interval, remaining)).await;
+                // A wait clipped to the remaining lifetime lands exactly on the
+                // deadline, so re-check here rather than only at the top of the
+                // loop: the code is dead by now and the request must not go out.
+                if std::time::Instant::now() >= deadline {
+                    bail!(expired());
+                }
+                match enrollment.device_grant_poll(&start.device_code).await? {
+                    DevicePollOutcome::Pending => {}
+                    DevicePollOutcome::SlowDown => interval = interval.saturating_add(5),
+                    DevicePollOutcome::Denied(reason) => bail!("device grant failed: {reason}"),
+                    DevicePollOutcome::Token(token) => break *token,
+                }
+            }
+        }
+    };
+
+    eprintln!(
+        "{}",
+        ta(
+            "cli-oidc-enrolled",
+            &[("alias", &alias)],
+            format!(
+                "Enrolled with [oidc.{alias}]. The access token is on stdout; present it as \
+                 auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN."
+            ),
+        )
+    );
+    if let Some(secs) = token.expires_in {
+        let secs = secs.to_string();
+        eprintln!(
+            "{}",
+            ta(
+                "cli-oidc-token-expiry",
+                &[("seconds", &secs)],
+                format!("The token expires in {secs} seconds."),
+            )
+        );
+    }
+    println!("{}", token.access_token);
     Ok(())
 }
 
@@ -7707,11 +14121,44 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            // Operator-facing posture notice, not runtime bookkeeping. An event
+            // with no category stores as `internal`, and the dashboard Logs view
+            // hides that category by default, so an uncategorised notice is
+            // absent from the history an operator actually reads.
+            .with_category(::zeroclaw_log::EventCategory::System)
+            // The config surface reports this same fact as a structured
+            // warning. Carrying its code and path here is what lets an operator
+            // correlate the two rather than read them as separate problems;
+            // `with_attrs` persists them to the trace and serves them from the
+            // logs API, which the ephemeral variant would not.
+            .with_attrs(::serde_json::json!({
+                "code": ::zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD,
+                "path": "verifiable_intent.enabled",
+            })),
         "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
     );
 }
 
+fn running_executable_for_remediation() -> Option<std::path::PathBuf> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        if let Some(executable) = zeroclaw_runtime::restart::recorded_launch_executable() {
+            return Some(executable.to_path_buf());
+        }
+        if zeroclaw_runtime::restart::launch_command_recorded() {
+            return None;
+        }
+        std::env::current_exe().ok()
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        std::env::current_exe().ok()
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -7721,13 +14168,27 @@ fn gate_security_posture(
     }
     let sections = config.degraded_security.join(", ");
     if !allow_degraded {
+        let remediation_executable = running_executable_for_remediation();
+        let remediation = remediation_executable.map_or_else(
+            || {
+                "The running executable path could not be resolved; use a daemon-owned repair \
+                 surface such as the gateway config editor instead of an unqualified PATH command."
+                    .to_string()
+            },
+            |exe| {
+                format!(
+                    "Running executable: {}. Use that executable with `config migrate` to see \
+                     the precise error.",
+                    exe.display()
+                )
+            },
+        );
         anyhow::bail!(
             "Config contains malformed security-critical sections ({sections}); \
              they were reset to defaults, so the running posture may be weaker \
              than intended. Refusing to serve with a degraded security posture. \
-             Repair these sections in {} and restart — run `zeroclaw config \
-             migrate` to see the precise error. To boot anyway (e.g. to reach \
-             the gateway config editor and repair from there), re-run with \
+             Repair these sections in {} and restart — {remediation} To boot anyway \
+             (e.g. to reach the gateway config editor and repair from there), re-run with \
              `--allow-degraded-security`.",
             config.config_path.display()
         );
@@ -7907,7 +14368,54 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
         route: Some(route),
         forge,
         llm,
+        decision: std::collections::HashMap::default(),
     }
+}
+
+/// Abort SOP cron drivers that no generation will adopt, and keep joining them.
+///
+/// `abort` only requests cancellation, so a driver that reaches no await point
+/// keeps running under the superseded config. Dropping its `JoinHandle` would
+/// detach that task, losing the last way to observe work still in flight — so a
+/// reaper owns the handles and joins them instead.
+///
+/// Returns the reaper's handle (`None` when nothing was still running) so a test
+/// can observe that ownership was retained rather than merely claimed.
+#[cfg(feature = "agent-runtime")]
+fn reap_orphaned_sop_drivers(
+    carried: Vec<tokio::task::JoinHandle<()>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let orphaned = carried
+        .iter()
+        .filter(|driver| !driver.is_finished())
+        .count();
+    for driver in &carried {
+        driver.abort();
+    }
+    if orphaned == 0 {
+        return None;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+        "SOP cron driver(s) from a previous generation are still running, but this \
+         configuration runs no SOP maintenance to own them; re-aborted and handed to a \
+         reaper that joins them"
+    );
+    Some(::zeroclaw_spawn::spawn!(async move {
+        for driver in carried {
+            let _ = driver.await;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+            "orphaned SOP cron driver(s) from a superseded generation have stopped"
+        );
+    }))
 }
 
 /// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
@@ -7915,34 +14423,43 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
 /// prunes terminal runs past the retention policy, and dispatches cached cron
 /// SOP triggers. Returns `None` (no task) when the tick is disabled
 /// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
-/// returned handle and aborts it when the foreground daemon/channel run exits.
-/// The tick itself self-approves nothing - timeout handling follows
+/// returned handle and shuts it down when the foreground daemon/channel run
+/// exits. The tick itself self-approves nothing - timeout handling follows
 /// `approval_timeout_action` (default `escalate`, fail-closed).
 #[cfg(feature = "agent-runtime")]
 fn spawn_sop_maintenance(
+    config: &Config,
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     interval_secs: u64,
-) -> Option<tokio::task::JoinHandle<()>> {
+    // The generation's supervisor set: the tick registers every driver it
+    // starts here, and the supervisor — not this ticker — owns the drain.
+    drivers: Option<SopDriverSet>,
+) -> Option<SopMaintenance> {
     if interval_secs == 0 {
         return None;
     }
     let engine = sop_engine.cloned()?;
+    let drivers = drivers?;
     let audit = sop_audit.cloned();
+    let config = config.clone();
     let cron_cache = audit
         .as_ref()
         .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
-    Some(::zeroclaw_spawn::spawn!(async move {
+    let tick_drivers = drivers;
+    let ticker = ::zeroclaw_spawn::spawn!(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_cron_check = chrono::Utc::now();
         loop {
             ticker.tick().await;
             let Some(report) = run_sop_maintenance_tick(
+                &config,
                 &engine,
                 audit.as_ref(),
                 cron_cache.as_ref(),
                 &mut last_cron_check,
+                &tick_drivers,
             )
             .await
             else {
@@ -7964,7 +14481,302 @@ fn spawn_sop_maintenance(
                 );
             }
         }
-    }))
+    });
+    Some(SopMaintenance { ticker })
+}
+
+/// In-flight headless drivers for one daemon generation — cron-started,
+/// channel-started, and approval-resumed alike.
+///
+/// Shared between every producer that registers drivers and the
+/// [`SopDriverSupervisor`] that drains them before the subsystem rebuilds.
+#[cfg(feature = "agent-runtime")]
+type SopDriverSet = zeroclaw_runtime::sop::SopDriverHandles;
+
+/// How long a daemon generation waits for its in-flight cron drivers to finish
+/// before aborting the stragglers. Long enough for a step already in a provider
+/// call to land, short enough that a reload is not held hostage by one.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the shutdown waits for aborted drivers to actually stop. An aborted
+/// task ends at its next await point, so this is a grace for that hop, not a
+/// second drain — a driver still running when it expires is reported rather than
+/// waited on forever, so one wedged task cannot hold a reload open.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_ABORT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One daemon generation's SOP maintenance tick. The drivers the tick starts
+/// register in the generation's [`SopDriverSupervisor`], which owns the drain;
+/// stopping the tick (see [`Self::stop`]) only guarantees no further producer
+/// runs while that drain finalizes the set.
+#[cfg(feature = "agent-runtime")]
+struct SopMaintenance {
+    ticker: tokio::task::JoinHandle<()>,
+}
+
+/// What one generation's driver teardown hands to the next generation.
+#[cfg(feature = "agent-runtime")]
+struct SopDriverTeardown {
+    /// Drivers aborted but not yet stopped; the next generation adopts them
+    /// (see [`SopDriverSupervisor::carried`]).
+    still_running: Vec<tokio::task::JoinHandle<()>>,
+    /// Runs whose driver was aborted but whose terminal write could not be
+    /// made here: the store refused it, or a straggler still held the engine.
+    /// Their durable rows are still `Running`, so the next generation's engine
+    /// restores them; it adopts these so its maintenance owns the settlement
+    /// instead of renewing a claim nothing will release.
+    unsettled_runs: Vec<String>,
+    /// Same queue the old engine writes, including failures after handoff.
+    pending_settlements: Option<zeroclaw_runtime::sop::engine::OrphanedRunSettlementQueue>,
+}
+
+/// One daemon generation's headless-driver supervisor. Every driver the
+/// generation starts — a cron tick, channel ingress, or an approval resume —
+/// registers in `drivers`, and teardown drains the set before the loop
+/// rebuilds, so no headless work straddles a reload unowned.
+///
+/// Exists whenever the SOP engine exists; the maintenance ticker is one
+/// producer among several, not the owner.
+#[cfg(feature = "agent-runtime")]
+struct SopDriverSupervisor {
+    drivers: SopDriverSet,
+    /// Retained independently of driver handles, which admission may prune.
+    pending_settlements: Option<zeroclaw_runtime::sop::engine::OrphanedRunSettlementQueue>,
+    /// Drivers a previous generation aborted that had not stopped by the time
+    /// its teardown returned.
+    ///
+    /// Cancellation lands at a task's next await point, and a task that reaches
+    /// none cannot be forced. Rather than dropping those handles — which
+    /// detaches the tasks and loses every way to observe them — this generation
+    /// adopts them: [`Self::shutdown`] reports the ones still running and hands
+    /// the rest forward again, so a straggler stays owned and counted until it
+    /// actually ends. They are already aborted, so they are never waited on
+    /// again; a wedged task costs one `is_finished` check per reload, not
+    /// another drain.
+    carried: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenance {
+    /// Abort the tick and JOIN it. `abort` only requests cancellation, and a
+    /// tick already inside its body can still spawn and register a driver;
+    /// awaiting the aborted handle is what guarantees no new producer runs
+    /// while the supervisor's drain below finalizes the set.
+    async fn stop(self) {
+        self.ticker.abort();
+        let _ = self.ticker.await;
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopDriverSupervisor {
+    fn new(
+        carried: Vec<tokio::task::JoinHandle<()>>,
+        engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+    ) -> Self {
+        if !carried.is_empty() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"carried": carried.len()})),
+                "Adopted SOP driver(s) that a previous generation aborted but that had not \
+                 stopped; this generation tracks them until they do"
+            );
+        }
+        let pending_settlements = match engine.lock() {
+            Ok(engine) => engine.orphaned_run_settlement_queue(),
+            Err(poisoned) => poisoned.into_inner().orphaned_run_settlement_queue(),
+        };
+        Self {
+            drivers: SopDriverSet::default(),
+            pending_settlements: Some(pending_settlements),
+            carried,
+        }
+    }
+
+    /// Let in-flight drivers finish under the configuration they started
+    /// with, aborting — and then joining — any that overrun
+    /// [`SOP_DRIVER_DRAIN_TIMEOUT`]. The caller must stop every producer
+    /// (the maintenance tick, via [`SopMaintenance::stop`]) first.
+    ///
+    /// Returns the drivers that were still running when this returned: aborted,
+    /// but not yet stopped, because cancellation only lands at a task's next
+    /// await point and one that reaches none cannot be forced. The next
+    /// generation adopts them (see [`SopMaintenance::carried`]) instead of
+    /// detaching them. **A returned handle means a task from this generation is
+    /// still executing under superseded config, for as long as it takes to
+    /// yield** — the caller cannot assume a clean boundary, only a tracked one.
+    /// Empty on every ordinary shutdown.
+    #[must_use]
+    async fn shutdown(self) -> SopDriverTeardown {
+        self.shutdown_with_deadlines(SOP_DRIVER_DRAIN_TIMEOUT, SOP_DRIVER_ABORT_JOIN_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::shutdown`] with the two deadlines supplied, so a test can drive
+    /// the drain-expiry and join-expiry paths without waiting out the
+    /// production ones.
+    async fn shutdown_with_deadlines(
+        self,
+        drain_timeout: std::time::Duration,
+        abort_join_timeout: std::time::Duration,
+    ) -> SopDriverTeardown {
+        // Adopted from an earlier generation: already aborted, so they are
+        // re-checked rather than re-waited. Anything still running is handed
+        // forward again below.
+        let mut still_running: Vec<tokio::task::JoinHandle<()>> = self
+            .carried
+            .into_iter()
+            .filter(|driver| !driver.is_finished())
+            .collect();
+        // Borrowed by the drain below, not consumed: it must be able to time
+        // out without dropping the handles, because dropping a `JoinHandle`
+        // detaches its task rather than stopping it — and the abort arm still
+        // has to join them.
+        // Closed, not merely emptied. A producer can outlive the point where
+        // its generation stops accepting work — an RPC connection task can
+        // resolve an approval after the listener stopped accepting — so a
+        // driver can still arrive here. Closing makes that registration fail
+        // instead of landing in a vector this generation will never drain
+        // again.
+        let mut pending = match self.drivers.lock() {
+            Ok(mut drivers) => drivers.close_and_take_owned(),
+            Err(poisoned) => poisoned.into_inner().close_and_take_owned(),
+        };
+        if pending.is_empty() {
+            return SopDriverTeardown {
+                still_running,
+                unsettled_runs: Vec::new(),
+                pending_settlements: self.pending_settlements,
+            };
+        }
+        // A cursor, not an iterator: when the drain deadline fires mid-loop the
+        // abort arm below has to resume where this one stopped. Awaiting a
+        // `JoinHandle` that already resolved panics ("polled after
+        // completion"), so a second pass over the whole vector would turn a
+        // mixed batch — one driver that finished in time, one that did not —
+        // into a shutdown panic instead of a carried-forward straggler.
+        let mut joined_upto = 0usize;
+        let drained = tokio::time::timeout(drain_timeout, async {
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto].handle).await;
+                joined_upto += 1;
+            }
+        })
+        .await;
+        if drained.is_ok() {
+            return SopDriverTeardown {
+                still_running,
+                unsettled_runs: Vec::new(),
+                pending_settlements: self.pending_settlements,
+            };
+        }
+        // `abort` only *requests* cancellation: the task stops at its next
+        // await point, which is after this call returns. Joining the aborted
+        // handles is what makes the boundary real — without it the next
+        // generation could start while a straggler is still inside a provider
+        // call under the superseded config. The join is bounded in turn, so a
+        // task that reaches no await point cannot wedge the reload; it is
+        // carried forward instead, still aborted and still tracked.
+        // Only the handles the drain did not consume: the ones before the
+        // cursor already resolved, and both aborting and re-awaiting them is
+        // either a no-op or a panic.
+        let aborted_from = joined_upto;
+        for driver in &pending[aborted_from..] {
+            driver.handle.abort();
+        }
+        let joined = tokio::time::timeout(abort_join_timeout, async {
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto].handle).await;
+                joined_upto += 1;
+            }
+        })
+        .await;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "drain_timeout_secs": drain_timeout.as_secs(),
+                    "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                    "joined_after_abort": joined.is_ok(),
+                })),
+            "SOP cron drivers did not finish before the drain deadline; aborted them so the next \
+             daemon generation does not overlap superseded configuration"
+        );
+        // Every aborted driver leaves its run `Running` and claimed with nothing
+        // to advance it, and the next generation restores active runs without
+        // starting drivers for them. Settle each one here, before that engine is
+        // built from the same store. `try_lock`, not `lock`: a straggler that has
+        // not reached an await point may hold the engine, and waiting on it
+        // would wedge the reload. A run that cannot be settled now is handed to
+        // the next generation, whose maintenance owns the retry.
+        let mut unsettled_runs = Vec::new();
+        for driver in &pending[aborted_from..] {
+            let Some((run_id, engine)) = driver.run.as_ref() else {
+                continue;
+            };
+            let settled = match engine.try_lock() {
+                Ok(mut guard) => guard
+                    .settle_orphaned_run(
+                        run_id,
+                        zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                    )
+                    .map_err(|e| e.to_string()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                    .into_inner()
+                    .settle_orphaned_run(
+                        run_id,
+                        zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+                    )
+                    .map_err(|e| e.to_string()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    Err("the engine is still held by a driver that has not stopped".to_string())
+                }
+            };
+            if let Err(error) = settled {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "error": error,
+                        })),
+                    "Could not settle a SOP run whose driver was aborted at teardown; the next \
+                     generation's maintenance takes over the terminal write"
+                );
+                unsettled_runs.push(run_id.clone());
+            }
+        }
+        still_running.extend(
+            pending
+                .into_iter()
+                .filter(|driver| !driver.handle.is_finished())
+                .map(|driver| driver.handle),
+        );
+        if !still_running.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                        "still_running": still_running.len(),
+                    })),
+                "SOP cron driver(s) had not stopped when the post-abort join grace expired; they \
+                 keep running under the superseded config until they reach an await point, and \
+                 the next generation starts alongside them. Carried into that generation so they \
+                 stay tracked rather than detached"
+            );
+        }
+        SopDriverTeardown {
+            still_running,
+            unsettled_runs,
+            pending_settlements: self.pending_settlements,
+        }
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -7990,10 +14802,12 @@ impl SopMaintenanceTickReport {
 
 #[cfg(feature = "agent-runtime")]
 async fn run_sop_maintenance_tick(
+    config: &Config,
     engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
     audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
     last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+    drivers: &SopDriverSet,
 ) -> Option<SopMaintenanceTickReport> {
     let maintenance = match engine.lock() {
         Ok(mut e) => e.run_maintenance_tick(),
@@ -8023,8 +14837,28 @@ async fn run_sop_maintenance_tick(
         .await;
         for result in &results {
             match result {
-                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. } => {
                     report.cron_started += 1;
+                    if matches!(
+                        action.as_ref(),
+                        zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                            | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                    ) {
+                        // Admitted so this daemon generation can drain the
+                        // driver before a reload swaps the config and engine it
+                        // captured. Admission and creation share one lock, so a
+                        // generation that drained mid-tick refuses the driver
+                        // rather than starting one nothing will drain. Finished
+                        // handles are dropped on the way in so a long-lived
+                        // daemon does not accumulate them.
+                        zeroclaw_runtime::sop::spawn_and_register_sop_driver(
+                            drivers,
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            Some(std::sync::Arc::clone(audit)),
+                            action.as_ref().clone(),
+                        );
+                    }
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
                 | zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { .. }
@@ -8042,7 +14876,22 @@ async fn run_sop_maintenance_tick(
                 }
             }
         }
-        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+        let unhandled = results
+            .iter()
+            .filter(|result| {
+                !matches!(
+                    result,
+                    zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. }
+                        if matches!(
+                            action.as_ref(),
+                            zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                                | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                        )
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&unhandled);
     }
 
     Some(report)
@@ -8053,7 +14902,7 @@ async fn run_gateway_if_enabled(
     host: &str,
     port: u16,
     config: zeroclaw::config::Config,
-    tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
     let default_host = config.gateway.host.clone();
     let default_port = config.gateway.port;
@@ -8061,12 +14910,23 @@ async fn run_gateway_if_enabled(
     // can self-respawn after the listener is released. Must mirror the same
     // call in the Daemon branch.
     zeroclaw_runtime::restart::record_launch();
+    // With no daemon, this command owns what the daemon would: the
+    // live-pricing refresher and the gateway-start hook, which fires once
+    // the listener reports its bound address.
+    zeroclaw_runtime::daemon::spawn_pricing_refresher(&config);
+    let hooks = config.hooks.enabled.then(|| {
+        std::sync::Arc::new(zeroclaw_runtime::hooks::HookRunner::from_config(
+            &config.hooks,
+        ))
+    });
+    let readiness =
+        zeroclaw_runtime::daemon::gateway_start_hook_reporter(hooks, host.to_string(), None);
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None,
+        host, port, config, event_bus, None, None, None, None, None, None, None, readiness,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -8085,17 +14945,18 @@ async fn run_gateway_if_enabled(
     }
 }
 
-#[cfg(not(feature = "gateway"))]
+#[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
 #[allow(clippy::unused_async)]
 async fn run_gateway_if_enabled(
     _host: &str,
     _port: u16,
     _config: zeroclaw::config::Config,
-    _tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    _event_bus: Option<zeroclaw_runtime::observability::EventBus>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -8104,10 +14965,12 @@ fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
     host == default_host && port == default_port
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_browser_host(host: &str) -> &str {
     match host {
         "0.0.0.0" => "127.0.0.1",
@@ -8116,6 +14979,7 @@ fn gateway_browser_host(host: &str) -> &str {
     }
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -8159,6 +15023,7 @@ fn gateway_addr_in_use_message(
     lines.join("\n")
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
     let mut command = format!("    zeroclaw gateway start --port {port}");
     if host != default_host {
@@ -8167,6 +15032,7 @@ fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -
     command
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn gateway_paircode_recovery_command(
     host: &str,
     port: u16,
@@ -8184,6 +15050,7 @@ fn gateway_paircode_recovery_command(
     command
 }
 
+#[cfg(any(feature = "agent-runtime", test))]
 fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     const SCAN_LIMIT: u16 = 20;
 
@@ -8282,6 +15149,1571 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
 
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn composed_channel_requirements_reach_localized_secret_repairs() {
+        use crate::plugins::channel_instance::{
+            channel_instance_key, config_set_command_for, config_verdict, required_keys,
+        };
+        use crate::plugins::egress_ceremony::ShellDialect;
+        use serde_json::{Value, json};
+        use std::path::Path;
+        use zeroclaw_config::schema::PluginEntryConfig;
+        use zeroclaw_plugins::PluginManifest;
+
+        let schema_manifest = |schema: Value| -> PluginManifest {
+            serde_json::from_value(json!({
+                "name": "schema-channel",
+                "version": "1.0.0",
+                "capabilities": ["channel"],
+                "permissions": ["config_read"],
+                "config_schema": schema,
+            }))
+            .expect("fixture manifest")
+        };
+        let secret_schema = || {
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"api_token": {"type": "string", "x-secret": true}},
+            })
+        };
+
+        let mut all_of = secret_schema();
+        all_of["allOf"] = json!([{"required": ["api_token"]}]);
+        let mut referenced = secret_schema();
+        referenced["$ref"] = json!("#/$defs/requirements");
+        referenced["$defs"] = json!({"requirements": {"required": ["api_token"]}});
+        let mut escaped_pointer = secret_schema();
+        escaped_pointer["allOf"] = json!([{"$ref": "#/$defs/required~1fields"}]);
+        escaped_pointer["$defs"] = json!({"required/fields": {"required": ["api_token"]}});
+
+        for schema in [all_of, referenced, escaped_pointer] {
+            let manifest = schema_manifest(schema);
+            zeroclaw_plugins::config::validate_manifest_config(&manifest)
+                .expect("the canonical contract admits this schema");
+            let mut entry = PluginEntryConfig {
+                name: channel_instance_key(&manifest, "operations").expect("instance key"),
+                ..PluginEntryConfig::default()
+            };
+            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
+            let keys = required_keys(&manifest, Some(&entry));
+            assert_eq!(keys.len(), 1, "the refused row needs a repair command");
+            assert_eq!(keys[0].name, "api_token");
+            assert!(keys[0].secret && keys[0].addressable && !keys[0].set);
+            let command = config_set_command_for(
+                ShellDialect::host(),
+                Path::new("/tmp/schema-profile"),
+                &format!("plugins.entries.{}.config.api_token", entry.name),
+                None,
+            );
+            let line = required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
+            assert_eq!(
+                line,
+                ta(
+                    "cli-plugin-channel-required-secret-missing",
+                    &[("key", "api_token"), ("command", &command)],
+                    "",
+                )
+            );
+            assert!(line.contains(&command));
+
+            entry
+                .config
+                .insert("api_token".into(), "fixture-secret-value".into());
+            assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
+            let keys = required_keys(&manifest, Some(&entry));
+            assert!(keys[0].set);
+            let line = required_key_line(Path::new("/tmp/schema-profile"), &entry.name, &keys[0]);
+            assert!(!line.contains("fixture-secret-value") && !line.contains(&command));
+        }
+    }
+
+    /// `oidc login` prints the access token on stdout and shells capture it, so
+    /// the browser opener must not inherit the CLI's standard streams. The probe
+    /// child records whether its stdout and stderr are the null device, then
+    /// writes noise and exits nonzero: neither may disturb the spawn.
+    #[cfg(all(unix, feature = "agent-runtime"))]
+    #[test]
+    fn browser_opener_children_get_no_standard_streams() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let marker = std::env::temp_dir().join(format!(
+            "zeroclaw-spawn-detached-{}-{nanos}.marker",
+            std::process::id()
+        ));
+        let marker_path = marker.to_string_lossy().into_owned();
+        let script = "if [ /dev/stdout -ef /dev/null ] && [ /dev/stderr -ef /dev/null ]; then \
+                      echo quiet > \"$0\"; else echo leak > \"$0\"; fi; echo NOISE; exit 3";
+
+        let spawned = spawn_detached("sh", &["-c", script, &marker_path]);
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = std::fs::remove_file(&marker);
+                panic!("spawning a noisy opener must succeed; got: {err}");
+            }
+        };
+        // Reap the probe so it does not linger as a zombie; its nonzero exit is
+        // expected and must not have failed the spawn above.
+        let status = child.wait();
+        let observed = std::fs::read_to_string(&marker);
+        let _ = std::fs::remove_file(&marker);
+
+        let status = status.unwrap_or_else(|err| panic!("waiting on the probe failed: {err}"));
+        assert!(
+            !status.success(),
+            "probe must report its nonzero exit; got: {status}"
+        );
+        let observed = observed
+            .unwrap_or_else(|err| panic!("probe must have written {marker_path}; got: {err}"));
+        assert_eq!(
+            observed.trim(),
+            "quiet",
+            "spawn_detached must give the child no standard streams"
+        );
+    }
+
+    /// RFC 8628 lets an identity provider advertise any `expires_in` and
+    /// `interval`, and a client that follows both blindly can be parked for as
+    /// long as the remote side likes — or handed a lifetime that makes the
+    /// deadline arithmetic meaningless.
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn device_grant_bounds_refuse_hostile_timings() {
+        device_grant_bounds(600, 5).unwrap();
+        device_grant_bounds(MAX_DEVICE_CODE_LIFETIME_SECS, MAX_DEVICE_POLL_INTERVAL_SECS).unwrap();
+
+        let err = device_grant_bounds(0, 5).unwrap_err().to_string();
+        assert!(err.contains("expires_in = 0"), "{err}");
+        for lifetime in [MAX_DEVICE_CODE_LIFETIME_SECS + 1, u64::MAX] {
+            let err = device_grant_bounds(lifetime, 5).unwrap_err().to_string();
+            assert!(err.contains("will wait for approval"), "{err}");
+        }
+        for interval in [MAX_DEVICE_POLL_INTERVAL_SECS + 1, u64::MAX] {
+            let err = device_grant_bounds(600, interval).unwrap_err().to_string();
+            assert!(err.contains("between polls"), "{err}");
+        }
+    }
+
+    /// Every wait is floored at the RFC 8628 default and clipped to what is
+    /// left of the code's lifetime: an issuer advertising `expires_in = 1,
+    /// interval = 60` must not put this client to sleep for a minute past the
+    /// moment the code it is waiting on died.
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn device_poll_wait_floors_and_clips_the_interval() {
+        use std::time::Duration;
+
+        let lifetime = Duration::from_mins(10);
+        for advertised in [0, 1, 4, MIN_DEVICE_POLL_INTERVAL_SECS] {
+            assert_eq!(
+                device_poll_wait(advertised, lifetime),
+                Duration::from_secs(MIN_DEVICE_POLL_INTERVAL_SECS),
+                "an advertised {advertised}s must be raised to the floor"
+            );
+        }
+        assert_eq!(device_poll_wait(97, lifetime), Duration::from_secs(97));
+        assert_eq!(
+            device_poll_wait(60, Duration::from_secs(1)),
+            Duration::from_secs(1),
+            "no wait may outlive the device code"
+        );
+        assert_eq!(device_poll_wait(60, Duration::ZERO), Duration::ZERO);
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    struct SelectorTestTerminal {
+        size: Option<(u16, u16)>,
+        keys: std::collections::VecDeque<std::io::Result<QuickstartSelectorKey>>,
+        actions: Vec<&'static str>,
+        fail_action: Option<&'static str>,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    impl SelectorTestTerminal {
+        fn new(
+            size: Option<(u16, u16)>,
+            keys: impl IntoIterator<Item = std::io::Result<QuickstartSelectorKey>>,
+        ) -> Self {
+            Self {
+                size,
+                keys: keys.into_iter().collect(),
+                actions: Vec::new(),
+                fail_action: None,
+            }
+        }
+
+        fn perform(&mut self, action: &'static str) -> std::io::Result<()> {
+            self.actions.push(action);
+            if self.fail_action == Some(action) {
+                return Err(std::io::Error::other(format!("injected {action} failure")));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    impl QuickstartSelectorTerminal for SelectorTestTerminal {
+        fn size_checked(&mut self) -> Option<(u16, u16)> {
+            self.size
+        }
+
+        fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.perform("enter_alternate_screen")
+        }
+
+        fn clear_screen(&mut self) -> std::io::Result<()> {
+            self.perform("clear_screen")
+        }
+
+        fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+            self.perform("move_cursor_to_origin")
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.perform("hide_cursor")
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.perform("show_cursor")
+        }
+
+        fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.perform("leave_alternate_screen")
+        }
+
+        fn write_line(&mut self, _line: &str) -> std::io::Result<()> {
+            self.perform("write_line")
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.perform("flush")
+        }
+
+        fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+            self.actions.push("read_key");
+            self.keys.pop_front().unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "no injected selector key",
+                ))
+            })
+        }
+    }
+
+    /// One step of a deterministic PTY interaction: a key press, or a resize
+    /// of the output terminal applied between key presses the way a terminal
+    /// emulator changes a window while the selector waits for input.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    enum PtyStep {
+        Key(QuickstartSelectorKey),
+        ResizeOutput { rows: u16, columns: u16 },
+    }
+
+    /// Injected input for the production Crossterm adapter.
+    ///
+    /// Keys are queued rather than read from the process-global event source
+    /// so the regression runs under a test harness without racing a
+    /// controlling terminal. Resizes are applied to the PTY master exactly as
+    /// a terminal emulator would, so the adapter's own geometry query must
+    /// observe them.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    struct PtyQuickstartInput {
+        master: std::fs::File,
+        steps: std::collections::VecDeque<PtyStep>,
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    impl QuickstartSelectorInput for PtyQuickstartInput {
+        fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+            loop {
+                match self.steps.pop_front() {
+                    Some(PtyStep::Key(key)) => return Ok(key),
+                    Some(PtyStep::ResizeOutput { rows, columns }) => {
+                        set_pty_size(&self.master, rows, columns);
+                    }
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "no injected selector key",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open a PTY pair sized `rows` by `columns`, returned as `(master, slave)`.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn open_pty(rows: u16, columns: u16) -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut dimensions = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: both descriptor pointers refer to live `c_int` storage. The
+        // optional name and termios inputs are null, and `dimensions` remains
+        // live for the duration of the call.
+        let openpty_result = unsafe {
+            libc::openpty(
+                &raw mut master_fd,
+                &raw mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut dimensions,
+            )
+        };
+        assert_eq!(openpty_result, 0, "openpty failed");
+
+        // SAFETY: `openpty` returned two distinct, live descriptors. Each is
+        // transferred to exactly one `File`, which closes it exactly once.
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(master_fd),
+                std::fs::File::from_raw_fd(slave_fd),
+            )
+        }
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn set_pty_size(pty: &std::fs::File, rows: u16, columns: u16) {
+        use std::os::fd::AsRawFd;
+
+        let dimensions = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `pty` owns a live PTY descriptor and `dimensions` is a fully
+        // initialized `winsize` that outlives the call.
+        let result =
+            unsafe { libc::ioctl(pty.as_raw_fd(), libc::TIOCSWINSZ, &raw const dimensions) };
+        assert_eq!(result, 0, "TIOCSWINSZ failed");
+    }
+
+    /// Build the production Crossterm adapter over a PTY slave with injected
+    /// input, so the exact production escape sequences and geometry query run.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn pty_quickstart_terminal(
+        master: &std::fs::File,
+        slave: std::fs::File,
+        steps: impl IntoIterator<Item = PtyStep>,
+    ) -> CrosstermQuickstartTerminal<std::fs::File, PtyQuickstartInput> {
+        CrosstermQuickstartTerminal {
+            output: slave,
+            input: PtyQuickstartInput {
+                master: master.try_clone().expect("PTY master should be clonable"),
+                steps: steps.into_iter().collect(),
+            },
+        }
+    }
+
+    /// Read everything written to the PTY, returning once the output is idle.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn drain_pty_output(master: &mut std::fs::File) -> String {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the PTY master descriptor is live; preserving its current
+        // flags and adding O_NONBLOCK prevents a spurious poll wakeup from
+        // hanging the test.
+        let master_flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert!(master_flags >= 0, "reading PTY master flags failed");
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    master.as_raw_fd(),
+                    libc::F_SETFL,
+                    master_flags | libc::O_NONBLOCK,
+                )
+            },
+            0,
+            "setting PTY master nonblocking mode failed"
+        );
+
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let mut poll_fd = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll_fd` points to one initialized poll descriptor.
+            let ready = unsafe { libc::poll(&raw mut poll_fd, 1, 100) };
+            assert!(ready >= 0, "polling PTY output failed");
+            if ready == 0 || poll_fd.revents & libc::POLLIN == 0 {
+                break;
+            }
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to read PTY output: {error}"),
+            }
+        }
+        String::from_utf8(output).expect("selector output should be UTF-8")
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    const PTY_CLEAR_AND_HOME: &str = "\u{1b}[2J\u{1b}[1;1H";
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    const PTY_SHOW_CURSOR_AND_LEAVE_SCREEN: &str = "\u{1b}[?25h\u{1b}[?1049l";
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_repeated_navigation_redraws_at_pty_origin() {
+        let (mut master, slave) = open_pty(20, 80);
+        let mut term = pty_quickstart_terminal(
+            &master,
+            slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Up),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("repeated PTY navigation should succeed");
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+
+        let output = drain_pty_output(&mut master);
+        drop(term);
+
+        assert_eq!(
+            output.matches(PTY_CLEAR_AND_HOME).count(),
+            4,
+            "the initial frame and all three navigation redraws must begin at the PTY origin; \
+             output: {output:?}"
+        );
+    }
+
+    /// Quickstart accepts distinct input and output terminals. The frame must
+    /// be fitted to the terminal that receives it: a process-global query can
+    /// describe the controlling terminal while stderr is a narrower one.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_measures_the_terminal_that_receives_the_frame() {
+        let (controlling_master, controlling_slave) = open_pty(20, 80);
+        let (mut output_master, output_slave) = open_pty(20, 40);
+
+        let mut controlling = pty_quickstart_terminal(&controlling_master, controlling_slave, []);
+        assert_eq!(
+            controlling.size_checked(),
+            Some((20, 80)),
+            "the adapter over the controlling PTY reports that PTY's geometry"
+        );
+
+        let mut term = pty_quickstart_terminal(
+            &output_master,
+            output_slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+        let output_size = quickstart_selector_terminal_size(&mut term)
+            .expect("the output PTY reports its geometry");
+        assert_eq!(
+            output_size,
+            (20, 40),
+            "the adapter over the output PTY must report the output PTY, not the controlling one"
+        );
+
+        // Fit exactly as the Quickstart caller does, from the sampled output
+        // geometry, with content that only fits the wider terminal unfitted.
+        let row_budget = quickstart_selector_row_budget(usize::from(output_size.1))
+            .expect("40 columns is a supported width");
+        let prompt = "Open a selector (Enter), or pick Create. Esc to quit.";
+        let fitted_prompt = fit_quickstart_selector_row(prompt, row_budget);
+        assert_ne!(
+            fitted_prompt, prompt,
+            "the prompt needs fitting at 40 columns"
+        );
+        let label = "[ ] Model provider — not yet chosen (pick one to continue)";
+        let fitted_label = fit_quickstart_selector_row(label, row_budget);
+        assert_ne!(fitted_label, label, "the row needs fitting at 40 columns");
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            std::slice::from_ref(&fitted_label),
+            &fitted_prompt,
+            output_size,
+        )
+        .expect("navigation on the output PTY should succeed");
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+
+        let output = drain_pty_output(&mut output_master);
+        drop(term);
+        drop(controlling);
+
+        assert!(
+            output.contains(&format!("? {fitted_prompt}")) && output.contains(&fitted_label),
+            "the fitted prompt and row must reach the output terminal; output: {output:?}"
+        );
+        assert!(
+            !output.contains(prompt) && !output.contains(label),
+            "unfitted text must never reach the 40-column output terminal; output: {output:?}"
+        );
+        for line in output.split("\r\n") {
+            assert!(
+                console::measure_text_width(line) <= 40,
+                "{line:?} exceeds the 40-column output terminal"
+            );
+        }
+    }
+
+    /// A resize of the output terminal alone raises no Crossterm resize event,
+    /// so the recheck on the next key must read the output terminal itself.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_fails_closed_when_only_the_output_terminal_resizes() {
+        let (mut master, slave) = open_pty(20, 40);
+        let mut term = pty_quickstart_terminal(
+            &master,
+            slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::ResizeOutput {
+                    rows: 20,
+                    columns: 30,
+                },
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+        let initial_size = quickstart_selector_terminal_size(&mut term)
+            .expect("the output PTY reports its geometry");
+        assert_eq!(initial_size, (20, 40));
+
+        let error = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            initial_size,
+        )
+        .expect_err("an output-only resize must stop the selector");
+        assert_eq!(
+            error.to_string(),
+            quickstart_selector_resize_error((20, 40), (20, 30)).to_string(),
+            "the recheck must report the output terminal's new geometry"
+        );
+
+        let output = drain_pty_output(&mut master);
+        drop(term);
+
+        assert_eq!(
+            output.matches(PTY_CLEAR_AND_HOME).count(),
+            2,
+            "only the initial frame and the pre-resize redraw may be drawn; output: {output:?}"
+        );
+        assert!(
+            output.ends_with(PTY_SHOW_CURSOR_AND_LEAVE_SCREEN),
+            "the cursor and main screen must be restored after the resize; output: {output:?}"
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_output_terminal_size_is_unknown_without_reported_geometry() {
+        let not_a_terminal = tempfile::tempfile().expect("temporary file");
+        assert_eq!(quickstart_output_terminal_size(&not_a_terminal), None);
+
+        let (_unset_master, unset_slave) = open_pty(0, 0);
+        assert_eq!(quickstart_output_terminal_size(&unset_slave), None);
+
+        let (_master, slave) = open_pty(9, 20);
+        assert_eq!(quickstart_output_terminal_size(&slave), Some((9, 20)));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn fit_quickstart_selector_row_respects_byte_and_display_budgets() {
+        let short = "[ ] Memory — not yet chosen";
+        assert_eq!(fit_quickstart_selector_row(short, 80), short);
+
+        let rows = [
+            "[✓] Model provider — Anthropic (alias: main, model: claude-sonnet-4-5)",
+            "[✓] モデルプロバイダー — Anthropic（モデル：長い名前）",
+            "[✓] 模型提供方 — 提供商与模型摘要",
+            "emoji 👩‍💻 and combining e\u{301} text",
+            "line one\nline two\twith controls",
+        ];
+        for row in rows {
+            for budget in 0..=64 {
+                let fitted = fit_quickstart_selector_row(row, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
+
+        let long = rows[0];
+        assert_eq!(fit_quickstart_selector_row(long, 0), "");
+        assert_eq!(fit_quickstart_selector_row(long, 1), ".");
+        assert_eq!(fit_quickstart_selector_row(long, 2), "[.");
+        assert!(fit_quickstart_selector_row(long, 40).ends_with('…'));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_budget_rejects_unsafe_terminal_widths() {
+        assert!(
+            (0..QUICKSTART_SELECTOR_MIN_WIDTH)
+                .all(|width| quickstart_selector_row_budget(width).is_none())
+        );
+        assert_eq!(quickstart_selector_row_budget(20), Some(17));
+        assert_eq!(quickstart_selector_row_budget(21), Some(18));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_minimum_width_keeps_actions_identifiable() {
+        let budget = quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).unwrap();
+        let rows = [
+            ("[ ] Model provider — not yet chosen", "[ ] Model"),
+            ("[ ] Risk profile — not yet chosen", "[ ] Risk"),
+            ("[ ] Memory — not yet chosen", "[ ] Memory"),
+            ("[ ] Channels (0) — not yet chosen", "[ ] Channels"),
+            ("[ ] Peer groups — not yet chosen", "[ ] Peer"),
+            ("[ ] Agent identity — not yet chosen", "[ ] Agent"),
+            ("── Create agent", "── Create"),
+        ];
+
+        for (row, identifiable_prefix) in rows {
+            let fitted = fit_quickstart_selector_row(row, budget);
+            assert!(
+                fitted.starts_with(identifiable_prefix),
+                "{fitted:?} does not identify {row:?}"
+            );
+        }
+    }
+
+    /// The checklist rows exactly as a committed locale ships them.
+    ///
+    /// The identifiability guarantee is about the strings users actually see,
+    /// so these are read from the committed catalogues rather than retyped:
+    /// a hand-written approximation can stay distinguishable at a width where
+    /// the real, longer, column-padded row has already collapsed.
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_checklist_rows_for_locale(cli_ftl: &str) -> Vec<String> {
+        const ROW_KEYS: [&str; 6] = [
+            "cli-quickstart-row-model-provider",
+            "cli-quickstart-row-risk-profile",
+            "cli-quickstart-row-memory",
+            "cli-quickstart-row-channels",
+            "cli-quickstart-row-peer-groups",
+            "cli-quickstart-row-agent-identity",
+        ];
+
+        let value_for = |key: &str| -> String {
+            cli_ftl
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key} = ")))
+                .unwrap_or_else(|| panic!("{key} should be defined in the catalogue"))
+                .to_string()
+        };
+
+        let mut rows: Vec<String> = ROW_KEYS
+            .iter()
+            .map(|key| {
+                value_for(key)
+                    .replace("{$glyph}", "[ ]")
+                    .replace("{$summary}", "not yet chosen")
+            })
+            .collect();
+        rows.push(value_for("cli-quickstart-create-agent"));
+        rows
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_accepted_widths_keep_every_action_distinguishable() {
+        // The blocker this guards: a width floor chosen only for arithmetic
+        // safety left widths 3 and 4 "supported" while every fitted row
+        // collapsed to "" or ".", producing an interactive menu in which the
+        // user could not tell Provider from Risk from Create — and could
+        // commit real config chosen blind. Accepting a width must therefore
+        // mean the rows stay individually readable, in every locale we ship,
+        // not merely that the budget subtraction did not underflow.
+        let locales: [(&str, &str); 5] = [
+            (
+                "en",
+                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
+            ),
+        ];
+
+        for (locale, cli_ftl) in locales {
+            let rows = quickstart_checklist_rows_for_locale(cli_ftl);
+            assert_eq!(rows.len(), 7, "{locale}: expected seven checklist rows");
+
+            for width in 0..=120usize {
+                let Some(budget) = quickstart_selector_row_budget(width) else {
+                    continue;
+                };
+
+                let fitted: Vec<String> = rows
+                    .iter()
+                    .map(|row| fit_quickstart_selector_row(row, budget))
+                    .collect();
+
+                for (row, label) in rows.iter().zip(&fitted) {
+                    assert!(
+                        !label.is_empty(),
+                        "{locale}: width {width} accepted but {row:?} fits to an empty label"
+                    );
+                    assert!(
+                        label.chars().any(|ch| ch.is_alphanumeric()),
+                        "{locale}: width {width} accepted but {row:?} fits to {label:?}, \
+                         which carries no readable text"
+                    );
+                }
+
+                let distinct: std::collections::HashSet<&str> =
+                    fitted.iter().map(String::as_str).collect();
+                assert_eq!(
+                    distinct.len(),
+                    fitted.len(),
+                    "{locale}: width {width} accepted but the fitted rows are not all \
+                     distinguishable: {fitted:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_rejects_widths_that_erase_action_labels() {
+        // The specific widths the previous floor blessed. At width 3 the row
+        // budget was 0 and every label fitted to ""; at width 4 the budget was
+        // 1 and every label fitted to ".". Both must now be rejected before
+        // any interaction can start.
+        let rows = quickstart_checklist_rows_for_locale(include_str!(
+            "../crates/zeroclaw-runtime/locales/en/cli.ftl"
+        ));
+
+        for width in [0usize, 1, 2, 3, 4, 5, 10, 19] {
+            assert_eq!(
+                quickstart_selector_row_budget(width),
+                None,
+                "width {width} must be rejected, not fitted"
+            );
+        }
+
+        // Demonstrate what acceptance at those widths would have meant, so the
+        // rejection above is anchored to the user-visible failure rather than
+        // to an arbitrary constant.
+        for (collapsed_budget, expected) in [(0usize, ""), (1, ".")] {
+            let fitted: std::collections::HashSet<String> = rows
+                .iter()
+                .map(|row| fit_quickstart_selector_row(row, collapsed_budget))
+                .collect();
+            assert_eq!(
+                fitted,
+                std::collections::HashSet::from([expected.to_string()]),
+                "budget {collapsed_budget} collapses every action to {expected:?}"
+            );
+        }
+
+        assert!(
+            quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).is_some(),
+            "the floor itself must remain usable"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_height_prevents_paging_suffixes() {
+        let item_count = 7;
+        let min_height = quickstart_selector_min_height(item_count);
+
+        assert_eq!(min_height, 9);
+        assert!((0..min_height).all(|height| !quickstart_selector_fits_height(height, item_count)));
+        assert!(quickstart_selector_fits_height(min_height, item_count));
+        assert!(quickstart_selector_fits_height(min_height + 1, item_count));
+        assert_eq!(
+            quickstart_selector_min_height(usize::MAX),
+            usize::MAX,
+            "the terminal guard must not wrap on an unexpected item count"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_prompt_stays_within_final_terminal_budget() {
+        let prompts = [
+            "Open a selector (Enter), or pick Create. Esc to quit.",
+            "選択肢を開くには Enter、終了するには Esc を押してください。",
+            "Open a selector\nwithout adding a physical terminal row.",
+        ];
+
+        for terminal_width in [20, 40, 80] {
+            let budget = quickstart_selector_row_budget(terminal_width).unwrap();
+            for prompt in prompts {
+                let fitted = fit_quickstart_selector_row(prompt, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_unknown_terminal_size_fails_closed() {
+        // A narrow terminal with an unavailable size must not get rows fitted
+        // against a guessed geometry.
+        assert!(
+            !quickstart_selector_size_is_usable(None),
+            "an unknown terminal size must not be accepted for fitting"
+        );
+        assert!(
+            quickstart_selector_size_is_usable(Some((24, 80))),
+            "a reported size must still be accepted"
+        );
+
+        let mut term = SelectorTestTerminal::new(None, []);
+        assert_eq!(
+            quickstart_selector_terminal_size(&mut term),
+            None,
+            "the selector must preserve a failed terminal size query"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_recheck_rejects_resize_and_unknown_size() {
+        let initial = (24u16, 80u16);
+
+        assert!(
+            quickstart_selector_recheck_size(initial, Some(initial)).is_ok(),
+            "an unchanged size must allow the interaction to continue"
+        );
+
+        let resized = quickstart_selector_recheck_size(initial, Some((24, 40)))
+            .expect_err("a changed size must abort the interaction");
+        assert!(
+            resized.to_string().contains("40"),
+            "the resize error should name the new width; got {resized}"
+        );
+
+        // The important half: unknown is not evidence the geometry still
+        // matches. Without the checked query this branch would compare the
+        // fabricated (24, 80) against the initial sample, find them equal, and
+        // keep redrawing rows fitted for a terminal it can no longer see.
+        let unknown = quickstart_selector_recheck_size(initial, None)
+            .expect_err("an unavailable size must abort the interaction");
+        assert_eq!(
+            unknown.to_string(),
+            qta("cli-quickstart-terminal-size-unknown", &[]),
+            "unknown size must surface the localized size-unknown error"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_ctrl_c_restores_screen_even_when_cursor_restore_fails() {
+        let mut term =
+            SelectorTestTerminal::new(Some((20, 80)), [Ok(QuickstartSelectorKey::Interrupt)]);
+        term.fail_action = Some("show_cursor");
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("cleanup failure must not replace Ctrl+C interrupt semantics");
+
+        assert_eq!(outcome, QuickstartSelectorOutcome::Interrupt);
+        let show = term
+            .actions
+            .iter()
+            .position(|action| *action == "show_cursor")
+            .expect("cursor restoration must be attempted");
+        let leave = term
+            .actions
+            .iter()
+            .position(|action| *action == "leave_alternate_screen")
+            .expect("alternate-screen restoration must be attempted");
+        assert!(
+            show < leave,
+            "cleanup attempts should retain their safe order"
+        );
+        assert_eq!(term.actions.last(), Some(&"flush"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_partial_entry_failure_still_restores_screen() {
+        let mut term = SelectorTestTerminal::new(Some((20, 80)), []);
+        term.fail_action = Some("clear_screen");
+
+        let error = match QuickstartSelectorScreen::enter(&mut term) {
+            Ok(_) => panic!("injected clear failure should abort entry"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("clear_screen"));
+        assert_eq!(
+            term.actions,
+            [
+                "enter_alternate_screen",
+                "clear_screen",
+                "show_cursor",
+                "leave_alternate_screen",
+                "flush",
+            ]
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_read_error_still_restores_screen() {
+        let mut term = SelectorTestTerminal::new(
+            Some((20, 80)),
+            [Err(std::io::Error::other("injected read failure"))],
+        );
+
+        let error =
+            interact_quickstart_selector(&mut term, &["first".to_string()], "Choose", (20, 80))
+                .expect_err("injected read failure should surface");
+        assert!(error.to_string().contains("injected read failure"));
+        assert!(term.actions.contains(&"show_cursor"));
+        assert!(term.actions.contains(&"leave_alternate_screen"));
+        assert_eq!(term.actions.last(), Some(&"flush"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selection_maps_by_index_when_fitted_labels_are_identical() {
+        let actions = [
+            QuickstartChecklistAction::Provider,
+            QuickstartChecklistAction::Risk,
+            QuickstartChecklistAction::Memory,
+            QuickstartChecklistAction::Channels,
+            QuickstartChecklistAction::PeerGroups,
+            QuickstartChecklistAction::Agent,
+            QuickstartChecklistAction::Create,
+        ];
+        let choices: Vec<(QuickstartChecklistAction, String)> = actions
+            .iter()
+            .copied()
+            .map(|action| (action, "same row".to_string()))
+            .collect();
+        let fitted: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, 0))
+            .collect();
+        assert!(fitted.windows(2).all(|pair| pair[0] == pair[1]));
+
+        for (index, expected) in actions.into_iter().enumerate() {
+            assert_eq!(quickstart_action_for_pick(&choices, Some(index)), expected);
+        }
+        assert_eq!(
+            quickstart_action_for_pick(&choices, None),
+            QuickstartChecklistAction::Quit
+        );
+        assert_eq!(
+            quickstart_action_for_pick(&choices, Some(choices.len())),
+            QuickstartChecklistAction::Quit
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_reads_appimage_from_entry() {
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/home/user/Applications/ZeroClaw-x86_64.AppImage %U\n\
+             Icon=zeroclaw\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(entry).as_deref(),
+            Some("/home/user/Applications/ZeroClaw-x86_64.AppImage")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_ignores_unrelated_entry() {
+        let entry = "[Desktop Entry]\n\
+             Name=Some Other App\n\
+             Exec=/usr/bin/other %F\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(entry), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_rejects_substring_lookalike() {
+        // Identity is the visible Name, not any field containing "zeroclaw":
+        // an unrelated entry whose Exec merely mentions the substring must not
+        // qualify, otherwise it could preempt the real companion app.
+        let entry = "[Desktop Entry]\n\
+             Name=Unrelated App\n\
+             Exec=/tmp/not-zeroclaw-helper %U\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(entry), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_keeps_quoted_path_with_spaces() {
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=\"/home/user/My Applications/ZeroClaw-x86_64.AppImage\" %U\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(entry).as_deref(),
+            Some("/home/user/My Applications/ZeroClaw-x86_64.AppImage")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_rejects_unquoted_reserved_and_escaped_space() {
+        // Per the Desktop Entry spec a space (a reserved character) must be
+        // quoted; a backslash-escaped space outside quotes is malformed. The
+        // parser fails closed rather than launching a partially interpreted path.
+        let escaped_space = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/home/user/My\\ Apps/zeroclaw-desktop %U\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(escaped_space), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_decodes_quoted_literal_dollar_and_backslash() {
+        // A literal `$` in a quoted path is written `\\$` (general unescape
+        // `\\`->`\`, then the Exec layer unescapes `\$`->`$`); a literal
+        // backslash is written `\\\\`.
+        let dollar = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=\"/opt/\\\\$dir/zeroclaw-desktop\" %U\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(dollar).as_deref(),
+            Some("/opt/$dir/zeroclaw-desktop")
+        );
+        let backslash = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=\"/opt/a\\\\\\\\b/zeroclaw-desktop\"\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(backslash).as_deref(),
+            Some("/opt/a\\b/zeroclaw-desktop")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn parse_exec_program_fails_closed_on_malformed_input() {
+        // Unterminated quote.
+        assert_eq!(parse_exec_program("\"/opt/zeroclaw-desktop"), None);
+        // Dangling escape inside a quote.
+        assert_eq!(parse_exec_program("\"/opt/zeroclaw\\"), None);
+        // Dangling escape outside quotes (invalid general escape).
+        assert_eq!(parse_exec_program("/opt/zeroclaw\\"), None);
+        // A forbidden `=` in the executable token.
+        assert_eq!(parse_exec_program("/opt/a=b/zeroclaw-desktop"), None);
+        // Unquoted reserved character.
+        assert_eq!(parse_exec_program("/opt/$HOME/zeroclaw-desktop"), None);
+        // A valid bare token still parses.
+        assert_eq!(
+            parse_exec_program("zeroclaw-desktop %U").as_deref(),
+            Some("zeroclaw-desktop")
+        );
+        // The WHOLE line is validated, not just the first token:
+        // an unknown field code invalidates it.
+        assert_eq!(parse_exec_program("zeroclaw-desktop %Z"), None);
+        // Text directly adjacent to a closing quote is malformed.
+        assert_eq!(parse_exec_program("\"/opt/zeroclaw-desktop\"junk"), None);
+        // A raw (unescaped) reserved character inside quotes is malformed.
+        assert_eq!(parse_exec_program("\"/opt/$HOME/zeroclaw-desktop\""), None);
+        assert_eq!(parse_exec_program("\"/opt/`x`/zeroclaw-desktop\""), None);
+        // Known field codes and extra plain args are accepted.
+        assert_eq!(
+            parse_exec_program("zeroclaw-desktop %U --flag").as_deref(),
+            Some("zeroclaw-desktop")
+        );
+        assert_eq!(
+            parse_exec_program("zeroclaw-desktop %%").as_deref(),
+            Some("zeroclaw-desktop")
+        );
+        // A field code embedded in the PROGRAM token (not just a leading `%`)
+        // invalidates it, even though the basename would pass the AppImage-name
+        // check — both an unknown (`%Z`) and a known (`%U`) code are rejected.
+        assert_eq!(parse_exec_program("/tmp/ZeroClaw-%Z.AppImage"), None);
+        assert_eq!(parse_exec_program("/tmp/ZeroClaw-%U.AppImage"), None);
+        // A field code embedded in an ARGUMENT token (must stand alone) is
+        // rejected for both unknown and known codes.
+        assert_eq!(parse_exec_program("zeroclaw-desktop --flag=%Z"), None);
+        assert_eq!(parse_exec_program("zeroclaw-desktop --flag=%U"), None);
+        // A field code inside a quoted argument is rejected — the quote context
+        // is retained so `"%U"` cannot masquerade as a standalone field code.
+        assert_eq!(parse_exec_program("zeroclaw-desktop \"%U\""), None);
+        // An escaped literal percent embedded in a path stays valid.
+        assert_eq!(
+            parse_exec_program("/opt/zeroclaw-desktop 100%%done").as_deref(),
+            Some("/opt/zeroclaw-desktop")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_strips_field_codes_and_quotes() {
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw Companion\n\
+             Exec=\"/opt/zeroclaw/zeroclaw-desktop\" %u\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(entry).as_deref(),
+            Some("/opt/zeroclaw/zeroclaw-desktop")
+        );
+        // A bare field code with no real command must not resolve.
+        let bad = "[Desktop Entry]\nName=ZeroClaw\nExec=%U\nType=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(bad), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_honours_hidden_and_group_scope() {
+        // Otherwise a fully valid ZeroClaw Application entry — it resolves only
+        // because `Hidden=true` masks it, so the fixture actually exercises the
+        // Hidden rule rather than passing on some other missing field.
+        let masked = "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=ZeroClaw\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n\
+             Hidden=true\n";
+        assert_eq!(zeroclaw_desktop_exec(masked), None);
+
+        // Only the [Desktop Entry] group is consulted. The main group is an
+        // otherwise valid ZeroClaw Application with no Name of its own, so it
+        // resolves iff a `Name=ZeroClaw` from the Desktop Action group leaks in.
+        // It must not.
+        let action_only = "[Desktop Entry]\n\
+             Type=Application\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n\
+             [Desktop Action foo]\n\
+             Name=ZeroClaw\n\
+             Exec=/tmp/evil\n";
+        assert_eq!(zeroclaw_desktop_exec(action_only), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn is_zeroclaw_name_matches_deliberate_identity() {
+        assert!(is_zeroclaw_name("ZeroClaw"));
+        assert!(is_zeroclaw_name("zeroclaw"));
+        assert!(is_zeroclaw_name("ZeroClaw Companion"));
+        assert!(is_zeroclaw_name("ZeroClaw-desktop"));
+        assert!(!is_zeroclaw_name("ZeroClawesome"));
+        assert!(!is_zeroclaw_name("Not ZeroClaw"));
+        assert!(!is_zeroclaw_name("Some Other App"));
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_honours_precedence_masking_and_executability() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        fn write_entry(dir: &Path, id: &str, exec: &Path) {
+            let apps = dir.join("applications");
+            std::fs::create_dir_all(&apps).unwrap();
+            std::fs::write(
+                apps.join(id),
+                format!(
+                    "[Desktop Entry]\nName=ZeroClaw\nExec={}\nType=Application\n",
+                    exec.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+
+        // Both are the supported `zeroclaw-desktop` binary, in separate dirs.
+        let high_bin = high.path().join("zeroclaw-desktop");
+        let low_bin = low.path().join("zeroclaw-desktop");
+        write_exec(&high_bin);
+        write_exec(&low_bin);
+
+        // Same desktop-file ID in both dirs: the higher-precedence one wins.
+        write_entry(high.path(), "ZeroClaw.desktop", &high_bin);
+        write_entry(low.path(), "ZeroClaw.desktop", &low_bin);
+
+        let dirs = [high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(
+            discover_desktop_app(&dirs).as_deref(),
+            Some(high_bin.as_path())
+        );
+
+        // A non-executable Exec target is skipped rather than returned.
+        let broken = tempfile::tempdir().unwrap();
+        let non_exec = broken.path().join("zeroclaw-desktop");
+        std::fs::write(&non_exec, "not executable").unwrap();
+        write_entry(broken.path(), "ZeroClaw.desktop", &non_exec);
+        assert_eq!(discover_desktop_app(&[broken.path().to_path_buf()]), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_skips_lookalike_ordered_before_real_app() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+
+        // A lexically earlier entry (`000...`) with a ZeroClaw Name but a
+        // lookalike executable must not preempt the real companion app.
+        let lookalike = dir.path().join("zeroclaw-helper");
+        let real = dir.path().join("zeroclaw-desktop");
+        write_exec(&lookalike);
+        write_exec(&real);
+        std::fs::write(
+            apps.join("000-lookalike.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                lookalike.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            apps.join("zzz-real.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_desktop_app(&[dir.path().to_path_buf()]).as_deref(),
+            Some(real.as_path())
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_higher_precedence_hidden_masks_lower_valid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        fn write_entry(dir: &Path, body: &str) {
+            let apps = dir.join("applications");
+            std::fs::create_dir_all(&apps).unwrap();
+            std::fs::write(apps.join("ZeroClaw.desktop"), body).unwrap();
+        }
+
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        let low_bin = low.path().join("zeroclaw-desktop");
+        write_exec(&low_bin);
+
+        // A higher-precedence Hidden=true entry masks the same desktop-file ID in
+        // the lower directory, so the lower (valid) entry must not be launched.
+        write_entry(
+            high.path(),
+            "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec=/opt/zeroclaw/zeroclaw-desktop\nHidden=true\n",
+        );
+        write_entry(
+            low.path(),
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                low_bin.display()
+            ),
+        );
+
+        let dirs = [high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(discover_desktop_app(&dirs), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn resolve_executable_rejects_relative_path_with_separator() {
+        // A relative Exec value with a separator would be resolved by `which` against the
+        // current working directory, so it must be rejected rather than launched.
+        assert_eq!(resolve_executable("./zeroclaw-helper"), None);
+        assert_eq!(resolve_executable("../bin/zeroclaw-helper"), None);
+        assert_eq!(resolve_executable("sub/dir/zeroclaw-helper"), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn collect_desktop_entries_does_not_follow_directory_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(
+            apps.join("ZeroClaw.desktop"),
+            "[Desktop Entry]\nName=ZeroClaw\nExec=/usr/bin/zeroclaw\nType=Application\n",
+        )
+        .unwrap();
+        // A directory symlink pointing back at its own parent would recurse forever if
+        // followed. The scan must treat it as a non-directory and terminate.
+        std::os::unix::fs::symlink(&apps, apps.join("loop")).unwrap();
+
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        collect_desktop_entries(&apps, &apps, &mut out, &mut visited);
+
+        // Terminates (no infinite loop) and collects only the real entry.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "ZeroClaw.desktop");
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_skips_special_symlink_and_oversized_entries() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+
+        let fifo = apps.join("000-fifo.desktop");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_name` is a live, NUL-terminated pathname and the mode is
+        // a valid permission bitmask. The return value is checked immediately.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_desktop_entry(&fifo), None);
+
+        let fifo_link = apps.join("001-fifo-link.desktop");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+        assert_eq!(read_desktop_entry(&fifo_link), None);
+
+        let oversized = apps.join("002-oversized.desktop");
+        let oversized_len = usize::try_from(DESKTOP_ENTRY_MAX_BYTES).unwrap() + 1;
+        std::fs::write(&oversized, vec![b'x'; oversized_len]).unwrap();
+        assert_eq!(read_desktop_entry(&oversized), None);
+
+        let real = dir.path().join("zeroclaw-desktop");
+        std::fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&real).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&real, permissions).unwrap();
+        std::fs::write(
+            apps.join("zzz-real.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_desktop_app(&[dir.path().to_path_buf()]).as_deref(),
+            Some(real.as_path())
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_rejects_zeroclaw_name_with_unrelated_exec() {
+        // A ZeroClaw display name paired with an unrelated executable must not
+        // resolve: identity is Type + Name + a ZeroClaw-shaped Exec target, not
+        // the display name alone. A lexically earlier entry like this must not
+        // preempt the real app.
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw Helper\n\
+             Exec=/tmp/unrelated %U\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(entry), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_requires_application_type() {
+        // A non-Application entry never resolves, even with a ZeroClaw Name and
+        // a ZeroClaw executable.
+        let link = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n\
+             Type=Link\n";
+        assert_eq!(zeroclaw_desktop_exec(link), None);
+
+        // Missing Type is also rejected (the published entry always sets it).
+        let no_type = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n";
+        assert_eq!(zeroclaw_desktop_exec(no_type), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn is_zeroclaw_appimage_name_anchors_identity() {
+        // The published `ZeroClaw-*.AppImage` form (separator required).
+        assert!(is_zeroclaw_appimage_name("ZeroClaw-x86_64.AppImage"));
+        assert!(is_zeroclaw_appimage_name("zeroclaw-aarch64.appimage"));
+        // A no-boundary lookalike must not qualify.
+        assert!(!is_zeroclaw_appimage_name("ZeroClawevil.AppImage"));
+        // Missing the separator (not a published form).
+        assert!(!is_zeroclaw_appimage_name("zeroclaw.appimage"));
+        // A lookalike whose name merely contains the substring must not qualify.
+        assert!(!is_zeroclaw_appimage_name("not-zeroclaw-helper.AppImage"));
+        assert!(!is_zeroclaw_appimage_name("ZeroClaw.txt"));
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn is_zeroclaw_program_binds_to_supported_names() {
+        // Exact published binary, or a published-form AppImage.
+        assert!(is_zeroclaw_program("/usr/bin/zeroclaw-desktop"));
+        assert!(is_zeroclaw_program(
+            "/home/user/Applications/ZeroClaw-x86_64.AppImage"
+        ));
+        // Lookalikes sharing the prefix are rejected.
+        assert!(!is_zeroclaw_program("/tmp/zeroclaw-helper"));
+        assert!(!is_zeroclaw_program("/tmp/zeroclaw-evil"));
+        assert!(!is_zeroclaw_program("/usr/bin/zeroclaw"));
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_masks_nested_desktop_file_ids() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        fn write_nested_entry(dir: &Path, rel_id: &str, exec: &Path) {
+            let full = dir.join("applications").join(rel_id);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(
+                full,
+                format!(
+                    "[Desktop Entry]\nName=ZeroClaw\nExec={}\nType=Application\n",
+                    exec.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        let high_bin = high.path().join("zeroclaw-desktop");
+        let low_bin = low.path().join("zeroclaw-desktop");
+        write_exec(&high_bin);
+        write_exec(&low_bin);
+
+        // Same nested desktop-file ID (`vendor/ZeroClaw.desktop` -> ID
+        // `vendor-ZeroClaw.desktop`) in both dirs: the higher-precedence entry
+        // must mask the lower one, which only works if IDs are derived
+        // recursively rather than from top-level basenames.
+        write_nested_entry(high.path(), "vendor/ZeroClaw.desktop", &high_bin);
+        write_nested_entry(low.path(), "vendor/ZeroClaw.desktop", &low_bin);
+
+        let dirs = [high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(
+            discover_desktop_app(&dirs).as_deref(),
+            Some(high_bin.as_path())
+        );
+    }
+
+    #[test]
+    fn sop_logs_cli_parses_run_limit_and_json_output() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "sop",
+            "logs",
+            "run-123-0001",
+            "--limit",
+            "42",
+            "--json",
+        ])
+        .expect("sop logs command should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Sop {
+                sop_command: SopCommands::Logs {
+                    run_id,
+                    limit: 42,
+                    json: true,
+                }
+            } if run_id == "run-123-0001"
+        ));
+    }
+
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn openrc_log_writer_cli_maps_only_known_streams() {
@@ -8307,6 +16739,59 @@ mod tests {
                 "/tmp/arbitrary.log"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn desktop_daemon_cli_parses_hidden_command() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "service",
+            "run-desktop-daemon",
+            "--port",
+            "42617",
+        ])
+        .expect("internal desktop daemon should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunDesktopDaemon { port },
+                ..
+            } if port == 42617
+        ));
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("run-desktop-daemon"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn windows_daemon_cli_requires_config_dir_and_stays_hidden() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "--config-dir",
+            "C:\\Users\\agent\\Zero Claw",
+            "service",
+            "run-windows-daemon",
+        ])
+        .expect("internal Windows task runner should parse");
+        assert_eq!(
+            cli.config_dir.as_deref(),
+            Some("C:\\Users\\agent\\Zero Claw")
+        );
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunWindowsDaemon,
+                ..
+            }
+        ));
+        assert!(
+            !Cli::command()
+                .render_help()
+                .to_string()
+                .contains("run-windows-daemon")
         );
     }
 
@@ -8407,6 +16892,20 @@ mod tests {
     }
 
     #[test]
+    fn acp_cli_accepts_process_default_agent() {
+        let cli = Cli::try_parse_from(["zeroclaw", "acp", "--agent", "fable"])
+            .expect("standalone ACP should accept a process default agent");
+
+        match cli.command {
+            Commands::Acp { agent, .. } => {
+                assert_eq!(agent.as_deref(), Some("fable"));
+            }
+            other => panic!("expected ACP command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_quickstart_uses_advertised_local_provider_runtime_default() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "lmstudio".into(),
@@ -8422,6 +16921,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_quickstart_uses_advertised_remote_provider_runtime_default() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "anthropic".into(),
@@ -8437,6 +16937,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "agent-runtime")]
     fn cli_quickstart_uses_state_fallback_when_provider_has_no_override() {
         let providers = vec![zeroclaw_runtime::quickstart::QuickstartTypeOption {
             kind: "ollama".into(),
@@ -8721,6 +17222,7 @@ mod tests {
                         rotate_device,
                         port,
                         host,
+                        json,
                     }),
             } => {
                 assert!(new);
@@ -8728,6 +17230,7 @@ mod tests {
                 assert_eq!(rotate_device, None);
                 assert_eq!(port, Some(3001));
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
+                assert!(!json, "text output is the default");
             }
             other => panic!("expected gateway get-paircode command, got {other:?}"),
         }
@@ -8754,6 +17257,322 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn issue_client_cert_cleans_staged_material_when_ledger_record_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let tls_dir = config.data_dir.join("tls");
+        zeroclaw_tls::ensure_server_materials(&tls_dir, &[]).expect("daemon TLS materials");
+        std::fs::create_dir(tls_dir.join("ledger.db")).expect("poison ledger path");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ledger"), "got: {err}");
+        assert!(!out.path().join("client-dev_under_test.crt").exists());
+        assert!(!out.path().join("client-dev_under_test.key").exists());
+        assert!(!out.path().join(".client-dev_under_test.crt.tmp").exists());
+        assert!(!out.path().join(".client-dev_under_test.key.tmp").exists());
+    }
+
+    /// `delivered_at` for a fingerprint, straight from the ledger table. The
+    /// ledger exposes no reader for it (nothing in production asks), so the
+    /// operator-CLI test reads SQLite directly.
+    #[cfg(feature = "agent-runtime")]
+    fn cert_delivered_at(data_dir: &std::path::Path, fingerprint: &str) -> Option<i64> {
+        let conn = rusqlite::Connection::open(data_dir.join("tls").join("ledger.db")).unwrap();
+        conn.query_row(
+            "SELECT delivered_at FROM issued_certs WHERE fingerprint = ?1",
+            rusqlite::params![fingerprint],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The operator CLI's publication boundary, which is the most direct of the
+    /// three: `issue-client-cert` records the issuance and only then renames
+    /// the staged key and certificate into place. A rename that fails leaves an
+    /// ACTIVE ledger row for a credential that was never published, and a retry
+    /// used to add a SECOND active row for the same device rather than
+    /// replacing the first.
+    /// The drop-in copies into --out-dir are operator-facing credentials, not
+    /// cosmetic output: a failure there must fail the command rather than
+    /// report a successful issuance over a missing or stale ca.crt.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn issue_client_cert_out_dir_drop_in_failure_fails_the_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        zeroclaw_tls::ensure_server_materials(&config.data_dir.join("tls"), &[])
+            .expect("daemon TLS materials");
+
+        // Obstruct the drop-in ca.crt with a non-empty directory so the copy
+        // fails after the primary named files were published.
+        let ca_dest = out.path().join("ca.crt");
+        std::fs::create_dir(&ca_dest).expect("obstruct ca.crt");
+        std::fs::write(ca_dest.join("occupied"), b"x").expect("occupy it");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_dropin_test",
+            Some(out.path().to_path_buf()),
+            true,
+        )
+        .expect_err("an incomplete drop-in directory must fail the command")
+        .to_string();
+        assert!(
+            err.contains("ca.crt") && err.contains("drop-in"),
+            "the error must name the drop-in file and directory: {err}"
+        );
+        assert!(
+            err.contains("issued"),
+            "the error must say the primary credentials were still issued: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn issue_client_cert_rename_failure_leaves_an_undelivered_row_that_reconciles_away() {
+        use zeroclaw_runtime::security::cert_ledger::{CertLedger, CertStatus, revoked_list_path};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        zeroclaw_tls::ensure_server_materials(&config.data_dir.join("tls"), &[])
+            .expect("daemon TLS materials");
+
+        // Make the publication rename fail the way a real filesystem does:
+        // the destination is a non-empty directory, so renaming a file onto it
+        // cannot succeed. `--force` gets past the "already exists" guard, which
+        // is exactly how an operator re-issuing over a broken layout arrives
+        // here.
+        let key_dest = out.path().join("client-dev_under_test.key");
+        std::fs::create_dir(&key_dest).expect("obstruct the key destination");
+        std::fs::write(key_dest.join("occupied"), b"x").expect("occupy it");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            true,
+        )
+        .expect_err("an unpublishable certificate must fail the command")
+        .to_string();
+        assert!(
+            err.contains("publish private key"),
+            "the error must say publication failed: {err}"
+        );
+        assert!(
+            err.contains(".client-dev_under_test.key.tmp"),
+            "the error must name the STAGED file, not only the destination: {err}"
+        );
+        // Staged material is not left lying around as a stray private key.
+        assert!(!out.path().join(".client-dev_under_test.key.tmp").exists());
+        assert!(!out.path().join(".client-dev_under_test.crt.tmp").exists());
+
+        // The row is active - promotion happens before publication by design -
+        // but undelivered, because the rename never succeeded.
+        let ghost = {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("open ledger");
+            let active = ledger.list_active().expect("list active");
+            assert_eq!(
+                active.len(),
+                1,
+                "the issuance was recorded before publishing"
+            );
+            active[0].fingerprint.clone()
+        };
+        assert_eq!(
+            cert_delivered_at(&config.data_dir, &ghost),
+            None,
+            "a failed rename must not mark the certificate delivered"
+        );
+
+        // Once the delivery deadline passes, the next ledger open revokes it.
+        {
+            let conn =
+                rusqlite::Connection::open(config.data_dir.join("tls").join("ledger.db")).unwrap();
+            conn.execute(
+                "UPDATE issued_certs SET issued_at = issued_at - 7200 WHERE fingerprint = ?1",
+                rusqlite::params![ghost],
+            )
+            .unwrap();
+        }
+        {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+            assert_eq!(
+                ledger.status_of(&ghost).expect("status"),
+                Some(CertStatus::Revoked),
+                "an unpublished certificate must be reconciled to revoked"
+            );
+        }
+        let crl = std::fs::read_to_string(revoked_list_path(&config.data_dir)).expect("read crl");
+        assert!(
+            crl.lines().any(|l| l == ghost),
+            "the reconciled revocation must reach the verifier's file, got: {crl:?}"
+        );
+
+        // The retry - the operator clears the obstruction and re-issues - must
+        // end with exactly ONE usable credential, not two.
+        std::fs::remove_dir_all(&key_dest).expect("clear the obstruction");
+        issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            true,
+        )
+        .expect("the retry must publish");
+
+        let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+        let active = ledger.list_active().expect("list active");
+        assert_eq!(
+            active.len(),
+            1,
+            "the retry must not leave a second active row for the same device, got: {:?}",
+            active.iter().map(|e| &e.fingerprint).collect::<Vec<_>>()
+        );
+        let published = active[0].fingerprint.clone();
+        assert_ne!(published, ghost, "the retry mints a fresh certificate");
+        assert!(
+            cert_delivered_at(&config.data_dir, &published).is_some(),
+            "a published certificate must be recorded as delivered"
+        );
+        assert_eq!(
+            ledger.status_of(&ghost).expect("status"),
+            Some(CertStatus::Revoked),
+            "the first attempt stays revoked - not duplicated into a second active row"
+        );
+        // And the files the operator asked for are actually there.
+        assert!(out.path().join("client-dev_under_test.crt").is_file());
+        assert!(out.path().join("client-dev_under_test.key").is_file());
+    }
+
+    /// Operator revocation through the `revoke-client-cert` handler writes the
+    /// fingerprint into `<data_dir>/tls/revoked` - the exact file the WSS
+    /// verifier reads - so a revoked cert is refused at the next handshake (A5).
+    /// Guards the production trigger for revocation (the path the ledger revoke
+    /// API exposes but nothing operator-facing reached before this command).
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn revoke_client_cert_handler_materializes_the_revoked_file() {
+        use zeroclaw_runtime::security::cert_ledger::{
+            CertLedger, CertStatus, IssuanceActor, LedgerEntry, revoked_list_path,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let fp = "ab".repeat(32); // 64-hex fingerprint
+        {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("open ledger");
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev_under_test".to_string(),
+                        fingerprint: fp.clone(),
+                        not_before: 0,
+                        not_after: i64::MAX,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: IssuanceActor::Operator.label(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .expect("record issued");
+        }
+
+        // The operator command revokes by fingerprint.
+        revoke_wss_client_cert(&config, Some(fp.clone()), None).expect("revoke");
+
+        // The verifier's input file now lists the fingerprint, and the ledger
+        // reflects the revocation.
+        let revoked = std::fs::read_to_string(revoked_list_path(&config.data_dir))
+            .expect("read revoked file");
+        assert!(
+            revoked.lines().any(|l| l == fp),
+            "revoked file must list the revoked fingerprint, got: {revoked:?}"
+        );
+        let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+        assert_eq!(
+            ledger.status_of(&fp).expect("status"),
+            Some(CertStatus::Revoked)
+        );
+    }
+
+    /// `revoke-client-cert` requires exactly one of --fingerprint / --device,
+    /// and `list-client-certs` parses.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn revoke_and_list_client_cert_cli_parsing() {
+        // Neither selector -> rejected.
+        assert!(Cli::try_parse_from(["zeroclaw", "security", "revoke-client-cert"]).is_err());
+        // Both selectors -> rejected (mutually exclusive).
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "security",
+                "revoke-client-cert",
+                "--fingerprint",
+                "ab",
+                "--device",
+                "d",
+            ])
+            .is_err()
+        );
+        // Exactly one selector -> parses.
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "security",
+            "revoke-client-cert",
+            "--fingerprint",
+            "abcd",
+        ])
+        .expect("single selector parses");
+        match cli.command {
+            Commands::Security {
+                security_command:
+                    SecurityCommands::RevokeClientCert {
+                        fingerprint,
+                        device,
+                    },
+            } => {
+                assert_eq!(fingerprint.as_deref(), Some("abcd"));
+                assert!(device.is_none());
+            }
+            other => panic!("expected revoke-client-cert, got {other:?}"),
+        }
+        // list-client-certs parses with --json.
+        let cli = Cli::try_parse_from(["zeroclaw", "security", "list-client-certs", "--json"])
+            .expect("list parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Security {
+                security_command: SecurityCommands::ListClientCerts { json: true }
+            }
+        ));
+    }
+
+    /// `--rotate` parses and is mutually exclusive with `--new` and
+    /// `--rotate-device` so the destructive path cannot be silently combined
+    /// with "add another client".
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn gateway_get_paircode_rotate_flags_parse_and_conflict() {
@@ -8832,7 +17651,10 @@ mod tests {
             Some("Pairing is active but no new code available (already paired or code expired)"),
         );
 
-        assert!(msg.contains("only displays an existing active code; it does not mint"));
+        assert!(msg.contains(&t(
+            "cli-pairing-show-only",
+            "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.",
+        )));
         assert!(msg.contains("zeroclaw gateway get-paircode --new"));
         assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
         assert!(msg.contains("open http://127.0.0.1:42617"));
@@ -8919,8 +17741,115 @@ mod tests {
             Some("Pairing is active but no new code available (already paired or code expired)"),
         );
 
-        assert!(msg.contains("did not mint a new pairing code"));
+        assert!(msg.contains(&t(
+            "cli-pairing-new-code-unavailable",
+            "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.",
+        )));
         assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_preserves_localized_output_for_show_and_disabled_branches() {
+        let default = config::GatewayConfig::default();
+        let show = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            true,
+            None,
+        );
+        let expected_show = indent_paircode_lines(vec![
+            t(
+                "cli-pairing-no-code",
+                "🔐 Gateway pairing is enabled, but no active pairing code is available.",
+            ),
+            String::new(),
+            t(
+                "cli-pairing-show-only",
+                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.",
+            ),
+            t("cli-pairing-pair-another", "To pair another device, run:"),
+            "    zeroclaw gateway get-paircode --new".into(),
+            String::new(),
+            t(
+                "cli-pairing-revoke-replace",
+                "To revoke existing pairings and mint a replacement code, run:",
+            ),
+            "    zeroclaw gateway get-paircode --rotate".into(),
+            String::new(),
+            t("cli-pairing-inspect", "To inspect the running gateway:"),
+            "    open http://127.0.0.1:42617".into(),
+        ]);
+        assert_eq!(show, expected_show);
+
+        let disabled = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            false,
+            None,
+        );
+        let expected_disabled = indent_paircode_lines(vec![
+            t(
+                "cli-pairing-disabled",
+                "⚠️  Gateway pairing is disabled in config.",
+            ),
+            t(
+                "cli-pairing-requests-accepted",
+                "All requests will be accepted without authentication.",
+            ),
+            t(
+                "cli-pairing-enable-config",
+                "To enable pairing, set [gateway] require_pairing = true.",
+            ),
+        ]);
+        assert_eq!(disabled, expected_disabled);
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_preserves_localized_action_recovery_branches() {
+        let default = config::GatewayConfig::default();
+        let add_client = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::AddClient,
+            true,
+            None,
+        );
+        assert!(add_client.contains(&t(
+            "cli-pairing-new-code-unavailable",
+            "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.",
+        )));
+        assert!(add_client.contains(&t(
+            "cli-pairing-retry-or-rotate",
+            "Try again shortly, or revoke existing pairings and mint a replacement code:",
+        )));
+
+        let rotate = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::RotateAll,
+            true,
+            None,
+        );
+        assert!(rotate.contains(&t(
+            "cli-pairing-rotate-no-code",
+            "The rotate request completed without returning a replacement code.",
+        )));
+        assert!(rotate.contains(&t(
+            "cli-pairing-check-enabled",
+            "Check whether pairing is enabled, then request a new device code:",
+        )));
     }
 
     #[test]
@@ -9104,110 +18033,6 @@ mod tests {
                 other => panic!("expected onboard command, got {other:?}"),
             }
         }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_detects_cellar_paths() {
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(
-                Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw"),
-                |_| None,
-            ),
-            Some(PathBuf::from("/opt/homebrew/var/zeroclaw")),
-        );
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(
-                Path::new("/usr/local/Cellar/zeroclaw/0.8.0/bin/zeroclaw"),
-                |_| None,
-            ),
-            Some(PathBuf::from("/usr/local/var/zeroclaw")),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_detects_brew_bin_symlink_layout() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let prefix = temp.path().join("homebrew");
-        std::fs::create_dir_all(prefix.join("Cellar")).expect("create Cellar marker");
-        let exe = prefix.join("bin/zeroclaw");
-
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(&exe, |_| None),
-            Some(prefix.join("var/zeroclaw")),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_preserves_explicit_runtime_paths() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-
-        for var in [
-            "ZEROCLAW_CONFIG_DIR",
-            "ZEROCLAW_DATA_DIR",
-            "ZEROCLAW_WORKSPACE",
-        ] {
-            assert_eq!(
-                resolve_homebrew_onboard_config_dir(exe, |name| {
-                    (name == var).then(|| "/tmp/zeroclaw-explicit".to_string())
-                }),
-                None,
-                "{var} should take precedence over Homebrew detection",
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn homebrew_onboard_config_dir_treats_workspace_whitespace_as_explicit() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-
-        assert_eq!(
-            resolve_homebrew_onboard_config_dir(exe, |name| {
-                (name == "ZEROCLAW_WORKSPACE").then(|| "   ".to_string())
-            }),
-            None,
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn apply_homebrew_onboard_config_dir_sets_detected_config_dir() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-        let mut applied = None;
-
-        let detected = apply_homebrew_onboard_config_dir_with(
-            exe,
-            |_| None,
-            |name, value| applied = Some((name, value.to_path_buf())),
-        );
-
-        assert_eq!(detected, Some(PathBuf::from("/opt/homebrew/var/zeroclaw")));
-        assert_eq!(
-            applied,
-            Some((
-                "ZEROCLAW_CONFIG_DIR",
-                PathBuf::from("/opt/homebrew/var/zeroclaw"),
-            )),
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "agent-runtime")]
-    fn apply_homebrew_onboard_config_dir_skips_explicit_config_dir() {
-        let exe = Path::new("/opt/homebrew/Cellar/zeroclaw/0.8.0/bin/zeroclaw");
-        let mut applied = None;
-
-        let detected = apply_homebrew_onboard_config_dir_with(
-            exe,
-            |name| (name == "ZEROCLAW_CONFIG_DIR").then(|| "/tmp/zeroclaw".to_string()),
-            |name, value| applied = Some((name, value.to_path_buf())),
-        );
-
-        assert_eq!(detected, None);
-        assert_eq!(applied, None);
     }
 
     #[test]
@@ -9418,6 +18243,31 @@ mod tests {
                 .iter_entries()
                 .any(|(family, alias, _)| family == "openai" && alias == "alloy"),
             "tts alias should resolve after materialization"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_materializes_first_dynamic_secret_map_entry() {
+        let mut config = Config::default();
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo";
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("known dynamic secret-map path should materialize");
+
+        assert!(created, "missing provider alias should be created");
+        config
+            .set_prop_persistent(path, "bar")
+            .expect("first dynamic secret-map entry should be writable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Foo"))
+                .map(String::as_str),
+            Some("bar")
         );
     }
 
@@ -9732,22 +18582,757 @@ mod tests {
         );
     }
 
+    /// Fixture for the cron-dispatch regressions: a one-step SOP on a
+    /// once-a-minute cron trigger, a mock OpenAI-compatible provider so the
+    /// step's agent turn actually completes, and the engine/audit/cache trio
+    /// the maintenance tick consumes.
+    ///
+    /// `owner` is the SOP's `agent`. `Some("sop-runner")` names the one
+    /// configured agent; `None` leaves the procedure unowned, which the
+    /// headless driver must refuse rather than borrow an identity for.
+    #[cfg(feature = "agent-runtime")]
+    struct CronSopHarness {
+        _tmp: tempfile::TempDir,
+        _server: wiremock::MockServer,
+        config: Config,
+        engine: std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        audit: std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>,
+        cache: zeroclaw_runtime::sop::dispatch::SopCronCache,
+        drivers: SopDriverSet,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    const CRON_SOP_AGENT: &str = "sop-runner";
+
+    #[cfg(feature = "agent-runtime")]
+    async fn cron_sop_harness(owner: Option<&str>) -> CronSopHarness {
+        cron_sop_harness_with(owner, false).await
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    fn orphaned_run_sop(name: &str) -> zeroclaw_runtime::sop::Sop {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+        Sop {
+            name: name.into(),
+            description: "orphaned-run regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Auto,
+            priority: SopPriority::Normal,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+            admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
+        }
+    }
+
+    /// Start one run on `store` and return the engine holding it plus its id.
+    #[cfg(feature = "agent-runtime")]
+    fn engine_with_one_running_run(
+        name: &str,
+        store: std::sync::Arc<dyn zeroclaw_runtime::sop::SopRunStore>,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        String,
+    ) {
+        let mut engine =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(store);
+        engine.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        let action = engine
+            .start_run(
+                name,
+                zeroclaw_runtime::sop::SopEvent {
+                    source: zeroclaw_runtime::sop::SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-09-24T00:00:00Z".into(),
+                },
+            )
+            .expect("the run starts");
+        let run_id = match &action {
+            zeroclaw_runtime::sop::SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected the run to be ready for a driver, got {other:?}"),
+        };
+        (std::sync::Arc::new(std::sync::Mutex::new(engine)), run_id)
+    }
+
+    /// A reload that has to abort a driver mid-step must not strand its run.
+    ///
+    /// The aborted driver leaves the run `Running` and claimed, and the next
+    /// generation restores active runs without starting drivers for them. This
+    /// uses the SQLite store the daemon runs on and rebuilds the replacement
+    /// engine from the same database, because in-memory cleanup alone would
+    /// leave the durable row restorable: the run has to be terminal on disk,
+    /// with its claim released, before the next generation reads it.
     #[tokio::test]
     #[cfg(feature = "agent-runtime")]
-    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+    async fn an_aborted_driver_settles_its_run_before_the_next_generation_restores_it() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::types::SopRunStatus;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tmp.path().join("sop-runs.db");
+        let name = "aborted-driver";
+        let store =
+            std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"));
+        let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            1,
+            "the run holds a claim"
+        );
+
+        // A driver mid-step that will not finish on its own.
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+            &drivers,
+            &run_id,
+            &engine,
+            || ::zeroclaw_spawn::spawn!(std::future::pending::<()>()),
+        ));
+
+        let teardown = SopDriverSupervisor {
+            drivers,
+            pending_settlements: None,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            teardown.still_running.is_empty(),
+            "the aborted driver stopped"
+        );
+        assert!(
+            teardown.unsettled_runs.is_empty(),
+            "the run was settled at teardown, so nothing is handed on"
+        );
+
+        {
+            let guard = engine.lock().unwrap();
+            assert!(!guard.active_runs().contains_key(&run_id));
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Failed,
+                "a step that was underway and did not finish is recorded as failed"
+            );
+        }
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            0,
+            "settlement released the claim"
+        );
+        assert!(
+            store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "run_driver_aborted"),
+            "the durable record says why the run ended"
+        );
+
+        // The replacement generation opens the same database.
+        let reopened =
+            std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"));
+        let mut rebuilt =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(reopened.clone());
+        rebuilt.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        rebuilt.restore_runs();
+        assert!(
+            !rebuilt.active_runs().contains_key(&run_id),
+            "the next generation must not restore a settled run as active"
+        );
+        rebuilt.run_maintenance_tick();
+        assert_eq!(
+            reopened.claim_counts(name).unwrap().0,
+            0,
+            "and nothing renews a claim for it"
+        );
+    }
+
+    /// When the terminal write at teardown fails, the run is still `Running` on
+    /// disk and the next generation restores it with a renewed claim. That
+    /// generation must take over the settlement rather than hold the claim
+    /// forever with no driver.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn a_run_teardown_could_not_settle_is_settled_by_the_next_generation() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::store::testing::FailFirstTerminalWrite;
+        use zeroclaw_runtime::sop::types::SopRunStatus;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tmp.path().join("sop-runs.db");
+        let name = "unsettled-at-teardown";
+        let store = std::sync::Arc::new(FailFirstTerminalWrite::new(
+            zeroclaw_runtime::sop::SqliteRunStore::open(&db).expect("store"),
+        ));
+        let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+            &drivers,
+            &run_id,
+            &engine,
+            || ::zeroclaw_spawn::spawn!(std::future::pending::<()>()),
+        ));
+        let teardown = SopDriverSupervisor {
+            drivers,
+            pending_settlements: None,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            store.fired(),
+            "the teardown's terminal write was the one that failed"
+        );
+        assert_eq!(
+            teardown.unsettled_runs,
+            vec![run_id.clone()],
+            "a run teardown could not settle is handed to the next generation"
+        );
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            1,
+            "still claimed on disk"
+        );
+
+        // The next generation, as the daemon loop builds it: a fresh engine on
+        // the same store that restores active runs, then adopts the hand-off.
+        let mut next =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+                .with_store(store.clone());
+        next.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        next.restore_runs();
+        assert!(
+            next.active_runs().contains_key(&run_id),
+            "the unsettled row restores as active"
+        );
+        next.adopt_orphaned_run_settlements(teardown.unsettled_runs.into_iter().map(|run_id| {
+            (
+                run_id,
+                zeroclaw_runtime::sop::OrphanedRunSettlement::DriverAborted,
+            )
+        }));
+        let summary = next.run_maintenance_tick();
+        assert_eq!(summary.settled_orphaned_runs, 1);
+        assert!(!next.active_runs().contains_key(&run_id));
+        assert_eq!(next.get_run(&run_id).unwrap().status, SopRunStatus::Failed);
+        assert_eq!(
+            store.claim_counts(name).unwrap().0,
+            0,
+            "the next generation released the claim instead of renewing it"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn a_finished_drivers_settlement_retry_survives_reload_with_its_original_kind() {
+        use zeroclaw_runtime::sop::SopRunStore as _;
+        use zeroclaw_runtime::sop::store::testing::FailFirstTerminalWrite;
+        use zeroclaw_runtime::sop::{OrphanedRunSettlement, SopRunStatus};
+
+        for (kind, event_kind, restore_succeeds) in [
+            (
+                OrphanedRunSettlement::ExecutionRejected,
+                "run_execution_rejected",
+            ),
+            (
+                OrphanedRunSettlement::DrainedBeforeAdmission,
+                "run_generation_drained",
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(kind, event_kind)| {
+            [true, false].map(|restore_succeeds| (kind, event_kind, restore_succeeds))
+        }) {
+            let tmp = tempfile::tempdir().unwrap();
+            let db = tmp.path().join("sop-runs.db");
+            let name = "finished-driver-retry";
+            let store = std::sync::Arc::new(FailFirstTerminalWrite::new(
+                zeroclaw_runtime::sop::SqliteRunStore::open(&db).unwrap(),
+            ));
+            let (engine, run_id) = engine_with_one_running_run(name, store.clone());
+            let supervisor = SopDriverSupervisor::new(Vec::new(), &engine);
+            let driver_engine = engine.clone();
+            let driver_run = run_id.clone();
+            assert!(zeroclaw_runtime::sop::admit_sop_driver_for_run(
+                &supervisor.drivers,
+                &run_id,
+                &engine,
+                || {
+                    ::zeroclaw_spawn::spawn!(async move {
+                        driver_engine
+                            .lock()
+                            .unwrap()
+                            .settle_orphaned_run(&driver_run, kind)
+                            .unwrap_err();
+                    })
+                },
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !store.fired() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // This current-thread task has no await inside its settlement;
+            // it finished before this test resumes. New admission prunes it.
+            assert!(zeroclaw_runtime::sop::admit_sop_driver(
+                &supervisor.drivers,
+                || ::zeroclaw_spawn::spawn!(async {}),
+            ));
+            assert_eq!(supervisor.drivers.lock().unwrap().len(), 1);
+            let teardown = supervisor.shutdown().await;
+            assert!(teardown.still_running.is_empty());
+            assert!(teardown.unsettled_runs.is_empty());
+            assert_eq!(store.claim_counts(name).unwrap().0, 1);
+
+            let reopened =
+                std::sync::Arc::new(zeroclaw_runtime::sop::SqliteRunStore::open(&db).unwrap());
+            let mut next = zeroclaw_runtime::sop::SopEngine::new(
+                zeroclaw_config::schema::SopConfig::default(),
+            )
+            .with_store(reopened.clone());
+            next.set_sops_for_test(vec![orphaned_run_sop(name)]);
+            let connection = rusqlite::Connection::open(&db).unwrap();
+            let stored_json: String = connection
+                .query_row(
+                    "SELECT json FROM sop_runs WHERE run_id=?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if !restore_succeeds {
+                connection
+                    .execute(
+                        "UPDATE sop_runs SET json='invalid' WHERE run_id=?1",
+                        [&run_id],
+                    )
+                    .unwrap();
+            }
+            next.restore_runs();
+            next.adopt_orphaned_run_settlement_queue(teardown.pending_settlements.unwrap());
+            // Aborted-driver fallback must not relabel an existing rejection.
+            next.adopt_orphaned_run_settlements([(
+                run_id.clone(),
+                OrphanedRunSettlement::DriverAborted,
+            )]);
+            if !restore_succeeds {
+                assert!(next.active_runs().is_empty());
+                assert_eq!(next.run_maintenance_tick().settled_orphaned_runs, 0);
+                assert!(next.has_pending_orphan_settlement(&run_id));
+                assert_eq!(reopened.claim_counts(name).unwrap().0, 1);
+                assert!(!reopened.list_events(&run_id).unwrap().iter().any(|event| {
+                    event.kind == event_kind || event.kind == "run_driver_aborted"
+                }));
+                connection
+                    .execute(
+                        "UPDATE sop_runs SET json=?1 WHERE run_id=?2",
+                        [&stored_json, &run_id],
+                    )
+                    .unwrap();
+                // Do not restore again: maintenance must resolve the cache miss.
+            }
+            assert_eq!(next.run_maintenance_tick().settled_orphaned_runs, 1);
+            assert!(!next.has_pending_orphan_settlement(&run_id));
+            assert_eq!(next.run_maintenance_tick().settled_orphaned_runs, 0);
+            assert_eq!(
+                next.get_run(&run_id).unwrap().status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(
+                reopened.load_run(&run_id).unwrap().unwrap().run.status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(reopened.claim_counts(name).unwrap().0, 0);
+            let events = reopened.list_events(&run_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.kind == event_kind)
+                    .count(),
+                1
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event.kind == "run_driver_aborted")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn overlapping_generations_settle_an_orphan_once_and_reconcile_stale_views() {
+        use std::sync::{Arc, Mutex, mpsc};
+        use std::time::Duration;
+        use zeroclaw_runtime::sop::metrics::SopMetricsCollector;
+        use zeroclaw_runtime::sop::store::{
+            ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy,
+            SopEventRecord, StoreError,
+        };
+        use zeroclaw_runtime::sop::{
+            OrphanedRunSettlement, SopEngine, SopRunStatus, SopRunStore, SqliteRunStore,
+        };
+
+        // Pause one authoritative read after it took its snapshot. The other
+        // engine must not enter its read until this settlement has finished.
+        type ReadProbe = (mpsc::Sender<()>, Option<mpsc::Receiver<()>>);
+
+        struct ReadProbeStore {
+            inner: SqliteRunStore,
+            probe: Mutex<Option<ReadProbe>>,
+        }
+
+        impl SopRunStore for ReadProbeStore {
+            fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
+                self.inner.save_run(run)
+            }
+            fn save_run_with_event(
+                &self,
+                run: &PersistedRun,
+                event: &SopEventRecord,
+            ) -> Result<u64, StoreError> {
+                self.inner.save_run_with_event(run, event)
+            }
+            fn finish_run(&self, id: &str, run: &PersistedRun) -> Result<(), StoreError> {
+                self.inner.finish_run(id, run)
+            }
+            fn finish_run_with_event(
+                &self,
+                id: &str,
+                run: &PersistedRun,
+                event: &SopEventRecord,
+            ) -> Result<u64, StoreError> {
+                self.inner.finish_run_with_event(id, run, event)
+            }
+            fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
+                self.inner.load_active_runs()
+            }
+            fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
+                self.inner.load_terminal_runs(limit)
+            }
+            fn load_run(&self, id: &str) -> Result<Option<PersistedRun>, StoreError> {
+                let run = self.inner.load_run(id)?;
+                let probe = self.probe.lock().unwrap().take();
+                if let Some((started, release)) = probe {
+                    started.send(()).unwrap();
+                    if let Some(release) = release {
+                        release.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                }
+                Ok(run)
+            }
+            fn last_terminal_completed_at(&self, name: &str) -> Result<Option<String>, StoreError> {
+                self.inner.last_terminal_completed_at(name)
+            }
+            fn try_claim_run(
+                &self,
+                id: &str,
+                name: &str,
+                per_sop: usize,
+                global: usize,
+            ) -> Result<Option<ClaimToken>, StoreError> {
+                self.inner.try_claim_run(id, name, per_sop, global)
+            }
+            fn renew_claim_for_restore(
+                &self,
+                id: &str,
+                name: &str,
+            ) -> Result<ClaimToken, StoreError> {
+                self.inner.renew_claim_for_restore(id, name)
+            }
+            fn claim_counts(&self, name: &str) -> Result<(usize, usize), StoreError> {
+                self.inner.claim_counts(name)
+            }
+            fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+                self.inner.heartbeat_claim(token)
+            }
+            fn release_claim(&self, token: &ClaimToken) -> Result<(), StoreError> {
+                self.inner.release_claim(token)
+            }
+            fn expired_claims(&self, now: &str) -> Result<Vec<ClaimToken>, StoreError> {
+                self.inner.expired_claims(now)
+            }
+            fn append_event(&self, event: &SopEventRecord) -> Result<u64, StoreError> {
+                self.inner.append_event(event)
+            }
+            fn list_events(&self, id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
+                self.inner.list_events(id)
+            }
+            fn save_proposal(&self, proposal: &ProposalRecord) -> Result<(), StoreError> {
+                self.inner.save_proposal(proposal)
+            }
+            fn load_proposal(&self, id: &str) -> Result<Option<ProposalRecord>, StoreError> {
+                self.inner.load_proposal(id)
+            }
+            fn list_proposals(
+                &self,
+                status: Option<ProposalStatus>,
+            ) -> Result<Vec<ProposalRecord>, StoreError> {
+                self.inner.list_proposals(status)
+            }
+            fn prune(&self, policy: &RetentionPolicy) -> Result<usize, StoreError> {
+                self.inner.prune(policy)
+            }
+            fn health_check(&self) -> bool {
+                self.inner.health_check()
+            }
+            fn backend(&self) -> &'static str {
+                self.inner.backend()
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("sop-runs.db");
+        let name = "overlapping-settlement";
+        let old_store = Arc::new(ReadProbeStore {
+            inner: SqliteRunStore::open(&db).unwrap(),
+            probe: Mutex::new(None),
+        });
+        let (old, run_id) = engine_with_one_running_run(name, old_store.clone());
+        let queue = old.lock().unwrap().orphaned_run_settlement_queue();
+        let next_store = Arc::new(ReadProbeStore {
+            inner: SqliteRunStore::open(&db).unwrap(),
+            probe: Mutex::new(None),
+        });
+        let metrics = Arc::new(SopMetricsCollector::new());
+        let (notifier, mut notifications) = tokio::sync::broadcast::channel(8);
+        let mut next = SopEngine::new(zeroclaw_config::schema::SopConfig::default())
+            .with_store(next_store.clone())
+            .with_metrics(metrics.clone())
+            .with_run_notifier(notifier);
+        next.set_sops_for_test(vec![orphaned_run_sop(name)]);
+        next.restore_runs();
+        next.adopt_orphaned_run_settlement_queue(queue.clone());
+        assert!(next.active_runs().contains_key(&run_id));
+
+        // An unreadable durable row must retain the retry even with both caches
+        // populated; it must not fall back to writing either cached snapshot.
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let json: String = connection
+            .query_row(
+                "SELECT json FROM sop_runs WHERE run_id=?1",
+                [&run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sop_runs SET json='invalid' WHERE run_id=?1",
+                [&run_id],
+            )
+            .unwrap();
+        assert!(
+            old.lock()
+                .unwrap()
+                .settle_orphaned_run(&run_id, OrphanedRunSettlement::ExecutionRejected)
+                .is_err()
+        );
+        assert!(next.has_pending_orphan_settlement(&run_id));
+        assert_eq!(next_store.claim_counts(name).unwrap().0, 1);
+        connection
+            .execute(
+                "UPDATE sop_runs SET json=?1 WHERE run_id=?2",
+                [&json, &run_id],
+            )
+            .unwrap();
+
+        let (old_read, old_read_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        *old_store.probe.lock().unwrap() = Some((old_read, Some(release_rx)));
+        let (next_read, next_read_rx) = mpsc::channel();
+        *next_store.probe.lock().unwrap() = Some((next_read, None));
+        let old_run_id = run_id.clone();
+        let old_engine = old.clone();
+        let old_attempt = std::thread::spawn(move || {
+            old_engine
+                .lock()
+                .unwrap()
+                .settle_orphaned_run(&old_run_id, OrphanedRunSettlement::ExecutionRejected)
+        });
+        old_read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let serialized = queue.settlement_in_progress_for_test();
+        let (attempt_started, attempt_started_rx) = mpsc::channel();
+        let next_run_id = run_id.clone();
+        let next_attempt = std::thread::spawn(move || {
+            attempt_started.send(()).unwrap();
+            let result =
+                next.settle_orphaned_run(&next_run_id, OrphanedRunSettlement::DriverAborted);
+            (next, result)
+        });
+        attempt_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        // Release and join before asserting, including on a broken lock, so the
+        // regression never leaves a paused worker behind on failure.
+        release.send(()).unwrap();
+        let old_result = old_attempt.join().unwrap().unwrap();
+        let (mut next, next_result) = next_attempt.join().unwrap();
+        assert!(
+            serialized,
+            "the handed-off gate must cover the old engine's authoritative read"
+        );
+        assert_eq!(old_result, Some(SopRunStatus::Running));
+        assert_eq!(next_result.unwrap(), None);
+        next_read_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        for engine in [&*old.lock().unwrap(), &next] {
+            assert!(!engine.active_runs().contains_key(&run_id));
+            assert!(!engine.has_pending_orphan_settlement(&run_id));
+            assert_eq!(
+                engine.get_run(&run_id).unwrap().status,
+                SopRunStatus::Cancelled
+            );
+            assert_eq!(engine.finished_runs(Some(name)).len(), 1);
+        }
+        let durable = next_store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(durable.run.status, SopRunStatus::Cancelled);
+        assert_eq!(next_store.claim_counts(name).unwrap().0, 0);
+        let events = next_store.list_events(&run_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "run_execution_rejected")
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == "run_driver_aborted")
+        );
+        assert_eq!(metrics.snapshot()["global"]["runs_cancelled"], 0);
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Another retry and maintenance pass only reconcile views; they must not
+        // rewrite the winner's terminal revision or refill its released claim.
+        next.adopt_orphaned_run_settlements([(
+            run_id.clone(),
+            OrphanedRunSettlement::DriverAborted,
+        )]);
+        assert_eq!(next.run_maintenance_tick().settled_orphaned_runs, 0);
+        assert_eq!(next.finished_runs(Some(name)).len(), 1);
+        assert_eq!(
+            next_store.load_run(&run_id).unwrap().unwrap().revision,
+            durable.revision
+        );
+        assert_eq!(next_store.claim_counts(name).unwrap().0, 0);
+        assert_eq!(next_store.list_events(&run_id).unwrap().len(), events.len());
+        assert_eq!(metrics.snapshot()["global"]["runs_cancelled"], 0);
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let reused = next_store
+            .try_claim_run("replacement-run", name, 1, 1)
+            .unwrap()
+            .expect("settlement made the concurrency slot reusable");
+        next_store.release_claim(&reused).unwrap();
+    }
+
+    /// `calls_tool`: the model asks for one tool before answering, so a test can
+    /// assert on what the step recorded having run.
+    #[cfg(feature = "agent-runtime")]
+    async fn cron_sop_harness_with(owner: Option<&str>, calls_tool: bool) -> CronSopHarness {
         use std::sync::{Arc, Mutex};
-        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, MemoryConfig, RiskProfileConfig, SopConfig,
+        };
         use zeroclaw_memory::traits::Memory;
         use zeroclaw_runtime::sop::{
             Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
         };
+
+        let server = wiremock::MockServer::start().await;
+        if calls_tool {
+            // Consumed by the first request only, so the follow-up falls through
+            // to the plain answer mounted below.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/chat/completions"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "id": "chatcmpl-tool",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "test-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": serde_json::Value::Null,
+                                "tool_calls": [{
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "audit_probe",
+                                        "arguments": "{}",
+                                    },
+                                }],
+                            },
+                            "finish_reason": "tool_calls",
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "step one done"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                })),
+            )
+            .mount(&server)
+            .await;
 
         let mut engine = SopEngine::new(SopConfig::default());
         engine.set_sops_for_test(vec![Sop {
             name: "cron-sop".into(),
             description: "cron regression".into(),
             version: "0.1.0".into(),
-            execution_mode: SopExecutionMode::Supervised,
+            execution_mode: SopExecutionMode::Auto,
             priority: SopPriority::Normal,
             triggers: vec![SopTrigger::Cron {
                 expression: "* * * * *".into(),
@@ -9768,7 +19353,8 @@ mod tests {
             deterministic: false,
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
-            agent: None,
+            agent: owner.map(str::to_string),
+            decision: None,
         }]);
         let engine = Arc::new(Mutex::new(engine));
 
@@ -9782,14 +19368,865 @@ mod tests {
         let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
         let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
 
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        {
+            let base = providers
+                .models
+                .ensure("custom", "default")
+                .expect("`custom` slot must exist on ModelProviders");
+            base.api_key = Some("test-key".into());
+            base.model = Some("test-model".into());
+            base.uri = Some(server.uri());
+        }
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            CRON_SOP_AGENT.to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        // A headless step runs under the owning agent's fail-closed approval
+        // policy, so a Supervised agent's step may only use tools it
+        // auto-approves, exactly as in a real deployment. `audit_probe` is the
+        // tool the call-recording regression asks for.
+        let mut risk_profile = RiskProfileConfig::default();
+        risk_profile.auto_approve.push("audit_probe".into());
+        let mut risk_profiles = std::collections::HashMap::new();
+        risk_profiles.insert("default".to_string(), risk_profile);
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            providers,
+            agents,
+            risk_profiles,
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.scheduler_retries = 0;
+
+        CronSopHarness {
+            _tmp: tmp,
+            _server: server,
+            config,
+            engine,
+            audit,
+            cache,
+            drivers: SopDriverSet::default(),
+        }
+    }
+
+    /// Wait for the cron-started run to leave the active set, then return the
+    /// retained terminal run.
+    #[cfg(feature = "agent-runtime")]
+    async fn await_terminal_cron_run(
+        harness: &CronSopHarness,
+    ) -> zeroclaw_runtime::sop::types::SopRun {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("cron-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cron-started SOP should be driven to a retained terminal run")
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_drives_cached_cron_triggers() {
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
         let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
-        let report =
-            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
-                .await
-                .expect("maintenance tick should complete");
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
 
         assert_eq!(report.cron_started, 1);
-        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the tick must retain its driver so the daemon generation can drain it"
+        );
+
+        let run = await_terminal_cron_run(&harness).await;
+        // The point of the regression: the cron path must run the step through
+        // the resolved agent and SUCCEED, not merely stop being stranded.
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "cron-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
+        );
+    }
+
+    /// An unattended run is the one whose record cannot be reconstructed from a
+    /// conversation afterwards: nobody watched it, and there is no session to
+    /// read back. The headless driver recorded `tool_calls: []` regardless of
+    /// what the step actually ran, so the stored record did not merely omit the
+    /// calls, it asserted there had been none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn headless_step_records_the_tool_calls_it_made() {
+        let harness = cron_sop_harness_with(Some(CRON_SOP_AGENT), true).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+
+        let run = await_terminal_cron_run(&harness).await;
+        let step = run
+            .step_results
+            .first()
+            .expect("the cron run executed its step");
+
+        assert!(
+            !step.tool_calls.is_empty(),
+            "a headless step must record the calls it made, got {:?}",
+            step.tool_calls
+        );
+        assert_eq!(
+            step.tool_calls[0].tool, "audit_probe",
+            "the recorded call must name the tool the step actually requested"
+        );
+    }
+
+    /// With the maintenance tick disabled entirely, the generation's driver
+    /// supervisor must still exist and drive channel-started work: a file
+    /// event through the production filesystem adapter starts an auto-mode
+    /// SOP whose driver registers in the supervisor's set and completes under
+    /// the SOP's own agent. Guards the conditional sink construction and the
+    /// adapter wiring, which a dispatch-helper regression cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn filesystem_adapter_drives_a_run_with_maintenance_disabled() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        let watch = tempfile::tempdir().expect("watch dir");
+        // Canonical, not as handed out: on macOS the temp dir sits under
+        // `/var`, a symlink to `/private/var`, and the watcher reports the
+        // resolved path. Configuring the trigger with the unresolved one makes
+        // `filesystem_path_matches` compare two spellings of the same
+        // directory and never fire, so the adapter would look broken on a
+        // platform where it is not.
+        let watch_dir = std::fs::canonicalize(watch.path()).expect("canonical watch dir");
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "fs-sop".into(),
+                description: "maintenance-disabled adapter regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Filesystem {
+                    path: watch_dir.to_string_lossy().into_owned(),
+                    events: vec![],
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+                decision: None,
+            }]);
+        }
+
+        // No maintenance tick exists anywhere in this test: the supervisor's
+        // set stands alone, exactly as when `maintenance_interval_secs == 0`.
+        let supervisor_set = zeroclaw_runtime::sop::SopDriverHandles::default();
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            supervisor_set.clone(),
+        );
+        let channel = zeroclaw_channels::filesystem::FilesystemChannel::new(
+            zeroclaw_channels::filesystem::FilesystemChannelConfig {
+                config: zeroclaw_config::schema::FilesystemConfig {
+                    enabled: true,
+                    paths: vec![watch_dir.to_string_lossy().into_owned()],
+                    events: vec!["created".into(), "modified".into()],
+                    debounce_ms: 50,
+                    ..Default::default()
+                },
+                alias: "fswatch".into(),
+                engine: std::sync::Arc::clone(&harness.engine),
+                audit: std::sync::Arc::clone(&harness.audit),
+                driver_sink: Some(sink),
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let listener = ::zeroclaw_spawn::spawn!(async move {
+            use zeroclaw_api::channel::Channel;
+            let _ = channel.listen(tx).await;
+        });
+        // Give the watcher a beat to arm before the event lands.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        std::fs::write(watch.path().join("event.txt"), "review please").expect("write event");
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if let Some(run) = engine.finished_runs(Some("fs-sop")).first() {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a file event must start and finish a run with no maintenance tick");
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "{:?}",
+            run.step_results
+        );
+        assert!(
+            !supervisor_set.lock().unwrap().is_empty(),
+            "the driver must register in the supervisor set"
+        );
+        listener.abort();
+    }
+
+    /// The channel half of the same gap: a channel-triggered auto SOP was
+    /// admitted by the shared ingress and then stranded, because no caller of
+    /// the ingress owned a driver for the run it had just started. With the
+    /// ingress carrying a `SopDriverSink`, the started run must be handed a
+    /// supervised driver and reach a retained terminal state under the SOP's
+    /// own agent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn channel_ingress_drives_started_run_to_terminal() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
+        // Same machinery as the cron regressions (agent, provider mock, audit,
+        // driver set) — only the trigger source changes.
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "channel-sop".into(),
+                description: "channel ingress regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Channel {
+                    channel: "telegram".into(),
+                    alias: None,
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+                decision: None,
+            }]);
+        }
+
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            harness.drivers.clone(),
+        );
+
+        let results = zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in_driven(
+            &harness.engine,
+            &harness.audit,
+            Some(&sink),
+            zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+            Some("telegram.main:message"),
+            Some("review please"),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "exactly one SOP should match, got {results:?}"
+        );
+        assert!(
+            matches!(
+                &results[0],
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. }
+            ),
+            "the channel event should start the SOP, got {:?}",
+            results[0]
+        );
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the ingress must register the started run's driver in the shared set"
+        );
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("channel-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("channel-started SOP should be driven to a retained terminal run");
+
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "channel-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
+        );
+    }
+
+    /// A cron SOP with no owning agent must fail closed. Before this, the
+    /// headless driver fell back to the alphabetically first configured agent,
+    /// running an unattended procedure under an unrelated agent's provider,
+    /// workspace, tools, and risk profile.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_unowned_cron_sop() {
+        let harness = cron_sop_harness(None).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "an unowned headless SOP must fail, not borrow another agent"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("no owning agent"),
+            "the failure should name the missing owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains(CRON_SOP_AGENT),
+            "the refusal must not fall back to the one configured agent, got {:?}",
+            step.output
+        );
+    }
+
+    /// Disabling an agent withdraws it from service. An unattended cron SOP is
+    /// the one run with nobody watching, so a disabled owner must stop it
+    /// rather than quietly keep executing under the agent the operator turned
+    /// off.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_a_disabled_owner() {
+        let mut harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        harness
+            .config
+            .agents
+            .get_mut(CRON_SOP_AGENT)
+            .expect("harness configures the owning agent")
+            .enabled = false;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "a SOP owned by a disabled agent must fail closed"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("disabled"),
+            "the failure should name the disabled owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains("step one done"),
+            "the step must not have run under the disabled agent, got {:?}",
+            step.output
+        );
+    }
+
+    /// `abort` only requests cancellation. Shutdown must join the handles it
+    /// aborts, or the replacement generation can start while a straggler is
+    /// still running under the superseded config — the overlap this teardown
+    /// exists to prevent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_joins_the_drivers_it_aborts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Flips its flag when the driver task's future is dropped, which is
+        /// what actually happens when an aborted task stops.
+        struct StoppedFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for StoppedFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let driver_flag = std::sync::Arc::clone(&stopped);
+        let drivers = SopDriverSet::default();
+        // Outlasts the drain deadline: shutdown has to abort it.
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async move {
+                let _flag = StoppedFlag(driver_flag);
+                tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+            })
+        }));
+
+        // Short deadlines so the drain-expiry path runs without waiting out the
+        // production ones; the logic under test is identical.
+        let carried = SopDriverSupervisor {
+            drivers,
+            pending_settlements: None,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "shutdown returned while an aborted driver was still running"
+        );
+        assert!(
+            carried.still_running.is_empty(),
+            "a driver that stopped on abort has nothing to carry forward"
+        );
+    }
+
+    /// A generation that adopts no drivers must still own the ones it inherited.
+    /// The flag is the point: if the reaper returned without joining — or if the
+    /// handles were dropped, which detaches the tasks — it would still be false
+    /// when the reaper finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn orphaned_sop_drivers_are_reaped_rather_than_detached() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let start_flag = std::sync::Arc::clone(&started);
+        let flag = std::sync::Arc::clone(&finished);
+        // Blocking, so `abort` cannot stop it once it is polled: exactly the
+        // driver whose handle must not be dropped.
+        let driver = ::zeroclaw_spawn::spawn!(async move {
+            start_flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        // Wait for the first poll. `abort` on a task the runtime has not polled
+        // yet cancels it outright, which under load would leave the driver never
+        // having run at all — a race in the test, not in the reaper.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver must begin before it is reaped");
+
+        let reaper = reap_orphaned_sop_drivers(vec![driver])
+            .expect("a driver still running must be reaped, not dropped");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reaper)
+            .await
+            .expect("the reaper must finish once its drivers stop")
+            .expect("the reaper task itself must not fail");
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the reaper must join its drivers before finishing"
+        );
+    }
+
+    /// Nothing to own: every carried driver already stopped, so there is no
+    /// reaper to spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn finished_drivers_need_no_reaper() {
+        let driver = ::zeroclaw_spawn::spawn!(async {});
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        assert!(
+            reap_orphaned_sop_drivers(vec![driver]).is_none(),
+            "a batch with nothing running must not spawn a reaper"
+        );
+    }
+
+    /// The drain and the post-abort join are two passes over the SAME handles.
+    /// When the drain deadline lands mid-batch — one driver already joined, one
+    /// still running — the second pass must resume at the cursor rather than
+    /// re-await a handle that already resolved: polling a completed
+    /// `JoinHandle` panics, which would turn an ordinary slow driver into a
+    /// shutdown panic whenever a sibling finished in time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_survives_a_mixed_completion_batch() {
+        // Ordered deliberately: the first resolves at once, so the drain
+        // consumes its handle before the deadline; the second reaches no await
+        // point and outlives both deadlines.
+        // Briefly pending rather than instantly complete: admission prunes
+        // finished handles, so a zero-await task would be pruned by the next
+        // admission and this test would lose the mixed batch it exists for.
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            })
+        }));
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            })
+        }));
+        let carried = SopDriverSupervisor {
+            drivers,
+            pending_settlements: None,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.still_running.len(),
+            1,
+            "only the driver that outlived the grace is carried; the one the drain \
+             already joined must not be awaited a second time"
+        );
+    }
+
+    /// The other half of the contract: a driver that reaches no await point
+    /// cannot be cancelled on demand, and the join grace exists so one cannot
+    /// wedge a reload. It must then be carried into the next generation rather
+    /// than dropped — dropping a `JoinHandle` detaches the task, losing the
+    /// last way to observe work still running under superseded config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_carries_a_driver_that_outlives_its_abort() {
+        let drivers = SopDriverSet::default();
+        // Blocking, not `tokio::time::sleep`: abort lands at the next await
+        // point, and this task deliberately reaches none while the grace runs.
+        assert!(zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            })
+        }));
+
+        let started = std::time::Instant::now();
+        let carried = SopDriverSupervisor {
+            drivers,
+            pending_settlements: None,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.still_running.len(),
+            1,
+            "a driver still running when the join grace expired must be carried, not detached"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the join grace must bound the wait rather than block on the task"
+        );
+
+        // The next generation adopts it: already aborted, so it is re-checked
+        // and handed on again without a second drain.
+        let adopted_at = std::time::Instant::now();
+        let still_carried = SopDriverSupervisor {
+            drivers: SopDriverSet::default(),
+            pending_settlements: None,
+            carried: carried.still_running,
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            still_carried.still_running.len(),
+            1,
+            "an adopted driver that is still running stays carried"
+        );
+        assert!(
+            adopted_at.elapsed() < std::time::Duration::from_millis(500),
+            "adopting an already-aborted driver must not re-drain it"
+        );
+    }
+
+    /// A producer can outlive the point where its generation stops taking work:
+    /// the RPC listener stops accepting while its existing connection tasks keep
+    /// running, so one of them can resolve an approval after the drain has
+    /// already taken the set. The drain therefore CLOSES the set rather than
+    /// merely emptying it.
+    ///
+    /// Refusing the driver afterwards is not enough on its own. Creating the
+    /// task first and checking the generation second lets Tokio poll the driver
+    /// in between, so a rejected run can already be mutating the SOP engine
+    /// under superseded config and permissions before anything cancels it — and
+    /// cancellation is only cooperative, so a driver that reaches no await point
+    /// could not be stopped at all, only abandoned. Admission therefore creates
+    /// the task only once the generation has accepted it, which is what this
+    /// proves: the body never runs, rather than being cancelled once it has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_driver_admitted_after_the_drain_never_starts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let drivers = SopDriverSet::default();
+        let carried = SopDriverSupervisor {
+            drivers: std::sync::Arc::clone(&drivers),
+            pending_settlements: None,
+            carried: Vec::new(),
+        }
+        .shutdown()
+        .await;
+        assert!(
+            carried.still_running.is_empty() && carried.unsettled_runs.is_empty(),
+            "a generation with no drivers drains clean"
+        );
+        assert!(
+            drivers.lock().unwrap().is_closed(),
+            "the drain must close the set so late producers cannot join it"
+        );
+
+        // One flag for the act of creating the driver, one for the driver's own
+        // body. A closed generation may set neither: the work has to be refused
+        // before it starts, not cancelled once it has.
+        let spawned = std::sync::Arc::new(AtomicBool::new(false));
+        let body_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let spawned_flag = std::sync::Arc::clone(&spawned);
+        let body_flag = std::sync::Arc::clone(&body_ran);
+
+        let admitted = zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            spawned_flag.store(true, Ordering::SeqCst);
+            ::zeroclaw_spawn::spawn!(async move {
+                body_flag.store(true, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+            })
+        });
+
+        assert!(
+            !admitted,
+            "a driver produced after its generation drained must be refused"
+        );
+        assert!(
+            !spawned.load(Ordering::SeqCst),
+            "the refused driver must never be created at all; creating it and refusing it \
+             afterwards is precisely the race this admission order closes"
+        );
+        assert!(
+            drivers.lock().unwrap().is_empty(),
+            "the refused driver must not land in the drained set"
+        );
+
+        // Give a task that should not exist every chance to run before
+        // concluding that it did not. Without this, a body that HAD started
+        // might simply not have been polled yet, and the assertion below would
+        // pass on scheduling luck rather than on the refusal.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !body_ran.load(Ordering::SeqCst),
+            "no driver body may run under a generation that has already drained"
+        );
+    }
+
+    /// The open half of the same boundary, and the control for the refusal test
+    /// above: admission creates the driver AND takes ownership of it in one
+    /// step, so the set a generation drains really does hold the task it
+    /// started — and a driver body that is allowed to run does run, which is
+    /// what stops the refusal test from passing vacuously.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_driver_admitted_into_an_open_generation_is_created_and_owned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let drivers = SopDriverSet::default();
+        let body_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let body_flag = std::sync::Arc::clone(&body_ran);
+
+        let admitted = zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async move {
+                body_flag.store(true, Ordering::SeqCst);
+            })
+        });
+
+        assert!(admitted, "an open generation admits a driver");
+        assert_eq!(
+            drivers.lock().unwrap().len(),
+            1,
+            "the admitted driver is owned by the generation that admitted it"
+        );
+
+        let carried = SopDriverSupervisor {
+            drivers: std::sync::Arc::clone(&drivers),
+            pending_settlements: None,
+            carried: Vec::new(),
+        }
+        .shutdown()
+        .await;
+        assert!(
+            carried.still_running.is_empty() && carried.unsettled_runs.is_empty(),
+            "the admitted driver finished well inside the drain"
+        );
+        assert!(
+            body_ran.load(Ordering::SeqCst),
+            "an admitted driver's body must actually run, or the refusal test proves nothing"
+        );
     }
 
     #[test]
@@ -9878,6 +20315,7 @@ mod tests {
                     model: Some("claude-opus-4-7".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -9933,5 +20371,5756 @@ mod tests {
             msg.contains("No model provider configured"),
             "error must mention missing provider; got: {msg}"
         );
+    }
+
+    /// Runtime load verification for an *already installed* plugin.
+    ///
+    /// The install gate cannot cover a plugin installed before it existed,
+    /// installed through `--no-verify`, or one whose host was upgraded
+    /// underneath it. These are the two surfaces that can: `plugin info`
+    /// always, `plugin list --verify` on demand.
+    ///
+    /// The assertions run against the rendered lines rather than captured
+    /// stdout because those functions *are* the output. That is also what lets
+    /// the plain listing be checked for the absence of the flag's effect.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    mod plugin_load_check {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+        use std::sync::OnceLock;
+        use zeroclaw::plugins::host::PluginHost;
+
+        /// The wasmtime-independent part of a compile failure's cause chain.
+        /// Asserting on this rather than on translated prose keeps the test
+        /// honest under any locale the process happens to detect.
+        const LOAD_FAILURE_CAUSE: &str = "failed to load WASM component";
+
+        fn verifier_limits() -> zeroclaw::plugins::component::PluginLimits {
+            zeroclaw_runtime::plugin_runtime::plugin_limits(
+                &crate::config::schema::Config::default(),
+            )
+        }
+
+        /// The fixture package's manifest, mirroring the one the plugins
+        /// crate's end-to-end test installs.
+        const FIXTURE_MANIFEST: &str = r#"name = "tool-fixture"
+version = "0.0.0"
+wasm_path = "tool-fixture.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.label]
+type = "string"
+"#;
+
+        /// This test binary sits at `<target>/<profile>/deps/<name>`, so its
+        /// own path is what locates the target directory when
+        /// `CARGO_TARGET_DIR` has moved it.
+        fn cargo_target_dir() -> PathBuf {
+            let exe = std::env::current_exe().expect("test binary path");
+            exe.ancestors()
+                .nth(3)
+                .expect("test binary should sit under <target>/<profile>/deps/")
+                .to_path_buf()
+        }
+
+        /// Build the in-tree tool component once per test binary. There is no
+        /// skip path: a fixture that cannot be built is a test failure, not a
+        /// silently green run.
+        fn tool_fixture() -> PathBuf {
+            static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+            FIXTURE
+                .get_or_init(|| {
+                    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("crates/zeroclaw-plugins/tests/fixtures/tool-fixture");
+                    // Its own target directory, so the nested Cargo invocation
+                    // cannot contend with this test process's build lock.
+                    let target_dir = cargo_target_dir().join("tmp/plugin-load-check-fixture");
+                    let status = Command::new(env!("CARGO"))
+                        .current_dir(&fixture_dir)
+                        .args([
+                            "build",
+                            "--locked",
+                            "--quiet",
+                            "--package",
+                            "zeroclaw-tool-plugin-fixture",
+                            "--target",
+                            "wasm32-wasip2",
+                            "--target-dir",
+                        ])
+                        .arg(&target_dir)
+                        .status()
+                        .expect("run Cargo for the tool component fixture");
+                    assert!(
+                        status.success(),
+                        "tool fixture must build; install the wasm32-wasip2 target"
+                    );
+
+                    let wasm =
+                        target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm");
+                    assert!(wasm.is_file(), "tool fixture WASM was not produced");
+                    wasm
+                })
+                .clone()
+        }
+
+        /// Seed a throwaway config directory and install the fixture into it
+        /// through the real `PluginHost::install`, so the package under test is
+        /// laid out exactly as `zeroclaw plugin install` leaves one.
+        fn install_fixture(workspace: &Path) -> PluginHost {
+            let source = workspace.join("source/tool-fixture");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::copy(tool_fixture(), source.join("tool-fixture.wasm")).unwrap();
+            std::fs::write(source.join("manifest.toml"), FIXTURE_MANIFEST).unwrap();
+
+            let mut host = PluginHost::new(workspace).expect("throwaway plugin host");
+            let installed = host
+                .install(source.to_str().expect("utf-8 temp path"))
+                .expect("install the in-tree tool fixture");
+            assert_eq!(installed, "tool-fixture");
+            host
+        }
+
+        #[tokio::test]
+        async fn plugin_info_reports_that_the_installed_fixture_loads() {
+            let workspace = tempfile::tempdir().unwrap();
+            let host = install_fixture(workspace.path());
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the installed fixture is discovered");
+            let instance_rows = installed_instance_rows(
+                &crate::config::schema::Config::default(),
+                &host,
+                &info.name,
+            )
+            .unwrap();
+
+            let status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::Loads),
+                "the in-tree tool fixture must load against this host; got {status:?}"
+            );
+
+            let lines = plugin_info_lines(&info, &instance_rows, &[], &[], &status);
+            assert!(
+                lines.iter().any(|line| line.contains("tool-fixture")),
+                "info must name the plugin: {lines:#?}"
+            );
+            assert!(
+                !lines.iter().any(|line| line.contains(LOAD_FAILURE_CAUSE)),
+                "a plugin that loads must carry no load failure: {lines:#?}"
+            );
+            // The verdict is a rendered line, not an implied one: the same
+            // plugin under a different verdict must end differently.
+            let other = plugin_info_lines(
+                &info,
+                &instance_rows,
+                &[],
+                &[],
+                &PluginLoadStatus::NoComponent,
+            );
+            assert_eq!(lines.len(), other.len(), "one verdict line either way");
+            assert_ne!(
+                lines.last(),
+                other.last(),
+                "the last line must be the verdict: {lines:#?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn load_verdict_uses_the_runtime_resolved_plugin_limits() {
+            let workspace = tempfile::tempdir().unwrap();
+            let host = install_fixture(workspace.path());
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the installed fixture is discovered");
+
+            let mut constrained = crate::config::schema::Config::default();
+            constrained.plugins.limits.max_instances = 1;
+            let constrained_status = installed_plugin_load_status(
+                &host,
+                &info,
+                zeroclaw_runtime::plugin_runtime::plugin_limits(&constrained),
+            )
+            .await
+            .expect("the load verdict is reported, not raised");
+            assert!(
+                matches!(constrained_status, PluginLoadStatus::Fails(_)),
+                "a limit below the component's required instances must not report loads: {constrained_status:?}"
+            );
+
+            let default_status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .expect("the load verdict is reported, not raised");
+            assert!(
+                matches!(default_status, PluginLoadStatus::Loads),
+                "the same component must load under the default runtime limits: {default_status:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn plugin_info_and_list_verify_expose_a_plugin_that_no_longer_loads() {
+            let workspace = tempfile::tempdir().unwrap();
+            let installed = install_fixture(workspace.path());
+            let wasm = installed
+                .get_plugin("tool-fixture")
+                .and_then(|info| info.wasm_path)
+                .expect("the fixture ships a component");
+
+            // Replace the installed component with an artifact this host cannot
+            // instantiate. Discovery is unaffected: the manifest is intact and
+            // the file exists, which is the whole reported state a plain
+            // listing has to go on. Each CLI invocation builds a fresh host
+            // that admits the installed bytes from disk, so the check below
+            // uses one too rather than the host that did the install.
+            std::fs::write(&wasm, b"not a wasm component").unwrap();
+            let host = PluginHost::new(workspace.path()).expect("rediscover the installed plugin");
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the replaced component is still discovered");
+            let instance_rows = installed_instance_rows(
+                &crate::config::schema::Config::default(),
+                &host,
+                &info.name,
+            )
+            .unwrap();
+            assert!(
+                info.loaded,
+                "discovery still calls the package loaded, which is why the check is needed"
+            );
+
+            let status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .unwrap();
+            let PluginLoadStatus::Fails(cause) = &status else {
+                panic!("a non-component artifact must not report as loading; got {status:?}");
+            };
+            assert!(
+                cause.contains(LOAD_FAILURE_CAUSE),
+                "the verdict must carry the cause chain; got: {cause}"
+            );
+
+            let lines = plugin_info_lines(&info, &instance_rows, &[], &[], &status);
+            assert!(
+                lines
+                    .last()
+                    .is_some_and(|line| line.contains(LOAD_FAILURE_CAUSE)),
+                "plugin info must end on the failure and its cause: {lines:#?}"
+            );
+
+            // `plugin list --verify` annotates the row; plain `plugin list`
+            // renders exactly what it rendered before the flag existed.
+            let verified = plugin_list_lines(&[(info.clone(), Some(status))]);
+            let plain = plugin_list_lines(&[(info.clone(), None)]);
+            assert_eq!(plain.len(), 2, "header plus one row: {plain:#?}");
+            assert_eq!(verified.len(), 2, "header plus one row: {verified:#?}");
+            assert_eq!(plain[0], verified[0], "the header is not verdict-dependent");
+            assert!(
+                plain[1].starts_with("  tool-fixture v0.0.0 — "),
+                "plain row shape is unchanged: {:?}",
+                plain[1]
+            );
+            assert!(
+                !plain[1].contains(LOAD_FAILURE_CAUSE),
+                "plain list must not run the check: {:?}",
+                plain[1]
+            );
+            assert!(
+                verified[1].starts_with("  tool-fixture v0.0.0 — "),
+                "the verified row keeps the same identity prefix: {:?}",
+                verified[1]
+            );
+            assert!(
+                verified[1].contains(LOAD_FAILURE_CAUSE),
+                "the verified row must name the failure: {:?}",
+                verified[1]
+            );
+        }
+
+        #[test]
+        fn plugin_list_verify_reports_a_skill_only_package_as_not_applicable() {
+            // A package with no component is not a failure: there is nothing to
+            // instantiate, and reporting one as broken would train operators to
+            // ignore the column.
+            let info = zeroclaw::plugins::PluginInfo {
+                name: "skills-only".to_string(),
+                version: "1.0.0".to_string(),
+                description: Some("markdown bundle".to_string()),
+                capabilities: vec![zeroclaw::plugins::PluginCapability::Skill],
+                permissions: Vec::new(),
+                wasm_path: None,
+                loaded: true,
+            };
+
+            let lines = plugin_list_lines(&[(info.clone(), Some(PluginLoadStatus::NoComponent))]);
+            assert_eq!(lines.len(), 2, "{lines:#?}");
+            assert!(
+                lines[1].starts_with("  skills-only v1.0.0 — markdown bundle"),
+                "{:?}",
+                lines[1]
+            );
+            assert!(
+                !lines[1].contains(LOAD_FAILURE_CAUSE),
+                "a component-less package must not read as a load failure: {:?}",
+                lines[1]
+            );
+            let plain = plugin_list_lines(&[(info.clone(), None)]);
+            assert_ne!(
+                lines[1], plain[1],
+                "--verify must still say something about a component-less package"
+            );
+
+            let info_lines =
+                plugin_info_lines(&info, &[], &[], &[], &PluginLoadStatus::NoComponent);
+            assert!(
+                !info_lines
+                    .iter()
+                    .any(|line| line.contains(LOAD_FAILURE_CAUSE)),
+                "{info_lines:#?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_skill_only_package_is_not_applicable_rather_than_a_failure() {
+            // A markdown bundle rides the same install machinery but ships no
+            // component. Reporting it as a load failure would train an operator
+            // to ignore the verdict, so the check must short-circuit before it
+            // ever reaches the instantiator.
+            let workspace = tempfile::tempdir().unwrap();
+            let source = workspace.path().join("source/skills-only");
+            std::fs::create_dir_all(source.join("skills/greet")).unwrap();
+            std::fs::write(
+                source.join("manifest.toml"),
+                "name = \"skills-only\"\n\
+                 version = \"1.0.0\"\n\
+                 capabilities = [\"skill\"]\n",
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("skills/greet/SKILL.md"),
+                "---\nname: greet\ndescription: say hello\n---\n\nHello.\n",
+            )
+            .unwrap();
+
+            let mut host = PluginHost::new(workspace.path()).expect("throwaway plugin host");
+            host.install(source.to_str().expect("utf-8 temp path"))
+                .expect("install the skill-only package");
+            let info = host
+                .get_plugin("skills-only")
+                .expect("the skill bundle is discovered");
+            assert!(info.wasm_path.is_none(), "the fixture ships no component");
+
+            let status = installed_plugin_load_status(&host, &info, verifier_limits())
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::NoComponent),
+                "a component-less package is not applicable, not broken; got {status:?}"
+            );
+            assert!(!status.is_load_failure(), "and must not fail the exit code");
+        }
+
+        #[test]
+        fn only_a_real_load_failure_makes_plugin_info_exit_non_zero() {
+            // The exit code is the scriptable part of the contract. A package
+            // with no component must not be reported as broken.
+            assert!(PluginLoadStatus::Fails("boom".to_string()).is_load_failure());
+            assert!(!PluginLoadStatus::Loads.is_load_failure());
+            assert!(!PluginLoadStatus::NoComponent.is_load_failure());
+        }
+
+        #[test]
+        fn plugin_list_without_verify_renders_no_verdict() {
+            let info = zeroclaw::plugins::PluginInfo {
+                name: "some-plugin".to_string(),
+                version: "0.2.0".to_string(),
+                description: None,
+                capabilities: vec![zeroclaw::plugins::PluginCapability::Tool],
+                permissions: Vec::new(),
+                wasm_path: Some(PathBuf::from("/nonexistent/some-plugin.wasm")),
+                loaded: false,
+            };
+
+            let plain = plugin_list_lines(&[(info, None)]);
+            assert_eq!(plain.len(), 2, "{plain:#?}");
+            assert!(
+                plain[1].starts_with("  some-plugin v0.2.0 — "),
+                "{:?}",
+                plain[1]
+            );
+            assert!(
+                plugin_list_lines(&[]).len() == 1,
+                "an empty listing is the single 'no plugins' line"
+            );
+        }
+    }
+
+    /// A config rooted in `dir` with secret encryption on and an existing
+    /// `config.toml` at the current schema version, so `save_dirty` takes its
+    /// incremental path, `encrypt_secrets` has a key directory to work in,
+    /// and the commands that refuse an older schema accept the file.
+    #[cfg(feature = "plugins-wasm")]
+    fn config_in_dir(dir: &std::path::Path) -> crate::config::schema::Config {
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = {}\n",
+                crate::config::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .expect("seed config file");
+        let mut config = crate::config::schema::Config::default();
+        config.config_path = path;
+        config.secrets.encrypt = true;
+        config
+    }
+
+    /// Build an admitted-shape manifest from TOML, the way a real plugin ships
+    /// one, so the instance key derives from the same fields production reads.
+    #[cfg(feature = "plugins-wasm")]
+    fn manifest_from_toml(src: &str) -> zeroclaw::plugins::PluginManifest {
+        toml::from_str(src).expect("test manifest must parse")
+    }
+
+    /// A manifest providing `capabilities`, declaring `hosts` and requesting
+    /// `permissions`, with a config schema unless `with_config_schema` is
+    /// false.
+    #[cfg(feature = "plugins-wasm")]
+    fn manifest_with(
+        name: &str,
+        capabilities: &[&str],
+        hosts: &[&str],
+        permissions: &[&str],
+        with_config_schema: bool,
+    ) -> zeroclaw::plugins::PluginManifest {
+        let quote = |xs: &[&str]| -> String {
+            xs.iter()
+                .map(|x| format!("\"{x}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let schema = if with_config_schema {
+            "config_schema = { type = \"object\" }\n"
+        } else {
+            ""
+        };
+        manifest_from_toml(&format!(
+            "name = \"{name}\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [{}]\n\
+             permissions = [{}]\n\
+             {schema}\
+             [egress]\n\
+             hosts = [{}]\n",
+            quote(capabilities),
+            quote(permissions),
+            quote(hosts)
+        ))
+    }
+
+    /// A tool manifest declaring `hosts` and requesting `permissions`, with a
+    /// config schema unless `with_config_schema` is false.
+    #[cfg(feature = "plugins-wasm")]
+    fn tool_manifest_with(
+        name: &str,
+        hosts: &[&str],
+        permissions: &[&str],
+        with_config_schema: bool,
+    ) -> zeroclaw::plugins::PluginManifest {
+        manifest_with(name, &["tool"], hosts, permissions, with_config_schema)
+    }
+
+    /// The common case: a tool plugin that requests `http_client`.
+    #[cfg(feature = "plugins-wasm")]
+    fn tool_manifest(
+        name: &str,
+        hosts: &[&str],
+        with_config_schema: bool,
+    ) -> zeroclaw::plugins::PluginManifest {
+        tool_manifest_with(name, hosts, &["http_client"], with_config_schema)
+    }
+
+    /// The `zpi1_` key production derives for a package's default tool binding.
+    #[cfg(feature = "plugins-wasm")]
+    fn expected_instance_key(manifest: &zeroclaw::plugins::PluginManifest) -> String {
+        zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
+            manifest,
+            zeroclaw::plugins::PluginCapability::Tool,
+            std::iter::empty(),
+        )
+        .expect("scope must derive")
+        .id()
+        .config_entry_key()
+        .expect("instance key must derive")
+    }
+
+    /// The `zpi1_` key of the scope the activation plan admits for
+    /// `[channels.plugin.<alias>]`: the channel capability, the alias as the
+    /// binding, and the manifest's permissions as the grant set.
+    #[cfg(feature = "plugins-wasm")]
+    fn expected_channel_instance_key(
+        manifest: &zeroclaw::plugins::PluginManifest,
+        alias: &str,
+    ) -> String {
+        zeroclaw::plugins::instance::PluginInstanceScope::from_manifest(
+            manifest,
+            zeroclaw::plugins::PluginCapability::Channel,
+            alias,
+            manifest.permissions.iter().copied(),
+        )
+        .expect("the runtime's scope must derive")
+        .id()
+        .config_entry_key()
+        .expect("instance key must derive")
+    }
+
+    /// Bind `alias` to `package` the way a `[channels.plugin.<alias>]` table
+    /// does.
+    #[cfg(feature = "plugins-wasm")]
+    fn bind_channel_alias(
+        config: &mut crate::config::schema::Config,
+        alias: &str,
+        package: &str,
+        enabled: bool,
+    ) {
+        // Every field is named today; the base keeps this literal compiling
+        // when `PluginChannelConfig` gains one.
+        #[allow(clippy::needless_update)]
+        config.channels.plugin.insert(
+            alias.to_string(),
+            crate::config::schema::PluginChannelConfig {
+                package: package.to_string(),
+                enabled,
+                ..crate::config::schema::PluginChannelConfig::default()
+            },
+        );
+    }
+
+    /// The entries `plugin install` seeds for `manifest` under `config`,
+    /// through the enumeration and adapter the install path uses.
+    #[cfg(feature = "plugins-wasm")]
+    fn install_entries(
+        config: &crate::config::schema::Config,
+        manifest: &zeroclaw::plugins::PluginManifest,
+    ) -> Vec<(zeroclaw::plugins::PluginCapability, String)> {
+        tool_binding_entries(
+            crate::plugins::channel_instance::instance_rows(config, manifest)
+                .expect("entries must derive"),
+        )
+    }
+
+    /// Install's seeding of a package's tool rows without a package to
+    /// publish: stage the rows, save once, then report, as
+    /// `publish_and_seed_plugin` does around any channel binding it adds.
+    #[cfg(feature = "plugins-wasm")]
+    async fn seed_plugin_config_entries(
+        config: &mut crate::config::schema::Config,
+        package: &str,
+        entries: &[(zeroclaw::plugins::PluginCapability, String)],
+        declared_egress: &[String],
+    ) -> Result<()> {
+        let staged = stage_plugin_config_entries(config, package, entries, declared_egress)?;
+        if !staged.created.is_empty() {
+            Box::pin(config.save_dirty()).await?;
+        }
+        report_seeded_plugin_config_entries(config, package, &staged, declared_egress);
+        Ok(())
+    }
+
+    /// Read the `[[plugins.entries]]` table named `name` back off disk.
+    #[cfg(feature = "plugins-wasm")]
+    fn entry_on_disk(path: &std::path::Path, name: &str) -> toml::Table {
+        let raw = std::fs::read_to_string(path).expect("config file must exist after save");
+        let doc: toml::Table = toml::from_str(&raw).expect("saved config must be valid TOML");
+        doc.get("plugins")
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("entries"))
+            .and_then(toml::Value::as_array)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| e.get("name").and_then(toml::Value::as_str) == Some(name))
+            })
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_else(|| panic!("no [[plugins.entries]] row named '{name}' on disk"))
+    }
+
+    /// THE unification invariant (typed instance config plus the egress
+    /// grant): `plugin install` seeds the egress grant onto the SAME `zpi1_`
+    /// instance-key row
+    /// that carries the instance's private config — one row per instance,
+    /// never one row for config and a second keyed by the package name.
+    ///
+    /// Pinned as observable state: the row's `name` on disk is the derived
+    /// instance key, that row carries the grant, and no package-name-keyed row
+    /// exists at all.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn install_seeds_egress_onto_the_instance_key_row_not_a_package_name_row() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let path = config.config_path.clone();
+
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        assert!(
+            instance_key.starts_with("zpi1_"),
+            "the entry key must be the opaque instance key; got {instance_key}"
+        );
+        assert_ne!(
+            instance_key, "weather-tool",
+            "the instance key must not collapse to the package name"
+        );
+
+        let entries = install_entries(&config, &manifest);
+        seed_plugin_config_entries(
+            &mut config,
+            "weather-tool",
+            &entries,
+            &manifest.egress.hosts,
+        )
+        .await
+        .expect("seeding a fresh entry must succeed");
+
+        // Exactly one row, keyed by the instance key, carrying the grant.
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "one row per instance: {:?}",
+            config
+                .plugins
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let entry = &config.plugins.entries[0];
+        assert_eq!(
+            entry.name, instance_key,
+            "the seeded row must be keyed by the instance key"
+        );
+        assert_eq!(entry.egress_hosts, vec!["api.example.com".to_string()]);
+
+        // The same row is the one `entry_egress` resolves — the read `plugin
+        // list` and the runtime policy both perform.
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(
+            granted,
+            vec!["api.example.com".to_string()],
+            "entry_egress must resolve the grant by instance key"
+        );
+        assert!(
+            config.plugins.entry_egress("weather-tool").0.is_empty(),
+            "no package-name-keyed row may carry the grant"
+        );
+
+        // And it is the instance key that persists to disk.
+        let on_disk = entry_on_disk(&path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("egress_hosts must be persisted")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(hosts, vec!["api.example.com"]);
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !raw.contains("name = \"weather-tool\""),
+            "install must not write a package-name-keyed entry:\n{raw}"
+        );
+    }
+
+    /// Grant ceremony, install half: the declaration seeds the row it
+    /// just created, and it lands as a PLAINTEXT sibling of the encrypted
+    /// `config` map — the allowlist is what the operator audits, so it has to
+    /// be readable in the file they audit.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn seeded_egress_is_written_plaintext_beside_encrypted_config() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let path = config.config_path.clone();
+
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "*.cdn.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        let entries = install_entries(&config, &manifest);
+        seed_plugin_config_entries(
+            &mut config,
+            "weather-tool",
+            &entries,
+            &manifest.egress.hosts,
+        )
+        .await
+        .expect("seeding a fresh entry must succeed");
+
+        // In memory: the grant is on the plaintext field, canonicalized, and
+        // nothing leaked into the secret map.
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("install must seed an entry");
+        assert_eq!(
+            entry.egress_hosts,
+            vec![
+                "*.cdn.example.com".to_string(),
+                "api.example.com".to_string()
+            ],
+            "the declaration must seed egress_hosts, sorted and canonical"
+        );
+        assert!(
+            entry.config.is_empty(),
+            "egress must never be written into the #[secret] config map: {:?}",
+            entry.config
+        );
+
+        // Now add a genuine secret through the same call the CLI's `zeroclaw
+        // config set` makes, so the file carries both kinds of value and the
+        // save path can be shown to treat them differently.
+        config
+            .set_prop_persistent(
+                &format!("plugins.entries.{instance_key}.config.api_key"),
+                "sk-not-real",
+            )
+            .expect("plugin config values must be settable");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("save must succeed");
+
+        let on_disk = entry_on_disk(&path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("egress_hosts must be persisted")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["*.cdn.example.com", "api.example.com"],
+            "the granted allowlist must be readable plaintext on disk"
+        );
+        for host in &hosts {
+            assert!(
+                !host.starts_with("enc2:"),
+                "egress destinations must not be encrypted: {host}"
+            );
+        }
+        let api_key = on_disk
+            .get("config")
+            .and_then(toml::Value::as_table)
+            .and_then(|c| c.get("api_key"))
+            .and_then(toml::Value::as_str)
+            .expect("the secret config value must be persisted");
+        assert!(
+            api_key.starts_with("enc2:"),
+            "secret config values must still encrypt at rest; got {api_key}"
+        );
+    }
+
+    /// Grant ceremony, upgrade half and the security invariant of this
+    /// stage: an install that finds an EXISTING instance row never extends its
+    /// allowlist, however much the new manifest declares. The operator applies
+    /// the difference deliberately.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn install_never_auto_extends_an_existing_egress_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let path = config.config_path.clone();
+
+        // v1: one declared destination, seeded at first install.
+        let v1 = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&v1);
+        let entries = install_entries(&config, &v1);
+        seed_plugin_config_entries(&mut config, "weather-tool", &entries, &v1.egress.hosts)
+            .await
+            .expect("first install must seed");
+
+        // v2 of the same package declares an extra destination. Its instance
+        // key is unchanged (identity is package/capability/binding, not
+        // version), so installing it meets the existing row — and must leave
+        // it exactly as the operator left it.
+        let v2 = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        assert_eq!(
+            expected_instance_key(&v2),
+            instance_key,
+            "a version bump must not move the instance key"
+        );
+        let entries_v2 = install_entries(&config, &v2);
+        seed_plugin_config_entries(&mut config, "weather-tool", &entries_v2, &v2.egress.hosts)
+            .await
+            .expect("re-seeding an existing entry must not fail");
+
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("the entry must still exist");
+        assert_eq!(
+            entry.egress_hosts,
+            vec!["api.example.com".to_string()],
+            "a package upgrade must NEVER extend an existing egress grant"
+        );
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "re-seeding must not duplicate the entry"
+        );
+
+        let on_disk = entry_on_disk(&path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("egress_hosts must be persisted")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["api.example.com"],
+            "the on-disk grant must be untouched by the upgrade"
+        );
+    }
+
+    /// A `[[plugins.entries]]` row as a pre-typed-config install left it:
+    /// keyed by the package name, carrying the operator's values.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn legacy_package_named_entry(
+        package: &str,
+        hosts: &[&str],
+    ) -> crate::config::schema::PluginEntryConfig {
+        crate::config::schema::PluginEntryConfig {
+            name: package.to_string(),
+            config: std::collections::HashMap::from([(
+                "api_key".to_string(),
+                "operator-secret".to_string(),
+            )]),
+            egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }
+    }
+
+    /// The no-row repair works end to end. An installed HTTP plugin with no
+    /// config row (installed before this ceremony, or its row removed by hand)
+    /// gets a gap line whose command is a `config patch`, since `config set`
+    /// cannot create a row. That command is run through a real `sh`, with
+    /// `zeroclaw` replaced by a function that records its arguments and input;
+    /// the recorded patch is then applied the way the `config patch` handler
+    /// applies one (create the map key, convert the value, set it, save). The
+    /// row and its grant exist on disk afterwards, and the gap is gone.
+    #[tokio::test]
+    #[cfg(all(unix, feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn the_absent_row_repair_creates_the_row_and_its_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("gitea-tool", &["git.example.com"], false);
+        let instance_key = expected_instance_key(&manifest);
+        assert!(
+            config.plugins.entries.is_empty(),
+            "the instance starts with no row"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "one gap, one line: {lines:?}");
+        let command = crate::plugins::egress_ceremony::egress_create_command(
+            egress_command_config_dir(&config),
+            &instance_key,
+            &["git.example.com".to_string()],
+        );
+        assert!(
+            lines[0].contains(&command),
+            "a missing row must be repaired by the command that creates it: {lines:?}"
+        );
+
+        // Run the printed command through a real shell.
+        let args_file = tmp.path().join("captured-args");
+        let stdin_file = tmp.path().join("captured-stdin");
+        let script = format!(
+            "zeroclaw() {{ printf '%s\\n' \"$@\" > '{}'; cat > '{}'; }}\n{command}\n",
+            args_file.display(),
+            stdin_file.display()
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run sh");
+        assert!(status.success(), "the printed command must run: {command}");
+        let args = std::fs::read_to_string(&args_file).expect("captured arguments");
+        let dir = egress_command_config_dir(&config)
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            vec!["--config-dir", dir.as_str(), "config", "patch", "-"],
+            "the command must reach `config patch -` for the selected configuration"
+        );
+        let body = std::fs::read_to_string(&stdin_file).expect("captured input");
+
+        // Apply the patch as the handler does.
+        let ops: Vec<serde_json::Value> = serde_json::from_str(&body).expect("a JSON Patch");
+        assert_eq!(ops.len(), 1, "{body}");
+        assert_eq!(ops[0]["op"], "add", "{body}");
+        let path = ops[0]["path"]
+            .as_str()
+            .and_then(|p| p.strip_prefix('/'))
+            .expect("a JSON Pointer path")
+            .replace('/', ".");
+        assert!(
+            !config.ensure_map_or_list_key_for_path(&path),
+            "the row key must be creatable: {path}"
+        );
+        let value = json_value_to_setprop_string(&ops[0]["value"], &config, &path, 0, false)
+            .expect("the list converts like any patched value");
+        config
+            .set_prop_persistent(&path, &value)
+            .expect("the grant is written");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("the patch saves");
+
+        let on_disk = entry_on_disk(&config.config_path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("the row carries egress_hosts")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(hosts, vec!["git.example.com"]);
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "after the repair the declaration is granted"
+        );
+    }
+
+    /// `plugin list`'s gap diagnostic, canonical case: the row the printed
+    /// command addresses exists, so the command resolves and is printed on its
+    /// own. This is the shape the legacy case below must NOT take.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_gap_diagnostic_prints_the_grant_command_alone_when_the_canonical_row_exists() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "one gap, one line: {lines:?}");
+        assert!(
+            lines[0].contains("api2.example.com"),
+            "the gap must name the ungranted destination: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(&crate::plugins::egress_ceremony::egress_set_command(
+                egress_command_config_dir(&config),
+                &instance_key,
+                &[
+                    "api.example.com".to_string(),
+                    "api2.example.com".to_string()
+                ],
+            )),
+            "the command must carry the union against the canonical key: {lines:?}"
+        );
+    }
+
+    /// REGRESSION: on a pre-typed-config install the row is still keyed by the
+    /// package name, so `entry_egress` resolves nothing against the canonical
+    /// `zpi1_` key, the gap is reported, and the command the diagnostic used to
+    /// print addressed a row that does not exist. Running it as printed fails
+    /// with `Unknown property` and grants nothing.
+    ///
+    /// The diagnostic must detect that state and print the documented rename
+    /// FIRST, naming both the legacy row and the key to give it, with the grant
+    /// command explicitly second. Detection only: a list command must not
+    /// rewrite the operator's config.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_legacy_package_named_row_gets_the_migration_step_before_the_grant_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com"],
+        )];
+        assert!(
+            config.plugins.entry_egress(&instance_key).0.is_empty(),
+            "the premise: the canonical key resolves no grant on a legacy install"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+
+        // The migration instruction names the row to rename and the name to
+        // give it. Either one missing leaves the operator unable to act.
+        assert!(
+            rendered.contains("weather-tool") && rendered.contains(&instance_key),
+            "the output must name both the legacy row and the canonical key: {rendered}"
+        );
+
+        // Ordering is the fix. The grant command only resolves after the
+        // rename, so it must never be the first thing offered.
+        let grant_at = lines
+            .iter()
+            .position(|line| line.contains("config set plugins.entries"))
+            .expect("the grant command must still be printed");
+        let migrate_at = lines
+            .iter()
+            .position(|line| {
+                line.contains(&instance_key) && !line.contains("config set plugins.entries")
+            })
+            .expect("a migration line naming the canonical key must be printed");
+        assert!(
+            migrate_at < grant_at,
+            "the rename must precede the grant command: {lines:?}"
+        );
+        assert!(
+            !lines[0].contains("config set plugins.entries"),
+            "the bare grant command must not lead the report: {lines:?}"
+        );
+
+        // Detection, not mutation: `plugin list` never edits config.
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "the diagnostic must not create a row"
+        );
+        assert_eq!(
+            config.plugins.entries[0].name, "weather-tool",
+            "the diagnostic must not rename the operator's row"
+        );
+        assert_eq!(
+            config.plugins.entries[0].egress_hosts,
+            vec!["api.example.com".to_string()],
+            "the diagnostic must not rewrite the operator's grant"
+        );
+    }
+
+    /// REGRESSION (operator-grant loss): the legacy row carries a grant the
+    /// operator authored themselves — a self-hosted `gitea.example.net` the
+    /// manifest never declares — alongside a declared `api.example.com`. The
+    /// manifest also declares a new `api2.example.com` the row does not grant.
+    ///
+    /// The migrate-then-grant command must be built from the LEGACY row's grant
+    /// unioned with the declaration, not from the empty canonical row. `config
+    /// set` REPLACES the list, so following the printed instructions verbatim
+    /// (rename the row, then run the grant command) must not silently delete the
+    /// operator-only `gitea.example.net`. This end-to-end applies the printed
+    /// command's value through the real config setter and proves all three hosts
+    /// survive. The sibling legacy test above cannot catch this: its sole grant
+    /// is also declared, so the empty-vs-legacy union is identical there.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_legacy_migration_command_preserves_an_operator_only_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+
+        // A pre-typed-config row: package-name keyed, granting one declared host
+        // AND one operator-authored host the manifest does not declare.
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com", "gitea.example.net"],
+        )];
+        assert!(
+            config.plugins.entry_egress(&instance_key).0.is_empty(),
+            "premise: the canonical key resolves no grant on a legacy install"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let grant_line = lines
+            .iter()
+            .find(|line| line.contains("config set plugins.entries"))
+            .expect("the migrate ceremony must still print a grant command");
+        // The command double-quotes its value; take what is between the quotes.
+        let command_value = &printed_command_value(grant_line);
+        assert!(
+            command_value.contains("gitea.example.net"),
+            "the printed command must carry the operator-only grant forward: {grant_line}"
+        );
+
+        // Follow the printed instructions verbatim: (1) rename the legacy row to
+        // the canonical instance key, then (2) apply the grant command's value
+        // through the real config setter — the same path `zeroclaw config set`
+        // takes. `config set` REPLACES the list, so the row's grant after this is
+        // exactly the command's value.
+        config.plugins.entries[0].name = instance_key.clone();
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                command_value,
+            )
+            .expect("applying the grant command must succeed after the rename");
+
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert!(
+            granted.contains(&"gitea.example.net".to_string()),
+            "the operator-only grant must survive the migration command: {granted:?}"
+        );
+        assert!(
+            granted.contains(&"api2.example.com".to_string()),
+            "the newly declared host must be granted by the migration command: {granted:?}"
+        );
+        assert!(
+            granted.contains(&"api.example.com".to_string()),
+            "the already-granted declared host must survive too: {granted:?}"
+        );
+    }
+
+    /// The quoted value of the `zeroclaw config set` command printed on `line`.
+    /// A verdict line also carries the runtime's reason, which quotes the
+    /// offending entry, so the value is read after the command, not from the
+    /// first quote on the line.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn printed_command_value(line: &str) -> String {
+        use crate::plugins::egress_ceremony::{POWERSHELL_ONLY_MARKER, ShellDialect};
+        let start = line
+            .find("config set plugins.entries")
+            .expect("the line must carry a config set command");
+        let quoted = &line[start..];
+        // Undo the host shell's quoting. A Windows line is one double-quoted
+        // argument with no escapes inside, unless it was refused, in which case
+        // the marker names the PowerShell form that follows it.
+        let dialect = match ShellDialect::host() {
+            ShellDialect::Windows if line.starts_with(POWERSHELL_ONLY_MARKER) => {
+                ShellDialect::PowerShell
+            }
+            ShellDialect::Windows => {
+                let open = quoted
+                    .find('"')
+                    .expect("the printed Windows command double-quotes its value");
+                let rest = &quoted[open + 1..];
+                let close = rest.find('"').expect("the quoted value must close");
+                return rest[..close].to_string();
+            }
+            other => other,
+        };
+        let open = quoted
+            .find('\'')
+            .expect("the printed command single-quotes its value");
+        // The argument runs to the closing quote, and an embedded quote was
+        // written as `'\''` (POSIX) or `''` (PowerShell).
+        let mut value = String::new();
+        let mut rest = &quoted[open + 1..];
+        loop {
+            let close = rest.find('\'').expect("the quoted value must close");
+            value.push_str(&rest[..close]);
+            rest = &rest[close + 1..];
+            let escaped_quote = match dialect {
+                ShellDialect::Posix => rest.strip_prefix("\\''"),
+                ShellDialect::PowerShell => rest.strip_prefix('\''),
+                ShellDialect::Windows => unreachable!("handled above"),
+            };
+            if let Some(after) = escaped_quote {
+                value.push('\'');
+                rest = after;
+            } else {
+                break;
+            }
+        }
+        value
+    }
+
+    /// The runtime's own acceptance check for a row, with the same inputs the
+    /// diagnostic hands the planner. Tests assert against this, not against a
+    /// re-implementation, so "the repaired row is accepted" means exactly that.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn runtime_accepts_row(config: &crate::config::schema::Config, instance_key: &str) -> bool {
+        let (hosts, allow_private) = config.plugins.entry_egress(instance_key);
+        zeroclaw::plugins::egress::EgressPolicy::new(
+            &hosts,
+            &allow_private,
+            &config.security.nat64_prefixes,
+            config.plugins.limits.max_connections_per_instance,
+        )
+        .is_ok()
+    }
+
+    /// REGRESSION (silent inert grant): the legacy row's grant already covers
+    /// everything the manifest declares, so a declaration-versus-grant diff
+    /// against that row is empty. But the runtime never reads a package-name
+    /// row — it resolves the grant by the canonical `zpi1_` key, which has no
+    /// row — so every request is denied until the operator renames the row.
+    /// The diagnostic must still print the rename. Using the stranded row to
+    /// decide *whether* to speak, rather than only *what command to offer*,
+    /// made this case silent: the state that most needed the instruction
+    /// produced no output at all.
+    ///
+    /// No grant command is offered: the rename alone puts a row the runtime
+    /// accepts into effect, and `config set` would only replace a list that
+    /// is already right.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_stranded_grant_that_already_covers_the_declaration_still_prints_the_rename() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+
+        // The legacy row grants everything declared, plus an operator host.
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com", "gitea.example.net"],
+        )];
+        assert!(
+            config.plugins.entry_egress(&instance_key).0.is_empty(),
+            "premise: the runtime resolves NO grant by the canonical key, so the plugin \
+             has no reach however complete the legacy row looks"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+        assert!(
+            !lines.is_empty(),
+            "a stranded grant is inert; the diagnostic must not report it as healthy"
+        );
+        assert!(
+            rendered.contains("weather-tool") && rendered.contains(&instance_key),
+            "the rename instruction must name the legacy row and the key to give it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("config set plugins.entries"),
+            "nothing is missing after the rename and the runtime accepts the row, so no \
+             grant command may be offered: {rendered}"
+        );
+
+        // Follow the printed instruction: the rename alone restores reach, the
+        // runtime accepts the row, and the diagnostic goes quiet.
+        config.plugins.entries[0].name = instance_key.clone();
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(
+            granted,
+            vec![
+                "api.example.com".to_string(),
+                "gitea.example.net".to_string()
+            ],
+            "after the rename the runtime reads the authored grant unchanged"
+        );
+        assert!(runtime_accepts_row(&config, &instance_key));
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "a canonical row that covers the declaration has nothing to report"
+        );
+    }
+
+    /// REGRESSION (rejected authored entry): the legacy row grants `*.com`,
+    /// which the grammar rejects as a single-label wildcard, but a hand-edited
+    /// config survives `load_or_init`, which only warns. The containment
+    /// relation trusts its inputs, so `*.com` "covers" the declared `api.com`,
+    /// and a planner that let the row vouch for itself would print the rename
+    /// alone. After that rename the runtime builds the policy from the row,
+    /// rejects `*.com`, and denies every request. The diagnostic must report
+    /// the runtime's reason, still print the rename, and print a grant
+    /// command that leaves the rejected entry out, so following the steps
+    /// yields a row the runtime accepts.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_stranded_grant_the_runtime_rejects_is_named_and_kept_out_of_the_printed_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![legacy_package_named_entry("weather-tool", &["*.com"])];
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("*.com"),
+            "the runtime's reason names the rejected entry so the operator can find it: {rendered}"
+        );
+        assert!(
+            rendered.contains(&instance_key),
+            "the rename must still be printed: {rendered}"
+        );
+        let grant_line = lines
+            .iter()
+            .find(|line| line.contains("config set plugins.entries"))
+            .expect("a refused row must force a grant command, since the rename alone would put a refused allowlist in effect");
+        let command_value = &printed_command_value(grant_line);
+        assert!(
+            command_value.contains("api.com") && !command_value.contains("*.com"),
+            "the command must carry the declaration and leave the rejected entry out: {grant_line}"
+        );
+
+        // Follow the printed steps: rename, then apply. The resulting row is
+        // one the runtime accepts, and the diagnostic goes quiet.
+        config.plugins.entries[0].name = instance_key.clone();
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                command_value,
+            )
+            .expect("applying the printed command must succeed after the rename");
+        assert_eq!(
+            config.plugins.entry_egress(&instance_key).0,
+            vec!["api.com".to_string()]
+        );
+        assert!(
+            runtime_accepts_row(&config, &instance_key),
+            "the repaired row must be one the runtime's own constructor accepts"
+        );
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "a repaired canonical row that covers the declaration has nothing to report"
+        );
+    }
+
+    /// REGRESSION (planner must not out-lenient the runtime): a canonical row
+    /// whose grant covers the declaration but carries boundary whitespace. The
+    /// runtime refuses that row on the raw bytes, so every request is denied;
+    /// a planner that trimmed before judging would call it healthy. The
+    /// diagnostic must report the runtime's reason and print a command that
+    /// yields a row the runtime accepts.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_canonical_row_the_runtime_refuses_for_whitespace_is_reported_and_repaired() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec![" api.example.com ".to_string(), String::new()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the runtime refuses this row as it stands"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("whitespace"),
+            "the runtime's own reason must be reported: {rendered}"
+        );
+        let grant_line = lines
+            .iter()
+            .find(|line| line.contains("config set plugins.entries"))
+            .expect("a refused row must be offered a repair command");
+        let command_value = &printed_command_value(grant_line);
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                command_value,
+            )
+            .expect("applying the printed command must succeed");
+        assert!(
+            runtime_accepts_row(&config, &instance_key),
+            "the repaired row must be one the runtime's own constructor accepts"
+        );
+        assert!(
+            egress_grant_gap_lines(&config, &manifest)
+                .expect("gap lines must build")
+                .is_empty()
+        );
+    }
+
+    /// REGRESSION (deployment-wide refusal blamed on a row): the row is valid
+    /// but does not cover the whole declaration; only `security.nat64_prefixes`
+    /// is malformed, which the config loader only warns about. The runtime
+    /// refuses every policy for it. A report that ran the constructor and
+    /// attributed any failure to the row would call the grant refused and tell
+    /// the operator to fix `egress_allow_private`; a report that merely
+    /// filtered the deployment error out would still print a per-row grant
+    /// command, implying the grant could take effect when it cannot. The
+    /// per-plugin report must stay silent, and the deployment line must name
+    /// the responsible paths, once. Once the deployment is fixed, the real gap
+    /// is reported as usual.
+    /// A row outlives `plugin remove` and is keyed by package name alone, so a
+    /// package reinstalled under the name, which may come from another
+    /// publisher and declare nothing, inherits the old grant. Install must say
+    /// so, private carve-outs included, and `remove` must say the grant stays.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn an_undeclaring_reinstall_is_told_it_inherits_the_existing_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &[], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string(), "10.0.0.5".to_string()],
+            egress_allow_private: vec!["10.0.0.5".to_string()],
+            tls_profiles: Vec::new(),
+        }];
+
+        let install = existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]);
+        assert_eq!(install.len(), 1, "{install:?}");
+        assert!(
+            install[0].contains("declares no egress")
+                && install[0].contains("api.example.com, 10.0.0.5; private: 10.0.0.5")
+                && install[0].contains(&instance_key),
+            "{install:?}"
+        );
+
+        let rows = crate::plugins::channel_instance::instance_rows(&config, &manifest)
+            .expect("rows must derive");
+        assert_eq!(
+            rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+            vec![instance_key.as_str()],
+            "the tool package owns exactly its default binding's row"
+        );
+        assert_eq!(
+            removed_plugin_grant_rows(&config, &manifest),
+            rows,
+            "`plugin remove` checks a tool package's rows exactly as before"
+        );
+        let removed = removed_plugin_kept_grant_lines(&config, "weather-tool", &rows);
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(
+            removed[0].contains(&instance_key) && removed[0].contains("private: 10.0.0.5"),
+            "{removed:?}"
+        );
+
+        // A row that grants nothing has nothing to inherit or keep.
+        config.plugins.entries[0].egress_hosts.clear();
+        config.plugins.entries[0].egress_allow_private.clear();
+        assert!(
+            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]).is_empty()
+        );
+        assert!(removed_plugin_kept_grant_lines(&config, "weather-tool", &rows).is_empty());
+    }
+
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_deployment_wide_refusal_is_reported_once_with_its_own_paths_not_as_a_row_repair() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+        config.security.nat64_prefixes = vec!["2001:db8::/97".to_string()];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the runtime refuses every policy under a malformed prefix list"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert!(
+            lines.is_empty(),
+            "no per-row line may print under a deployment-wide refusal, not even for \
+             the real gap: {lines:?}"
+        );
+        assert!(
+            existing_egress_grant_lines(
+                &config,
+                "weather-tool",
+                &instance_key,
+                &manifest.egress.hosts
+            )
+            .is_empty(),
+            "the install-time report follows the same rule"
+        );
+        let deployment = egress_deployment_gap_line(&config)
+            .expect("the deployment refusal must be reported on its own");
+        assert!(
+            deployment.contains("security.nat64_prefixes")
+                && deployment.contains("max_connections_per_instance"),
+            "the deployment line must name the paths that fix it: {deployment}"
+        );
+        assert!(
+            !deployment.contains("egress_allow_private")
+                && !deployment.contains("config set plugins.entries"),
+            "the deployment line must not offer a row repair: {deployment}"
+        );
+
+        // Fix the deployment: the row's real gap is now reported as usual.
+        config.security.nat64_prefixes.clear();
+        assert_eq!(egress_deployment_gap_line(&config), None);
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("api2.example.com")
+                && lines[0].contains("config set plugins.entries"),
+            "the uncovered destination and its command are reported once the deployment \
+             is accepted: {lines:?}"
+        );
+    }
+
+    /// REGRESSION (install and list must agree): a canonical row whose hosts
+    /// cover the declaration but whose `egress_allow_private` names a host no
+    /// grant covers. The host-only upgrade diff is empty, so a reinstall that
+    /// looked only at hosts would print nothing while the runtime refuses the
+    /// row and denies every request. The install-time report must print the
+    /// same runtime verdict `plugin list` prints, word for word, including
+    /// that the printed command alone does not complete the repair.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn reinstall_reports_the_runtime_verdict_for_an_existing_row_with_an_ungranted_carveout() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: vec!["other.example.com".to_string()],
+            tls_profiles: Vec::new(),
+        }];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the row is refused"
+        );
+
+        let install = existing_egress_grant_lines(
+            &config,
+            "weather-tool",
+            &instance_key,
+            &manifest.egress.hosts,
+        );
+        let rendered = install.join("\n");
+        assert!(
+            rendered.contains("not granted"),
+            "the runtime's reason must be reported at install: {rendered}"
+        );
+        assert!(
+            rendered.contains("config set plugins.entries"),
+            "a repair command must be offered at install: {rendered}"
+        );
+        assert!(
+            rendered.contains("egress_allow_private"),
+            "the command alone does not complete the repair, and install must say so: {rendered}"
+        );
+
+        // Same words as `plugin list`: both surfaces share one renderer.
+        let list = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        for line in &list {
+            assert!(
+                install.contains(line),
+                "install must print every verdict line list prints; missing {line:?} in {install:?}"
+            );
+        }
+    }
+
+    /// REGRESSION (install and list must agree, rejected entry): a canonical
+    /// row granting `*.com`, which the runtime rejects. The install-time
+    /// report must name the runtime's reason and offer a command whose value
+    /// leaves the rejected entry out, rather than staying silent or printing a
+    /// replacement that carries it forward.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn reinstall_names_a_rejected_host_entry_and_keeps_it_out_of_the_apply_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest("weather-tool", &["api.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["*.com".to_string()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the row is refused"
+        );
+
+        let install = existing_egress_grant_lines(
+            &config,
+            "weather-tool",
+            &instance_key,
+            &manifest.egress.hosts,
+        );
+        let rendered = install.join("\n");
+        assert!(
+            rendered.contains("*.com"),
+            "the reason names the entry: {rendered}"
+        );
+        for line in install
+            .iter()
+            .filter(|line| line.contains("config set plugins.entries"))
+        {
+            let value = &printed_command_value(line);
+            assert!(
+                value.contains("api.com") && !value.contains("*.com"),
+                "every printed command must carry the declaration and leave the rejected \
+                 entry out: {line}"
+            );
+        }
+        assert!(
+            install
+                .iter()
+                .any(|line| line.contains("config set plugins.entries")),
+            "a repair command must be offered: {rendered}"
+        );
+    }
+
+    /// A manifest that declares nothing grants nothing: `http_client` alone
+    /// still confers no reach, and the seeded row stays deny-everything.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_manifest_without_a_declaration_seeds_no_egress() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+
+        // A config schema still earns a row; the egress grant on it is empty.
+        let manifest = tool_manifest("silent-tool", &[], true);
+        let instance_key = expected_instance_key(&manifest);
+        let entries = install_entries(&config, &manifest);
+        seed_plugin_config_entries(&mut config, "silent-tool", &entries, &manifest.egress.hosts)
+            .await
+            .expect("seeding must succeed");
+
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("the entry is still seeded");
+        assert!(
+            entry.egress_hosts.is_empty(),
+            "no declaration means no grant: {:?}",
+            entry.egress_hosts
+        );
+    }
+
+    /// A channel instance is keyed by the alias of the `[channels.plugin.<alias>]`
+    /// binding that names its package, so without a binding a channel-only
+    /// package has no instance at all. The ceremony must not invent a
+    /// package-level key in its place: the package owns no rows and install
+    /// seeds nothing, even when its manifest declares destinations.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_channel_only_package_seeds_nothing_rather_than_inventing_a_key() {
+        let manifest = manifest_from_toml(
+            "name = \"chat-bridge\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"channel\"]\n\
+             permissions = [\"http_client\"]\n\
+             config_schema = { type = \"object\" }\n\
+             [egress]\n\
+             hosts = [\"api.example.com\"]\n",
+        );
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let rows = crate::plugins::channel_instance::instance_rows(&config, &manifest)
+            .expect("derivation must not error");
+        assert!(
+            rows.is_empty(),
+            "a channel-only package without a binding has no instance row: {rows:?}"
+        );
+        let entries = install_entries(&config, &manifest);
+        assert!(
+            entries.is_empty(),
+            "install has nothing to seed for it: {entries:?}"
+        );
+
+        seed_plugin_config_entries(&mut config, "chat-bridge", &entries, &manifest.egress.hosts)
+            .await
+            .expect("seeding nothing must succeed");
+        assert!(
+            config.plugins.entries.is_empty(),
+            "no row may be invented for a channel-only package: {:?}",
+            config
+                .plugins
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The key derived for a `[channels.plugin.<alias>]` binding is the key of
+    /// the scope the activation plan admits for it: the channel capability,
+    /// the alias as the binding, and the manifest's permissions as the grant
+    /// set. The grant set is not part of the key, so the derivation needs
+    /// none. Each alias keys its own instance, apart from the package's
+    /// default tool binding.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn channel_instance_key_equals_the_key_of_the_scope_the_runtime_admits() {
+        use crate::plugins::channel_instance::channel_instance_key;
+
+        let manifest = manifest_with(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["api.example.com"],
+            &["http_client", "config_read"],
+            true,
+        );
+        let admitted = zeroclaw::plugins::instance::PluginInstanceScope::from_manifest(
+            &manifest,
+            zeroclaw::plugins::PluginCapability::Channel,
+            "operations",
+            manifest.permissions.iter().copied(),
+        )
+        .expect("the runtime admits the binding")
+        .id()
+        .config_entry_key()
+        .expect("the admitted scope has a key");
+
+        let key = channel_instance_key(&manifest, "operations").expect("the key derives");
+        assert_eq!(key, admitted);
+        assert_ne!(
+            key,
+            channel_instance_key(&manifest, "support").expect("the key derives"),
+            "each alias keys its own instance"
+        );
+        assert_ne!(
+            key,
+            expected_instance_key(&manifest),
+            "a channel instance never shares the default tool binding's row"
+        );
+    }
+
+    /// The one enumeration the CLI surfaces share: the default tool binding's
+    /// row first, then one row per `[channels.plugin.<alias>]` binding that
+    /// names the package, sorted by alias, a disabled binding included. A
+    /// binding naming another package is not this package's instance.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn instance_rows_list_the_tool_binding_then_one_channel_row_per_bound_alias() {
+        use crate::plugins::channel_instance::{PluginInstanceRow, instance_rows};
+        use zeroclaw::plugins::PluginCapability;
+
+        let manifest = manifest_with(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["api.example.com"],
+            &["http_client"],
+            true,
+        );
+        let mut config = crate::config::schema::Config::default();
+        bind_channel_alias(&mut config, "support", "chat-bridge", true);
+        bind_channel_alias(&mut config, "operations", "chat-bridge", false);
+        bind_channel_alias(&mut config, "elsewhere", "other-bridge", true);
+
+        let rows = instance_rows(&config, &manifest).expect("rows must derive");
+        assert_eq!(
+            rows,
+            vec![
+                PluginInstanceRow {
+                    capability: PluginCapability::Tool,
+                    binding: "chat-bridge".to_string(),
+                    key: expected_instance_key(&manifest),
+                },
+                PluginInstanceRow {
+                    capability: PluginCapability::Channel,
+                    binding: "operations".to_string(),
+                    key: expected_channel_instance_key(&manifest, "operations"),
+                },
+                PluginInstanceRow {
+                    capability: PluginCapability::Channel,
+                    binding: "support".to_string(),
+                    key: expected_channel_instance_key(&manifest, "support"),
+                },
+            ]
+        );
+        assert!(
+            rows.iter().all(|row| row.binding != "elsewhere"),
+            "an alias bound to another package owns nothing here: {rows:?}"
+        );
+    }
+
+    /// A channel instance exists only through a binding, so a channel-only
+    /// package that no binding names owns no row, and a binding naming another
+    /// package does not lend it one.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_channel_only_package_without_a_binding_owns_no_rows() {
+        use crate::plugins::channel_instance::{bound_channel_aliases, instance_rows};
+
+        let manifest = manifest_with(
+            "chat-bridge",
+            &["channel"],
+            &["api.example.com"],
+            &["http_client"],
+            true,
+        );
+        let mut config = crate::config::schema::Config::default();
+        bind_channel_alias(&mut config, "elsewhere", "other-bridge", true);
+
+        assert!(bound_channel_aliases(&config, "chat-bridge").is_empty());
+        let rows = instance_rows(&config, &manifest).expect("rows must derive");
+        assert!(rows.is_empty(), "no binding, no instance, no row: {rows:?}");
+    }
+
+    /// A binding makes a channel instance, but a row is owed only for host
+    /// state. With no config schema, no declaration and no governed transport,
+    /// the package is bound and owns no row.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_channel_package_owning_no_host_state_gets_a_binding_but_no_row() {
+        use crate::plugins::channel_instance::{bound_channel_aliases, instance_rows};
+
+        let manifest = manifest_with("quiet-bridge", &["channel"], &[], &["memory_read"], false);
+        let mut config = crate::config::schema::Config::default();
+        bind_channel_alias(&mut config, "operations", "quiet-bridge", true);
+
+        assert_eq!(
+            bound_channel_aliases(&config, "quiet-bridge"),
+            vec!["operations".to_string()]
+        );
+        let rows = instance_rows(&config, &manifest).expect("rows must derive");
+        assert!(
+            rows.is_empty(),
+            "an instance with no host state owns no row: {rows:?}"
+        );
+    }
+
+    /// The transport rule differs by row, on purpose. A channel row uses its
+    /// declaration through any governed transport, so a socket-only or
+    /// WebSocket-only channel is seeded and diagnosed. The default tool
+    /// binding keeps its `http_client`-only rule unchanged. Without any
+    /// governed transport no row can use the declaration.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn declared_hosts_count_any_governed_transport_for_channel_rows_but_only_http_for_tool_rows() {
+        use crate::plugins::channel_instance::{declared_hosts_for_row, instance_rows};
+
+        let mut config = crate::config::schema::Config::default();
+        bind_channel_alias(&mut config, "operations", "relay-bridge", true);
+        let declared = vec!["relay.example.net".to_string()];
+        let rows_for = |permissions: &[&str]| {
+            let manifest = manifest_with(
+                "relay-bridge",
+                &["tool", "channel"],
+                &["relay.example.net"],
+                permissions,
+                false,
+            );
+            let rows = instance_rows(&config, &manifest).expect("rows must derive");
+            assert_eq!(
+                rows.iter().map(|row| row.is_channel()).collect::<Vec<_>>(),
+                vec![false, true],
+                "one tool row, then the channel row: {rows:?}"
+            );
+            (manifest, rows)
+        };
+
+        for permission in ["socket_client", "websocket_client"] {
+            let (manifest, rows) = rows_for(&[permission]);
+            assert_eq!(
+                declared_hosts_for_row(&manifest, &rows[1]),
+                declared,
+                "a channel row uses its declaration through {permission}"
+            );
+            assert!(
+                declared_hosts_for_row(&manifest, &rows[0]).is_empty(),
+                "the tool row keeps its http_client-only rule, so {permission} alone uses no \
+                 declaration"
+            );
+        }
+
+        let (manifest, rows) = rows_for(&["http_client"]);
+        for row in &rows {
+            assert_eq!(
+                declared_hosts_for_row(&manifest, row),
+                declared,
+                "http_client serves both rows: {row:?}"
+            );
+        }
+
+        let (manifest, rows) = rows_for(&["memory_read"]);
+        for row in &rows {
+            assert!(
+                declared_hosts_for_row(&manifest, row).is_empty(),
+                "without a governed transport no row can use the declaration: {row:?}"
+            );
+        }
+    }
+
+    /// `plugin info` prints the default tool binding's key line exactly as it
+    /// always has, then one line per bound alias that names the
+    /// `plugin.<alias>` binding and that instance's own key.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn plugin_info_prints_one_channel_key_line_per_bound_alias() {
+        let manifest = manifest_with(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["api.example.com"],
+            &["http_client"],
+            true,
+        );
+        let mut config = crate::config::schema::Config::default();
+        bind_channel_alias(&mut config, "operations", "chat-bridge", true);
+        bind_channel_alias(&mut config, "support", "chat-bridge", false);
+        let rows = crate::plugins::channel_instance::instance_rows(&config, &manifest)
+            .expect("rows must derive");
+        let info = zeroclaw::plugins::PluginInfo {
+            name: "chat-bridge".to_string(),
+            version: "1.0.0".to_string(),
+            description: None,
+            capabilities: manifest.capabilities.clone(),
+            permissions: manifest.permissions.clone(),
+            wasm_path: None,
+            loaded: true,
+        };
+
+        let lines = plugin_info_lines(&info, &rows, &[], &[], &PluginLoadStatus::NoComponent);
+        let key_lines: Vec<&String> = lines.iter().filter(|line| line.contains("zpi1_")).collect();
+        assert_eq!(key_lines.len(), 3, "one key line per instance: {lines:#?}");
+        let tool_key = expected_instance_key(&manifest);
+        assert_eq!(
+            key_lines[0],
+            &ta(
+                "cli-plugin-config-entry-key",
+                &[("capability", "Tool"), ("key", &tool_key)],
+                "Config entry key",
+            ),
+            "the tool line keeps its key and arguments"
+        );
+        for (line, alias) in key_lines[1..].iter().zip(["operations", "support"]) {
+            let key = expected_channel_instance_key(&manifest, alias);
+            assert!(
+                line.contains(&format!("plugin.{alias}")) && line.contains(&key),
+                "a channel line names its binding and its own key: {line}"
+            );
+        }
+    }
+
+    /// `plugin list` reports a channel instance's gap under the instance's own
+    /// name and key. This socket-only channel package declares a destination
+    /// and is bound, but no row exists yet, so the one line names the binding
+    /// and the host and carries the `config patch` command that creates the
+    /// row with its grant.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn plugin_list_reports_a_channel_instance_gap_with_the_row_creating_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = manifest_with(
+            "irc-bridge",
+            &["channel"],
+            &["irc.example.net"],
+            &["socket_client"],
+            false,
+        );
+        bind_channel_alias(&mut config, "operations", "irc-bridge", true);
+        let key = expected_channel_instance_key(&manifest, "operations");
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "one instance, one gap, one line: {lines:?}");
+        assert!(
+            lines[0].contains("irc-bridge (plugin.operations)")
+                && lines[0].contains("irc.example.net"),
+            "the gap names the instance and the destination: {lines:?}"
+        );
+        let command = crate::plugins::egress_ceremony::egress_create_command(
+            egress_command_config_dir(&config),
+            &key,
+            &["irc.example.net".to_string()],
+        );
+        assert!(
+            lines[0].contains("config patch") && lines[0].contains(&command),
+            "an absent row is repaired by the command that creates it under the instance's \
+             key: {lines:?}"
+        );
+    }
+
+    /// A package-name row is the default tool binding's pre-typed-config name,
+    /// never a channel instance's. Offering to rename it onto a channel
+    /// instance's key would move the tool binding's grant to the channel, so
+    /// the channel gap stays the one row-creating command and no rename step
+    /// is printed.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_package_named_row_never_strands_a_channel_instance_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = manifest_with(
+            "irc-bridge",
+            &["channel"],
+            &["irc.example.net"],
+            &["socket_client"],
+            false,
+        );
+        bind_channel_alias(&mut config, "operations", "irc-bridge", true);
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "irc-bridge",
+            &["irc.example.net"],
+        )];
+        let key = expected_channel_instance_key(&manifest, "operations");
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let command = crate::plugins::egress_ceremony::egress_create_command(
+            egress_command_config_dir(&config),
+            &key,
+            &["irc.example.net".to_string()],
+        );
+        assert_eq!(lines.len(), 1, "no migration steps follow: {lines:?}");
+        assert!(
+            lines[0].contains(&command),
+            "the channel row is created, not renamed from the package-name row: {lines:?}"
+        );
+    }
+
+    /// `plugin list` offers no `config patch` repair for an absent channel row
+    /// whose alias the config alias grammar rejects: `config patch` validates
+    /// the whole config and refuses that alias, so the line names the table to
+    /// rename instead, as the instance's readiness report does. A bound alias
+    /// the grammar accepts keeps its repair.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn plugin_list_names_the_table_to_rename_for_an_absent_row_under_an_alias_outside_the_grammar()
+    {
+        use crate::plugins::egress_ceremony::egress_create_command;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = manifest_with(
+            "irc-bridge",
+            &["channel"],
+            &["irc.example.net"],
+            &["socket_client"],
+            false,
+        );
+        bind_channel_alias(&mut config, "ops-team", "irc-bridge", true);
+        bind_channel_alias(&mut config, "operations", "irc-bridge", true);
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let reason = zeroclaw_config::helpers::validate_alias_key("ops-team")
+            .expect_err("the alias grammar rejects a hyphen");
+        assert!(
+            lines.contains(&format!(
+                "  {}",
+                ta(
+                    "cli-plugin-channel-row-missing-invalid-alias",
+                    &[
+                        ("alias", "ops-team"),
+                        ("reason", &reason),
+                        ("table", "[channels.plugin.ops-team]"),
+                    ],
+                    "",
+                )
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains(&expected_channel_instance_key(&manifest, "ops-team"))),
+            "no repair addresses the row the grammar keeps from being created: {lines:#?}"
+        );
+        let repair = egress_create_command(
+            egress_command_config_dir(&config),
+            &expected_channel_instance_key(&manifest, "operations"),
+            &["irc.example.net".to_string()],
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(&repair)),
+            "the alias the grammar accepts keeps its repair: {lines:#?}"
+        );
+
+        // With nothing declared there is no repair, so there is nothing to
+        // replace either: neither alias gets a line.
+        let undeclaring = manifest_with("irc-bridge", &["channel"], &[], &["socket_client"], false);
+        let lines = egress_grant_gap_lines(&config, &undeclaring).expect("gap lines must build");
+        assert!(
+            lines.is_empty(),
+            "nothing declared, nothing to report for either alias: {lines:#?}"
+        );
+    }
+
+    /// `plugin remove` keeps configuration, so it says what stays: each row
+    /// that keeps a grant, named by its instance (the bare package for the
+    /// default tool binding, exactly as before), then each channel binding
+    /// that still names the package, with the table that drops it.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn plugin_remove_reports_kept_channel_rows_and_dangling_bindings() {
+        use crate::plugins::channel_instance::{bound_channel_aliases, instance_rows};
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = manifest_with(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["api.example.com"],
+            &["http_client"],
+            true,
+        );
+        bind_channel_alias(&mut config, "operations", "chat-bridge", true);
+        bind_channel_alias(&mut config, "support", "chat-bridge", false);
+        bind_channel_alias(&mut config, "elsewhere", "other-bridge", true);
+        let tool_key = expected_instance_key(&manifest);
+        let operations_key = expected_channel_instance_key(&manifest, "operations");
+        let granting = |name: &str| crate::config::schema::PluginEntryConfig {
+            name: name.to_string(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        };
+        // The tool row and the `operations` row keep a grant; `support` has no
+        // row at all.
+        config.plugins.entries = vec![granting(&tool_key), granting(&operations_key)];
+
+        let rows = instance_rows(&config, &manifest).expect("rows must derive");
+        assert_eq!(
+            removed_plugin_grant_rows(&config, &manifest),
+            rows,
+            "for a version that owns state, `plugin remove` checks the rows it owns"
+        );
+        let kept = removed_plugin_kept_grant_lines(&config, "chat-bridge", &rows);
+        assert_eq!(
+            kept,
+            vec![
+                ta(
+                    "cli-plugin-removed-grant-kept",
+                    &[
+                        ("name", "chat-bridge"),
+                        ("key", &tool_key),
+                        ("grants", "api.example.com"),
+                    ],
+                    "The plugin's config entry keeps its egress grant.",
+                ),
+                ta(
+                    "cli-plugin-removed-channel-grant-kept",
+                    &[
+                        ("name", "chat-bridge"),
+                        ("alias", "operations"),
+                        ("key", &operations_key),
+                        ("grants", "api.example.com"),
+                    ],
+                    "The config entry for the channel instance keeps its egress grant.",
+                ),
+            ],
+            "one line per row that keeps a grant: the tool row under the bare package, the \
+             channel row under its binding, inherited only by a package bound to that alias"
+        );
+
+        let bindings = removed_plugin_binding_lines(
+            "chat-bridge",
+            &bound_channel_aliases(&config, "chat-bridge"),
+        );
+        assert_eq!(
+            bindings.len(),
+            2,
+            "one line per binding that names the package: {bindings:?}"
+        );
+        for (line, alias) in bindings.iter().zip(["operations", "support"]) {
+            assert!(
+                line.contains(&format!("plugin.{alias}"))
+                    && line.contains(&format!("[channels.plugin.{alias}]"))
+                    && line.contains("'chat-bridge'"),
+                "the line names the binding, the table that drops it, and the package: {line}"
+            );
+        }
+    }
+
+    /// A row outlives `plugin remove`, so a reinstalled version that owns no
+    /// instance state (no schema, no declared destination, no governed
+    /// transport) can sit on a row an earlier version owned, still granting
+    /// egress under the bound alias's key. The package's rows do not include
+    /// it, but removing the package still reports the grant the row keeps,
+    /// because a package bound to that alias later inherits it.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn plugin_remove_reports_a_kept_channel_grant_for_a_version_that_owns_no_state() {
+        use crate::plugins::channel_instance::instance_rows;
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = manifest_with("irc-bridge", &["channel"], &[], &[], false);
+        bind_channel_alias(&mut config, "ops", "irc-bridge", true);
+        let key = expected_channel_instance_key(&manifest, "ops");
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: key.clone(),
+            egress_hosts: vec!["irc.example.net".to_string()],
+            ..crate::config::schema::PluginEntryConfig::default()
+        }];
+        assert!(
+            instance_rows(&config, &manifest)
+                .expect("rows must derive")
+                .is_empty(),
+            "the installed version owns no row"
+        );
+
+        let kept = removed_plugin_kept_grant_lines(
+            &config,
+            "irc-bridge",
+            &removed_plugin_grant_rows(&config, &manifest),
+        );
+        assert_eq!(
+            kept,
+            vec![ta(
+                "cli-plugin-removed-channel-grant-kept",
+                &[
+                    ("name", "irc-bridge"),
+                    ("alias", "ops"),
+                    ("key", &key),
+                    ("grants", "irc.example.net"),
+                ],
+                "",
+            )],
+            "the kept grant under the bound alias's key is reported"
+        );
+    }
+
+    /// A plugin source directory: `manifest_toml` beside a stub component, the
+    /// shape `plugin install` admits. The stub is never load-checked.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn write_plugin_source(manifest_toml: &str) -> tempfile::TempDir {
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        source
+    }
+
+    /// A host with one package installed through the real `PluginHost`, as
+    /// `plugin install` leaves one, and the directories it lives in.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    struct InstalledPackage {
+        host: zeroclaw::plugins::host::PluginHost,
+        _source: tempfile::TempDir,
+        _plugins: tempfile::TempDir,
+    }
+
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn install_package(manifest_toml: &str) -> InstalledPackage {
+        let source = write_plugin_source(manifest_toml);
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(plugins.path())
+            .expect("plugin host");
+        host.install(source.path().to_str().expect("utf-8 source path"))
+            .expect("install the package");
+        InstalledPackage {
+            host,
+            _source: source,
+            _plugins: plugins,
+        }
+    }
+
+    /// The manifest of package `name` providing `capabilities`, requesting
+    /// `permissions` and declaring `hosts`, with no config schema: one a real
+    /// host admits.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn package_manifest_toml(
+        name: &str,
+        capabilities: &[&str],
+        permissions: &[&str],
+        hosts: &[&str],
+    ) -> String {
+        let quote = |xs: &[&str]| -> String {
+            xs.iter()
+                .map(|x| format!("\"{x}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "name = \"{name}\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [{}]\n\
+             permissions = [{}]\n\
+             [egress]\n\
+             hosts = [{}]\n",
+            quote(capabilities),
+            quote(permissions),
+            quote(hosts)
+        )
+    }
+
+    /// The `[channels.plugin.<alias>]` table saved on disk, if there is one.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn binding_on_disk(path: &std::path::Path, alias: &str) -> Option<toml::Table> {
+        let raw = std::fs::read_to_string(path).expect("config file must exist");
+        let doc: toml::Table = toml::from_str(&raw).expect("saved config must be valid TOML");
+        doc.get("channels")
+            .and_then(toml::Value::as_table)
+            .and_then(|channels| channels.get("plugin"))
+            .and_then(toml::Value::as_table)
+            .and_then(|bindings| bindings.get(alias))
+            .and_then(toml::Value::as_table)
+            .cloned()
+    }
+
+    /// The name of every `[[plugins.entries]]` row saved on disk, in order.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn entry_names_on_disk(path: &std::path::Path) -> Vec<String> {
+        let raw = std::fs::read_to_string(path).expect("config file must exist");
+        let doc: toml::Table = toml::from_str(&raw).expect("saved config must be valid TOML");
+        doc.get("plugins")
+            .and_then(toml::Value::as_table)
+            .and_then(|plugins| plugins.get("entries"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("name").and_then(toml::Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The `egress_hosts` a saved row grants; empty when the key is absent.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn granted_on_disk(path: &std::path::Path, key: &str) -> Vec<String> {
+        entry_on_disk(path, key)
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The saved text of the first table headed `header`, through its last
+    /// sub-table and without trailing blank lines: exactly the bytes a save
+    /// that did not touch the table must leave alone.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn table_text(raw: &str, header: &str) -> String {
+        let path = header.trim_matches(|c| c == '[' || c == ']');
+        let nested = [format!("[{path}."), format!("[[{path}.")];
+        let mut lines = raw.lines().skip_while(|line| line.trim() != header);
+        let first = lines
+            .next()
+            .unwrap_or_else(|| panic!("no {header} table in:\n{raw}"));
+        let mut text = vec![first];
+        for line in lines {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('[')
+                && !nested
+                    .iter()
+                    .any(|prefix| trimmed.starts_with(prefix.as_str()))
+            {
+                break;
+            }
+            text.push(line);
+        }
+        while text.last().is_some_and(|line| line.trim().is_empty()) {
+            text.pop();
+        }
+        text.join("\n")
+    }
+
+    /// The binding ceremony under `--egress declared`: `plugin bind` creates
+    /// the `[channels.plugin.<alias>]` binding and the instance's row in one
+    /// save, grants the row exactly the canonical declaration, and prints the
+    /// grant with the command that edits it. A socket-only channel is seeded
+    /// the same way: a channel row counts every governed transport, where the
+    /// default tool binding counts only `http_client`.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_creates_the_binding_and_seeds_the_declaration_on_declared() {
+        use crate::plugins::channel_instance::EgressDecision;
+        use crate::plugins::egress_ceremony::egress_set_command;
+
+        for (package, permission) in [
+            ("chat-bridge", "http_client"),
+            ("irc-bridge", "socket_client"),
+        ] {
+            let installed = install_package(&package_manifest_toml(
+                package,
+                &["channel"],
+                &[permission],
+                &["irc.example.net", "api.example.com"],
+            ));
+            let manifest = installed.host.manifest(package).expect("installed").clone();
+            let key = expected_channel_instance_key(&manifest, "operations");
+            let tmp = tempfile::tempdir().expect("config dir");
+            let mut config = config_in_dir(tmp.path());
+
+            let lines = Box::pin(bind_channel_instance(
+                &mut config,
+                &installed.host,
+                package,
+                "operations",
+                Some(EgressDecision::SeedDeclared),
+            ))
+            .await
+            .expect("bind");
+
+            let binding =
+                binding_on_disk(&config.config_path, "operations").expect("the binding is saved");
+            assert_eq!(
+                binding.get("package").and_then(toml::Value::as_str),
+                Some(package)
+            );
+            assert!(
+                config.channels.plugin["operations"].enabled,
+                "a new binding takes the default, enabled"
+            );
+            assert_eq!(
+                entry_names_on_disk(&config.config_path),
+                vec![key.clone()],
+                "one row, keyed by the instance: {permission}"
+            );
+            assert_eq!(
+                granted_on_disk(&config.config_path, &key),
+                vec!["api.example.com", "irc.example.net"],
+                "the row grants the canonical declaration: {permission}"
+            );
+            assert!(
+                entry_on_disk(&config.config_path, &key)
+                    .get("egress_allow_private")
+                    .and_then(toml::Value::as_array)
+                    .is_none_or(Vec::is_empty),
+                "a private-address carve-out is never seeded"
+            );
+            assert!(config.dirty_paths.is_empty(), "the one save wrote it all");
+
+            assert_eq!(
+                lines[0],
+                ta(
+                    "cli-plugin-channel-bound",
+                    &[("alias", "operations"), ("name", package)],
+                    "",
+                )
+            );
+            assert!(
+                lines.contains(&ta("cli-plugin-config-entry-seeded", &[("name", &key)], "")),
+                "the seeded line names the instance key: {lines:#?}"
+            );
+            let command = egress_set_command(
+                egress_command_config_dir(&config),
+                &key,
+                &["api.example.com".to_string(), "irc.example.net".to_string()],
+            );
+            assert!(
+                lines.iter().any(|line| line.contains(&command)),
+                "the grant is printed with the command that edits it: {lines:#?}"
+            );
+        }
+    }
+
+    /// `--egress none` creates the row with an empty grant, so the instance
+    /// has no network reach, and prints the declaration with the command that
+    /// grants it later. That command resolves against the row the ceremony
+    /// created.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_with_none_creates_the_row_with_an_empty_grant_and_prints_the_grant_command() {
+        use crate::plugins::channel_instance::EgressDecision;
+        use crate::plugins::egress_ceremony::{egress_hosts_path, egress_set_command};
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &["irc.example.net"],
+        ));
+        let manifest = installed
+            .host
+            .manifest("irc-bridge")
+            .expect("installed")
+            .clone();
+        let key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "operations",
+            Some(EgressDecision::Withhold),
+        ))
+        .await
+        .expect("bind");
+
+        assert!(binding_on_disk(&config.config_path, "operations").is_some());
+        assert_eq!(entry_names_on_disk(&config.config_path), vec![key.clone()]);
+        assert!(
+            granted_on_disk(&config.config_path, &key).is_empty(),
+            "--egress none grants nothing"
+        );
+
+        let command = egress_set_command(
+            egress_command_config_dir(&config),
+            &key,
+            &["irc.example.net".to_string()],
+        );
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-egress-withheld",
+                &[
+                    ("alias", "operations"),
+                    ("hosts", "irc.example.net"),
+                    ("command", &command),
+                ],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.contains(&command)).count(),
+            1,
+            "the withheld line carries the command; the readiness block does not repeat it: \
+             {lines:#?}"
+        );
+
+        config
+            .set_prop(&egress_hosts_path(&key), &printed_command_value(&command))
+            .expect("the printed command addresses the row the ceremony created");
+        assert_eq!(
+            config.plugins.entry_egress(&key).0,
+            vec!["irc.example.net".to_string()]
+        );
+    }
+
+    /// Without a decision, a manifest declaring destinations the new row could
+    /// use is refused before anything is written: no binding, no row, and the
+    /// config file byte-identical. The refusal lists the hosts and both flags.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_refuses_without_a_decision_when_hosts_are_declared_and_writes_nothing() {
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["irc.example.net", "api.example.com"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let before = std::fs::read(&config.config_path).expect("read config");
+
+        let error = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            None,
+        ))
+        .await
+        .expect_err("a declaration needs a decision");
+
+        assert_eq!(
+            error.to_string(),
+            ta(
+                "cli-plugin-channel-egress-decision-required",
+                &[
+                    ("name", "chat-bridge"),
+                    ("alias", "operations"),
+                    ("count", "2"),
+                    ("hosts", "api.example.com, irc.example.net"),
+                ],
+                "",
+            )
+        );
+        assert!(
+            error.to_string().contains("--egress declared")
+                && error.to_string().contains("--egress none"),
+            "the refusal names both flags: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config"),
+            before,
+            "nothing is written"
+        );
+        assert!(
+            config.channels.plugin.is_empty()
+                && config.plugins.entries.is_empty()
+                && config.dirty_paths.is_empty(),
+            "nothing changes in memory either"
+        );
+    }
+
+    /// A repeated ceremony writes nothing: the binding is kept, the row exists,
+    /// and the config file stays byte-identical, whether the flag is repeated
+    /// or omitted, since an existing row needs no decision.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_is_idempotent_a_second_run_leaves_the_config_file_byte_identical() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("first bind");
+        let after_first = std::fs::read(&config.config_path).expect("read config");
+
+        for decision in [Some(EgressDecision::SeedDeclared), None] {
+            let lines = Box::pin(bind_channel_instance(
+                &mut config,
+                &installed.host,
+                "chat-bridge",
+                "operations",
+                decision,
+            ))
+            .await
+            .expect("repeat bind");
+            assert_eq!(
+                lines[0],
+                ta(
+                    "cli-plugin-channel-binding-kept",
+                    &[("alias", "operations"), ("name", "chat-bridge")],
+                    "",
+                ),
+                "{decision:?}"
+            );
+            assert_eq!(
+                std::fs::read(&config.config_path).expect("read config"),
+                after_first,
+                "a repeated run writes nothing: {decision:?}"
+            );
+        }
+        assert_eq!(config.channels.plugin.len(), 1, "one binding");
+        assert_eq!(config.plugins.entries.len(), 1, "one row");
+    }
+
+    /// Repair, without touching what exists. A row whose binding was removed
+    /// gets the binding back, and the row, an encrypted config value and a TLS
+    /// profile included, keeps its exact bytes. A binding made with `config
+    /// set`, which has no row, gets its row, and keeps its exact bytes.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_repairs_a_binding_that_has_no_row_and_a_row_that_has_no_binding_without_touching_their_bytes()
+     {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(
+            r#"name = "irc-bridge"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+permissions = ["socket_client", "config_read"]
+
+[config_schema]
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.ca_bundle]
+type = "string"
+x-secret = true
+
+[egress]
+hosts = ["irc.example.net"]
+"#,
+        );
+        let manifest = installed
+            .host
+            .manifest("irc-bridge")
+            .expect("installed")
+            .clone();
+        let operations_key = expected_channel_instance_key(&manifest, "operations");
+        let support_key = expected_channel_instance_key(&manifest, "support");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+
+        // `operations`: a row whose binding is gone.
+        config
+            .plugins
+            .entries
+            .push(crate::config::schema::PluginEntryConfig {
+                name: operations_key.clone(),
+                config: std::collections::HashMap::from([(
+                    "ca_bundle".to_string(),
+                    "not a real certificate".to_string(),
+                )]),
+                egress_hosts: vec!["irc.example.net".to_string()],
+                egress_allow_private: Vec::new(),
+                tls_profiles: vec![crate::config::schema::PluginTlsProfileConfig {
+                    name: "corp".to_string(),
+                    hosts: vec!["irc.example.net".to_string()],
+                    system_roots: true,
+                    custom_ca_secret: Some("ca_bundle".to_string()),
+                    client_certificate_secret: None,
+                    client_private_key_secret: None,
+                }],
+            });
+        config.mark_dirty(&format!("plugins.entries.{operations_key}"));
+        // `support`: a binding with no row.
+        bind_channel_alias(&mut config, "support", "irc-bridge", true);
+        config.mark_dirty("channels.plugin.support");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("write the starting config");
+        let before = std::fs::read_to_string(&config.config_path).expect("read config");
+        assert!(
+            before.contains("enc2:") && before.contains("corp"),
+            "premise: the row holds an encrypted value and a TLS profile:\n{before}"
+        );
+        let row_before = table_text(&before, "[[plugins.entries]]");
+        let binding_before = table_text(&before, "[channels.plugin.support]");
+
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "operations",
+            None,
+        ))
+        .await
+        .expect("an existing row needs no decision");
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "support",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("the missing row is created");
+
+        let after = std::fs::read_to_string(&config.config_path).expect("read config");
+        assert_eq!(
+            table_text(&after, "[[plugins.entries]]"),
+            row_before,
+            "the existing row keeps its bytes:\n{after}"
+        );
+        assert_eq!(
+            table_text(&after, "[channels.plugin.support]"),
+            binding_before,
+            "the existing binding keeps its bytes:\n{after}"
+        );
+        assert_eq!(
+            binding_on_disk(&config.config_path, "operations")
+                .and_then(|binding| binding.get("package").cloned()),
+            Some(toml::Value::String("irc-bridge".to_string())),
+            "the missing binding is created"
+        );
+        assert_eq!(
+            entry_names_on_disk(&config.config_path),
+            vec![operations_key, support_key.clone()],
+            "one row per instance, no duplicate"
+        );
+        assert_eq!(
+            granted_on_disk(&config.config_path, &support_key),
+            vec!["irc.example.net"]
+        );
+    }
+
+    /// An existing row is never extended, whatever the flags: a script that
+    /// always passes `--egress declared` cannot widen a grant. The row keeps
+    /// its empty grant, the declaration difference is printed with the command
+    /// that applies it, and the flag is reported as not applied.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_never_extends_an_existing_row_even_with_declared() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed
+            .host
+            .manifest("chat-bridge")
+            .expect("installed")
+            .clone();
+        let key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config
+            .plugins
+            .entries
+            .push(crate::config::schema::PluginEntryConfig {
+                name: key.clone(),
+                config: std::collections::HashMap::new(),
+                egress_hosts: Vec::new(),
+                egress_allow_private: Vec::new(),
+                tls_profiles: Vec::new(),
+            });
+        config.mark_dirty(&format!("plugins.entries.{key}"));
+        Box::pin(config.save_dirty())
+            .await
+            .expect("write the starting config");
+
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("bind");
+
+        assert!(
+            config.plugins.entry_egress(&key).0.is_empty(),
+            "the existing grant stays empty"
+        );
+        assert!(granted_on_disk(&config.config_path, &key).is_empty());
+        let name = "chat-bridge (plugin.operations)";
+        for expected in [
+            format!(
+                "  {}",
+                ta(
+                    "cli-plugin-egress-added",
+                    &[("host", "api.example.com")],
+                    ""
+                )
+            ),
+            ta("cli-plugin-egress-never-extended", &[("name", name)], ""),
+            ta(
+                "cli-plugin-channel-egress-flag-ignored",
+                &[("alias", "operations")],
+                "",
+            ),
+        ] {
+            assert!(
+                lines.contains(&expected),
+                "missing {expected:?}: {lines:#?}"
+            );
+        }
+        assert!(
+            !lines.contains(&ta("cli-plugin-config-entry-seeded", &[("name", &key)], "")),
+            "nothing was seeded: {lines:#?}"
+        );
+    }
+
+    /// Another package's alias is never taken over: the refusal names the
+    /// owner, and config, in memory and on disk, is left as it was.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_refuses_an_alias_owned_by_another_package_and_changes_nothing() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        bind_channel_alias(&mut config, "operations", "other-bridge", true);
+        config.mark_dirty("channels.plugin.operations");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("write the starting config");
+        let before = std::fs::read(&config.config_path).expect("read config");
+
+        let error = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect_err("another package's alias is refused");
+
+        assert_eq!(
+            error.to_string(),
+            ta(
+                "cli-plugin-channel-alias-owned",
+                &[
+                    ("alias", "operations"),
+                    ("owner", "other-bridge"),
+                    ("name", "chat-bridge"),
+                ],
+                "",
+            )
+        );
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config"),
+            before
+        );
+        assert_eq!(config.channels.plugin["operations"].package, "other-bridge");
+        assert!(config.plugins.entries.is_empty() && config.dirty_paths.is_empty());
+
+        // The owner is another binding's `package`, config text validation
+        // only warns about, so the refusal prints it escaped.
+        let hostile = "evil\u{1b}[31mRED";
+        bind_channel_alias(&mut config, "billing", hostile, true);
+        let error = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "billing",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect_err("another package's alias is refused");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(&hostile.escape_debug().to_string()) && !rendered.contains('\u{1b}'),
+            "the owner reaches the terminal escaped: {rendered:?}"
+        );
+    }
+
+    /// The two refusals the ceremony reaches before it checks the alias
+    /// grammar, a package without the `channel` capability and an alias the
+    /// grammar rejects, print the alias as typed escaped, inside the
+    /// grammar's reason as well.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn binding_refusals_before_the_alias_grammar_print_the_alias_escaped() {
+        use crate::plugins::channel_instance::BindingRefusal;
+
+        let hostile = "ops\u{202e}team";
+        let escaped = hostile.escape_debug().to_string();
+        let reason = zeroclaw_config::helpers::validate_alias_key(hostile)
+            .expect_err("the alias grammar refuses a format character");
+        for refusal in [
+            BindingRefusal::NotAChannelPackage,
+            BindingRefusal::InvalidAlias(reason),
+        ] {
+            let line = binding_refusal_line("chat-bridge", hostile, &refusal);
+            assert!(
+                line.contains(&escaped) && !line.contains('\u{202e}'),
+                "{refusal:?} prints the alias escaped: {line:?}"
+            );
+        }
+    }
+
+    /// A section the loader dropped is never written over. A malformed
+    /// `plugins`, `channels`, `channels.plugin` or alias table, or a config
+    /// that failed to load at all, refuses the ceremony before any write; a
+    /// dropped table of another alias does not.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_refuses_a_degraded_plugins_or_channels_section() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+
+        for (security, section) in [
+            (false, "plugins"),
+            (false, "channels"),
+            (false, "channels.plugin"),
+            (false, "channels.plugin.operations"),
+            (true, crate::config::migration::WHOLE_CONFIG_SENTINEL),
+        ] {
+            let tmp = tempfile::tempdir().expect("config dir");
+            let mut config = config_in_dir(tmp.path());
+            if security {
+                config.degraded_security.push(section.to_string());
+            } else {
+                config.degraded_sections.push(section.to_string());
+            }
+            let before = std::fs::read(&config.config_path).expect("read config");
+
+            let error = Box::pin(bind_channel_instance(
+                &mut config,
+                &installed.host,
+                "chat-bridge",
+                "operations",
+                Some(EgressDecision::SeedDeclared),
+            ))
+            .await
+            .expect_err("a degraded section refuses the ceremony");
+
+            assert_eq!(
+                error.to_string(),
+                ta(
+                    "cli-plugin-channel-config-degraded",
+                    &[("alias", "operations"), ("section", section)],
+                    "",
+                )
+            );
+            assert_eq!(
+                std::fs::read(&config.config_path).expect("read config"),
+                before,
+                "{section}: nothing is written"
+            );
+            assert!(
+                config.channels.plugin.is_empty() && config.plugins.entries.is_empty(),
+                "{section}: nothing changes in memory"
+            );
+        }
+
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config
+            .degraded_sections
+            .push("channels.plugin.support".to_string());
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("another alias's dropped table does not block this binding");
+        assert!(binding_on_disk(&config.config_path, "operations").is_some());
+    }
+
+    /// Instances never read each other's rows. Alias `operations` holds an
+    /// operator-authored grant and the mixed package's tool row another;
+    /// binding `support` grants the new row the manifest's declaration and
+    /// nothing else, and leaves both other rows as they were.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_seeds_alias_b_from_the_manifest_only_never_from_alias_a_or_the_tool_row() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed
+            .host
+            .manifest("chat-bridge")
+            .expect("installed")
+            .clone();
+        let tool_key = expected_instance_key(&manifest);
+        let operations_key = expected_channel_instance_key(&manifest, "operations");
+        let support_key = expected_channel_instance_key(&manifest, "support");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let row = |name: &str, hosts: &[&str]| crate::config::schema::PluginEntryConfig {
+            name: name.to_string(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        };
+        config.plugins.entries = vec![
+            row(&tool_key, &["tool.example.net"]),
+            row(&operations_key, &["api.example.com", "gitea.a.example.net"]),
+        ];
+        bind_channel_alias(&mut config, "operations", "chat-bridge", true);
+
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "support",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("bind support");
+
+        assert_eq!(
+            config.plugins.entry_egress(&support_key).0,
+            vec!["api.example.com".to_string()],
+            "the new row gets the declaration only"
+        );
+        assert_eq!(
+            granted_on_disk(&config.config_path, &support_key),
+            vec!["api.example.com"]
+        );
+        assert_eq!(
+            config.plugins.entry_egress(&operations_key).0,
+            vec![
+                "api.example.com".to_string(),
+                "gitea.a.example.net".to_string()
+            ],
+            "alias A's grant is untouched"
+        );
+        assert_eq!(
+            config.plugins.entry_egress(&tool_key).0,
+            vec!["tool.example.net".to_string()],
+            "the tool row's grant is untouched"
+        );
+    }
+
+    /// The required keys, in schema order: a missing secret and a missing
+    /// plain key each get the exact `config set` command, which prompts for
+    /// the value rather than taking it on the command line; a publisher's
+    /// hostile property name gets no command, only the row to edit. Once set,
+    /// each key reads `set` and no value is ever printed. A value the schema
+    /// refuses is reported through the resolver's message, whose property
+    /// name, publisher text holding a bidirectional override, is escaped.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_prints_required_keys_with_commands_only_for_addressable_names_and_never_values() {
+        use crate::plugins::channel_instance::config_set_command_for;
+        use crate::plugins::egress_ceremony::ShellDialect;
+
+        let installed = install_package(
+            r#"name = "chat-bridge"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+permissions = ["socket_client", "config_read"]
+
+[config_schema]
+type = "object"
+additionalProperties = false
+required = ["api_token", "label", "$(id)"]
+
+[config_schema.properties.api_token]
+type = "string"
+x-secret = true
+
+[config_schema.properties.label]
+type = "string"
+
+[config_schema.properties."$(id)"]
+type = "string"
+
+[config_schema.properties."note\u202E"]
+type = "string"
+maxLength = 1
+"#,
+        );
+        let manifest = installed
+            .host
+            .manifest("chat-bridge")
+            .expect("installed")
+            .clone();
+        let key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            None,
+        ))
+        .await
+        .expect("nothing is declared, so no decision is needed");
+
+        let command_for = |name: &str| {
+            config_set_command_for(
+                ShellDialect::host(),
+                egress_command_config_dir(&config),
+                &format!("plugins.entries.{key}.config.{name}"),
+                None,
+            )
+        };
+        let expected = [
+            ta(
+                "cli-plugin-channel-required-config",
+                &[("alias", "operations"), ("count", "3")],
+                "",
+            ),
+            format!(
+                "  {}",
+                ta(
+                    "cli-plugin-channel-required-secret-missing",
+                    &[("key", "api_token"), ("command", &command_for("api_token"))],
+                    "",
+                )
+            ),
+            format!(
+                "  {}",
+                ta(
+                    "cli-plugin-channel-required-key-missing",
+                    &[("key", "label"), ("command", &command_for("label"))],
+                    "",
+                )
+            ),
+            format!(
+                "  {}",
+                ta(
+                    "cli-plugin-channel-required-key-unaddressable",
+                    &[("key", "$(id)"), ("row", &key)],
+                    "",
+                )
+            ),
+        ];
+        let at = lines
+            .iter()
+            .position(|line| line == &expected[0])
+            .unwrap_or_else(|| panic!("the required keys are listed: {lines:#?}"));
+        assert_eq!(&lines[at..at + expected.len()], &expected, "{lines:#?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("config.$(id)")),
+            "a hostile property name never reaches a command: {lines:#?}"
+        );
+
+        let values = [
+            ("api_token", "SECRET-VALUE-4f1d"),
+            ("label", "LABEL-VALUE-8c2e"),
+            ("$(id)", "HOSTILE-VALUE-6b3a"),
+        ];
+        let entry = config
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == key)
+            .expect("the ceremony created the row");
+        for (name, value) in values {
+            entry.config.insert(name.to_string(), value.to_string());
+        }
+        let lines = channel_instance_readiness_lines(
+            &config,
+            &installed.host,
+            installed.host.manifest("chat-bridge").expect("installed"),
+            "operations",
+            true,
+        );
+        for (name, _) in values {
+            assert!(
+                lines.contains(&format!(
+                    "  {}",
+                    ta("cli-plugin-channel-required-key-set", &[("key", name)], "")
+                )),
+                "{name} reads set: {lines:#?}"
+            );
+        }
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-config-valid",
+                &[("alias", "operations")],
+                "",
+            )),
+            "the runtime's resolver accepts the row: {lines:#?}"
+        );
+        for (_, value) in values {
+            assert!(
+                !lines.iter().any(|line| line.contains(value)),
+                "no value is ever printed: {lines:#?}"
+            );
+        }
+
+        let entry = config
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == key)
+            .expect("the row is still there");
+        entry.config.insert(
+            "note\u{202e}".to_string(),
+            "TOO-LONG-VALUE-3f1a".to_string(),
+        );
+        let lines = channel_instance_readiness_lines(
+            &config,
+            &installed.host,
+            installed.host.manifest("chat-bridge").expect("installed"),
+            "operations",
+            true,
+        );
+        let error = crate::plugins::channel_instance::config_verdict(
+            installed.host.manifest("chat-bridge").expect("installed"),
+            "operations",
+            config
+                .plugins
+                .entries
+                .iter()
+                .find(|entry| entry.name == key),
+        )
+        .expect_err("the schema refuses the value");
+        assert!(
+            error.contains("note\\u{202e}") && !error.contains('\u{202e}'),
+            "the resolver's message names the property, escaped: {error:?}"
+        );
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-config-invalid",
+                &[("alias", "operations"), ("error", &error)],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains('\u{202e}')),
+            "no line carries the override as written: {lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("TOO-LONG-VALUE-3f1a")),
+            "no value is ever printed: {lines:#?}"
+        );
+    }
+
+    /// A row outlives `plugin remove`, so a reinstall whose manifest owns no
+    /// instance state (no schema, no declared destination, no governed
+    /// transport) can meet a row under the alias's key that still holds
+    /// config values. The runtime reads that row and refuses the values when
+    /// it constructs the instance, so the readiness report runs the same
+    /// verdict on it and prints the config-invalid line, never the value.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn readiness_reports_a_retained_row_that_a_manifest_without_state_refuses() {
+        use crate::plugins::channel_instance::{channel_instance_row, config_verdict};
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &[],
+            &[],
+        ));
+        let manifest = installed.host.manifest("chat-bridge").expect("installed");
+        assert_eq!(
+            channel_instance_row(manifest, "operations").expect("the alias names an instance"),
+            None,
+            "the manifest owns no instance state, so it is owed no row"
+        );
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        bind_channel_alias(&mut config, "operations", "chat-bridge", true);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: expected_channel_instance_key(manifest, "operations"),
+            config: std::collections::HashMap::from([(
+                "api_token".to_string(),
+                "RETAINED-VALUE-5d7e".to_string(),
+            )]),
+            ..crate::config::schema::PluginEntryConfig::default()
+        }];
+
+        let error = config_verdict(manifest, "operations", config.plugins.entries.first())
+            .expect_err("the runtime's resolver refuses values a manifest has no schema for");
+        assert!(error.contains("declares no config_schema"), "{error}");
+        let lines = channel_instance_readiness_lines(
+            &config,
+            &installed.host,
+            manifest,
+            "operations",
+            true,
+        );
+        let at = lines
+            .iter()
+            .position(|line| {
+                *line
+                    == ta(
+                        "cli-plugin-channel-config-invalid",
+                        &[("alias", "operations"), ("error", &error)],
+                        "",
+                    )
+            })
+            .unwrap_or_else(|| panic!("the refusal is reported: {lines:#?}"));
+        // The package's enumeration owns no row for this instance, so no key
+        // line names it elsewhere: the report names the row to delete.
+        let key = expected_channel_instance_key(manifest, "operations");
+        assert_eq!(
+            lines.get(at + 1),
+            Some(&ta(
+                "cli-plugin-channel-retained-row",
+                &[("alias", "operations"), ("key", &key)],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("RETAINED-VALUE-5d7e")),
+            "no value is ever printed: {lines:#?}"
+        );
+    }
+
+    /// A manifest without a `config_schema` that still owns instance state,
+    /// here a governed transport, keeps the instance's row, which holds its
+    /// egress grant. A config value left on that row is refused all the same,
+    /// so the report names the row by its key and says to remove the values
+    /// and keep the row, never to delete it, and never prints the value.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn readiness_reports_retained_values_on_a_row_that_still_holds_the_egress_grant() {
+        use crate::plugins::channel_instance::{channel_instance_row, config_verdict};
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &["irc.example.net"],
+        ));
+        let manifest = installed.host.manifest("irc-bridge").expect("installed");
+        let key = expected_channel_instance_key(manifest, "operations");
+        assert_eq!(
+            channel_instance_row(manifest, "operations")
+                .expect("the alias names an instance")
+                .map(|row| row.key),
+            Some(key.clone()),
+            "a governed transport owns a row"
+        );
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        bind_channel_alias(&mut config, "operations", "irc-bridge", true);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: key.clone(),
+            config: std::collections::HashMap::from([(
+                "api_token".to_string(),
+                "RETAINED-VALUE-9c4b".to_string(),
+            )]),
+            egress_hosts: vec!["irc.example.net".to_string()],
+            ..crate::config::schema::PluginEntryConfig::default()
+        }];
+
+        let error = config_verdict(manifest, "operations", config.plugins.entries.first())
+            .expect_err("the runtime's resolver refuses values a manifest has no schema for");
+        let lines = channel_instance_readiness_lines(
+            &config,
+            &installed.host,
+            manifest,
+            "operations",
+            true,
+        );
+        let at = lines
+            .iter()
+            .position(|line| {
+                *line
+                    == ta(
+                        "cli-plugin-channel-config-invalid",
+                        &[("alias", "operations"), ("error", &error)],
+                        "",
+                    )
+            })
+            .unwrap_or_else(|| panic!("the refusal is reported: {lines:#?}"));
+        let args = [("alias", "operations"), ("key", key.as_str())];
+        assert_eq!(
+            lines.get(at + 1),
+            Some(&ta("cli-plugin-channel-retained-values", &args, "")),
+            "the row is named, with the values to remove: {lines:#?}"
+        );
+        assert!(
+            !lines.contains(&ta("cli-plugin-channel-retained-row", &args, "")),
+            "a row that holds the egress grant is never to be deleted: {lines:#?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("RETAINED-VALUE-9c4b")),
+            "no value is ever printed: {lines:#?}"
+        );
+    }
+
+    /// The activation line is the runtime's own verdict on the binding, one
+    /// unmet precondition at a time, each naming what supplies it. The
+    /// ceremony itself enables nothing and edits no agent.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn readiness_reports_the_runtime_verdict_for_each_unmet_precondition() {
+        use crate::plugins::channel_instance::config_set_command_for;
+        use crate::plugins::egress_ceremony::ShellDialect;
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &[],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "operations",
+            None,
+        ))
+        .await
+        .expect("bind");
+        let config_dir = egress_command_config_dir(&config).to_path_buf();
+        let enable_plugins = config_set_command_for(
+            ShellDialect::host(),
+            &config_dir,
+            "plugins.enabled",
+            Some("true"),
+        );
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-activation-plugins-disabled",
+                &[("alias", "operations"), ("command", &enable_plugins)],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            !config.plugins.enabled && config.agents.is_empty(),
+            "the ceremony never enables the plugin system or edits an agent"
+        );
+
+        let manifest = installed.host.manifest("irc-bridge").expect("installed");
+        let readiness = |config: &crate::config::schema::Config| {
+            channel_instance_readiness_lines(config, &installed.host, manifest, "operations", true)
+        };
+
+        config.plugins.enabled = true;
+        assert!(
+            readiness(&config).contains(&ta(
+                "cli-plugin-channel-activation-no-owner",
+                &[("alias", "operations")],
+                "",
+            )),
+            "{:#?}",
+            readiness(&config)
+        );
+
+        config.agents.insert(
+            "operator".to_string(),
+            crate::config::schema::AliasedAgentConfig {
+                channels: vec![crate::config::providers::ChannelRef::new(
+                    "plugin.operations",
+                )],
+                ..crate::config::schema::AliasedAgentConfig::default()
+            },
+        );
+        config.plugins.max_active_instances = 0;
+        assert!(
+            readiness(&config).contains(&ta(
+                "cli-plugin-channel-activation-over-ceiling",
+                &[("alias", "operations")],
+                "",
+            )),
+            "{:#?}",
+            readiness(&config)
+        );
+
+        config.plugins.max_active_instances = 50;
+        if let Some(binding) = config.channels.plugin.get_mut("operations") {
+            binding.enabled = false;
+        }
+        let enable_binding = config_set_command_for(
+            ShellDialect::host(),
+            &config_dir,
+            "channels.plugin.operations.enabled",
+            Some("true"),
+        );
+        assert!(
+            readiness(&config).contains(&ta(
+                "cli-plugin-channel-activation-binding-disabled",
+                &[("alias", "operations"), ("command", &enable_binding)],
+                "",
+            )),
+            "{:#?}",
+            readiness(&config)
+        );
+    }
+
+    /// With every precondition met the instance is reported ready, the
+    /// declaration the ceremony granted leaves no egress gap, and the note
+    /// that a running daemon needs a restart or reload closes the report.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn readiness_reports_ready_when_every_precondition_holds() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &["irc.example.net"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config.plugins.enabled = true;
+        config.agents.insert(
+            "operator".to_string(),
+            crate::config::schema::AliasedAgentConfig {
+                channels: vec![crate::config::providers::ChannelRef::new(
+                    "plugin.operations",
+                )],
+                ..crate::config::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        let lines = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "irc-bridge",
+            "operations",
+            Some(EgressDecision::SeedDeclared),
+        ))
+        .await
+        .expect("bind");
+
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-permissions",
+                &[("alias", "operations"), ("permissions", "socket_client")],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-activation-ready",
+                &[("alias", "operations")],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines.last(),
+            Some(&ta(
+                "cli-plugin-channel-restart-note",
+                &[("alias", "operations")],
+                "",
+            )),
+            "the restart note closes the report"
+        );
+        let manifest = installed.host.manifest("irc-bridge").expect("installed");
+        assert!(
+            egress_grant_gap_lines(&config, manifest)
+                .expect("gap lines must build")
+                .is_empty(),
+            "`plugin list` agrees: the granted declaration leaves no gap"
+        );
+    }
+
+    /// Install still seeds the default tool binding's row alone. An alias bound
+    /// before the install makes the enumeration yield a channel row too, and
+    /// install must leave that row uncreated rather than grant it the
+    /// declaration unasked.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn install_seeds_no_channel_row_for_an_alias_bound_before_install() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = "name = \"chat-bridge\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\", \"channel\"]\n\
+             permissions = [\"http_client\"]\n\
+             [egress]\n\
+             hosts = [\"api.example.com\"]\n";
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let manifest = manifest_from_toml(manifest_toml);
+
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        bind_channel_alias(&mut config, "operations", "chat-bridge", true);
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let admitted = host
+            .admit_source(source.path().to_str().expect("utf-8 source path"))
+            .expect("admit the source");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            None,
+            |_| {},
+        ))
+        .await
+        .expect("install");
+
+        let row_names: Vec<String> = config
+            .plugins
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(
+            row_names,
+            vec![expected_instance_key(&manifest)],
+            "install seeds the tool row and no channel row"
+        );
+    }
+
+    /// A tool package that declares egress but ships no config schema still
+    /// owns host state — its grant — so it earns an instance row. Master's
+    /// config-schema-only predicate returned nothing for it, which would have
+    /// left the declaration with nowhere to land.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn an_egress_declaration_alone_earns_an_instance_row() {
+        let config = crate::config::schema::Config::default();
+        let declaring = tool_manifest("beacon-tool", &["api.example.com"], false);
+        assert_eq!(
+            install_entries(&config, &declaring).len(),
+            1,
+            "a declared destination needs a row to be granted on"
+        );
+
+        // No schema, no declaration, no network permission: no host-owned
+        // state, no row.
+        let inert = tool_manifest_with("inert-tool", &[], &["memory_read"], false);
+        assert!(
+            install_entries(&config, &inert).is_empty(),
+            "a package owning no host state must not get a row"
+        );
+    }
+
+    /// The SECOND grant path: the plugin whose destination is deployment
+    /// configuration (self-hosted Gitea, LAN Nextcloud). Its author cannot
+    /// declare the host, so it ships a network permission with no `[egress]`
+    /// table and no `config_schema`. It must still get an instance row —
+    /// otherwise the operator has nowhere to author the grant.
+    ///
+    /// The second half pins *why* the row is required: without one, the dotted
+    /// path does not resolve, so `zeroclaw config set
+    /// plugins.entries.<key>.egress_hosts` cannot create the grant either.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_network_permission_alone_earns_a_row_so_the_operator_can_grant_reach() {
+        let defaults = crate::config::schema::Config::default();
+        for permission in ["http_client", "websocket_client", "socket_client"] {
+            let manifest = tool_manifest_with("gitea-tool", &[], &[permission], false);
+            let entries = install_entries(&defaults, &manifest);
+            assert_eq!(
+                entries.len(),
+                1,
+                "{permission} alone must earn a row the operator can grant on"
+            );
+        }
+
+        let manifest = tool_manifest_with("gitea-tool", &[], &["http_client"], false);
+        let instance_key = expected_instance_key(&manifest);
+        let entries = install_entries(&defaults, &manifest);
+
+        // Before the row exists the grant is unaddressable — this is the
+        // dead-end the widened predicate exists to prevent.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut bare = config_in_dir(tmp.path());
+        assert!(
+            bare.set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                "gitea.internal.example.com",
+            )
+            .is_err(),
+            "without a seeded row the egress path must not resolve"
+        );
+
+        // After install seeds it, the operator's own grant lands on the row.
+        let mut config = config_in_dir(tmp.path());
+        seed_plugin_config_entries(&mut config, "gitea-tool", &entries, &manifest.egress.hosts)
+            .await
+            .expect("seeding must succeed");
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("a network-permitted tool must get a row");
+        assert!(
+            entry.egress_hosts.is_empty(),
+            "the row starts deny-everything: {:?}",
+            entry.egress_hosts
+        );
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                "gitea.internal.example.com",
+            )
+            .expect("the operator must be able to author the grant on the seeded row");
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(granted, vec!["gitea.internal.example.com".to_string()]);
+    }
+
+    /// A declaration without a transport never becomes a grant, including
+    /// after a later version adds one. Version 1 declares a host but asks for
+    /// no network permission: install creates its row (the declaration makes
+    /// it host state) and leaves the grant empty. `plugin remove` keeps the
+    /// row, so version 2, which adds `http_client` with the same declaration,
+    /// meets an existing row, and an existing row is never extended. The host
+    /// stays ungranted until the operator grants it.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_transportless_declaration_does_not_become_reach_when_a_later_version_adds_http() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let write_source = |permissions: &str| {
+            let manifest_toml = format!(
+                "name = \"dormant-tool\"\n\
+                 version = \"1.0.0\"\n\
+                 wasm_path = \"plugin.wasm\"\n\
+                 capabilities = [\"tool\"]\n\
+                 permissions = [{permissions}]\n\
+                 [egress]\n\
+                 hosts = [\"api.example.com\"]\n"
+            );
+            let source = tempfile::tempdir().expect("source dir");
+            std::fs::write(source.path().join("manifest.toml"), &manifest_toml)
+                .expect("write manifest");
+            std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+            (source, manifest_from_toml(&manifest_toml))
+        };
+        let grant_of = |config: &crate::config::schema::Config, key: &str| {
+            config
+                .plugins
+                .entries
+                .iter()
+                .find(|e| e.name == key)
+                .map(|e| e.egress_hosts.clone())
+        };
+
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+
+        // v1: declares a host, no transport.
+        let (v1_source, v1) = write_source("");
+        let key = expected_instance_key(&v1);
+        let admitted = host
+            .admit_source(v1_source.path().to_str().unwrap())
+            .expect("admit v1");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            None,
+            |_| {},
+        ))
+        .await
+        .expect("install v1");
+        assert_eq!(
+            grant_of(&config, &key),
+            Some(Vec::new()),
+            "v1 gets a row but no grant: it has no transport to use one"
+        );
+
+        // Remove v1; its row stays, as `plugin remove` leaves config alone.
+        host.remove("dormant-tool").expect("remove v1");
+
+        // v2: same declaration, now with http_client.
+        let (v2_source, v2) = write_source("\"http_client\"");
+        assert_eq!(expected_instance_key(&v2), key, "same package, same row");
+        let admitted = host
+            .admit_source(v2_source.path().to_str().unwrap())
+            .expect("admit v2");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            None,
+            |_| {},
+        ))
+        .await
+        .expect("install v2");
+        assert_eq!(
+            grant_of(&config, &key),
+            Some(Vec::new()),
+            "adding http_client must not turn the earlier declaration into reach"
+        );
+    }
+
+    /// REGRESSION (grant ceremony, rollback half): a fresh `plugin install`
+    /// whose config seeding fails must leave NO package behind. The publish and
+    /// the seed are one transaction, so on a seed failure the just-published
+    /// package is rolled back — the plugins directory and the host's loaded set
+    /// are left clean, and a second install of the same source is a normal
+    /// fresh install rather than an `AlreadyLoaded` dead end forcing a manual
+    /// removal.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_failed_seed_rolls_the_published_package_back_so_retry_is_a_fresh_install() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        // A real installable package: a manifest that owns host state (a
+        // declared destination plus a network permission) so seeding creates a
+        // row, and a stub wasm so the copy step runs.
+        let manifest_toml = "name = \"rollback-probe\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\"]\n\
+             permissions = [\"http_client\"]\n\
+             [egress]\n\
+             hosts = [\"api.example.com\"]\n";
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source
+            .path()
+            .to_str()
+            .expect("utf-8 source path")
+            .to_string();
+
+        let manifest = manifest_from_toml(manifest_toml);
+        let instance_key = expected_instance_key(&manifest);
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+
+        // ── First install: force the seed phase to fail ──
+        // A dirty path that resolves against neither live config nor the on-disk
+        // doc makes `save_dirty` fail deterministically at apply time — in
+        // memory, cross-platform, with no unwritable-filesystem trick.
+        let dir1 = tempfile::tempdir().expect("config dir 1");
+        let mut config1 = config_in_dir(dir1.path());
+        config1.mark_dirty("cost.rates.providers.models.openai.ghost-model.input_per_mtok");
+
+        let admitted = host.admit_source(&source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config1,
+            admitted,
+            None,
+            |_name| {},
+        ))
+        .await
+        .expect_err("seeding must fail on the poisoned dirty path");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("rolled back"),
+            "the failure must report the rollback: {rendered}"
+        );
+        assert!(
+            !rendered.contains("AlreadyLoaded"),
+            "a fresh install that fails to seed must not surface AlreadyLoaded: {rendered}"
+        );
+
+        // The rollback left nothing behind: no directory, no loaded entry.
+        assert!(
+            !plugins.path().join("rollback-probe").exists(),
+            "the published package directory must be removed on seed failure"
+        );
+        assert!(
+            host.get_plugin("rollback-probe").is_none(),
+            "the loaded set must not retain a rolled-back package"
+        );
+
+        // ── Retry with a clean config: a normal fresh install ──
+        let dir2 = tempfile::tempdir().expect("config dir 2");
+        let mut config2 = config_in_dir(dir2.path());
+        let admitted = host.admit_source(&source_arg).expect("admit the source");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config2,
+            admitted,
+            None,
+            |_name| {},
+        ))
+        .await
+        .expect("retry of the same source must be a normal fresh install, not AlreadyLoaded");
+
+        assert!(
+            host.get_plugin("rollback-probe").is_some(),
+            "the retry must publish the package"
+        );
+        assert!(
+            plugins.path().join("rollback-probe").exists(),
+            "the retry must leave the package on disk"
+        );
+        assert!(
+            config2
+                .plugins
+                .entries
+                .iter()
+                .any(|e| e.name == instance_key),
+            "the retry must seed the instance-key row"
+        );
+    }
+
+    /// REGRESSION (unsupported beta config): removing a pre-typed plugin leaves
+    /// its package-name config row behind. Reinstall must refuse before it
+    /// creates a second, canonical row, print the same ordered update guidance
+    /// as `plugin list`, and roll the package publication back. The unsupported
+    /// row remains untouched for the operator to update deliberately.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn reinstall_refuses_a_legacy_row_without_creating_or_mutating_config() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = r#"name = "weather-tool"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.api_key]
+type = "string"
+x-secret = true
+
+[egress]
+hosts = ["api.example.com", "api2.example.com"]
+"#;
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source.path().to_str().expect("utf-8 source path");
+
+        let manifest = manifest_from_toml(manifest_toml);
+        let instance_key = expected_instance_key(&manifest);
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let config_path = config.config_path.clone();
+        let operator_host = "gitea.internal.example.com";
+        let mut legacy =
+            legacy_package_named_entry("weather-tool", &["api.example.com", operator_host]);
+        legacy.egress_allow_private = vec![operator_host.to_string()];
+        config.plugins.entries.push(legacy);
+        config.mark_dirty("plugins.entries.weather-tool");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("the legacy row must exist on disk before reinstall");
+        let before = std::fs::read_to_string(&config_path).expect("read legacy config");
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let announced = std::cell::Cell::new(false);
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            None,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("an unsupported package-name row must refuse reinstall");
+        let rendered = format!("{err:#}");
+        assert!(
+            !announced.get(),
+            "a refused install must never announce success before rolling back"
+        );
+        assert!(
+            rendered.contains(&crate::plugins::egress_ceremony::zeroclaw_invocation_for(
+                crate::plugins::egress_ceremony::ShellDialect::host(),
+                config_dir.path()
+            )),
+            "the printed grant command must address the configuration the install \
+             ran against: {rendered}"
+        );
+
+        assert!(
+            rendered.contains("rolled back"),
+            "the error must say the attempted package publication was undone: {rendered}"
+        );
+        assert!(
+            rendered.contains("weather-tool") && rendered.contains(&instance_key),
+            "the warning must name the unsupported row and canonical key: {rendered}"
+        );
+        let update_at = rendered
+            .find("rename")
+            .expect("the first update step must describe the row rename");
+        let grant_at = rendered
+            .find("config set plugins.entries")
+            .expect("the second update step must carry the grant command");
+        assert!(
+            update_at < grant_at,
+            "the update step must precede the grant command: {rendered}"
+        );
+        assert!(
+            host.get_plugin("weather-tool").is_none(),
+            "the refused install must not leave the package loaded"
+        );
+        assert!(
+            !plugins.path().join("weather-tool").exists(),
+            "the refused install must remove the published package directory"
+        );
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "refusal must not append a canonical row: {:?}",
+            config
+                .plugins
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let entry = &config.plugins.entries[0];
+        assert_eq!(entry.name, "weather-tool");
+        assert_eq!(
+            entry.config.get("api_key").map(String::as_str),
+            Some("operator-secret"),
+            "private config must remain untouched"
+        );
+        assert_eq!(
+            entry.egress_hosts,
+            vec!["api.example.com".to_string(), operator_host.to_string()],
+            "reinstall must not replace or widen the unsupported row's grant"
+        );
+        assert_eq!(
+            entry.egress_allow_private,
+            vec![operator_host.to_string()],
+            "the private-address carve-out must remain untouched"
+        );
+        assert!(
+            !config
+                .plugins
+                .entries
+                .iter()
+                .any(|candidate| candidate.name == instance_key),
+            "refusal must happen before canonical-row creation"
+        );
+        assert_eq!(
+            config.plugins.entry_egress(&instance_key),
+            (Vec::new(), Vec::new()),
+            "no canonical runtime state may be materialized"
+        );
+
+        let after = std::fs::read_to_string(&config_path).expect("read refused config");
+        assert_eq!(
+            after, before,
+            "the failed install must leave the on-disk beta config byte-identical"
+        );
+    }
+
+    /// REGRESSION (install follows `plugin list`'s deployment contract): a
+    /// stranded package-name row *and* a deployment the runtime refuses
+    /// outright. The legacy-install refusal must report the deployment paths
+    /// once and print no rename-then-grant steps, because no row command can
+    /// take effect until the deployment is fixed. Install is still refused and
+    /// still rolled back, announcing nothing.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn reinstall_under_a_deployment_wide_refusal_reports_the_deployment_once_without_row_steps()
+     {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = r#"name = "weather-tool"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.api_key]
+type = "string"
+x-secret = true
+
+[egress]
+hosts = ["api.example.com", "api2.example.com"]
+"#;
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source.path().to_str().expect("utf-8 source path");
+
+        let manifest = manifest_from_toml(manifest_toml);
+        let instance_key = expected_instance_key(&manifest);
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(config_dir.path());
+        let config_path = config.config_path.clone();
+        config.plugins.entries.push(legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com"],
+        ));
+        config.security.nat64_prefixes = vec!["2001:db8::/97".to_string()];
+        config.mark_dirty("plugins.entries.weather-tool");
+        config.mark_dirty("security.nat64_prefixes");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("the legacy row must exist on disk before reinstall");
+        let before = std::fs::read_to_string(&config_path).expect("read legacy config");
+        assert!(
+            !runtime_accepts_row(&config, &instance_key),
+            "premise: the runtime refuses every policy under a malformed prefix list"
+        );
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let announced = std::cell::Cell::new(false);
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            None,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("a stranded row must refuse reinstall under a deployment refusal too");
+        let rendered = format!("{err:#}");
+
+        assert!(
+            rendered.contains("security.nat64_prefixes")
+                && rendered.contains("max_connections_per_instance"),
+            "the refusal must name the deployment paths that fix it: {rendered}"
+        );
+        assert!(
+            !rendered.contains("config set plugins.entries") && !rendered.contains("rename"),
+            "no rename or grant step may print under a deployment-wide refusal, \
+             exactly as `plugin list` prints none: {rendered}"
+        );
+        assert!(
+            rendered.contains("rolled back"),
+            "the attempted publish must still be undone: {rendered}"
+        );
+        assert!(
+            !announced.get(),
+            "a refused install must not announce success"
+        );
+        assert!(
+            host.get_plugin("weather-tool").is_none()
+                && !plugins.path().join("weather-tool").exists(),
+            "the refused install must leave no package behind"
+        );
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "refusal must not append a canonical row"
+        );
+        let after = std::fs::read_to_string(&config_path).expect("read refused config");
+        assert_eq!(after, before, "the on-disk config must be byte-identical");
+
+        // Fix the deployment: the same reinstall now prints the ordered
+        // rename-then-grant steps it always did.
+        config.security.nat64_prefixes.clear();
+        let admitted = host.admit_source(source_arg).expect("admit the source");
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            None,
+            |_name| announced.set(true),
+        ))
+        .await
+        .expect_err("the stranded row still refuses reinstall");
+        let rendered = format!("{err:#}");
+        let rename_at = rendered.find("rename").expect("the rename step returns");
+        let grant_at = rendered
+            .find("zeroclaw --config-dir")
+            .expect("the grant step returns, addressing this configuration");
+        assert!(
+            rename_at < grant_at,
+            "rename precedes the grant: {rendered}"
+        );
+        assert!(!announced.get());
+    }
+
+    /// REGRESSION (two profiles, one canonical key): the printed grant command
+    /// must act on the configuration the operator inspected. `--config-dir` is
+    /// process-local, so a command that omitted it would, pasted into the
+    /// operator's shell, address the ambient profile — and the canonical row
+    /// key is identical across profiles, so it would replace *that* profile's
+    /// allowlist with a list computed from this one. Applying the printed
+    /// command through the real setter against the directory it names changes
+    /// profile A and leaves profile B's grant byte-for-byte intact.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn the_printed_command_targets_the_inspected_profile_and_leaves_the_other_alone() {
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        let row = |hosts: &[&str]| crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        };
+
+        let dir_a = tempfile::tempdir().expect("profile a");
+        let mut profile_a = config_in_dir(dir_a.path());
+        profile_a.plugins.entries = vec![row(&["api.example.com"])];
+        profile_a.mark_dirty(&format!("plugins.entries.{instance_key}"));
+        Box::pin(profile_a.save_dirty())
+            .await
+            .expect("save profile a");
+
+        let dir_b = tempfile::tempdir().expect("profile b");
+        let mut profile_b = config_in_dir(dir_b.path());
+        profile_b.plugins.entries = vec![row(&["api.example.com", "gitea.b.example.net"])];
+        profile_b.mark_dirty(&format!("plugins.entries.{instance_key}"));
+        Box::pin(profile_b.save_dirty())
+            .await
+            .expect("save profile b");
+        let b_before = std::fs::read_to_string(&profile_b.config_path).expect("read b");
+
+        // Both surfaces that print a grant command for profile A.
+        let install_lines = existing_egress_grant_lines(
+            &profile_a,
+            "weather-tool",
+            &instance_key,
+            &manifest.egress.hosts,
+        );
+        let list_lines =
+            egress_grant_gap_lines(&profile_a, &manifest).expect("gap lines must build");
+        use crate::plugins::egress_ceremony::{ShellDialect, zeroclaw_invocation_for};
+        let invocation_a = zeroclaw_invocation_for(ShellDialect::host(), dir_a.path());
+        let invocation_b = zeroclaw_invocation_for(ShellDialect::host(), dir_b.path());
+        for (surface, lines) in [("install", &install_lines), ("list", &list_lines)] {
+            let command = lines
+                .iter()
+                .find(|line| line.contains("config set"))
+                .unwrap_or_else(|| panic!("{surface} must print the grant command: {lines:?}"));
+            assert!(
+                command.contains(&invocation_a),
+                "{surface}'s command must address profile A's directory: {command}"
+            );
+            assert!(
+                !command.contains(&invocation_b)
+                    && !command.contains(&dir_b.path().to_string_lossy().to_string()),
+                "{surface}'s command must not mention profile B: {command}"
+            );
+            // The directory the command names is exactly the one it was
+            // computed against, so the operator's shell resolves the same
+            // profile this process did.
+            let named = command
+                .split("--config-dir '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .expect("the command carries a quoted --config-dir");
+            assert_eq!(std::path::Path::new(named), dir_a.path());
+        }
+
+        // Apply the printed value through the real setter against the
+        // directory the command names: A grows, B is untouched.
+        let command = install_lines
+            .iter()
+            .find(|line| line.contains("config set"))
+            .expect("install prints the command");
+        profile_a
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                &printed_command_value(command),
+            )
+            .expect("the printed value must apply through the real setter");
+        Box::pin(profile_a.save_dirty())
+            .await
+            .expect("save profile a");
+        assert_eq!(
+            profile_a.plugins.entry_egress(&instance_key).0,
+            vec![
+                "api.example.com".to_string(),
+                "api2.example.com".to_string()
+            ]
+        );
+        let b_after = std::fs::read_to_string(&profile_b.config_path).expect("read b");
+        assert_eq!(b_after, b_before, "profile B must be byte-identical");
+        assert!(
+            b_after.contains("gitea.b.example.net"),
+            "premise: profile B's operator-only grant is on disk: {b_after}"
+        );
+    }
+
+    /// `plugin install --channel-alias` binds the channel instance inside the
+    /// install transaction: the mixed package's tool row is seeded by its own
+    /// rule, the binding and the channel row by the binding ceremony, and one
+    /// save persists all three.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_with_channel_alias_binds_and_seeds_in_one_save() {
+        use crate::plugins::channel_instance::EgressDecision;
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = package_manifest_toml(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["http_client"],
+            &["api.example.com"],
+        );
+        let source = write_plugin_source(&manifest_toml);
+        let manifest = manifest_from_toml(&manifest_toml);
+        let tool_key = expected_instance_key(&manifest);
+        let channel_key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let admitted = host
+            .admit_source(source.path().to_str().expect("utf-8 source path"))
+            .expect("admit the source");
+        let announced = std::cell::Cell::new(false);
+
+        let lines = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            Some(ChannelBindingRequest {
+                alias: "operations".to_string(),
+                egress: Some(EgressDecision::SeedDeclared),
+            }),
+            |_| announced.set(true),
+        ))
+        .await
+        .expect("install");
+
+        assert!(announced.get() && host.get_plugin("chat-bridge").is_some());
+        assert_eq!(config.channels.plugin.len(), 1, "one binding");
+        assert_eq!(
+            binding_on_disk(&config.config_path, "operations")
+                .and_then(|binding| binding.get("package").cloned()),
+            Some(toml::Value::String("chat-bridge".to_string()))
+        );
+        // One save applies its dirty paths in no fixed order, so the rows it
+        // creates together land on disk in either order.
+        let mut rows_on_disk = entry_names_on_disk(&config.config_path);
+        rows_on_disk.sort();
+        let mut expected_rows = vec![tool_key.clone(), channel_key.clone()];
+        expected_rows.sort();
+        assert_eq!(
+            rows_on_disk, expected_rows,
+            "the tool row and one channel row"
+        );
+        for key in [&tool_key, &channel_key] {
+            assert_eq!(
+                granted_on_disk(&config.config_path, key),
+                vec!["api.example.com"],
+                "each row is granted its declaration: {key}"
+            );
+        }
+        assert!(config.dirty_paths.is_empty(), "the one save wrote it all");
+        assert_eq!(
+            lines.first(),
+            Some(&ta(
+                "cli-plugin-channel-bound",
+                &[("alias", "operations"), ("name", "chat-bridge")],
+                "",
+            ))
+        );
+        assert_eq!(
+            lines.last(),
+            Some(&ta(
+                "cli-plugin-channel-restart-note",
+                &[("alias", "operations")],
+                "",
+            )),
+            "the channel report ends with the readiness block"
+        );
+    }
+
+    /// A channel request the binding ceremony would refuse fails the install
+    /// before the load check and before anything is published: no package
+    /// directory, no loaded plugin, no announcement, and config untouched.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_with_channel_alias_refuses_before_publish_when_the_decision_is_missing() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let source = write_plugin_source(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let before = std::fs::read(&config.config_path).expect("read config");
+        let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let admitted = host
+            .admit_source(source.path().to_str().expect("utf-8 source path"))
+            .expect("admit the source");
+        let announced = std::cell::Cell::new(false);
+
+        let error = Box::pin(install_admitted_source(
+            &mut host,
+            &mut config,
+            admitted,
+            Some(ChannelBindingRequest {
+                alias: "operations".to_string(),
+                egress: None,
+            }),
+            limits,
+            // The load check is on, and the stub component would fail it, so
+            // the refusal below proves the pre-check comes first.
+            false,
+            |_| announced.set(true),
+        ))
+        .await
+        .expect_err("a missing decision refuses the install");
+
+        assert_eq!(
+            error.to_string(),
+            ta(
+                "cli-plugin-channel-egress-decision-required",
+                &[
+                    ("name", "chat-bridge"),
+                    ("alias", "operations"),
+                    ("count", "1"),
+                    ("hosts", "api.example.com"),
+                ],
+                "",
+            )
+        );
+        assert!(
+            !plugins.path().join("chat-bridge").exists(),
+            "nothing was published"
+        );
+        assert!(host.get_plugin("chat-bridge").is_none());
+        assert!(!announced.get());
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config"),
+            before
+        );
+        assert!(config.channels.plugin.is_empty() && config.plugins.entries.is_empty());
+    }
+
+    /// The install transaction covers the channel binding. A save that fails
+    /// after the package is published rolls the package back and persists
+    /// neither the tool row nor the binding nor the channel row; a retry
+    /// against a clean config is a fresh install that binds exactly once.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_seed_failure_with_a_channel_request_rolls_back_and_persists_nothing_and_retry_binds_once()
+     {
+        use crate::plugins::channel_instance::EgressDecision;
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml = package_manifest_toml(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["http_client"],
+            &["api.example.com"],
+        );
+        let source = write_plugin_source(&manifest_toml);
+        let source_arg = source
+            .path()
+            .to_str()
+            .expect("utf-8 source path")
+            .to_string();
+        let manifest = manifest_from_toml(&manifest_toml);
+        let channel_key = expected_channel_instance_key(&manifest, "operations");
+        let request = || {
+            Some(ChannelBindingRequest {
+                alias: "operations".to_string(),
+                egress: Some(EgressDecision::SeedDeclared),
+            })
+        };
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+
+        // The one save fails on a dirty path that resolves nowhere, as in the
+        // tool-only rollback test.
+        let dir1 = tempfile::tempdir().expect("config dir 1");
+        let mut config1 = config_in_dir(dir1.path());
+        let before = std::fs::read(&config1.config_path).expect("read config");
+        config1.mark_dirty("cost.rates.providers.models.openai.ghost-model.input_per_mtok");
+        let announced = std::cell::Cell::new(false);
+        let admitted = host.admit_source(&source_arg).expect("admit the source");
+        let error = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config1,
+            admitted,
+            request(),
+            |_| announced.set(true),
+        ))
+        .await
+        .expect_err("the save fails on the poisoned dirty path");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("rolled back"), "{rendered}");
+        assert!(!announced.get(), "a rolled-back install never announces");
+        assert!(
+            !plugins.path().join("chat-bridge").exists()
+                && host.get_plugin("chat-bridge").is_none(),
+            "the published package is rolled back"
+        );
+        assert_eq!(
+            std::fs::read(&config1.config_path).expect("read config"),
+            before,
+            "nothing is persisted: no tool row, no binding, no channel row"
+        );
+
+        let dir2 = tempfile::tempdir().expect("config dir 2");
+        let mut config2 = config_in_dir(dir2.path());
+        let admitted = host.admit_source(&source_arg).expect("admit the source");
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config2,
+            admitted,
+            request(),
+            |_| {},
+        ))
+        .await
+        .expect("the retry is a fresh install, not AlreadyLoaded");
+        assert!(host.get_plugin("chat-bridge").is_some());
+        assert_eq!(config2.channels.plugin.len(), 1, "exactly one binding");
+        assert!(binding_on_disk(&config2.config_path, "operations").is_some());
+        assert_eq!(
+            entry_names_on_disk(&config2.config_path)
+                .iter()
+                .filter(|name| **name == channel_key)
+                .count(),
+            1,
+            "exactly one channel row"
+        );
+    }
+
+    /// Install without `--channel-alias` binds nothing for a channel package,
+    /// as before: no binding and no row. Its only addition is the hint naming
+    /// the commands that bind an instance, which a package without the
+    /// channel capability does not get. Every command is complete, with
+    /// `ALIAS` where the alias goes: one command when binding takes no egress
+    /// decision, and one per decision, each on its own line, when the
+    /// manifest declares a destination its channel can reach.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_without_channel_alias_prints_the_bind_hint_for_a_channel_package() {
+        use crate::plugins::channel_instance::{
+            plugin_bind_command_for, plugin_bind_decision_commands_for,
+        };
+        use crate::plugins::egress_ceremony::ShellDialect;
+        use zeroclaw::plugins::host::PluginHost;
+
+        for (package, capability, hosts) in [
+            ("chat-bridge", "channel", &["api.example.com"][..]),
+            ("relay-bridge", "channel", &[][..]),
+            ("weather-tool", "tool", &["api.example.com"][..]),
+        ] {
+            let source = write_plugin_source(&package_manifest_toml(
+                package,
+                &[capability],
+                &["http_client"],
+                hosts,
+            ));
+            let tmp = tempfile::tempdir().expect("config dir");
+            let mut config = config_in_dir(tmp.path());
+            let plugins = tempfile::tempdir().expect("plugins dir");
+            let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+            let admitted = host
+                .admit_source(source.path().to_str().expect("utf-8 source path"))
+                .expect("admit the source");
+
+            let lines = Box::pin(publish_and_seed_plugin(
+                &mut host,
+                &mut config,
+                admitted,
+                None,
+                |_| {},
+            ))
+            .await
+            .expect("install");
+
+            let config_dir = egress_command_config_dir(&config);
+            if capability != "channel" {
+                assert!(lines.is_empty(), "no hint for a tool package: {lines:#?}");
+            } else if hosts.is_empty() {
+                // Nothing is declared, so binding takes no decision.
+                let command =
+                    plugin_bind_command_for(ShellDialect::host(), config_dir, package, None, None);
+                assert!(command.ends_with(" --channel-alias ALIAS"), "{command}");
+                assert_eq!(
+                    lines,
+                    vec![ta(
+                        "cli-plugin-channel-bind-hint",
+                        &[("name", package), ("command", &command)],
+                        "",
+                    )]
+                );
+            } else {
+                // The package declares a destination its channel can reach,
+                // so the line names it and each decision gets a command of
+                // its own, `--egress none` first.
+                let [none, declared] = plugin_bind_decision_commands_for(
+                    ShellDialect::host(),
+                    config_dir,
+                    package,
+                    None,
+                );
+                assert!(
+                    none.ends_with(" --channel-alias ALIAS --egress none"),
+                    "{none}"
+                );
+                assert!(
+                    declared.ends_with(" --channel-alias ALIAS --egress declared"),
+                    "{declared}"
+                );
+                assert_eq!(
+                    lines,
+                    vec![
+                        ta(
+                            "cli-plugin-channel-bind-hint-egress",
+                            &[("name", package), ("hosts", "api.example.com")],
+                            "",
+                        ),
+                        format!("  {none}"),
+                        format!("  {declared}"),
+                    ]
+                );
+            }
+            if capability == "channel" {
+                assert!(
+                    config.channels.plugin.is_empty() && config.plugins.entries.is_empty(),
+                    "a channel package installed without an alias binds and seeds nothing"
+                );
+            }
+        }
+    }
+
+    /// A config file on an older schema is refused before anything is written,
+    /// by `plugin bind` and by `plugin install --channel-alias` alike, as
+    /// `config set` refuses it: the save would stamp the current schema
+    /// version onto sections still in the older shape, which would then stop
+    /// taking effect. The refusal names the migration, the file stays
+    /// byte-identical, and the install publishes nothing.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn bind_and_install_with_channel_alias_refuse_an_older_schema_and_leave_it_byte_identical()
+     {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let manifest_toml =
+            package_manifest_toml("chat-bridge", &["channel"], &["http_client"], &[]);
+        let installed = install_package(&manifest_toml);
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        std::fs::write(
+            &config.config_path,
+            "schema_version = 2\n\n[autonomy]\nmax_actions_per_hour = 7\n",
+        )
+        .expect("write a V2 config");
+        let before = std::fs::read(&config.config_path).expect("read config");
+
+        let error = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            "chat-bridge",
+            "operations",
+            None,
+        ))
+        .await
+        .expect_err("bind refuses an older schema");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("schema_version 2") && rendered.contains("zeroclaw config migrate"),
+            "the refusal names the schema and the migration: {rendered}"
+        );
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config"),
+            before
+        );
+        assert!(config.channels.plugin.is_empty() && config.plugins.entries.is_empty());
+
+        let source = write_plugin_source(&manifest_toml);
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let admitted = host
+            .admit_source(source.path().to_str().expect("utf-8 source path"))
+            .expect("admit the source");
+        let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&config);
+        let error = Box::pin(install_admitted_source(
+            &mut host,
+            &mut config,
+            admitted,
+            Some(ChannelBindingRequest {
+                alias: "operations".to_string(),
+                egress: None,
+            }),
+            limits,
+            // The load check is on, and the stub component would fail it, so
+            // the refusal below comes before it.
+            false,
+            |_| {},
+        ))
+        .await
+        .expect_err("install --channel-alias refuses an older schema");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("zeroclaw config migrate"),
+            "the refusal names the migration: {rendered}"
+        );
+        assert!(
+            !plugins.path().join("chat-bridge").exists()
+                && host.get_plugin("chat-bridge").is_none(),
+            "nothing was published"
+        );
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config"),
+            before,
+            "the older-schema file stays byte-identical"
+        );
+    }
+
+    /// One `plugin bind` request a printed line makes: the `--config-dir` it
+    /// selects, the package, the alias and the egress decision.
+    #[cfg(all(unix, feature = "plugins-wasm", feature = "agent-runtime"))]
+    type BindRequest = (
+        Option<String>,
+        String,
+        String,
+        Option<crate::plugins::channel_instance::EgressDecision>,
+    );
+
+    /// The `plugin bind` requests printed lines make when they are pasted
+    /// together into a POSIX shell, in the order they run. The lines run
+    /// through one real `sh` exactly as printed, indentation included, with
+    /// `zeroclaw` replaced by a function that records each call's arguments,
+    /// and the CLI's own parser reads them.
+    #[cfg(all(unix, feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn bind_requests_from_pasted_lines(
+        lines: &[&str],
+        scratch: &std::path::Path,
+    ) -> Vec<BindRequest> {
+        let calls = scratch.join("captured-calls");
+        // A fresh directory for each paste, so no earlier call is read back.
+        let _ = std::fs::remove_dir_all(&calls);
+        std::fs::create_dir_all(&calls).expect("create the calls directory");
+        let block = lines.join("\n");
+        let script = format!(
+            "calls=0\nzeroclaw() {{ calls=$((calls + 1)); printf '%s\\n' \"$@\" > '{}'/\"$calls\"; }}\n{block}\n",
+            calls.display()
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run sh");
+        assert!(status.success(), "the lines must run as printed:\n{block}");
+        assert_eq!(
+            std::fs::read_dir(&calls).expect("read the calls").count(),
+            lines.len(),
+            "one call per pasted line:\n{block}"
+        );
+        (1..=lines.len())
+            .map(|call| {
+                let args: Vec<String> = std::fs::read_to_string(calls.join(call.to_string()))
+                    .expect("captured arguments")
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                let cli = Cli::try_parse_from(std::iter::once("zeroclaw".to_string()).chain(args))
+                    .expect("the CLI parses the printed command");
+                let config_dir = cli.config_dir;
+                let Commands::Plugin {
+                    plugin_command:
+                        PluginCommands::Bind {
+                            package,
+                            channel_alias,
+                            egress,
+                        },
+                } = cli.command
+                else {
+                    panic!("the printed command is `plugin bind`:\n{block}");
+                };
+                (config_dir, package, channel_alias, egress.map(Into::into))
+            })
+            .collect()
+    }
+
+    /// The `plugin bind` request one printed line makes when it is pasted on
+    /// its own ([`bind_requests_from_pasted_lines`]).
+    #[cfg(all(unix, feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn bind_request_from_printed_line(line: &str, scratch: &std::path::Path) -> BindRequest {
+        let mut requests = bind_requests_from_pasted_lines(&[line], scratch);
+        assert_eq!(requests.len(), 1, "one line, one request");
+        requests.remove(0)
+    }
+
+    /// The readiness line for a bound alias whose row is missing prints the
+    /// command that creates the row, and when the manifest declares
+    /// destinations the row can use, the line names them and one complete
+    /// command per egress decision follows it, `--egress none` first. The
+    /// `--egress declared` line, run on its own as printed through a real
+    /// `sh` and parsed by the CLI's own parser, binds the row and grants the
+    /// declaration.
+    #[tokio::test]
+    #[cfg(all(unix, feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn the_printed_row_missing_declared_line_binds_the_row_as_printed() {
+        use crate::plugins::channel_instance::plugin_bind_decision_commands_for;
+        use crate::plugins::egress_ceremony::ShellDialect;
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &["irc.example.net"],
+        ));
+        let manifest = installed
+            .host
+            .manifest("irc-bridge")
+            .expect("installed")
+            .clone();
+        let key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        // Bound with `config set channels.plugin.operations.package`, which
+        // creates no row.
+        bind_channel_alias(&mut config, "operations", "irc-bridge", true);
+        config.mark_dirty("channels.plugin.operations");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("write the binding");
+
+        let dir = egress_command_config_dir(&config).to_path_buf();
+        let [none, declared] = plugin_bind_decision_commands_for(
+            ShellDialect::host(),
+            &dir,
+            "irc-bridge",
+            Some("operations"),
+        );
+        assert!(none.ends_with(" --egress none"), "{none}");
+        assert!(declared.ends_with(" --egress declared"), "{declared}");
+        let lines = channel_instance_readiness_lines(
+            &config,
+            &installed.host,
+            &manifest,
+            "operations",
+            true,
+        );
+        let at = lines
+            .iter()
+            .position(|line| {
+                *line
+                    == ta(
+                        "cli-plugin-channel-row-missing-declared",
+                        &[("alias", "operations"), ("hosts", "irc.example.net")],
+                        "",
+                    )
+            })
+            .unwrap_or_else(|| panic!("the missing row is named: {lines:#?}"));
+        assert_eq!(
+            lines.get(at + 1..at + 3),
+            Some(&[format!("  {none}"), format!("  {declared}")][..]),
+            "one command per decision follows the line: {lines:#?}"
+        );
+
+        let (config_dir, package, alias, egress) =
+            bind_request_from_printed_line(&lines[at + 2], tmp.path());
+        assert_eq!(
+            config_dir.as_deref(),
+            dir.to_str(),
+            "the command selects the configuration it was computed against"
+        );
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            &package,
+            &alias,
+            egress,
+        ))
+        .await
+        .expect("the command binds as printed");
+        assert_eq!(
+            granted_on_disk(&config.config_path, &key),
+            vec!["irc.example.net"]
+        );
+    }
+
+    /// The two decision lines pasted together, as one block copied out of
+    /// the report, fail closed: the `--egress none` line runs first and
+    /// creates the row with no network reach, and the `--egress declared` line
+    /// after it finds the row in place, so the ceremony grants nothing and
+    /// says the flag was not applied.
+    #[tokio::test]
+    #[cfg(all(unix, feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn the_two_printed_decision_lines_pasted_together_grant_nothing() {
+        use crate::plugins::channel_instance::EgressDecision;
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &["irc.example.net"],
+        ));
+        let manifest = installed
+            .host
+            .manifest("irc-bridge")
+            .expect("installed")
+            .clone();
+        let key = expected_channel_instance_key(&manifest, "operations");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        bind_channel_alias(&mut config, "operations", "irc-bridge", true);
+        config.mark_dirty("channels.plugin.operations");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("write the binding");
+
+        let lines = channel_instance_readiness_lines(
+            &config,
+            &installed.host,
+            &manifest,
+            "operations",
+            true,
+        );
+        let at = lines
+            .iter()
+            .position(|line| {
+                *line
+                    == ta(
+                        "cli-plugin-channel-row-missing-declared",
+                        &[("alias", "operations"), ("hosts", "irc.example.net")],
+                        "",
+                    )
+            })
+            .unwrap_or_else(|| panic!("the missing row is named: {lines:#?}"));
+        let block = lines
+            .get(at + 1..at + 3)
+            .unwrap_or_else(|| panic!("two decision lines follow: {lines:#?}"));
+        let requests = bind_requests_from_pasted_lines(
+            &block.iter().map(String::as_str).collect::<Vec<_>>(),
+            tmp.path(),
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|(_, _, _, egress)| *egress)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(EgressDecision::Withhold),
+                Some(EgressDecision::SeedDeclared)
+            ],
+            "the `--egress none` line runs first"
+        );
+
+        let mut reports = Vec::new();
+        for (_, package, alias, egress) in requests {
+            reports.push(
+                Box::pin(bind_channel_instance(
+                    &mut config,
+                    &installed.host,
+                    &package,
+                    &alias,
+                    egress,
+                ))
+                .await
+                .expect("each pasted line runs"),
+            );
+        }
+        assert!(
+            entry_names_on_disk(&config.config_path).contains(&key),
+            "the first line created the row"
+        );
+        assert!(
+            granted_on_disk(&config.config_path, &key).is_empty(),
+            "the pasted block grants nothing"
+        );
+        assert!(
+            reports[1].contains(&ta(
+                "cli-plugin-channel-egress-flag-ignored",
+                &[("alias", "operations")],
+                "",
+            )),
+            "the second line says its flag was not applied: {:#?}",
+            reports[1]
+        );
+    }
+
+    /// A printed bind hint runs as printed: the shell passes the `ALIAS`
+    /// placeholder through, and the ceremony refuses it as an invalid alias
+    /// and writes nothing. With the placeholder replaced by an alias, the
+    /// same line binds.
+    #[tokio::test]
+    #[cfg(all(unix, feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn the_printed_bind_hint_is_refused_until_its_alias_placeholder_is_replaced() {
+        use crate::plugins::channel_instance::{ALIAS_PLACEHOLDER, BindingRefusal, EgressDecision};
+
+        let installed = install_package(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &["irc.example.net"],
+        ));
+        let manifest = installed.host.manifest("irc-bridge").expect("installed");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let before = std::fs::read(&config.config_path).expect("read config");
+
+        let hint = channel_bind_hint_lines(&config, manifest);
+        let declared = hint
+            .iter()
+            .find(|line| line.ends_with(" --egress declared"))
+            .unwrap_or_else(|| panic!("a command per decision: {hint:#?}"));
+        assert!(declared.contains(ALIAS_PLACEHOLDER), "{declared}");
+
+        let (_, package, alias, egress) = bind_request_from_printed_line(declared, tmp.path());
+        assert_eq!(
+            alias, ALIAS_PLACEHOLDER,
+            "the shell passes the placeholder as is"
+        );
+        assert_eq!(egress, Some(EgressDecision::SeedDeclared));
+        let error = Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            &package,
+            &alias,
+            egress,
+        ))
+        .await
+        .expect_err("the placeholder is not an alias");
+        let reason = zeroclaw_config::helpers::validate_alias_key(ALIAS_PLACEHOLDER)
+            .expect_err("the alias grammar refuses the placeholder");
+        assert_eq!(
+            error.to_string(),
+            binding_refusal_line(&package, &alias, &BindingRefusal::InvalidAlias(reason))
+        );
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config"),
+            before,
+            "the refused command writes nothing"
+        );
+        assert!(config.channels.plugin.is_empty() && config.plugins.entries.is_empty());
+
+        let replaced = declared.replace(
+            &format!("--channel-alias {ALIAS_PLACEHOLDER} "),
+            "--channel-alias operations ",
+        );
+        assert_ne!(&replaced, declared, "the placeholder is replaced");
+        let (_, package, alias, egress) = bind_request_from_printed_line(&replaced, tmp.path());
+        Box::pin(bind_channel_instance(
+            &mut config,
+            &installed.host,
+            &package,
+            &alias,
+            egress,
+        ))
+        .await
+        .expect("the line binds once the placeholder is replaced");
+        assert_eq!(
+            granted_on_disk(
+                &config.config_path,
+                &expected_channel_instance_key(manifest, "operations")
+            ),
+            vec!["irc.example.net"]
+        );
+    }
+
+    /// Install without `--channel-alias` of a channel package that bindings
+    /// already name, as a reinstall after `plugin remove` finds them, reports
+    /// each bound alias's readiness, as `plugin info` does, instead of the
+    /// generic bind hint. It still creates no channel row.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_without_channel_alias_reports_the_readiness_of_aliases_already_bound() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        let source = write_plugin_source(&package_manifest_toml(
+            "irc-bridge",
+            &["channel"],
+            &["socket_client"],
+            &["irc.example.net"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        bind_channel_alias(&mut config, "operations", "irc-bridge", true);
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let admitted = host
+            .admit_source(source.path().to_str().expect("utf-8 source path"))
+            .expect("admit the source");
+
+        let lines = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            None,
+            |_| {},
+        ))
+        .await
+        .expect("install");
+
+        let manifest = host.manifest("irc-bridge").expect("installed");
+        assert_eq!(
+            lines,
+            channel_instance_readiness_lines(&config, &host, manifest, "operations", true),
+            "the bound alias's readiness replaces the hint"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("plugin.operations") && line.contains("irc.example.net")),
+            "the missing row and its declaration are named: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains(&format!(
+                "--channel-alias {}",
+                crate::plugins::channel_instance::ALIAS_PLACEHOLDER
+            ))),
+            "no generic hint: {lines:#?}"
+        );
+        assert!(
+            config.plugins.entries.is_empty(),
+            "install without an alias still creates no channel row"
+        );
+    }
+
+    /// A bound alias the instance identity rules reject, which config
+    /// validation only warns about, no longer takes the package down: the
+    /// package's other rows are still enumerated, `plugin list` still
+    /// reports, `plugin info` and `plugin install` print one line for the
+    /// alias, and `plugin remove` keeps the tool row's warning. The alias
+    /// reaches the terminal escaped.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn an_alias_no_instance_can_be_named_by_is_skipped_and_reported_escaped() {
+        use crate::plugins::channel_instance::{
+            bound_channel_aliases, instance_rows, unkeyed_channel_aliases,
+        };
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["tool", "channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed.host.manifest("chat-bridge").expect("installed");
+        let tool_key = expected_instance_key(manifest);
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let hostile = "op\u{1b}[2Js";
+        bind_channel_alias(&mut config, hostile, "chat-bridge", true);
+        bind_channel_alias(&mut config, "support", "chat-bridge", true);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: tool_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+            tls_profiles: Vec::new(),
+        }];
+
+        let rows = instance_rows(&config, manifest).expect("the package's rows still derive");
+        assert_eq!(
+            rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>(),
+            vec![tool_key, expected_channel_instance_key(manifest, "support")],
+            "the tool row and the good alias's row, without the rejected alias"
+        );
+        let unkeyed = unkeyed_channel_aliases(&config, manifest);
+        assert_eq!(
+            unkeyed
+                .iter()
+                .map(|(alias, _)| alias.as_str())
+                .collect::<Vec<_>>(),
+            vec![hostile]
+        );
+        assert!(
+            egress_grant_gap_lines(&config, manifest).is_ok(),
+            "plugin list still reports the package"
+        );
+
+        let escaped = hostile.escape_debug().to_string();
+        let skipped = unkeyed_alias_line("chat-bridge", hostile, &unkeyed[0].1);
+        assert!(
+            skipped.contains(&format!("plugin.{escaped}")) && !skipped.contains('\u{1b}'),
+            "the alias is printed escaped: {skipped:?}"
+        );
+        let readiness = bound_channel_readiness(&config, &installed.host, manifest);
+        assert_eq!(
+            readiness
+                .iter()
+                .find(|(alias, _)| alias == hostile)
+                .map(|(_, lines)| lines.clone()),
+            Some(vec![skipped.clone()]),
+            "info and install print the one line for the alias"
+        );
+        let info = installed.host.get_plugin("chat-bridge").expect("installed");
+        let info_lines = plugin_info_lines(
+            &info,
+            &rows,
+            &readiness,
+            &[],
+            &PluginLoadStatus::NoComponent,
+        );
+        assert!(info_lines.contains(&skipped), "{info_lines:#?}");
+
+        assert_eq!(
+            removed_plugin_kept_grant_lines(&config, "chat-bridge", &rows).len(),
+            1,
+            "remove still reports the tool row's kept grant"
+        );
+        let bindings = removed_plugin_binding_lines(
+            "chat-bridge",
+            &bound_channel_aliases(&config, "chat-bridge"),
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|line| line.contains(&format!("plugin.{escaped}")))
+                && bindings.iter().all(|line| !line.contains('\u{1b}')),
+            "remove prints the alias escaped: {bindings:?}"
+        );
+    }
+
+    /// `plugin info` reports every bound alias of a package from one runtime
+    /// query, so one report builds at most one activation plan. Block for
+    /// block, it prints what asking about each alias alone prints: the same
+    /// verdicts under a ceiling that admits one binding and not the other, and
+    /// the one line for an alias no instance can be keyed by, which is not
+    /// asked about.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_package_report_prints_the_per_alias_readiness_blocks_from_one_query() {
+        use crate::plugins::channel_instance::unkeyed_channel_aliases;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed.host.manifest("chat-bridge").expect("installed");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config.plugins.enabled = true;
+        config.plugins.max_active_instances = 1;
+        let unkeyable = "ops\u{1}team";
+        for alias in ["alpha", "beta", unkeyable] {
+            bind_channel_alias(&mut config, alias, "chat-bridge", true);
+        }
+        config.agents.insert(
+            "operator".to_string(),
+            crate::config::schema::AliasedAgentConfig {
+                channels: vec![
+                    crate::config::providers::ChannelRef::new("plugin.alpha"),
+                    crate::config::providers::ChannelRef::new("plugin.beta"),
+                ],
+                ..crate::config::schema::AliasedAgentConfig::default()
+            },
+        );
+        let unkeyed = unkeyed_channel_aliases(&config, manifest);
+        assert_eq!(
+            unkeyed.len(),
+            1,
+            "premise: one alias cannot key an instance"
+        );
+
+        let report = bound_channel_readiness(&config, &installed.host, manifest);
+
+        assert_eq!(
+            report
+                .iter()
+                .map(|(alias, _)| alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", unkeyable]
+        );
+        for (alias, lines) in &report {
+            let expected = if alias == unkeyable {
+                vec![unkeyed_alias_line("chat-bridge", alias, &unkeyed[0].1)]
+            } else {
+                channel_instance_readiness_lines(&config, &installed.host, manifest, alias, true)
+            };
+            assert_eq!(lines, &expected, "alias {alias:?}");
+        }
+        // Not vacuous: the one slot goes to `alpha`, so the two blocks carry
+        // different verdicts from the same plan.
+        assert!(
+            report[0].1.contains(&ta(
+                "cli-plugin-channel-activation-ready",
+                &[("alias", "alpha")],
+                "",
+            )),
+            "{:#?}",
+            report[0].1
+        );
+        assert!(
+            report[1].1.contains(&ta(
+                "cli-plugin-channel-activation-over-ceiling",
+                &[("alias", "beta")],
+                "",
+            )),
+            "{:#?}",
+            report[1].1
+        );
+    }
+
+    /// When the runtime cannot build its activation plan, the one query that
+    /// asks about every alias together answers for none of them. The report
+    /// then asks about each alias alone, as `plugin bind` does, so a binding
+    /// that fails a precondition before the plan keeps its own line and fix
+    /// command, and only a binding the plan would have judged reports the
+    /// plan's failure. Block for block, that is what the one-alias report
+    /// prints.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_package_report_asks_about_each_alias_alone_when_the_plan_cannot_be_built() {
+        use crate::plugins::channel_instance::{config_set_command_for, unkeyed_channel_aliases};
+        use crate::plugins::egress_ceremony::ShellDialect;
+        use zeroclaw_runtime::plugin_runtime::channel_binding_admission;
+
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed.host.manifest("chat-bridge").expect("installed");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config.plugins.enabled = true;
+        // Owned and enabled, so the plan's explicit pass reaches identity
+        // formation for this alias and refuses the control character, which
+        // fails the plan as a whole.
+        let unkeyable = "bad\u{1}alias";
+        bind_channel_alias(&mut config, "alpha", "chat-bridge", true);
+        bind_channel_alias(&mut config, "beta", "chat-bridge", false);
+        bind_channel_alias(&mut config, unkeyable, "chat-bridge", true);
+        config.agents.insert(
+            "operator".to_string(),
+            crate::config::schema::AliasedAgentConfig {
+                channels: vec![
+                    crate::config::providers::ChannelRef::new("plugin.alpha"),
+                    crate::config::providers::ChannelRef::new(format!("plugin.{unkeyable}")),
+                ],
+                ..crate::config::schema::AliasedAgentConfig::default()
+            },
+        );
+        let unkeyed = unkeyed_channel_aliases(&config, manifest);
+        assert_eq!(
+            unkeyed.len(),
+            1,
+            "premise: one alias cannot key an instance"
+        );
+        let plan_error = channel_binding_admission(&config, &installed.host, &["alpha", "beta"])
+            .expect_err("premise: the plan cannot be built, so the one query answers for nothing")
+            .to_string();
+
+        let report = bound_channel_readiness(&config, &installed.host, manifest);
+
+        assert_eq!(
+            report
+                .iter()
+                .map(|(alias, _)| alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", unkeyable, "beta"]
+        );
+        for (alias, lines) in &report {
+            let expected = if alias == unkeyable {
+                vec![unkeyed_alias_line("chat-bridge", alias, &unkeyed[0].1)]
+            } else {
+                channel_instance_readiness_lines(&config, &installed.host, manifest, alias, true)
+            };
+            assert_eq!(lines, &expected, "alias {alias:?}");
+        }
+        // `alpha` needs the plan, so its block reports the plan's failure;
+        // `beta` fails its own precondition first and keeps its line and
+        // command, as it did when every alias was asked about alone.
+        assert!(
+            report[0].1.contains(&ta(
+                "cli-plugin-channel-activation-plan-failed",
+                &[("alias", "alpha"), ("error", &plan_error)],
+                "",
+            )),
+            "{:#?}",
+            report[0].1
+        );
+        let enable_beta = config_set_command_for(
+            ShellDialect::host(),
+            egress_command_config_dir(&config),
+            "channels.plugin.beta.enabled",
+            Some("true"),
+        );
+        assert!(
+            report[2].1.contains(&ta(
+                "cli-plugin-channel-activation-binding-disabled",
+                &[("alias", "beta"), ("command", &enable_beta)],
+                "",
+            )),
+            "{:#?}",
+            report[2].1
+        );
+        assert!(
+            !report[2].1.iter().any(|line| line.contains(&plan_error)),
+            "a binding the plan never judged does not report the plan's failure: {:#?}",
+            report[2].1
+        );
+    }
+
+    /// A hand-written binding whose alias the config alias grammar rejects,
+    /// which config validation only warns about, still names an instance, so
+    /// it gets a readiness block. With no row yet, that block gives the
+    /// grammar's reason and the table to rename instead of `plugin bind`
+    /// commands the ceremony would refuse as printed. Every line of the block
+    /// prints the alias escaped, the reason included, and so does the key
+    /// line `plugin info` prints for the instance.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_bound_alias_the_alias_grammar_rejects_is_told_to_rename_rather_than_bind() {
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed.host.manifest("chat-bridge").expect("installed");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let hostile = "ops\u{202e}team";
+        for alias in ["ops-team", hostile] {
+            bind_channel_alias(&mut config, alias, "chat-bridge", true);
+        }
+
+        let readiness = bound_channel_readiness(&config, &installed.host, manifest);
+        let lines_of = |alias: &str| {
+            readiness
+                .iter()
+                .find(|(bound, _)| bound == alias)
+                .map(|(_, lines)| lines.clone())
+                .unwrap_or_else(|| panic!("{alias:?} gets a readiness block: {readiness:#?}"))
+        };
+
+        let lines = lines_of("ops-team");
+        let reason = zeroclaw_config::helpers::validate_alias_key("ops-team")
+            .expect_err("the alias grammar rejects a hyphen");
+        assert!(
+            lines.contains(&ta(
+                "cli-plugin-channel-row-missing-invalid-alias",
+                &[
+                    ("alias", "ops-team"),
+                    ("reason", &reason),
+                    ("table", "[channels.plugin.ops-team]"),
+                ],
+                "",
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("--channel-alias")),
+            "no bind command the ceremony would refuse: {lines:#?}"
+        );
+
+        let lines = lines_of(hostile);
+        let escaped = hostile.escape_debug().to_string();
+        let rename = lines
+            .iter()
+            .find(|line| line.contains(&format!("[channels.plugin.\"{escaped}\"]")))
+            .unwrap_or_else(|| {
+                panic!("the table to rename is named, quoted and escaped: {lines:#?}")
+            });
+        assert!(
+            !rename.contains('\u{202e}'),
+            "the alias is escaped, inside the reason too: {rename:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("--channel-alias")),
+            "no bind command the ceremony would refuse: {lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains('\u{202e}')),
+            "every readiness line prints the alias escaped: {lines:#?}"
+        );
+
+        let rows = crate::plugins::channel_instance::instance_rows(&config, manifest)
+            .expect("the package's rows derive");
+        let info = installed.host.get_plugin("chat-bridge").expect("installed");
+        let info_lines = plugin_info_lines(
+            &info,
+            &rows,
+            &readiness,
+            &[],
+            &PluginLoadStatus::NoComponent,
+        );
+        assert!(
+            info_lines.contains(&ta(
+                "cli-plugin-config-entry-key-channel",
+                &[
+                    ("alias", &escaped),
+                    ("key", &expected_channel_instance_key(manifest, hostile)),
+                ],
+                "",
+            )),
+            "the key line names the alias escaped: {info_lines:#?}"
+        );
+        assert!(
+            info_lines.iter().all(|line| !line.contains('\u{202e}')),
+            "no line of `plugin info` prints the alias as written: {info_lines:#?}"
+        );
+
+        // `plugin remove` prints it escaped as well: in the line for the grant
+        // the alias's row keeps, and in the line for the binding left behind.
+        config
+            .plugins
+            .entries
+            .push(crate::config::schema::PluginEntryConfig {
+                name: expected_channel_instance_key(manifest, hostile),
+                egress_hosts: vec!["api.example.com".to_string()],
+                ..crate::config::schema::PluginEntryConfig::default()
+            });
+        let kept = removed_plugin_kept_grant_lines(
+            &config,
+            "chat-bridge",
+            &removed_plugin_grant_rows(&config, manifest),
+        );
+        let bindings = removed_plugin_binding_lines(
+            "chat-bridge",
+            &crate::plugins::channel_instance::bound_channel_aliases(&config, "chat-bridge"),
+        );
+        assert!(
+            kept.iter()
+                .any(|line| line.contains(&format!("plugin.{escaped}"))),
+            "the kept grant names the alias escaped: {kept:#?}"
+        );
+        assert!(
+            kept.iter()
+                .chain(&bindings)
+                .all(|line| !line.contains('\u{202e}')),
+            "no line of `plugin remove` prints the alias as written: {kept:#?} {bindings:#?}"
+        );
+    }
+
+    /// A disabled hand-written binding whose alias the config alias grammar
+    /// rejects gets no `config set` command: `config set` splits its path at
+    /// the dots, so a command for `a.b` would create a binding of its own
+    /// named `a`. The report names the table to edit by hand instead, quoted
+    /// as the one table it is, and prints the alias escaped. Every other line
+    /// that names such a table, the rename line, the removed binding and the
+    /// skipped alias, quotes it the same way.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_disabled_binding_under_an_alias_outside_the_grammar_names_the_table_to_edit() {
+        let installed = install_package(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let manifest = installed.host.manifest("chat-bridge").expect("installed");
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        config.plugins.enabled = true;
+        let hostile = "ops\u{202e}team";
+        for alias in ["a.b", hostile] {
+            bind_channel_alias(&mut config, alias, "chat-bridge", false);
+        }
+
+        let readiness = bound_channel_readiness(&config, &installed.host, manifest);
+        for alias in ["a.b", hostile] {
+            let lines = readiness
+                .iter()
+                .find(|(bound, _)| bound == alias)
+                .map(|(_, lines)| lines.clone())
+                .unwrap_or_else(|| panic!("{alias:?} gets a readiness block: {readiness:#?}"));
+            let shown = alias.escape_debug().to_string();
+            let table = format!("[channels.plugin.\"{shown}\"]");
+            assert!(
+                lines.contains(&ta(
+                    "cli-plugin-channel-activation-binding-disabled-manual",
+                    &[("alias", &shown), ("table", &table)],
+                    "",
+                )),
+                "{lines:#?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains(&table) && line.contains("plugin bind")),
+                "the rename line quotes the table too: {lines:#?}"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("zeroclaw --config-dir")),
+                "no printed command, `config set` or other, for this alias: {lines:#?}"
+            );
+            assert!(
+                lines.iter().all(|line| !line.contains('\u{202e}')),
+                "the alias is printed escaped: {lines:#?}"
+            );
+        }
+
+        let quoted = "[channels.plugin.\"a.b\"]";
+        let bindings = removed_plugin_binding_lines("chat-bridge", &["a.b".to_string()]);
+        let skipped = unkeyed_alias_line("chat-bridge", "a.b", "a reason");
+        for line in bindings.iter().chain(std::iter::once(&skipped)) {
+            assert!(
+                line.contains(quoted) && !line.contains("[channels.plugin.a.b]"),
+                "the table is named as the one table it is: {line:?}"
+            );
+        }
+        assert!(
+            removed_plugin_binding_lines("chat-bridge", &["operations".to_string()])[0]
+                .contains("[channels.plugin.operations]"),
+            "an alias that is a bare key is printed bare"
+        );
+    }
+
+    /// `plugin install --channel-alias` reports a bound alias no instance can
+    /// be named by as well: after the requested alias's binding report and
+    /// readiness comes the one line for the skipped binding, escaped, and the
+    /// requested alias binds as usual.
+    #[tokio::test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    async fn install_with_channel_alias_also_reports_a_bound_alias_no_instance_can_be_named_by() {
+        use crate::plugins::channel_instance::{EgressDecision, unkeyed_channel_aliases};
+        use zeroclaw::plugins::host::PluginHost;
+
+        let source = write_plugin_source(&package_manifest_toml(
+            "chat-bridge",
+            &["channel"],
+            &["http_client"],
+            &["api.example.com"],
+        ));
+        let tmp = tempfile::tempdir().expect("config dir");
+        let mut config = config_in_dir(tmp.path());
+        let hostile = "op\u{1b}[2Js";
+        bind_channel_alias(&mut config, hostile, "chat-bridge", true);
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+        let admitted = host
+            .admit_source(source.path().to_str().expect("utf-8 source path"))
+            .expect("admit the source");
+
+        let lines = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config,
+            admitted,
+            Some(ChannelBindingRequest {
+                alias: "operations".to_string(),
+                egress: Some(EgressDecision::SeedDeclared),
+            }),
+            |_| {},
+        ))
+        .await
+        .expect("install");
+
+        let unkeyed =
+            unkeyed_channel_aliases(&config, host.manifest("chat-bridge").expect("installed"));
+        assert_eq!(
+            unkeyed
+                .iter()
+                .map(|(alias, _)| alias.as_str())
+                .collect::<Vec<_>>(),
+            vec![hostile]
+        );
+        assert_eq!(
+            lines.first(),
+            Some(&ta(
+                "cli-plugin-channel-bound",
+                &[("alias", "operations"), ("name", "chat-bridge")],
+                "",
+            ))
+        );
+        assert_eq!(
+            lines.last(),
+            Some(&unkeyed_alias_line("chat-bridge", hostile, &unkeyed[0].1)),
+            "the skipped binding follows the requested alias's report: {lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains('\u{1b}')),
+            "no raw control character reaches the terminal: {lines:#?}"
+        );
+        assert!(binding_on_disk(&config.config_path, "operations").is_some());
     }
 }

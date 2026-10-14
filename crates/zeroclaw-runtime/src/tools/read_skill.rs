@@ -359,6 +359,9 @@ description = "Ship safely"
 
         let mut config = config_for_tmp(&tmp);
         config.plugins.enabled = true;
+        // Plugin-shipped skills are auto-discovered instances, so they are
+        // admitted only when the operator opted into auto-discovery.
+        config.plugins.auto_discover = true;
         config.plugins.plugins_dir = plugins_dir.to_string_lossy().into_owned();
         let tool = make_tool(config);
 

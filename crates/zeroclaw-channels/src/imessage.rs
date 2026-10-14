@@ -435,7 +435,11 @@ mod tests {
         let ch = IMessageChannel::new("imessage_test_alias", Arc::new(|| vec!["*".into()]));
         assert!(ch.is_contact_allowed("+1234567890"));
         assert!(ch.is_contact_allowed("random@icloud.com"));
-        assert!(ch.is_contact_allowed(""));
+        // "Anyone" means any identifiable contact. A blank sender names nobody,
+        // so there is nothing a deny rule could ever have written down and
+        // nothing to attribute the message to; the wildcard does not reach it.
+        assert!(!ch.is_contact_allowed(""));
+        assert!(!ch.is_contact_allowed("   "));
     }
 
     #[test]

@@ -1,32 +1,285 @@
+use super::AnthropicRefusalError;
 use super::ModelProvider;
-use super::dispatch::ProviderDispatch;
-use super::stream_guard::AbortOnDrop;
+use super::dispatch::{
+    AcceptedRoute, AccountedCallReport, ProviderDispatch, current_dispatch_billable_usage,
+    mark_current_dispatch_composite, stream_as_dispatch_composite,
+    stream_with_exact_dispatch_route, with_exact_dispatch_route,
+};
+use super::safeguard_notice::{
+    SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
+    take_last_safeguard_fallback,
+};
 use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
+use parking_lot::Mutex as ParkingMutex;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag, turn_stop};
 
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
 pub struct ProviderFallbackInfo {
-    /// ModelProvider that was originally requested.
+    /// ModelProvider family that was originally requested.
     pub requested_provider: String,
     /// Model that was originally requested.
     pub requested_model: String,
-    /// ModelProvider that actually served the request.
+    /// ModelProvider family that actually served the request.
     pub actual_provider: String,
     /// Model that actually served the request.
     pub actual_model: String,
 }
 
+/// Fallback metadata for a caller that needs exact configured-candidate
+/// provenance in addition to the stable provider-family display fields.
+#[derive(Debug, Clone)]
+pub struct ProviderFallbackAttribution {
+    /// Stable provider/model record for channel and direct-agent notices.
+    pub fallback: ProviderFallbackInfo,
+    /// Exact configured candidate that was requested before fallback.
+    pub requested_candidate: String,
+    /// Exact configured candidate that served the recovered request.
+    pub actual_candidate: String,
+}
+
 tokio::task_local! {
-    static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
+    static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackAttribution>>;
+}
+
+tokio::task_local! {
+    static PROVIDER_CONTEXT_TRUNCATED: RefCell<bool>;
+}
+
+tokio::task_local! {
+    static RELIABLE_CALL_ACCOUNTING: Arc<ParkingMutex<ReliableCallAccounting>>;
+}
+
+tokio::task_local! {
+    static STREAM_REFUSAL_RECOVERY: RefCell<Option<AnthropicRefusalError>>;
+}
+
+/// Seed a non-streaming recovery with the refusal that ended a pre-output
+/// stream. Reliable consumes it to skip the exact already-billed candidate;
+/// a direct Anthropic provider consumes it to return the same refusal without
+/// replaying the HTTP request.
+pub(crate) async fn scope_stream_refusal_recovery<F: std::future::Future>(
+    refusal: AnthropicRefusalError,
+    future: F,
+) -> F::Output {
+    STREAM_REFUSAL_RECOVERY
+        .scope(RefCell::new(Some(refusal)), future)
+        .await
+}
+
+pub(crate) fn take_stream_refusal_recovery() -> Option<AnthropicRefusalError> {
+    STREAM_REFUSAL_RECOVERY
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReliableEntryId {
+    model_slot: usize,
+    entry_index: usize,
+}
+
+/// Explicit outcome of the retry policy for one entry. Returned by the pure
+/// [`ReliableModelProvider::stream_recovery_decision`]; callers must not infer
+/// precedence from branch order — read the `match` arms instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    /// Attempt the entry with the given retry budget.
+    Admit(u32),
+    /// Skip the entry entirely (avoids replaying a failed stream entry).
+    Skip,
+}
+
+/// Call-scoped outcome retained independently of the provider result.
+///
+/// In particular, callers must extract it before propagating an error: a
+/// rejected attempt can have been billed even when Reliable eventually fails.
+#[derive(Debug, Default)]
+pub(crate) struct ReliableCallAccounting {
+    accepted_route: Option<AcceptedRoute>,
+    stream_resume_after: Option<ReliableEntryId>,
+    stream_recovery_semantic_empty: bool,
+    stream_recovery_semantic_empty_permission: bool,
+    stream_recovery_image_replacement_permission: bool,
+    stream_recovery_failure: Option<ProviderErrorDiagnostic>,
+    /// True iff the recorded stream failure carries a transport-reported
+    /// connect failure: some error in the chain downcasts to
+    /// `StreamError::ConnectFailed`, which only a send site emits. This
+    /// grant matches the non-streaming retry loop, which already retries
+    /// connect failures on the same entry; the redirect limit on that
+    /// variant applies equally to both paths. Provider error text never
+    /// sets this.
+    stream_recovery_connect_failed: bool,
+}
+
+impl ReliableCallAccounting {
+    /// Transfer the selected stream's provisional physical attempt to the
+    /// runtime semantic classifier. It becomes a rejected report only when
+    /// that classifier rejects the completed stream response.
+    #[doc(hidden)]
+    fn into_report(mut self) -> AccountedCallReport {
+        AccountedCallReport::new(self.accepted_route.take())
+    }
+}
+
+/// An opaque per-call accounting scope for the landed dispatch seam.
+///
+/// The runtime retains this handle across cancellation so a dropped provider
+/// future cannot erase reports from attempts that had already completed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReliableCallAccountingScope {
+    accounting: Arc<ParkingMutex<ReliableCallAccounting>>,
+}
+
+impl ReliableCallAccountingScope {
+    pub(crate) async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        RELIABLE_CALL_ACCOUNTING
+            .scope(self.accounting.clone(), future)
+            .await
+    }
+
+    pub(crate) fn take(&self) -> AccountedCallReport {
+        std::mem::take(&mut *self.accounting.lock()).into_report()
+    }
+}
+
+#[cfg(test)]
+async fn scope_reliable_call_accounting<F: std::future::Future>(
+    future: F,
+) -> (F::Output, AccountedCallReport) {
+    let scope = ReliableCallAccountingScope::default();
+    let output = scope.scope(future).await;
+    (output, scope.take())
+}
+
+fn accounted_rejected_attempt_usage() -> Option<TokenUsage> {
+    current_dispatch_billable_usage()
+}
+
+/// Preserve Reliable's exact-entry recovery policy, but only once the selected
+/// stream has actually been polled.  Billing ownership belongs to dispatch;
+/// this is continuation state, not an attempt record.
+fn activate_stream_recovery_after_first_poll(model_slot: usize, entry_index: usize) {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        accounting.lock().stream_resume_after = Some(ReliableEntryId {
+            model_slot,
+            entry_index,
+        });
+    });
+}
+
+fn stream_with_recovery_identity<T>(
+    stream: stream::BoxStream<'static, StreamResult<T>>,
+    model_slot: usize,
+    entry_index: usize,
+) -> stream::BoxStream<'static, StreamResult<T>>
+where
+    T: Send + 'static,
+{
+    let mut stream = stream;
+    let mut started = false;
+    stream::poll_fn(move |cx| {
+        if !started {
+            started = true;
+            activate_stream_recovery_after_first_poll(model_slot, entry_index);
+        }
+        stream.as_mut().poll_next(cx)
+    })
+    .boxed()
+}
+
+/// A later direct/primary recovery supersedes a stream's provisional fallback
+/// candidate. Presentation still waits for runtime semantic acceptance.
+pub(crate) fn clear_provisional_provider_route() {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| accounting.lock().accepted_route = None);
+}
+
+fn record_accepted_attempt(
+    entry: &ReliableModelProviderEntry,
+    model: &str,
+    fallback: Option<ProviderFallbackAttribution>,
+) {
+    let route = AcceptedRoute::new(
+        entry.cooldown_key.clone(),
+        entry.served_model(model).to_string(),
+        fallback,
+    );
+    let _ = RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().accepted_route = Some(route));
+}
+
+fn has_reliable_call_accounting() -> bool {
+    RELIABLE_CALL_ACCOUNTING.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn mark_stream_recovery_semantic_empty() {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        let mut accounting = accounting.lock();
+        accounting.stream_recovery_semantic_empty = true;
+        accounting.stream_recovery_semantic_empty_permission = true;
+    });
+}
+
+/// Permit one non-streaming call to the exact entry whose image-bearing stream
+/// ended in HTTP 400. Runtime grants this only after constructing a provider-
+/// only request view with the novel image identities removed.
+#[doc(hidden)]
+pub fn permit_exact_image_recovery() {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        accounting
+            .lock()
+            .stream_recovery_image_replacement_permission = true;
+    });
+}
+
+/// Preserve the classified stream failure while runtime attempts eligible
+/// non-streaming recovery candidates.
+///
+/// The diagnostic is presentation-only. The recovery exception is decided
+/// from the error chain itself: it is granted only when some cause
+/// downcasts to `StreamError::ConnectFailed`, which a streaming adapter
+/// emits at the send site on a transport-reported connect failure. The
+/// exception matches the non-streaming retry loop, which already retries
+/// connect failures on the same entry; the redirect limit on that variant
+/// applies equally to both paths. Provider error text never grants it.
+pub(crate) fn record_stream_recovery_failure(error: &anyhow::Error) {
+    let stream_recovery_connect_failed = error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<StreamError>(),
+            Some(StreamError::ConnectFailed(_))
+        )
+    });
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        let mut accounting = accounting.lock();
+        accounting.stream_recovery_connect_failed = stream_recovery_connect_failed;
+        accounting.stream_recovery_failure = Some(provider_error_diagnostic(error));
+    });
+}
+
+fn stream_recovery_was_semantic_empty() -> bool {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().stream_recovery_semantic_empty)
+        .unwrap_or(false)
+}
+
+fn stream_recovery_failure_diagnostic() -> Option<ProviderErrorDiagnostic> {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().stream_recovery_failure.clone())
+        .ok()
+        .flatten()
 }
 
 /// Take (consume) the last model_provider fallback info, if any.
@@ -36,6 +289,52 @@ pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
         .try_with(|cell| cell.borrow_mut().take())
         .ok()
         .flatten()
+        .map(|attribution| attribution.fallback)
+}
+
+/// Take fallback metadata including the exact configured candidates.
+pub fn take_last_provider_fallback_attribution() -> Option<ProviderFallbackAttribution> {
+    PROVIDER_FALLBACK
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+/// Take whether Reliable shortened the provider-visible transcript while
+/// recovering the current request from a context-window error.
+///
+/// This is intentionally distinct from fallback attribution: retrying the
+/// same candidate must not render a fallback notice, but the caller must not
+/// cache that response under the untrimmed request transcript.
+pub fn take_last_provider_context_truncation() -> bool {
+    PROVIDER_CONTEXT_TRUNCATED
+        .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+        .unwrap_or(false)
+}
+
+fn record_provider_context_truncation() {
+    let _ = PROVIDER_CONTEXT_TRUNCATED.try_with(|cell| *cell.borrow_mut() = true);
+}
+
+/// Record the fallback that served the current successful provider request, or
+/// clear stale attribution when the primary served it.
+///
+/// A fallback scope can span an agentic tool loop, which issues several model
+/// requests. The caller-visible result must describe the request that produced
+/// the final response, not an earlier request that only produced a tool call.
+fn record_successful_provider_fallback(record: Option<&ProviderFallbackRecord>) {
+    if let Some(record) = record {
+        record.record();
+    } else {
+        let _ = PROVIDER_FALLBACK.try_with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// Commit the route of a response the runtime has accepted semantically.
+/// A primary/direct accepted response intentionally clears an earlier fallback
+/// candidate in the same outer delivery scope.
+pub(crate) fn commit_accepted_provider_route(route: Option<ProviderFallbackAttribution>) {
+    let _ = PROVIDER_FALLBACK.try_with(|cell| *cell.borrow_mut() = route);
 }
 
 /// Run the given future within a provider-fallback scope.
@@ -43,24 +342,87 @@ pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
 /// `take_last_provider_fallback` (post-loop channel code) must execute
 /// within this scope for the data to be visible.
 pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Output {
-    PROVIDER_FALLBACK.scope(RefCell::new(None), future).await
+    PROVIDER_FALLBACK
+        .scope(
+            RefCell::new(None),
+            PROVIDER_CONTEXT_TRUNCATED.scope(RefCell::new(false), future),
+        )
+        .await
 }
 
 /// Record a model_provider fallback event.
+/// No-ops when called outside a `scope_provider_fallback` scope.
 fn record_provider_fallback(
     requested_provider: &str,
     requested_model: &str,
     actual_provider: &str,
     actual_model: &str,
-) {
+    requested_candidate: &str,
+    actual_candidate: &str,
+) -> ProviderFallbackInfo {
+    let fallback = ProviderFallbackInfo {
+        requested_provider: requested_provider.to_string(),
+        requested_model: requested_model.to_string(),
+        actual_provider: actual_provider.to_string(),
+        actual_model: actual_model.to_string(),
+    };
     let _ = PROVIDER_FALLBACK.try_with(|cell| {
-        *cell.borrow_mut() = Some(ProviderFallbackInfo {
-            requested_provider: requested_provider.to_string(),
-            requested_model: requested_model.to_string(),
-            actual_provider: actual_provider.to_string(),
-            actual_model: actual_model.to_string(),
+        *cell.borrow_mut() = Some(ProviderFallbackAttribution {
+            fallback: fallback.clone(),
+            requested_candidate: requested_candidate.to_string(),
+            actual_candidate: actual_candidate.to_string(),
         });
     });
+    // An accounted runtime call owns presentation timing. Legacy direct trait
+    // callers still receive the historical immediate recovery record.
+    if !has_reliable_call_accounting() {
+        commit_accepted_provider_route(Some(ProviderFallbackAttribution {
+            fallback: fallback.clone(),
+            requested_candidate: requested_candidate.to_string(),
+            actual_candidate: actual_candidate.to_string(),
+        }));
+    }
+    fallback
+}
+
+/// Retain refusal accounting and presentation data independently from the
+/// terminal cause. A later candidate failure may replace the terminal error,
+/// while the billed usage and a successful-rescue notice must still survive.
+fn remember_refusal(
+    refusal_seen: &mut Option<AnthropicRefusalError>,
+    rejected_attempt_usage: &mut Option<TokenUsage>,
+    error: &anyhow::Error,
+) {
+    if let Some(refusal) = error.downcast_ref::<AnthropicRefusalError>() {
+        accumulate_usage(rejected_attempt_usage, refusal.usage.as_deref());
+        if refusal_seen.is_none() {
+            *refusal_seen = Some(refusal.clone());
+        }
+    }
+}
+
+fn record_refusal_rescue(
+    refusal_seen: &Option<AnthropicRefusalError>,
+    requested_model: &str,
+    served_model: &str,
+) {
+    let Some(refusal) = refusal_seen else {
+        return;
+    };
+    let server_notice = take_last_safeguard_fallback()
+        .filter(|notice| notice.kind == SafeguardFallbackKind::ServerSide);
+    commit_safeguard_fallback(Some(SafeguardFallbackNotice {
+        kind: if server_notice.is_some() {
+            SafeguardFallbackKind::ClientAndServer
+        } else {
+            SafeguardFallbackKind::ClientSide
+        },
+        requested_model: requested_model.to_string(),
+        served_model: server_notice
+            .map(|notice| notice.served_model)
+            .unwrap_or_else(|| served_model.to_string()),
+        category: refusal.category.clone(),
+    }));
 }
 
 struct ProviderFallbackRecord {
@@ -68,16 +430,21 @@ struct ProviderFallbackRecord {
     requested_model: String,
     actual_provider: String,
     actual_model: String,
+    requested_candidate: String,
+    actual_candidate: String,
 }
 
 impl ProviderFallbackRecord {
-    fn new_if_recovered(
+    fn new_if_true_fallback(
         requested_provider: &str,
         requested_model: &str,
         actual_provider: &str,
         actual_model: &str,
+        used_later_candidate: bool,
+        requested_candidate: &str,
+        actual_candidate: &str,
     ) -> Option<Self> {
-        if requested_provider == actual_provider && requested_model == actual_model {
+        if !used_later_candidate && requested_model == actual_model {
             return None;
         }
 
@@ -86,6 +453,8 @@ impl ProviderFallbackRecord {
             requested_model: requested_model.to_string(),
             actual_provider: actual_provider.to_string(),
             actual_model: actual_model.to_string(),
+            requested_candidate: requested_candidate.to_string(),
+            actual_candidate: actual_candidate.to_string(),
         })
     }
 
@@ -95,14 +464,33 @@ impl ProviderFallbackRecord {
             &self.requested_model,
             &self.actual_provider,
             &self.actual_model,
+            &self.requested_candidate,
+            &self.actual_candidate,
         );
+    }
+
+    fn info(&self) -> ProviderFallbackInfo {
+        ProviderFallbackInfo {
+            requested_provider: self.requested_provider.clone(),
+            requested_model: self.requested_model.clone(),
+            actual_provider: self.actual_provider.clone(),
+            actual_model: self.actual_model.clone(),
+        }
+    }
+
+    fn attribution(&self) -> ProviderFallbackAttribution {
+        ProviderFallbackAttribution {
+            fallback: self.info(),
+            requested_candidate: self.requested_candidate.clone(),
+            actual_candidate: self.actual_candidate.clone(),
+        }
     }
 }
 
 fn stream_with_success_recording<T, IsFinal>(
-    rx: tokio::sync::mpsc::Receiver<StreamResult<T>>,
-    guard: AbortOnDrop,
+    stream: stream::BoxStream<'static, StreamResult<T>>,
     fallback_record: Option<ProviderFallbackRecord>,
+    accepted_route: AcceptedRoute,
     is_final: IsFinal,
 ) -> stream::BoxStream<'static, StreamResult<T>>
 where
@@ -110,17 +498,23 @@ where
     IsFinal: Fn(&T) -> bool + Send + 'static,
 {
     stream::unfold(
-        (rx, guard, fallback_record, false, false, is_final),
-        |(mut rx, guard, fallback_record, saw_error, recorded, is_final)| async move {
-            match rx.recv().await {
+        (
+            stream,
+            fallback_record,
+            accepted_route,
+            false,
+            false,
+            is_final,
+        ),
+        |(mut stream, fallback_record, accepted_route, saw_error, recorded, is_final)| async move {
+            match stream.next().await {
                 Some(event) => {
                     let mut saw_error = saw_error;
                     let mut recorded = recorded;
                     match &event {
                         Ok(value) if !saw_error && !recorded && is_final(value) => {
-                            if let Some(record) = &fallback_record {
-                                record.record();
-                            }
+                            record_successful_provider_fallback(fallback_record.as_ref());
+                            record_accepted_route(accepted_route.clone());
                             recorded = true;
                         }
                         Err(_) => {
@@ -130,25 +524,61 @@ where
                     }
                     Some((
                         event,
-                        (rx, guard, fallback_record, saw_error, recorded, is_final),
+                        (
+                            stream,
+                            fallback_record,
+                            accepted_route,
+                            saw_error,
+                            recorded,
+                            is_final,
+                        ),
                     ))
                 }
-                None => {
-                    if !saw_error
-                        && !recorded
-                        && let Some(record) = &fallback_record
-                    {
-                        record.record();
-                    }
-                    None
-                }
+                None => None,
             }
         },
     )
     .boxed()
 }
 
+fn record_accepted_route(route: AcceptedRoute) {
+    let _ = RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().accepted_route = Some(route));
+}
+
+/// Classify a chat call that exhausted every provider/model in the chain.
+/// The kind comes from the typed terminal failure the exhaustion path already
+/// built, so the auth case is classified where it was identified rather than
+/// re-sniffed from the aggregate text.
+fn provider_exhausted_stop(err: &anyhow::Error) -> TurnStop {
+    let kind = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+        .map(ReliableProviderTerminalFailure::kind);
+    let detail = err.to_string();
+    match kind {
+        Some(
+            ReliableProviderTerminalFailureKind::Authentication
+            | ReliableProviderTerminalFailureKind::CredentialsMissing,
+        ) => TurnStop::fatal(TurnStopCode::ProviderAuth, detail),
+        _ => TurnStop::recoverable(TurnStopCode::ProviderUnavailable, detail),
+    }
+}
+
+/// Attach the exhaustion stop without disturbing the error itself: `tag` keeps
+/// the cause's `Display` and source chain, so every existing `chain()` walk
+/// (rejected usage, semantic-empty, terminal failure) still finds what it did.
+fn provider_exhausted(err: anyhow::Error) -> anyhow::Error {
+    let stop = provider_exhausted_stop(&err);
+    tag(err, stop)
+}
+
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
+    if crate::model_refusal_from_error(err).is_some() {
+        return Some(
+            "The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.",
+        );
+    }
     let msg = err.to_string();
     // 503 / service unavailable / high demand (Gemini, OpenAI, etc.)
     if msg.contains("503")
@@ -170,8 +600,86 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     None
 }
 
+/// Provider-declared terminal failures override retry/message heuristics.
+fn has_typed_non_retryable_marker(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|source| source.is::<crate::traits::NonRetryableProviderError>())
+}
+
+/// The status shape rule shared by `embedded_status_code` and the
+/// error-text marker parser (`http_status_from_error_text`): a status
+/// code is a run of exactly three ASCII digits with no alphanumeric byte
+/// on either side.
+fn is_status_shaped_run(bytes: &[u8], start: usize) -> bool {
+    start + 3 <= bytes.len()
+        && bytes[start..start + 3].iter().all(u8::is_ascii_digit)
+        && (start == 0 || !bytes[start - 1].is_ascii_alphanumeric())
+        && (start + 3 == bytes.len() || !bytes[start + 3].is_ascii_alphanumeric())
+}
+
+/// First status-shaped HTTP status code embedded in an error message and
+/// admitted by `accept`: a run of exactly three ASCII digits, not adjacent
+/// (either side) to an ASCII alphanumeric character
+/// (`is_status_shaped_run`). Numbers glued to units or words ("480s"),
+/// longer digit runs ("0409", "4800"), and values `accept` rejects are
+/// not status codes. This keeps timing and sizing numbers in provider
+/// messages (for example a stream-idle bound of 480 s) from being misread
+/// as an HTTP status.
+fn embedded_status_code(message: &str, accept: impl Fn(u16) -> bool) -> Option<u16> {
+    let bytes = message.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_digit() {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if is_status_shaped_run(bytes, start)
+            && let Ok(code) = message[start..start + 3].parse::<u16>()
+            && accept(code)
+        {
+            return Some(code);
+        }
+        start = end;
+    }
+    None
+}
+
+/// First status-shaped HTTP client error (4xx) code embedded in a message.
+fn embedded_client_status(message: &str) -> Option<u16> {
+    embedded_status_code(message, |code| (400..500).contains(&code))
+}
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // A provider's typed classification is definitive. Check the full chain
+    // before text or status heuristics so recoverable-looking wording cannot
+    // override an explicit provider safety decision.
+    if has_typed_non_retryable_marker(err) {
+        return true;
+    }
+
+    // A typed model refusal cannot be repaired by replaying the same request
+    // against the same candidate. Advance directly to the next configured
+    // provider/model entry.
+    if err.downcast_ref::<AnthropicRefusalError>().is_some() {
+        return true;
+    }
+
+    // Typed stop next; the string heuristics below stay as the fallback for
+    // errors that came from outside our code.
+    if let Some(stop) = turn_stop(err) {
+        match stop.code {
+            // Recoverable by trimming history — same carve-out as the string path.
+            TurnStopCode::ContextOverflow => return false,
+            TurnStopCode::ProviderAuth => return true,
+            _ => {}
+        }
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -195,13 +703,12 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
     // Fallback: parse status codes from stringified errors (some model_providers
     // embed codes in error messages rather than returning typed HTTP errors).
+    // Only status-shaped numbers count (see `embedded_client_status`), so
+    // elapsed times and other digit noise in a message never look like an
+    // HTTP client error.
     let msg = err.to_string();
-    for word in msg.split(|c: char| !c.is_ascii_digit()) {
-        if let Ok(code) = word.parse::<u16>()
-            && (400..500).contains(&code)
-        {
-            return code != 429 && code != 408;
-        }
+    if let Some(code) = embedded_client_status(&msg) {
+        return code != 429 && code != 408;
     }
 
     // Heuristic: detect auth/model failures by keyword when no HTTP status
@@ -228,18 +735,33 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    msg_lower.contains("model")
-        && (msg_lower.contains("not found")
-            || msg_lower.contains("unknown")
-            || msg_lower.contains("unsupported")
-            || msg_lower.contains("does not exist")
-            || msg_lower.contains("invalid"))
+    has_model_not_found_hint(&msg_lower)
+}
+
+/// The single terminal-failure predicate the four non-streaming retry arms
+/// consult. Typed provider decisions (`NonRetryableProviderError`), typed
+/// refusals, and business-quota rate limits are definitive and never
+/// retried — overload wording cannot clear them. Overload downgrades only
+/// the heuristic non-retryable classification (status text, auth keyword
+/// hints), where the same wording can describe a transient server shed.
+/// Centralising the precedence here means the four arms cannot drift.
+fn is_terminal_provider_failure(err: &anyhow::Error) -> bool {
+    has_typed_non_retryable_marker(err)
+        || err.downcast_ref::<AnthropicRefusalError>().is_some()
+        || is_non_retryable_rate_limit(err)
+        || (is_non_retryable(err) && !is_overloaded(err))
 }
 
 /// Check if an error indicates an authentication/authorization failure.
 /// Used by channels to evict cached model_providers whose OAuth tokens may have
 /// expired so the next request triggers a fresh credential resolution.
 pub fn is_auth_error(err: &anyhow::Error) -> bool {
+    if let Some(stop) = turn_stop(err)
+        && stop.code == TurnStopCode::ProviderAuth
+    {
+        return true;
+    }
+
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
         && let Some(status) = reqwest_err.status()
     {
@@ -264,6 +786,20 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| msg_lower.contains(hint))
 }
 
+fn is_missing_credential_error(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    [
+        "missing api key",
+        "api key not set",
+        "api key is required",
+        "missing access token",
+        "token not set",
+        "anthropic credentials not set",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+}
+
 pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     let hints = [
@@ -276,7 +812,11 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
 }
 
 pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
+    if let Some(stop) = turn_stop(err)
+        && stop.code == TurnStopCode::ContextOverflow
+    {
+        return true;
+    }
     let hints = [
         "exceeds the context window",
         "exceeds the available context size",
@@ -290,7 +830,10 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
         "prompt exceeds max length",
     ];
 
-    hints.iter().any(|hint| lower.contains(hint))
+    err.chain().any(|cause| {
+        let lower = cause.to_string().to_lowercase();
+        hints.iter().any(|hint| lower.contains(hint))
+    })
 }
 
 /// Check if an error is a rate-limit (429) error.
@@ -303,6 +846,53 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     msg.contains("429")
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
+}
+
+/// Check if an error is an overload (transient server-side shed): the
+/// upstream accepted the request and dropped it under load. The decision is
+/// layered, each layer decisive when it applies:
+///
+/// 1. A typed reqwest status: overload iff it is 529.
+/// 2. The outermost status the crate's recognised markers yield
+///    (`modelprovider error:`, `api error (`, `http `): 529 is an
+///    overload; any 4xx is definitive and not one; another 5xx falls
+///    through to the wording, so a gateway's 502 or 503 whose body says
+///    "overloaded" still gets the overload floor. A status quoted from
+///    an upstream body never outranks the adapter's own status.
+/// 3. A status-shaped embedded client status (4xx): definitive, not an
+///    overload; a parsed client status outranks wording, so
+///    "429 ...: servers overloaded" is a rate limit, not a shed.
+/// 4. Otherwise the wording: "overloaded" (case-insensitive, covering
+///    `overloaded_error`) or a status-shaped 529.
+///
+/// Residual: a status-shaped `529` (space or punctuation on both sides) in
+/// a message with no recognised status marker and no typed classification
+/// is treated as overload — the price of the text fallback.
+/// `is_terminal_provider_failure` keeps that residual from overriding
+/// typed or quota decisions. Consulted on error values only — successful
+/// response text never reaches it. A plain 503 (even one whose body
+/// mentions "overload") is not an overload signal; it keeps the ordinary
+/// server-error policy without the overload backoff floor.
+fn is_overloaded(err: &anyhow::Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
+        && let Some(status) = reqwest_err.status()
+    {
+        return status.as_u16() == 529;
+    }
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+    if let Some(status) = http_status_from_error_text(&lower) {
+        if status == 529 {
+            return true;
+        }
+        if (400..500).contains(&status) {
+            return false;
+        }
+    }
+    if embedded_client_status(&msg).is_some() {
+        return false;
+    }
+    lower.contains("overloaded") || embedded_status_code(&lower, |code| code == 529).is_some()
 }
 
 fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
@@ -398,12 +988,186 @@ fn compact_error_detail(err: &anyhow::Error) -> String {
         .join(" ")
 }
 
+/// Sanitized HTTP failure retained across provider wrappers so runtime policy
+/// can act on the status code without parsing provider prose.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ProviderHttpError {
+    status: u16,
+    message: String,
+}
+
+impl ProviderHttpError {
+    pub(crate) fn new(status: reqwest::StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status: status.as_u16(),
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderErrorDiagnostic {
     kind: &'static str,
     phase: &'static str,
     hint: &'static str,
     endpoint: Option<String>,
+}
+
+/// A terminal Reliable failure that can be rendered safely at a user-facing
+/// delivery boundary without exposing retry-attempt diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliableProviderTerminalFailureKind {
+    ContextWindow,
+    CredentialsMissing,
+    Authentication,
+    RateLimited,
+    ProviderServer,
+    ModelNotFound,
+    ClientRequest,
+    Connection,
+    Timeout,
+    Other,
+}
+
+impl ReliableProviderTerminalFailureKind {
+    fn from_diagnostic_kind(kind: &str) -> Self {
+        match kind {
+            "context_window" => Self::ContextWindow,
+            "credentials_missing" => Self::CredentialsMissing,
+            "auth" => Self::Authentication,
+            "rate_limited" => Self::RateLimited,
+            "provider_server" => Self::ProviderServer,
+            "model_not_found" => Self::ModelNotFound,
+            "client_error" => Self::ClientRequest,
+            "connect" | "connect_timeout" | "dns" => Self::Connection,
+            "timeout" => Self::Timeout,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The typed terminal presentation cause for a Reliable provider failure.
+///
+/// `Display` intentionally remains the full diagnostic summary used by logs.
+/// User-facing delivery must select a localized message from [`Self::kind`]
+/// instead of exposing the retry envelope.
+#[derive(Debug)]
+pub struct ReliableProviderTerminalFailure {
+    kind: ReliableProviderTerminalFailureKind,
+    provider: Option<String>,
+    endpoint: Option<String>,
+    diagnostic: String,
+    terminal_cause: Option<anyhow::Error>,
+}
+
+impl ReliableProviderTerminalFailure {
+    pub fn new(
+        kind: ReliableProviderTerminalFailureKind,
+        endpoint: Option<String>,
+        diagnostic: String,
+    ) -> Self {
+        Self {
+            kind,
+            provider: None,
+            endpoint,
+            diagnostic,
+            terminal_cause: None,
+        }
+    }
+
+    /// Classify a provider error into a safe terminal presentation cause.
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        let diagnostic = provider_error_diagnostic(error);
+        Self::new(
+            ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            diagnostic.endpoint,
+            format!(
+                "provider error: kind={}; phase={}; hint={}",
+                diagnostic.kind, diagnostic.phase, diagnostic.hint
+            ),
+        )
+    }
+
+    fn with_cause(
+        provider: Option<&str>,
+        diagnostic: ProviderErrorDiagnostic,
+        failure_aggregate: String,
+        terminal_cause: anyhow::Error,
+    ) -> Self {
+        Self {
+            kind: ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            provider: provider
+                .filter(|provider| !provider.is_empty())
+                .map(str::to_owned),
+            endpoint: diagnostic.endpoint,
+            diagnostic: failure_aggregate,
+            terminal_cause: Some(terminal_cause),
+        }
+    }
+
+    pub fn kind(&self) -> ReliableProviderTerminalFailureKind {
+        self.kind
+    }
+
+    /// Attach the configured provider identity used for safe user-facing text.
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        let provider = provider.into();
+        self.provider = (!provider.is_empty()).then_some(provider);
+        self
+    }
+
+    /// Attach an underlying terminal cause while retaining diagnostic and kind mapping.
+    pub fn with_terminal_cause(mut self, cause: anyhow::Error) -> Self {
+        self.terminal_cause = Some(cause);
+        self
+    }
+
+    /// The underlying terminal cause if one was attached.
+    pub fn terminal_cause(&self) -> Option<&anyhow::Error> {
+        self.terminal_cause.as_ref()
+    }
+
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    pub fn endpoint_is_local(&self) -> bool {
+        self.endpoint.as_deref().is_some_and(|endpoint| {
+            reqwest::Url::parse(endpoint)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .parse::<IpAddr>()
+                            .is_ok_and(|address| address.is_loopback())
+                })
+        })
+    }
+}
+
+impl std::fmt::Display for ReliableProviderTerminalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for ReliableProviderTerminalFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.terminal_cause
+            .as_ref()
+            .map(|cause| cause.as_ref() as &(dyn std::error::Error + 'static))
+    }
 }
 
 fn sanitized_url_endpoint(mut url: reqwest::Url) -> String {
@@ -426,6 +1190,128 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
     Some(sanitized_url_endpoint(url))
 }
 
+/// HTTP status code carried by one of the crate's recognised error-text
+/// markers: a `modelprovider error:` prefix at the start of the text, or
+/// an `api error (` / `http ` marker anywhere in it. The outermost marker
+/// wins: adapters format their own response status first and append the
+/// upstream body after it (the Gemini CLI OAuth refresh bail in
+/// `gemini.rs` is the shape in hand), and `anyhow::Error::to_string`
+/// renders the outermost message, so the first marker in the text carries
+/// the wrapper's status; anything later is quoted payload and never
+/// outranks it. The shape rule is the one `embedded_status_code` applies:
+/// exactly three digits, no alphanumeric neighbour.
+fn http_status_from_error_text(text: &str) -> Option<u16> {
+    for prefix in [
+        "model_provider stream error: modelprovider error:",
+        "modelprovider error:",
+    ] {
+        if let Some(after_prefix) = text.strip_prefix(prefix).map(str::trim_start)
+            && let Some(code) = after_prefix
+                .get(..3)
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|code| (400..600).contains(code))
+                .filter(|_| {
+                    after_prefix
+                        .as_bytes()
+                        .get(3)
+                        .is_some_and(u8::is_ascii_whitespace)
+                })
+        {
+            return Some(code);
+        }
+    }
+
+    // Earliest accepted marker occurrence wins, across both markers: a
+    // status quoted from an upstream body sits after the adapter's own
+    // status and must not override it.
+    let bytes = text.as_bytes();
+    let mut outermost: Option<(usize, u16)> = None;
+    for marker in ["api error (", "http "] {
+        let mut scanned_to = 0;
+        let mut remainder = text;
+        while let Some(start) = remainder.find(marker) {
+            let marker_at = scanned_to + start;
+            let status_at = marker_at + marker.len();
+            if is_status_shaped_run(bytes, status_at)
+                && let Ok(code) = text[status_at..status_at + 3].parse::<u16>()
+                && (400..600).contains(&code)
+                && outermost.is_none_or(|(at, _)| marker_at < at)
+            {
+                outermost = Some((marker_at, code));
+            }
+            scanned_to = status_at;
+            remainder = &remainder[start + marker.len()..];
+        }
+    }
+    outermost.map(|(_, code)| code)
+}
+
+fn http_status_diagnostic(code: u16, endpoint: Option<String>) -> ProviderErrorDiagnostic {
+    let (kind, hint) = if matches!(code, 401 | 403) {
+        ("auth", "check provider credentials")
+    } else if code == 429 {
+        ("rate_limited", "wait, change key/quota, or switch provider")
+    } else if (500..600).contains(&code) {
+        (
+            "provider_server",
+            "provider returned a server error; retry or switch provider",
+        )
+    } else if code == 404 {
+        (
+            "model_not_found",
+            "check the configured model id for this provider",
+        )
+    } else if (400..500).contains(&code) {
+        (
+            "client_error",
+            "provider rejected the request; check config, model, or request shape",
+        )
+    } else {
+        ("http_error", "inspect provider response or switch provider")
+    };
+    ProviderErrorDiagnostic {
+        kind,
+        phase: "http_response",
+        hint,
+        endpoint,
+    }
+}
+
+fn http_status_is_authoritative(code: u16) -> bool {
+    matches!(code, 401 | 403 | 404 | 429) || (500..600).contains(&code)
+}
+
+fn has_model_not_found_hint(message: &str) -> bool {
+    message.split(": ").any(|segment| {
+        let segment = segment.trim_start();
+
+        [
+            "model not found",
+            "unknown model",
+            "unsupported model",
+            "invalid model",
+        ]
+        .iter()
+        .any(|hint| segment.starts_with(hint))
+            || ["model ", "requested model ", "the requested model "]
+                .iter()
+                .find_map(|prefix| segment.strip_prefix(prefix))
+                .is_some_and(|model_detail| {
+                    [
+                        " not found",
+                        " does not exist",
+                        " is unknown",
+                        " is unsupported",
+                        " is not supported",
+                        " is invalid",
+                    ]
+                    .iter()
+                    .any(|hint| model_detail.contains(hint))
+                        || model_detail == "unknown"
+                })
+    })
+}
+
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
     let error_detail = compact_error_detail(err);
     let lower = error_detail.to_lowercase();
@@ -433,12 +1319,32 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         .downcast_ref::<reqwest::Error>()
         .and_then(|reqwest_err| reqwest_err.url().cloned().map(sanitized_url_endpoint))
         .or_else(|| endpoint_from_error_text(&error_detail));
+    let structured_status = err
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+        .map(|status| status.as_u16());
+    let text_status = http_status_from_error_text(&lower);
+
+    let http_status = structured_status.or(text_status);
+
+    if let Some(status) = http_status.filter(|status| http_status_is_authoritative(*status)) {
+        return http_status_diagnostic(status, endpoint);
+    }
 
     if is_context_window_exceeded(err) {
         return ProviderErrorDiagnostic {
             kind: "context_window",
             phase: "request_validation",
             hint: "reduce context or use a larger-context model",
+            endpoint,
+        };
+    }
+
+    if is_missing_credential_error(err) {
+        return ProviderErrorDiagnostic {
+            kind: "credentials_missing",
+            phase: "configuration",
+            hint: "configure provider credentials",
             endpoint,
         };
     }
@@ -461,35 +1367,22 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
-        if let Some(status) = reqwest_err.status() {
-            let code = status.as_u16();
-            let (kind, hint) = if status.is_server_error() {
-                (
-                    "provider_server",
-                    "provider returned a server error; retry or switch provider",
-                )
-            } else if code == 404 {
-                (
-                    "model_not_found",
-                    "check the configured model id for this provider",
-                )
-            } else if status.is_client_error() {
-                (
-                    "client_error",
-                    "provider rejected the request; check config, model, or request shape",
-                )
-            } else {
-                ("http_error", "inspect provider response or switch provider")
-            };
-            return ProviderErrorDiagnostic {
-                kind,
-                phase: "http_response",
-                hint,
-                endpoint,
-            };
-        }
+    if is_overloaded(err) {
+        // Overload (529 / `overloaded_error`) is a server-side shed:
+        // classify and present it exactly like any other 5xx.
+        return ProviderErrorDiagnostic {
+            kind: "provider_server",
+            phase: "http_response",
+            hint: "provider returned a server error; retry or switch provider",
+            endpoint,
+        };
+    }
 
+    if let Some(status) = http_status {
+        return http_status_diagnostic(status, endpoint);
+    }
+
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
         if reqwest_err.is_timeout() && reqwest_err.is_connect() {
             return ProviderErrorDiagnostic {
                 kind: "connect_timeout",
@@ -530,6 +1423,15 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
+    if lower.contains("client error (connect)") || lower.contains("connection refused") {
+        return ProviderErrorDiagnostic {
+            kind: "connect",
+            phase: "connect",
+            hint: "could not open provider connection; check network, VPN, or firewall",
+            endpoint,
+        };
+    }
+
     if lower.contains("timed out") || lower.contains("timeout") {
         return ProviderErrorDiagnostic {
             kind: "timeout",
@@ -548,13 +1450,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
-    if lower.contains("model")
-        && (lower.contains("not found")
-            || lower.contains("unknown")
-            || lower.contains("unsupported")
-            || lower.contains("does not exist")
-            || lower.contains("invalid"))
-    {
+    if has_model_not_found_hint(&lower) {
         return ProviderErrorDiagnostic {
             kind: "model_not_found",
             phase: "http_response",
@@ -630,7 +1526,7 @@ fn provider_exhausted_attrs(
 
 fn is_context_turn_boundary(message: &ChatMessage) -> bool {
     message.role == "user"
-        && !crate::multimodal::is_prompt_tool_result_message(message)
+        && !zeroclaw_api::tool_carrier::is_tool_result_carrier(&message.role, &message.content)
         && !message.is_pruned_context_separator()
 }
 
@@ -686,43 +1582,325 @@ fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
     first_kept_position
 }
 
+const MAX_RETAINED_FAILURE_EVENTS: usize = 8;
+const MAX_FAILURE_AGGREGATE_BYTES: usize = 2_048;
+
+#[derive(Clone, Debug, Default)]
+struct FailureEvents {
+    total: usize,
+    retained: Vec<String>,
+}
+
+impl FailureEvents {
+    fn push(&mut self, event: String) {
+        self.total += 1;
+        if self.retained.len() < MAX_RETAINED_FAILURE_EVENTS {
+            self.retained.push(event);
+        }
+    }
+
+    fn next_index(&self) -> usize {
+        self.total + 1
+    }
+}
+
 fn push_failure(
-    failures: &mut Vec<String>,
-    provider_name: &str,
-    model: &str,
+    failures: &mut FailureEvents,
     attempt: u32,
     max_attempts: u32,
-    reason: &str,
-    error_detail: &str,
+    reason: &'static str,
     diagnostic: Option<&ProviderErrorDiagnostic>,
 ) {
+    // This aggregate can cross into model-visible tool results and durable
+    // background results. Keep it to fields controlled by ZeroClaw; the
+    // provider response detail is retained in the structured attempt logs.
     let mut failure = format!(
-        "model_provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
+        "event {} (retry {attempt}/{max_attempts}): {reason}",
+        failures.next_index()
     );
     if let Some(diagnostic) = diagnostic {
         failure.push_str(&format!(
             "; kind={}; phase={}; hint={}",
             diagnostic.kind, diagnostic.phase, diagnostic.hint
         ));
-        if let Some(endpoint) = diagnostic.endpoint.as_deref() {
-            failure.push_str(&format!("; endpoint={endpoint}"));
-        }
     }
     failures.push(failure);
 }
 
+fn omitted_failure_marker(count: usize) -> String {
+    format!("[{count} additional failure event(s) omitted]")
+}
+
+fn format_failure_aggregate(header: String, failures: &FailureEvents) -> String {
+    let all_omitted_marker = omitted_failure_marker(failures.total);
+    let minimum_suffix_len = if failures.total > 0 {
+        1 + all_omitted_marker.len()
+    } else {
+        0
+    };
+    let mut output = if header.len() + minimum_suffix_len <= MAX_FAILURE_AGGREGATE_BYTES {
+        header
+    } else {
+        format!(
+            "Model provider failure after {} failure event(s). Events:",
+            failures.total
+        )
+    };
+    let mut retained_count = 0;
+
+    for failure in &failures.retained {
+        let candidate_retained_count = retained_count + 1;
+        let omitted_after = failures.total - candidate_retained_count;
+        let reserved_marker_len = if omitted_after > 0 {
+            1 + omitted_failure_marker(omitted_after).len()
+        } else {
+            0
+        };
+        if output.len() + 1 + failure.len() + reserved_marker_len > MAX_FAILURE_AGGREGATE_BYTES {
+            break;
+        }
+        output.push('\n');
+        output.push_str(failure);
+        retained_count = candidate_retained_count;
+    }
+
+    let omitted = failures.total - retained_count;
+    if omitted > 0 {
+        output.push('\n');
+        output.push_str(&omitted_failure_marker(omitted));
+    }
+    debug_assert!(output.len() <= MAX_FAILURE_AGGREGATE_BYTES);
+    output
+}
+
+fn failure_aggregate(failures: &FailureEvents) -> String {
+    format_failure_aggregate(
+        format!(
+            "All model providers/models failed after {} failure event(s). Events:",
+            failures.total
+        ),
+        failures,
+    )
+}
+
+fn context_failure_aggregate(message: &str, failures: &FailureEvents) -> String {
+    format_failure_aggregate(
+        format!(
+            "{message} Failed after {} failure event(s). Events:",
+            failures.total
+        ),
+        failures,
+    )
+}
+
 fn is_empty_completion(resp: &ChatResponse) -> bool {
-    resp.text_or_empty().trim().is_empty()
-        && resp.tool_calls.is_empty()
-        && resp
-            .reasoning_content
-            .as_deref()
-            .is_none_or(|r| r.trim().is_empty())
+    resp.is_semantically_empty_terminal()
+}
+
+fn is_empty_text_completion(text: &str) -> bool {
+    zeroclaw_api::model_provider::strip_think_tags(text).is_empty()
+}
+
+fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>())
+}
+
+/// Extract billing metadata a Reliable terminal error preserves alongside its
+/// actual cause. The caller still returns the original error unchanged.
+pub(crate) fn terminal_error_usage(error: &anyhow::Error) -> Option<TokenUsage> {
+    crate::rejected_attempt_usage_from_error(error).cloned()
+}
+
+/// A Reliable chat request exhausted its candidates after receiving rejected
+/// semantic completions. The provider-reported usage is retained so the turn
+/// loop can account for work that was billed even though no response was
+/// accepted.
+#[derive(Debug)]
+pub struct ReliableRejectedCompletionUsage {
+    pub usage: TokenUsage,
+    failures: FailureEvents,
+    terminal_cause: Option<anyhow::Error>,
+}
+
+impl ReliableRejectedCompletionUsage {
+    fn new(usage: TokenUsage, failures: FailureEvents) -> Self {
+        Self {
+            usage,
+            failures,
+            terminal_cause: None,
+        }
+    }
+
+    fn with_terminal_cause(
+        usage: TokenUsage,
+        failures: FailureEvents,
+        cause: anyhow::Error,
+    ) -> Self {
+        Self {
+            usage,
+            failures,
+            terminal_cause: Some(cause),
+        }
+    }
+}
+
+impl std::fmt::Display for ReliableRejectedCompletionUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", failure_aggregate(&self.failures))
+    }
+}
+
+impl std::error::Error for ReliableRejectedCompletionUsage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.terminal_cause
+            .as_ref()
+            .map(|cause| cause.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// The final candidate attempt completed successfully at the transport layer
+/// but supplied neither usable text nor a native tool call. This remains typed
+/// independently from optional rejected-attempt usage so delivery layers can
+/// classify the actual terminal failure without guessing from accounting data.
+#[derive(Debug)]
+pub struct ReliableSemanticEmptyCompletion {
+    failures: FailureEvents,
+    rejected_usage: Option<ReliableRejectedCompletionUsage>,
+    terminal_cause: zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+}
+
+impl std::fmt::Display for ReliableSemanticEmptyCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", failure_aggregate(&self.failures))
+    }
+}
+
+impl std::error::Error for ReliableSemanticEmptyCompletion {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.rejected_usage
+            .as_ref()
+            .map(|usage| usage as &(dyn std::error::Error + 'static))
+            .or(Some(&self.terminal_cause))
+    }
+}
+
+fn reliable_terminal_error(
+    failures: FailureEvents,
+    rejected_attempt_usage: Option<TokenUsage>,
+    final_cause_is_semantic_empty: bool,
+) -> anyhow::Error {
+    let rejected_attempt_usage = rejected_attempt_usage.or_else(accounted_rejected_attempt_usage);
+    if final_cause_is_semantic_empty {
+        let terminal_cause = zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion;
+        return anyhow::Error::new(ReliableSemanticEmptyCompletion {
+            failures: failures.clone(),
+            rejected_usage: rejected_attempt_usage.map(|usage| {
+                ReliableRejectedCompletionUsage::with_terminal_cause(
+                    usage,
+                    failures,
+                    anyhow::Error::new(
+                        zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+                    ),
+                )
+            }),
+            terminal_cause,
+        });
+    }
+
+    match rejected_attempt_usage {
+        Some(usage) => anyhow::Error::new(ReliableRejectedCompletionUsage::new(usage, failures)),
+        None => anyhow::Error::msg(failure_aggregate(&failures)),
+    }
+}
+
+fn reliable_terminal_error_with_cause(
+    provider: Option<&str>,
+    failures: FailureEvents,
+    rejected_attempt_usage: Option<TokenUsage>,
+    final_cause_is_semantic_empty: bool,
+    final_cause: Option<anyhow::Error>,
+) -> anyhow::Error {
+    let rejected_attempt_usage = rejected_attempt_usage.or_else(accounted_rejected_attempt_usage);
+    if !final_cause_is_semantic_empty && let Some(cause) = final_cause {
+        let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure::with_cause(
+            provider,
+            provider_error_diagnostic(&cause),
+            failure_aggregate(&failures),
+            cause,
+        ));
+        if let Some(usage) = rejected_attempt_usage {
+            return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
+                usage,
+                failures,
+                terminal_failure,
+            ));
+        }
+        return terminal_failure;
+    }
+    if !final_cause_is_semantic_empty && let Some(diagnostic) = stream_recovery_failure_diagnostic()
+    {
+        let terminal_failure = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+                diagnostic.endpoint,
+                failure_aggregate(&failures),
+            )
+            .with_provider(provider.unwrap_or_default()),
+        );
+        if let Some(usage) = rejected_attempt_usage {
+            return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
+                usage,
+                failures,
+                terminal_failure,
+            ));
+        }
+        return terminal_failure;
+    }
+    reliable_terminal_error(
+        failures,
+        rejected_attempt_usage,
+        final_cause_is_semantic_empty,
+    )
+}
+
+pub(crate) fn accumulate_usage(total: &mut Option<TokenUsage>, usage: Option<&TokenUsage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let accumulated = total.get_or_insert_with(TokenUsage::default);
+    for (target, value) in [
+        (&mut accumulated.input_tokens, usage.input_tokens),
+        (&mut accumulated.output_tokens, usage.output_tokens),
+        (
+            &mut accumulated.cached_input_tokens,
+            usage.cached_input_tokens,
+        ),
+    ] {
+        if let Some(value) = value {
+            *target = Some(target.unwrap_or(0).saturating_add(value));
+        }
+    }
+}
+
+fn combine_response_usage(response: &mut ChatResponse, prior_attempts: Option<TokenUsage>) {
+    let Some(prior_attempts) = prior_attempts else {
+        return;
+    };
+    let mut combined = Some(prior_attempts);
+    accumulate_usage(&mut combined, response.usage.as_ref());
+    response.usage = combined;
 }
 
 enum ReliableModelProviderEntryProvider {
     Direct(Box<dyn ModelProvider>),
     Pinned(crate::model_pin::ModelPinnedProvider),
+    #[cfg(test)]
+    DispatchObservedPinned {
+        pinned_model: String,
+        provider: Box<dyn ModelProvider>,
+    },
 }
 
 impl ReliableModelProviderEntryProvider {
@@ -730,6 +1908,8 @@ impl ReliableModelProviderEntryProvider {
         match self {
             Self::Direct(provider) => provider.as_ref(),
             Self::Pinned(provider) => provider,
+            #[cfg(test)]
+            Self::DispatchObservedPinned { provider, .. } => provider.as_ref(),
         }
     }
 
@@ -737,12 +1917,19 @@ impl ReliableModelProviderEntryProvider {
         match self {
             Self::Direct(_) => requested_model,
             Self::Pinned(provider) => provider.pinned_model(),
+            #[cfg(test)]
+            Self::DispatchObservedPinned { pinned_model, .. } => pinned_model,
         }
     }
 }
 
 pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
+    /// Exact configured candidate identity used for fallback attribution.
+    ///
+    /// This deliberately differs from `display_name`: two aliases can share a
+    /// provider family and model while still being distinct fallback candidates.
+    candidate_name: String,
     cooldown_key: String,
     provider: ReliableModelProviderEntryProvider,
 }
@@ -753,8 +1940,24 @@ impl ReliableModelProviderEntry {
         cooldown_key: impl Into<String>,
         provider: Box<dyn ModelProvider>,
     ) -> Self {
+        let display_name = display_name.into();
+        Self {
+            candidate_name: display_name.clone(),
+            display_name,
+            cooldown_key: cooldown_key.into(),
+            provider: ReliableModelProviderEntryProvider::Direct(provider),
+        }
+    }
+
+    pub(crate) fn new_with_candidate(
+        display_name: impl Into<String>,
+        cooldown_key: impl Into<String>,
+        candidate_name: impl Into<String>,
+        provider: Box<dyn ModelProvider>,
+    ) -> Self {
         Self {
             display_name: display_name.into(),
+            candidate_name: candidate_name.into(),
             cooldown_key: cooldown_key.into(),
             provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
@@ -771,9 +1974,11 @@ impl ReliableModelProviderEntry {
         pinned_model: &str,
         inner: Box<dyn ModelProvider>,
     ) -> Self {
+        let cooldown_key = cooldown_key.into();
         Self {
             display_name: display_name.into(),
-            cooldown_key: cooldown_key.into(),
+            candidate_name: cooldown_key.clone(),
+            cooldown_key,
             provider: ReliableModelProviderEntryProvider::Pinned(
                 crate::model_pin::ModelPinnedProvider::builder(alias)
                     .pinned_model(pinned_model)
@@ -783,10 +1988,34 @@ impl ReliableModelProviderEntry {
         }
     }
 
+    /// Build a test-only pinned entry whose provider observes Reliable's dispatch argument.
+    #[cfg(test)]
+    fn new_dispatch_observed_pinned(
+        display_name: impl Into<String>,
+        cooldown_key: impl Into<String>,
+        pinned_model: impl Into<String>,
+        provider: Box<dyn ModelProvider>,
+    ) -> Self {
+        let cooldown_key = cooldown_key.into();
+        Self {
+            display_name: display_name.into(),
+            candidate_name: cooldown_key.clone(),
+            cooldown_key,
+            provider: ReliableModelProviderEntryProvider::DispatchObservedPinned {
+                pinned_model: pinned_model.into(),
+                provider,
+            },
+        }
+    }
+
     /// Model this entry serves for `requested_model`: the pinned model when
     /// the entry is model-pinned, otherwise the requested model unchanged.
     fn served_model<'a>(&'a self, requested_model: &'a str) -> &'a str {
         self.provider.served_model(requested_model)
+    }
+
+    fn candidate_name(&self) -> &str {
+        &self.candidate_name
     }
 
     fn provider(&self) -> &dyn ModelProvider {
@@ -849,6 +2078,35 @@ impl ReliableModelProvider {
             rate_limit_cooldowns: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Build a provider whose entries mirror `push_pinned_entries`: every entry
+    /// shares ONE `cooldown_key` (the `<family>.<alias>` reference) and differs
+    /// only in its pinned model, exactly as a `fallback_models` list produces.
+    ///
+    /// Exposed for cross-crate regressions that need the same-alias
+    /// pinned-model failover shape; the production builder reaches
+    /// `new_pinned` directly.
+    #[doc(hidden)]
+    pub fn new_pinned_for_test(
+        alias: &str,
+        entries: Vec<(&str, &str, &str, std::sync::Arc<dyn ModelProvider>)>,
+        max_retries: u32,
+        base_backoff_ms: u64,
+    ) -> Self {
+        let model_providers = entries
+            .into_iter()
+            .map(|(cooldown_key, provider_alias, pinned_model, inner)| {
+                ReliableModelProviderEntry::new_pinned(
+                    cooldown_key,
+                    cooldown_key,
+                    provider_alias,
+                    pinned_model,
+                    Box::new(inner),
+                )
+            })
+            .collect();
+        Self::new_with_entries(alias, model_providers, max_retries, base_backoff_ms)
+    }
     /// Set additional API keys for round-robin rotation on rate-limit errors.
     pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
         self.api_keys = keys;
@@ -884,13 +2142,29 @@ impl ReliableModelProvider {
         if let Some(retry_after) = parse_retry_after_ms(err) {
             // Use Retry-After but cap at 30s to avoid indefinite waits
             retry_after.min(30_000).max(base)
+        } else if is_overloaded(err) {
+            // Overload sheds arrive without a Retry-After; an immediate
+            // re-send lands back in the same shed window, so hold at least
+            // the floor. Growth across attempts stays the loop's doubling.
+            base.max(Self::OVERLOAD_BACKOFF_FLOOR_MS)
         } else {
             base
         }
     }
 
+    fn configured_provider_identity(&self) -> Option<&str> {
+        self.model_providers
+            .first()
+            .map(ReliableModelProviderEntry::candidate_name)
+            .filter(|provider| !provider.is_empty())
+    }
+
     /// Default cooldown after a retryable 429 when Retry-After is absent.
     const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
+
+    /// Minimum wait between attempts after an overload when no Retry-After
+    /// is parsed. Overload sheds typically outlast one round trip.
+    const OVERLOAD_BACKOFF_FLOOR_MS: u64 = 2_000;
 
     /// Returns whether a cooldown is active and prunes expired cooldowns.
     fn provider_cooldown_active(&self, cooldown_key: &str) -> bool {
@@ -914,17 +2188,129 @@ impl ReliableModelProvider {
         self.model_providers.len() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
     }
 
-    fn record_cooldown_skip_failure(failures: &mut Vec<String>, provider_name: &str, model: &str) {
-        failures.push(format!(
-            "model_provider={provider_name} model={model}: skipped; reason=rate_limit_cooldown"
-        ));
+    /// Admit an entry with its configured retry budget, except for the exact
+    /// stream-failed entry, which is skipped to avoid replaying it. Image
+    /// replacement and semantic-empty (with budget) each permit one atomic
+    /// non-stream attempt. A typed connect failure and the single-candidate
+    /// case instead carry the full configured budget. An explicit one-attempt
+    /// grant takes precedence when these exceptions overlap.
+    fn effective_retry_limit(
+        &self,
+        model_slot: usize,
+        entry_index: usize,
+        has_other_candidate: bool,
+    ) -> Option<u32> {
+        let max_retries = self.max_retries;
+        RELIABLE_CALL_ACCOUNTING
+            .try_with(|accounting| {
+                let mut accounting = accounting.lock();
+                let exact_failed_entry = accounting.stream_resume_after.is_some_and(|failed| {
+                    model_slot == failed.model_slot && entry_index == failed.entry_index
+                });
+                // Connect-failed is a transport fact, not an error-text
+                // reading: the flag is set only when the recorded failure
+                // carries `StreamError::ConnectFailed`, which adapters emit
+                // at the send site on a transport-reported connect failure.
+                // A provider's own error text (an SSE error frame on an
+                // accepted 200 response, an API error body) never grants
+                // this; unknown provenance keeps the skip.
+                let connect_failed = accounting.stream_recovery_connect_failed;
+                let decision = Self::stream_recovery_decision(
+                    max_retries,
+                    exact_failed_entry,
+                    connect_failed,
+                    accounting.stream_recovery_semantic_empty_permission,
+                    accounting.stream_recovery_image_replacement_permission,
+                    has_other_candidate,
+                );
+                match decision {
+                    RetryDecision::Admit(limit) => {
+                        if exact_failed_entry {
+                            // Consume one-shot recovery grants so each fires at
+                            // most once. Clearing the resume marker merges the
+                            // single-candidate and connect-failed grants into
+                            // an explicit one-attempt recovery when more than
+                            // one applies, and keeps connect-failed from firing
+                            // twice in one call. The next candidate keeps its
+                            // own ordinary budget.
+                            accounting.stream_recovery_semantic_empty_permission = false;
+                            accounting.stream_recovery_image_replacement_permission = false;
+                            if !has_other_candidate || connect_failed {
+                                accounting.stream_resume_after = None;
+                            }
+                        }
+                        Some(limit)
+                    }
+                    RetryDecision::Skip => None,
+                }
+            })
+            .unwrap_or(Some(max_retries))
     }
 
-    fn log_cooldown_skip(&self, provider_name: &str) {
+    /// Pure retry policy for a single entry: precedence is encoded in this
+    /// `match` so each recovery mode is an explicit, independently testable
+    /// decision rather than a branch in an if-chain. Stateful one-shot
+    /// consumption lives in [`Self::effective_retry_limit`], not here.
+    fn stream_recovery_decision(
+        max_retries: u32,
+        exact_failed_entry: bool,
+        connect_failed: bool,
+        semantic_empty_permission: bool,
+        image_replacement_permission: bool,
+        has_other_candidate: bool,
+    ) -> RetryDecision {
+        if !exact_failed_entry {
+            return RetryDecision::Admit(max_retries);
+        }
+        // Explicit one-attempt recovery wins when exceptions overlap. See
+        // `effective_retry_limit` for the merged one-shot consumption.
+        if image_replacement_permission || (max_retries > 0 && semantic_empty_permission) {
+            return RetryDecision::Admit(0);
+        }
+        // Connect failure on the stream send: the exception matches the
+        // non-streaming retry loop, which already retries connect failures
+        // on the same entry; the redirect limit on the variant applies
+        // equally to both paths. The grant carries the configured budget
+        // even when another candidate exists (a zero budget still means
+        // exactly one attempt).
+        if connect_failed {
+            return RetryDecision::Admit(max_retries);
+        }
+        // Single-candidate stream failure: no alternative entry exists, so a
+        // non-stream retry of the same entry is recovery, not replay, and it
+        // carries the configured budget (a zero budget still means exactly
+        // one attempt). Semantic-empty keeps its single-attempt grant.
+        if !has_other_candidate {
+            return RetryDecision::Admit(max_retries);
+        }
+        RetryDecision::Skip
+    }
+
+    fn record_cooldown_skip_failure(failures: &mut FailureEvents, max_attempts: u32) {
+        let diagnostic = ProviderErrorDiagnostic {
+            kind: "rate_limited",
+            phase: "cooldown",
+            hint: "wait for provider cooldown or switch provider",
+            endpoint: None,
+        };
+        push_failure(
+            failures,
+            0,
+            max_attempts,
+            "rate_limit_cooldown",
+            Some(&diagnostic),
+        );
+    }
+
+    fn log_cooldown_skip(&self, provider_name: &str, model: &str) {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"model_provider": provider_name})),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "model_provider": provider_name,
+                    "model": model,
+                })
+            ),
             "Skipping model_provider during rate-limit cooldown"
         );
     }
@@ -965,24 +2351,37 @@ impl ReliableModelProvider {
 
     /// Shared tail of the empty-completion retry path used by every chat method:
     /// record the empty attempt, warn, sleep the current backoff, then double it
-    /// (capped). The caller keeps the emptiness check (it differs per return
-    /// type) and the `continue`. See [`is_empty_completion`].
+    /// (capped). The caller owns the response-shape check and either retries
+    /// or records its final failed attempt. See [`is_empty_completion`].
     async fn backoff_after_empty_completion(
         &self,
-        failures: &mut Vec<String>,
+        failures: &mut FailureEvents,
         provider_name: &str,
         model: &str,
         attempt: u32,
         backoff_ms: &mut u64,
     ) {
+        self.record_empty_completion_failure(failures, provider_name, model, attempt, true);
+        tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
+        *backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+    }
+
+    /// Record an invalid but HTTP-successful provider response. The retry
+    /// loops use this as an ordinary failure so that exhaustion advances to
+    /// fallback instead of returning a successful blank turn.
+    fn record_empty_completion_failure(
+        &self,
+        failures: &mut FailureEvents,
+        provider_name: &str,
+        model: &str,
+        attempt: u32,
+        retrying: bool,
+    ) {
         push_failure(
             failures,
-            provider_name,
-            model,
             attempt + 1,
             self.max_retries + 1,
             "empty_response",
-            "model_provider returned an empty completion",
             None,
         );
         ::zeroclaw_log::record!(
@@ -993,17 +2392,53 @@ impl ReliableModelProvider {
                     "model_provider": provider_name,
                     "model": model,
                     "attempt": attempt + 1,
-                    "backoff_ms": *backoff_ms
+                    "retrying": retrying,
                 })),
-            "Empty completion; retrying"
+            if retrying {
+                "Empty completion; retrying"
+            } else {
+                "Empty completion; retries exhausted"
+            }
         );
-        tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
-        *backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
     }
 }
 
 #[async_trait]
 impl ModelProvider for ReliableModelProvider {
+    fn has_stable_request_identity(&self, model: &str) -> bool {
+        if self.model_providers.len() != 1
+            || self
+                .model_fallbacks
+                .get(model)
+                .is_some_and(|fallbacks| !fallbacks.is_empty())
+        {
+            return false;
+        }
+
+        self.model_providers
+            .first()
+            .is_some_and(|entry| entry.provider().has_stable_request_identity(model))
+    }
+
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        if self.max_retries != 0
+            || !self.api_keys.is_empty()
+            || self.model_providers.len() != 1
+            || self
+                .model_fallbacks
+                .get(model)
+                .is_some_and(|fallbacks| !fallbacks.is_empty())
+        {
+            return false;
+        }
+
+        self.model_providers.first().is_some_and(|entry| {
+            entry
+                .provider()
+                .supports_exact_request_replay(request, entry.served_model(model))
+        })
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for entry in &self.model_providers {
             let provider_name = entry.display_name.as_str();
@@ -1037,19 +2472,30 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
+        let mut refusal_seen = None;
+        let mut rejected_attempt_usage = None;
+        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
+        let mut final_cause = None;
+        let mut final_cause_provider = None;
+        let mut terminal_provider_keys = HashSet::new();
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
         // immediately. On non-retryable error, break to next model_provider. On
         // retryable error, sleep with exponential backoff and retry.
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_slot, current_model) in models.iter().enumerate() {
+            for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
+                let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
-                    self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    self.log_cooldown_skip(provider_name, served_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1058,27 +2504,46 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match ProviderDispatch::from_ref(entry.provider())
-                        .chat_with_system(system_prompt, message, current_model, temperature)
-                        .await
+                    commit_safeguard_fallback(None);
+                    match with_exact_dispatch_route(
+                        entry.cooldown_key.clone(),
+                        entry.served_model(current_model).to_string(),
+                        ProviderDispatch::from_ref(entry.provider()).chat_with_system(
+                            system_prompt,
+                            message,
+                            current_model,
+                            temperature,
+                        ),
+                    )
+                    .await
                     {
                         Ok(resp) => {
-                            // Re-roll a transient empty completion instead of
-                            // returning a blank turn (bounded by `max_retries`).
-                            if attempt < self.max_retries && resp.trim().is_empty() {
-                                self.backoff_after_empty_completion(
+                            if is_empty_text_completion(&resp) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
-                                    &mut backoff_ms,
-                                )
-                                .await;
-                                continue;
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
                             }
-                            let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_slot != 0
+                                || entry_index != 0
                                 || self
                                     .model_providers
                                     .first()
@@ -1089,40 +2554,93 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
+                                    model_slot != 0 || entry_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                                record_accepted_attempt(
+                                    entry,
+                                    current_model,
+                                    fallback_record
+                                        .as_ref()
+                                        .map(ProviderFallbackRecord::attribution),
+                                );
+                            } else {
+                                record_successful_provider_fallback(None);
+                                record_accepted_attempt(entry, current_model, None);
                             }
+                            record_refusal_rescue(&refusal_seen, model, served_model);
                             return Ok(resp);
                         }
                         Err(e) => {
-                            // Context window exceeded: no history to truncate
-                            // in chat_with_system, bail immediately.
-                            if is_context_window_exceeded(&e) {
-                                let error_detail = compact_error_detail(&e);
-                                push_failure(
+                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
+                            if is_semantic_empty_completion_error(&e) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
+                            }
+                            final_cause_is_semantic_empty = false;
+                            // Context window exceeded: no history to truncate
+                            // in chat_with_system, bail immediately.
+                            if is_context_window_exceeded(&e) && !is_non_retryable(&e) {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
                                     attempt + 1,
                                     self.max_retries + 1,
-                                    "non_retryable",
-                                    &error_detail,
-                                    None,
+                                    "context_window",
+                                    Some(&diagnostic),
                                 );
-                                anyhow::bail!(
-                                    "Request exceeds model context window. Attempts:\n{}",
-                                    failures.join("\n")
+                                let context_error = context_failure_aggregate(
+                                    "Request exceeds model context window.",
+                                    &failures,
                                 );
+                                return Err(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()),
+                                    failures,
+                                    rejected_attempt_usage,
+                                    false,
+                                    Some(e),
+                                )
+                                .context(context_error));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
-                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            // Typed terminal decisions and business quota
+                            // win; overload wording only downgrades
+                            // heuristic non-retryable text (see
+                            // `is_terminal_provider_failure`).
+                            let non_retryable = is_terminal_provider_failure(&e);
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -1132,12 +2650,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1163,18 +2678,25 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_failure_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             &error_detail,
                                             &diagnostic,
                                         )
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -1190,7 +2712,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_retry_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             attempt + 1,
                                             wait,
                                             failure_reason,
@@ -1203,6 +2725,8 @@ impl ModelProvider for ReliableModelProvider {
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
+                            final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -1213,7 +2737,7 @@ impl ModelProvider for ReliableModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(provider_exhausted_attrs(
                             provider_name,
-                            current_model,
+                            served_model,
                             last_error_detail.as_deref(),
                             last_diagnostic.as_ref(),
                         )),
@@ -1226,10 +2750,15 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
+            failures,
+            rejected_attempt_usage,
+            final_cause_is_semantic_empty,
+            final_cause,
+        )))
     }
 
     async fn chat_with_history(
@@ -1238,17 +2767,28 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
+        let mut refusal_seen = None;
+        let mut rejected_attempt_usage = None;
+        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
+        let mut final_cause = None;
+        let mut final_cause_provider = None;
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_slot, current_model) in models.iter().enumerate() {
+            for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
+                let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
-                    self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    self.log_cooldown_skip(provider_name, served_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1257,27 +2797,45 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match ProviderDispatch::from_ref(entry.provider())
-                        .chat_with_history(&effective_messages, current_model, temperature)
-                        .await
+                    commit_safeguard_fallback(None);
+                    match with_exact_dispatch_route(
+                        entry.cooldown_key.clone(),
+                        entry.served_model(current_model).to_string(),
+                        ProviderDispatch::from_ref(entry.provider()).chat_with_history(
+                            &effective_messages,
+                            current_model,
+                            temperature,
+                        ),
+                    )
+                    .await
                     {
                         Ok(resp) => {
-                            // Re-roll a transient empty completion instead of
-                            // returning a blank turn (bounded by `max_retries`).
-                            if attempt < self.max_retries && resp.trim().is_empty() {
-                                self.backoff_after_empty_completion(
+                            if is_empty_text_completion(&resp) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
-                                    &mut backoff_ms,
-                                )
-                                .await;
-                                continue;
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
                             }
-                            let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_slot != 0
+                                || entry_index != 0
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1289,51 +2847,112 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
+                                    model_slot != 0 || entry_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                                record_accepted_attempt(
+                                    entry,
+                                    current_model,
+                                    fallback_record
+                                        .as_ref()
+                                        .map(ProviderFallbackRecord::attribution),
+                                );
+                            } else {
+                                record_successful_provider_fallback(None);
+                                record_accepted_attempt(entry, current_model, None);
                             }
+                            record_refusal_rescue(&refusal_seen, model, served_model);
                             return Ok(resp);
                         }
                         Err(e) => {
+                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
+                            if is_semantic_empty_completion_error(&e) {
+                                if attempt < self.max_retries {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    served_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
+                                break;
+                            }
+                            final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e) && !context_truncated {
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
+                                    record_provider_context_truncation();
                                     context_truncated = true;
-                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let error_detail = compact_error_detail(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
-                                push_failure(
-                                    &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "non_retryable",
-                                    &error_detail,
-                                    None,
+                                let context_error = context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). Try using a model \
+                                         with a larger context window, reducing the number of tools/skills, or \
+                                         enabling compact_context in config."
+                                    ),
+                                    &failures,
                                 );
-                                anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced without \
-                                     breaking message/tool pairing ({truncation_limit}). \
-                                     Try using a model with a larger context window, reducing the number \
-                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
+                                return Err(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()),
+                                    failures,
+                                    rejected_attempt_usage,
+                                    false,
+                                    Some(e),
+                                )
+                                .context(context_error));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
-                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            // Typed terminal decisions and business quota
+                            // win; overload wording only downgrades
+                            // heuristic non-retryable text (see
+                            // `is_terminal_provider_failure`).
+                            let non_retryable = is_terminal_provider_failure(&e);
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -1343,12 +2962,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1372,18 +2988,25 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_failure_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             &error_detail,
                                             &diagnostic,
                                         )
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -1399,7 +3022,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_retry_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             attempt + 1,
                                             wait,
                                             failure_reason,
@@ -1412,6 +3035,8 @@ impl ModelProvider for ReliableModelProvider {
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
+                            final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -1422,7 +3047,7 @@ impl ModelProvider for ReliableModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(provider_exhausted_attrs(
                             provider_name,
-                            current_model,
+                            served_model,
                             last_error_detail.as_deref(),
                             last_diagnostic.as_ref(),
                         )),
@@ -1431,10 +3056,15 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
+            failures,
+            rejected_attempt_usage,
+            final_cause_is_semantic_empty,
+            final_cause,
+        )))
     }
 
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
@@ -1452,6 +3082,11 @@ impl ModelProvider for ReliableModelProvider {
                 .model_providers
                 .iter()
                 .all(|entry| entry.provider().supports_vision());
+        capabilities.native_tool_calling = !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider().supports_native_tools());
         capabilities
     }
 
@@ -1466,14 +3101,61 @@ impl ModelProvider for ReliableModelProvider {
                 .model_providers
                 .iter()
                 .all(|entry| entry.provider().capabilities_for_model(model).vision);
+        capabilities.native_tool_calling = !self.model_providers.is_empty()
+            && self.model_providers.iter().all(|entry| {
+                entry
+                    .provider()
+                    .capabilities_for_model(model)
+                    .native_tool_calling
+            });
         capabilities
     }
 
-    fn supports_native_tools(&self) -> bool {
+    fn vision_limited_by(&self, model: &str) -> Option<String> {
+        // Name the fallback entry that forces the ANDed `vision` above to
+        // `false`, so error sites can blame it instead of the primary. When
+        // the primary (index 0) is itself the non-vision entry there is no
+        // fallback to blame - report `None` and let the caller fall back to
+        // its ordinary "this model_provider" wording rather than mislabeling
+        // the primary's own limitation as a fallback's.
         self.model_providers
-            .first()
-            .map(|entry| entry.provider().supports_native_tools())
-            .unwrap_or(false)
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| !entry.provider().capabilities_for_model(model).vision)
+            .and_then(|(index, entry)| (index != 0).then(|| entry.candidate_name().to_string()))
+    }
+
+    fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+        let mut has_native = false;
+        let mut has_text_only = false;
+
+        for entry in &self.model_providers {
+            let provider = entry.provider();
+            if provider.has_mixed_native_tool_support_for_model(model) {
+                return true;
+            }
+            if provider.capabilities_for_model(model).native_tool_calling {
+                has_native = true;
+            } else {
+                has_text_only = true;
+            }
+            if has_native && has_text_only {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        // The turn loop selects one tool protocol before Reliable chooses a
+        // candidate. A native request is therefore safe only when every
+        // candidate the request may reach accepts native tool specifications.
+        !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider().supports_native_tools())
     }
 
     fn supports_vision(&self) -> bool {
@@ -1487,17 +3169,36 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
+        let mut refusal_seen = None;
+        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
+        let mut rejected_attempt_usage = None;
+        let mut final_cause = None;
+        let mut final_cause_provider = None;
 
-        for current_model in &models {
-            for entry in &self.model_providers {
+        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+
+        for (model_slot, current_model) in models.iter().enumerate() {
+            for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                let Some(retry_limit) =
+                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
+                else {
+                    final_cause_provider = Some(entry.candidate_name().to_string());
+                    continue;
+                };
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
+                let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
-                    self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    self.log_cooldown_skip(provider_name, served_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1505,29 +3206,57 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_error_detail: Option<String> = None;
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
-                for attempt in 0..=self.max_retries {
-                    match ProviderDispatch::from_ref(entry.provider())
-                        .chat_with_tools(&effective_messages, tools, current_model, temperature)
-                        .await
+                for attempt in 0..=retry_limit {
+                    commit_safeguard_fallback(None);
+                    match with_exact_dispatch_route(
+                        entry.cooldown_key.clone(),
+                        entry.served_model(current_model).to_string(),
+                        ProviderDispatch::from_ref(entry.provider()).chat_with_tools(
+                            &effective_messages,
+                            tools,
+                            current_model,
+                            temperature,
+                        ),
+                    )
+                    .await
                     {
-                        Ok(resp) => {
-                            // Re-roll a transient empty completion instead of
-                            // returning a blank turn (bounded by `max_retries`;
-                            // see `is_empty_completion`).
-                            if attempt < self.max_retries && is_empty_completion(&resp) {
-                                self.backoff_after_empty_completion(
+                        Ok(mut resp) => {
+                            if is_empty_completion(&resp) {
+                                if let Some(usage) = resp.usage.clone()
+                                    && !has_reliable_call_accounting()
+                                {
+                                    accumulate_usage(&mut rejected_attempt_usage, Some(&usage));
+                                }
+                                if attempt < retry_limit {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
-                                    &mut backoff_ms,
-                                )
-                                .await;
-                                continue;
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
                             }
-                            let served_model = entry.served_model(current_model);
+                            if let Some(usage) = rejected_attempt_usage.take()
+                                && !has_reliable_call_accounting()
+                            {
+                                combine_response_usage(&mut resp, Some(usage));
+                            }
                             if attempt > 0
                                 || served_model != model
+                                || model_slot != 0
+                                || entry_index != 0
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1539,51 +3268,110 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
+                                    model_slot != 0 || entry_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                                record_accepted_attempt(
+                                    entry,
+                                    current_model,
+                                    fallback_record
+                                        .as_ref()
+                                        .map(ProviderFallbackRecord::attribution),
+                                );
+                            } else {
+                                record_successful_provider_fallback(None);
+                                record_accepted_attempt(entry, current_model, None);
                             }
+                            record_refusal_rescue(&refusal_seen, model, served_model);
                             return Ok(resp);
                         }
                         Err(e) => {
+                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
+                            if is_semantic_empty_completion_error(&e) {
+                                if attempt < retry_limit {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    served_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
+                            }
+                            final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e) && !context_truncated {
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
+                                    record_provider_context_truncation();
                                     context_truncated = true;
-                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let error_detail = compact_error_detail(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
-                                push_failure(
-                                    &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "non_retryable",
-                                    &error_detail,
-                                    None,
+                                let context_error = context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). Try using a model \
+                                         with a larger context window, reducing the number of tools/skills, or \
+                                         enabling compact_context in config."
+                                    ),
+                                    &failures,
                                 );
-                                anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced without \
-                                     breaking message/tool pairing ({truncation_limit}). \
-                                     Try using a model with a larger context window, reducing the number \
-                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
+                                return Err(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()),
+                                    failures,
+                                    rejected_attempt_usage,
+                                    false,
+                                    Some(e),
+                                )
+                                .context(context_error));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
-                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            // Typed terminal decisions and business quota
+                            // win; overload wording only downgrades
+                            // heuristic non-retryable text (see
+                            // `is_terminal_provider_failure`).
+                            let non_retryable = is_terminal_provider_failure(&e);
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -1593,12 +3381,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1622,22 +3407,29 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_failure_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             &error_detail,
                                             &diagnostic,
                                         )
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
-                            if attempt < self.max_retries {
+                            if attempt < retry_limit {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -1649,7 +3441,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_retry_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             attempt + 1,
                                             wait,
                                             failure_reason,
@@ -1662,6 +3454,8 @@ impl ModelProvider for ReliableModelProvider {
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
+                            final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -1672,7 +3466,7 @@ impl ModelProvider for ReliableModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(provider_exhausted_attrs(
                             provider_name,
-                            current_model,
+                            served_model,
                             last_error_detail.as_deref(),
                             last_diagnostic.as_ref(),
                         )),
@@ -1681,10 +3475,15 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
+            failures,
+            rejected_attempt_usage,
+            final_cause_is_semantic_empty,
+            final_cause,
+        )))
     }
 
     async fn chat(
@@ -1693,17 +3492,65 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
+        let mut streamed_refusal = take_stream_refusal_recovery();
+        let mut refusal_seen = streamed_refusal.clone();
+        let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
+        let mut rejected_attempt_usage = streamed_refusal
+            .as_ref()
+            .and_then(|refusal| refusal.usage.as_deref().cloned());
+        // A streamed refusal is already a terminal typed failure for its
+        // exact physical candidate. Retain it while skipping that candidate's
+        // non-streaming replay; a later distinct failure deliberately
+        // overwrites this cause below.
+        let mut final_cause = streamed_refusal.as_ref().cloned().map(anyhow::Error::new);
+        let mut final_cause_provider = streamed_refusal
+            .as_ref()
+            .and_then(|refusal| refusal.attempted_candidate.clone());
 
-        for current_model in &models {
-            for entry in &self.model_providers {
+        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+
+        for (model_slot, current_model) in models.iter().enumerate() {
+            for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                let skip_streamed_refusal = streamed_refusal.as_ref().is_some_and(|refusal| {
+                    refusal.requested_model == *current_model
+                        && model_slot == 0
+                        && refusal.attempted_candidate_index.map_or_else(
+                            || {
+                                refusal
+                                    .attempted_candidate
+                                    .as_deref()
+                                    .map_or(entry_index == 0, |candidate| {
+                                        candidate == entry.candidate_name()
+                                    })
+                            },
+                            |index| index == entry_index,
+                        )
+                });
+                if skip_streamed_refusal {
+                    final_cause_provider = Some(entry.candidate_name().to_string());
+                    streamed_refusal = None;
+                    continue;
+                }
+                let Some(retry_limit) =
+                    self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
+                else {
+                    final_cause_provider = Some(entry.candidate_name().to_string());
+                    continue;
+                };
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
+                let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
-                    self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    self.log_cooldown_skip(provider_name, served_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1711,34 +3558,61 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_error_detail: Option<String> = None;
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
-                for attempt in 0..=self.max_retries {
+                for attempt in 0..=retry_limit {
+                    commit_safeguard_fallback(None);
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
                         thinking: request.thinking,
                     };
-                    match ProviderDispatch::from_ref(entry.provider())
-                        .chat(req, current_model, temperature)
-                        .await
+                    match with_exact_dispatch_route(
+                        entry.cooldown_key.clone(),
+                        entry.served_model(current_model).to_string(),
+                        ProviderDispatch::from_ref(entry.provider()).chat(
+                            req,
+                            current_model,
+                            temperature,
+                        ),
+                    )
+                    .await
                     {
-                        Ok(resp) => {
-                            // Re-roll a transient empty completion instead of
-                            // returning a blank turn (bounded by `max_retries`;
-                            // see `is_empty_completion`).
-                            if attempt < self.max_retries && is_empty_completion(&resp) {
-                                self.backoff_after_empty_completion(
+                        Ok(mut resp) => {
+                            if is_empty_completion(&resp) {
+                                if let Some(usage) = resp.usage.clone()
+                                    && !has_reliable_call_accounting()
+                                {
+                                    accumulate_usage(&mut rejected_attempt_usage, Some(&usage));
+                                }
+                                if attempt < retry_limit {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
-                                    &mut backoff_ms,
-                                )
-                                .await;
-                                continue;
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
                             }
-                            let served_model = entry.served_model(current_model);
+                            if let Some(usage) = rejected_attempt_usage.take()
+                                && !has_reliable_call_accounting()
+                            {
+                                combine_response_usage(&mut resp, Some(usage));
+                            }
                             if attempt > 0
                                 || served_model != model
+                                || model_slot != 0
+                                || entry_index != 0
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1750,51 +3624,110 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
+                                    model_slot != 0 || entry_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                                record_accepted_attempt(
+                                    entry,
+                                    current_model,
+                                    fallback_record
+                                        .as_ref()
+                                        .map(ProviderFallbackRecord::attribution),
+                                );
+                            } else {
+                                record_successful_provider_fallback(None);
+                                record_accepted_attempt(entry, current_model, None);
                             }
+                            record_refusal_rescue(&refusal_seen, model, served_model);
                             return Ok(resp);
                         }
                         Err(e) => {
+                            remember_refusal(&mut refusal_seen, &mut rejected_attempt_usage, &e);
+                            if is_semantic_empty_completion_error(&e) {
+                                if attempt < retry_limit {
+                                    self.backoff_after_empty_completion(
+                                        &mut failures,
+                                        provider_name,
+                                        served_model,
+                                        attempt,
+                                        &mut backoff_ms,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                self.record_empty_completion_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    served_model,
+                                    attempt,
+                                    false,
+                                );
+                                final_cause_is_semantic_empty = true;
+                                break;
+                            }
+                            final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e) && !context_truncated {
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
+                                    record_provider_context_truncation();
                                     context_truncated = true;
-                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let error_detail = compact_error_detail(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
-                                push_failure(
-                                    &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "non_retryable",
-                                    &error_detail,
-                                    None,
+                                let context_error = context_failure_aggregate(
+                                    &format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). Try using a model \
+                                         with a larger context window, reducing the number of tools/skills, or \
+                                         enabling compact_context in config."
+                                    ),
+                                    &failures,
                                 );
-                                anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced without \
-                                     breaking message/tool pairing ({truncation_limit}). \
-                                     Try using a model with a larger context window, reducing the number \
-                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
+                                return Err(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()),
+                                    failures,
+                                    rejected_attempt_usage,
+                                    false,
+                                    Some(e),
+                                )
+                                .context(context_error));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
-                            let non_retryable = is_non_retryable(&e) || non_retryable_rate_limit;
+                            // Typed terminal decisions and business quota
+                            // win; overload wording only downgrades
+                            // heuristic non-retryable text (see
+                            // `is_terminal_provider_failure`).
+                            let non_retryable = is_terminal_provider_failure(&e);
                             let rate_limited = is_rate_limited(&e);
                             let failure_reason = failure_reason(rate_limited, non_retryable);
                             let error_detail = compact_error_detail(&e);
@@ -1804,12 +3737,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1833,22 +3763,29 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_failure_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             &error_detail,
                                             &diagnostic,
                                         )
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
-                            if attempt < self.max_retries {
+                            if attempt < retry_limit {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -1860,7 +3797,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_retry_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             attempt + 1,
                                             wait,
                                             failure_reason,
@@ -1873,6 +3810,8 @@ impl ModelProvider for ReliableModelProvider {
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
+                            final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -1883,7 +3822,7 @@ impl ModelProvider for ReliableModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(provider_exhausted_attrs(
                             provider_name,
-                            current_model,
+                            served_model,
                             last_error_detail.as_deref(),
                             last_diagnostic.as_ref(),
                         )),
@@ -1896,13 +3835,27 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        anyhow::bail!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
+            failures,
+            rejected_attempt_usage,
+            final_cause_is_semantic_empty,
+            final_cause,
+        )))
     }
 
     fn supports_streaming(&self) -> bool {
+        // Aggregation stays any(): a streaming-capable fallback may serve a
+        // turn whose selected primary disclaims streaming, surfacing the
+        // standard fallback notice (runtime contract, verified by
+        // streamed_turn_surfaces_streaming_provider_fallback_notice). The
+        // audit's stream-into-disclaiming-route hazard is closed at the
+        // dispatch layer instead: RouterModelProvider never streams a
+        // resolved route that disclaims streaming, and the passthrough
+        // leaf's streaming builders never attach thinking params to the
+        // streamed wire (unverified SSE frames, no signed capture there).
         self.model_providers
             .iter()
             .any(|entry| entry.provider().supports_streaming())
@@ -1921,9 +3874,11 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        mark_current_dispatch_composite();
+        commit_safeguard_fallback(None);
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
 
-        for entry in &self.model_providers {
+        for (entry_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -1935,11 +3890,9 @@ impl ModelProvider for ReliableModelProvider {
             }
 
             if self.provider_should_skip_for_cooldown(entry) {
-                self.log_cooldown_skip(provider_name);
+                self.log_cooldown_skip(provider_name, entry.served_model(model));
                 continue;
             }
-
-            let provider_clone = provider_name.to_string();
 
             let current_model = self
                 .model_chain(model)
@@ -1948,7 +3901,8 @@ impl ModelProvider for ReliableModelProvider {
                 .unwrap_or(model)
                 .to_string();
             let served_model = entry.served_model(&current_model).to_string();
-            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+            let streamed_candidate = entry.candidate_name().to_string();
+            let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                 self.model_providers
                     .first()
                     .map(|entry| entry.display_name.as_str())
@@ -1956,37 +3910,55 @@ impl ModelProvider for ReliableModelProvider {
                 model,
                 provider_name,
                 &served_model,
+                entry_index != 0,
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.candidate_name())
+                    .unwrap_or(""),
+                entry.candidate_name(),
             );
-
             let req = ChatRequest {
                 messages: request.messages,
                 tools: request.tools,
                 thinking: request.thinking,
             };
-            let stream = ProviderDispatch::from_ref(model_provider).stream_chat(
-                req,
-                &current_model,
-                temperature,
-                options,
+            let stream = stream_with_exact_dispatch_route(
+                entry.cooldown_key.clone(),
+                served_model.clone(),
+                ProviderDispatch::from_ref(model_provider).stream_chat(
+                    req,
+                    &served_model,
+                    temperature,
+                    options,
+                ),
             );
-            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
-
-            let handle = ::zeroclaw_spawn::spawn!(async move {
-                let mut stream = stream;
-                while let Some(event) = stream.next().await {
-                    if let Err(ref e) = event {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_clone, "model": current_model, "e": e.to_string()})), "Streaming error: ");
+            let stream = stream
+                .map(move |mut event| {
+                    if let Err(StreamError::ModelRefusal(ref mut refusal)) = event {
+                        refusal.attempted_candidate = Some(streamed_candidate.clone());
+                        refusal.attempted_candidate_index = Some(entry_index);
                     }
-                    if tx.send(event).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let guard = AbortOnDrop::new(handle.abort_handle());
-            return stream_with_success_recording(rx, guard, fallback_record, |event| {
-                matches!(event, StreamEvent::Final)
-            });
+                    event
+                })
+                .boxed();
+            let stream = stream_with_recovery_identity(stream, 0, entry_index);
+            let accepted_route = AcceptedRoute::new(
+                entry.cooldown_key.clone(),
+                served_model.clone(),
+                fallback_record
+                    .as_ref()
+                    .map(ProviderFallbackRecord::attribution),
+            );
+            // Usage is billing metadata, not stream acceptance. A provider can
+            // report usage and then fail before Final; recording the fallback
+            // at Usage would leak a route that never produced an accepted
+            // completion to legacy direct callers.
+            return stream_with_success_recording(
+                stream,
+                fallback_record,
+                accepted_route,
+                |event| matches!(event, StreamEvent::Final),
+            );
         }
 
         let message = if needs_tool_events {
@@ -1994,7 +3966,10 @@ impl ModelProvider for ReliableModelProvider {
         } else {
             "No model_provider supports streaming".to_string()
         };
-        stream::once(async move { Err(super::traits::StreamError::ModelProvider(message)) }).boxed()
+        stream_as_dispatch_composite(
+            stream::once(async move { Err(super::traits::StreamError::ModelProvider(message)) })
+                .boxed(),
+        )
     }
 
     fn stream_chat_with_system(
@@ -2005,9 +3980,10 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        mark_current_dispatch_composite();
         // Try each model_provider/model combination for streaming
         // For streaming, we use the first model_provider that supports it and has streaming enabled
-        for entry in &self.model_providers {
+        for (provider_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -2015,20 +3991,18 @@ impl ModelProvider for ReliableModelProvider {
             }
 
             if self.provider_should_skip_for_cooldown(entry) {
-                self.log_cooldown_skip(provider_name);
+                self.log_cooldown_skip(provider_name, entry.served_model(model));
                 continue;
             }
 
             // Clone model_provider data for the stream
-            let provider_clone = provider_name.to_string();
-
             // Try the first model in the chain for streaming
             let current_model = match self.model_chain(model).first() {
                 Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
             let served_model = entry.served_model(&current_model).to_string();
-            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+            let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                 self.model_providers
                     .first()
                     .map(|entry| entry.display_name.as_str())
@@ -2036,47 +4010,52 @@ impl ModelProvider for ReliableModelProvider {
                 model,
                 provider_name,
                 &served_model,
+                provider_index != 0,
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.candidate_name())
+                    .unwrap_or(""),
+                entry.candidate_name(),
             );
 
             // For streaming, we attempt once and propagate errors
             // The caller can retry the entire request if needed
-            let stream = model_provider.stream_chat_with_system(
-                system_prompt,
-                message,
-                &current_model,
-                temperature,
-                options,
+            let stream = stream_with_exact_dispatch_route(
+                entry.cooldown_key.clone(),
+                served_model.clone(),
+                ProviderDispatch::from_ref(model_provider).stream_chat_with_system(
+                    system_prompt,
+                    message,
+                    &served_model,
+                    temperature,
+                    options,
+                ),
+            );
+            let accepted_route = AcceptedRoute::new(
+                entry.cooldown_key.clone(),
+                served_model.clone(),
+                fallback_record
+                    .as_ref()
+                    .map(ProviderFallbackRecord::attribution),
             );
 
-            // Use a channel to bridge the stream with logging
-            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
-
-            let handle = ::zeroclaw_spawn::spawn!(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    if let Err(ref e) = chunk {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_clone, "model": current_model, "e": e.to_string()})), "Streaming error: ");
-                    }
-                    if tx.send(chunk).await.is_err() {
-                        break; // Receiver dropped
-                    }
-                }
-            });
-
-            // Convert channel receiver to stream
-            let guard = AbortOnDrop::new(handle.abort_handle());
-            return stream_with_success_recording(rx, guard, fallback_record, |chunk| {
-                chunk.is_final
-            });
+            return stream_with_success_recording(
+                stream,
+                fallback_record,
+                accepted_route,
+                |chunk| chunk.is_final,
+            );
         }
 
         // No streaming support available
-        stream::once(async move {
-            Err(super::traits::StreamError::ModelProvider(
-                "No model_provider supports streaming".to_string(),
-            ))
-        })
-        .boxed()
+        stream_as_dispatch_composite(
+            stream::once(async move {
+                Err(super::traits::StreamError::ModelProvider(
+                    "No model_provider supports streaming".to_string(),
+                ))
+            })
+            .boxed(),
+        )
     }
 
     fn stream_chat_with_history(
@@ -2086,10 +4065,11 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        mark_current_dispatch_composite();
         // Try each model_provider/model combination for streaming with history.
         // Mirrors stream_chat_with_system but delegates to the underlying
         // model_provider's stream_chat_with_history, preserving the full conversation.
-        for entry in &self.model_providers {
+        for (provider_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -2097,18 +4077,16 @@ impl ModelProvider for ReliableModelProvider {
             }
 
             if self.provider_should_skip_for_cooldown(entry) {
-                self.log_cooldown_skip(provider_name);
+                self.log_cooldown_skip(provider_name, entry.served_model(model));
                 continue;
             }
-
-            let provider_clone = provider_name.to_string();
 
             let current_model = match self.model_chain(model).first() {
                 Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
             let served_model = entry.served_model(&current_model).to_string();
-            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+            let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                 self.model_providers
                     .first()
                     .map(|entry| entry.display_name.as_str())
@@ -2116,42 +4094,49 @@ impl ModelProvider for ReliableModelProvider {
                 model,
                 provider_name,
                 &served_model,
+                provider_index != 0,
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.candidate_name())
+                    .unwrap_or(""),
+                entry.candidate_name(),
             );
 
-            let stream = model_provider.stream_chat_with_history(
-                messages,
-                &current_model,
-                temperature,
-                options,
+            let stream = stream_with_exact_dispatch_route(
+                entry.cooldown_key.clone(),
+                served_model.clone(),
+                ProviderDispatch::from_ref(model_provider).stream_chat_with_history(
+                    messages,
+                    &served_model,
+                    temperature,
+                    options,
+                ),
+            );
+            let accepted_route = AcceptedRoute::new(
+                entry.cooldown_key.clone(),
+                served_model.clone(),
+                fallback_record
+                    .as_ref()
+                    .map(ProviderFallbackRecord::attribution),
             );
 
-            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
-
-            let handle = ::zeroclaw_spawn::spawn!(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    if let Err(ref e) = chunk {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_clone, "model": current_model, "e": e.to_string()})), "Streaming error: ");
-                    }
-                    if tx.send(chunk).await.is_err() {
-                        break; // Receiver dropped
-                    }
-                }
-            });
-
-            let guard = AbortOnDrop::new(handle.abort_handle());
-            return stream_with_success_recording(rx, guard, fallback_record, |chunk| {
-                chunk.is_final
-            });
+            return stream_with_success_recording(
+                stream,
+                fallback_record,
+                accepted_route,
+                |chunk| chunk.is_final,
+            );
         }
 
         // No streaming support available
-        stream::once(async move {
-            Err(super::traits::StreamError::ModelProvider(
-                "No model_provider supports streaming".to_string(),
-            ))
-        })
-        .boxed()
+        stream_as_dispatch_composite(
+            stream::once(async move {
+                Err(super::traits::StreamError::ModelProvider(
+                    "No model_provider supports streaming".to_string(),
+                ))
+            })
+            .boxed(),
+        )
     }
 }
 
@@ -2177,9 +4162,51 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::AnthropicModelProvider;
+    use crate::router::{Route, RouterModelProvider};
     use futures_util::StreamExt;
     use std::sync::Arc;
     use zeroclaw_api::tool::ToolSpec;
+
+    fn drain_captured_events(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn assert_captured_model(
+        events: &[serde_json::Value],
+        message: &str,
+        provider: &str,
+        served_model: &str,
+    ) {
+        let matching: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.get("message").and_then(|value| value.as_str()) == Some(message)
+                    && event
+                        .get("attributes")
+                        .and_then(|attrs| attrs.get("model_provider"))
+                        .and_then(|value| value.as_str())
+                        == Some(provider)
+            })
+            .collect();
+        assert!(
+            !matching.is_empty(),
+            "missing structured log for {provider}: {message}"
+        );
+
+        for event in matching {
+            let attrs = event
+                .get("attributes")
+                .expect("structured log must include attributes");
+            assert_eq!(
+                attrs.get("model").and_then(|value| value.as_str()),
+                Some(served_model),
+                "wrong model attribution in {message}: {attrs}"
+            );
+        }
+    }
 
     struct MockModelProvider {
         calls: Arc<AtomicUsize>,
@@ -2190,6 +4217,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for MockModelProvider {
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -2228,6 +4259,456 @@ mod tests {
         fn alias(&self) -> &str {
             "MockModelProvider"
         }
+    }
+
+    struct MarkerErrorProvider {
+        calls: Arc<AtomicUsize>,
+        error: &'static str,
+    }
+
+    impl MarkerErrorProvider {
+        fn failure(&self) -> anyhow::Error {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::Error::new(crate::traits::NonRetryableProviderError::new(self.error))
+        }
+    }
+
+    enum RefusalThenFailureMode {
+        Refusal,
+        Failure,
+    }
+
+    struct RefusalThenFailureStub {
+        mode: RefusalThenFailureMode,
+    }
+
+    impl RefusalThenFailureStub {
+        fn outcome(&self, model: &str) -> anyhow::Result<ChatResponse> {
+            match self.mode {
+                RefusalThenFailureMode::Refusal => Err(anyhow::Error::new(AnthropicRefusalError {
+                    requested_model: model.to_string(),
+                    category: Some("test-category".to_string()),
+                    usage: Some(Box::new(TokenUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    })),
+                    attempted_candidate: None,
+                    attempted_candidate_index: None,
+                })),
+                RefusalThenFailureMode::Failure => {
+                    anyhow::bail!("500 later provider failure")
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MarkerErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Err(self.failure())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Err(self.failure())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MarkerErrorProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MarkerErrorProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RefusalThenFailureStub {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.outcome(model)
+                .map(|response| response.text.unwrap_or_default())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.outcome(model)
+                .map(|response| response.text.unwrap_or_default())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.outcome(model)
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.outcome(model)
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RefusalThenFailureStub {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RefusalThenFailureStub"
+        }
+    }
+
+    fn refusal_then_failure_reliable() -> ReliableModelProvider {
+        ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "anthropic",
+                    "anthropic.primary",
+                    "anthropic-primary",
+                    "claude-primary",
+                    Box::new(RefusalThenFailureStub {
+                        mode: RefusalThenFailureMode::Refusal,
+                    }),
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "other",
+                    "other.fallback",
+                    "other-fallback",
+                    "fallback-model",
+                    Box::new(RefusalThenFailureStub {
+                        mode: RefusalThenFailureMode::Failure,
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    fn assert_later_failure_keeps_refusal_usage(error: &anyhow::Error) {
+        assert!(format!("{error:#}").contains("500 later provider failure"));
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<AnthropicRefusalError>()),
+            "the earlier refusal must not replace the later terminal cause: {error:#}"
+        );
+        let usage = crate::rejected_attempt_usage_from_error(error)
+            .expect("the earlier refusal's billed usage must survive");
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(3));
+    }
+
+    #[tokio::test]
+    async fn later_provider_failure_supersedes_refusal_across_all_call_forms() {
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({"name": "noop"})];
+
+        let error = refusal_then_failure_reliable()
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "claude-primary",
+                Some(0.0),
+            )
+            .await
+            .expect_err("chat must report the later failure");
+        assert_later_failure_keeps_refusal_usage(&error);
+
+        let error = refusal_then_failure_reliable()
+            .chat_with_tools(&messages, &tools, "claude-primary", Some(0.0))
+            .await
+            .expect_err("chat_with_tools must report the later failure");
+        assert_later_failure_keeps_refusal_usage(&error);
+
+        let error = refusal_then_failure_reliable()
+            .chat_with_history(&messages, "claude-primary", Some(0.0))
+            .await
+            .expect_err("chat_with_history must report the later failure");
+        assert_later_failure_keeps_refusal_usage(&error);
+
+        let error = refusal_then_failure_reliable()
+            .chat_with_system(None, "hello", "claude-primary", Some(0.0))
+            .await
+            .expect_err("chat_with_system must report the later failure");
+        assert_later_failure_keeps_refusal_usage(&error);
+    }
+
+    #[tokio::test]
+    async fn transient_error_hint_finds_refusal_beneath_reliable_envelopes() {
+        let exhausted_refusal = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "anthropic",
+                "anthropic.primary",
+                "anthropic-primary",
+                "claude-primary",
+                Box::new(RefusalThenFailureStub {
+                    mode: RefusalThenFailureMode::Refusal,
+                }),
+            )],
+            0,
+            1,
+        );
+        let error = exhausted_refusal
+            .chat_with_system(None, "hello", "claude-primary", Some(0.0))
+            .await
+            .expect_err("a single refusing candidate exhausts the chain");
+        assert!(
+            error.downcast_ref::<AnthropicRefusalError>().is_none(),
+            "the refusal must sit beneath the rejected-usage envelope: {error:#}"
+        );
+        assert!(crate::model_refusal_from_error(&error).is_some());
+        assert!(
+            transient_error_hint(&error).is_some_and(|hint| hint.contains("safety system")),
+            "an exhausted refusal must select the safety-specific hint"
+        );
+
+        let error = refusal_then_failure_reliable()
+            .chat_with_system(None, "hello", "claude-primary", Some(0.0))
+            .await
+            .expect_err("the later failure is terminal");
+        assert!(crate::model_refusal_from_error(&error).is_none());
+        assert!(
+            transient_error_hint(&error).is_none_or(|hint| !hint.contains("safety system")),
+            "a later non-refusal failure keeps the generic guidance"
+        );
+    }
+
+    /// Leaf stub for an ordinary transport failure that precedes a fallback.
+    struct UnavailableStub;
+
+    #[async_trait]
+    impl ModelProvider for UnavailableStub {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("503 service unavailable")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("503 service unavailable")
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for UnavailableStub {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "UnavailableStub"
+        }
+    }
+
+    /// Leaf stub whose accepted attempt was served by its own server-side
+    /// fallback, recorded the way the native Anthropic client records it.
+    struct ServerFallbackStub {
+        served_model: &'static str,
+    }
+
+    impl ServerFallbackStub {
+        fn serve(&self, requested_model: &str) -> String {
+            commit_safeguard_fallback(Some(SafeguardFallbackNotice {
+                kind: SafeguardFallbackKind::ServerSide,
+                requested_model: requested_model.to_string(),
+                served_model: self.served_model.to_string(),
+                category: None,
+            }));
+            "served by fallback".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ServerFallbackStub {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.serve(model))
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(self.serve(model)),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ServerFallbackStub {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ServerFallbackStub"
+        }
+    }
+
+    /// Primary model A on a pinned entry, a separate pinned client fallback
+    /// entry using model B, and B's request served by its server fallback C.
+    fn pinned_server_fallback_reliable(primary: Box<dyn ModelProvider>) -> ReliableModelProvider {
+        ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "anthropic",
+                    "anthropic.primary",
+                    "anthropic-primary",
+                    "model-a",
+                    primary,
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "anthropic",
+                    "anthropic.fallback",
+                    "anthropic-fallback",
+                    "model-b",
+                    Box::new(ServerFallbackStub {
+                        served_model: "model-c",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    async fn accepted_route_records(
+        provider: &ReliableModelProvider,
+    ) -> (
+        anyhow::Result<String>,
+        Option<ProviderFallbackInfo>,
+        Option<SafeguardFallbackNotice>,
+    ) {
+        crate::scope_safeguard_fallback(scope_provider_fallback(async {
+            let response = provider
+                .chat_with_system(None, "hello", "model-a", Some(0.0))
+                .await;
+            (
+                response,
+                take_last_provider_fallback(),
+                take_last_safeguard_fallback(),
+            )
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_then_pinned_server_fallback_keeps_both_route_legs() {
+        let provider = pinned_server_fallback_reliable(Box::new(UnavailableStub));
+        let (response, fallback, notice) = accepted_route_records(&provider).await;
+
+        assert_eq!(response.unwrap(), "served by fallback");
+        let fallback = fallback.expect("the ordinary A to B recovery is recorded");
+        assert_eq!(fallback.requested_model, "model-a");
+        assert_eq!(fallback.actual_model, "model-b");
+        let notice = notice.expect("the server-side B to C switch is recorded");
+        assert_eq!(
+            notice.kind,
+            SafeguardFallbackKind::ServerSide,
+            "an ordinary failure must not be described as a refusal-triggered client recovery"
+        );
+        assert_eq!(notice.requested_model, "model-b");
+        assert_eq!(notice.served_model, "model-c");
+
+        let visible = crate::visible_provider_fallback(Some(&fallback), Some(&notice))
+            .expect("the A to B leg is the only record naming the original request");
+        assert_eq!(visible.requested_model, "model-a");
+        assert_eq!(visible.actual_model, "model-b");
+    }
+
+    #[tokio::test]
+    async fn refusal_then_pinned_server_fallback_composes_one_client_and_server_notice() {
+        let provider = pinned_server_fallback_reliable(Box::new(RefusalThenFailureStub {
+            mode: RefusalThenFailureMode::Refusal,
+        }));
+        let (response, fallback, notice) = accepted_route_records(&provider).await;
+
+        assert_eq!(response.unwrap(), "served by fallback");
+        let fallback = fallback.expect("the client recovery is still recorded");
+        assert_eq!(fallback.requested_model, "model-a");
+        let notice = notice.expect("refusal recovery composes the accepted route");
+        assert_eq!(notice.kind, SafeguardFallbackKind::ClientAndServer);
+        assert_eq!(notice.requested_model, "model-a");
+        assert_eq!(notice.served_model, "model-c");
+        assert_eq!(notice.category.as_deref(), Some("test-category"));
+        assert!(
+            crate::visible_provider_fallback(Some(&fallback), Some(&notice)).is_none(),
+            "the composed notice already names the original request"
+        );
     }
 
     /// Mock that records which model was used for each call.
@@ -2362,6 +4843,106 @@ mod tests {
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn request_identity_is_unstable_when_provider_failover_is_possible() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: calls.clone(),
+                        fail_until_attempt: 0,
+                        response: "primary",
+                        error: "unused",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls,
+                        fail_until_attempt: 0,
+                        response: "fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(!model_provider.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn request_identity_is_unstable_when_model_fallback_is_configured() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "primary",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        )
+        .with_model_fallbacks(HashMap::from([(
+            "model".to_string(),
+            vec!["fallback-model".to_string()],
+        )]));
+
+        assert!(!model_provider.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn single_provider_request_identity_remains_stable() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "primary",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        assert!(model_provider.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn pinned_request_identity_is_stable_only_without_a_model_remap() {
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "primary",
+                "primary.default",
+                "primary.default",
+                "pinned-model",
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "primary",
+                    error: "unused",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        assert!(model_provider.has_stable_request_identity("pinned-model"));
+        assert!(!model_provider.has_stable_request_identity("requested-model"));
+    }
+
     /// A `fallback_models` downgrade uses model-PINNED entries on one
     /// provider: the model swap happens inside `ModelPinnedProvider`, so the
     /// failover loop must read the entry's pinned model to record the
@@ -2461,6 +5042,311 @@ mod tests {
         );
     }
 
+    /// A pinned entry's physical model belongs in operator diagnostics while
+    /// the terminal aggregate remains bounded and free of route identity.
+    #[tokio::test]
+    async fn pinned_empty_completion_logs_served_model_but_aggregate_stays_safe() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "gemini",
+                "gemini.mock",
+                "mock",
+                "gemini-3-flash",
+                Box::new(EmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                    empty_until_attempt: usize::MAX,
+                    response: "never",
+                }),
+            )],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let err = model_provider
+            .chat(request, "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect_err("a pinned entry stuck on empty completions must not succeed");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        let text = err.to_string();
+        assert!(text.contains("event 1 (retry 1/2): empty_response"));
+        assert!(
+            !text.contains("gemini"),
+            "aggregate leaked provider identity: {text}"
+        );
+        assert!(
+            !text.contains("gemini-3-flash") && !text.contains("deepseek-v4-flash"),
+            "aggregate leaked model identity: {text}"
+        );
+        assert_captured_model(
+            &events,
+            "Empty completion; retrying",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_captured_model(
+            &events,
+            "Empty completion; retries exhausted",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pinned_retry_and_exhaustion_logs_use_served_model() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "gemini",
+                "gemini.mock",
+                "mock",
+                "gemini-3-flash",
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "temporary provider outage",
+                }),
+            )],
+            1,
+            1,
+        );
+
+        let err = model_provider
+            .chat_with_system(None, "hello", "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect_err("a pinned entry stuck on a retryable error must not succeed");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        let text = err.to_string();
+        assert!(
+            !text.contains("gemini")
+                && !text.contains("gemini-3-flash")
+                && !text.contains("deepseek-v4-flash")
+                && !text.contains("temporary provider outage"),
+            "aggregate leaked physical attempt details: {text}"
+        );
+        assert_captured_model(
+            &events,
+            "ModelProvider call failed, retrying",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_captured_model(
+            &events,
+            "Exhausted retries, trying next model_provider/model",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pinned_non_retryable_log_uses_served_model() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "gemini",
+                "gemini.mock",
+                "mock",
+                "gemini-3-flash",
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "HTTP 400 invalid request",
+                }),
+            )],
+            2,
+            1,
+        );
+
+        let err = model_provider
+            .chat_with_system(None, "hello", "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect_err("a pinned entry with a non-retryable error must fail");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        let text = err.to_string();
+        assert!(!text.contains("HTTP 400 invalid request"));
+        assert!(!text.contains("gemini-3-flash"));
+        assert_captured_model(
+            &events,
+            "Non-retryable error, moving on",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_captured_model(
+            &events,
+            "Exhausted retries, trying next model_provider/model",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pinned_context_truncation_log_uses_served_model() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "gemini",
+                "gemini.mock",
+                "mock",
+                "gemini-3-flash",
+                Box::new(ContextOverflowMock {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 1,
+                    post_context_error: None,
+                    message_counts: parking_lot::Mutex::new(Vec::new()),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old request"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("current request"),
+        ];
+
+        let result = model_provider
+            .chat_with_history(&messages, "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect("the truncated retry should recover");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        assert_eq!(result, "recovered after truncation");
+        assert_captured_model(
+            &events,
+            "Context window exceeded; truncated history and retrying",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pinned_rate_limit_and_cooldown_logs_use_each_served_model() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let rate_limited_calls = Arc::new(AtomicUsize::new(0));
+        let skipped_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "gemini",
+                    "gemini.mock",
+                    "mock",
+                    "gemini-3-flash",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&rate_limited_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "HTTP 429 Too Many Requests, Retry-After: 30",
+                    }),
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "gemini",
+                    "gemini.mock",
+                    "mock",
+                    "gemini-2-flash",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&skipped_calls),
+                        fail_until_attempt: 0,
+                        response: "should be skipped",
+                        error: "unused",
+                    }),
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "anthropic",
+                    "anthropic.mock",
+                    "mock",
+                    "claude-fallback",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "recovered",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            1,
+            1,
+        );
+
+        let result = model_provider
+            .simple_chat("hello", "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect("the downstream fallback should recover");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        assert_eq!(result, "recovered");
+        assert_captured_model(
+            &events,
+            "ModelProvider rate-limited; trying next provider",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_captured_model(
+            &events,
+            "Skipping model_provider during rate-limit cooldown",
+            "gemini",
+            "gemini-2-flash",
+        );
+        assert_eq!(rate_limited_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(skipped_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
     /// Returns an empty completion (blank `chat_with_system` text, which the
     /// default `chat`/`chat_with_tools`/`chat_with_history` impls surface as a
     /// blank `ChatResponse`) for the first `empty_until_attempt` calls, then a
@@ -2469,6 +5355,57 @@ mod tests {
         calls: Arc<AtomicUsize>,
         empty_until_attempt: usize,
         response: &'static str,
+    }
+
+    struct UsageEmptyThenTextMock {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct UsagePersistentEmptyMock {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct ContextWindowErrorMock;
+
+    struct TerminalUsageErrorMock;
+
+    #[derive(Debug)]
+    struct ContextWindowTypedError;
+
+    impl std::fmt::Display for ContextWindowTypedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("input exceeds the context window")
+        }
+    }
+
+    impl std::error::Error for ContextWindowTypedError {}
+
+    #[derive(Debug)]
+    struct TerminalProviderTypedError;
+
+    impl std::fmt::Display for TerminalProviderTypedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("typed terminal provider failure")
+        }
+    }
+
+    impl std::error::Error for TerminalProviderTypedError {}
+
+    fn terminal_usage_error() -> anyhow::Error {
+        anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
+            TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            },
+            FailureEvents::default(),
+            anyhow::Error::new(TerminalProviderTypedError),
+        ))
+    }
+
+    struct ThinkOnlyThenTextMock {
+        calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -2499,6 +5436,318 @@ mod tests {
         fn alias(&self) -> &str {
             "EmptyThenTextMock"
         }
+    }
+
+    #[async_trait]
+    impl ModelProvider for UsageEmptyThenTextMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: (attempt > 0).then(|| "recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: (attempt > 0).then(|| "recovered".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for UsageEmptyThenTextMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "UsageEmptyThenTextMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for UsagePersistentEmptyMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for UsagePersistentEmptyMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "UsagePersistentEmptyMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ContextWindowErrorMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Err(anyhow::Error::new(ContextWindowTypedError))
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Err(anyhow::Error::new(ContextWindowTypedError))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalUsageErrorMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Err(terminal_usage_error())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Err(terminal_usage_error())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Err(terminal_usage_error())
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Err(terminal_usage_error())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalUsageErrorMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalUsageErrorMock"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ContextWindowErrorMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ContextWindowErrorMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkOnlyThenTextMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if attempt == 0 {
+                "<think>internal reasoning</think>".to_string()
+            } else {
+                "recovered".to_string()
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ThinkOnlyThenTextMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ThinkOnlyThenTextMock"
+        }
+    }
+
+    fn persistent_empty_reliable(calls: Arc<AtomicUsize>) -> ReliableModelProvider {
+        ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(EmptyThenTextMock {
+                    calls,
+                    empty_until_attempt: usize::MAX,
+                    response: "never",
+                }),
+            )],
+            0,
+            1,
+        )
+    }
+
+    fn semantic_empty_then_provider_error_reliable() -> ReliableModelProvider {
+        ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        empty_until_attempt: usize::MAX,
+                        response: "never",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "failure".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "upstream terminal provider failure",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
     }
 
     #[tokio::test]
@@ -2534,6 +5783,982 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_retry_preserves_usage_from_rejected_empty_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsageEmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let response = model_provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect("second attempt succeeds");
+
+        let usage = response.usage.expect("combined usage is retained");
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(10));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn accounted_chat_keeps_rejected_usage_out_of_accepted_response() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsageEmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let accounted = ProviderDispatch::from_ref(&model_provider)
+            .chat_accounted(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect("second attempt succeeds");
+
+        let accepted = accounted.response.usage.expect("accepted usage");
+        assert_eq!(accepted.input_tokens, Some(10));
+        assert_eq!(accepted.output_tokens, Some(5));
+        let rejected = accounted
+            .rejected_attempt_usage
+            .expect("rejected usage sidecar");
+        assert_eq!(rejected.input_tokens, Some(10));
+        assert_eq!(rejected.output_tokens, Some(5));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn accounted_chat_with_tools_keeps_rejected_usage_out_of_accepted_response() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsageEmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let accounted = ProviderDispatch::from_ref(&model_provider)
+            .chat_with_tools_accounted(&messages, &[], "test", Some(0.0))
+            .await
+            .expect("second attempt succeeds");
+
+        let accepted = accounted.response.usage.expect("accepted usage");
+        assert_eq!(accepted.input_tokens, Some(10));
+        assert_eq!(accepted.output_tokens, Some(5));
+        let rejected = accounted
+            .rejected_attempt_usage
+            .expect("rejected usage sidecar");
+        assert_eq!(rejected.input_tokens, Some(10));
+        assert_eq!(rejected.output_tokens, Some(5));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn accounted_primary_success_exposes_configured_provider_ref_and_served_model() {
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "primary-display",
+                "openai.primary",
+                "primary-alias",
+                "served-model",
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "unused",
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&model_provider)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "requested-model",
+                Some(0.0),
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        let route = outcome
+            .accounting
+            .accepted_route()
+            .cloned()
+            .expect("accepted Reliable call must retain its configured route");
+        assert_eq!(route.provider_ref(), "openai.primary");
+        assert_eq!(route.model(), "served-model");
+        assert!(
+            route.fallback().is_some(),
+            "pinned model is a visible recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn accounted_failover_keeps_rejected_and_accepted_configured_routes_distinct() {
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "primary-display",
+                    "openai.primary",
+                    "primary-alias",
+                    "model-a",
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "backup-display",
+                    "anthropic.backup",
+                    "backup-alias",
+                    "model-b",
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "recovered",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&model_provider)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "requested-model",
+                Some(0.0),
+            )
+            .await;
+
+        assert_eq!(
+            outcome
+                .result
+                .expect("backup response succeeds")
+                .response
+                .text
+                .as_deref(),
+            Some("recovered")
+        );
+        assert_eq!(outcome.accounting.rejected_attempts().len(), 1);
+        let rejected = &outcome.accounting.rejected_attempts()[0];
+        assert_eq!(rejected.provider_ref(), "openai.primary");
+        assert_eq!(rejected.model(), "model-a");
+        let accepted = outcome
+            .accounting
+            .accepted_route()
+            .cloned()
+            .expect("fallback must retain its actual configured route");
+        assert_eq!(accepted.provider_ref(), "anthropic.backup");
+        assert_eq!(accepted.model(), "model-b");
+    }
+
+    /// Physical attempts must retain their served model even when two pinned
+    /// entries share the same configured provider alias. The route string is
+    /// insufficient identity for billing a model downgrade.
+    #[tokio::test]
+    async fn accounted_same_configured_provider_keeps_pinned_models_distinct() {
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "shared-display",
+                    "openai.shared",
+                    "shared-alias",
+                    "model-a",
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "shared-display",
+                    "openai.shared",
+                    "shared-alias",
+                    "model-b",
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "recovered",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&model_provider)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "requested-model",
+                Some(0.0),
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.accounting.rejected_attempts().len(), 1);
+        let rejected = &outcome.accounting.rejected_attempts()[0];
+        assert_eq!(rejected.provider_ref(), "openai.shared");
+        assert_eq!(rejected.model(), "model-a");
+        let accepted = outcome
+            .accounting
+            .accepted_route()
+            .cloned()
+            .expect("fallback must retain its actual pinned model");
+        assert_eq!(accepted.provider_ref(), "openai.shared");
+        assert_eq!(accepted.model(), "model-b");
+    }
+
+    #[tokio::test]
+    async fn accounted_report_excludes_provider_error_and_response_content() {
+        const ERROR_SENTINEL: &str = "S9470_PROVIDER_ERROR_BODY";
+        const RESPONSE_SENTINEL: &str = "S9470_PROVIDER_RESPONSE_BODY";
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "unused",
+                        error: ERROR_SENTINEL,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: RESPONSE_SENTINEL,
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("request text must not enter the report")];
+        let outcome = ProviderDispatch::from_ref(&model_provider)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "model",
+                Some(0.0),
+            )
+            .await;
+
+        assert_eq!(
+            outcome
+                .result
+                .expect("fallback response succeeds")
+                .response
+                .text
+                .as_deref(),
+            Some(RESPONSE_SENTINEL)
+        );
+        let report = format!("{:?}", outcome.accounting);
+        for secret in [
+            ERROR_SENTINEL,
+            RESPONSE_SENTINEL,
+            "request text must not enter the report",
+        ] {
+            assert!(
+                !report.contains(secret),
+                "accounting report leaked {secret}: {report}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_accounted_calls_keep_attempt_reports_task_local() {
+        let make_provider = |provider_ref: &str, served_model: &str| {
+            ReliableModelProvider::new_with_entries(
+                "test",
+                vec![ReliableModelProviderEntry::new_pinned(
+                    provider_ref,
+                    provider_ref,
+                    provider_ref,
+                    served_model,
+                    Box::new(UsageEmptyThenTextMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                )],
+                1,
+                1,
+            )
+        };
+        let first = make_provider("openai.first", "model-first");
+        let second = make_provider("anthropic.second", "model-second");
+        let messages = vec![ChatMessage::user("hello")];
+        let first_dispatch = ProviderDispatch::from_ref(&first);
+        let second_dispatch = ProviderDispatch::from_ref(&second);
+
+        let (first, second) = tokio::join!(
+            first_dispatch.chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "requested-first",
+                Some(0.0),
+            ),
+            second_dispatch.chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "requested-second",
+                Some(0.0),
+            ),
+        );
+
+        for (outcome, provider_ref, model) in [
+            (first, "openai.first", "model-first"),
+            (second, "anthropic.second", "model-second"),
+        ] {
+            assert!(outcome.result.is_ok());
+            assert_eq!(outcome.accounting.rejected_attempts().len(), 1);
+            let rejected = &outcome.accounting.rejected_attempts()[0];
+            assert_eq!(rejected.provider_ref(), provider_ref);
+            assert_eq!(rejected.model(), model);
+            let accepted = outcome
+                .accounting
+                .accepted_route()
+                .cloned()
+                .expect("each task keeps its own accepted route");
+            assert_eq!(accepted.provider_ref(), provider_ref);
+            assert_eq!(accepted.model(), model);
+        }
+    }
+
+    #[tokio::test]
+    async fn accounted_chat_outcome_retains_rejected_attempts_on_error() {
+        let messages = vec![ChatMessage::user("hello")];
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "failure".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "terminal provider failure",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let outcome = ProviderDispatch::from_ref(&model_provider)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await;
+
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.accounting.rejected_attempts().len(), 1);
+        let rejected = &outcome.accounting.rejected_attempts()[0];
+        assert_eq!(rejected.provider_ref(), "empty");
+        assert_eq!(rejected.model(), "test");
+        assert_eq!(rejected.usage().input_tokens, Some(10));
+        assert_eq!(rejected.usage().output_tokens, Some(5));
+    }
+
+    #[tokio::test]
+    async fn terminal_error_usage_is_accounted_at_the_dispatch_boundary() {
+        let messages = vec![ChatMessage::user("hello")];
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "configured.primary".into(),
+                Box::new(TerminalUsageErrorMock) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+
+        let outcome = ProviderDispatch::from_ref(&provider)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "served-model",
+                Some(0.0),
+            )
+            .await;
+        assert_terminal_usage_accounting(
+            outcome.result.map(|response| response.response),
+            outcome.accounting,
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_reliable_terminal_usage_is_not_double_counted() {
+        let messages = vec![ChatMessage::user("hello")];
+        let inner = ReliableModelProvider::new(
+            "inner",
+            vec![
+                (
+                    "inner.first".into(),
+                    Box::new(TerminalUsageErrorMock) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "inner.second".into(),
+                    Box::new(TerminalUsageErrorMock) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let outer = ReliableModelProvider::new(
+            "outer",
+            vec![(
+                "outer.wrapper".into(),
+                Box::new(inner) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+
+        let outcome = ProviderDispatch::from_ref(&outer)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "served-model",
+                Some(0.0),
+            )
+            .await;
+
+        assert!(outcome.result.is_err());
+        let rejected = outcome.accounting.rejected_attempts();
+        assert_eq!(rejected.len(), 2);
+        assert_eq!(rejected[0].provider_ref(), "inner.first");
+        assert_eq!(rejected[1].provider_ref(), "inner.second");
+        for attempt in rejected {
+            assert_eq!(attempt.model(), "served-model");
+            assert_eq!(attempt.usage().input_tokens, Some(10));
+            assert_eq!(attempt.usage().output_tokens, Some(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn reliable_then_router_reports_the_router_selected_leaf() {
+        let router = RouterModelProvider::new(
+            "router",
+            vec![(
+                "configured.leaf".to_string(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "unused",
+                }) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "fast".to_string(),
+                Route {
+                    provider_name: "configured.leaf".to_string(),
+                    model: "served-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+        let reliable = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "outer-wrapper".into(),
+                Box::new(router) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&reliable)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:fast",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        let leaf = &outcome.accounting.attempts()[0];
+        assert_eq!(
+            (leaf.provider_ref(), leaf.model()),
+            ("configured.leaf", "served-model")
+        );
+        assert!(matches!(
+            leaf.outcome(),
+            crate::dispatch::AttemptUsageOutcome::Missing
+        ));
+        assert_eq!(
+            outcome
+                .accounting
+                .accepted_route()
+                .map(|route| (route.provider_ref(), route.model())),
+            Some(("configured.leaf", "served-model"))
+        );
+    }
+
+    #[tokio::test]
+    async fn router_then_reliable_reports_the_reliable_physical_leaf_on_error() {
+        let reliable = ReliableModelProvider::new(
+            "inner-reliable",
+            vec![(
+                "inner.actual".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "expected failure",
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "router",
+            vec![(
+                "router-child".to_string(),
+                Box::new(reliable) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "fast".to_string(),
+                Route {
+                    provider_name: "router-child".to_string(),
+                    model: "served-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&router)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:fast",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        let leaf = &outcome.accounting.attempts()[0];
+        assert_eq!(
+            (leaf.provider_ref(), leaf.model()),
+            ("inner.actual", "served-model")
+        );
+        assert!(matches!(
+            leaf.outcome(),
+            crate::dispatch::AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        ));
+        assert!(outcome.accounting.accepted_route().is_none());
+    }
+
+    #[tokio::test]
+    async fn reliable_then_router_failure_reports_the_router_physical_leaf() {
+        let router = RouterModelProvider::new(
+            "router",
+            vec![(
+                "configured.leaf".to_string(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "expected failure",
+                }) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "fast".to_string(),
+                Route {
+                    provider_name: "configured.leaf".to_string(),
+                    model: "served-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+        let reliable = ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "outer-wrapper".into(),
+                Box::new(router) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&reliable)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:fast",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_err());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        assert_eq!(
+            (
+                outcome.accounting.attempts()[0].provider_ref(),
+                outcome.accounting.attempts()[0].model(),
+            ),
+            ("configured.leaf", "served-model")
+        );
+        assert!(outcome.accounting.accepted_route().is_none());
+    }
+
+    #[tokio::test]
+    async fn router_then_reliable_success_reports_the_reliable_physical_leaf() {
+        let reliable = ReliableModelProvider::new(
+            "inner-reliable",
+            vec![(
+                "inner.actual".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "unused",
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "router",
+            vec![(
+                "router-child".to_string(),
+                Box::new(reliable) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "fast".to_string(),
+                Route {
+                    provider_name: "router-child".to_string(),
+                    model: "served-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&router)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:fast",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        assert_eq!(
+            (
+                outcome.accounting.attempts()[0].provider_ref(),
+                outcome.accounting.attempts()[0].model(),
+            ),
+            ("inner.actual", "served-model")
+        );
+        assert_eq!(
+            outcome
+                .accounting
+                .accepted_route()
+                .map(|route| (route.provider_ref(), route.model())),
+            Some(("inner.actual", "served-model"))
+        );
+    }
+
+    fn assert_terminal_usage_accounting<T: std::fmt::Debug>(
+        result: anyhow::Result<T>,
+        accounting: AccountedCallReport,
+    ) {
+        let error = result.expect_err("the terminal mock must fail");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<TerminalProviderTypedError>()),
+            "the final typed cause must remain downcastable: {error:#}"
+        );
+        assert_eq!(accounting.rejected_attempts().len(), 1);
+        let rejected = &accounting.rejected_attempts()[0];
+        assert_eq!(rejected.provider_ref(), "configured.primary");
+        assert_eq!(rejected.model(), "served-model");
+        assert_eq!(rejected.usage().input_tokens, Some(10));
+        assert_eq!(rejected.usage().output_tokens, Some(5));
+    }
+
+    #[tokio::test]
+    async fn chat_exhausted_empty_completions_retain_rejected_usage() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsagePersistentEmptyMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let error = model_provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect_err("persistent semantic-empty responses must fail");
+
+        let rejected = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
+            .expect("rejected usage must survive exhaustion");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>()),
+            "the final semantic-empty cause must remain typed alongside usage"
+        );
+        assert_eq!(rejected.usage.input_tokens, Some(20));
+        assert_eq!(rejected.usage.output_tokens, Some(10));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_semantic_empty_reliable_call_has_no_accepted_route() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsagePersistentEmptyMock {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&model_provider)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await;
+
+        assert!(outcome.result.is_err());
+        assert!(outcome.accounting.accepted_route().is_none());
+        assert_eq!(outcome.accounting.rejected_attempts().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_preserves_rejected_usage_on_untruncatable_context_error() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                ("context".into(), Box::new(ContextWindowErrorMock)),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello"),
+        ];
+
+        let error = model_provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect_err("untruncatable context error must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("without breaking message/tool pairing")
+        );
+        let rejected = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
+            .expect("rejected usage must survive the early context exit");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>()),
+            "a later context failure supersedes an earlier semantic-empty attempt"
+        );
+        assert_eq!(rejected.usage.input_tokens, Some(10));
+        assert_eq!(rejected.usage.output_tokens, Some(5));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ContextWindowTypedError>()),
+            "the untruncatable context cause must remain downcastable: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_preserves_rejected_usage_on_untruncatable_context_error() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                ("context".into(), Box::new(ContextWindowErrorMock)),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello"),
+        ];
+        let tools = vec![serde_json::json!({"name": "noop"})];
+
+        let error = model_provider
+            .chat_with_tools(&messages, &tools, "test", Some(0.0))
+            .await
+            .expect_err("untruncatable context error must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("without breaking message/tool pairing")
+        );
+        let rejected = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
+            .expect("rejected usage must survive the early context exit");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>()),
+            "a later context failure supersedes an earlier semantic-empty attempt"
+        );
+        assert_eq!(rejected.usage.input_tokens, Some(10));
+        assert_eq!(rejected.usage.output_tokens, Some(5));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ContextWindowTypedError>()),
+            "the untruncatable context cause must remain downcastable: {error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn chat_with_tools_retries_empty_completion_then_succeeds() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
@@ -2556,6 +6781,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.text.as_deref(), Some("recovered"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_retry_preserves_usage_from_rejected_empty_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(UsageEmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let response = model_provider
+            .chat_with_tools(&messages, &[], "test", Some(0.0))
+            .await
+            .expect("second attempt succeeds");
+
+        let usage = response.usage.expect("combined usage is retained");
+        assert_eq!(usage.input_tokens, Some(20));
+        assert_eq!(usage.output_tokens, Some(10));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -2586,6 +6838,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_with_system_retries_think_only_text_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(ThinkOnlyThenTextMock {
+                    calls: Arc::clone(&calls),
+                }),
+            )],
+            1,
+            1,
+        );
+        let result = model_provider
+            .chat_with_system(None, "hello", "test", Some(0.0))
+            .await
+            .expect("think-only text must retry through the Reliable path");
+
+        assert_eq!(result, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_falls_back_after_think_only_text() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: 0,
+                        response: "<think>internal reasoning</think>",
+                        error: "unused",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let result = model_provider
+            .chat_with_system(None, "hello", "test", Some(0.0))
+            .await
+            .expect("think-only text must advance to provider fallback");
+
+        assert_eq!(result, "from fallback");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn chat_with_system_retries_empty_string_then_succeeds() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
@@ -2613,7 +6928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_persistent_empty_returns_blank_without_error() {
+    async fn chat_persistent_empty_returns_aggregated_error() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
             "test",
@@ -2635,15 +6950,264 @@ mod tests {
             tools: None,
             thinking: None,
         };
-        // Exhausting the empty re-rolls returns the last (blank) response rather
-        // than erroring — strictly never worse than the pre-fix behavior.
+        let err = model_provider
+            .chat(request, "test", Some(0.0))
+            .await
+            .expect_err("an exhausted empty completion must not be returned as success");
+        assert!(
+            err.to_string()
+                .contains("All model providers/models failed")
+        );
+        assert!(err.to_string().contains("empty_response"));
+        // Initial attempt + max_retries (2) re-rolls = 3 calls.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn every_reliable_chat_entrypoint_rejects_persistent_empty_completion() {
+        let messages = vec![ChatMessage::user("hello")];
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = persistent_empty_reliable(Arc::clone(&calls));
+        let error = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect_err("semantic-empty chat result must fail");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = persistent_empty_reliable(Arc::clone(&calls));
+        let error = provider
+            .chat_with_tools(&messages, &[], "test", Some(0.0))
+            .await
+            .expect_err("semantic-empty tool result must fail");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = persistent_empty_reliable(Arc::clone(&calls));
+        let error = provider
+            .chat_with_history(&messages, "test", Some(0.0))
+            .await
+            .expect_err("semantic-empty history result must fail");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = persistent_empty_reliable(Arc::clone(&calls));
+        let error = provider
+            .chat_with_system(None, "hello", "test", Some(0.0))
+            .await
+            .expect_err("semantic-empty system result must fail");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn every_reliable_chat_entrypoint_uses_the_later_provider_failure_cause() {
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({"name": "noop"})];
+
+        let error = semantic_empty_then_provider_error_reliable()
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+            )
+            .await
+            .expect_err("the later provider failure must fail chat");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+
+        let error = semantic_empty_then_provider_error_reliable()
+            .chat_with_tools(&messages, &tools, "test", Some(0.0))
+            .await
+            .expect_err("the later provider failure must fail chat_with_tools");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+
+        let error = semantic_empty_then_provider_error_reliable()
+            .chat_with_history(&messages, "test", Some(0.0))
+            .await
+            .expect_err("the later provider failure must fail chat_with_history");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+
+        let error = semantic_empty_then_provider_error_reliable()
+            .chat_with_system(None, "hello", "test", Some(0.0))
+            .await
+            .expect_err("the later provider failure must fail chat_with_system");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+    }
+
+    fn assert_later_provider_failure_supersedes_semantic_empty(error: &anyhow::Error) {
+        assert!(
+            error
+                .to_string()
+                .contains("event 2 (retry 1/1): retryable; kind=provider_error"),
+            "the final provider failure classification must be retained: {error:#}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("upstream terminal provider failure"),
+            "provider-controlled failure text must not reach the terminal summary: {error:#}"
+        );
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<ReliableSemanticEmptyCompletion>()),
+            "a later provider failure must supersede the semantic-empty marker: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_provider_failure_keeps_rejected_usage_without_a_semantic_empty_marker() {
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![serde_json::json!({"name": "noop"})];
+
+        let error = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "failure".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "upstream terminal provider failure",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+        .chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "test",
+            Some(0.0),
+        )
+        .await
+        .expect_err("the later provider failure must fail chat");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+        assert_rejected_usage_survives(&error);
+
+        let error = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "empty".into(),
+                    Box::new(UsagePersistentEmptyMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "failure".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "upstream terminal provider failure",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+        .chat_with_tools(&messages, &tools, "test", Some(0.0))
+        .await
+        .expect_err("the later provider failure must fail chat_with_tools");
+        assert_later_provider_failure_supersedes_semantic_empty(&error);
+        assert_rejected_usage_survives(&error);
+    }
+
+    fn assert_rejected_usage_survives(error: &anyhow::Error) {
+        let rejected = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
+            .expect("rejected usage must survive the later provider failure");
+        assert_eq!(rejected.usage.input_tokens, Some(10));
+        assert_eq!(rejected.usage.output_tokens, Some(5));
+    }
+
+    #[tokio::test]
+    async fn chat_persistent_empty_falls_back_to_next_provider() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&primary_calls),
+                        empty_until_attempt: usize::MAX,
+                        response: "never",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(EmptyThenTextMock {
+                        calls: Arc::clone(&fallback_calls),
+                        empty_until_attempt: 0,
+                        response: "recovered by fallback",
+                    }),
+                ),
+            ],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
         let result = model_provider
             .chat(request, "test", Some(0.0))
             .await
-            .unwrap();
-        assert_eq!(result.text.as_deref(), Some(""));
-        // Initial attempt + max_retries (2) re-rolls = 3 calls.
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+            .expect("fallback should recover an exhausted empty completion");
+
+        assert_eq!(result.text.as_deref(), Some("recovered by fallback"));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2711,12 +7275,111 @@ mod tests {
             .await
             .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All model_providers/models failed"));
-        assert!(msg.contains("model_provider=p1 model=test"));
-        assert!(msg.contains("model_provider=p2 model=test"));
-        assert!(msg.contains("error=p1 error"));
-        assert!(msg.contains("error=p2 error"));
+        assert!(msg.contains("All model providers/models failed after 2 failure event(s)"));
+        assert!(msg.contains("event 1 (retry 1/1): retryable"));
+        assert!(msg.contains("event 2 (retry 1/1): retryable"));
+        assert!(!msg.contains("p1 error"));
+        assert!(!msg.contains("p2 error"));
         assert!(msg.contains("retryable"));
+        assert_eq!(
+            turn_stop(&err).expect("exhaustion must be typed").code,
+            TurnStopCode::ProviderUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn exhaustion_after_an_auth_failure_is_typed_as_auth() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "p1".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "401 Unauthorized: invalid api key",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        let err = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("the only model_provider fails");
+        let stop = turn_stop(&err).expect("exhaustion must be typed");
+        assert_eq!(stop.code, TurnStopCode::ProviderAuth);
+        assert!(is_auth_error(&err), "typed auth must reach is_auth_error");
+        // Tagging is invisible: the aggregate still says what it always said,
+        // and still redacts the raw provider body.
+        assert!(
+            err.to_string()
+                .contains("All model providers/models failed"),
+            "got: {err}"
+        );
+        assert!(!err.to_string().contains("invalid api key"), "got: {err}");
+    }
+
+    #[test]
+    fn a_typed_context_overflow_classifies_without_its_message() {
+        let err = zeroclaw_api::turn_stop::tag(
+            anyhow::Error::msg("upstream said something unhelpful"),
+            TurnStop::fatal(TurnStopCode::ContextOverflow, "context overflow"),
+        );
+        assert!(is_context_window_exceeded(&err));
+        assert!(!is_non_retryable(&err), "overflow stays retryable");
+    }
+
+    #[test]
+    fn an_untyped_string_error_still_classifies_through_the_fallback() {
+        let err = anyhow::Error::msg("prompt is too long for this model");
+        assert!(turn_stop(&err).is_none(), "external errors stay untyped");
+        assert!(is_context_window_exceeded(&err));
+        assert!(!is_non_retryable(&err));
+        assert!(is_auth_error(&anyhow::Error::msg("401 Unauthorized")));
+    }
+
+    #[tokio::test]
+    async fn excessive_failure_events_are_bounded_without_provider_details() {
+        const PROVIDER_COUNT: usize = 64;
+        let providers: Vec<(String, Box<dyn ModelProvider>)> = (0..PROVIDER_COUNT)
+            .map(|index| {
+                (
+                    format!("sensitive-provider-identity-{index}"),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "sensitive provider response body: secret-token",
+                    }) as Box<dyn ModelProvider>,
+                )
+            })
+            .collect();
+        let model_provider = ReliableModelProvider::new("test", providers, 0, 1);
+
+        let err = model_provider
+            .simple_chat("hello", "sensitive-model-identity", Some(0.0))
+            .await
+            .expect_err("all model providers should fail");
+        let msg = err.to_string();
+
+        assert!(
+            msg.len() <= MAX_FAILURE_AGGREGATE_BYTES,
+            "aggregate was {} bytes",
+            msg.len()
+        );
+        assert!(msg.contains("after 64 failure event(s)"));
+        assert!(msg.contains("event 8 (retry 1/1): retryable"));
+        assert!(!msg.contains("event 9 (retry 1/1): retryable"));
+        assert!(msg.contains(&format!(
+            "[{} additional failure event(s) omitted]",
+            PROVIDER_COUNT - MAX_RETAINED_FAILURE_EVENTS
+        )));
+        assert!(!msg.contains("sensitive-provider-identity"));
+        assert!(!msg.contains("sensitive-model-identity"));
+        assert!(!msg.contains("sensitive provider response body"));
+        assert!(!msg.contains("secret-token"));
     }
 
     #[test]
@@ -2756,6 +7419,331 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::Error::msg(
             "OpenAI Codex stream error: Your input exceeds the context window of this model."
         )));
+    }
+
+    #[test]
+    fn typed_non_retryable_marker_takes_precedence_over_retryable_heuristics() {
+        let error = anyhow::Error::new(crate::traits::NonRetryableProviderError::new(
+            "provider explicitly rejected retry",
+        ))
+        .context("429 Too Many Requests");
+        assert!(is_non_retryable(&error));
+    }
+
+    #[test]
+    fn terminal_provider_failure_outranks_overload_wording() {
+        // A typed provider decision is definitive even when its message
+        // says "overloaded".
+        let typed = anyhow::Error::new(crate::traits::NonRetryableProviderError::new(
+            "backend overloaded, refusing further work",
+        ));
+        assert!(is_terminal_provider_failure(&typed));
+        // A business-quota 429 that mentions overload keeps the rate-limit
+        // policy, not the overload floor.
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "429 Too Many Requests: insufficient_quota, servers overloaded"
+        )));
+        // An auth failure with incidental 529 digits is not overloaded (a
+        // parsed client status outranks wording), so the heuristic
+        // non-retryable classification stands.
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "401 Unauthorized: request req_a529b"
+        )));
+        // An outer auth status stays terminal when the upstream body
+        // quotes an overload status: the marker layer reads the
+        // outermost status, and only status-shaped tokens count, so a
+        // nested "529" (or a queue-depth "52931") never clears it.
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}"
+        )));
+        assert!(is_terminal_provider_failure(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (52931 queued requests)\"}"
+        )));
+        // A typed refusal is terminal (constructed offline, no live
+        // response needed).
+        let refusal = anyhow::Error::new(AnthropicRefusalError {
+            requested_model: "test-model".to_string(),
+            category: None,
+            usage: None,
+            attempted_candidate: None,
+            attempted_candidate_index: None,
+        });
+        assert!(is_terminal_provider_failure(&refusal));
+        // Overload wording alone is a transient shed: never terminal.
+        assert!(!is_terminal_provider_failure(&anyhow::Error::msg(
+            "Anthropic API error (529 <unknown status code>): overloaded"
+        )));
+        assert!(!is_terminal_provider_failure(&anyhow::Error::msg(
+            "ModelProvider error: overloaded_error: Overloaded"
+        )));
+        assert!(!is_terminal_provider_failure(&anyhow::Error::msg(
+            "503 Service Unavailable: OVERLOADED"
+        )));
+    }
+
+    #[tokio::test]
+    async fn reliable_provider_does_not_retry_a_typed_marker_with_retryable_text() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MarkerErrorProvider {
+                    calls: Arc::clone(&calls),
+                    error: "429 Too Many Requests",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("typed provider failure should be terminal");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Overload wording inside a typed provider decision must not buy
+    /// retries: the marker is definitive, so `chat` fires exactly once and
+    /// the failure events record `non_retryable`.
+    #[tokio::test(start_paused = true)]
+    async fn chat_does_not_retry_typed_marker_with_overload_wording() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MarkerErrorProvider {
+                    calls: Arc::clone(&calls),
+                    error: "backend overloaded, refusing further work",
+                }),
+            )],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                None,
+            )
+            .await
+            .expect_err("typed provider failure is terminal despite overload wording");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("non_retryable"),
+            "failure events must record non_retryable: {err}"
+        );
+    }
+
+    /// An auth failure whose message carries incidental 529 digits must not
+    /// be reclassified as overload: one attempt, `non_retryable` reason.
+    #[tokio::test]
+    async fn chat_with_system_does_not_retry_auth_failure_with_incidental_529_digits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "",
+                    error: "401 Unauthorized: request req_a529b",
+                }),
+            )],
+            2,
+            1,
+        );
+        let err = provider
+            .chat_with_system(None, "hello", "test", None)
+            .await
+            .expect_err("auth failure with incidental 529 digits must stay terminal");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("non_retryable"),
+            "failure events must record non_retryable: {err}"
+        );
+    }
+
+    /// An outer auth status with an overload status quoted from the
+    /// upstream body is terminal: the marker layer reads the outermost
+    /// status, so the `chat_with_tools` arm fails fast instead of
+    /// retrying the authentication failure against the same candidate.
+    #[tokio::test(start_paused = true)]
+    async fn chat_with_tools_does_not_retry_outer_auth_status_with_nested_529() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "",
+                    error: "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}",
+                }),
+            )],
+            2,
+            1,
+        );
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "noop", "parameters": {}}
+        })];
+        let err = provider
+            .chat_with_tools(&[], &tools, "test", None)
+            .await
+            .expect_err("outer auth status with nested 529 must stay terminal");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("non_retryable"),
+            "failure events must record non_retryable: {err}"
+        );
+    }
+
+    /// A mixed quota/overload message is a business quota: one attempt on
+    /// the first candidate, then failover. The rate-limit policy, not the
+    /// overload floor, governs the message.
+    #[tokio::test]
+    async fn chat_mixed_quota_overload_message_advances_after_one_attempt() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "first".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&first_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "",
+                        error: "429 Too Many Requests: insufficient_quota, servers overloaded",
+                    }),
+                ),
+                (
+                    "second".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&second_calls),
+                        fail_until_attempt: 0,
+                        response: "recovered",
+                        error: "",
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let resp = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                None,
+            )
+            .await
+            .expect("second candidate recovers after the quota failure");
+        assert_eq!(resp.text.as_deref(), Some("recovered"));
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Single-candidate pin for the mixed quota/overload message: with no
+    /// second candidate the rate-limit cooldown failover branch is
+    /// unreachable, so a classification that let overload wording clear
+    /// the business-quota decision would retry here (three calls under
+    /// `max_retries = 2`) instead of failing fast with the rate-limit
+    /// terminal reason.
+    #[tokio::test(start_paused = true)]
+    async fn chat_mixed_quota_overload_message_is_terminal_on_single_candidate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "only".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "",
+                    error: "429 Too Many Requests: insufficient_quota, servers overloaded",
+                }),
+            )],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                None,
+            )
+            .await
+            .expect_err("mixed quota/overload message is terminal on a single candidate");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            err.to_string().contains("rate_limited_non_retryable"),
+            "failure events must record rate_limited_non_retryable: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_context_marker_skips_other_pins_on_the_same_provider() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let primary: Arc<dyn ModelProvider> = Arc::new(MarkerErrorProvider {
+            calls: Arc::clone(&primary_calls),
+            error: "Your input exceeds the context window of this model",
+        });
+        let entries = vec![
+            ReliableModelProviderEntry::new_pinned(
+                "primary",
+                "primary.physical",
+                "primary",
+                "primary-model",
+                Box::new(Arc::clone(&primary)),
+            ),
+            ReliableModelProviderEntry::new_pinned(
+                "primary",
+                "primary.physical",
+                "primary",
+                "fallback-model-on-primary",
+                Box::new(Arc::clone(&primary)),
+            ),
+            ReliableModelProviderEntry::new(
+                "fallback",
+                "fallback.physical",
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&fallback_calls),
+                    fail_until_attempt: 0,
+                    response: "fallback success",
+                    error: "unused",
+                }),
+            ),
+        ];
+        let provider = ReliableModelProvider::new_with_entries("test", entries, 3, 1);
+
+        let response = provider
+            .simple_chat("hello", "requested-model", Some(0.0))
+            .await
+            .expect("typed rejection should skip sibling pins and reach a distinct provider");
+        assert_eq!(response, "fallback success");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2841,7 +7829,40 @@ mod tests {
                 "larger-context model",
             ),
             (
+                "missing api key for configured provider",
+                "credentials_missing",
+                "configuration",
+                "configure provider credentials",
+            ),
+            (
+                "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
+                "credentials_missing",
+                "configuration",
+                "configure provider credentials",
+            ),
+            (
+                "API error (401): missing API key",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "API error (403): API key not set",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
                 "401 Unauthorized: invalid api key",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                // The outer adapter status classifies the diagnostic; a
+                // 529 quoted from the upstream body is payload, not the
+                // response status.
+                "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}",
                 "auth",
                 "http_response",
                 "credentials",
@@ -2872,6 +7893,108 @@ mod tests {
                 "model id",
             ),
             (
+                "compatible API error (503 Service Unavailable): overload",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "compatible API error (400 Bad Request): malformed request",
+                "client_error",
+                "http_response",
+                "request shape",
+            ),
+            (
+                "compatible API error (400 Bad Request): input exceeds the context window of this model",
+                "context_window",
+                "request_validation",
+                "larger-context model",
+            ),
+            (
+                "HTTP 503 Service Unavailable",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "HTTP 404 Not Found",
+                "model_not_found",
+                "http_response",
+                "model id",
+            ),
+            (
+                "HTTP 400 Bad Request",
+                "client_error",
+                "http_response",
+                "request shape",
+            ),
+            (
+                "HTTP request failed: HTTP 503 Service Unavailable",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "compatible API error (401 Unauthorized): invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "compatible API error (403 Forbidden): invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "compatible API error (429 Too Many Requests): retry later",
+                "rate_limited",
+                "http_response",
+                "quota",
+            ),
+            (
+                "ModelProvider error: 401 Unauthorized: invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "ModelProvider error: 403 Forbidden: invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "ModelProvider error: 404 Not Found: unknown model",
+                "model_not_found",
+                "http_response",
+                "model id",
+            ),
+            (
+                "ModelProvider error: 429 Too Many Requests: retry later",
+                "rate_limited",
+                "http_response",
+                "quota",
+            ),
+            (
+                "ModelProvider error: 503 Service Unavailable: overload",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "model_provider stream error: ModelProvider error: 404 Not Found: unknown model",
+                "model_not_found",
+                "http_response",
+                "model id",
+            ),
+            (
+                "model_provider stream error: JSON parse error: invalid type: string \"503 Service Unavailable\", expected a sequence at line 1 column 36",
+                "provider_error",
+                "unknown",
+                "inspect provider error",
+            ),
+            (
                 "provider returned an opaque transport error",
                 "provider_error",
                 "unknown",
@@ -2889,31 +8012,172 @@ mod tests {
     }
 
     #[test]
-    fn failure_summary_includes_provider_diagnostic_fields() {
+    fn provider_error_diagnostic_prioritizes_wrapped_structured_http_status() {
+        for (status, expected_kind) in [
+            (reqwest::StatusCode::UNAUTHORIZED, "auth"),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        ] {
+            let response = reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .body(reqwest::Body::default())
+                    .expect("test response should build"),
+            );
+            let error = anyhow::Error::new(
+                response
+                    .error_for_status()
+                    .expect_err("error status should produce an error"),
+            )
+            .context("missing API key");
+
+            let diagnostic = provider_error_diagnostic(&error);
+
+            assert_eq!(diagnostic.kind, expected_kind, "{status}");
+            assert_eq!(diagnostic.phase, "http_response", "{status}");
+        }
+
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::BAD_REQUEST)
+                .body(reqwest::Body::default())
+                .expect("test response should build"),
+        );
+        let error = anyhow::Error::new(
+            response
+                .error_for_status()
+                .expect_err("error status should produce an error"),
+        )
+        .context("input exceeds the context window of this model");
+
+        let diagnostic = provider_error_diagnostic(&error);
+
+        assert_eq!(diagnostic.kind, "context_window");
+        assert_eq!(diagnostic.phase, "request_validation");
+    }
+
+    #[test]
+    fn terminal_provider_failure_keeps_attempt_diagnostics_out_of_presentation_type() {
+        let mut failures = FailureEvents::default();
+        failures.push("event 1 (retry 1/1): retryable; provider detail".to_string());
+        let error = reliable_terminal_error_with_cause(
+            Some("custom.truefoundry"),
+            failures,
+            None,
+            false,
+            Some(anyhow::Error::msg(
+                "error sending request for url (http://127.0.0.1:11434/v1/chat/completions): \
+                 client error (Connect): connection refused",
+            )),
+        );
+
+        assert!(error.to_string().contains("event 1 (retry 1/1)"));
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("terminal provider failure must retain its typed presentation cause");
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::Connection
+        );
+        assert_eq!(failure.provider(), Some("custom.truefoundry"));
+        assert_eq!(
+            failure.endpoint(),
+            Some("http://127.0.0.1:11434/v1/chat/completions")
+        );
+        assert!(failure.endpoint_is_local());
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("client error (Connect): connection refused")
+        }));
+    }
+
+    #[test]
+    fn terminal_provider_failure_preserves_rejected_usage_accounting() {
+        let mut failures = FailureEvents::default();
+        failures.push("event 1 (retry 1/1): retryable; provider detail".to_string());
+        let error = reliable_terminal_error_with_cause(
+            None,
+            failures,
+            Some(TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            }),
+            false,
+            Some(anyhow::Error::msg(
+                "compatible API error (503 Service Unavailable)",
+            )),
+        );
+
+        assert_rejected_usage_survives(&error);
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<ReliableProviderTerminalFailure>()
+                .is_some()
+        }));
+    }
+
+    #[tokio::test]
+    async fn anthropic_missing_credentials_reach_typed_terminal_failure() {
+        let model_provider = ReliableModelProvider::new(
+            "anthropic",
+            vec![(
+                "anthropic".into(),
+                Box::new(AnthropicModelProvider::builder("anthropic").build()),
+            )],
+            0,
+            1,
+        );
+
+        let error = model_provider
+            .simple_chat("hello", "claude-sonnet-4-5", Some(0.0))
+            .await
+            .expect_err("missing Anthropic credentials should fail");
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("Reliable must retain the typed Anthropic failure");
+
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::CredentialsMissing
+        );
+    }
+
+    #[test]
+    fn failure_summary_contains_only_safe_diagnostic_fields() {
         let diagnostic = ProviderErrorDiagnostic {
             kind: "connect_timeout",
             phase: "tls_or_connect",
             hint: "check network, VPN, or firewall",
             endpoint: Some("https://api.deepseek.com/chat/completions".to_string()),
         };
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
 
-        push_failure(
-            &mut failures,
-            "deepseek",
-            "deepseek-reasoner",
-            1,
-            3,
-            "retryable",
-            "operation timed out",
-            Some(&diagnostic),
-        );
+        push_failure(&mut failures, 1, 3, "retryable", Some(&diagnostic));
 
-        let summary = failures.join("\n");
+        let summary = failure_aggregate(&failures);
+        assert!(summary.contains("event 1 (retry 1/3): retryable"));
         assert!(summary.contains("kind=connect_timeout"));
         assert!(summary.contains("phase=tls_or_connect"));
-        assert!(summary.contains("endpoint=https://api.deepseek.com/chat/completions"));
         assert!(summary.contains("hint=check network, VPN, or firewall"));
+        assert!(!summary.contains("https://api.deepseek.com/chat/completions"));
+        assert!(!summary.contains("operation timed out"));
+    }
+
+    #[test]
+    fn failure_aggregate_enforces_byte_limit_when_an_event_does_not_fit() {
+        let mut failures = FailureEvents::default();
+        failures.push("provider-controlled-body".repeat(MAX_FAILURE_AGGREGATE_BYTES));
+
+        let summary = failure_aggregate(&failures);
+
+        assert!(summary.len() <= MAX_FAILURE_AGGREGATE_BYTES);
+        assert!(summary.contains("after 1 failure event(s)"));
+        assert!(summary.contains("[1 additional failure event(s) omitted]"));
+        assert!(!summary.contains("provider-controlled-body"));
     }
 
     #[tokio::test]
@@ -2951,7 +8215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregated_error_marks_non_retryable_model_mismatch_with_details() {
+    async fn aggregated_error_marks_non_retryable_model_mismatch_without_provider_text() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
             "test",
@@ -2974,8 +8238,10 @@ mod tests {
             .expect_err("model_provider should fail");
         let msg = err.to_string();
 
+        assert!(msg.contains("All model providers/models failed after 1 failure event(s)"));
         assert!(msg.contains("non_retryable"));
-        assert!(msg.contains("error=unsupported model: glm-4.7"));
+        assert!(msg.contains("kind=model_not_found"));
+        assert!(!msg.contains("unsupported model: glm-4.7"));
         // Non-retryable errors should not consume retry budget.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -3160,7 +8426,7 @@ mod tests {
             .expect_err("all models should fail");
         assert!(
             err.to_string()
-                .contains("All model_providers/models failed")
+                .contains("All model providers/models failed after 3 failure event(s)")
         );
 
         let seen = mock.models_seen.lock();
@@ -3312,6 +8578,221 @@ mod tests {
         assert_eq!(model_provider.compute_backoff(500, &err), 500);
     }
 
+    #[test]
+    fn is_overloaded_matches_status_and_message_signals() {
+        // Typed reqwest error carrying a 529 status (built offline).
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(529)
+                .body("overloaded")
+                .expect("static test response"),
+        );
+        let typed = anyhow::Error::new(response.error_for_status().expect_err("529 is an error"));
+        assert!(is_overloaded(&typed), "reqwest 529 must match");
+
+        // Anthropic SSE error type carried in the message.
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "ModelProvider error: overloaded_error: Overloaded"
+        )));
+        // Recognised `ModelProvider error:` prefix yields the status
+        // (gateway style).
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "ModelProvider error: 529 <unknown status code>: Overloaded"
+        )));
+        // Marker layer: the crate's `api error (` marker yields the status
+        // even when the payload wording alone would carry it.
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (529 <unknown status code>): {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"
+        )));
+        // Case-insensitive: a 503 body that says "OVERLOADED" is an overload
+        // signal too (same provider_server classification, plus the floor).
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "503 Service Unavailable: OVERLOADED"
+        )));
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (503 Service Unavailable): overloaded_error"
+        )));
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "ModelProvider error: 502 Bad Gateway: upstream overloaded"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (400 Bad Request): prompt has 529 tokens"
+        )));
+        // The marker layer reads the outermost status and only
+        // status-shaped tokens: an adapter's own HTTP status wins over a
+        // status quoted from the upstream body, and "52931 queued
+        // requests" is a queue depth, not a 529.
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (529 <unknown status code>)\"}"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 401 Unauthorized): {\"error_description\":\"upstream API error (52931 queued requests)\"}"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "Anthropic API error (52931 queued requests)"
+        )));
+        // The outer status is the real one: an outer 529 with a quoted
+        // 401 in the body is an overload, not an auth failure.
+        assert!(is_overloaded(&anyhow::Error::msg(
+            "Gemini CLI OAuth refresh failed (HTTP 529 overloaded): {\"error\":\"upstream API error (401 Unauthorized)\"}"
+        )));
+
+        // The predicate classifies the shared provider_server kind, matching
+        // any other 5xx.
+        let diagnostic = provider_error_diagnostic(&anyhow::Error::msg(
+            "ModelProvider error: overloaded_error: Overloaded",
+        ));
+        assert_eq!(diagnostic.kind, "provider_server");
+
+        // Negatives: other failure classes never match, and the singular
+        // word "overload" is prose, not the provider's overload signal — a
+        // plain 503 keeps the ordinary server-error policy (base backoff, no
+        // floor). The status half matches status-shaped runs only, so "529"
+        // inside a larger number (token counts below) is not an overload
+        // signal: this predicate overrides non-retryable classification in
+        // the retry loop, and a 400 whose body merely mentions a token count
+        // must not be retried. The predicate only ever sees error values, so
+        // response text containing "Overloaded" cannot reach it.
+        assert!(!is_overloaded(&anyhow::Error::msg("429 Too Many Requests")));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "401 Unauthorized: bad key"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "503 Service Unavailable: overload"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "maximum context length exceeded"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: prompt is 15290 tokens, limit 8192"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: input has 52931 tokens"
+        )));
+        // Shape rule, shared with `embedded_client_status`: a status is a
+        // run of exactly three digits with non-alphanumeric neighbours, so
+        // digits glued to letters ("req_a529b", "model529b",
+        // "chatcmpl-529abc") or to more digits ("0529") are never a status,
+        // and a leading-zero run is four digits, not a three-digit status.
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "401 Unauthorized: request req_a529b"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "unknown model model529b for this key"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "no such completion chatcmpl-529abc"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "gateway reported 0529 queued requests"
+        )));
+        // A parsed client status outranks overload wording: a bad request
+        // and a rate limit are client decisions, not a server shed.
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "400 Bad Request: prompt has 529 tokens"
+        )));
+        assert!(!is_overloaded(&anyhow::Error::msg(
+            "429 Too Many Requests: insufficient_quota, servers overloaded"
+        )));
+    }
+
+    #[test]
+    fn embedded_status_code_admits_by_acceptor() {
+        // A non-client acceptor: the overload probe looking for a bare 529.
+        // A status-shaped 529 between spaces is found.
+        assert_eq!(
+            embedded_status_code("shed 529 retry later", |code| code == 529),
+            Some(529)
+        );
+        // Digits glued to letters on either side are not a status.
+        assert_eq!(
+            embedded_status_code("request req_a529b failed", |code| code == 529),
+            None
+        );
+        // A leading-zero run is four digits, not a three-digit status.
+        assert_eq!(
+            embedded_status_code("queue depth 0529", |code| code == 529),
+            None
+        );
+        // The first accepted code wins when two are present.
+        assert_eq!(
+            embedded_status_code("saw 530 then 529", |code| matches!(code, 529 | 530)),
+            Some(530)
+        );
+    }
+
+    #[test]
+    fn http_status_from_error_text_prefers_outer_status_and_status_shaped_tokens() {
+        // Inputs are lowercase: both callers pass a lowercased message.
+        // The outer adapter status wins over a status quoted from the
+        // upstream body (the Gemini CLI OAuth refresh adapter wraps its
+        // own response status around the body it received).
+        assert_eq!(
+            http_status_from_error_text(
+                "gemini cli oauth refresh failed (http 401 unauthorized): {\"error_description\":\"upstream api error (529 <unknown status code>)\"}"
+            ),
+            Some(401)
+        );
+        // A marker-adjacent run of more than three digits is not a
+        // status: "52931 queued requests" is a queue depth, not a 529.
+        assert_eq!(
+            http_status_from_error_text(
+                "gemini cli oauth refresh failed (http 401 unauthorized): {\"error_description\":\"upstream api error (52931 queued requests)\"}"
+            ),
+            Some(401)
+        );
+        assert_eq!(
+            http_status_from_error_text("anthropic api error (52931 queued requests)"),
+            None
+        );
+        assert_eq!(http_status_from_error_text("http 52931"), None);
+        // The outer status is the real one: an outer 529 with a quoted
+        // 401 in the body is an overload, not an auth failure.
+        assert_eq!(
+            http_status_from_error_text(
+                "gemini cli oauth refresh failed (http 529 overloaded): {\"error\":\"upstream api error (401 unauthorized)\"}"
+            ),
+            Some(529)
+        );
+        // Unchanged positives: a lone marker status, and the
+        // `modelprovider error:` prefix path.
+        assert_eq!(
+            http_status_from_error_text(
+                "anthropic api error (529 <unknown status code>): overloaded"
+            ),
+            Some(529)
+        );
+        assert_eq!(
+            http_status_from_error_text(
+                "modelprovider error: 529 <unknown status code>: overloaded"
+            ),
+            Some(529)
+        );
+        // A marker whose token is not status-shaped is skipped; the next
+        // valid marker counts.
+        assert_eq!(
+            http_status_from_error_text("anthropic api error (unknown): http 401"),
+            Some(401)
+        );
+    }
+
+    #[test]
+    fn compute_backoff_overload_floors_at_2s_without_retry_after() {
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        let err = anyhow::Error::msg("ModelProvider error: overloaded_error: Overloaded");
+        // Base below the floor: the floor binds.
+        assert_eq!(model_provider.compute_backoff(500, &err), 2_000);
+        // Base above the floor: the base wins.
+        assert_eq!(model_provider.compute_backoff(4_000, &err), 4_000);
+    }
+
+    #[test]
+    fn compute_backoff_overload_honors_retry_after() {
+        let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        let err = anyhow::Error::msg("overloaded_error: Overloaded (Retry-After: 1)");
+        assert_eq!(model_provider.compute_backoff(500, &err), 1_000);
+    }
+
     // ── §2.1 API auth error (401/403) tests ──────────────────
 
     #[test]
@@ -3375,6 +8856,51 @@ mod tests {
             !is_non_retryable(&err),
             "502 must NOT be treated as non-retryable"
         );
+    }
+
+    #[test]
+    fn non_retryable_ignores_stream_idle_timeout_messages() {
+        let err = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout; raise timeout_secs above 480s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "a stream idle timeout must stay retryable so the user's turn is preserved"
+        );
+        let err = anyhow::Error::msg(
+            "no data from provider for 3600s (stream idle timeout; raise timeout_secs above 3600s to wait longer): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "an hour-long idle bound is still not a client error"
+        );
+        let err = anyhow::Error::msg(
+            "no data from provider for 480s (stream idle timeout): error sending request for url (http://gateway.example/v1/chat/completions): operation timed out",
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "the fixed-bound idle rendering must also stay retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_detects_status_shaped_numbers_only() {
+        assert!(is_non_retryable(&anyhow::Error::msg("HTTP 401")));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            "upstream rejected the call: \"code\":404, model missing"
+        )));
+        assert!(is_non_retryable(&anyhow::Error::msg(
+            "status=403 forbidden"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "waited 480s for first byte"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "code 0409 from gateway"
+        )));
+        assert!(!is_non_retryable(&anyhow::Error::msg(
+            "spent 4800 ms connecting"
+        )));
     }
 
     // ── §2.2 Rate limit Retry-After edge cases ───────────────
@@ -3550,6 +9076,116 @@ mod tests {
         assert!(
             model_provider.provider_cooldown_active("primary"),
             "primary provider should remain cooled down after Retry-After"
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_skip_uses_safe_terminal_summary() {
+        let skipped_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new(
+                    "provider-alias-should-not-escape",
+                    "primary-cooldown-key",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&skipped_calls),
+                        fail_until_attempt: 0,
+                        response: "should be skipped",
+                        error: "unreachable",
+                    }),
+                ),
+                ReliableModelProviderEntry::new(
+                    "fallback-alias-should-not-escape",
+                    "fallback-cooldown-key",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "unreachable",
+                        error: "fallback provider response marker",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        let cooldown_error = anyhow::Error::msg("429 Too Many Requests, Retry-After: 30");
+        model_provider.set_rate_limit_cooldown("primary-cooldown-key", &cooldown_error);
+
+        let error = model_provider
+            .simple_chat("hello", "model-id-should-not-escape", Some(0.0))
+            .await
+            .expect_err("the non-cooled fallback should fail");
+        let message = error.to_string();
+
+        assert_eq!(skipped_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert!(message.contains("event 1 (retry 0/1): rate_limit_cooldown"));
+        assert!(message.contains("kind=rate_limited"));
+        assert!(message.contains("phase=cooldown"));
+        assert!(message.contains("event 2 (retry 1/1): retryable"));
+        assert!(!message.contains("provider-alias-should-not-escape"));
+        assert!(!message.contains("fallback-alias-should-not-escape"));
+        assert!(!message.contains("model-id-should-not-escape"));
+        assert!(!message.contains("fallback provider response marker"));
+    }
+
+    #[tokio::test]
+    async fn cooldown_skipped_candidate_creates_no_canonical_attempt() {
+        let skipped_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new(
+                    "skipped-display",
+                    "primary-cooldown-key",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&skipped_calls),
+                        fail_until_attempt: 0,
+                        response: "never",
+                        error: "unused",
+                    }),
+                ),
+                ReliableModelProviderEntry::new(
+                    "physical-fallback",
+                    "fallback-cooldown-key",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "expected fallback failure",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        provider.set_rate_limit_cooldown(
+            "primary-cooldown-key",
+            &anyhow::Error::msg("429 Too Many Requests, Retry-After: 30"),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&provider)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "served-model",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_err());
+        assert_eq!(skipped_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        assert_eq!(
+            outcome.accounting.attempts()[0].provider_ref(),
+            "fallback-cooldown-key"
         );
     }
 
@@ -3822,7 +9458,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mixed_chain_disables_native_tools_before_dispatch() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "native-primary".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "unused",
+                        tool_calls: vec![],
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text-fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "unused",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(
+            !provider.supports_native_tools(),
+            "a text-only fallback must select prompt-guided tools before dispatch"
+        );
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "Reliable capabilities must not advertise native tools that a fallback cannot accept"
+        );
+        assert!(
+            !provider
+                .capabilities_for_model("any-model")
+                .native_tool_calling,
+            "model-specific Reliable capabilities must not advertise native tools that a fallback cannot accept"
+        );
+        assert!(
+            provider.has_mixed_native_tool_support_for_model("any-model"),
+            "the strict-mode preflight must distinguish a mixed chain from a homogeneous text-only chain"
+        );
+    }
+
     // ── Gap 2-4: Parity tests for chat() ────────────────────────
+
+    #[test]
+    fn homogeneous_chains_do_not_report_mixed_native_tool_support() {
+        let native_provider = ReliableModelProvider::new(
+            "native",
+            vec![
+                (
+                    "native-primary".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "unused",
+                        tool_calls: vec![],
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "native-fallback".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "unused",
+                        tool_calls: vec![],
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let text_provider = ReliableModelProvider::new(
+            "text",
+            vec![
+                (
+                    "text-primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "unused",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text-fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "unused",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(native_provider.supports_native_tools());
+        assert!(
+            !native_provider.has_mixed_native_tool_support_for_model("any-model"),
+            "an all-native chain is homogeneous"
+        );
+        assert!(!text_provider.supports_native_tools());
+        assert!(
+            !text_provider.has_mixed_native_tool_support_for_model("any-model"),
+            "an all-text chain is homogeneous and remains valid in strict mode"
+        );
+    }
 
     #[tokio::test]
     async fn chat_returns_aggregated_error_when_all_providers_fail() {
@@ -3865,11 +9617,11 @@ mod tests {
             .await
             .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All model_providers/models failed"));
-        assert!(msg.contains("model_provider=p1 model=test"));
-        assert!(msg.contains("model_provider=p2 model=test"));
-        assert!(msg.contains("error=p1 chat error"));
-        assert!(msg.contains("error=p2 chat error"));
+        assert!(msg.contains("All model providers/models failed after 2 failure event(s)"));
+        assert!(msg.contains("event 1 (retry 1/1): retryable"));
+        assert!(msg.contains("event 2 (retry 1/1): retryable"));
+        assert!(!msg.contains("p1 chat error"));
+        assert!(!msg.contains("p2 chat error"));
         assert!(msg.contains("retryable"));
     }
 
@@ -4023,6 +9775,50 @@ mod tests {
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn terminal_provider_failure_names_the_final_fallback_candidate() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "401 Unauthorized",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "401 Unauthorized",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let error = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("all configured candidates should fail");
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("terminal provider failure must retain its typed cause");
+
+        assert_eq!(failure.provider(), Some("fallback"));
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::Authentication
+        );
+    }
+
     // ── Context window truncation tests ─────────────────────────
 
     #[test]
@@ -4047,6 +9843,15 @@ mod tests {
         assert!(is_context_window_exceeded(&anyhow::Error::msg(
             "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
         )));
+    }
+
+    #[test]
+    fn is_context_window_exceeded_detects_nested_provider_cause() {
+        let err = anyhow::Error::msg("maximum context length exceeded")
+            .context("provider request failed after retry recovery");
+
+        assert!(!err.to_string().contains("maximum context length"));
+        assert!(is_context_window_exceeded(&err));
     }
 
     #[test]
@@ -4191,7 +9996,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_context_treats_prompt_tool_results_as_part_of_turn() {
+    fn truncate_for_context_treats_tool_result_carriers_as_part_of_turn() {
         let mut messages = vec![
             ChatMessage::system("sys"),
             ChatMessage::user("old request"),
@@ -4305,7 +10110,24 @@ mod tests {
     struct ContextOverflowMock {
         calls: Arc<AtomicUsize>,
         fail_until_attempt: usize,
+        post_context_error: Option<&'static str>,
         message_counts: parking_lot::Mutex<Vec<usize>>,
+    }
+
+    impl ContextOverflowMock {
+        fn record_attempt(&self, message_count: usize) -> anyhow::Result<()> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.message_counts.lock().push(message_count);
+            if attempt <= self.fail_until_attempt {
+                anyhow::bail!(
+                    "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
+                );
+            }
+            if let Some(error) = self.post_context_error {
+                anyhow::bail!(error);
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -4317,7 +10139,8 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            Ok("ok".to_string())
+            self.record_attempt(0)?;
+            Ok("recovered after truncation".to_string())
         }
 
         async fn chat_with_history(
@@ -4326,14 +10149,39 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            self.message_counts.lock().push(messages.len());
-            if attempt <= self.fail_until_attempt {
-                anyhow::bail!(
-                    "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
-                );
-            }
+            self.record_attempt(messages.len())?;
             Ok("recovered after truncation".to_string())
+        }
+
+        async fn chat_with_tools(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.record_attempt(messages.len())?;
+            Ok(ChatResponse {
+                text: Some("recovered after truncation".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.record_attempt(request.messages.len())?;
+            Ok(ChatResponse {
+                text: Some("recovered after truncation".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for ContextOverflowMock {
@@ -4349,12 +10197,39 @@ mod tests {
         }
     }
 
+    fn all_non_stream_context_overflow_provider(calls: Arc<AtomicUsize>) -> ReliableModelProvider {
+        ReliableModelProvider::new(
+            "test",
+            vec![(
+                "local".into(),
+                Box::new(ContextOverflowMock {
+                    calls,
+                    fail_until_attempt: usize::MAX,
+                    post_context_error: None,
+                    message_counts: parking_lot::Mutex::new(Vec::new()),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        )
+    }
+
+    fn assert_single_safe_context_failure(err: anyhow::Error, calls: &AtomicUsize) {
+        let msg = err.to_string();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(msg.contains("after 1 failure event(s)"), "{msg}");
+        assert!(msg.contains("event 1 (retry 1/1): context_window"), "{msg}");
+        assert!(!msg.contains("8968 tokens"));
+        assert!(!msg.contains("8448 tokens"));
+    }
+
     #[tokio::test]
     async fn chat_with_history_truncates_on_context_overflow() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = ContextOverflowMock {
             calls: Arc::clone(&calls),
             fail_until_attempt: 1, // fail first call, succeed after truncation
+            post_context_error: None,
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 
@@ -4374,13 +10249,116 @@ mod tests {
             ChatMessage::user("current question"),
         ];
 
-        let result = model_provider
-            .chat_with_history(&messages, "local-model", Some(0.0))
-            .await
-            .unwrap();
+        let (result, fallback, context_truncated) = scope_provider_fallback(async {
+            let result = model_provider
+                .chat_with_history(&messages, "local-model", Some(0.0))
+                .await
+                .unwrap();
+            (
+                result,
+                take_last_provider_fallback(),
+                take_last_provider_context_truncation(),
+            )
+        })
+        .await;
         assert_eq!(result, "recovered after truncation");
         // Should have been called twice: once with full messages, once with truncated
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            fallback.is_none(),
+            "same-candidate context recovery is not user-visible fallback attribution"
+        );
+        assert!(
+            context_truncated,
+            "the internal provenance signal must remain available for cache safety"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_non_stream_context_overflows_with_zero_retries_report_one_attempt() {
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old message"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("current question"),
+        ];
+
+        let system_calls = Arc::new(AtomicUsize::new(0));
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&system_calls))
+            .chat_with_system(None, "hello", "local-model", Some(0.0))
+            .await
+            .expect_err("the only system-chat call should overflow");
+        assert_single_safe_context_failure(err, &system_calls);
+
+        let history_calls = Arc::new(AtomicUsize::new(0));
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&history_calls))
+            .chat_with_history(&messages, "local-model", Some(0.0))
+            .await
+            .expect_err("the only history-chat call should overflow");
+        assert_single_safe_context_failure(err, &history_calls);
+
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&tool_calls))
+            .chat_with_tools(&messages, &[], "local-model", Some(0.0))
+            .await
+            .expect_err("the only tool-chat call should overflow");
+        assert_single_safe_context_failure(err, &tool_calls);
+
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&chat_calls))
+            .chat(request, "local-model", Some(0.0))
+            .await
+            .expect_err("the only structured-chat call should overflow");
+        assert_single_safe_context_failure(err, &chat_calls);
+    }
+
+    #[tokio::test]
+    async fn context_truncation_then_failure_reports_both_events_in_order() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = ContextOverflowMock {
+            calls: Arc::clone(&calls),
+            fail_until_attempt: 1,
+            post_context_error: Some("sensitive final provider response body: secret-token"),
+            message_counts: parking_lot::Mutex::new(Vec::new()),
+        };
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
+            1,
+            1,
+        );
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old message"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("current question"),
+        ];
+
+        let err = model_provider
+            .chat_with_history(&messages, "local-model", Some(0.0))
+            .await
+            .expect_err("both provider calls should overflow");
+        let msg = err.to_string();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(msg.contains("after 2 failure event(s)"), "{msg}");
+        let first = msg
+            .find("event 1 (retry 1/2): context_window")
+            .expect("first overflow event should be retained");
+        let second = msg
+            .find("event 2 (retry 2/2): retryable")
+            .expect("post-truncation failure should be retained");
+        assert!(first < second, "events were reordered: {msg}");
+        assert!(msg.contains("kind=provider_error"));
+        assert!(!msg.contains("8968 tokens"));
+        assert!(!msg.contains("8448 tokens"));
+        assert!(!msg.contains("sensitive final provider response body"));
+        assert!(!msg.contains("secret-token"));
     }
 
     #[tokio::test]
@@ -4389,6 +10367,7 @@ mod tests {
         let mock = ContextOverflowMock {
             calls: Arc::clone(&calls),
             fail_until_attempt: 999, // always fail
+            post_context_error: None,
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 
@@ -4473,8 +10452,52 @@ mod tests {
         assert!(is_non_retryable(&err));
     }
 
+    #[test]
+    fn malformed_stream_parser_error_is_not_treated_as_a_model_failure() {
+        for payload in [
+            "503 Service Unavailable",
+            "model mystery is unknown",
+            "unknown model",
+        ] {
+            let err = anyhow::Error::msg(format!(
+                "model_provider stream error: JSON parse error: invalid type: string \"{payload}\", expected a sequence at line 1 column 36"
+            ));
+
+            assert!(!is_non_retryable(&err), "{payload}");
+            assert_eq!(
+                provider_error_diagnostic(&err).kind,
+                "provider_error",
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_first_failure_phrases_remain_non_retryable_and_classified() {
+        for message in [
+            "model \"missing\" not found",
+            "model \"mystery\" is unknown",
+            "model unknown",
+            "the requested model 'mystery' is unknown",
+            "model \"legacy\" is unsupported",
+            "model \"legacy\" is not supported",
+            "model \"bad\" is invalid",
+            "model \"gone\" does not exist",
+        ] {
+            let err = anyhow::Error::msg(message);
+
+            assert!(is_non_retryable(&err), "{message}");
+            assert_eq!(
+                provider_error_diagnostic(&err).kind,
+                "model_not_found",
+                "{message}"
+            );
+        }
+    }
+
     struct StreamingToolEventMock {
         stream_calls: Arc<AtomicUsize>,
+        non_stream_calls: Arc<AtomicUsize>,
         supports_tool_events: bool,
     }
 
@@ -4482,6 +10505,7 @@ mod tests {
         fn new(supports_tool_events: bool) -> Self {
             Self {
                 stream_calls: Arc::new(AtomicUsize::new(0)),
+                non_stream_calls: Arc::new(AtomicUsize::new(0)),
                 supports_tool_events,
             }
         }
@@ -4496,6 +10520,7 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
+            self.non_stream_calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".to_string())
         }
 
@@ -4546,18 +10571,150 @@ mod tests {
     enum StreamingRecordMode {
         Success,
         Error,
+        UsageThenError,
     }
 
     struct StreamingRecordMock {
         stream_calls: Arc<AtomicUsize>,
+        observed_models: Option<Arc<Mutex<Vec<String>>>>,
         supports: bool,
         mode: StreamingRecordMode,
+    }
+
+    struct StreamErrorNoChatReplayMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    /// The stream errors the connect-failed recovery tests drive, each
+    /// matching the exact shape its adapter emits.
+    #[derive(Clone, Copy)]
+    enum ConfiguredStreamError {
+        /// A transport connect failure at the send site, tagged by the
+        /// adapter as `StreamError::ConnectFailed` (the observed
+        /// connect-timeout chain).
+        ConnectFailed,
+        /// B1's counterexample: an accepted HTTP 200 stream whose SSE error
+        /// frame says `failed to resolve backend`, forwarded as a plain
+        /// provider-side error.
+        AcceptedResolveBackend,
+        /// The observed connect-timeout text carried without the transport's
+        /// typed verdict.
+        UntaggedConnectTimeoutText,
+    }
+
+    impl ConfiguredStreamError {
+        fn emit(self) -> crate::traits::StreamError {
+            match self {
+                Self::ConnectFailed => crate::traits::StreamError::ConnectFailed(
+                    "error sending request for url (https://gateway.example.test/v1/messages): \
+                     client error (Connect): operation timed out"
+                        .to_string(),
+                ),
+                Self::AcceptedResolveBackend => crate::traits::StreamError::ModelProvider(
+                    "api_error: failed to resolve backend".to_string(),
+                ),
+                Self::UntaggedConnectTimeoutText => crate::traits::StreamError::Http(
+                    "error sending request for url (https://gateway.example.test/v1/messages): \
+                     client error (Connect): operation timed out"
+                        .to_string(),
+                ),
+            }
+        }
+    }
+
+    /// Wrap a stream error the way the runtime's stream consumer hands it to
+    /// `record_stream_recovery_failure`: an outer message with the stream
+    /// error reachable as a chain cause.
+    fn runtime_stream_error_wrap(stream_error: crate::traits::StreamError) -> anyhow::Error {
+        anyhow::Error::new(stream_error).context("model_provider stream error")
+    }
+
+    /// Stream emits the configured error as its first item; non-streaming
+    /// chat counts calls, failing with an overload for the first
+    /// `chat_overload_failures` calls and then succeeding.
+    struct ConfiguredStreamErrorChatMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+        stream_error_kind: ConfiguredStreamError,
+        chat_overload_failures: usize,
+    }
+
+    struct StreamRefusalNoChatReplayMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SemanticRecoveryChatResult {
+        Success,
+        Empty,
+        Error,
+    }
+
+    struct SemanticEmptyNoChatReplayMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+        chat_result: SemanticRecoveryChatResult,
+    }
+
+    struct StreamThenChatErrorMock;
+
+    impl ::zeroclaw_api::attribution::Attributable for StreamThenChatErrorMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "StreamThenChatErrorMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamThenChatErrorMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("expected recovery failure")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("expected recovery failure")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            stream::iter(vec![Err(StreamingRecordMock::stream_error())]).boxed()
+        }
     }
 
     impl StreamingRecordMock {
         fn success(stream_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 stream_calls,
+                observed_models: None,
                 supports: true,
                 mode: StreamingRecordMode::Success,
             }
@@ -4566,6 +10723,7 @@ mod tests {
         fn unsupported(stream_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 stream_calls,
+                observed_models: None,
                 supports: false,
                 mode: StreamingRecordMode::Success,
             }
@@ -4574,6 +10732,29 @@ mod tests {
         fn error(stream_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 stream_calls,
+                observed_models: None,
+                supports: true,
+                mode: StreamingRecordMode::Error,
+            }
+        }
+
+        fn usage_then_error(stream_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                stream_calls,
+                observed_models: None,
+                supports: true,
+                mode: StreamingRecordMode::UsageThenError,
+            }
+        }
+
+        /// Creates a failing stream that records the model received from ProviderDispatch.
+        fn observed_error(
+            stream_calls: Arc<AtomicUsize>,
+            observed_models: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                stream_calls,
+                observed_models: Some(observed_models),
                 supports: true,
                 mode: StreamingRecordMode::Error,
             }
@@ -4581,6 +10762,58 @@ mod tests {
 
         fn stream_error() -> crate::traits::StreamError {
             crate::traits::StreamError::ModelProvider("stream failed".to_string())
+        }
+
+        /// Records the model argument before the mock emits its configured stream result.
+        fn record_model(&self, model: &str) {
+            if let Some(observed_models) = &self.observed_models {
+                observed_models
+                    .lock()
+                    .expect("observed model lock must remain available")
+                    .push(model.to_string());
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StreamErrorNoChatReplayMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "StreamErrorNoChatReplayMock"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StreamRefusalNoChatReplayMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "StreamRefusalNoChatReplayMock"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SemanticEmptyNoChatReplayMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "SemanticEmptyNoChatReplayMock"
         }
     }
 
@@ -4607,11 +10840,12 @@ mod tests {
         fn stream_chat(
             &self,
             _request: ChatRequest<'_>,
-            _model: &str,
+            model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.record_model(model);
             match self.mode {
                 StreamingRecordMode::Success => stream::iter(vec![
                     Ok(StreamEvent::TextDelta(StreamChunk::delta("streamed"))),
@@ -4619,6 +10853,16 @@ mod tests {
                 ])
                 .boxed(),
                 StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+                StreamingRecordMode::UsageThenError => stream::iter(vec![
+                    Ok(StreamEvent::Usage(TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
+                    })),
+                    Err(Self::stream_error()),
+                ])
+                .boxed(),
             }
         }
 
@@ -4626,11 +10870,12 @@ mod tests {
             &self,
             _system_prompt: Option<&str>,
             _message: &str,
-            _model: &str,
+            model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.record_model(model);
             match self.mode {
                 StreamingRecordMode::Success => stream::iter(vec![
                     Ok(StreamChunk::delta("streamed")),
@@ -4638,17 +10883,21 @@ mod tests {
                 ])
                 .boxed(),
                 StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+                StreamingRecordMode::UsageThenError => {
+                    stream::iter(vec![Err(Self::stream_error())]).boxed()
+                }
             }
         }
 
         fn stream_chat_with_history(
             &self,
             _messages: &[ChatMessage],
-            _model: &str,
+            model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.record_model(model);
             match self.mode {
                 StreamingRecordMode::Success => stream::iter(vec![
                     Ok(StreamChunk::delta("streamed")),
@@ -4656,7 +10905,313 @@ mod tests {
                 ])
                 .boxed(),
                 StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+                StreamingRecordMode::UsageThenError => {
+                    stream::iter(vec![Err(Self::stream_error())]).boxed()
+                }
             }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamErrorNoChatReplayMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(StreamingRecordMock::stream_error())]).boxed()
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ConfiguredStreamErrorChatMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ConfiguredStreamErrorChatMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ConfiguredStreamErrorChatMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let call = self.chat_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.chat_overload_failures {
+                anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
+            }
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let call = self.chat_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.chat_overload_failures {
+                anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
+            }
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(self.stream_error_kind.emit())]).boxed()
+        }
+    }
+
+    /// Stream fails pre-output; non-streaming calls fail with an overload
+    /// error for the first `chat_overload_failures` calls, then succeed.
+    struct StreamErrorThenOverloadedChatMock {
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+        chat_overload_failures: usize,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StreamErrorThenOverloadedChatMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "StreamErrorThenOverloadedChatMock"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamErrorThenOverloadedChatMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let call = self.chat_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.chat_overload_failures {
+                anyhow::bail!("ModelProvider error: overloaded_error: Overloaded");
+            }
+            Ok(ChatResponse {
+                text: Some("recovered after overload".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(StreamingRecordMock::stream_error())]).boxed()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamRefusalNoChatReplayMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![Err(StreamError::ModelRefusal(Box::new(
+                AnthropicRefusalError {
+                    requested_model: model.to_string(),
+                    category: Some("private-safety-category".to_string()),
+                    usage: Some(Box::new(TokenUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        cached_input_tokens: Some(1),
+                        cache_creation_input_tokens: None,
+                    })),
+                    attempted_candidate: None,
+                    attempted_candidate_index: None,
+                },
+            )))])
+            .boxed()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SemanticEmptyNoChatReplayMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            match self.chat_result {
+                SemanticRecoveryChatResult::Success => Ok(ChatResponse {
+                    text: Some("recovered".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }),
+                SemanticRecoveryChatResult::Empty => Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }),
+                SemanticRecoveryChatResult::Error => anyhow::bail!("recovery failed"),
+            }
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::reasoning(
+                    "reasoning only",
+                ))),
+                Ok(StreamEvent::Final),
+            ])
+            .boxed()
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for StreamingRecordMock {
@@ -4689,6 +11244,32 @@ mod tests {
                     "fallback",
                     "fallback.key",
                     "fallback-alias",
+                    "model-served",
+                    Box::new(fallback) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    /// Builds a pinned fallback whose inner mock sees Reliable's dispatch model unchanged.
+    fn reliable_with_dispatch_observed_pinned_fallback(
+        primary_calls: Arc<AtomicUsize>,
+        fallback: StreamingRecordMock,
+    ) -> ReliableModelProvider {
+        ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new(
+                    "primary",
+                    "primary.key",
+                    Box::new(StreamingRecordMock::unsupported(primary_calls))
+                        as Box<dyn ModelProvider>,
+                ),
+                ReliableModelProviderEntry::new_dispatch_observed_pinned(
+                    "fallback",
+                    "fallback.key",
                     "model-served",
                     Box::new(fallback) as Box<dyn ModelProvider>,
                 ),
@@ -4876,6 +11457,1666 @@ mod tests {
             fallback.is_none(),
             "failed streams must not leave successful fallback info behind"
         );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_usage_then_error_does_not_record_stale_fallback_info() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = reliable_with_streaming_pinned_fallback(
+            Arc::clone(&primary_calls),
+            StreamingRecordMock::usage_then_error(Arc::clone(&fallback_calls)),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let fallback = scope_provider_fallback(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "model-requested",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                StreamEvent::Usage(_)
+            ));
+            assert!(stream.next().await.unwrap().is_err());
+            assert!(stream.next().await.is_none());
+            take_last_provider_fallback()
+        })
+        .await;
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            fallback.is_none(),
+            "usage before a stream error must remain provisional"
+        );
+    }
+
+    /// Protects the Reliable-to-dispatch model handoff for all three stream entry points.
+    #[tokio::test]
+    async fn pinned_stream_failures_dispatch_the_served_model_for_every_entry_point() {
+        let observed_models = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = reliable_with_dispatch_observed_pinned_fallback(
+            Arc::new(AtomicUsize::new(0)),
+            StreamingRecordMock::observed_error(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&observed_models),
+            ),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let mut structured = model_provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "model-requested",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        assert!(structured.next().await.unwrap().is_err());
+
+        let mut system = model_provider.stream_chat_with_system(
+            Some("system"),
+            "hello",
+            "model-requested",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        assert!(system.next().await.unwrap().is_err());
+
+        let mut history = model_provider.stream_chat_with_history(
+            &messages,
+            "model-requested",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        assert!(history.next().await.unwrap().is_err());
+
+        assert_eq!(
+            *observed_models
+                .lock()
+                .expect("observed model lock must remain available"),
+            vec!["model-served"; 3],
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_recovery_continues_after_the_selected_entry_without_replay() {
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(StreamingRecordMock::error(Arc::new(AtomicUsize::new(0))))
+                        as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            assert!(stream.next().await.unwrap().is_err());
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A stream failure carrying the transport's own connect-failed verdict
+    /// must hand the exact failed entry its non-streaming recovery attempt
+    /// before any other candidate is tried. The recorded error is the
+    /// stream error the mock actually emitted, wrapped the way the runtime
+    /// wraps it.
+    #[tokio::test]
+    async fn connect_failed_stream_recovery_retries_the_failed_entry_before_other_candidates() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::ConnectFailed,
+                        chat_overload_failures: 0,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        // The transport reported the connect failure, so the primary gets
+        // the non-streaming attempt and the backup is never called.
+        assert_eq!(response.unwrap().text.as_deref(), Some("must not replay"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The connect-failed grant carries the configured retry budget: the
+    /// failed entry sees exactly `max_retries + 1` non-streaming attempts
+    /// before the backup is reached, and the backup keeps its own ordinary
+    /// budget.
+    #[tokio::test(start_paused = true)]
+    async fn connect_failed_stream_recovery_exhausts_the_failed_entry_budget_before_the_backup() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::ConnectFailed,
+                        chat_overload_failures: usize::MAX,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            2_000,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// An accepted stream cannot buy the connect-failed grant: an SSE error
+    /// on a 200 response (B1's counterexample, `api_error: failed to
+    /// resolve backend`) is a provider-side error type, so the failed entry
+    /// keeps the multi-candidate skip and the backup serves instead.
+    #[tokio::test]
+    async fn stream_recovery_skips_accepted_stream_error_frame_text() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::AcceptedResolveBackend,
+                        chat_overload_failures: 0,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        // The frame's `resolve` wording still classifies as a DNS
+        // diagnostic for presentation, but the recorded type is a
+        // provider-side stream error, so the primary is never retried.
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Connect-timeout text alone no longer grants the exception: the
+    /// observed connect-timeout message, recorded without the transport's
+    /// typed connect-failed verdict, keeps the multi-candidate skip.
+    #[tokio::test]
+    async fn stream_recovery_skips_connect_timeout_text_without_typed_verdict() {
+        let primary_chat_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-failure".into(),
+                    Box::new(ConfiguredStreamErrorChatMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&primary_chat_calls),
+                        stream_error_kind: ConfiguredStreamError::UntaggedConnectTimeoutText,
+                        chat_overload_failures: 0,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "backup".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&backup_calls),
+                        fail_until_attempt: 0,
+                        response: "backup response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let Err(stream_error) = stream.next().await.unwrap() else {
+                panic!("the mock stream must fail before any event");
+            };
+            record_stream_recovery_failure(&runtime_stream_error_wrap(stream_error));
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("backup response"));
+        assert_eq!(primary_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_non_stream_recovery_is_a_second_canonical_leaf() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-physical".into(),
+                    Box::new(StreamThenChatErrorMock) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "recovery-physical".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "expected recovery failure",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                assert!(
+                    ProviderDispatch::from_ref(&provider)
+                        .chat(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            "served-model",
+                            None,
+                        )
+                        .await
+                        .is_err()
+                );
+            })
+            .await;
+
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 2);
+        assert_eq!(
+            report
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.provider_ref())
+                .collect::<Vec<_>>(),
+            vec!["stream-physical", "recovery-physical"]
+        );
+        assert!(report.attempts().iter().all(|attempt| matches!(
+            attempt.outcome(),
+            crate::dispatch::AttemptUsageOutcome::OutcomeUnknown { observed: None }
+        )));
+    }
+
+    #[tokio::test]
+    async fn single_entry_stream_recovery_retries_same_candidate() {
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "physical".into(),
+                Box::new(StreamErrorNoChatReplayMock {
+                    stream_calls: Arc::new(AtomicUsize::new(0)),
+                    chat_calls: Arc::clone(&chat_calls),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let resp = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect("chat should succeed after stream recovery");
+                assert_eq!(resp.text.as_deref(), Some("must not replay"));
+            })
+            .await;
+
+        let report = scope.take();
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.attempts().len(), 2);
+        assert_eq!(report.attempts()[0].provider_ref(), "physical");
+        assert_eq!(report.attempts()[1].provider_ref(), "physical");
+    }
+
+    #[test]
+    fn single_candidate_recovery_decision_boundaries() {
+        // Non-failed entries always admit the configured budget.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, false, false, false, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, false, false, false, false, false),
+            RetryDecision::Admit(2)
+        );
+        // Semantic-empty wins with budget; without budget it stays skipped
+        // when another candidate exists.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, true, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, true, false, true),
+            RetryDecision::Skip
+        );
+        // Single-candidate stream failure: recovery is not replay, so the
+        // entry is admitted with the configured budget (exactly one attempt
+        // when that budget is zero). Merges with semantic-empty into the
+        // same single attempt when both grants apply at a zero budget.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, false, false),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, true, false),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, false, false),
+            RetryDecision::Admit(2)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, true, false),
+            RetryDecision::Admit(0)
+        );
+        // Multi-candidate without permission: skip the failed entry.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, false, false, false, true),
+            RetryDecision::Skip
+        );
+    }
+
+    #[test]
+    fn connect_failed_stream_recovery_decision_boundaries() {
+        // A connect failure admits the configured budget even when another
+        // candidate exists, exactly as the single-candidate case does (a
+        // zero budget still means exactly one attempt).
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(0, true, true, false, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, false, true),
+            RetryDecision::Admit(2)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, false, false),
+            RetryDecision::Admit(2)
+        );
+        // A failure that reached the upstream keeps the multi-candidate
+        // skip when no other exception applies.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, false, false, false, true),
+            RetryDecision::Skip
+        );
+        // Explicit one-attempt grants win over connect-failed and retain
+        // their single attempt.
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, true, false, true),
+            RetryDecision::Admit(0)
+        );
+        assert_eq!(
+            ReliableModelProvider::stream_recovery_decision(2, true, true, false, true, true),
+            RetryDecision::Admit(0)
+        );
+    }
+
+    /// A pre-output stream failure on a single candidate must hand the
+    /// recovery attempt the configured retry budget with overload backoff:
+    /// two overloaded non-streaming responses, then success on the third.
+    #[tokio::test(start_paused = true)]
+    async fn single_candidate_stream_recovery_uses_configured_budget_on_overload() {
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "physical".into(),
+                Box::new(StreamErrorThenOverloadedChatMock {
+                    stream_calls: Arc::new(AtomicUsize::new(0)),
+                    chat_calls: Arc::clone(&chat_calls),
+                    chat_overload_failures: 2,
+                }) as Box<dyn ModelProvider>,
+            )],
+            2,
+            2_000,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let started = tokio::time::Instant::now();
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let resp = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect("chat succeeds after overloaded recovery attempts");
+                assert_eq!(resp.text.as_deref(), Some("recovered after overload"));
+            })
+            .await;
+
+        // Budget 2 → up to 3 non-streaming attempts; the first two overload.
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 3);
+        // Paused-clock waits: at base 2000 the floor is inert — the
+        // 2000 + 4000 schedule is the loop's doubling alone, so deleting
+        // the floor would not fail this test. The below-floor case is
+        // pinned by `compute_backoff_overload_floors_at_2s_without_retry_after`.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(6_000),
+            "overload backoff waits missing: {elapsed:?}"
+        );
+    }
+
+    /// A zero budget stays exactly one attempt even when that attempt hits
+    /// an overload (the single-candidate grant is recovery, not extra budget).
+    #[tokio::test]
+    async fn single_candidate_stream_recovery_zero_budget_stays_one_attempt_on_overload() {
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "physical".into(),
+                Box::new(StreamErrorThenOverloadedChatMock {
+                    stream_calls: Arc::new(AtomicUsize::new(0)),
+                    chat_calls: Arc::clone(&chat_calls),
+                    chat_overload_failures: usize::MAX,
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let err = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect_err("zero-budget overload recovery must terminate");
+                assert!(
+                    format!("{err:?}").contains("overloaded_error"),
+                    "unexpected error: {err:?}"
+                );
+            })
+            .await;
+
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// With another candidate available, the stream-failed entry is skipped
+    /// unless the adapter recorded a transport connect failure; the
+    /// recovery request goes to the next entry instead.
+    #[tokio::test]
+    async fn multi_candidate_stream_failure_skips_failed_entry() {
+        let first_chat_calls = Arc::new(AtomicUsize::new(0));
+        let second_chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "first".into(),
+                    Box::new(StreamErrorNoChatReplayMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&first_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "second".into(),
+                    Box::new(StreamErrorNoChatReplayMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&second_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let resp = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect("second candidate recovers");
+                assert_eq!(resp.text.as_deref(), Some("must not replay"));
+            })
+            .await;
+
+        assert_eq!(
+            first_chat_calls.load(Ordering::SeqCst),
+            0,
+            "failed entry must not be replayed when another candidate exists"
+        );
+        assert_eq!(second_chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn single_entry_stream_recovery_failure_errors_after_one_attempt() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "physical".into(),
+                Box::new(StreamThenChatErrorMock) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("stream error event").is_err());
+                let err = ProviderDispatch::from_ref(&provider)
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "served-model",
+                        None,
+                    )
+                    .await
+                    .expect_err("failed recovery must surface, not loop");
+                assert!(
+                    format!("{err:?}").contains("expected recovery failure"),
+                    "unexpected error: {err:?}"
+                );
+            })
+            .await;
+
+        // Stream + exactly one recovery attempt are both ledger-visible.
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 2);
+        assert_eq!(report.attempts()[0].provider_ref(), "physical");
+        assert_eq!(report.attempts()[1].provider_ref(), "physical");
+    }
+
+    #[tokio::test]
+    async fn streamed_refusal_skips_exact_candidate_and_bills_usage_once() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let refused_chat_calls = Arc::new(AtomicUsize::new(0));
+        let rescue_chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new(
+                    "refusing",
+                    "refusing.key",
+                    Box::new(StreamRefusalNoChatReplayMock {
+                        stream_calls: Arc::clone(&stream_calls),
+                        chat_calls: Arc::clone(&refused_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "rescue",
+                    "rescue.key",
+                    "rescue-alias",
+                    "rescue-model",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&rescue_chat_calls),
+                        fail_until_attempt: 0,
+                        response: "rescued",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+
+        let (response, notice) = crate::scope_safeguard_fallback(async {
+            let response = scope
+                .scope(async {
+                    let dispatcher = ProviderDispatch::from_ref(&provider);
+                    let mut stream = dispatcher.stream_chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "requested-model",
+                        None,
+                        StreamOptions::new(true),
+                    );
+                    let refusal = match stream.next().await.expect("refusal event") {
+                        Err(StreamError::ModelRefusal(refusal)) => *refusal,
+                        other => panic!("expected typed refusal, got {other:?}"),
+                    };
+                    assert_eq!(refusal.attempted_candidate.as_deref(), Some("refusing"));
+                    assert_eq!(refusal.attempted_candidate_index, Some(0));
+                    scope.record_stream_interruption_usage(
+                        refusal.usage.as_deref().expect("refusal usage").clone(),
+                    );
+
+                    dispatcher
+                        .chat_after_stream_refusal(
+                            ChatRequest {
+                                messages: &messages,
+                                tools: None,
+                                thinking: None,
+                            },
+                            "requested-model",
+                            None,
+                            refusal,
+                        )
+                        .await
+                })
+                .await;
+            (response, take_last_safeguard_fallback())
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("rescued"));
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(refused_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rescue_chat_calls.load(Ordering::SeqCst), 1);
+
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 2);
+        assert_eq!(report.attempts()[0].provider_ref(), "refusing.key");
+        assert_eq!(report.attempts()[1].provider_ref(), "rescue.key");
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                observed: Some(TokenUsage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(3),
+                    cached_input_tokens: Some(1),
+                    cache_creation_input_tokens: None,
+                })
+            }
+        ));
+        assert!(matches!(
+            report.attempts()[1].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Missing
+        ));
+
+        let notice = notice.expect("successful refusal recovery notice");
+        assert_eq!(notice.kind, SafeguardFallbackKind::ClientSide);
+        assert_eq!(notice.requested_model, "requested-model");
+        assert_eq!(notice.served_model, "rescue-model");
+        assert_eq!(notice.category.as_deref(), Some("private-safety-category"));
+    }
+
+    #[tokio::test]
+    async fn single_candidate_streamed_refusal_retains_typed_cause_and_usage() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![ReliableModelProviderEntry::new(
+                "refusing",
+                "refusing.key",
+                Box::new(StreamRefusalNoChatReplayMock {
+                    stream_calls: Arc::clone(&stream_calls),
+                    chat_calls: Arc::clone(&chat_calls),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+
+        let error = scope
+            .scope(async {
+                let dispatcher = ProviderDispatch::from_ref(&provider);
+                let mut stream = dispatcher.stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "requested-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                let refusal = match stream.next().await.expect("refusal event") {
+                    Err(StreamError::ModelRefusal(refusal)) => *refusal,
+                    other => panic!("expected typed refusal, got {other:?}"),
+                };
+                scope.record_stream_interruption_usage(
+                    refusal.usage.as_deref().expect("refusal usage").clone(),
+                );
+                dispatcher
+                    .chat_after_stream_refusal(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "requested-model",
+                        None,
+                        refusal,
+                    )
+                    .await
+                    .expect_err("the only physical candidate already refused")
+            })
+            .await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            chat_calls.load(Ordering::SeqCst),
+            0,
+            "refusal must not replay"
+        );
+        let refusal = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<AnthropicRefusalError>())
+            .expect("streamed refusal must remain the typed terminal cause");
+        assert_eq!(refusal.requested_model, "requested-model");
+        assert_eq!(refusal.category.as_deref(), Some("private-safety-category"));
+        assert!(matches!(
+            refusal.usage.as_deref(),
+            Some(TokenUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                cached_input_tokens: Some(1),
+                cache_creation_input_tokens: None,
+            })
+        ));
+        let rejected = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
+            .expect("refusal usage must survive the Reliable error boundary");
+        assert_eq!(rejected.usage.input_tokens, Some(7));
+        assert_eq!(rejected.usage.output_tokens, Some(3));
+        assert_eq!(rejected.usage.cached_input_tokens, Some(1));
+    }
+
+    #[tokio::test]
+    async fn unpolled_reliable_stream_creates_no_accounted_attempt() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(StreamingRecordMock::success(Arc::new(AtomicUsize::new(0))))
+                    as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let (_, accounting) = scope_reliable_call_accounting(async {
+            let stream = provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "served-model",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            drop(stream);
+        })
+        .await;
+
+        let (rejected, accepted) = accounting.into_parts();
+        assert!(rejected.is_empty());
+        assert!(accepted.is_none());
+    }
+
+    #[tokio::test]
+    async fn no_eligible_reliable_stream_candidate_creates_no_wrapper_attempt() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "non-streaming".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "unused",
+                    error: "unused",
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&provider).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    Some(0.0),
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.expect("synthetic error event").is_err());
+            })
+            .await;
+
+        assert!(scope.take().attempts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nested_reliable_stream_reports_only_the_inner_physical_leaf() {
+        let inner = ReliableModelProvider::new(
+            "inner",
+            vec![(
+                "inner.actual".into(),
+                Box::new(StreamingRecordMock::success(Arc::new(AtomicUsize::new(0))))
+                    as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let outer = ReliableModelProvider::new(
+            "outer",
+            vec![(
+                "outer.wrapper".into(),
+                Box::new(inner) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+
+        scope
+            .scope(async {
+                let mut stream = ProviderDispatch::from_ref(&outer).stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "served-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                let mut saw_final = false;
+                while let Some(event) = stream.next().await {
+                    saw_final |=
+                        matches!(event.expect("successful nested stream"), StreamEvent::Final);
+                }
+                assert!(saw_final, "the physical leaf must reach Final");
+            })
+            .await;
+
+        let report = scope.take();
+        assert_eq!(report.attempts().len(), 1);
+        let leaf = &report.attempts()[0];
+        assert_eq!(
+            (leaf.provider_ref(), leaf.model()),
+            ("inner.actual", "served-model")
+        );
+        assert!(matches!(
+            leaf.outcome(),
+            crate::dispatch::AttemptUsageOutcome::Missing
+        ));
+        let accepted = report
+            .accepted_route()
+            .expect("Final marks the inner physical route accepted");
+        assert_eq!(
+            (accepted.provider_ref(), accepted.model()),
+            ("inner.actual", "served-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_stream_recovery_permission_is_one_shot_and_exact() {
+        let provider = ReliableModelProvider::new("test", Vec::new(), 2, 1);
+        let zero_budget = ReliableModelProvider::new("test", Vec::new(), 0, 1);
+
+        scope_reliable_call_accounting(async {
+            activate_stream_recovery_after_first_poll(3, 4);
+            mark_stream_recovery_semantic_empty();
+
+            assert_eq!(provider.effective_retry_limit(3, 3, true), Some(2));
+            assert_eq!(provider.effective_retry_limit(2, 4, true), Some(2));
+            assert_eq!(provider.effective_retry_limit(3, 4, true), Some(0));
+            assert_eq!(provider.effective_retry_limit(3, 4, true), None);
+
+            activate_stream_recovery_after_first_poll(5, 6);
+            mark_stream_recovery_semantic_empty();
+            assert_eq!(zero_budget.effective_retry_limit(5, 6, true), None);
+            assert!(stream_recovery_was_semantic_empty());
+
+            // Single-candidate stream failure grants one non-stream recovery
+            // attempt even with zero budget; the marker is consumed one-shot.
+            // Uses a budgeted provider so consumption is observable: granted
+            // once as Some(0), then normal budget Some(2) afterwards.
+            activate_stream_recovery_after_first_poll(7, 8);
+            assert_eq!(provider.effective_retry_limit(7, 8, false), Some(0));
+            assert_eq!(provider.effective_retry_limit(7, 8, false), Some(2));
+
+            // Single-candidate + semantic-empty on the same entry merges into
+            // one single attempt (semantic-empty wins): granted once, then
+            // normal budget — never two recovery attempts.
+            activate_stream_recovery_after_first_poll(9, 10);
+            mark_stream_recovery_semantic_empty();
+            assert_eq!(provider.effective_retry_limit(9, 10, false), Some(0));
+            assert_eq!(provider.effective_retry_limit(9, 10, false), Some(2));
+            // Both grants are consumed: re-arming the same marker without a
+            // fresh permission must skip when another candidate exists.
+            activate_stream_recovery_after_first_poll(9, 10);
+            assert_eq!(provider.effective_retry_limit(9, 10, true), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn image_stream_recovery_permissions_merge_into_one_exact_attempt() {
+        for max_retries in [0, 2] {
+            for has_other_candidate in [false, true] {
+                let provider = ReliableModelProvider::new("test", Vec::new(), max_retries, 1);
+                scope_reliable_call_accounting(async {
+                    activate_stream_recovery_after_first_poll(3, 4);
+                    mark_stream_recovery_semantic_empty();
+                    permit_exact_image_recovery();
+
+                    // Other entries keep their normal budget and cannot consume
+                    // the recovery permissions belonging to the failed entry.
+                    assert_eq!(
+                        provider.effective_retry_limit(3, 3, true),
+                        Some(max_retries)
+                    );
+                    assert_eq!(
+                        provider.effective_retry_limit(2, 4, true),
+                        Some(max_retries)
+                    );
+                    assert_eq!(
+                        provider.effective_retry_limit(3, 4, has_other_candidate),
+                        Some(0)
+                    );
+                    assert_eq!(
+                        provider.effective_retry_limit(3, 4, has_other_candidate),
+                        if has_other_candidate {
+                            None
+                        } else {
+                            Some(max_retries)
+                        }
+                    );
+                    // Re-arming an identity must not resurrect either grant.
+                    activate_stream_recovery_after_first_poll(3, 4);
+                    assert_eq!(provider.effective_retry_limit(3, 4, true), None);
+                })
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_stream_recovery_skips_only_failed_entry_and_uses_later_candidate() {
+        let earlier_chat_calls = Arc::new(AtomicUsize::new(0));
+        let failed_stream_calls = Arc::new(AtomicUsize::new(0));
+        let failed_chat_calls = Arc::new(AtomicUsize::new(0));
+        let later_chat_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "earlier-no-stream".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&earlier_chat_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "earlier failure",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "duplicate-display".into(),
+                    Box::new(SemanticEmptyNoChatReplayMock {
+                        stream_calls: Arc::clone(&failed_stream_calls),
+                        chat_calls: Arc::clone(&failed_chat_calls),
+                        chat_result: SemanticRecoveryChatResult::Success,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "duplicate-display".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&later_chat_calls),
+                        fail_until_attempt: 0,
+                        response: "later response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                StreamEvent::TextDelta(chunk)
+                    if chunk.delta.is_empty()
+                        && chunk.reasoning.as_deref() == Some("reasoning only")
+            ));
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                StreamEvent::Final
+            ));
+            mark_stream_recovery_semantic_empty();
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("later response"));
+        assert_eq!(earlier_chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(later_chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn semantic_stream_recovery_is_bounded_for_empty_and_error_recovery() {
+        for chat_result in [
+            SemanticRecoveryChatResult::Empty,
+            SemanticRecoveryChatResult::Error,
+        ] {
+            let stream_calls = Arc::new(AtomicUsize::new(0));
+            let chat_calls = Arc::new(AtomicUsize::new(0));
+            let provider = ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".into(),
+                    Box::new(SemanticEmptyNoChatReplayMock {
+                        stream_calls: Arc::clone(&stream_calls),
+                        chat_calls: Arc::clone(&chat_calls),
+                        chat_result,
+                    }) as Box<dyn ModelProvider>,
+                )],
+                3,
+                1,
+            );
+            let messages = vec![ChatMessage::user("hello")];
+
+            let result = scope_reliable_call_accounting(async {
+                let mut stream = provider.stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                    StreamOptions::new(true),
+                );
+                assert!(stream.next().await.unwrap().is_ok());
+                assert!(matches!(
+                    stream.next().await.unwrap().unwrap(),
+                    StreamEvent::Final
+                ));
+                mark_stream_recovery_semantic_empty();
+                provider
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "test",
+                        Some(0.0),
+                    )
+                    .await
+            })
+            .await
+            .0;
+
+            assert!(result.is_err());
+            assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(chat_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_semantic_stream_recovery_advances_to_fallback_budget() {
+        let failed_chat_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "failed".into(),
+                    Box::new(SemanticEmptyNoChatReplayMock {
+                        stream_calls: Arc::new(AtomicUsize::new(0)),
+                        chat_calls: Arc::clone(&failed_chat_calls),
+                        chat_result: SemanticRecoveryChatResult::Error,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 1,
+                        response: "fallback response",
+                        error: "temporary fallback failure",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            3,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let response = scope_reliable_call_accounting(async {
+            let mut stream = provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            assert!(stream.next().await.unwrap().is_ok());
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                StreamEvent::Final
+            ));
+            mark_stream_recovery_semantic_empty();
+            provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await
+        .0
+        .expect("fallback should recover after one failed semantic recovery");
+
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(failed_chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn router_preserves_exact_stream_recovery_identity() {
+        let earlier_chat_calls = Arc::new(AtomicUsize::new(0));
+        let failed_stream_calls = Arc::new(AtomicUsize::new(0));
+        let failed_chat_calls = Arc::new(AtomicUsize::new(0));
+        let later_chat_calls = Arc::new(AtomicUsize::new(0));
+        let reliable = ReliableModelProvider::new(
+            "inner",
+            vec![
+                (
+                    "duplicate-display".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&earlier_chat_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "earlier failure",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "duplicate-display".into(),
+                    Box::new(StreamErrorNoChatReplayMock {
+                        stream_calls: Arc::clone(&failed_stream_calls),
+                        chat_calls: Arc::clone(&failed_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "duplicate-display".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&later_chat_calls),
+                        fail_until_attempt: 0,
+                        response: "later response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "router",
+            vec![(
+                "reliable".to_string(),
+                Box::new(reliable) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "route".to_string(),
+                Route {
+                    provider_name: "reliable".to_string(),
+                    model: "inner-model".to_string(),
+                },
+            )],
+            "inner-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = router.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:route",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            assert!(stream.next().await.unwrap().is_err());
+            router
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "hint:route",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("later response"));
+        assert_eq!(earlier_chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(later_chat_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_recovery_keeps_earlier_tool_stream_ineligible_entry_eligible() {
+        let earlier = Arc::new(StreamingToolEventMock::new(false));
+        let failed_stream_calls = Arc::new(AtomicUsize::new(0));
+        let failed_chat_calls = Arc::new(AtomicUsize::new(0));
+        let later_chat_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "earlier-no-tool-events".into(),
+                    Box::new(Arc::clone(&earlier)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "failed-tool-stream".into(),
+                    Box::new(StreamErrorNoChatReplayMock {
+                        stream_calls: Arc::clone(&failed_stream_calls),
+                        chat_calls: Arc::clone(&failed_chat_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "later".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&later_chat_calls),
+                        fail_until_attempt: 0,
+                        response: "later response",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "run shell",
+            serde_json::json!({"type": "object"}),
+        )];
+
+        let (response, _) = scope_reliable_call_accounting(async {
+            let mut stream = model_provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "test",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            assert!(stream.next().await.unwrap().is_err());
+            model_provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "test",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(response.unwrap().text.as_deref(), Some("ok"));
+        assert_eq!(earlier.stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(earlier.non_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(later_chat_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -5211,6 +13452,140 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn later_primary_success_clears_stale_fallback_attribution() {
+        scope_provider_fallback(async {
+            let primary_calls = Arc::new(AtomicUsize::new(0));
+            let backup_calls = Arc::new(AtomicUsize::new(0));
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "primary".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::clone(&primary_calls),
+                            fail_until_attempt: 1,
+                            response: "final primary response",
+                            error: "503 Service Unavailable",
+                        }),
+                    ),
+                    (
+                        "backup".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::clone(&backup_calls),
+                            fail_until_attempt: 0,
+                            response: "tool-call response",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                0,
+                1,
+            );
+
+            assert_eq!(
+                model_provider
+                    .simple_chat("first", "test-model", Some(0.0))
+                    .await
+                    .expect("fallback recovers the first request"),
+                "tool-call response"
+            );
+            assert_eq!(
+                model_provider
+                    .simple_chat("second", "test-model", Some(0.0))
+                    .await
+                    .expect("primary recovers for the second request"),
+                "final primary response"
+            );
+            assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+            assert!(
+                take_last_provider_fallback().is_none(),
+                "the final primary request must clear fallback attribution"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retry_on_same_candidate_does_not_record_fallback_info() {
+        scope_provider_fallback(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&calls),
+                        fail_until_attempt: 1,
+                        response: "recovered on retry",
+                        error: "503 Service Unavailable",
+                    }),
+                )],
+                1,
+                1,
+            );
+
+            let response = model_provider
+                .simple_chat("hi", "test-model", Some(0.0))
+                .await
+                .expect("same candidate retry recovers");
+
+            assert_eq!(response, "recovered on retry");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(
+                take_last_provider_fallback().is_none(),
+                "retrying the exact candidate must not be reported as fallback"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn later_duplicate_candidate_records_fallback_info() {
+        scope_provider_fallback(async {
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "duplicate".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: usize::MAX,
+                            response: "unused",
+                            error: "503 Service Unavailable",
+                        }),
+                    ),
+                    (
+                        "duplicate".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 0,
+                            response: "recovered on later duplicate",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                0,
+                1,
+            );
+
+            let response = model_provider
+                .simple_chat("hi", "test-model", Some(0.0))
+                .await
+                .expect("later duplicate candidate recovers");
+
+            assert_eq!(response, "recovered on later duplicate");
+            let fallback = take_last_provider_fallback()
+                .expect("later configured candidate must be reported as fallback");
+            assert_eq!(fallback.requested_provider, "duplicate");
+            assert_eq!(fallback.actual_provider, "duplicate");
+            assert_eq!(fallback.requested_model, "test-model");
+            assert_eq!(fallback.actual_model, "test-model");
+        })
+        .await;
+    }
+
     // Vision must be safe for every provider the request can reach. Unlike
     // native tools, a fallback cannot recover after receiving an unsupported
     // image payload, so mixed chains report non-vision at the outer gate.
@@ -5305,6 +13680,135 @@ mod tests {
             0,
         );
         assert!(provider.supports_vision());
+    }
+
+    // `vision_limited_by` names the entry an error site should blame for a
+    // non-vision aggregate, so an operator debugging "does not support
+    // vision" sees which configured entry is actually responsible instead of
+    // always seeing the primary.
+    #[test]
+    fn vision_limited_by_names_the_non_vision_fallback() {
+        struct VisionMock(bool);
+
+        #[async_trait]
+        impl ModelProvider for VisionMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+
+            fn supports_vision(&self) -> bool {
+                self.0
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for VisionMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "VisionMock"
+            }
+        }
+
+        // Vision-capable primary, non-vision fallback: the fallback is named.
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "zai.default".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "lmstudio.default".into(),
+                    Box::new(VisionMock(false)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        assert_eq!(
+            provider.vision_limited_by("requested-model"),
+            Some("lmstudio.default".to_string()),
+            "the non-vision fallback entry must be named as the limiter"
+        );
+
+        // Routing may deliberately share cooldown state across distinct
+        // configured candidates. Diagnostics must name the candidate the
+        // operator configured, not the internal cooldown bucket it shares.
+        let provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new_with_candidate(
+                    "primary display",
+                    "shared-cooldown",
+                    "zai.primary",
+                    Box::new(VisionMock(true)),
+                ),
+                ReliableModelProviderEntry::new_with_candidate(
+                    "fallback display",
+                    "shared-cooldown",
+                    "lmstudio.fallback",
+                    Box::new(VisionMock(false)),
+                ),
+            ],
+            0,
+            0,
+        );
+        assert_eq!(
+            provider.vision_limited_by("requested-model"),
+            Some("lmstudio.fallback".to_string()),
+            "the configured candidate identity must not be replaced by its cooldown bucket"
+        );
+
+        // Every entry supports vision: nothing limits it.
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "zai.default".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "lmstudio.default".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        assert_eq!(
+            provider.vision_limited_by("requested-model"),
+            None,
+            "an all-vision chain has no limiter to name"
+        );
+
+        // Non-vision primary with no fallback to blame: `None`, not the
+        // primary's own name, so the caller keeps the ordinary
+        // "this model_provider" wording instead of mislabeling the primary
+        // as a fallback.
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "lmstudio.default".into(),
+                Box::new(VisionMock(false)) as Box<dyn ModelProvider>,
+            )],
+            0,
+            0,
+        );
+        assert_eq!(
+            provider.vision_limited_by("requested-model"),
+            None,
+            "a lone non-vision primary must not be reported as a fallback"
+        );
     }
 
     #[tokio::test]

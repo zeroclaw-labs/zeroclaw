@@ -8,6 +8,31 @@ use std::sync::LazyLock;
 const PREFIX: &str = "ZEROCLAW_";
 const SEP: &str = "__";
 
+/// `[todotracker]` was a daemon schema section in v0.8.3 only; TodoWrite
+/// display config now lives in ZeroCode's `zerocode-config.toml`. Removing the
+/// schema section would make these previously valid env vars unresolved, and
+/// an unresolved path is a hard error — so a working deployment would stop
+/// starting after an upgrade. Recognized legacy fields are therefore accepted
+/// and ignored (with a migration warning) instead of failing startup.
+///
+/// This is an exact allowlist: an unknown `ZEROCLAW_todotracker__*` field is
+/// still a hard error, so genuine typos keep surfacing.
+const LEGACY_TODOTRACKER_FIELDS: [&str; 5] = [
+    "enabled",
+    "enabled_at_start",
+    "location",
+    "width",
+    "max_height",
+];
+
+/// True when `tail` names a recognized legacy `[todotracker]` field that must
+/// no longer block daemon startup.
+fn is_recognized_legacy_todotracker(tail: &str) -> bool {
+    tail.strip_prefix("todotracker")
+        .and_then(|rest| rest.strip_prefix(SEP))
+        .is_some_and(|field| LEGACY_TODOTRACKER_FIELDS.contains(&field))
+}
+
 static NON_OVERRIDABLE_PATHS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| HashSet::from(["schema_version"]));
 
@@ -37,6 +62,20 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
     let mut paths: HashSet<String> = HashSet::with_capacity(entries.len());
     let mut snapshots: HashMap<String, String> = HashMap::with_capacity(entries.len());
     for (env_name, value, tail) in entries {
+        // Recognized legacy `[todotracker]` vars are accepted and ignored so an
+        // upgrade cannot turn a previously working deployment into a daemon
+        // that refuses to start. The value has no effect: TodoWrite display is
+        // now owned by ZeroCode's `zerocode-config.toml`.
+        if is_recognized_legacy_todotracker(&tail) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"env_var": env_name})),
+                "ignoring removed [todotracker] env override; move this setting into zerocode-config.toml"
+            );
+            continue;
+        }
         let path = resolve_path(&tail, config)
             .with_context(|| format!("{env_name} did not resolve to a schema path"))?;
         if NON_OVERRIDABLE_PATHS.contains(path.as_str()) {
@@ -175,7 +214,10 @@ pub(crate) fn raw_value_for_path(source: &Config, path: &str) -> Option<String> 
     }
     Some(match current {
         toml::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        // `set_prop` accepts raw strings for scalar fields, but structured
+        // fields must be restored in the same JSON grammar used by the
+        // override setter. TOML inline tables are not valid input there.
+        other => serde_json::to_string(other).ok()?,
     })
 }
 
@@ -184,15 +226,9 @@ pub fn mask_env_overrides_for_save(
     snapshots: &HashMap<String, String>,
 ) -> Result<()> {
     for (path, value) in snapshots {
-        if let Err(err) = config_to_save.set_prop(path, value) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{}", err)})),
-                "Save-mask reset failed; field retains default"
-            );
-        }
+        config_to_save
+            .set_prop(path, value)
+            .with_context(|| format!("failed to restore env-overridden path {path} before save"))?;
     }
     Ok(())
 }
@@ -206,7 +242,8 @@ pub(crate) async fn env_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::Config;
+    use crate::multi_agent::MemoryGrant;
+    use crate::schema::{AliasedAgentConfig, Config};
 
     struct EnvVarGuard(&'static str);
     impl EnvVarGuard {
@@ -254,6 +291,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walker_resolves_grok_cli_stdout_limit() {
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__grok_cli__default__max_acp_stdout_bytes",
+            "8388608",
+        );
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(
+            applied
+                .paths
+                .contains("providers.models.grok_cli.default.max_acp_stdout_bytes"),
+        );
+        assert_eq!(
+            config
+                .providers
+                .models
+                .grok_cli
+                .get("default")
+                .and_then(|entry| entry.max_acp_stdout_bytes),
+            Some(8_388_608)
+        );
+    }
+
+    #[tokio::test]
     async fn walker_accepts_alias_with_underscore() {
         let _guard = super::env_test_lock().await;
         let _v1 = EnvVarGuard::set(
@@ -288,6 +352,35 @@ mod tests {
         assert_eq!(
             entry.base.model.as_deref(),
             Some("anthropic/claude-sonnet-4-6"),
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_preserves_legacy_memory_grant_input_and_mixed_json() {
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(
+            "ZEROCLAW_agents__alpha__workspace__read_memory_from",
+            r#"["beta", {"agent":"gamma", "categories":["facts"]}]"#,
+        );
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("alpha".into(), AliasedAgentConfig::default());
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(
+            applied
+                .paths
+                .contains("agents.alpha.workspace.read_memory_from")
+        );
+        let grants = &config.agents["alpha"].workspace.read_memory_from;
+        assert_eq!(grants.len(), 2);
+        assert!(matches!(grants[0], MemoryGrant::Agent(_)));
+        assert_eq!(grants[1].as_str(), "gamma");
+        assert_eq!(
+            grants[1].categories(),
+            Some(["facts".to_string()].as_slice())
         );
     }
 
@@ -422,6 +515,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mask_restores_structured_memory_grant_snapshot() {
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(
+            "ZEROCLAW_agents__alpha__workspace__read_memory_from",
+            "beta",
+        );
+
+        let mut config = Config::default();
+        for alias in ["alpha", "beta", "gamma"] {
+            config
+                .agents
+                .insert(alias.to_string(), AliasedAgentConfig::default());
+        }
+        config
+            .agents
+            .get_mut("alpha")
+            .expect("alpha agent")
+            .workspace
+            .read_memory_from = vec![MemoryGrant::Scoped {
+            agent: crate::multi_agent::AgentAlias::new("gamma"),
+            categories: Some(vec!["facts".to_string()]),
+        }];
+
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        let path = "agents.alpha.workspace.read_memory_from";
+        assert!(applied.snapshots[path].starts_with('['));
+
+        let mut to_save = config.clone();
+        mask_env_overrides_for_save(&mut to_save, &applied.snapshots)
+            .expect("structured snapshot restores");
+        assert_eq!(
+            to_save.agents["alpha"].workspace.read_memory_from,
+            vec![MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("gamma"),
+                categories: Some(vec!["facts".to_string()]),
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn schema_version_override_rejected() {
         let _guard = super::env_test_lock().await;
         let _v = EnvVarGuard::set("ZEROCLAW_schema_version", "99");
@@ -433,5 +566,60 @@ mod tests {
             msg.contains("schema_version") && msg.contains("not overridable"),
             "error must name the path and the reason: {msg}",
         );
+    }
+    // ── Legacy `[todotracker]` compatibility ────────────────────────────────
+    //
+    // The section moved out of the daemon schema into ZeroCode's
+    // `zerocode-config.toml`. Recognized legacy env vars must not become
+    // unresolved paths, because an unresolved path is fatal and would stop a
+    // previously working daemon from starting after an upgrade.
+
+    #[tokio::test]
+    async fn recognized_legacy_todotracker_env_does_not_block_startup() {
+        let _guard = super::env_test_lock().await;
+        let _a = EnvVarGuard::set("ZEROCLAW_todotracker__enabled", "false");
+        let _b = EnvVarGuard::set("ZEROCLAW_todotracker__enabled_at_start", "true");
+        let _c = EnvVarGuard::set("ZEROCLAW_todotracker__location", "left");
+        let _d = EnvVarGuard::set("ZEROCLAW_todotracker__width", "40");
+        let _e = EnvVarGuard::set("ZEROCLAW_todotracker__max_height", "8");
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config)
+            .expect("recognized legacy todotracker vars must not fail daemon startup");
+
+        // Accepted-and-ignored: no schema path is touched by these vars.
+        assert!(
+            !applied.paths.iter().any(|p| p.starts_with("todotracker")),
+            "legacy vars must not resolve to a schema path: {:?}",
+            applied.paths,
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_legacy_todotracker_field_still_errors() {
+        let _guard = super::env_test_lock().await;
+        // Not on the exact allowlist: a typo must still surface loudly rather
+        // than being silently swallowed by the compatibility shim.
+        let _v = EnvVarGuard::set("ZEROCLAW_todotracker__wdith", "40");
+
+        let mut config = Config::default();
+        let err = apply_env_overrides(&mut config).expect_err("unknown field must hard-error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ZEROCLAW_todotracker__wdith") && msg.contains("did not resolve"),
+            "error must name the env var and the failure: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_shim_does_not_shadow_other_sections() {
+        let _guard = super::env_test_lock().await;
+        // A section that merely *starts with* the legacy name must not be
+        // captured by the allowlist prefix check.
+        let _v = EnvVarGuard::set("ZEROCLAW_todotracker_extra__enabled", "false");
+
+        let mut config = Config::default();
+        let err = apply_env_overrides(&mut config).expect_err("must hard-error");
+        assert!(format!("{err:#}").contains("did not resolve"));
     }
 }

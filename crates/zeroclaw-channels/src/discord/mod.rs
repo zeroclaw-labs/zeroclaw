@@ -13,7 +13,9 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelGatePrompt, ChannelMessage,
     GateChoiceEmphasis, SendMessage,
 };
-use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_api::media::{
+    MarkerKind, MediaAttachment, RenderedMarker, provider_loadable_image_mime_for,
+};
 use zeroclaw_runtime::i18n;
 
 // Contract tier: `embed` holds the embed value object that `types`'
@@ -106,13 +108,17 @@ pub struct DiscordChannel {
     multi_message_delay_ms: u64,
     /// Per-channel rate-limit tracking for draft edits.
     last_draft_edit: Mutex<HashMap<String, std::time::Instant>>,
-    /// Tracks how much text has been sent in MultiMessage mode.
-    multi_message_sent_len: Mutex<HashMap<String, usize>>,
+    /// Exact confirmed-delivered frame prefix per recipient in MultiMessage
+    /// mode. The confirmed byte offset is derived as `prefix.len()`; keeping
+    /// the bytes themselves (not just a count) lets `update_draft` detect and
+    /// remap the offset when a later sanitizer pass rewrites the frame before
+    /// it (see [`crate::orchestrator::remap_confirmed_offset`]).
+    multi_message_confirmed_prefix: Mutex<HashMap<String, String>>,
     /// Thread context captured from `send_draft()` for MultiMessage paragraph delivery.
     multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
     /// Stall-watchdog timeout in seconds (0 = disabled).
     stall_timeout_secs: u64,
-    pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<AsyncMutex<HashMap<String, crate::util::PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -180,7 +186,7 @@ impl DiscordChannel {
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             last_draft_edit: Mutex::new(HashMap::new()),
-            multi_message_sent_len: Mutex::new(HashMap::new()),
+            multi_message_confirmed_prefix: Mutex::new(HashMap::new()),
             multi_message_thread_ts: Mutex::new(HashMap::new()),
             stall_timeout_secs: 0,
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -268,30 +274,47 @@ impl DiscordChannel {
         self
     }
 
-    /// Configure voice transcription for audio attachments.
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
         }
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn process_attachments_for_test(
+        &self,
+        attachments: &[serde_json::Value],
+        client: &reqwest::Client,
+    ) -> (String, Vec<MediaAttachment>) {
+        process_attachments(
+            attachments,
+            client,
+            self.workspace_dir.as_deref(),
+            self.transcription_manager.as_deref(),
+        )
+        .await
     }
 
     /// Configure streaming mode for progressive draft updates or multi-message delivery.
@@ -760,6 +783,47 @@ impl DiscordChannel {
         crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
     }
 
+    fn canonical_approval_destination(recipient: &str) -> String {
+        recipient.split(':').next().unwrap_or(recipient).to_string()
+    }
+
+    async fn take_authorized_component(
+        components: &parking_lot::Mutex<pending::PendingComponents>,
+        approvals: &AsyncMutex<HashMap<String, crate::util::PendingApproval>>,
+        custom_id: &str,
+        destination: &str,
+    ) -> Option<ComponentIntent> {
+        let destination = Self::canonical_approval_destination(destination);
+        // Acquire the async lock first so no synchronous guard crosses an await.
+        // Checking and consuming the intent stays atomic for every component kind.
+        let approvals = approvals.lock().await;
+        components.lock().take_if(custom_id, |intent| match intent {
+            ComponentIntent::Approval { token, .. } => approvals.get(token).is_none_or(|pending| {
+                !destination.is_empty() && pending.destination == destination
+            }),
+            _ => true,
+        })
+    }
+
+    async fn resolve_approval_reply(
+        &self,
+        content: &str,
+        responder: &str,
+        destination: &str,
+    ) -> Option<crate::util::PendingApprovalResolution> {
+        let (token, response) = crate::util::parse_approval_reply(content)?;
+        Some(
+            crate::util::resolve_pending_approval(
+                &self.pending_approvals,
+                &token,
+                response,
+                self.is_user_allowed(responder),
+                &Self::canonical_approval_destination(destination),
+            )
+            .await,
+        )
+    }
+
     fn bot_user_id_from_token(token: &str) -> Option<String> {
         // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
@@ -811,6 +875,7 @@ impl DiscordChannel {
             token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
         self.send(&SendMessage::new(text, channel_id)).await
     }
@@ -840,12 +905,10 @@ impl DiscordChannel {
             }
         }
 
-        let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
-        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
-        let args_label = i18n::get_required_cli_string("channel-approval-args-label");
-        let text = format!(
-            "{heading}\n{tool_label}: {}\n{args_label}: {}",
-            request.tool_name, request.arguments_summary,
+        let text = build_buttoned_approval_text(
+            &request.tool_name,
+            &request.arguments_summary,
+            request.position_counter(),
         );
         let outgoing = DiscordOutgoing::with_components(text, vec![row]);
         let client = self.http_client();
@@ -866,6 +929,27 @@ impl DiscordChannel {
         let mut reg = self.pending_components.lock();
         build_component_rows(nonce, rows, &mut reg)
     }
+}
+
+/// Card text for the buttoned approval message.
+///
+/// Split out from the send so the rendered string can be asserted directly:
+/// the buttoned path builds its own text rather than going through
+/// [`crate::util::build_yesno_approval_prompt`], because the operator taps a
+/// control instead of echoing a token.
+fn build_buttoned_approval_text(
+    tool_name: &str,
+    arguments_summary: &str,
+    position: Option<(u32, u32)>,
+) -> String {
+    let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
+    let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+    let args_label = i18n::get_required_cli_string("channel-approval-args-label");
+    // Two pending cards from one turn are otherwise identical until tapped.
+    let position_line = crate::util::approval_position_line(position);
+    format!(
+        "{heading}\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"
+    )
 }
 
 fn build_component_rows(
@@ -1220,8 +1304,6 @@ async fn process_attachments(
             downloaded_audio_bytes = Some(bytes);
         }
 
-        let marker_kind = marker_kind_for(ct, is_audio);
-
         let bytes = match downloaded_audio_bytes {
             Some(b) => b,
             None => match download_attachment_bytes(client, url, name).await {
@@ -1230,17 +1312,23 @@ async fn process_attachments(
             },
         };
 
-        let marker_target = match workspace_dir {
+        // Decide the disposition from the bytes we now hold, so the same
+        // provider-loadability contract Telegram uses applies here: an image
+        // the loader cannot reload (HEIC/TIFF/SVG/BMP) renders as a document
+        // rather than an image the shared pipeline would try to re-inline.
+        let marker_kind = marker_kind_for(ct, name, &bytes, is_audio);
+        let marker_label = discord_marker_label(marker_kind);
+        let (marker_target, saved_locally) = match workspace_dir {
             Some(dir) => match save_attachment_bytes_to_workspace(dir, name, &bytes).await {
-                Ok(local_path) => local_path.display().to_string(),
+                Ok(local_path) => (local_path.display().to_string(), true),
                 Err(e) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": marker_kind, "error": format!("{}", e)})), "attachment save failed, falling back to url");
-                    url.to_string()
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": marker_label, "error": format!("{}", e)})), "attachment save failed, falling back to url");
+                    (url.to_string(), false)
                 }
             },
-            None => url.to_string(),
+            None => (url.to_string(), false),
         };
-        text_parts.push(format!("[{marker_kind}:{marker_target}]"));
+        text_parts.push(format!("[{marker_label}:{marker_target}]"));
 
         media.push(MediaAttachment {
             file_name: name.to_string(),
@@ -1250,6 +1338,18 @@ async fn process_attachments(
             } else {
                 Some(ct.to_string())
             },
+            // Record the exact rendered target for image URL fallbacks too.
+            // They are deliberately not treated as channel-owned by the
+            // shared pipeline: the raw bytes are available and can replace
+            // the URL without relying on remote fetching. The saved name
+            // carries a uniqueness prefix, so `file_name` alone cannot
+            // identify the marker just rendered above — record the target and
+            // disposition so a later stage reads the verdict rather than
+            // re-deciding it from the payload.
+            marker: (saved_locally || marker_kind == MarkerKind::Image).then(|| RenderedMarker {
+                target: marker_target.clone(),
+                kind: marker_kind,
+            }),
         });
     }
 
@@ -1338,19 +1438,40 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
     false
 }
 
-/// Map a Discord attachment's content type plus audio-detection result to
-/// the canonical outbound marker kind. Pulled out of `process_attachments`
-/// so the MIME-to-marker dispatch can be unit-tested without a live HTTP
+/// Map a Discord attachment's content type, name, and bytes plus its
+/// audio-detection result to the canonical outbound marker kind. Pulled out of
+/// `process_attachments` so the dispatch can be unit-tested without a live HTTP
 /// download.
-fn marker_kind_for(content_type: &str, is_audio: bool) -> &'static str {
+///
+/// An `image/*` content type is only an [`MarkerKind::Image`] when the provider
+/// loader would actually accept the format; the same HEIC/TIFF/SVG/BMP the
+/// Telegram path keeps out of `[IMAGE:]` markers render as documents here too,
+/// so the shared pipeline never reclassifies them into an `[IMAGE:data:...]`
+/// copy the provider rejects.
+fn marker_kind_for(content_type: &str, file_name: &str, data: &[u8], is_audio: bool) -> MarkerKind {
     if content_type.starts_with("image/") {
-        "IMAGE"
+        if provider_loadable_image_mime_for(file_name, data).is_some() {
+            MarkerKind::Image
+        } else {
+            MarkerKind::Document
+        }
     } else if is_audio {
-        "AUDIO"
+        MarkerKind::Audio
     } else if content_type.starts_with("video/") {
-        "VIDEO"
+        MarkerKind::Video
     } else {
-        "DOCUMENT"
+        MarkerKind::Document
+    }
+}
+
+/// The uppercase `[KIND:target]` label Discord renders for a disposition. The
+/// label format is Discord's own; `MarkerKind` stays channel-agnostic.
+fn discord_marker_label(kind: MarkerKind) -> &'static str {
+    match kind {
+        MarkerKind::Image => "IMAGE",
+        MarkerKind::Audio => "AUDIO",
+        MarkerKind::Video => "VIDEO",
+        MarkerKind::Document => "DOCUMENT",
     }
 }
 
@@ -2803,23 +2924,30 @@ impl Channel for DiscordChannel {
                                             return;
                                         }
 
-                                        // Single-use: drain the intent bound to
-                                        // this custom_id. The `take` runs ONLY
-                                        // after the fail-closed gate above, so an
-                                        // unauthorized click never drains an
-                                        // entry. Absent/expired/replayed (incl. a
-                                         // forged-but-zc1 id we never registered)
-                                         // → refuse, don't act.
-                                        let intent = pending_components.lock().take(&custom_id_raw);
+                                        // Wrong-destination clicks retain the button;
+                                        // every accepted intent is consumed exactly once.
+                                        let intent = Self::take_authorized_component(
+                                            &pending_components,
+                                            &pending_approvals,
+                                            &custom_id_raw,
+                                            &interaction_channel,
+                                        ).await;
                                         let prompt = match intent {
                                             Some(ComponentIntent::Approval { token, decision }) => {
-                                                let resolved = {
-                                                    let mut guard = pending_approvals.lock().await;
-                                                    approval::resolve_parked_approval(
-                                                        &mut guard, &token, decision,
-                                                    )
-                                                };
-                                                let key = if resolved {
+                                                let resolution = crate::util::resolve_pending_approval(
+                                                    &pending_approvals,
+                                                    &token,
+                                                    decision.response(),
+                                                    true,
+                                                    &Self::canonical_approval_destination(
+                                                        &interaction_channel,
+                                                    ),
+                                                )
+                                                .await;
+                                                let key = if matches!(
+                                                    resolution,
+                                                    crate::util::PendingApprovalResolution::Resolved
+                                                ) {
                                                     "channel-discord-approval-recorded"
                                                 } else {
                                                     "channel-discord-component-expired"
@@ -3209,23 +3337,25 @@ impl Channel for DiscordChannel {
                         format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
                     };
 
-                    // Intercept approval replies before forwarding to the agent.
-                    if let Some((token, response)) =
-                        crate::util::parse_approval_reply(&final_content)
-                    {
-                        let mut map = self.pending_approvals.lock().await;
-                        if let Some(sender) = map.remove(&token) {
-                            let _ = sender.send(response);
-                            continue;
-                        }
-                    }
-
-                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let channel_id = d
                         .get("channel_id")
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
+
+                    // Intercept approval replies before forwarding to the agent.
+                    if let Some(resolution) = self
+                        .resolve_approval_reply(&final_content, author_id, &channel_id)
+                        .await
+                        && !matches!(
+                            resolution,
+                            crate::util::PendingApprovalResolution::NotFound
+                        )
+                    {
+                        continue;
+                    }
+
+                    let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
 
                     if !message_id.is_empty() && !channel_id.is_empty() {
                         let reaction_channel = DiscordChannel::new(
@@ -3353,7 +3483,11 @@ impl Channel for DiscordChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode != zeroclaw_config::schema::StreamMode::Off
+        matches!(
+            self.stream_mode,
+            zeroclaw_config::schema::StreamMode::Partial
+                | zeroclaw_config::schema::StreamMode::MultiMessage
+        )
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
@@ -3362,6 +3496,16 @@ impl Channel for DiscordChannel {
 
     fn multi_message_delay_ms(&self) -> u64 {
         self.multi_message_delay_ms
+    }
+
+    async fn multi_message_confirmed_offset(&self, recipient: &str, _message_id: &str) -> usize {
+        if self.stream_mode != zeroclaw_config::schema::StreamMode::MultiMessage {
+            return 0;
+        }
+        self.multi_message_confirmed_prefix
+            .lock()
+            .get(recipient)
+            .map_or(0, String::len)
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
@@ -3399,7 +3543,7 @@ impl Channel for DiscordChannel {
             StreamMode::MultiMessage => {
                 // No initial draft — paragraphs are sent as new messages.
                 // Store thread context for paragraph delivery.
-                self.multi_message_sent_len.lock().clear();
+                self.multi_message_confirmed_prefix.lock().clear();
                 self.multi_message_thread_ts
                     .lock()
                     .insert(message.recipient.clone(), message.thread_ts.clone());
@@ -3482,30 +3626,42 @@ impl Channel for DiscordChannel {
             StreamMode::MultiMessage => {
                 // Track accumulated text and send new paragraphs at \n\n boundaries.
                 // Extract paragraph (if any) under the lock, then drop it before async work.
-                let (paragraph, thread_ts) = {
+                let (paragraph, sent_so_far, consumed, thread_ts) = {
                     let thread_ts = self
                         .multi_message_thread_ts
                         .lock()
                         .get(recipient)
                         .cloned()
                         .flatten();
-                    let mut sent_map = self.multi_message_sent_len.lock();
-                    let sent_so_far = sent_map.get(recipient).copied().unwrap_or(0);
-
-                    // DraftEvent::Clear resets accumulated text — reset our counter.
-                    if text.len() < sent_so_far {
-                        sent_map.insert(recipient.to_string(), 0);
-                        return Ok(());
-                    }
+                    let mut sent_map = self.multi_message_confirmed_prefix.lock();
+                    let confirmed = sent_map.get(recipient).map_or("", String::as_str);
+                    let sent_so_far = if text.as_bytes().starts_with(confirmed.as_bytes()) {
+                        confirmed.len()
+                    } else {
+                        // The frame no longer starts with the confirmed bytes:
+                        // either a later sanitizer pass (e.g. a redaction span
+                        // completing on this delta) rewrote text before the
+                        // confirmed offset, or a DraftEvent::Clear restarted
+                        // the accumulation. Remap the offset onto the new
+                        // frame before slicing anything with it; a restart
+                        // remaps to 0.
+                        let remapped = crate::orchestrator::remap_confirmed_offset(confirmed, text);
+                        sent_map.insert(recipient.to_string(), text[..remapped].to_string());
+                        remapped
+                    };
                     if text.len() == sent_so_far {
                         return Ok(());
                     }
 
+                    // `sent_so_far` is a byte-verified prefix of `text` (or a
+                    // remap result on a `\n\n` boundary), so this slice cannot
+                    // split a UTF-8 character.
                     let new_text = &text[sent_so_far..];
                     let mut scan_pos = 0;
                     let mut in_fence = false;
                     let bytes = new_text.as_bytes();
                     let mut found_paragraph = None;
+                    let mut consumed = 0;
 
                     while scan_pos < bytes.len() {
                         let ch = bytes[scan_pos];
@@ -3525,8 +3681,7 @@ impl Channel for DiscordChannel {
                             && bytes[scan_pos + 1] == b'\n'
                         {
                             let paragraph = new_text[..scan_pos].trim().to_string();
-                            let consumed = scan_pos + 2;
-                            *sent_map.entry(recipient.to_string()).or_insert(0) += consumed;
+                            consumed = scan_pos + 2;
                             if !paragraph.is_empty() {
                                 found_paragraph = Some(paragraph);
                             }
@@ -3536,28 +3691,36 @@ impl Channel for DiscordChannel {
                         scan_pos += 1;
                     }
                     // Lock is dropped here at end of block.
-                    (found_paragraph, thread_ts)
+                    (found_paragraph, sent_so_far, consumed, thread_ts)
                 };
 
                 if let Some(paragraph) = paragraph {
                     let msg = SendMessage::new(&paragraph, recipient).in_thread(thread_ts.clone());
-                    if let Err(e) = self.send(&msg).await {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "multi-message paragraph send failed"
-                        );
-                    }
+                    self.send(&msg).await?;
+                    // Advance only after the transport confirms delivery. A
+                    // failed paragraph remains in the buffer for finalization.
+                    self.multi_message_confirmed_prefix.lock().insert(
+                        recipient.to_string(),
+                        text[..sent_so_far + consumed].to_string(),
+                    );
                     if self.multi_message_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             self.multi_message_delay_ms,
                         ))
                         .await;
                     }
+                    // Recurse to handle remaining text.
+                    return self.update_draft(recipient, message_id, text).await;
+                } else if consumed > 0 {
+                    // An empty paragraph has no transport content, so there is
+                    // no send to confirm: its delimiter advances the confirmed
+                    // coordinate immediately. Without this the scanner would
+                    // rediscover the same empty paragraph on every frame and
+                    // never reach the text behind it.
+                    self.multi_message_confirmed_prefix.lock().insert(
+                        recipient.to_string(),
+                        text[..sent_so_far + consumed].to_string(),
+                    );
                     // Recurse to handle remaining text.
                     return self.update_draft(recipient, message_id, text).await;
                 }
@@ -3581,26 +3744,24 @@ impl Channel for DiscordChannel {
                 .lock()
                 .remove(recipient)
                 .flatten();
-            let sent_so_far = self
-                .multi_message_sent_len
+            let confirmed = self
+                .multi_message_confirmed_prefix
                 .lock()
                 .remove(recipient)
-                .unwrap_or(0);
+                .unwrap_or_default();
+            // The reconciled final text is built to preserve the confirmed
+            // prefix byte-for-byte; remap defensively so a divergent frame
+            // degrades to re-sending whole paragraphs, never a corrupt slice.
+            let sent_so_far = if text.as_bytes().starts_with(confirmed.as_bytes()) {
+                confirmed.len()
+            } else {
+                crate::orchestrator::remap_confirmed_offset(&confirmed, text)
+            };
             if text.len() > sent_so_far {
                 let remaining = text[sent_so_far..].trim().to_string();
                 if !remaining.is_empty() {
                     let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
-                    if let Err(e) = self.send(&msg).await {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "multi-message final flush failed"
-                        );
-                    }
+                    self.send(&msg).await?;
                 }
             }
             return Ok(());
@@ -3744,7 +3905,7 @@ impl Channel for DiscordChannel {
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
         if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
-            self.multi_message_sent_len.lock().remove(recipient);
+            self.multi_message_confirmed_prefix.lock().remove(recipient);
             self.multi_message_thread_ts.lock().remove(recipient);
             return Ok(());
         }
@@ -3859,10 +4020,18 @@ impl Channel for DiscordChannel {
         let token = crate::util::new_approval_token();
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: Self::canonical_approval_destination(recipient),
+                tool_name: request.tool_name.clone(),
+            },
+        );
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            token.clone(),
+        );
 
         // Strip thread suffix — approval message goes to the channel root.
         let channel_id = recipient.split(':').next().unwrap_or(recipient);
@@ -3875,7 +4044,7 @@ impl Channel for DiscordChannel {
                 .await
         };
         if let Err(err) = emitted {
-            self.pending_approvals.lock().await.remove(&token);
+            guard.remove().await;
             return Err(err);
         }
 
@@ -3885,17 +4054,20 @@ impl Channel for DiscordChannel {
         // report it to the model as an operator's refusal.
         let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                Ok(Ok(resp)) => {
+                    guard.disarm();
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                }
                 Ok(Err(_)) => {
                     // Sender dropped: the gateway task went away without a click.
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::Unreachable,
                     )
                 }
                 Err(_) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    guard.remove().await;
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::TimedOut,
@@ -4227,6 +4399,298 @@ mod tests {
         );
     }
 
+    /// Discord saves attachments under a uniqueness-prefixed name while the
+    /// envelope keeps the sender's name, so the marker target and the file
+    /// name never match. Driving the real `process_attachments` through the
+    /// real pipeline proves the two are joined by recorded provenance rather
+    /// than by name — a basename comparison sends this image twice.
+    #[tokio::test]
+    async fn saved_attachment_marker_joins_to_its_envelope_through_the_pipeline() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": format!("{}/attachments/1/photo.jpg", server.uri()),
+        })];
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        let saved = media[0]
+            .marker_target()
+            .expect("a saved attachment must record the target it rendered");
+        // The recorded target is a native filesystem path, so the separator is
+        // `\` on Windows and `/` elsewhere. Walk it as a `Path` instead of
+        // matching a `/`-joined substring, which only ever held on Unix — and
+        // which made the save-name check below compare the whole path.
+        let saved_path = std::path::Path::new(saved);
+        assert_eq!(
+            saved_path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|dir| dir.to_str()),
+            Some("discord_files"),
+            "expected a workspace save path, got: {saved}"
+        );
+        assert_ne!(
+            saved_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(saved),
+            media[0].file_name,
+            "the save name must differ from the sender name, or this test proves nothing"
+        );
+        assert!(
+            text.contains(&format!("[IMAGE:{saved}]")),
+            "rendered text must reference exactly the recorded target: {text}"
+        );
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert_eq!(
+            enriched, text,
+            "a Discord-saved image must not be inlined a second time"
+        );
+        assert!(
+            !enriched.contains("IMAGE:data:"),
+            "no base64 copy may be added alongside the path marker: {enriched}"
+        );
+    }
+
+    /// A Discord `image/heic` upload is not a format the provider loader
+    /// accepts. It must render as a document and keep that disposition through
+    /// the shared pipeline; before the loadability contract reached Discord,
+    /// the broader `image/*` classifier marked it channel-owned as an image,
+    /// the pipeline skipped the whole attachment, and the provider then
+    /// rejected the marker it could not reload — dropping the bytes entirely.
+    #[tokio::test]
+    async fn unloadable_image_upload_stays_a_document_through_the_pipeline() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.heic"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0x00, 0x01, 0x02, 0x03]))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.heic",
+            "content_type": "image/heic",
+            "url": format!("{}/attachments/1/photo.heic", server.uri()),
+        })];
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert_eq!(
+            media[0].marker.as_ref().map(|m| m.kind),
+            Some(MarkerKind::Document),
+            "an unloadable image must be owned as a document, not an image"
+        );
+        assert!(
+            text.contains("[DOCUMENT:") && !text.contains("[IMAGE:"),
+            "the unloadable image must render as a document marker: {text}"
+        );
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert_eq!(
+            enriched, text,
+            "a channel-owned document must not be reclassified and inlined as an image"
+        );
+        assert!(
+            !enriched.contains("IMAGE:data:"),
+            "no base64 image copy may be produced for an unloadable image: {enriched}"
+        );
+    }
+
+    /// With no workspace configured (or a failed save) the rendered target is
+    /// the attachment URL, which the default no-remote-image path will not
+    /// fetch. The typed envelope records that fallback as non-owned, so the
+    /// pipeline replaces the URL with inline data and provider preparation
+    /// sees one effective image reference without a false partial-load note.
+    /// A real 1x1 JPEG.
+    ///
+    /// Provider preparation now fully decodes image bytes rather than sniffing
+    /// their header, so a fixture that only carries the JPEG magic number is
+    /// rejected as corrupt. Tests that assert an image survives preparation
+    /// must serve bytes that actually decode.
+    fn valid_jpeg_bytes() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])))
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .expect("test JPEG encodes");
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn image_with_no_workspace_is_enriched_rather_than_dropped() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(valid_jpeg_bytes()))
+            .mount(&server)
+            .await;
+
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": format!("{}/attachments/1/photo.jpg", server.uri()),
+        })];
+
+        // No workspace: the marker target can only be the (non-reloadable) URL.
+        let (text, media) =
+            process_attachments(&attachments, &reqwest::Client::new(), None, None).await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert!(
+            media[0].marker_target().is_some(),
+            "a URL fallback must retain its exact channel marker target"
+        );
+        assert_eq!(
+            media[0].channel_rendered_remote_image_target(),
+            attachments[0]["url"].as_str(),
+            "the URL fallback must be exposed for exact replacement"
+        );
+        assert!(
+            !media[0].channel_rendered_owned_disposition(),
+            "a remote URL fallback must not be deferred by the shared pipeline"
+        );
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert!(
+            enriched.contains("IMAGE:data:"),
+            "the loadable image's bytes must reach the provider as inline data, not be dropped: {enriched}"
+        );
+
+        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+            &[zeroclaw_api::model_provider::ChatMessage::user(enriched)],
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("provider preparation should accept the inline fallback image");
+        assert!(prepared.contains_images);
+        let provider_content = &prepared.messages[0].content;
+        assert_eq!(
+            provider_content.matches("data:image/jpeg;base64,").count(),
+            1,
+            "provider preparation must receive one effective image: {provider_content}"
+        );
+        assert!(
+            !provider_content.contains("could not be loaded"),
+            "a successful inline fallback must not produce a partial-load note: {provider_content}"
+        );
+        assert!(
+            !provider_content.contains(attachments[0]["url"].as_str().unwrap()),
+            "the unfetchable URL must not survive beside the inline image: {provider_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_with_failed_workspace_save_is_enriched_rather_than_dropped() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/attachments/1/photo.jpg", server.uri());
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": url,
+        })];
+        // A regular file cannot contain the `discord_files` save directory,
+        // so this exercises the same URL fallback after download succeeds.
+        let blocked_workspace = tempfile::NamedTempFile::new().unwrap();
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(blocked_workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert_eq!(media[0].marker_target(), Some(url.as_str()));
+        assert_eq!(
+            media[0].channel_rendered_remote_image_target(),
+            Some(url.as_str())
+        );
+        assert!(!media[0].channel_rendered_owned_disposition());
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert!(enriched.contains("[IMAGE:data:image/jpeg;base64,"));
+        assert!(!enriched.contains(&url));
+    }
+
     #[tokio::test]
     async fn interaction_answer_over_2000_chars_chunks_into_edit_plus_followup() {
         use wiremock::matchers::{method, path};
@@ -4438,6 +4902,7 @@ mod tests {
             cancellation_token: None,
             attachments: Vec::new(),
             in_reply_to: None,
+            references: Vec::new(),
             force_voice: false,
             suppress_voice: false,
         };
@@ -6725,28 +7190,98 @@ mod tests {
 
     #[test]
     fn marker_kind_for_classifies_each_mime_family() {
-        assert_eq!(marker_kind_for("image/png", false), "IMAGE");
-        assert_eq!(marker_kind_for("image/jpeg", false), "IMAGE");
-        assert_eq!(marker_kind_for("video/mp4", false), "VIDEO");
-        assert_eq!(marker_kind_for("application/pdf", false), "DOCUMENT");
-        assert_eq!(marker_kind_for("application/zip", false), "DOCUMENT");
-        assert_eq!(marker_kind_for("", false), "DOCUMENT");
+        assert_eq!(
+            marker_kind_for("image/png", "photo.png", b"", false),
+            MarkerKind::Image
+        );
+        assert_eq!(
+            marker_kind_for("image/jpeg", "photo.jpg", b"", false),
+            MarkerKind::Image
+        );
+        assert_eq!(
+            marker_kind_for("video/mp4", "clip.mp4", b"", false),
+            MarkerKind::Video
+        );
+        assert_eq!(
+            marker_kind_for("application/pdf", "doc.pdf", b"", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("application/zip", "archive.zip", b"", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("", "blob", b"", false),
+            MarkerKind::Document
+        );
+    }
+
+    #[test]
+    fn marker_kind_for_demotes_an_unloadable_image_to_a_document() {
+        // The provider loader rejects HEIC/TIFF/SVG/BMP, so an `image/*`
+        // content type in one of those formats must render as a document
+        // rather than an image the shared pipeline would try to re-inline.
+        assert_eq!(
+            marker_kind_for("image/heic", "photo.heic", b"", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("image/tiff", "scan.tiff", b"", false),
+            MarkerKind::Document
+        );
+        // A recognized-but-rejected extension wins over the payload: BMP bytes
+        // that carry a PNG magic prefix stay a document, matching the loader's
+        // precedence (an unrecognized extension like `.heic` instead defers to
+        // the magic sniff, which is covered separately).
+        assert_eq!(
+            marker_kind_for(
+                "image/bmp",
+                "photo.bmp",
+                &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+                false
+            ),
+            MarkerKind::Document
+        );
+    }
+
+    #[test]
+    fn marker_kind_for_recovers_a_loadable_image_from_its_magic_bytes() {
+        // An extensionless upload still classifies as an image when the bytes
+        // carry a provider-loadable magic signature (PNG here).
+        assert_eq!(
+            marker_kind_for(
+                "image/png",
+                "photo",
+                &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+                false
+            ),
+            MarkerKind::Image
+        );
     }
 
     #[test]
     fn marker_kind_for_treats_audio_flag_as_audio_regardless_of_content_type() {
         // Filename-detected audio with no content_type should still classify
         // as AUDIO, matching the unified inbound pipeline.
-        assert_eq!(marker_kind_for("", true), "AUDIO");
-        assert_eq!(marker_kind_for("application/octet-stream", true), "AUDIO");
+        assert_eq!(
+            marker_kind_for("", "clip.ogg", b"", true),
+            MarkerKind::Audio
+        );
+        assert_eq!(
+            marker_kind_for("application/octet-stream", "clip.ogg", b"", true),
+            MarkerKind::Audio
+        );
     }
 
     #[test]
     fn marker_kind_for_prefers_image_over_audio_when_content_type_is_image() {
         // Defensive: if a Discord attachment somehow tripped both heuristics,
-        // image MIME wins so vision-capable providers still receive image
-        // bytes through the MediaAttachment path.
-        assert_eq!(marker_kind_for("image/png", true), "IMAGE");
+        // a loadable image MIME wins so vision-capable providers still receive
+        // image bytes through the MediaAttachment path.
+        assert_eq!(
+            marker_kind_for("image/png", "photo.png", b"", true),
+            MarkerKind::Image
+        );
     }
 
     #[test]
@@ -7365,37 +7900,58 @@ mod tests {
             mention_only,
         );
         let (tx, rx) = oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
-        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::Deny).unwrap();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        let resolution = crate::util::resolve_pending_approval(
+            &ch.pending_approvals,
+            "abc123",
+            ChannelApprovalResponse::Deny,
+            true,
+            "c1",
+        )
+        .await;
+        assert_eq!(resolution, crate::util::PendingApprovalResolution::Resolved);
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
     }
 
-    /// Faithful model of the type-3 dispatch's post-peer-check sequence: gate
-    /// first, and ONLY on success take + resolve. Mirrors mod.rs so the test
-    /// asserts the real ordering contract.
-    fn dispatch_approval_click(
+    /// Compose the production component take and resolver after the ingress gate.
+    async fn dispatch_approval_click(
         peers: &[String],
         user_id: &str,
         custom_id: &str,
         pending_components: &parking_lot::Mutex<pending::PendingComponents>,
-        pending_approvals: &mut std::collections::HashMap<
-            String,
-            oneshot::Sender<ChannelApprovalResponse>,
-        >,
+        pending_approvals: &AsyncMutex<HashMap<String, crate::util::PendingApproval>>,
+        destination: &str,
     ) -> bool {
         // Fail-closed authz BEFORE any take. DM-style (no guild/channel filter)
         // with an empty peer list = nobody, exactly like the message path.
-        if interaction_gate(peers, &[], &[], user_id, None, "c1", None).is_err() {
+        if interaction_gate(peers, &[], &[], user_id, None, destination, None).is_err() {
             return false; // unauthorized: must not drain or resolve anything
         }
-        let intent = pending_components.lock().take(custom_id);
+        let intent = DiscordChannel::take_authorized_component(
+            pending_components,
+            pending_approvals,
+            custom_id,
+            destination,
+        )
+        .await;
         match intent {
             Some(ComponentIntent::Approval { token, decision }) => {
-                approval::resolve_parked_approval(pending_approvals, &token, decision)
+                let resolution = crate::util::resolve_pending_approval(
+                    pending_approvals,
+                    &token,
+                    decision.response(),
+                    true,
+                    destination,
+                )
+                .await;
+                matches!(resolution, crate::util::PendingApprovalResolution::Resolved)
             }
             _ => false,
         }
@@ -7416,12 +7972,20 @@ mod tests {
                 decision,
             },
         );
-        let mut approvals = std::collections::HashMap::new();
+        let approvals = AsyncMutex::new(HashMap::new());
         let (tx, rx) = oneshot::channel();
-        approvals.insert(token.to_string(), tx);
+        approvals.lock().await.insert(
+            token.to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
 
         let resolved =
-            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals);
+            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1")
+                .await;
         assert!(resolved, "authorized click resolves the oneshot");
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
@@ -7441,9 +8005,16 @@ mod tests {
                 decision,
             },
         );
-        let mut approvals = std::collections::HashMap::new();
+        let approvals = AsyncMutex::new(HashMap::new());
         let (tx, mut rx) = oneshot::channel();
-        approvals.insert(token.to_string(), tx);
+        approvals.lock().await.insert(
+            token.to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
 
         // "intruder" is not in the (specific, non-wildcard) peer list → gate
         // denies BEFORE the take.
@@ -7452,13 +8023,15 @@ mod tests {
             "intruder",
             &wire,
             &reg,
-            &mut approvals,
-        );
+            &approvals,
+            "c1",
+        )
+        .await;
         assert!(!resolved, "unauthorized click resolves nothing");
         // The oneshot is unresolved (rx still pending, sender still parked).
         assert!(rx.try_recv().is_err(), "no decision delivered");
         assert!(
-            approvals.contains_key(token),
+            approvals.lock().await.contains_key(token),
             "the approval entry is NOT drained by an unauthorized click"
         );
         // And the pending component entry survives: an authorized user could
@@ -7466,6 +8039,114 @@ mod tests {
         assert!(
             reg.lock().take(&wire).is_some(),
             "the component entry was not drained by the unauthorized click"
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_approval_requires_authorized_responder_and_destination() {
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["u1".to_string()]),
+            false,
+            false,
+        );
+        let (tx, mut rx) = oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "tok123".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+
+        assert_eq!(
+            ch.resolve_approval_reply("tok123 yes", "intruder", "c1")
+                .await,
+            Some(crate::util::PendingApprovalResolution::Rejected)
+        );
+        assert_eq!(
+            ch.resolve_approval_reply("tok123 yes", "u1", "c2").await,
+            Some(crate::util::PendingApprovalResolution::Rejected)
+        );
+        assert!(ch.pending_approvals.lock().await.contains_key("tok123"));
+        assert!(rx.try_recv().is_err());
+
+        assert_eq!(
+            ch.resolve_approval_reply("tok123 yes", "u1", "c1:thread")
+                .await,
+            Some(crate::util::PendingApprovalResolution::Resolved)
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            ch.resolve_approval_reply("tok123 no", "u1", "c1").await,
+            Some(crate::util::PendingApprovalResolution::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_component_take_preserves_non_approval_single_use() {
+        let components = parking_lot::Mutex::new(pending::PendingComponents::default());
+        let approvals = AsyncMutex::new(HashMap::new());
+        components.lock().register(
+            "turn-button".into(),
+            ComponentIntent::ResolveIntoTurn {
+                prompt: "continue".into(),
+            },
+        );
+        let (first, second) = tokio::join!(
+            DiscordChannel::take_authorized_component(&components, &approvals, "turn-button", "c1"),
+            DiscordChannel::take_authorized_component(&components, &approvals, "turn-button", "c1"),
+        );
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_button_wrong_destination_preserves_component_until_right_click() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::AllowOnce);
+        let wire = cid.encode().unwrap();
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let approvals = AsyncMutex::new(HashMap::new());
+        let (tx, mut rx) = oneshot::channel();
+        approvals.lock().await.insert(
+            token.to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+
+        assert!(
+            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c2",)
+                .await
+        );
+        assert!(approvals.lock().await.contains_key(token));
+        assert!(rx.try_recv().is_err());
+
+        assert!(
+            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
+                .await
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(reg.lock().take(&wire).is_none());
+        assert!(
+            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
+                .await
         );
     }
 
@@ -7484,22 +8165,27 @@ mod tests {
                 decision,
             },
         );
-        let mut approvals = std::collections::HashMap::new();
+        let approvals = AsyncMutex::new(HashMap::new());
         let (tx, rx) = oneshot::channel();
-        approvals.insert(token.to_string(), tx);
+        approvals.lock().await.insert(
+            token.to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "c1".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
 
-        assert!(dispatch_approval_click(
-            &[String::from("*")],
-            "u1",
-            &wire,
-            &reg,
-            &mut approvals
-        ));
+        assert!(
+            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1",)
+                .await
+        );
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
         // The component entry is gone (single-use take), so a replay of the same
         // custom_id resolves nothing even from an authorized user.
         assert!(
-            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals),
+            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &approvals, "c1")
+                .await,
             "replayed click refused"
         );
     }
@@ -7543,6 +8229,42 @@ mod tests {
                 "each button resolves to its server-bound decision"
             );
         }
+    }
+
+    #[test]
+    fn buttoned_approval_card_shows_the_batch_position() {
+        // The buttoned card is a real approval front door: without this line,
+        // two cards from one turn are indistinguishable before either is
+        // tapped, which is the whole failure being fixed.
+        let text = super::build_buttoned_approval_text("shell", "ls -la", Some((2, 3)));
+        assert!(
+            text.contains("2") && text.contains("3"),
+            "buttoned card should carry the batch position; got {text}"
+        );
+        assert_eq!(
+            text,
+            format!(
+                "{}\n{}{}",
+                i18n::get_required_cli_string("channel-approval-heading-shout"),
+                crate::util::approval_position_line(Some((2, 3))),
+                format_args!(
+                    "{}: shell\n{}: ls -la",
+                    i18n::get_required_cli_string("channel-approval-tool-label"),
+                    i18n::get_required_cli_string("channel-approval-args-label"),
+                ),
+            ),
+            "the position line comes from the shared helper, above the tool line"
+        );
+    }
+
+    #[test]
+    fn buttoned_approval_card_omits_the_position_for_a_single_call() {
+        let single = super::build_buttoned_approval_text("shell", "ls -la", Some((1, 1)));
+        let none = super::build_buttoned_approval_text("shell", "ls -la", None);
+        assert_eq!(
+            single, none,
+            "a one-call batch renders exactly as an unpositioned card"
+        );
     }
 
     // ── [COMPONENTS:{json}] agent marker → interactive components (EPIC B) ──
@@ -8022,7 +8744,7 @@ mod tests {
             .find("interaction_gate(")
             .expect("type-3/5 arm gates");
         let take35 = region35
-            .find("pending_components.lock().take(")
+            .find("Self::take_authorized_component(")
             .expect("type-3/5 arm takes");
         assert!(
             gate35 < take35,

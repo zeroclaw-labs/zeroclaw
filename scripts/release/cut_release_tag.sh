@@ -52,7 +52,7 @@ fi
 # Auto-sync all version references before tagging
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RELEASE_VERSION="${TAG#v}"
-bash "$SCRIPT_DIR/bump-version.sh" "$RELEASE_VERSION"
+bash "$SCRIPT_DIR/bump-version.sh" --release "$RELEASE_VERSION"
 if ! git diff --quiet; then
   git add -A
   git commit -m "chore: sync version references to $TAG"

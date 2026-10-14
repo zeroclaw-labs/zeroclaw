@@ -1,0 +1,74 @@
+{
+  "frames": [
+    {
+      "channel": "http",
+      "dir": "send",
+      "payload": {
+        "body": {
+          "message": "Stream a reply.",
+          "stream": true
+        },
+        "headers": {
+          "Accept": "text/event-stream",
+          "X-Session-Id": "golden-webhook-sse"
+        },
+        "method": "POST",
+        "path": "/webhook?agent=web"
+      }
+    },
+    {
+      "channel": "http",
+      "dir": "recv",
+      "payload": {
+        "content_type": "text/event-stream",
+        "status": 200
+      }
+    },
+    {
+      "channel": "sse",
+      "dir": "recv",
+      "payload": {
+        "data": {
+          "text": "Streamed "
+        },
+        "event": "token"
+      }
+    },
+    {
+      "channel": "sse",
+      "dir": "recv",
+      "payload": {
+        "data": {
+          "text": "Streamed webhook "
+        },
+        "event": "token"
+      }
+    },
+    {
+      "channel": "sse",
+      "dir": "recv",
+      "payload": {
+        "data": {
+          "text": "Streamed webhook reply."
+        },
+        "event": "token"
+      }
+    },
+    {
+      "channel": "sse",
+      "dir": "recv",
+      "payload": {
+        "data": {},
+        "event": "done"
+      }
+    },
+    {
+      "channel": "provider",
+      "dir": "meta",
+      "payload": {
+        "requests": 1
+      }
+    }
+  ],
+  "scenario": "webhook_sse_turn"
+}

@@ -37,8 +37,8 @@ Subagents must set their working directory to the repository root before shell o
 
 ## User-Facing Text
 
-- User-facing runtime CLI, tool, and onboarding text uses Fluent `fl!()` keys rather than bare literals.
-- Zerocode uses its independent Fluent catalogue through its documented `crate::i18n` helpers. Web dashboard text follows the TypeScript `web/src/lib/i18n.ts` contract, not Rust `fl!()`.
+- User-facing runtime CLI, tool, and onboarding text uses Fluent keys through `zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args}` rather than bare literals; see `crates/zeroclaw-runtime/src/i18n.rs`.
+- Zerocode uses its independent Fluent catalogue through its documented `crate::i18n` helpers. Web dashboard text follows the TypeScript `web/src/lib/i18n.ts` contract, not the Rust runtime i18n helpers.
 - Logs, tracing fields, and panic text remain English and use stable error keys where the logging contract requires them.
 - English Markdown is the documentation source of truth. Follow the documented localization workflow instead of editing generated translations by hand.
 

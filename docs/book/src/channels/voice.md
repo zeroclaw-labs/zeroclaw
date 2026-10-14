@@ -33,6 +33,7 @@ The agent doesn't send audio anywhere; wake detection is local. Only post-wake s
 {{#config-fields channels.voice_wake}}
 
 > **Build flag:** Voice Wake is gated by the `voice-wake` cargo feature on `zeroclaw-channels`. Build with `--features voice-wake` to include it.
+> On Android, Voice Wake requires Android 8 (API level 26) or newer.
 
 ## TTS (outbound speech synthesis)
 

@@ -788,8 +788,9 @@ pub fn aieos_to_system_prompt(identity: &AieosIdentity) -> String {
             let mut sorted_keys: Vec<_> = matrix.keys().collect();
             sorted_keys.sort();
             for trait_name in sorted_keys {
-                let weight = matrix.get(trait_name).unwrap();
-                let _ = writeln!(prompt, "- {}: {:.2}", trait_name, weight);
+                if let Some(weight) = matrix.get(trait_name) {
+                    let _ = writeln!(prompt, "- {}: {:.2}", trait_name, weight);
+                }
             }
         }
 
@@ -960,8 +961,9 @@ pub fn aieos_to_system_prompt(identity: &AieosIdentity) -> String {
             let mut sorted_keys: Vec<_> = favorites.keys().collect();
             sorted_keys.sort();
             for category in sorted_keys {
-                let value = favorites.get(category).unwrap();
-                let _ = writeln!(prompt, "- {}: {}", category, value);
+                if let Some(value) = favorites.get(category) {
+                    let _ = writeln!(prompt, "- {}: {}", category, value);
+                }
             }
         }
 

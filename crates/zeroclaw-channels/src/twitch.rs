@@ -102,6 +102,13 @@ impl Channel for TwitchChannel {
         self.inner.health_check().await
     }
 
+    /// Forward the inner channel's passive observation; see the note on
+    /// `PacedChannel::listener_health`. The trait default would otherwise
+    /// answer `None` for the wrapper and hide a signal the inner channel has.
+    fn listener_health(&self) -> Option<zeroclaw_api::channel::ListenerHealth> {
+        self.inner.listener_health()
+    }
+
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         // No typing concept in the Twitch IRC or EventSub APIs.
         Ok(())

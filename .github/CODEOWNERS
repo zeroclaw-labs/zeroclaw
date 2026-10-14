@@ -34,8 +34,6 @@
 /crates/zeroclaw-api/**       @tidux
 /crates/zeroclaw-infra/**     @tidux
 /crates/zeroclaw-hardware/**  @tidux
-/crates/aardvark-sys/**       @tidux
-/crates/robot-kit/**          @tidux
 /crates/zeroclaw-macros/**    @tidux
 /firmware/**                  @tidux
 /src/providers/**             @tidux @Audacity88
@@ -120,11 +118,9 @@
 # ---------------------------------------------------------------------------
 /crates/zeroclaw-plugins/**                @JordanTheJet @Audacity88
 /crates/zeroclaw-runtime/src/skills/**     @JordanTheJet @Audacity88
-/crates/zeroclaw-runtime/src/skillforge/** @JordanTheJet @Audacity88
 /plugins/**                                @JordanTheJet @Audacity88
 /src/plugins/**                            @JordanTheJet @Audacity88
 /src/skills/**                             @JordanTheJet @Audacity88
-/src/skillforge/**                         @JordanTheJet @Audacity88
 /.claude/skills/**                         @JordanTheJet @Audacity88
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use super::scope::StepToolScope;
 use super::step_contract::{StepFailure, StepRouting};
+use crate::live_config_authority::{
+    AgentExecutionAdmission, AgentExecutionCapability, AgentExecutionError, AgentExecutionSelection,
+};
 
 // ── Priority ────────────────────────────────────────────────────
 
@@ -150,7 +153,7 @@ pub enum SopTrigger {
         #[serde(default)]
         condition: Option<String>,
     },
-    /// Inbound HTTP request. Defined and matched, but no live route feeds it.
+    /// Inbound HTTP request. Live: gateway `/sop/*` and SOP-first `/webhook` routes.
     #[trigger(display = "path")]
     Webhook {
         /// Request path matched exactly against the event path.
@@ -231,6 +234,23 @@ pub enum SopTrigger {
 impl SopTrigger {
     pub fn source(&self) -> SopTriggerSource {
         SopTriggerSource::from(self)
+    }
+
+    /// True when this trigger can *only* start a run with no ambient agent turn.
+    ///
+    /// Every fan-in source except `Manual` fires from a listener, poller, or
+    /// the maintenance tick, none of which carry an agent identity a step could
+    /// borrow, so a procedure reachable by one must declare its own owning
+    /// agent (see [`Sop::agent`]).
+    ///
+    /// `Manual` is false because it is reachable from both sides: through the
+    /// `sop_execute` tool the calling turn's agent owns the run, while the
+    /// dashboard run endpoint emits the same event from outside any agent turn.
+    /// The trigger alone cannot tell those apart, so ownership for a Manual
+    /// start is enforced by the surface that starts it
+    /// (`sop::headless_ownership_refusal`) rather than by this flag.
+    pub fn is_headless(&self) -> bool {
+        !matches!(self, Self::Manual)
     }
 }
 
@@ -389,6 +409,18 @@ pub struct SopStep {
     /// resumes (the gate prompt gains an "Edit" choice). Absent = no editing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit: Option<String>,
+    /// Conditional part (`- decide:` bullet): a yes/no question the SOP's
+    /// decision model answers about the triggering event when the run starts,
+    /// in the same call as the SOP's gate. The step runs only on "yes"
+    /// (p(yes) at or above `[decision] part_threshold`); on "no" it is recorded
+    /// as skipped and the run moves on. If the model cannot answer, it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decide: Option<String>,
+    /// Skip this step when step N's `decide` question was answered "yes"
+    /// (`- unless_decided: N` bullet). Lets one decision select between
+    /// alternative sets of steps, e.g. a scope hold instead of a full review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unless_decided: Option<u32>,
 }
 
 impl Default for SopStep {
@@ -413,6 +445,8 @@ impl Default for SopStep {
             policy: None,
             gate_prompt: None,
             edit: None,
+            decide: None,
+            unless_decided: None,
         }
     }
 }
@@ -508,6 +542,10 @@ pub struct Sop {
     /// ambient agent loop to borrow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Optional decision-model gate and execution-mode choice, from the
+    /// `[decision]` table of `SOP.toml`. See [`super::decision`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<super::decision::SopDecisionSpec>,
 }
 
 fn default_cooldown_secs() -> u64 {
@@ -592,6 +630,8 @@ pub struct SopManifest {
     pub positions: Vec<StepPosition>,
     #[serde(default)]
     pub steps: Vec<SopStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<super::decision::SopDecisionSpec>,
 }
 
 /// One step's persisted canvas coordinate in SOP.toml.
@@ -661,6 +701,7 @@ impl SopManifest {
                 })
                 .collect(),
             steps: sop.steps.clone(),
+            decision: sop.decision.clone(),
         }
     }
 }
@@ -694,6 +735,10 @@ pub struct SopEvent {
 pub enum SopRunStatus {
     Pending,
     Running,
+    /// An operator requested cancellation while work was in flight. The run
+    /// remains active and keeps its admission claim until the driver reaches
+    /// the next supported step boundary.
+    CancelRequested,
     WaitingApproval,
     /// Paused at a checkpoint in a deterministic workflow.
     PausedCheckpoint,
@@ -707,6 +752,7 @@ impl fmt::Display for SopRunStatus {
         match self {
             Self::Pending => write!(f, "pending"),
             Self::Running => write!(f, "running"),
+            Self::CancelRequested => write!(f, "cancel_requested"),
             Self::WaitingApproval => write!(f, "waiting_approval"),
             Self::PausedCheckpoint => write!(f, "paused_checkpoint"),
             Self::Completed => write!(f, "completed"),
@@ -786,6 +832,17 @@ pub struct SopStepResult {
 pub struct SopRun {
     pub run_id: String,
     pub sop_name: String,
+    /// The agent whose turn started this run, for runs that began inside one
+    /// (`sop_execute`). A headless trigger has no initiating turn and leaves it
+    /// `None`.
+    ///
+    /// Persisted because it has to outlive the thing it came from: an unowned
+    /// at an approval resumes on the headless driver — possibly in a later
+    /// daemon generation — with that turn long gone. `#[serde(default)]` so runs
+    /// persisted before this field restore as `None` rather than failing to
+    /// load.
+    #[serde(default)]
+    pub initiating_agent: Option<String>,
     pub trigger_event: SopEvent,
     /// Stable per-run boundary marker for untrusted trigger framing.
     #[serde(default)]
@@ -795,6 +852,12 @@ pub struct SopRun {
     pub total_steps: u32,
     pub started_at: String,
     pub completed_at: Option<String>,
+    /// Why this run reached a `Failed` terminal state, captured at the
+    /// transition that failed it. `None` while the run is live and for runs
+    /// that ended any other way. Serialized only when present, so runs
+    /// persisted before this field existed round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     pub step_results: Vec<SopStepResult>,
     /// ISO-8601 timestamp when the run entered WaitingApproval (for timeout tracking).
     #[serde(default)]
@@ -815,6 +878,17 @@ pub struct SopRun {
     /// reset when a new checkpoint parks, untouched by revise re-parks.
     #[serde(default)]
     pub revision_base: u32,
+    /// Execution mode a decision model chose for this run at dispatch. When
+    /// set it replaces the SOP's authored mode for this run's approval gating;
+    /// step-level confirmations and checkpoints still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_mode: Option<SopExecutionMode>,
+    /// p(yes) the decision model gave each conditional-part step (`decide`)
+    /// at dispatch, keyed by step number. A step whose answer is below the
+    /// SOP's `part_threshold` is skipped; a step missing here runs. Also
+    /// exposed to `when:` conditions as `$.decisions.<step>`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub decisions: std::collections::BTreeMap<u32, f64>,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SopRun {
@@ -825,7 +899,6 @@ impl ::zeroclaw_api::attribution::Attributable for SopRun {
         &self.sop_name
     }
 }
-
 /// Lightweight projection of a run for list surfaces (Runs page). Carries
 /// just enough to render a row and open the per-run overlay, without the
 /// full step-result payload.
@@ -857,6 +930,119 @@ impl SopRunSummary {
             completed_at: run.completed_at.clone(),
             trigger_source: run.trigger_event.source.to_string(),
             active,
+        }
+    }
+}
+
+/// Full detail for one run as exposed over RPC (`sops/run-detail`) — an
+/// explicit projection, not the persisted [`SopRun`].
+///
+/// Policy at this response boundary, applied independently of what any
+/// storage path did earlier:
+/// - free-text fields that can carry model or tool content (step output,
+///   tool arguments/output/error, the trigger topic) pass through the
+///   credential scrubber on the way out;
+/// - fields no consuming view reads are excluded rather than redacted — the
+///   raw trigger payload, the untrusted-framing marker, gate revision
+///   bookkeeping, structured tool output payloads, and savings counters are
+///   not on this struct, so a future serializer change cannot leak them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunDetail {
+    pub run_id: String,
+    pub sop_name: String,
+    pub status: SopRunStatus,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub waiting_since: Option<String>,
+    /// Where the run's trigger came from (manual, a channel, cron, ...).
+    pub trigger_source: String,
+    /// The trigger's routing topic, scrubbed; the raw payload is excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_topic: Option<String>,
+    /// True while the run is live rather than a retained terminal record.
+    pub active: bool,
+    /// Why the run failed, scrubbed. This is the run-level cause the engine
+    /// retains, not a step's output: a run can fail before any step result
+    /// exists — an input-schema rejection finishes the run straight from
+    /// validation — and then this is the only explanation the response carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    pub steps: Vec<SopStepDetail>,
+}
+
+/// One executed step inside [`SopRunDetail`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopStepDetail {
+    pub step_number: u32,
+    pub status: SopStepStatus,
+    /// Scrubbed display output (or failure text) recorded for the step.
+    pub output: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<SopToolCallDetail>,
+}
+
+/// One tool invocation inside [`SopStepDetail`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopToolCallDetail {
+    pub index: u32,
+    pub tool: String,
+    /// Scrubbed arguments the tool actually received.
+    pub args: serde_json::Value,
+    pub success: bool,
+    /// Scrubbed display output.
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
+impl SopRunDetail {
+    pub fn from_run(run: &SopRun, active: bool) -> Self {
+        use crate::agent::turn::redact::{scrub_credentials, scrub_credentials_value};
+        Self {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            status: run.status,
+            current_step: run.current_step,
+            total_steps: run.total_steps,
+            started_at: run.started_at.clone(),
+            completed_at: run.completed_at.clone(),
+            waiting_since: run.waiting_since.clone(),
+            trigger_source: run.trigger_event.source.to_string(),
+            trigger_topic: run.trigger_event.topic.as_deref().map(scrub_credentials),
+            active,
+            failure_reason: run.failure_reason.as_deref().map(scrub_credentials),
+            steps: run
+                .step_results
+                .iter()
+                .map(|step| SopStepDetail {
+                    step_number: step.step_number,
+                    status: step.status,
+                    output: scrub_credentials(&step.output),
+                    started_at: step.started_at.clone(),
+                    completed_at: step.completed_at.clone(),
+                    effective_agent: step.effective_agent.clone(),
+                    tool_calls: step
+                        .tool_calls
+                        .iter()
+                        .map(|call| SopToolCallDetail {
+                            index: call.index,
+                            tool: call.tool.clone(),
+                            args: scrub_credentials_value(call.args.clone()),
+                            success: call.success,
+                            output: scrub_credentials(&call.output),
+                            error: call.error.as_deref().map(scrub_credentials),
+                            duration_ms: call.duration_ms,
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 }
@@ -896,6 +1082,36 @@ pub struct DeterministicSavings {
     pub total_runs: u64,
 }
 
+/// Non-serialized authority witness carried by an executable SOP action.
+///
+/// Capture generations when the engine produces the action. An unnamed live
+/// step inherits the executing agent, so its target is resolved by the consumer,
+/// using only these captured generations rather than a fresh admission token.
+#[derive(Clone)]
+pub struct SopExecutionWitness {
+    selection: AgentExecutionSelection,
+}
+
+impl fmt::Debug for SopExecutionWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SopExecutionWitness")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SopExecutionWitness {
+    pub fn capture(capability: &AgentExecutionCapability) -> Self {
+        Self {
+            selection: capability.capture_selection(),
+        }
+    }
+
+    pub fn admit(&self, alias: &str) -> Result<AgentExecutionAdmission, AgentExecutionError> {
+        self.selection.resolve_and_admit(alias)
+    }
+}
+
 /// What the engine instructs the caller to do next after a state transition.
 #[derive(Debug, Clone)]
 pub enum SopRunAction {
@@ -927,6 +1143,9 @@ pub enum SopRunAction {
         run_id: String,
         step: SopStep,
         context: String,
+        /// The exact authority generations selected when this executable action
+        /// was produced. `None` is retained for unmanaged standalone callers.
+        execution_witness: Option<SopExecutionWitness>,
     },
     /// Pause and wait for operator approval before executing this step.
     WaitApproval {
@@ -948,7 +1167,9 @@ pub enum SopRunAction {
         step: SopStep,
         state_file: PathBuf,
     },
-    /// Routing selected a step whose dependencies are not yet satisfied.
+    /// No immediate execution is available. This covers dependency waits and
+    /// fail-closed lifecycle retries where the canonical run remains active
+    /// until persistence or maintenance reconciles it.
     Pending {
         run_id: String,
         sop_name: String,
@@ -957,6 +1178,8 @@ pub enum SopRunAction {
     },
     /// The SOP run completed successfully.
     Completed { run_id: String, sop_name: String },
+    /// The SOP run stopped at an operator-requested safe boundary.
+    Cancelled { run_id: String, sop_name: String },
     /// The SOP run failed.
     Failed {
         run_id: String,
@@ -1408,6 +1631,7 @@ path = "/sop/test"
         let run = SopRun {
             run_id: "run-001".into(),
             sop_name: "test-sop".into(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,
@@ -1420,6 +1644,7 @@ path = "/sop/test"
             total_steps: 5,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: None,
+            failure_reason: None,
             step_results: vec![SopStepResult {
                 effective_agent: None,
                 step_number: 1,
@@ -1433,6 +1658,8 @@ path = "/sop/test"
             llm_calls_saved: 0,
             revision: 0,
             revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();

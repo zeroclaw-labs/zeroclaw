@@ -19,6 +19,28 @@ pub const PERSONALITY_FILES: &[&str] = &[
     "MEMORY.md",
 ];
 
+/// The curated long-term memory file. Isolated sessions withhold this one file
+/// from the provider-visible prompt; every other personality file still loads.
+pub const MEMORY_PERSONALITY_FILE: &str = "MEMORY.md";
+
+/// [`PERSONALITY_FILES`] minus [`MEMORY_PERSONALITY_FILE`], for isolated / ACP
+/// sessions created with `exclude_memory: true`. Those sessions get no memory
+/// tools, a `NoneMemory` backend and no automatic saves; the curated memory
+/// *content* must be withheld from the provider-visible prompt too, otherwise
+/// the "persistent memory isolated" guarantee is only half enforced.
+///
+/// Derived from [`PERSONALITY_FILES`] at call time so the canonical list stays
+/// the single source of truth: a new non-memory personality file is picked up
+/// by isolated sessions automatically, with no second list to update in
+/// lockstep. Do not filter ad hoc at a call site — use this helper.
+pub fn personality_files_without_memory() -> Vec<&'static str> {
+    PERSONALITY_FILES
+        .iter()
+        .copied()
+        .filter(|name| *name != MEMORY_PERSONALITY_FILE)
+        .collect()
+}
+
 pub const EDITABLE_PERSONALITY_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
@@ -69,12 +91,13 @@ impl PersonalityProfile {
     pub fn render(&self) -> String {
         let mut out = String::new();
         for file in &self.files {
-            let _ = writeln!(out, "### {}\n", file.name);
             out.push_str(&file.content);
             if file.truncated {
                 let _ = writeln!(
                     out,
-                    "\n\n[... truncated at {MAX_FILE_CHARS} chars — use `read` for full file]\n"
+                    "\n\n[... {name} truncated at {limit} chars — use `read {name}` for full file]\n",
+                    name = file.name,
+                    limit = MAX_FILE_CHARS,
                 );
             } else {
                 out.push_str("\n\n");
@@ -170,6 +193,52 @@ mod tests {
     }
 
     #[test]
+    fn isolated_personality_view_is_canonical_list_minus_memory() {
+        let isolated = personality_files_without_memory();
+
+        // The isolated view must be derived from the canonical list, not a
+        // hand-maintained copy: exactly the canonical selection minus the one
+        // memory file, in canonical order.
+        let expected: Vec<&str> = PERSONALITY_FILES
+            .iter()
+            .copied()
+            .filter(|name| *name != MEMORY_PERSONALITY_FILE)
+            .collect();
+        assert_eq!(
+            isolated, expected,
+            "isolated view must equal the canonical list minus the memory file"
+        );
+
+        // Nothing but the memory file may be dropped.
+        assert_eq!(
+            isolated.len(),
+            PERSONALITY_FILES.len() - 1,
+            "exactly one file (the memory file) may be withheld from isolated sessions"
+        );
+        assert!(
+            !isolated.contains(&MEMORY_PERSONALITY_FILE),
+            "isolated sessions must not load the curated memory file"
+        );
+        for name in PERSONALITY_FILES
+            .iter()
+            .filter(|name| **name != MEMORY_PERSONALITY_FILE)
+        {
+            assert!(
+                isolated.contains(name),
+                "isolated sessions must still load canonical personality file {name}"
+            );
+        }
+
+        // Guards the actual regression: the canonical list is the only place a
+        // new personality file is registered, so a future addition reaches
+        // isolated sessions with no second list to update.
+        assert!(
+            PERSONALITY_FILES.contains(&MEMORY_PERSONALITY_FILE),
+            "the memory file must be part of the canonical list it is filtered from"
+        );
+    }
+
+    #[test]
     fn load_personality_reads_existing_files() {
         let ws = setup_workspace(&[
             ("SOUL.md", "I am a helpful assistant."),
@@ -227,9 +296,12 @@ mod tests {
 
         let profile = load_personality(&ws);
         let rendered = profile.render();
-        assert!(rendered.contains("### SOUL.md"));
+        assert!(!rendered.contains("SOUL.md"), "heading removed: {rendered}");
         assert!(rendered.contains("Be kind."));
-        assert!(rendered.contains("### IDENTITY.md"));
+        assert!(
+            !rendered.contains("IDENTITY.md"),
+            "heading removed: {rendered}"
+        );
         assert!(rendered.contains("Name: Nova"));
 
         let _ = std::fs::remove_dir_all(ws);
@@ -242,7 +314,10 @@ mod tests {
 
         let profile = load_personality(&ws);
         let rendered = profile.render();
-        assert!(rendered.contains("[... truncated at"));
+        assert!(
+            rendered.contains("SOUL.md truncated"),
+            "expected filename in truncation notice: {rendered}"
+        );
 
         let _ = std::fs::remove_dir_all(ws);
     }

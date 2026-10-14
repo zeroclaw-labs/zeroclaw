@@ -6,7 +6,7 @@ An agent lists the channels it answers on; see [Agents](../agents/overview.md) f
 
 Channels are implementations of the `Channel` trait in `zeroclaw-api`. Each one is feature-gated at compile time, so a minimal build only includes the channels you want.
 
-The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, Telegram, Discord, and filesystem. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Standard pre-built binaries add Matrix, Lark, and WhatsApp Web; the Android artifact omits WhatsApp Web for target compatibility. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
+The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, Telegram, Discord, and filesystem. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Standard distribution artifacts add Git, Matrix, Lark, and WhatsApp Web; the Android artifact omits WhatsApp Web for target compatibility. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
 
 <div class="os-tabs-src">
 
@@ -36,9 +36,10 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | LINE | `channel-line` | [LINE](./line.md) |
 | Nextcloud Talk | `channel-nextcloud` | [Nextcloud Talk](./nextcloud-talk.md) |
 | Signal | `channel-signal` | [Signal](./signal.md) |
-| Twitch | `channel-twitch` | No dedicated guide |
+| Twitch | `channel-twitch` | [Twitch](./social.md#twitch) |
 | WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
 | WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
+| WeCom (Bot Webhook / AI Bot WS) | `channel-wecom`, `channel-wecom-ws` | [Other chat platforms](./chat-others.md) |
 | iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
@@ -123,6 +124,30 @@ Secrets (bot tokens, API keys, passwords) are stored encrypted; set them through
 | `approval_timeout_secs` | Seconds to wait for operator approval on `always_ask` tools before auto-denying |
 
 Inbound senders are gated through [peer groups](./peer-groups.md), not a per-channel field.
+
+### Model fallback notices
+
+`channels.model_fallback_notice` controls notices for ordinary fallback to a different model within the same provider family. The default is `off`. Cross-family fallback notices and safeguard notices keep their existing behavior in every mode.
+
+| Mode | Delivered notice |
+|---|---|
+| `off` | No ordinary same-family model fallback notice |
+| `redacted` | A generic notice that a fallback model served the reply, without provider or model identifiers |
+| `detailed` | The requested and served provider/model identifiers |
+
+The setting applies globally to all channels that use the shared channel orchestrator. Choose the mode for every audience that can receive a reply, including shared rooms and public channels. `detailed` exposes routing identifiers to those audiences; `redacted` reports recovery without those identifiers. There are no per-channel overrides.
+
+This setting does not control fallback notices in gateway web chat, ZeroCode, or RPC sessions; those use the agent turn path and retain their existing detailed notices with provider and model identifiers.
+
+Set the mode through ZeroCode Config or another supported config editor, or use:
+
+```bash
+zeroclaw config set channels.model_fallback_notice redacted
+```
+
+The orchestrator reads the current live config when it delivers the reply, so a published mode change can affect a turn already in progress. Saving a file alone does not update a running daemon's live config. Use the existing config publication and reload paths described in [Config lifecycle](../architecture/config-lifecycle.md#saved-vs-applied); standalone CLI writes take effect on the next load or reload.
+
+These notices are added only to outbound delivery. Stored assistant history keeps the model's response without the notice, so later turns do not receive this delivery metadata as conversation content. Attribution must identify a successful fallback to a different model before a notice is added; same-family, same-model profile changes remain indistinguishable in the current attribution record.
 
 ## Streaming capability
 

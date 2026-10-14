@@ -1,26 +1,69 @@
 name: CodeQL
 
-# Static analysis for JavaScript/TypeScript source under web/.
-# Uses the existing .github/codeql/codeql-config.yml (paths-ignore tests/).
-# Rust CodeQL lives in the sibling ci-code-analysis.yml workflow (master push
-# + daily, alongside Semgrep); language coverage is split across the two.
+# Deep static analysis for both CodeQL-covered languages:
+#   javascript-typescript — web/ dashboard source (no build step needed;
+#                           CodeQL extracts interpreted languages directly)
+#   rust                  — workspace crates (manual cargo build)
+# Uses the shared .github/codeql/codeql-config.yml (paths-ignore tests/).
+# Semgrep's fast per-PR pattern scan lives in the sibling ci-code-analysis.yml.
+#
+# We deliberately do NOT trigger CodeQL on PRs. A 10-30 minute analysis that
+# sometimes times out on Rust is a productivity tax, not a security guarantee.
+# Semgrep covers the fast path on every PR; CodeQL catches what Semgrep
+# misses, after merge. Keeping this job out of PR-triggered workflows also
+# keeps it from rendering as a permanently skipped check on every PR.
 #
 # Triggers:
-#   push to master     — immediate feedback on merged code
-#   schedule           — weekly catch for new queries (query packs update
+#   push to master     — immediate feedback on merged code, for pushes that
+#                        change analyzed code (see `paths` below)
+#   schedule           — daily catch for new queries (query packs update
 #                        independently of the codebase)
-#   workflow_dispatch  — manual re-run after a config change
+#   workflow_dispatch  — manual re-run after a config change, or an
+#                        on-demand scan of a branch before merge
 
 on:
   push:
     branches: [master]
+    # Only pushes that change code this workflow analyzes. CodeQL's result
+    # depends only on these files, so a docs-, skills-, or policy-only push
+    # would reproduce the previous analysis exactly, and under the
+    # cancel-in-progress policy below it would also cancel the in-flight
+    # analysis of the last real code push. Extensions are matched anywhere
+    # because the javascript-typescript extractor scans every JS/TS/HTML file
+    # in the repository, not only web/. The daily schedule still analyzes the
+    # full tree, so anything outside this list is covered within a day.
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - '.cargo/**'
+      - '**/*.js'
+      - '**/*.jsx'
+      - '**/*.mjs'
+      - '**/*.cjs'
+      - '**/*.ts'
+      - '**/*.tsx'
+      - '**/*.mts'
+      - '**/*.cts'
+      - '**/*.html'
+      - '**/*.htm'
+      - '**/*.vue'
+      - '**/package.json'
+      - '**/package-lock.json'
+      - '**/tsconfig*.json'
+      - '.github/codeql/**'
+      - '.github/workflows/codeql.yml'
   schedule:
-    - cron: '34 10 * * 2'   # Tuesdays at 10:34 UTC
+    - cron: '37 5 * * *'   # daily at 05:37 UTC — random offset to spread load
   workflow_dispatch:
 
+# A scan of a superseded commit has no value: a newer push cancels any
+# in-flight run so the latest master analysis is never queued behind a
+# stale or scheduled one (same policy the Rust job had in its old home).
 concurrency:
   group: codeql-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -29,26 +72,46 @@ permissions:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+    # Results upload to this repo's Security tab; skip on forks.
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    # Keep the fast interpreted-language scan on GitHub; give only Rust the
+    # Blacksmith label the compile-heavy ci.yml jobs pin directly. The label
+    # is a checked-in constant rather than a repository variable, matching
+    # ci.yml, so moving the Rust scan back to GitHub-hosted is one reviewed
+    # edit here and no workflow depends on an Actions variable for runners.
+    runs-on: ${{ matrix.language == 'rust' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        language: [javascript-typescript]
+        language: [javascript-typescript, rust]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Install Rust toolchain
+        if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+
+      - name: Install system dependencies
+        if: matrix.language == 'rust'
+        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
+
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        uses: github/codeql-action/init@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           languages: ${{ matrix.language }}
           config-file: .github/codeql/codeql-config.yml
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+      - name: Build
+        if: matrix.language == 'rust'
+        run: cargo build --locked --workspace --exclude zeroclaw-desktop --features ci-all
+        env:
+          CARGO_TERM_COLOR: always
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           category: '/language:${{ matrix.language }}'

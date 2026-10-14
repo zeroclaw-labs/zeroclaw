@@ -1,7 +1,7 @@
-//! `cargo generate installers` - render install surfaces from canonical route
-//! semantics and deterministic renderer bodies. The spec owns route policy;
-//! renderers own generated surface content; content outside generated zones is
-//! hand-authored. Every tracked surface is registered below and drift-checked.
+//! Maintainer surface generation. `cargo generate installers` renders install
+//! surfaces from canonical route semantics; `cargo generate review-docs`
+//! materializes repeated PR-review policy. Typed specs own policy, renderers
+//! own generated content, and text outside generated zones stays hand-authored.
 
 pub mod container;
 pub mod container_base;
@@ -10,8 +10,13 @@ pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
+pub mod review_docs;
+pub mod runtime_locales;
 pub mod setup_bat;
+pub mod sop_syntax;
 pub mod spec;
+pub mod tools_ftl;
+pub mod zerocode_themes;
 
 use container::ContainerSurface;
 use spec::Selection as Sel;
@@ -46,6 +51,16 @@ fn registry() -> Vec<Surface> {
             name: "install-docs",
             file: "docs/book/src/_snippets/install.md",
             render: docs::render_file,
+        },
+        Surface {
+            name: "runtime-locales",
+            file: "crates/zeroclaw-runtime/src/generated_locales.rs",
+            render: runtime_locales::render_file,
+        },
+        Surface {
+            name: "tools-en-ftl",
+            file: "crates/zeroclaw-tools/locales/en/tools.ftl",
+            render: tools_ftl::render_file,
         },
         Surface {
             name: "readme-unix-fast",
@@ -92,6 +107,14 @@ fn registry() -> Vec<Surface> {
             file: "Dockerfile.alpine",
             render: |root, cur| render_docker_arg(root, cur),
         },
+        // Base-image pins only: the relay builds `-p zerorelay` with no feature
+        // selection, so it carries no `docker-features-arg` zone and must not go
+        // through `render_docker_arg`.
+        Surface {
+            name: "dockerfile-zerorelay",
+            file: "apps/zerorelay/Dockerfile",
+            render: |root, cur| container_base::splice_zones(root, cur),
+        },
         Surface {
             name: "pkgbuild",
             file: "dist/aur/PKGBUILD",
@@ -116,6 +139,11 @@ fn registry() -> Vec<Surface> {
             name: "docker-tags",
             file: "dev/ci/docker-tags.toml",
             render: |root, cur| docker_tags::render_file(root, cur),
+        },
+        Surface {
+            name: "zerocode-themes",
+            file: "apps/zerocode/src/generated_themes.rs",
+            render: zerocode_themes::render_file,
         },
     ]
 }

@@ -68,8 +68,18 @@ Host surfaces are permission-gated:
 
 - `HttpClient` is the permission that attaches outbound HTTP state and
   links WASI HTTP.
-- `ConfigRead` is required before the host injects a plugin's resolved
-  config section under `__config`.
+- `ConfigRead` is required before the host injects resolved values under tool
+  `__config` or serves channel `config.get`. A tool or channel consumer may mark
+  top-level string properties `x-secret = true`; those values never enter the
+  public object and are read through the instance-scoped `secrets` import.
+  Tools receive secret access during `execute`. Channels receive `config.get`
+  and `secrets.get` during `configure` and operational calls; both reads share
+  one canonical config resolution per call. Instantiation and static metadata
+  discovery remain unavailable. The host drops each call's materialized view;
+  compliant channel guests must resolve at point of use and not retain returned
+  config or plaintext, which the host cannot enforce after delivery. Static
+  identity and capability exports are read at load, so changing those values
+  requires channel lifecycle reconstruction.
 - The host does not expose a raw environment-variable read function.
 - Store limits, fuel, table limits, instance limits, and memory ceilings
   are resolved before the store is built.

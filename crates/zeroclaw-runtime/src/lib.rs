@@ -6,37 +6,46 @@
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
 pub mod cli_input;
+/// Locale table rendered from repo-root `locales.toml` by
+/// `cargo generate installers runtime-locales`. Generated, not hand-edited.
+mod generated_locales;
 pub mod identity;
+pub mod live_config_authority;
 pub mod migration;
 pub mod util;
 
 pub mod agent;
+pub mod agent_lifecycle;
 pub mod approval;
 pub mod browse;
 pub mod calendar;
+pub mod composition;
 pub mod control_plane;
 pub mod cost;
 pub mod cron;
 pub mod daemon;
 pub mod doctor;
+pub mod enroll;
 pub mod health;
 pub mod heartbeat;
 pub mod hooks;
 pub mod i18n;
 pub mod integrations;
-pub mod nodes;
 pub mod observability;
 pub mod peers;
 pub mod platform;
+pub mod plugin_runtime;
+#[cfg(feature = "plugins-wasm")]
+pub(crate) mod plugin_state;
 pub mod process_stats;
 pub mod quickstart;
 pub mod rag;
+pub mod relay;
 pub mod restart;
 pub mod routines;
 pub mod rpc;
 pub mod security;
 pub mod service;
-pub mod skillforge;
 pub mod skills;
 pub mod sop;
 pub mod subagent;
@@ -44,3 +53,5 @@ pub mod tools;
 pub mod trust;
 pub mod tunnel;
 pub mod verifiable_intent;
+
+pub use live_config_authority::{AgentExecutionCapability, LiveConfigAuthority};

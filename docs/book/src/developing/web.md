@@ -39,7 +39,7 @@ cargo web install       # npm install in web/
 
 ## CI and release builds
 
-CI does not run `cargo web build`: the lint/build/test jobs use a `web/dist/.gitkeep` placeholder so the gateway crate compiles without the bundle. Producing a release artifact that includes the dashboard is a separate step:
+The required CI gate runs `cargo web check` when the dashboard, its toolchain, the Rust crates that own the exported schemas (`zeroclaw-config`, `zeroclaw-gateway`, `zeroclaw-runtime`, and `zeroclaw-sop-graph`), the `xtask` generator, workspace manifests, or this workflow changes. This regenerates the ignored TypeScript client and typechecks the dashboard without producing a bundle. The Rust lint/build/test jobs still use a `web/dist/.gitkeep` placeholder so the gateway crate can compile without the bundle. Producing a release artifact that includes the dashboard is a separate step:
 
 <div class="os-tabs-src">
 
@@ -53,6 +53,28 @@ cargo build --release --features gateway
 </div>
 
 The gateway loads `web/dist/` from the filesystem at runtime via `static_files.rs`, so the Rust compile and the web build are decoupled. Ship the populated `web/dist/` alongside the binary for installs that should serve the dashboard.
+
+## Nix builds
+
+`nix/web.nix` exposes `packages.zeroclaw-web` (the `dist/` bundle at
+`$out/share/zeroclaw-web/`) and `packages.zeroclaw-openapi-spec` (the
+hermetic spec dump). The chain is split so each sandbox stays single-language:
+
+1. `zeroclaw-openapi-spec` builds `cargo xtask web` and runs
+   `web spec-dump --out $out`: pure Rust, no npm. `api-generated.ts` is
+   deliberately *not* produced here.
+2. `zeroclaw-web` (`buildNpmPackage`, Node 24 per `.nvmrc`) copies the dumped
+   helpers into `src/lib/`, derives `api-generated.ts` from `openapi.json`
+   with the vendored `openapi-typescript`, then runs the standard
+   `npm run build`.
+
+```sh
+nix build .#zeroclaw-web
+nix build .#zeroclaw-openapi-spec
+```
+
+The NixOS module (`nix/module.nix`, `webUiPackage` option) points
+`gateway.web_dist_dir` at the bundle; see `nix/README.md`.
 
 ## Required tools
 

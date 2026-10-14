@@ -2,6 +2,7 @@
 
 use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
+pub use zeroclaw_api::model_provider::strip_think_tags;
 
 /// A single parsed tool call extracted from LLM output.
 #[derive(Debug, Clone)]
@@ -24,44 +25,70 @@ pub enum ToolProtocolEnvelopeKind {
 }
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
-    let initial = match raw {
+    match raw {
         Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
         Some(value) => value.clone(),
         None => serde_json::Value::Object(serde_json::Map::new()),
-    };
-    unwrap_nested_json_strings(initial)
+    }
 }
 
-/// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
-/// Why: Gemini (and some other model_providers) sometimes double-encode nested object/array
-/// parameters as JSON strings inside the outer arguments payload, which breaks tools
-/// that expect `Value::Object` / `Value::Array` at those positions.
-fn unwrap_nested_json_strings(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, v) in map {
-                out.insert(k, unwrap_nested_json_strings(v));
+/// Canonical vocabulary of terminal markers emitted by providers that must be
+/// stripped from final response text. This is the single source of truth for
+/// the marker vocabulary, shared by the non-streaming
+/// [`strip_trailing_terminal_markers`] helper and the streaming state machine
+/// (`zeroclaw-runtime`'s `StreamTerminalMarkerStripper`) so a vocabulary or
+/// matching-rule change cannot drift one path.
+///
+/// Order matters: longer spellings must precede shorter ones so a suffix check
+/// matches the most specific marker first.
+pub const TERMINAL_MARKERS: [&str; 2] = ["<|eom|>", "<eom>"];
+
+/// Strip trailing terminal markers (`<eom>`, `<|eom|>`) from a response string.
+/// Handles stacked markers with arbitrary whitespace between them.
+///
+/// Terminal markers are protocol metadata that should not appear in user-visible text.
+/// This function iteratively removes trailing markers and whitespace until none remain.
+///
+/// # Examples
+///
+/// ```
+/// use zeroclaw_tool_call_parser::strip_trailing_terminal_markers;
+///
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<|eom|>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom><|eom|>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>  \n"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>           <|eom|>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Text with <eom> inline"), "Text with <eom> inline");
+/// ```
+pub fn strip_trailing_terminal_markers(text: &str) -> String {
+    let mut result = text.to_string();
+
+    loop {
+        // Look for a recognized marker at the end of the trailing-whitespace-
+        // trimmed tail. When the trimmed tail ends in a marker, remove the
+        // marker AND the whitespace that followed it (the marker suffix).
+        // Whitespace BEFORE the marker belongs to the response text and is
+        // preserved — this matches the streaming stripper, which keeps e.g.
+        // `"Answer\n<eom>"` as `"Answer\n"`. If no marker is found, unmarked
+        // trailing whitespace (e.g. `"Answer\n"`) is ordinary text and is
+        // preserved too, so the two paths share one policy.
+        let trimmed = result.trim_end();
+        let mut stripped = false;
+        for marker in TERMINAL_MARKERS {
+            if let Some(prefix) = trimmed.strip_suffix(marker) {
+                result = prefix.to_string();
+                stripped = true;
+                break;
             }
-            serde_json::Value::Object(out)
         }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(unwrap_nested_json_strings).collect())
+        if !stripped {
+            break;
         }
-        serde_json::Value::String(s) => {
-            let trimmed = s.trim_start();
-            if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                match serde_json::from_str::<serde_json::Value>(&s) {
-                    Ok(parsed) => unwrap_nested_json_strings(parsed),
-                    Err(_) => serde_json::Value::String(s),
-                }
-            } else {
-                serde_json::Value::String(s)
-            }
-        }
-        other => other,
     }
+
+    result
 }
 
 fn parse_tool_call_id(
@@ -494,6 +521,33 @@ pub fn contains_tool_protocol_tag_call(text: &str) -> bool {
     !calls.is_empty()
 }
 
+/// `text` carries a call `parse_tool_calls` would return, in any syntax
+/// the parser supports, and is not a teaching example.
+/// [`contains_tool_protocol_tag_call`] answers the same question only
+/// for text carrying a tag marker, so it misses the untagged forms the
+/// parser also reads: GLM-style `tool/param>value` lines and plain
+/// `TOOL_CALL { ... }} /TOOL_CALL` blocks. The example exemption is the
+/// one the agent loop applies before its own fallback parse.
+pub fn contains_parseable_tool_call(text: &str) -> bool {
+    if looks_like_tool_protocol_example(text) {
+        return false;
+    }
+
+    let (_, calls) = parse_tool_calls(text);
+    !calls.is_empty()
+}
+
+/// `text` opens call syntax the parser reads, whether or not the call has
+/// closed yet: one of the tag markers the tagged check looks for, or a
+/// `TOOL_CALL` / `[TOOL_CALL]` block opener. `TOOL_CALL` is matched
+/// case-sensitively, as the parser's own malformed-call check matches it,
+/// so the `tool_call_id` key does not count. A span carrying an opener
+/// cannot be judged as a quotation on its own, because the closer the
+/// call needs may arrive after the span.
+pub fn contains_tool_call_opener(text: &str) -> bool {
+    contains_tool_protocol_tag_marker(text) || text.contains("TOOL_CALL")
+}
+
 fn classify_tagged_tool_protocol_envelope(text: &str) -> Option<ToolProtocolEnvelopeKind> {
     if !starts_with_tool_protocol_tag_or_fence(text) {
         return None;
@@ -800,8 +854,14 @@ fn extract_xml_pairs(input: &str) -> Vec<(&str, &str)> {
     let mut results = Vec::new();
     let mut search_start = 0;
     while let Some(open_cap) = XML_OPEN_TAG_RE.captures(&input[search_start..]) {
-        let full_open = open_cap.get(0).unwrap();
-        let tag_name = open_cap.get(1).unwrap().as_str();
+        let Some(full_open) = open_cap.get(0) else {
+            break;
+        };
+        let Some(tag_name) = open_cap.get(1) else {
+            search_start += full_open.end();
+            continue;
+        };
+        let tag_name = tag_name.as_str();
         let open_end = search_start + full_open.end();
 
         let closing_tag = format!("</{tag_name}>");
@@ -869,7 +929,7 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
         }
 
         calls.push(ParsedToolCall {
-            name: tool_name,
+            name: map_tool_name_alias(&tool_name).to_string(),
             arguments: serde_json::Value::Object(args),
             tool_call_id: None,
         });
@@ -948,7 +1008,7 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
         }
 
         calls.push(ParsedToolCall {
-            name: name.to_string(),
+            name: map_tool_name_alias(name).to_string(),
             arguments: serde_json::Value::Object(args),
             tool_call_id: None,
         });
@@ -1552,9 +1612,10 @@ fn map_tool_name_alias(tool_name: &str) -> &str {
         .map(|(_, suffix)| suffix)
         .unwrap_or(tool_name);
     match tool_name {
-        // Shell variations (including GLM aliases that map to shell)
-        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" | "browser_open" | "browser"
-        | "web_search" => "shell",
+        // Only shell aliases may enter the legacy URL-to-curl conversion.
+        // Browser and search calls must retain their own tool boundaries.
+        "shell" | "bash" | "sh" | "exec" | "command" | "cmd" => "shell",
+        "web_search" => "web_search_tool",
         // Messaging variations
         "send_message" | "sendmessage" => "message_send",
         // File tool variations
@@ -2285,7 +2346,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut last_end = 0;
 
         for cap in MD_TOOL_CALL_RE.captures_iter(response) {
-            let full_match = cap.get(0).unwrap();
+            let Some(full_match) = cap.get(0) else {
+                continue;
+            };
             // Range-aware: a fence that OPENS before a refused span and runs
             // through it must be refused too, not just one that starts inside.
             if range_hits_rejected_span(&rejected_tools_spans, full_match.start(), full_match.end())
@@ -2331,7 +2394,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut last_end = 0;
 
         for cap in MD_TOOL_NAME_RE.captures_iter(response) {
-            let full_match = cap.get(0).unwrap();
+            let Some(full_match) = cap.get(0) else {
+                continue;
+            };
             // Range-aware: a fence that OPENS before a refused span and runs
             // through it must be refused too, not just one that starts inside.
             if range_hits_rejected_span(&rejected_tools_spans, full_match.start(), full_match.end())
@@ -2372,7 +2437,7 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                         serde_json::Value::Object(serde_json::Map::new())
                     };
                     calls.push(ParsedToolCall {
-                        name: tool_name.to_string(),
+                        name: map_tool_name_alias(tool_name).to_string(),
                         arguments,
                         tool_call_id: None,
                     });
@@ -2499,30 +2564,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     }
 
     (text_parts.join("\n"), calls)
-}
-
-/// Remove `<think>...</think>` blocks from model output.
-/// Qwen and other reasoning models embed chain-of-thought inline in the
-/// response text using `<think>` tags.  These must be removed before parsing
-/// tool-call tags or displaying output.
-pub fn strip_think_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        if let Some(start) = rest.find("<think>") {
-            result.push_str(&rest[..start]);
-            if let Some(end) = rest[start..].find("</think>") {
-                rest = &rest[start + end + "</think>".len()..];
-            } else {
-                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
-                break;
-            }
-        } else {
-            result.push_str(rest);
-            break;
-        }
-    }
-    result.trim().to_string()
 }
 
 /// Strip prompt-guided tool artifacts from visible output while preserving
@@ -2668,8 +2709,10 @@ pub fn build_native_assistant_history_from_parsed_calls(
         "tool_calls": calls_json,
     });
 
-    if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
+    if let Some(rc) = reasoning_content
+        && let Some(obj) = obj.as_object_mut()
+    {
+        obj.insert(
             "reasoning_content".to_string(),
             serde_json::Value::String(rc.to_string()),
         );
@@ -3352,21 +3395,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_arguments_value_unwraps_nested_object_string() {
+    fn parse_arguments_value_preserves_nested_object_string() {
         let raw = serde_json::json!({
             "service": "gmail",
             "params": "{\"maxResults\":3}"
         });
         let out = parse_arguments_value(Some(&raw));
         assert_eq!(out["service"], serde_json::json!("gmail"));
-        assert_eq!(out["params"], serde_json::json!({"maxResults": 3}));
+        assert_eq!(out["params"], raw["params"]);
     }
 
     #[test]
-    fn parse_arguments_value_unwraps_nested_array_string() {
+    fn parse_arguments_value_preserves_nested_array_string() {
         let raw = serde_json::json!({ "items": "[1,2,3]" });
         let out = parse_arguments_value(Some(&raw));
-        assert_eq!(out["items"], serde_json::json!([1, 2, 3]));
+        assert_eq!(out["items"], raw["items"]);
     }
 
     #[test]
@@ -3389,7 +3432,7 @@ mod tests {
         let inner = r#"{"params":"{\"maxResults\":3}"}"#;
         let raw = serde_json::Value::String(inner.to_string());
         let out = parse_arguments_value(Some(&raw));
-        assert_eq!(out["params"], serde_json::json!({"maxResults": 3}));
+        assert_eq!(out["params"], r#"{"maxResults":3}"#);
     }
 
     #[test]
@@ -3405,7 +3448,7 @@ mod tests {
         assert_eq!(parsed.name, "google_workspace");
         assert_eq!(
             parsed.arguments["params"],
-            serde_json::json!({"maxResults": 3})
+            serde_json::json!(r#"{"maxResults":3}"#)
         );
         assert_eq!(
             parsed.arguments["sub_resource"],
@@ -3752,7 +3795,10 @@ Done."#;
                     .get("attributes")
                     .and_then(|attributes| attributes.get("_file"))
                     .and_then(|value| value.as_str())
-                    .is_some_and(|file| file.ends_with("zeroclaw-tool-call-parser/src/lib.rs"));
+                    .is_some_and(|file| {
+                        file.replace('\\', "/")
+                            .ends_with("zeroclaw-tool-call-parser/src/lib.rs")
+                    });
                 if matches_message && matches_source {
                     break 'search event;
                 }
@@ -4680,6 +4726,78 @@ Done."#;
         assert!(contains_tool_protocol_tag_call(embedded));
     }
 
+    /// The two untagged call forms inside an invalid result fragment:
+    /// no tag marker, so the tagged check does not look, while
+    /// `parse_tool_calls` still returns the shell call. The fragment
+    /// with a plain placeholder is the control: no call either way.
+    #[test]
+    fn contains_parseable_tool_call_reads_untagged_forms_the_tagged_check_misses() {
+        let glm = "{\"tool_call_id\":\"call_1\",\"content\":\nshell/command>printf guard_probe\n}";
+        let perl = "{\"tool_call_id\":\"call_1\",\"content\":\nTOOL_CALL { tool => \"shell\", args => { --command \"pwd\" }} /TOOL_CALL\n}";
+        let inert = "{\"tool_call_id\": <call-123>, \"content\": <text>}";
+
+        for (label, text) in [("glm", glm), ("TOOL_CALL", perl)] {
+            let (_, calls) = parse_tool_calls(text);
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["shell"],
+                "{label}: the parser reads a shell call from the fragment"
+            );
+            assert!(
+                !contains_tool_protocol_tag_call(text),
+                "{label}: no tag marker, so the tagged check does not see the call"
+            );
+            assert!(
+                contains_parseable_tool_call(text),
+                "{label}: the any-syntax check must see what the parser reads"
+            );
+        }
+
+        assert!(parse_tool_calls(inert).1.is_empty());
+        assert!(!contains_parseable_tool_call(inert));
+    }
+
+    /// An opened call whose closer has not arrived parses as nothing, so
+    /// only the opener check sees it. The `tool_call_id` key alone is not
+    /// an opener.
+    #[test]
+    fn contains_tool_call_opener_sees_calls_the_parser_cannot_close_yet() {
+        let cases = [
+            (
+                "single-quoted invoke",
+                "{\"tool_call_id\": \"call_1\", \"content\": \"<invoke name='shell'><parameter name='command'>pwd</parameter>\"}",
+            ),
+            (
+                "double-quoted invoke",
+                "{\"tool_call_id\":\"call_1\",\"content\": <invoke name=\"shell\"><parameter name=\"command\">pwd</parameter>",
+            ),
+            (
+                "TOOL_CALL",
+                "{\"tool_call_id\":\"call_1\",\"content\":\"TOOL_CALL {\"}",
+            ),
+            (
+                "[TOOL_CALL]",
+                "{\"tool_call_id\":\"call_1\",\"content\":\"[TOOL_CALL]{\"}",
+            ),
+        ];
+        for (label, text) in cases {
+            assert!(
+                parse_tool_calls(text).1.is_empty(),
+                "{label}: the call has not closed, so the parser reads none"
+            );
+            assert!(
+                contains_tool_call_opener(text),
+                "{label}: the opener is seen"
+            );
+        }
+        assert!(!contains_tool_call_opener(
+            "{\"tool_call_id\": \"call_1\", \"content\": \"ok\"}"
+        ));
+    }
+
     #[test]
     fn classify_tool_protocol_envelope_flags_standalone_tool_fences() {
         let tool_call_fence = r#"```tool_call
@@ -4818,14 +4936,16 @@ Done."#;
         let response = "browser_open/url>https://example.com";
         let calls = parse_glm_style_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "shell");
-        assert_eq!(calls[0].1["command"], "curl -s 'https://example.com'");
+        assert_eq!(calls[0].0, "browser_open");
+        assert_eq!(
+            calls[0].1,
+            serde_json::json!({"url": "https://example.com"})
+        );
     }
 
     #[test]
-    fn parse_glm_style_quotes_url_apostrophes_and_metacharacters() {
-        let calls =
-            parse_glm_style_tool_calls("browser_open/url>https://example.com/it's;still=one");
+    fn parse_glm_style_shell_quotes_url_apostrophes_and_metacharacters() {
+        let calls = parse_glm_style_tool_calls("shell/url>https://example.com/it's;still=one");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
         assert_eq!(
@@ -4888,14 +5008,18 @@ browser_open/url>https://example.com"#;
         let response = "Checking...\nbrowser_open/url>https://example.com\nDone";
         let (text, calls) = parse_tool_calls(response);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].name, "browser_open");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"url": "https://example.com"})
+        );
         assert!(text.contains("Checking"));
         assert!(text.contains("Done"));
     }
 
     #[test]
-    fn parse_glm_style_rejects_non_http_url_param() {
-        let response = "browser_open/url>javascript:alert(1)";
+    fn parse_glm_style_shell_rejects_non_http_url_param() {
+        let response = "shell/url>javascript:alert(1)";
         let calls = parse_glm_style_tool_calls(response);
         assert!(calls.is_empty());
     }
@@ -5124,14 +5248,13 @@ Let me check the result."#;
     }
 
     #[test]
-    fn parse_glm_shortened_body_browser_open_maps_to_shell_command() {
-        // browser_open aliases to shell, and shortened calls must still emit
-        // shell's canonical "command" argument.
+    fn parse_glm_shortened_body_browser_open_preserves_url() {
         let call = parse_glm_shortened_body("browser_open>https://example.com").unwrap();
-        assert_eq!(call.name, "shell");
-        let cmd = call.arguments["command"].as_str().unwrap();
-        assert!(cmd.contains("curl"));
-        assert!(cmd.contains("example.com"));
+        assert_eq!(call.name, "browser_open");
+        assert_eq!(
+            call.arguments,
+            serde_json::json!({"url": "https://example.com"})
+        );
     }
 
     #[test]
@@ -5292,6 +5415,61 @@ Let me check the result."#;
     }
 
     #[test]
+    fn tool_alias_format_parity() {
+        let arguments = serde_json::json!({
+            "path": "example.txt",
+            "content": "{\"keep\":\"a string\"}",
+            "options": {"enabled": true},
+        });
+        for (raw, expected) in [
+            ("readfile", "file_read"),
+            ("bash", "shell"),
+            ("send_message", "message_send"),
+            ("file_read", "file_read"),
+            ("custom_tool", "custom_tool"),
+            ("Bash", "Bash"),
+        ] {
+            let bodies = [
+                format!("<tool_call><{raw}>{arguments}</{raw}></tool_call>"),
+                format!("<invoke name=\"{raw}\">{arguments}</invoke>"),
+                format!("```tool {raw}\n{arguments}\n```"),
+                format!(r#"<tool_call>{{"name":"{raw}","arguments":{arguments}}}</tool_call>"#),
+            ];
+            for body in bodies {
+                let response = format!("Before\n{body}\nAfter");
+                let (text, calls) = parse_tool_calls(&response);
+                assert_eq!(text, "Before\nAfter", "{response}");
+                assert_eq!(calls.len(), 1, "{response}");
+                assert_eq!(calls[0].name, expected, "{response}");
+                assert_eq!(calls[0].arguments, arguments, "{response}");
+                assert_eq!(calls[0].tool_call_id, None, "{response}");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_alias_format_parity_for_dotted_minimax_names() {
+        for (raw, expected) in [
+            ("default_api.readfile", "file_read"),
+            ("tools.bash", "shell"),
+            ("tools.custom_tool", "custom_tool"),
+            ("tools.Bash", "Bash"),
+        ] {
+            let json = format!(r#"{{"name":"{raw}","arguments":{{"path":"example.txt"}}}}"#);
+            let minimax = format!(
+                "<invoke name=\"{raw}\"><parameter name=\"path\">example.txt</parameter></invoke>"
+            );
+            let (_, json_calls) = parse_tool_calls(&json);
+            let (_, minimax_calls) = parse_tool_calls(&minimax);
+            assert_eq!(json_calls.len(), 1, "{json}");
+            assert_eq!(minimax_calls.len(), 1, "{minimax}");
+            assert_eq!(minimax_calls[0].name, expected);
+            assert_eq!(minimax_calls[0].name, json_calls[0].name);
+            assert_eq!(minimax_calls[0].arguments, json_calls[0].arguments);
+        }
+    }
+
+    #[test]
     fn map_tool_name_alias_direct_coverage() {
         assert_eq!(map_tool_name_alias("bash"), "shell");
         assert_eq!(map_tool_name_alias("filelist"), "file_list");
@@ -5341,5 +5519,96 @@ Let me check the result."#;
         assert_eq!(default_param_for_tool("http_request"), "url");
         assert_eq!(default_param_for_tool("browser_open"), "url");
         assert_eq!(default_param_for_tool("unknown_tool"), "input");
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_basic() {
+        assert_eq!(strip_trailing_terminal_markers("Summary<eom>"), "Summary");
+        assert_eq!(strip_trailing_terminal_markers("Summary<|eom|>"), "Summary");
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_preserves_unmarked_whitespace() {
+        // No marker present: trailing whitespace is ordinary text and must be
+        // preserved, matching the streaming path which never trims whitespace
+        // that is not part of a marker suffix.
+        assert_eq!(strip_trailing_terminal_markers("Answer\n"), "Answer\n");
+        assert_eq!(strip_trailing_terminal_markers("Answer  "), "Answer  ");
+        assert_eq!(
+            strip_trailing_terminal_markers("Plain response\n\n"),
+            "Plain response\n\n"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_whitespace_before_marker() {
+        // Whitespace BEFORE a recognized marker belongs to the response text
+        // and is preserved, matching the streaming stripper ("Answer\n<eom>"
+        // streams as "Answer\n"). Only the marker itself (plus any whitespace
+        // that followed it) is removed.
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary  <eom>"),
+            "Summary  "
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary \n\t<|eom|>"),
+            "Summary \n\t"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_stacked() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom><|eom|>"),
+            "Summary"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<|eom|><eom>"),
+            "Summary"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_with_whitespace() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>  \n"),
+            "Summary"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>\t\n  "),
+            "Summary"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>           <|eom|>"),
+            "Summary"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_preserves_inline() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Text with <eom> inline"),
+            "Text with <eom> inline"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Code: <|eom|> here"),
+            "Code: <|eom|> here"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_empty() {
+        assert_eq!(strip_trailing_terminal_markers(""), "");
+        // Pure whitespace with no marker is ordinary text and is preserved,
+        // matching the streaming path (which never trims unmarked whitespace).
+        assert_eq!(strip_trailing_terminal_markers("   "), "   ");
+        assert_eq!(strip_trailing_terminal_markers("<eom>"), "");
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_marker_only_with_whitespace() {
+        assert_eq!(strip_trailing_terminal_markers("<eom>\n"), "");
+        assert_eq!(strip_trailing_terminal_markers("<|eom|>  "), "");
+        assert_eq!(strip_trailing_terminal_markers("<eom>\n<|eom|>"), "");
     }
 }

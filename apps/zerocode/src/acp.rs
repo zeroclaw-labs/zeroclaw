@@ -12,6 +12,11 @@ pub(crate) struct Acp {
 }
 
 impl Acp {
+    #[cfg(test)]
+    pub(crate) fn from_chat_for_test(inner: chat::Chat) -> Self {
+        Self { inner }
+    }
+
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
             inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
@@ -22,28 +27,127 @@ impl Acp {
         self.inner.init().await
     }
 
-    pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {
-        self.inner.set_resume_session_id(sid);
+    pub(crate) fn set_resume_sessions(&mut self, entries: Vec<chat::ResumeEntry>) {
+        self.inner.set_resume_sessions(entries);
     }
 
-    pub(crate) fn set_resume_agent_alias(&mut self, alias: Option<String>) {
-        self.inner.set_resume_agent_alias(alias);
+    pub(crate) fn resume_entries(&self) -> Vec<chat::ResumeEntry> {
+        self.inner.resume_entries()
     }
 
-    pub(crate) fn current_session_id(&self) -> Option<&str> {
-        self.inner.current_session_id()
+    pub(crate) fn commit_reconnect_handoff(&mut self) {
+        self.inner.commit_reconnect_handoff();
     }
 
-    pub(crate) fn current_agent_alias(&self) -> Option<&str> {
-        self.inner.current_agent_alias()
+    pub(crate) fn terminal_statuses(&self) -> Vec<(crate::turn_status::TurnStatus, String)> {
+        self.inner.terminal_statuses()
+    }
+
+    pub(crate) fn session_summaries(&self) -> Vec<chat::SidebarSessionSummary> {
+        self.inner.session_summaries()
+    }
+
+    pub(crate) fn owns_session(&self, session_id: &str) -> bool {
+        self.inner.owns_session(session_id)
+    }
+
+    pub(crate) fn try_install_elicitation(
+        &mut self,
+        request: crate::client::RpcInboundRequest,
+    ) -> chat::ElicitationRouting {
+        self.inner.try_install_elicitation(request)
+    }
+
+    pub(crate) fn note_elicitation_drop(&mut self) {
+        self.inner.note_elicitation_drop();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_session_for_test(&mut self, session_id: &str) {
+        self.inner.activate_session_for_test(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_transcript_drag_for_test(&mut self, move_pointer: bool) {
+        self.inner.begin_transcript_drag_for_test(move_pointer);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcript_selected_text_for_test(&self) -> Option<String> {
+        self.inner.transcript_selected_text_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_elicitation_for_test(&self) -> bool {
+        self.inner.has_pending_elicitation_for_test()
+    }
+
+    pub(crate) async fn focus_session(&mut self, session_id: &str) -> bool {
+        self.inner.focus_session(session_id).await
+    }
+
+    pub(crate) fn finish_transcript_drag_if_released(&mut self, mouse: &MouseEvent) {
+        self.inner.finish_transcript_drag_if_released(mouse);
+    }
+
+    pub(crate) async fn add_agent_session(&mut self, agent_alias: &str) {
+        self.inner.add_agent_session(agent_alias).await;
+    }
+
+    /// Close one tracked Code session while preserving its durable history.
+    pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
+        self.inner.close_session(session_id).await
     }
 
     pub(crate) async fn refresh_if_inactive(&mut self) {
         self.inner.refresh_if_inactive().await;
     }
 
-    pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        self.inner.draw(frame, area);
+    pub(crate) fn tick_transport_events(&mut self) {
+        self.inner.tick_transport_events();
+    }
+
+    pub(crate) fn draw_with_dock(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        queue_area: Option<Rect>,
+        plan_area: Option<Rect>,
+    ) {
+        self.inner
+            .draw_with_dock(frame, area, queue_area, plan_area);
+    }
+
+    pub(crate) fn draw_dock_overlay(&self, frame: &mut ratatui::Frame) {
+        self.inner.draw_dock_overlay(frame);
+    }
+
+    pub(crate) fn context_menu_open(&self) -> bool {
+        self.inner.context_menu_open()
+    }
+
+    pub(crate) async fn handle_queue_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+        self.inner.handle_queue_mouse(mouse, area).await;
+    }
+
+    pub(crate) async fn handle_context_menu_mouse(&mut self, mouse: MouseEvent) -> bool {
+        self.inner.handle_context_menu_mouse(mouse).await
+    }
+
+    pub(crate) fn plan_visible(&self) -> bool {
+        self.inner.plan_visible()
+    }
+
+    pub(crate) fn current_session_id(&self) -> Option<&str> {
+        self.inner.current_session_id()
+    }
+
+    pub(crate) fn set_plan_visible(&mut self, visible: bool) {
+        self.inner.set_plan_visible(visible);
+    }
+
+    pub(crate) fn take_plan_toggle_request(&mut self) -> bool {
+        self.inner.take_plan_toggle_request()
     }
 
     pub(crate) async fn handle_key(
@@ -70,12 +174,20 @@ impl Acp {
         self.inner.in_browse_mode()
     }
 
-    pub(crate) fn wants_quit_chord(&self) -> bool {
-        self.inner.wants_quit_chord()
+    pub(crate) fn wants_quit_chord(&self, key: &KeyEvent) -> bool {
+        self.inner.wants_quit_chord(key)
+    }
+
+    pub(crate) fn copy_composer_selection(&self, key: &KeyEvent) -> bool {
+        self.inner.copy_composer_selection(key)
     }
 
     pub(crate) fn take_help_request(&mut self) -> bool {
         self.inner.take_help_request()
+    }
+
+    pub(crate) fn take_add_session_request(&mut self) -> bool {
+        self.inner.take_add_session_request()
     }
 
     pub(crate) fn exit_browse_mode(&mut self) {
@@ -90,7 +202,7 @@ impl Acp {
         self.inner.handle_paste(text);
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<String>, Option<u64>, Option<u64>) {
         self.inner.ctx_tokens()
     }
 
@@ -100,6 +212,10 @@ impl Acp {
 
     pub(crate) fn current_cwd(&self) -> Option<&str> {
         self.inner.current_cwd()
+    }
+
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        self.inner.info_message()
     }
 }
 

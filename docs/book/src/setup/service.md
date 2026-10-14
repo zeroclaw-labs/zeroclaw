@@ -150,7 +150,7 @@ launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 
 </div>
 
-Logs go to `<config-dir>/logs/` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `~/.zeroclaw/logs/`). Homebrew installs write to `$HOMEBREW_PREFIX/var/zeroclaw/logs/` instead. Each launchd capture file retains recent output within an 8 MiB bound. Reinstall and restart the service after upgrading so the generated LaunchAgent uses bounded capture.
+Logs go to `<config-dir>/logs/` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `~/.zeroclaw/logs/`). Homebrew installs write to `$HOMEBREW_PREFIX/var/zeroclaw/logs/` instead. Each launchd capture file retains recent output within an 8 MiB bound. Reinstall and restart the service after upgrading so the generated LaunchAgent uses bounded capture. `zeroclaw service logs` tails whichever of the two files hold output, so a daemon that only writes to stdout still shows up; `--follow` watches both, so a failure written to `daemon.stderr.log` after startup still reaches a running viewer. When more than one file is shown, `tail` labels each block with a `==> path <==` header.
 
 ### Homebrew-managed
 
@@ -176,11 +176,12 @@ Don't mix `zeroclaw service` CLI commands with `brew services`, pick one. Both e
 
 - Trigger: at logon (`/SC ONLOGON`)
 - Run level: `LIMITED` (runs as the current user, not elevated)
-- Action: runs the install wrapper `zeroclaw-daemon.cmd`, which launches `zeroclaw daemon`
+- Action: runs `zeroclaw.exe --config-dir <config-dir> service run-windows-daemon` directly; the internal runner owns the daemon child and its output capture
+- Window: Windows currently attaches an empty console window to this interactive scheduled task. Leave it open while the service runs; closing it may stop the runner and daemon. Background launch without that window is tracked in [#10991](https://github.com/zeroclaw-labs/zeroclaw/issues/10991).
 
 Verify in Task Scheduler GUI (`taskschd.msc`) under Task Scheduler Library → ZeroClaw Daemon.
 
-Logs go to `<config-dir>\logs\` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `%USERPROFILE%\.zeroclaw\logs\`):
+Logs go to `<config-dir>\logs\` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `%USERPROFILE%\.zeroclaw\logs\`). Each file retains recent output within an 8 MiB bound. To replace an existing task, including an older `.cmd` wrapper or this direct runner, first run `schtasks /Change /TN "ZeroClaw Daemon" /Disable`, reboot Windows, then run `zeroclaw service install`. Installation refuses to replace a task in any state except Disabled because Task Scheduler's Ready state does not prove that its processes exited; `zeroclaw service stop` alone is insufficient. The installer checks that the task is Disabled but cannot verify that Windows rebooted, so complete that step before reinstalling. The old wrapper file may remain but is no longer used. The runner requires the config root and capture files to belong to the task account and rejects reparse-point paths while restricting their ACLs. Task Scheduler action paths containing literal `%` signs are not supported. `zeroclaw service logs` prints whichever of the two files hold output, and `--follow` shows the others first and then streams `daemon.stdout.log`, or `daemon.stderr.log` when only that file holds output, because `Get-Content -Wait` tracks a single path. To read one directly:
 
 <div class="os-tabs-src">
 

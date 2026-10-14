@@ -88,11 +88,7 @@ impl Channel for WeComChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("WeCom webhook send failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "WeCom webhook send").await?;
 
         // WeCom returns {"errcode":0,"errmsg":"ok"} on success.
         let result: serde_json::Value = resp.json().await?;

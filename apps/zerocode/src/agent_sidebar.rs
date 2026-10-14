@@ -1,0 +1,1054 @@
+//! Shell-level agent sidebar: every session the chat-like panes track, with
+//! live status dots, `+`/`-` session controls, and the Quickstart
+//! launcher at the bottom.
+//!
+//! The sidebar owns only widget state (scroll, hit rects,
+//! picker). Session rows are derived per frame from the panes'
+//! `session_summaries()` — the panes stay the single source of truth.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
+use tokio::sync::mpsc;
+
+use crate::chat::{PaneKind, SidebarSessionSummary, SidebarStatus};
+use crate::client::RpcClient;
+use crate::i18n::{t, t_args};
+use crate::keymap::ModalAction;
+use crate::{mouse, theme, widgets};
+
+/// Minimum columns the main content keeps; below this the sidebar auto-skips
+/// for the frame instead of squeezing the pane.
+pub(crate) const CONTENT_MIN_COLS: u16 = 40;
+/// Row width at which the right-aligned pane tag is shown.
+const PANE_TAG_MIN_COLS: u16 = 16;
+
+/// Per-frame shell context the sidebar renders against.
+pub(crate) struct SidebarCtx {
+    /// The chat-like pane the current mode maps to, if any.
+    pub active_pane: Option<PaneKind>,
+    pub quickstart_active: bool,
+    pub connected: bool,
+}
+
+/// A user action the shell must route (mode switch + pane call).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SidebarEvent {
+    FocusSession { pane: PaneKind, session_id: String },
+    CloseSession { pane: PaneKind, session_id: String },
+    OpenPicker,
+    PickAgent { pane: PaneKind, alias: String },
+    OpenQuickstart,
+}
+
+/// The `+` agent picker modal.
+struct SidebarPicker {
+    /// Pane a pick adds to, captured when the picker opened.
+    target: PaneKind,
+    /// Display labels (alias + open-marker suffix), parallel to `aliases`.
+    state: widgets::PickerState,
+    aliases: Vec<String>,
+    /// Informational only: selecting an open alias still creates a new session.
+    open_aliases: HashSet<String>,
+    loading: bool,
+    error: Option<String>,
+    rx: mpsc::UnboundedReceiver<Result<Vec<String>, String>>,
+    double_click: mouse::DoubleClickTracker,
+    /// Recorded at draw for click routing.
+    modal_rect: Rect,
+}
+
+impl SidebarPicker {
+    fn selectable(&self) -> bool {
+        !self.loading && self.error.is_none() && !self.aliases.is_empty()
+    }
+
+    /// The rows the modal shows: real aliases, or a single status row.
+    fn display_items(&self) -> Vec<String> {
+        if self.loading {
+            vec![t("zc-sidebar-picker-loading")]
+        } else if let Some(ref e) = self.error {
+            vec![t_args("zc-sidebar-picker-error", &[("error", e)])]
+        } else if self.aliases.is_empty() {
+            vec![t("zc-sidebar-picker-empty")]
+        } else {
+            self.state.items.clone()
+        }
+    }
+}
+
+pub(crate) struct AgentSidebar {
+    /// Scroll offset into the session rows.
+    scroll: u16,
+    // Geometry recorded by draw, read by the mouse handler (repo convention:
+    // draw records, mouse reads). All `Rect::default()` while hidden.
+    area: Rect,
+    minus_rect: Rect,
+    /// The focused session in the active pane, captured during the last draw.
+    minus_target: Option<(PaneKind, String)>,
+    plus_rect: Rect,
+    quickstart_rect: Rect,
+    row_rects: Vec<(PaneKind, String, Rect)>,
+    row_close_rects: Vec<(PaneKind, String, Rect)>,
+    picker: Option<SidebarPicker>,
+}
+
+impl AgentSidebar {
+    pub(crate) fn new() -> Self {
+        Self {
+            scroll: 0,
+            area: Rect::default(),
+            minus_rect: Rect::default(),
+            minus_target: None,
+            plus_rect: Rect::default(),
+            quickstart_rect: Rect::default(),
+            row_rects: Vec::new(),
+            row_close_rects: Vec::new(),
+            picker: None,
+        }
+    }
+
+    pub(crate) fn picker_open(&self) -> bool {
+        self.picker.is_some()
+    }
+
+    pub(crate) fn close_picker(&mut self) {
+        self.picker = None;
+    }
+
+    /// Whether `(col, row)` falls inside the sidebar panel (not the picker).
+    pub(crate) fn contains(&self, col: u16, row: u16) -> bool {
+        self.area.width > 0 && mouse::in_rect(col, row, self.area)
+    }
+
+    /// Invalidate panel hit targets when the shell hides or relocates Sessions.
+    /// Scroll and picker lifecycle are deliberately preserved.
+    pub(crate) fn clear_geometry(&mut self) {
+        self.area = Rect::default();
+        self.minus_rect = Rect::default();
+        self.minus_target = None;
+        self.plus_rect = Rect::default();
+        self.quickstart_rect = Rect::default();
+        self.row_rects.clear();
+        self.row_close_rects.clear();
+    }
+
+    /// Render the sidebar into the shell-provided `area`,
+    /// recording hit rects for the mouse handler.
+    pub(crate) fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        rows: &[SidebarSessionSummary],
+        ctx: &SidebarCtx,
+    ) {
+        self.clear_geometry();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        self.area = area;
+        frame.render_widget(Clear, area);
+        let block = theme::panel_block(&t("zc-sidebar-title")).style(theme::fill_style());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // The session controls live on the top border. `-` targets only the
+        // visibly focused session in the active pane; the shell still gates
+        // both actions while disconnected.
+        self.minus_target = rows
+            .iter()
+            .find(|summary| summary.focused && ctx.active_pane == Some(summary.pane_kind))
+            .map(|summary| (summary.pane_kind, summary.session_id.clone()));
+        if area.width >= 10 {
+            let minus = Rect {
+                x: area.x + area.width - 8,
+                y: area.y,
+                width: 3,
+                height: 1,
+            };
+            let minus_style = if ctx.connected && self.minus_target.is_some() {
+                theme::accent_style()
+            } else {
+                theme::dim_style()
+            };
+            frame.render_widget(Paragraph::new(Span::styled("[-]", minus_style)), minus);
+            self.minus_rect = minus;
+        }
+        if area.width >= 6 {
+            let plus = Rect {
+                x: area.x + area.width - 4,
+                y: area.y,
+                width: 3,
+                height: 1,
+            };
+            let plus_style = if ctx.connected {
+                theme::accent_style()
+            } else {
+                theme::dim_style()
+            };
+            frame.render_widget(Paragraph::new(Span::styled("[+]", plus_style)), plus);
+            self.plus_rect = plus;
+        }
+
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        // Bottom of the panel: separator + Quickstart launcher row.
+        let quickstart_rows = u16::from(inner.height >= 1) + u16::from(inner.height >= 2);
+        let rows_area = Rect {
+            height: inner.height - quickstart_rows,
+            ..inner
+        };
+
+        self.draw_session_rows(frame, rows_area, rows, ctx);
+
+        if quickstart_rows == 2 {
+            let sep = Rect {
+                y: inner.y + inner.height - 2,
+                height: 1,
+                ..inner
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(inner.width as usize),
+                    theme::dim_style(),
+                )),
+                sep,
+            );
+        }
+        if quickstart_rows >= 1 {
+            let qs = Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            };
+            let style = if ctx.quickstart_active {
+                theme::selected_style()
+            } else {
+                theme::accent_style()
+            };
+            let label = widgets::truncate_to_width(
+                &format!("\u{bb} {}", t("zc-pane-quickstart")),
+                qs.width as usize,
+            );
+            frame.render_widget(Paragraph::new(Span::styled(label, style)), qs);
+            self.quickstart_rect = qs;
+        }
+    }
+
+    fn draw_session_rows(
+        &mut self,
+        frame: &mut Frame,
+        rows_area: Rect,
+        rows: &[SidebarSessionSummary],
+        ctx: &SidebarCtx,
+    ) {
+        if rows_area.height == 0 {
+            self.scroll = 0;
+            return;
+        }
+        if rows.is_empty() {
+            self.scroll = 0;
+            let hint = Rect {
+                y: rows_area.y + rows_area.height / 2,
+                height: 1,
+                ..rows_area
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    widgets::truncate_to_width(&t("zc-sidebar-empty"), hint.width as usize),
+                    theme::dim_style(),
+                ))
+                .centered(),
+                hint,
+            );
+            return;
+        }
+
+        let visible = rows_area.height as usize;
+        let max_scroll = rows.len().saturating_sub(visible) as u16;
+        self.scroll = self.scroll.min(max_scroll);
+
+        for (i, summary) in rows
+            .iter()
+            .skip(self.scroll as usize)
+            .take(visible)
+            .enumerate()
+        {
+            let row_rect = Rect {
+                y: rows_area.y + i as u16,
+                height: 1,
+                ..rows_area
+            };
+            let focused_here = summary.focused && ctx.active_pane == Some(summary.pane_kind);
+            let row_style = if focused_here {
+                theme::selection_highlight(true, true)
+            } else if summary.focused {
+                theme::selection_highlight(false, true)
+            } else {
+                Style::default()
+            };
+
+            // Every row shows the dim pane tag when the sidebar is wide enough.
+            // The row body changes focus; the right-edge `✕` closes that row's
+            // session without changing focus first.
+            let tag = if row_rect.width >= PANE_TAG_MIN_COLS {
+                let label = match summary.pane_kind {
+                    PaneKind::Chat => t("zc-pane-chat"),
+                    PaneKind::Acp => t("zc-pane-code"),
+                };
+                Some(label)
+            } else {
+                None
+            };
+            let tag_width = tag
+                .as_ref()
+                .map(|s| crate::display_width::display_width(s) + 1)
+                .unwrap_or(0);
+
+            // Right-edge per-row close affordance (`✕`), restored alongside the
+            // Sessions-header `[-]` so a specific session can be closed without
+            // focusing it first. Skipped only when the row is too narrow.
+            let close_w: u16 = if row_rect.width >= 6 { 2 } else { 0 };
+            let content_rect = Rect {
+                width: row_rect.width.saturating_sub(close_w),
+                ..row_rect
+            };
+
+            let name_width = (content_rect.width as usize).saturating_sub(2 + tag_width);
+            let duplicate = rows
+                .iter()
+                .filter(|row| row.agent_alias == summary.agent_alias)
+                .count()
+                > 1;
+            let name = if duplicate {
+                let ordinal = rows
+                    .iter()
+                    .take(self.scroll as usize + i + 1)
+                    .filter(|row| row.agent_alias == summary.agent_alias)
+                    .count();
+                let suffix = format!(" #{ordinal}");
+                format!(
+                    "{}{}",
+                    widgets::truncate_to_width(
+                        &summary.agent_alias,
+                        name_width.saturating_sub(suffix.len())
+                    ),
+                    suffix
+                )
+            } else {
+                widgets::truncate_to_width(&summary.agent_alias, name_width)
+            };
+            let pad = name_width.saturating_sub(crate::display_width::display_width(&name));
+
+            let status_glyph = match summary.status {
+                SidebarStatus::Running => "\u{25b6} ",
+                _ => "\u{25cf} ",
+            };
+            let mut spans = vec![
+                Span::styled(status_glyph, status_style(summary.status)),
+                Span::styled(name, theme::body_style()),
+            ];
+            if let Some(label) = tag {
+                spans.push(Span::raw(" ".repeat(pad + 1)));
+                spans.push(Span::styled(label, theme::dim_style()));
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).style(row_style),
+                content_rect,
+            );
+            self.row_rects
+                .push((summary.pane_kind, summary.session_id.clone(), row_rect));
+            if close_w > 0 {
+                let close_rect = Rect {
+                    x: content_rect.x + content_rect.width,
+                    y: row_rect.y,
+                    width: close_w,
+                    height: 1,
+                };
+                let close_style = if focused_here {
+                    theme::selection_highlight(true, true)
+                } else {
+                    theme::dim_style()
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled("\u{2715}", close_style)),
+                    close_rect,
+                );
+                self.row_close_rects.push((
+                    summary.pane_kind,
+                    summary.session_id.clone(),
+                    close_rect,
+                ));
+            }
+        }
+    }
+
+    /// Render the `+` picker modal (drawn above the panes, below the help
+    /// overlay). Records the modal rect for click routing.
+    pub(crate) fn draw_picker(&mut self, frame: &mut Frame, screen: Rect) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let title = t("zc-sidebar-picker-title");
+        let items = picker.display_items();
+        let cursor = if picker.selectable() {
+            picker.state.cursor
+        } else {
+            usize::MAX // no highlighted row for status-only content
+        };
+        picker.modal_rect =
+            widgets::PickerModal::area_for(&title, &items, screen).unwrap_or_default();
+        widgets::PickerModal::new(&title, &items, cursor).render(frame, screen);
+    }
+
+    /// Open the picker targeting `pane`, spawning a background agent fetch.
+    /// `open_aliases` marks aliases already open without changing launch behavior.
+    pub(crate) fn open_picker(
+        &mut self,
+        target: PaneKind,
+        open_aliases: HashSet<String>,
+        rpc: &Arc<RpcClient>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let rpc = Arc::clone(rpc);
+        tokio::spawn(async move {
+            let result = match rpc.agents_status().await {
+                Ok(result) => Ok(result
+                    .agents
+                    .into_iter()
+                    .filter(|a| a.enabled)
+                    .map(|a| a.alias)
+                    .collect::<Vec<_>>()),
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(result);
+        });
+        self.picker = Some(SidebarPicker {
+            target,
+            state: widgets::PickerState::default(),
+            aliases: Vec::new(),
+            open_aliases,
+            loading: true,
+            error: None,
+            rx,
+            double_click: mouse::DoubleClickTracker::new(),
+            modal_rect: Rect::default(),
+        });
+    }
+
+    /// Drain the background agent fetch, if one is pending. Called once per
+    /// tick from the app loop.
+    pub(crate) fn drain_picker_fetch(&mut self) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        if !picker.loading {
+            return;
+        }
+        match picker.rx.try_recv() {
+            Ok(Ok(aliases)) => {
+                picker.loading = false;
+                let open_suffix = t("zc-sidebar-picker-open-suffix");
+                let labels = aliases
+                    .iter()
+                    .map(|alias| {
+                        if picker.open_aliases.contains(alias) {
+                            format!("{alias} {open_suffix}")
+                        } else {
+                            alias.clone()
+                        }
+                    })
+                    .collect();
+                picker.aliases = aliases;
+                picker.state = widgets::PickerState::new(labels, None);
+            }
+            Ok(Err(e)) => {
+                picker.loading = false;
+                picker.error = Some(e);
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                picker.loading = false;
+                picker.error = Some(t("zc-sidebar-picker-disconnected"));
+            }
+        }
+    }
+
+    /// Keys while the picker is open. Returns an event on confirm; `Cancel`
+    /// and confirms on status-only content close the picker.
+    pub(crate) fn handle_picker_key(&mut self, key: &KeyEvent) -> Option<SidebarEvent> {
+        let picker = self.picker.as_mut()?;
+        match ModalAction::from_chord(key) {
+            Some(ModalAction::Up) => {
+                picker.state.move_up();
+                None
+            }
+            Some(ModalAction::Down) => {
+                picker.state.move_down();
+                None
+            }
+            Some(ModalAction::Confirm) => {
+                let event = Self::picker_confirm(picker);
+                self.picker = None;
+                event
+            }
+            Some(ModalAction::Cancel) => {
+                self.picker = None;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn picker_confirm(picker: &SidebarPicker) -> Option<SidebarEvent> {
+        if !picker.selectable() {
+            return None;
+        }
+        let alias = picker.aliases.get(picker.state.cursor)?.clone();
+        Some(SidebarEvent::PickAgent {
+            pane: picker.target,
+            alias,
+        })
+    }
+
+    /// Mouse routing. The app forwards events here when the picker is open
+    /// or the click falls inside the sidebar area.
+    pub(crate) fn handle_mouse(&mut self, mouse: &MouseEvent) -> Option<SidebarEvent> {
+        if self.picker.is_some() {
+            return self.handle_picker_mouse(mouse);
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let (col, row) = (mouse.column, mouse.row);
+                if mouse::in_rect(col, row, self.minus_rect)
+                    && let Some((pane, session_id)) = self.minus_target.clone()
+                {
+                    return Some(SidebarEvent::CloseSession { pane, session_id });
+                }
+                if mouse::in_rect(col, row, self.plus_rect) {
+                    return Some(SidebarEvent::OpenPicker);
+                }
+                if mouse::in_rect(col, row, self.quickstart_rect) {
+                    return Some(SidebarEvent::OpenQuickstart);
+                }
+                // A per-row `✕` closes that specific session; the rest of
+                // the row only moves focus.
+                for (pane, sid, rect) in &self.row_close_rects {
+                    if mouse::in_rect(col, row, *rect) {
+                        return Some(SidebarEvent::CloseSession {
+                            pane: *pane,
+                            session_id: sid.clone(),
+                        });
+                    }
+                }
+                for (pane, sid, rect) in &self.row_rects {
+                    if mouse::in_rect(col, row, *rect) {
+                        return Some(SidebarEvent::FocusSession {
+                            pane: *pane,
+                            session_id: sid.clone(),
+                        });
+                    }
+                }
+                None
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(1);
+                None
+            }
+            MouseEventKind::ScrollDown => {
+                // Clamped against the row count on the next draw.
+                self.scroll = self.scroll.saturating_add(1);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_picker_mouse(&mut self, mouse: &MouseEvent) -> Option<SidebarEvent> {
+        let picker = self.picker.as_mut()?;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let (col, row) = (mouse.column, mouse.row);
+                if !mouse::in_rect(col, row, picker.modal_rect) {
+                    self.picker = None;
+                    return None;
+                }
+                if !picker.selectable() {
+                    return None;
+                }
+                if let Some(idx) =
+                    mouse::list_click_index(row, picker.modal_rect, 0, picker.aliases.len())
+                {
+                    picker.state.cursor = idx;
+                    if picker.double_click.click(col, row) {
+                        let event = Self::picker_confirm(picker);
+                        self.picker = None;
+                        return event;
+                    }
+                }
+                None
+            }
+            MouseEventKind::ScrollUp => {
+                picker.state.move_up();
+                None
+            }
+            MouseEventKind::ScrollDown => {
+                picker.state.move_down();
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+fn status_style(status: SidebarStatus) -> Style {
+    match status {
+        SidebarStatus::Ready => theme::status_ready_style(),
+        SidebarStatus::Running => theme::status_running_style(),
+        SidebarStatus::NeedsHuman => theme::status_attention_style(),
+        SidebarStatus::Errored => theme::status_error_style(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseEventKind};
+
+    fn sidebar() -> AgentSidebar {
+        AgentSidebar {
+            scroll: 0,
+            area: Rect::default(),
+            minus_rect: Rect::default(),
+            minus_target: None,
+            plus_rect: Rect::default(),
+            quickstart_rect: Rect::default(),
+            row_rects: Vec::new(),
+            row_close_rects: Vec::new(),
+            picker: None,
+        }
+    }
+
+    fn summary(alias: &str, sid: &str, focused: bool) -> SidebarSessionSummary {
+        SidebarSessionSummary {
+            session_id: sid.into(),
+            agent_alias: alias.into(),
+            message_count: 0,
+            status: SidebarStatus::Ready,
+            pane_kind: PaneKind::Chat,
+            focused,
+        }
+    }
+
+    fn click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn draw_records_row_controls_and_quickstart_rects() {
+        let mut s = sidebar();
+        let area = Rect::new(0, 1, 24, 12);
+        let rows = vec![summary("alpha", "s1", true), summary("beta", "s2", false)];
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 14);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| s.draw(frame, area, &rows, &ctx)).unwrap();
+
+        assert_eq!(s.row_rects.len(), 2);
+        assert!(s.minus_rect.width > 0, "minus affordance recorded");
+        assert!(s.plus_rect.width > 0, "plus affordance recorded");
+        assert!(s.quickstart_rect.width > 0, "quickstart row recorded");
+
+        // Click routing through the recorded rects. Every row cell, including
+        // the trailing tag cells, only focuses its session.
+        let (_, sid, row2) = s.row_rects[1].clone();
+        assert_eq!(
+            s.handle_mouse(&click(row2.x + 1, row2.y)),
+            Some(SidebarEvent::FocusSession {
+                pane: PaneKind::Chat,
+                session_id: sid,
+            })
+        );
+        let (focused_pane, focused_sid, focused_row) = s.row_rects[0].clone();
+        assert_eq!((focused_pane, focused_sid.as_str()), (PaneKind::Chat, "s1"));
+        let (_, _, close_rect) = s.row_close_rects[0].clone();
+        for x in focused_row.x..close_rect.x {
+            assert_eq!(
+                s.handle_mouse(&click(x, focused_row.y)),
+                Some(SidebarEvent::FocusSession {
+                    pane: PaneKind::Chat,
+                    session_id: "s1".into(),
+                }),
+                "row body cell must only focus (column {x})"
+            );
+        }
+        assert_eq!(
+            s.handle_mouse(&click(close_rect.x, close_rect.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Chat,
+                session_id: "s1".into(),
+            }),
+            "the per-row close affordance must close the focused session"
+        );
+        assert_eq!(
+            s.handle_mouse(&click(s.minus_rect.x, s.minus_rect.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Chat,
+                session_id: "s1".into(),
+            })
+        );
+        assert_eq!(
+            s.handle_mouse(&click(s.plus_rect.x, s.plus_rect.y)),
+            Some(SidebarEvent::OpenPicker)
+        );
+        assert_eq!(
+            s.handle_mouse(&click(s.quickstart_rect.x, s.quickstart_rect.y)),
+            Some(SidebarEvent::OpenQuickstart)
+        );
+    }
+
+    #[test]
+    fn minus_targets_the_focused_session_in_the_active_pane() {
+        let mut sidebar = sidebar();
+        let area = Rect::new(0, 0, 24, 10);
+        let chat = summary("chat-agent", "chat-session", true);
+        let mut code = summary("code-agent", "code-session", true);
+        code.pane_kind = PaneKind::Acp;
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Acp),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &[chat, code], &ctx))
+            .unwrap();
+
+        assert_eq!(
+            sidebar.handle_mouse(&click(sidebar.minus_rect.x, sidebar.minus_rect.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Acp,
+                session_id: "code-session".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_alias_rows_have_distinct_labels_and_session_targets() {
+        let mut sidebar = sidebar();
+        let area = Rect::new(0, 0, 24, 10);
+        let rows = vec![summary("alpha", "s1", true), summary("alpha", "s2", false)];
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        for (idx, (_, sid, rect)) in sidebar.row_rects.clone().into_iter().enumerate() {
+            let text: String = (rect.x..rect.right())
+                .map(|x| term.backend().buffer()[(x, rect.y)].symbol())
+                .collect();
+            assert!(text.contains(&format!("alpha #{}", idx + 1)), "{text}");
+            assert_eq!(
+                sidebar.handle_mouse(&click(rect.x + 1, rect.y)),
+                Some(SidebarEvent::FocusSession {
+                    pane: PaneKind::Chat,
+                    session_id: sid,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn shell_draw_and_clear_invalidate_stale_panel_targets() {
+        let mut sidebar = sidebar();
+        let rows = vec![summary("alpha", "s1", true)];
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let area = Rect::new(70, 0, 30, 12);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        let old_targets = [
+            sidebar.plus_rect,
+            sidebar.quickstart_rect,
+            sidebar.row_rects[0].2,
+            sidebar.row_close_rects[0].2,
+        ];
+        sidebar.scroll = 3;
+        sidebar.clear_geometry();
+        assert_eq!(sidebar.scroll, 3);
+        assert!(!sidebar.contains(area.x, area.y));
+        for rect in old_targets {
+            assert_eq!(sidebar.handle_mouse(&click(rect.x, rect.y)), None);
+        }
+
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        assert!(sidebar.contains(area.x, area.y));
+        assert!(!sidebar.row_close_rects.is_empty());
+        // A smaller shell rectangle must invalidate the previous hit targets.
+        term.draw(|frame| sidebar.draw(frame, Rect::new(0, 0, 4, 1), &[], &ctx))
+            .unwrap();
+        assert!(sidebar.row_rects.is_empty());
+        assert!(sidebar.row_close_rects.is_empty());
+        assert_eq!(sidebar.plus_rect, Rect::default());
+        assert_eq!(sidebar.quickstart_rect, Rect::default());
+        for rect in old_targets {
+            assert_eq!(sidebar.handle_mouse(&click(rect.x, rect.y)), None);
+        }
+        term.draw(|frame| sidebar.draw(frame, Rect::new(0, 0, 30, 0), &rows, &ctx))
+            .unwrap();
+        assert_eq!(sidebar.area, Rect::default());
+    }
+
+    #[test]
+    fn running_row_is_explicit_without_showing_count_or_losing_close_target() {
+        let mut sidebar = sidebar();
+        let area = Rect::new(0, 0, crate::config::SIDEBAR_WIDTH_MIN, 8);
+        let mut row = summary("long-agent-name", "s1", true);
+        row.status = SidebarStatus::Running;
+        row.message_count = 42;
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            crate::config::SIDEBAR_WIDTH_MIN + CONTENT_MIN_COLS,
+            8,
+        ))
+        .unwrap();
+
+        term.draw(|frame| sidebar.draw(frame, area, &[row], &ctx))
+            .unwrap();
+
+        let (_, _, rect) = sidebar.row_rects[0].clone();
+        let text: String = (rect.x..rect.right())
+            .map(|x| term.backend().buffer()[(x, rect.y)].symbol())
+            .collect();
+        assert!(
+            text.contains("\u{25b6}"),
+            "running state must not rely on color: {text}"
+        );
+        assert!(
+            !text.contains("(42)"),
+            "message counts are not session identity: {text}"
+        );
+        // The trailing close affordance closes the running session; the row
+        // body still only focuses.
+        let (_, _, row) = sidebar.row_rects[0].clone();
+        let (_, _, close_rect) = sidebar.row_close_rects[0].clone();
+        assert_eq!(
+            sidebar.handle_mouse(&click(close_rect.x, close_rect.y)),
+            Some(SidebarEvent::CloseSession {
+                pane: PaneKind::Chat,
+                session_id: "s1".into(),
+            })
+        );
+        assert_eq!(
+            sidebar.handle_mouse(&click(row.x, row.y)),
+            Some(SidebarEvent::FocusSession {
+                pane: PaneKind::Chat,
+                session_id: "s1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn every_row_exposes_a_close_target_alongside_focus() {
+        // Every row regained a clickable close affordance (alongside the
+        // Sessions-header `[-]`), so a specific session can be closed without
+        // focusing it first. The rest of each row still only moves focus.
+        let mut sidebar = sidebar();
+        let area = Rect::new(0, 0, crate::config::SIDEBAR_WIDTH_MAX, 10);
+        let mut running = summary("running-agent", "s-running", true);
+        running.status = SidebarStatus::Running;
+        let rows = vec![
+            running,
+            summary("idle-agent", "s-idle", false),
+            summary("other-pane", "s-acp", false),
+        ];
+        let ctx = SidebarCtx {
+            active_pane: Some(PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            crate::config::SIDEBAR_WIDTH_MAX + CONTENT_MIN_COLS,
+            10,
+        ))
+        .unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+
+        // Every row - including the focused running one - exposes a close target.
+        let mut focused_close_seen = false;
+        for (pane, sid, rect) in sidebar.row_close_rects.clone().iter() {
+            match sidebar.handle_mouse(&click(rect.x, rect.y)) {
+                Some(SidebarEvent::CloseSession {
+                    pane: hit_pane,
+                    session_id,
+                }) => {
+                    assert_eq!(hit_pane, *pane, "{sid} close hit the wrong pane");
+                    assert_eq!(session_id, *sid, "{sid} close hit the wrong session");
+                    if sid == "s-running" {
+                        focused_close_seen = true;
+                    }
+                }
+                other => panic!("close target for {sid} produced {other:?}"),
+            }
+        }
+        assert_eq!(
+            sidebar.row_close_rects.len(),
+            rows.len(),
+            "every row must expose a close target"
+        );
+        assert!(
+            focused_close_seen,
+            "the focused running row must expose a close target"
+        );
+
+        // The row body still only focuses.
+        for (pane, sid, rect) in sidebar.row_rects.clone().iter() {
+            match sidebar.handle_mouse(&click(rect.x, rect.y)) {
+                Some(SidebarEvent::FocusSession {
+                    pane: hit_pane,
+                    session_id,
+                }) => {
+                    assert_eq!(hit_pane, *pane, "{sid} body hit the wrong pane");
+                    assert_eq!(session_id, *sid, "{sid} body hit the wrong session");
+                }
+                other => panic!("row body for {sid} produced {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_clamps_to_row_overflow() {
+        let mut s = sidebar();
+        let area = Rect::new(0, 0, 24, 6);
+        // inner height 4 => rows area 2 (separator + quickstart take 2).
+        let rows: Vec<_> = (0..5)
+            .map(|i| summary(&format!("a{i}"), &format!("s{i}"), false))
+            .collect();
+        let ctx = SidebarCtx {
+            active_pane: None,
+            quickstart_active: false,
+            connected: true,
+        };
+        s.scroll = 99;
+        let backend = ratatui::backend::TestBackend::new(100, 6);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| s.draw(frame, area, &rows, &ctx)).unwrap();
+        assert_eq!(s.scroll, 3, "scroll clamps to rows.len() - visible");
+        assert_eq!(s.row_rects.len(), 2);
+        assert_eq!(s.row_rects[0].1, "s3", "clamped scroll shows the tail");
+    }
+
+    #[tokio::test]
+    async fn picker_labels_mark_open_aliases_but_confirm_creates_a_session() {
+        let mut s = sidebar();
+        let (tx, rx) = mpsc::unbounded_channel();
+        s.picker = Some(SidebarPicker {
+            target: PaneKind::Chat,
+            state: widgets::PickerState::default(),
+            aliases: Vec::new(),
+            open_aliases: HashSet::from(["alpha".to_string()]),
+            loading: true,
+            error: None,
+            rx,
+            double_click: mouse::DoubleClickTracker::new(),
+            modal_rect: Rect::default(),
+        });
+        tx.send(Ok(vec!["alpha".to_string(), "beta".to_string()]))
+            .unwrap();
+        s.drain_picker_fetch();
+
+        let picker = s.picker.as_ref().unwrap();
+        assert!(picker.state.items[0].ends_with(&t("zc-sidebar-picker-open-suffix")));
+        assert_eq!(picker.state.items[1], "beta");
+
+        let confirm = KeyEvent::from(crossterm::event::KeyCode::Enter);
+        let event = s.handle_picker_key(&confirm);
+        assert_eq!(
+            event,
+            Some(SidebarEvent::PickAgent {
+                pane: PaneKind::Chat,
+                alias: "alpha".into(),
+            })
+        );
+        assert!(!s.picker_open(), "confirm closes the picker");
+    }
+
+    #[tokio::test]
+    async fn picker_error_row_is_not_selectable() {
+        let mut s = sidebar();
+        let (tx, rx) = mpsc::unbounded_channel();
+        s.picker = Some(SidebarPicker {
+            target: PaneKind::Acp,
+            state: widgets::PickerState::default(),
+            aliases: Vec::new(),
+            open_aliases: HashSet::new(),
+            loading: true,
+            error: None,
+            rx,
+            double_click: mouse::DoubleClickTracker::new(),
+            modal_rect: Rect::default(),
+        });
+        tx.send(Err("socket closed".to_string())).unwrap();
+        s.drain_picker_fetch();
+
+        let confirm = KeyEvent::from(crossterm::event::KeyCode::Enter);
+        assert_eq!(s.handle_picker_key(&confirm), None);
+        assert!(!s.picker_open(), "confirm on an error row closes");
+    }
+
+    #[test]
+    fn disconnected_picker_fetch_becomes_a_terminal_error_row() {
+        let mut s = sidebar();
+        let (tx, rx) = mpsc::unbounded_channel::<Result<Vec<String>, String>>();
+        s.picker = Some(SidebarPicker {
+            target: PaneKind::Chat,
+            state: widgets::PickerState::default(),
+            aliases: Vec::new(),
+            open_aliases: HashSet::new(),
+            loading: true,
+            error: None,
+            rx,
+            double_click: mouse::DoubleClickTracker::new(),
+            modal_rect: Rect::default(),
+        });
+        drop(tx);
+
+        s.drain_picker_fetch();
+
+        let picker = s.picker.as_ref().unwrap();
+        assert!(!picker.loading);
+        assert_eq!(
+            picker.error.as_deref(),
+            Some(t("zc-sidebar-picker-disconnected").as_str())
+        );
+    }
+}

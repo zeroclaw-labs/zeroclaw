@@ -17,6 +17,13 @@ pub const DEFAULT_BAUD: u32 = 115_200;
 /// Timeout for the ping handshake during device discovery (milliseconds).
 const PING_TIMEOUT_MS: u64 = 300;
 
+fn map_send_timeout(source: tokio::time::error::Elapsed) -> TransportError {
+    TransportError::Timeout {
+        secs: SEND_TIMEOUT_SECS,
+        source,
+    }
+}
+
 /// Allowed serial device path prefixes — reject arbitrary paths for security.
 use crate::util::is_serial_path_allowed as is_path_allowed;
 
@@ -98,7 +105,7 @@ impl Transport for HardwareSerialTransport {
             do_send(&self.port_path, self.baud_rate, &json),
         )
         .await
-        .map_err(|_| TransportError::Timeout(SEND_TIMEOUT_SECS))?
+        .map_err(map_send_timeout)?
     }
 
     fn kind(&self) -> TransportKind {
@@ -252,9 +259,35 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(TransportError::Disconnected | TransportError::Timeout(_))
+                Err(TransportError::Disconnected | TransportError::Timeout { .. })
             ),
             "expected Disconnected or Timeout, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_timeout_mapping_preserves_source_and_classification() {
+        let source = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let err = map_send_timeout(source);
+
+        assert!(matches!(
+            &err,
+            TransportError::Timeout {
+                secs: SEND_TIMEOUT_SECS,
+                ..
+            }
+        ));
+        assert!(
+            std::error::Error::source(&err)
+                .and_then(|source| source.downcast_ref::<tokio::time::error::Elapsed>())
+                .is_some(),
+            "timeout source should remain recoverable"
+        );
+        assert_eq!(
+            err.to_string(),
+            "transport timeout after 5s: deadline has elapsed"
         );
     }
 

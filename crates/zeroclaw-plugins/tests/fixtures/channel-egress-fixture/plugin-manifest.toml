@@ -1,0 +1,26 @@
+# Canonical on-disk manifest for the channel egress component fixture.
+#
+# The channel egress end-to-end test installs this file verbatim as a package's
+# `manifest.toml`, so it doubles as a worked example of the manifest a channel
+# plugin that reaches the network would ship: `http_client` grants the
+# `wasi:http` surface, `config_read` lets the guest read the URL it should call,
+# and the operator's `[[plugins.entries]].egress_hosts` grant (not this file)
+# decides which destinations that surface may actually open.
+name = "channel-egress-fixture"
+version = "0.0.0"
+description = "Channel component fixture that performs one wasi:http egress, for the channel egress integration test."
+wasm_path = "channel-egress-fixture.wasm"
+capabilities = ["channel"]
+permissions = ["config_read", "http_client"]
+
+# The guest issues one outbound GET to the `url` it is configured with, which is
+# what makes the end-to-end test prove that the host-owned egress policy — not
+# construction — decides whether the packet leaves the sandbox.
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+required = ["url"]
+additionalProperties = false
+
+[config_schema.properties.url]
+type = "string"

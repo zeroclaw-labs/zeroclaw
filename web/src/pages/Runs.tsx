@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Activity, ExternalLink, Loader2 } from 'lucide-react';
-import { runStatusBadge, type SopRunSummary } from '@/lib/sops';
+import { Activity, ExternalLink, Loader2, Square } from 'lucide-react';
+import { cancelSop, isTerminalRunStatus, runStatusBadge, type SopRunSummary } from '@/lib/sops';
 import { basePath } from '@/lib/basePath';
 import { getToken } from '@/lib/auth';
 import { formatRelative } from '@/lib/format';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
+import { confirmsCancellation, runsStreamEffect } from './runs.logic';
 
 type RunsFrame =
   | { type: 'snapshot'; runs: SopRunSummary[] }
@@ -29,6 +30,8 @@ export default function Runs() {
   const [ready, setReady] = useState(false);
   const [disabled, setDisabled] = useState(false);
   const [activeOnly, setActiveOnly] = useState(false);
+  const [cancellingIds, setCancellingIds] = useState<Set<string>>(new Set());
+  const [cancelErrors, setCancelErrors] = useState<Map<string, string>>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -59,20 +62,44 @@ export default function Runs() {
         } catch {
           return;
         }
-        if (frame.type === 'snapshot') {
+        const effect = runsStreamEffect(frame.type);
+        if (effect === 'replace' && frame.type === 'snapshot') {
           const next = new Map<string, SopRunSummary>();
           for (const r of frame.runs) next.set(r.run_id, r);
           setRuns(next);
+          setCancelErrors((prev) => {
+            const nextErrors = new Map(prev);
+            for (const run of frame.runs) {
+              if (confirmsCancellation(run.status, isTerminalRunStatus(run.status))) {
+                nextErrors.delete(run.run_id);
+              }
+            }
+            return nextErrors;
+          });
           setReady(true);
-        } else if (frame.type === 'run') {
+        } else if (effect === 'upsert' && frame.type === 'run') {
           setRuns((prev) => {
             const next = new Map(prev);
             next.set(frame.run.run_id, frame.run);
             return next;
           });
-        } else if (frame.type === 'disabled') {
+          if (
+            confirmsCancellation(frame.run.status, isTerminalRunStatus(frame.run.status))
+          ) {
+            setCancelErrors((prev) => {
+              const next = new Map(prev);
+              next.delete(frame.run.run_id);
+              return next;
+            });
+          }
+        } else if (effect === 'disable') {
           setDisabled(true);
           setReady(true);
+        } else if (effect === 'resync') {
+          // The missed frame may be the only terminal transition for a row.
+          // Reconnect so the server sends a fresh authoritative snapshot.
+          setReady(false);
+          ws.close();
         }
       };
     };
@@ -90,6 +117,37 @@ export default function Runs() {
     const list = sortRuns(runs);
     return activeOnly ? list.filter((r) => r.active) : list;
   }, [runs, activeOnly]);
+
+  // Reconcile the row from the HTTP response immediately. The subsequent live
+  // frame remains authoritative, but the operator should see CancelRequested
+  // (or a terminal race winner) without waiting for WebSocket delivery.
+  const handleCancel = useCallback((sopName: string, runId: string) => {
+    setCancellingIds((prev) => new Set(prev).add(runId));
+    setCancelErrors((prev) => {
+      const next = new Map(prev);
+      next.delete(runId);
+      return next;
+    });
+    cancelSop(sopName, runId)
+      .then((result) => {
+        setRuns((prev) => {
+          const next = new Map(prev);
+          next.set(runId, result.run);
+          return next;
+        });
+      })
+      .catch((e: unknown) => {
+        console.error('cancelSop failed', e);
+        setCancelErrors((prev) => new Map(prev).set(runId, t('sops.stop_error')));
+      })
+      .finally(() => {
+        setCancellingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(runId);
+          return next;
+        });
+      });
+  }, []);
 
   return (
     <div className="space-y-4">
@@ -162,13 +220,39 @@ export default function Runs() {
                     {r.run_id.slice(0, 8)}
                   </td>
                   <td className="px-4 py-2.5 text-right">
-                    <Link
-                      to={`/runs/${encodeURIComponent(r.sop_name)}/${encodeURIComponent(r.run_id)}`}
-                      className="inline-flex items-center gap-1 text-xs text-pc-accent hover:underline"
-                    >
-                      {t('runs.open')}
-                      <ExternalLink className="h-3 w-3" aria-hidden />
-                    </Link>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      {!isTerminalRunStatus(r.status) ? (
+                        <button
+                          type="button"
+                          disabled={
+                            cancellingIds.has(r.run_id) || r.status === 'cancel_requested'
+                          }
+                          onClick={() => handleCancel(r.sop_name, r.run_id)}
+                          className="inline-flex items-center gap-1 rounded border border-status-error/25 bg-status-error/10 px-2 py-1 text-xs text-status-error hover:bg-status-error/15 disabled:opacity-40"
+                        >
+                          {cancellingIds.has(r.run_id) || r.status === 'cancel_requested' ? (
+                            <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                          ) : (
+                            <Square className="h-3 w-3" aria-hidden fill="currentColor" />
+                          )}
+                          {r.status === 'cancel_requested'
+                            ? t('sops.stopping')
+                            : t('sops.stop')}
+                        </button>
+                      ) : null}
+                      <Link
+                        to={`/runs/${encodeURIComponent(r.sop_name)}/${encodeURIComponent(r.run_id)}`}
+                        className="inline-flex items-center gap-1 text-xs text-pc-accent hover:underline"
+                      >
+                        {t('runs.open')}
+                        <ExternalLink className="h-3 w-3" aria-hidden />
+                      </Link>
+                      {cancelErrors.get(r.run_id) ? (
+                        <span className="w-full text-xs text-status-error">
+                          {cancelErrors.get(r.run_id)}
+                        </span>
+                      ) : null}
+                    </div>
                   </td>
                 </tr>
               ))}

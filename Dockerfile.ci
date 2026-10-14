@@ -9,7 +9,7 @@
 ARG VARIANT=distroless
 
 # ── Base variants ────────────────────────────────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775 AS base-distroless
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2 AS base-distroless
 
 FROM debian:bookworm-slim AS base-debian
 RUN apt-get update && apt-get install -y --no-install-recommends \

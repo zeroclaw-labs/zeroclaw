@@ -78,21 +78,6 @@ impl GatewayClient {
         Ok(body["require_pairing"].as_bool().unwrap_or(false))
     }
 
-    /// Request a new pairing code from the gateway (localhost-only admin endpoint).
-    pub async fn request_new_paircode(&self) -> Result<String> {
-        let resp = self
-            .client
-            .post(format!("{}/admin/paircode/new", self.base_url))
-            .send()
-            .await
-            .context("paircode request failed")?;
-        let body: serde_json::Value = resp.json().await?;
-        body["pairing_code"]
-            .as_str()
-            .map(String::from)
-            .context("no pairing_code in response")
-    }
-
     /// Exchange a pairing code for a bearer token.
     pub async fn pair_with_code(&self, code: &str) -> Result<String> {
         let resp = self
@@ -122,12 +107,6 @@ impl GatewayClient {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
         }
-    }
-
-    /// Auto-pair with the gateway: request a new code and exchange it for a token.
-    pub async fn auto_pair(&self) -> Result<String> {
-        let code = self.request_new_paircode().await?;
-        self.pair_with_code(&code).await
     }
 
     /// Push the device's currently-granted capabilities to the gateway so the agent

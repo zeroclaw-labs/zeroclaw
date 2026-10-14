@@ -10,6 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
+use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
+
+const HTTP_REQUEST_PROXY_PINNING_ERROR: &str = "http_request requires direct transport so validated DNS answers remain pinned; set \
+     proxy.scope = \"services\" and omit tool.http_request and tool.* from proxy.services, or disable the proxy; \
+     proxy.scope = \"environment\" is incompatible with pinned HTTP requests";
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
@@ -20,6 +25,10 @@ pub struct HttpRequestTool {
     timeout_secs: u64,
     allow_private_hosts: bool,
     allowed_private_hosts: Vec<String>,
+    /// Network-specific NAT64 prefixes this deployment's translator serves.
+    /// Snapshotted at construction like `allowed_domains`; an IPv6 answer
+    /// inside one of them is classified by the IPv4 address it embeds.
+    nat64_prefixes: Vec<domain_guard::Nat64Prefix>,
     config_path: Option<PathBuf>,
     secrets_encrypt: bool,
 }
@@ -46,6 +55,7 @@ impl HttpRequestTool {
         timeout_secs: u64,
         allow_private_hosts: bool,
         allowed_private_hosts: Vec<String>,
+        nat64_prefixes: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
@@ -60,6 +70,10 @@ impl HttpRequestTool {
                 allowed_private_hosts,
                 "http_request.allowed_private_hosts",
             )?,
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
+            )?,
             config_path: None,
             secrets_encrypt: false,
         })
@@ -71,6 +85,7 @@ impl HttpRequestTool {
         timeout_secs: u64,
         allow_private_hosts: bool,
         allowed_private_hosts: Vec<String>,
+        nat64_prefixes: Vec<String>,
         config_path: PathBuf,
         secrets_encrypt: bool,
     ) -> anyhow::Result<Self> {
@@ -86,6 +101,10 @@ impl HttpRequestTool {
             allowed_private_hosts: domain_guard::normalize_allowed_domains(
                 allowed_private_hosts,
                 "http_request.allowed_private_hosts",
+            )?,
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
             )?,
             config_path: Some(config_path),
             secrets_encrypt,
@@ -119,11 +138,16 @@ impl HttpRequestTool {
         }
 
         let host = extract_host(url)?;
-        if host
-            .parse::<IpAddr>()
-            .is_ok_and(domain_guard::is_cloud_metadata_ip)
-        {
-            anyhow::bail!("Blocked cloud metadata host: {host}");
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if domain_guard::is_known_cloud_metadata_endpoint(ip) {
+                anyhow::bail!("Blocked cloud metadata host: {host}");
+            }
+            if domain_guard::is_cloud_metadata_ip(ip) {
+                anyhow::bail!(
+                    "Blocked link-local host: {host}; 169.254.0.0/16 is blocked unconditionally \
+                     because cloud metadata services are hosted in that range"
+                );
+            }
         }
         let port = extract_port(url)?;
 
@@ -144,8 +168,19 @@ impl HttpRequestTool {
         let private_resolution_allowed = self.allow_private_hosts
             || domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
+        let canonical_url = if host.parse::<IpAddr>().is_ok() {
+            url.to_string()
+        } else {
+            let mut parsed = reqwest::Url::parse(url)
+                .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+            parsed
+                .set_host(Some(&host))
+                .map_err(|_| anyhow::Error::msg("URL contains an invalid host"))?;
+            parsed.to_string()
+        };
+
         Ok(HttpRequestUrlPolicy {
-            url: url.to_string(),
+            url: canonical_url,
             host,
             port,
             private_resolution_allowed,
@@ -182,6 +217,7 @@ impl HttpRequestTool {
                 .iter()
                 .map(|addr| addr.ip())
                 .collect::<Vec<_>>(),
+            &self.nat64_prefixes,
         )?;
 
         Ok(ValidatedHttpRequestTarget {
@@ -243,11 +279,29 @@ impl HttpRequestTool {
     }
 
     fn resolve_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
-        Self::validate_secret_name(secret_name)?;
-        self.reload_auth_secret(secret_name)
+        self.resolve_auth_secret_with_env(secret_name, |name| std::env::var(name))
     }
 
-    fn reload_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
+    fn resolve_auth_secret_with_env<F>(
+        &self,
+        secret_name: &str,
+        env_lookup: F,
+    ) -> anyhow::Result<String>
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
+        Self::validate_secret_name(secret_name)?;
+        self.reload_auth_secret_with_env(secret_name, &env_lookup)
+    }
+
+    fn reload_auth_secret_with_env<F>(
+        &self,
+        secret_name: &str,
+        env_lookup: &F,
+    ) -> anyhow::Result<String>
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
         let config_path = self.config_path.as_ref().ok_or_else(|| {
             anyhow::Error::msg("auth_secret requires runtime config reload support")
         })?;
@@ -288,7 +342,8 @@ impl HttpRequestTool {
             raw_secret.clone()
         };
 
-        if let Some(env_secret) = resolve_env_backed_auth_secret(secret_name, &secret)? {
+        if let Some(env_secret) = resolve_env_backed_auth_secret(secret_name, &secret, env_lookup)?
+        {
             Ok(env_secret)
         } else {
             Ok(secret)
@@ -351,12 +406,21 @@ impl HttpRequestTool {
         } else {
             self.timeout_secs
         };
+        // Negotiate the encodings `http_decode` can decode. reqwest's own
+        // compression features are intentionally disabled workspace-wide, so
+        // this header is set explicitly. A caller-supplied `Accept-Encoding` in
+        // `headers` overrides it (per-request headers win over defaults).
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip, deflate, br"),
+        );
         let builder = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none());
-        let builder =
-            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.http_request");
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(default_headers);
         let builder = if target.host.parse::<IpAddr>().is_ok() {
             builder
         } else {
@@ -373,33 +437,42 @@ impl HttpRequestTool {
         Ok(request.send().await?)
     }
 
-    fn truncate_response(&self, text: &str) -> String {
-        // 0 means unlimited — no truncation.
-        if self.max_response_size == 0 {
-            return text.to_string();
+    /// Read the response body, decoding a `Content-Encoding: gzip | deflate | br`
+    /// body, while bounding memory to the display cap. A small compressed
+    /// response can decode into a much larger body, so the shared reader stops
+    /// the decoder once the decoded output passes the cap instead of buffering
+    /// the whole body first. A malformed compressed body surfaces as an error so
+    /// the caller can report a failed execution. The request method enables the
+    /// shared bodyless bypass (`HEAD` responses carry no body regardless of
+    /// what representation metadata advertises).
+    async fn read_response_text(
+        &self,
+        response: reqwest::Response,
+        method: reqwest::Method,
+    ) -> anyhow::Result<String> {
+        let limit = (self.max_response_size != 0).then_some(self.max_response_size);
+        let (mut text, overflowed) =
+            crate::http_decode::read_decoded_text(response, limit, Some(method)).await?;
+        if overflowed {
+            text.push_str("\n\n... [Response truncated due to size limit] ...");
         }
-        if text.len() > self.max_response_size {
-            let mut truncated = text
-                .chars()
-                .take(self.max_response_size)
-                .collect::<String>();
-            truncated.push_str("\n\n... [Response truncated due to size limit] ...");
-            truncated
-        } else {
-            text.to_string()
-        }
+        Ok(text)
     }
 }
 
-fn resolve_env_backed_auth_secret(
+fn resolve_env_backed_auth_secret<F>(
     secret_name: &str,
     raw_secret: &str,
-) -> anyhow::Result<Option<String>> {
+    env_lookup: &F,
+) -> anyhow::Result<Option<String>>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
     let Some(env_name) = env_secret_reference(raw_secret)? else {
         return Ok(None);
     };
 
-    let value = std::env::var(env_name).map_err(|e| {
+    let value = env_lookup(env_name).map_err(|e| {
         anyhow::Error::msg(format!(
             "auth_secret '{secret_name}' references environment variable '{env_name}', but it could not be read: {e}"
         ))
@@ -528,6 +601,33 @@ impl Tool for HttpRequestTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
+        let proxy_config = zeroclaw_config::schema::runtime_proxy_config();
+        if proxy_conflicts_with_dns_pinning(&proxy_config) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"service": "tool.http_request"})),
+                "http_request: configured runtime proxy rejected to preserve validated DNS pin"
+            );
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(HTTP_REQUEST_PROXY_PINNING_ERROR.into()),
+            });
+        }
+
+        let ignored_environment_proxy = zeroclaw_config::schema::environment_proxy_for_url(url);
+        if let Some(variable) = ignored_environment_proxy {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"proxy_variable": variable})),
+                "http_request: environment proxy ignored to preserve validated DNS pin"
+            );
+        }
+
         let target = match self.validate_request_target(url).await {
             Ok(v) => v,
             Err(e) => {
@@ -569,7 +669,7 @@ impl Tool for HttpRequestTool {
         }
 
         match self
-            .execute_request(&target, method, request_headers, body)
+            .execute_request(&target, method.clone(), request_headers, body)
             .await
         {
             Ok(response) => {
@@ -590,11 +690,19 @@ impl Tool for HttpRequestTool {
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                // Get response body with size limit
-                let response_text = match response.text().await {
-                    Ok(text) => self.truncate_response(&text),
-                    Err(e) => format!("[Failed to read response body: {e}]"),
-                };
+                // Get response body with a streamed size limit so transparent
+                // decompression cannot expand past the cap in memory. A body /
+                // decoder failure (e.g. a 2xx advertising gzip with malformed
+                // bytes) is an operational failure, not a successful execution,
+                // so track it separately from the HTTP status.
+                let (response_text, body_error) =
+                    match self.read_response_text(response, method).await {
+                        Ok(text) => (text, None),
+                        Err(e) => (
+                            format!("[Failed to read response body: {e}]"),
+                            Some(e.to_string()),
+                        ),
+                    };
 
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
@@ -615,23 +723,39 @@ impl Tool for HttpRequestTool {
                     "body": body_value,
                 });
 
+                let http_error = status.is_client_error() || status.is_server_error();
                 Ok(ToolResult {
-                    success: status.is_success(),
+                    success: status.is_success() && body_error.is_none(),
                     output: ToolOutput::json_with_text(data, output),
-                    error: if status.is_client_error() || status.is_server_error() {
-                        Some(format!("HTTP {}", status_code))
-                    } else {
-                        None
+                    error: match (&body_error, http_error) {
+                        (Some(detail), _) => {
+                            Some(format!("Failed to read response body: {detail}"))
+                        }
+                        (None, true) => Some(format!("HTTP {status_code}")),
+                        (None, false) => None,
                     },
                 })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("HTTP request failed: {e}")),
-            }),
+            Err(e) => {
+                let mut error = format!("HTTP request failed: {e}");
+                if let Some(variable) = ignored_environment_proxy {
+                    error.push_str(&format!(
+                        "; {variable} was intentionally ignored by the DNS-pinned request"
+                    ));
+                }
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error),
+                })
+            }
         }
     }
+}
+
+fn proxy_conflicts_with_dns_pinning(config: &ProxyConfig) -> bool {
+    (config.enabled && config.scope == ProxyScope::Environment)
+        || (config.has_any_proxy_url() && config.should_apply_to_service("tool.http_request"))
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -708,11 +832,12 @@ fn validate_resolved_ips_for_ssrf(
     host: &str,
     private_resolution_allowed: bool,
     ips: &[std::net::IpAddr],
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
 ) -> anyhow::Result<()> {
     if private_resolution_allowed {
-        domain_guard::validate_resolved_ips_exclude_metadata(host, ips)
+        domain_guard::validate_resolved_ips_exclude_metadata(host, ips, nat64_prefixes)
     } else {
-        domain_guard::validate_resolved_ips_are_public(host, ips)
+        domain_guard::validate_resolved_ips_are_public(host, ips, nat64_prefixes)
     }
 }
 
@@ -725,8 +850,93 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
+    async fn chunked_response(chunks: &[&[u8]]) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let owned_chunks = chunks
+            .iter()
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+
+        zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in owned_chunks {
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&chunk).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+            }
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+
+        reqwest::get(format!("http://{addr}")).await.unwrap()
+    }
+
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
         test_tool_with_private(allowed_domains, false)
+    }
+
+    #[tokio::test]
+    async fn response_limit_truncates_a_chunked_body_during_streaming() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            8,
+            30,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let response = chunked_response(&[b"hello", b" world", b" ignored"]).await;
+
+        let text = tool
+            .read_response_text(response, reqwest::Method::GET)
+            .await
+            .unwrap();
+
+        assert!(text.starts_with("hello wo"));
+        assert!(text.contains("[Response truncated due to size limit]"));
+        assert!(!text.contains("ignored"));
+    }
+
+    #[tokio::test]
+    async fn zero_response_limit_preserves_a_complete_chunked_body() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            0,
+            30,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let response = chunked_response(&[b"hello", b" world"]).await;
+
+        assert_eq!(
+            tool.read_response_text(response, reqwest::Method::GET)
+                .await
+                .unwrap(),
+            "hello world"
+        );
     }
 
     fn test_tool_with_private(
@@ -741,6 +951,35 @@ mod tests {
         allow_private_hosts: bool,
         allowed_private_hosts: Vec<&str>,
     ) -> HttpRequestTool {
+        test_tool_with_nat64(
+            allowed_domains,
+            allow_private_hosts,
+            allowed_private_hosts,
+            Vec::new(),
+        )
+    }
+
+    fn test_tool_with_nat64(
+        allowed_domains: Vec<&str>,
+        allow_private_hosts: bool,
+        allowed_private_hosts: Vec<&str>,
+        nat64_prefixes: Vec<&str>,
+    ) -> HttpRequestTool {
+        try_test_tool_with_nat64(
+            allowed_domains,
+            allow_private_hosts,
+            allowed_private_hosts,
+            nat64_prefixes,
+        )
+        .unwrap()
+    }
+
+    fn try_test_tool_with_nat64(
+        allowed_domains: Vec<&str>,
+        allow_private_hosts: bool,
+        allowed_private_hosts: Vec<&str>,
+        nat64_prefixes: Vec<&str>,
+    ) -> anyhow::Result<HttpRequestTool> {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -755,8 +994,8 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            nat64_prefixes.into_iter().map(String::from).collect(),
         )
-        .unwrap()
     }
 
     fn test_tool_with_auth_config(config_path: PathBuf, secrets_encrypt: bool) -> HttpRequestTool {
@@ -770,6 +1009,7 @@ mod tests {
             1_000_000,
             30,
             false,
+            Vec::new(),
             Vec::new(),
             config_path,
             secrets_encrypt,
@@ -852,6 +1092,7 @@ api_token = "Bearer from-disk"
             30,
             false,
             Vec::new(),
+            Vec::new(),
             config_path,
             false,
         )
@@ -875,19 +1116,14 @@ api_token = "${ZEROCLAW_TEST_HTTP_REQUEST_SECRET}"
 "#,
         )
         .unwrap();
-        unsafe {
-            std::env::set_var("ZEROCLAW_TEST_HTTP_REQUEST_SECRET", "Bearer from-env");
-        }
-        scopeguard::defer! {
-            unsafe {
-                std::env::remove_var("ZEROCLAW_TEST_HTTP_REQUEST_SECRET");
-            }
-        }
-
         let tool = test_tool_with_auth_config(config_path, false);
 
         assert_eq!(
-            tool.resolve_auth_secret("api_token").unwrap(),
+            tool.resolve_auth_secret_with_env("api_token", |name| {
+                assert_eq!(name, "ZEROCLAW_TEST_HTTP_REQUEST_SECRET");
+                Ok("Bearer from-env".to_string())
+            })
+            .unwrap(),
             "Bearer from-env"
         );
     }
@@ -904,13 +1140,12 @@ api_token = "${ZEROCLAW_TEST_HTTP_REQUEST_MISSING_SECRET}"
 "#,
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("ZEROCLAW_TEST_HTTP_REQUEST_MISSING_SECRET");
-        }
-
         let tool = test_tool_with_auth_config(config_path, false);
         let err = tool
-            .resolve_auth_secret("api_token")
+            .resolve_auth_secret_with_env("api_token", |name| {
+                assert_eq!(name, "ZEROCLAW_TEST_HTTP_REQUEST_MISSING_SECRET");
+                Err(std::env::VarError::NotPresent)
+            })
             .unwrap_err()
             .to_string();
 
@@ -958,6 +1193,7 @@ api_token = "{encrypted}"
             30,
             false,
             Vec::new(),
+            Vec::new(),
             config_path,
             true,
         )
@@ -993,28 +1229,23 @@ api_token = "{encrypted}"
             ),
         )
         .unwrap();
-        unsafe {
-            std::env::set_var(
-                "ZEROCLAW_TEST_HTTP_REQUEST_ENCRYPTED_SECRET",
-                "Bearer encrypted-env",
-            );
-        }
-        scopeguard::defer! {
-            unsafe {
-                std::env::remove_var("ZEROCLAW_TEST_HTTP_REQUEST_ENCRYPTED_SECRET");
-            }
-        }
-
         let tool = test_tool_with_auth_config(config_path, true);
 
         assert_eq!(
-            tool.resolve_auth_secret("api_token").unwrap(),
+            tool.resolve_auth_secret_with_env("api_token", |name| {
+                assert_eq!(name, "ZEROCLAW_TEST_HTTP_REQUEST_ENCRYPTED_SECRET");
+                Ok("Bearer encrypted-env".to_string())
+            })
+            .unwrap(),
             "Bearer encrypted-env"
         );
     }
 
     #[tokio::test]
     async fn execute_sends_auth_secret_as_authorization_header() {
+        // `Tool::execute` reads the process-global runtime proxy state, so hold
+        // the shared guard against the `proxy_config` writer tests.
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
             Ok(l) => l,
             Err(_) => return, // IPv6 loopback is unavailable in this environment.
@@ -1059,6 +1290,7 @@ api_token = "Bearer from-secret"
             5,
             true,
             Vec::new(),
+            Vec::new(),
             config_path,
             false,
         )
@@ -1088,6 +1320,395 @@ api_token = "Bearer from-secret"
         assert!(
             saw_auth_header,
             "auth_secret must send the resolved Authorization header"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_response_with_content_encoding_returns_empty_body() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A HEAD response carries no body by HTTP semantics, whatever
+        // representation metadata the server advertises. Finalizing a gzip
+        // decoder over the zero bytes actually sent used to report a missing
+        // trailer and turn a correct empty response into a body-read failure.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-encoding", "gzip"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url, "method": "HEAD" }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        let output = result.output.as_str();
+        assert!(output.contains("Status: 200"), "got {output}");
+        assert!(
+            output.contains("content-encoding"),
+            "response headers must be preserved: {output}"
+        );
+        assert!(
+            output.ends_with("Response Body:\n"),
+            "the body must be empty, got {output:?}"
+        );
+        assert!(!output.contains("Failed to read response body"));
+    }
+
+    #[tokio::test]
+    async fn no_content_with_compression_metadata_returns_empty_body() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 204 No Content forbids a body, so compression metadata on it
+        // describes nothing. The status is still a 2xx success and the body is
+        // empty — not a decoder failure over zero bytes.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(204).insert_header("content-encoding", "gzip"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        let output = result.output.as_str();
+        assert!(output.contains("Status: 204"), "got {output}");
+        assert!(
+            output.ends_with("Response Body:\n"),
+            "the body must be empty, got {output:?}"
+        );
+        assert!(!output.contains("Failed to read response body"));
+    }
+
+    #[tokio::test]
+    async fn not_modified_keeps_status_disposition_without_body_error() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 304 Not Modified has no body and keeps its existing disposition:
+        // non-success (it is not a 2xx) with no error string. The defect made
+        // the gzip finalizer over zero bytes add a spurious body-read error on
+        // top; that must not return.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(304).insert_header("content-encoding", "gzip"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            !result.success,
+            "304 must keep its non-success HTTP-status disposition"
+        );
+        assert!(
+            result.error.is_none(),
+            "a bodyless 304 must not gain a body-read error: {:?}",
+            result.error
+        );
+        let output = result.output.as_str();
+        assert!(output.contains("Status: 304"), "got {output}");
+        assert!(
+            output.ends_with("Response Body:\n"),
+            "the body must be empty, got {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_get_200_compressed_body_still_fails() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The bodyless bypass is method/status-driven, never driven by an
+        // empty payload: an ordinary GET 200 advertising gzip that sends zero
+        // bytes is a truncated compressed stream and must keep failing the
+        // body read.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-encoding", "gzip"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            !result.success,
+            "a GET 200 with an empty compressed body must fail: {:?}",
+            result.error
+        );
+        let error = result.error.expect("the body read must report a failure");
+        assert!(
+            error.contains("Failed to read response body"),
+            "got {error:?}"
+        );
+    }
+
+    fn deflate_stream(payload: &[u8]) -> Vec<u8> {
+        // HTTP `deflate` is zlib-wrapped; the decoder expects the wrapper.
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(payload).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_deflate_response_fails_the_body_read() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A GET 200 advertising deflate with zero body bytes has no zlib
+        // stream at all. It must fail the body read exactly like the empty
+        // gzip case, not report a successful empty response.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).insert_header("content-encoding", "deflate"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            !result.success,
+            "a GET 200 with an empty deflate body must fail: {:?}",
+            result.error
+        );
+        let error = result.error.expect("the body read must report a failure");
+        assert!(
+            error.contains("Failed to read response body"),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_empty_deflate_response_succeeds_with_empty_body() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Positive control: a complete zlib stream that encodes zero bytes is
+        // a legitimate empty body and must keep succeeding — the completion
+        // check may not turn "empty because complete" into a failure.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "deflate")
+                    .set_body_raw(deflate_stream(b""), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        assert!(
+            result.output.as_str().ends_with("Response Body:\n"),
+            "the body must be empty, got {:?}",
+            result.output.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn large_complete_deflate_response_decodes_exactly() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A valid deflate body larger than any internal verifier buffer must
+        // decode exactly under the configured cap; the completion check may
+        // not turn an ordinary under-cap response into a body-read failure.
+        let payload: String = (0..16_384)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "deflate")
+                    .set_body_raw(deflate_stream(payload.as_bytes()), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            65_536,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        let output = result.output.as_str();
+        assert!(
+            output.contains(payload.as_str()),
+            "the full body must decode exactly"
+        );
+        assert!(
+            !output.contains("[Response truncated due to size limit]"),
+            "an under-cap response is not truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_input_allowance_response_is_not_reported_as_truncated() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (body, limit) = crate::http_decode::empty_gzip_members_past_input_slack();
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(body, "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            limit,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(result.error.is_none());
+        assert!(
+            !result
+                .output
+                .as_str()
+                .contains("[Response truncated due to size limit]"),
+            "a complete exact-allowance response is not truncated"
         );
     }
 
@@ -1185,8 +1806,16 @@ api_token = "Bearer from-secret"
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool =
-            HttpRequestTool::new(security, vec![], 1_000_000, 30, false, Vec::new()).unwrap();
+        let tool = HttpRequestTool::new(
+            security,
+            vec![],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -1226,6 +1855,7 @@ api_token = "Bearer from-secret"
             30,
             false,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         let result = tool
@@ -1236,60 +1866,314 @@ api_token = "Bearer from-secret"
         assert!(result.error.unwrap().contains("read-only"));
     }
 
-    #[test]
-    fn truncate_response_within_limit() {
-        let tool = test_tool(vec!["example.com"]);
-        let text = "hello world";
-        assert_eq!(tool.truncate_response(text), "hello world");
-    }
+    #[tokio::test]
+    async fn read_response_text_bounds_decompressed_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[test]
-    fn truncate_response_over_limit() {
+        // A tiny gzip body that decodes to 10 KiB. `http_request` decodes gzip
+        // in `http_decode`, so this must not buffer the whole decoded body
+        // before the cap applies.
+        let payload = "a".repeat(10_000);
+        let gz = {
+            use flate2::{Compression, write::GzEncoder};
+            use std::io::Write;
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(payload.as_bytes()).unwrap();
+            enc.finish().unwrap()
+        };
+        assert!(gz.len() < 200, "compressed fixture should be small");
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(gz, "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            10,
+            vec!["*".into()],
+            128,
             30,
-            false,
+            true,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
-        let text = "hello world this is long";
-        let truncated = tool.truncate_response(text);
-        assert!(truncated.len() <= 10 + 60); // limit + message
-        assert!(truncated.contains("[Response truncated"));
+
+        // Fetch with a plain decoding client and read through the cap directly.
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let response = client.get(&url).send().await.expect("request succeeds");
+        let text = tool
+            .read_response_text(response, reqwest::Method::GET)
+            .await
+            .expect("body reads");
+
+        // The read stops at the 128-byte cap, nowhere near the 10 KiB decoded
+        // body, and the over-limit marker is appended.
+        assert!(
+            text.starts_with(&"a".repeat(128)),
+            "decoded prefix preserved up to the cap"
+        );
+        assert!(
+            text.contains("[Response truncated"),
+            "an over-cap body must be marked truncated: {text}"
+        );
     }
 
-    #[test]
-    fn truncate_response_zero_means_unlimited() {
+    #[tokio::test]
+    async fn decodes_every_gzip_member() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // RFC 1952 allows a gzip body to be a series of members. A single-member
+        // decoder returns the first one and drops the rest, reporting a partial
+        // body as a complete success.
+        let mut body = {
+            use flate2::{Compression, write::GzEncoder};
+            use std::io::Write;
+            let member = |payload: &[u8]| {
+                let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+                enc.write_all(payload).unwrap();
+                enc.finish().unwrap()
+            };
+            let mut out = member(b"first half, ");
+            out.extend_from_slice(&member(b"second half"));
+            out
+        };
+        body.shrink_to_fit();
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(body, "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            0, // max_response_size = 0 means no limit
+            vec!["*".into()],
+            1_048_576,
             30,
-            false,
+            true,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
-        let text = "a".repeat(10_000_000);
-        assert_eq!(tool.truncate_response(&text), text);
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(
+            result.output.as_str().contains("first half, second half"),
+            "every gzip member must decode, got {}",
+            result.output.as_str()
+        );
     }
 
-    #[test]
-    fn truncate_response_nonzero_still_truncates() {
+    #[tokio::test]
+    async fn repeated_content_encoding_lines_are_refused() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Separate field lines carry the same meaning as `gzip, br` in one line,
+        // and the chain is refused rather than half-decoded.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-encoding", "gzip")
+                    .append_header("content-encoding", "br")
+                    .set_body_raw(b"whatever".to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            5,
+            vec!["*".into()],
+            1_048_576,
             30,
-            false,
+            true,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
-        let text = "hello world";
-        let truncated = tool.truncate_response(text);
-        assert!(truncated.starts_with("hello"));
-        assert!(truncated.contains("[Response truncated"));
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(!result.success, "a coding chain must not be decoded");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Content-Encoding")),
+            "error should name the encoding contract, got {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_compressed_2xx_reports_failure() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A 200 that advertises gzip but sends bytes that are not a valid gzip
+        // stream. The body cannot be read, so the tool must report a failure —
+        // not `success: true` with an error string smuggled into the body — at
+        // the public `Tool::execute` boundary.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(b"not really gzip".to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            !result.success,
+            "a body that could not be decoded must not be a successful execution"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("read response body")),
+            "error must explain the body-read failure, got {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn request_advertises_accept_encoding() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The mock only matches when the request carries an Accept-Encoding
+        // header; a request without it falls through to a 404, so a 200 result
+        // proves the tool negotiates encodings.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .and(header_exists("accept-encoding"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            result.success,
+            "request must advertise Accept-Encoding (else the mock 404s): {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn compound_content_encoding_reports_failure() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A compound coding (`gzip, br`) is not a single supported token; the
+        // decoder must reject it rather than return the still-encoded bytes as
+        // model-visible garbage.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip, br")
+                    .set_body_raw(b"still-encoded bytes".to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(!result.success, "a compound encoding must not succeed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("read response body")),
+            "error must explain the body-read failure, got {:?}",
+            result.error
+        );
     }
 
     #[test]
@@ -1387,6 +2271,47 @@ api_token = "Bearer from-secret"
         // The actual Policy::none() enforcement is in execute_request's client builder.
         let tool = test_tool(vec!["example.com"]);
         assert_eq!(tool.name(), "http_request");
+    }
+
+    #[test]
+    fn runtime_proxy_conflicts_with_dns_pinning_only_when_it_applies() {
+        let global_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Zeroclaw,
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&global_proxy));
+        assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("tool.http_request"));
+        assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("tool.*"));
+
+        let environment_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Environment,
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&environment_proxy));
+        assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("environment"));
+
+        let exact_service_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Services,
+            services: vec!["tool.http_request".into()],
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&exact_service_proxy));
+
+        let other_service_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Services,
+            services: vec!["provider.openai".into()],
+            ..ProxyConfig::default()
+        };
+        assert!(!proxy_conflicts_with_dns_pinning(&other_service_proxy));
+        assert!(!proxy_conflicts_with_dns_pinning(&ProxyConfig::default()));
     }
 
     #[test]
@@ -1573,6 +2498,34 @@ api_token = "Bearer from-secret"
     }
 
     #[tokio::test]
+    async fn validate_request_target_canonicalizes_trailing_dot_before_dns_pinning() {
+        let tool = test_tool(vec!["example.com"]);
+
+        let target = tool
+            .validate_request_target_with_resolver(
+                "https://api.example.com./v1?x=1",
+                |host, port| {
+                    assert_eq!(host, "api.example.com");
+                    assert_eq!(port, 443);
+                    async {
+                        Ok(vec![SocketAddr::new(
+                            IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+                            443,
+                        )])
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let parsed = reqwest::Url::parse(&target.url).unwrap();
+
+        assert_eq!(target.host, "api.example.com");
+        assert_eq!(parsed.host_str(), Some(target.host.as_str()));
+        assert_eq!(parsed.path(), "/v1");
+        assert_eq!(parsed.query(), Some("x=1"));
+    }
+
+    #[tokio::test]
     async fn validate_request_target_allows_private_resolution_for_private_carveout() {
         let tool =
             test_tool_with_private_allowlist(vec!["example.com"], false, vec!["api.example.com"]);
@@ -1678,7 +2631,7 @@ api_token = "Bearer from-secret"
     #[test]
     fn validate_resolved_private_ip_is_blocked_by_default() {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
-        let err = validate_resolved_ips_for_ssrf("api.example.com", false, &ips)
+        let err = validate_resolved_ips_for_ssrf("api.example.com", false, &ips, &[])
             .unwrap_err()
             .to_string();
 
@@ -1691,7 +2644,7 @@ api_token = "Bearer from-secret"
     #[test]
     fn validate_resolved_private_ip_is_allowed_with_private_carveout() {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
-        assert!(validate_resolved_ips_for_ssrf("api.example.com", true, &ips).is_ok());
+        assert!(validate_resolved_ips_for_ssrf("api.example.com", true, &ips, &[]).is_ok());
     }
 
     #[test]
@@ -1699,7 +2652,7 @@ api_token = "Bearer from-secret"
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             169, 254, 169, 254,
         ))];
-        let err = validate_resolved_ips_for_ssrf("metadata.example.com", true, &ips)
+        let err = validate_resolved_ips_for_ssrf("metadata.example.com", true, &ips, &[])
             .unwrap_err()
             .to_string();
 
@@ -1718,6 +2671,19 @@ api_token = "Bearer from-secret"
             .to_string();
 
         assert!(err.contains("metadata"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn apipa_literal_is_blocked_with_link_local_diagnostic() {
+        let tool = test_tool_with_private(vec!["*"], true);
+        let err = tool
+            .validate_url("http://169.254.12.7/status")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("link-local host"), "unexpected error: {err}");
+        assert!(err.contains("blocked unconditionally"));
+        assert!(!err.contains("cloud metadata host"));
     }
 
     // ── IPv6 end-to-end coverage ──────────────────────────────
@@ -1747,6 +2713,7 @@ api_token = "Bearer from-secret"
 
     #[tokio::test]
     async fn ipv6_end_to_end_real_request_over_loopback() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
             Ok(l) => l,
             Err(_) => return, // IPv6 not available in this environment
@@ -1776,6 +2743,7 @@ api_token = "Bearer from-secret"
             5,         // timeout_secs
             true,      // allow_private_hosts
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
 
@@ -1797,5 +2765,104 @@ api_token = "Bearer from-secret"
             Ok(Err(_)) => {} // validation/network error — acceptable
             Err(_) => {}    // timeout — IPv6 connectivity may be unavailable
         }
+    }
+
+    /// A globally-classified NAT64 prefix, the shape a real deployment uses.
+    /// The IPv6 documentation range is itself non-global, so a documentation
+    /// prefix would be rejected for an unrelated reason and prove nothing
+    /// about the NAT64 decode.
+    const TEST_NAT64_PREFIX: &str = "2001:67c:2b0:db32:0:1::/96";
+    /// `TEST_NAT64_PREFIX` with 10.0.0.1 embedded per RFC 6052 §2.2.
+    const NAT64_PRIVATE_V4: &str = "2001:67c:2b0:db32:0:1:a00:1";
+    /// `TEST_NAT64_PREFIX` with 169.254.169.254 embedded.
+    const NAT64_METADATA_V4: &str = "2001:67c:2b0:db32:0:1:a9fe:a9fe";
+
+    async fn resolve_target_to(
+        tool: &HttpRequestTool,
+        address: &str,
+    ) -> anyhow::Result<ValidatedHttpRequestTarget> {
+        let ip = address.parse::<IpAddr>().unwrap();
+        tool.validate_request_target_with_resolver(
+            "https://attacker.example.com/",
+            move |_host, port| async move { Ok(vec![SocketAddr::new(ip, port)]) },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_blocks_resolution_to_embedded_private_v4() {
+        let tool = test_tool_with_nat64(vec!["*"], false, vec![], vec![TEST_NAT64_PREFIX]);
+        let err = resolve_target_to(&tool, NAT64_PRIVATE_V4)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global address 10.0.0.1"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(TEST_NAT64_PREFIX),
+            "error must name the configured prefix: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_blocks_resolution_to_embedded_metadata_v4() {
+        // The private opt-in never re-opens metadata, so this holds on both
+        // sides of the allow_private_hosts branch.
+        for allow_private in [false, true] {
+            let tool =
+                test_tool_with_nat64(vec!["*"], allow_private, vec![], vec![TEST_NAT64_PREFIX]);
+            let err = resolve_target_to(&tool, NAT64_METADATA_V4)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("cloud metadata address 169.254.169.254"),
+                "allow_private_hosts={allow_private} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nat64_embedded_private_v4_is_reachable_without_a_configured_prefix() {
+        // Honest boundary: nothing in the address marks it as NAT64, so with
+        // no prefix configured the tool dials it. This is exactly the hole
+        // `security.nat64_prefixes` closes.
+        let tool = test_tool_with_nat64(vec!["*"], false, vec![], vec![]);
+        let target = resolve_target_to(&tool, NAT64_PRIVATE_V4).await.unwrap();
+        assert_eq!(target.host, "attacker.example.com");
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_still_allows_embedded_global_v4() {
+        // 93.184.216.34 embedded under the same prefix; 192.0.2.33 from
+        // RFC 6052's own example is documentation space and non-global, so it
+        // cannot stand in for an accepted destination.
+        let tool = test_tool_with_nat64(vec!["*"], false, vec![], vec![TEST_NAT64_PREFIX]);
+        let target = resolve_target_to(&tool, "2001:67c:2b0:db32:0:1:5db8:d822")
+            .await
+            .unwrap();
+        assert_eq!(target.host, "attacker.example.com");
+    }
+
+    #[test]
+    fn malformed_nat64_prefix_fails_tool_construction() {
+        // Fail closed: a typo must refuse to build the tool rather than
+        // silently leaving the network-specific check disabled.
+        let err = try_test_tool_with_nat64(
+            vec!["example.com"],
+            false,
+            vec![],
+            vec![TEST_NAT64_PREFIX, "2001:db8::/33"],
+        )
+        .err()
+        .expect("malformed nat64 prefix must fail construction")
+        .to_string();
+        assert!(
+            err.contains("security.nat64_prefixes"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("2001:db8::/33"), "unexpected error: {err}");
     }
 }

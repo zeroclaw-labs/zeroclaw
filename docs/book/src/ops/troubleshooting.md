@@ -80,17 +80,21 @@ For the Raspberry Pi specifics, see [Raspberry Pi setup → build](../hardware/r
 
 ### Build is very slow
 
-The Matrix E2EE stack (`matrix-sdk`, `ruma`, `vodozemac`) and TLS/crypto native deps (`aws-lc-sys`, `ring`) are the main cost. Opt out if you don't need them:
+Build time scales with the features you enable. The Matrix E2EE stack (`matrix-sdk`, `ruma`, `vodozemac`) and the `aws-lc-sys` native crypto build are not in the default feature set: `channel-matrix` pulls in both, and `channels-full` pulls in `aws-lc-sys`. If you enabled features you don't need, drop them first.
+
+To build less than the default set, build the agent runtime alone:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-cargo build --release --locked --no-default-features --features "default-lean"
+cargo build --release --locked --no-default-features --features agent-runtime
 ```
 
 </div>
+
+This leaves out the other default features: `default-channels`, `gateway`, `acp-bridge`, `observability-prometheus`, and `schema-export`. Add back what you use by extending the list, for example `--features "agent-runtime,gateway,channel-telegram"`. [Channels overview](../channels/overview.md) lists the per-channel flags.
 
 Or check what's happening:
 
@@ -226,6 +230,16 @@ RUST_LOG=debug zeroclaw daemon
 
 </div>
 
+### Agent ignores rules written near the end of AGENTS.md
+
+On agent-loop and channel turns (CLI `zeroclaw agent`, daemon channels, delegate steps) with `compact_context` on (the default for a runtime profile that leaves it unset), each workspace bootstrap file (`AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md`, `USER.md`, plus `BOOTSTRAP.md` when present and `MEMORY.md` on turns with memory) is cut at 6000 characters before it reaches the model. The file looks complete on disk and the model sees a truncation marker, so rules past the cut are followed only when the agent happens to read the file mid-session. ACP (ZeroCode) sessions use a separate loader with a 20000-character cap per file and are not affected by this setting.
+
+The 6000-character cut is per file. The whole-prompt budget `max_system_prompt_chars`, when set, is applied afterwards and can cut further, including the marker; the documented `local_small` profile combines the 6000 per-file cap with an 8000-character whole-prompt budget.
+
+To see it, run `zeroclaw doctor`: it prints a `[workspace]` warning per over-cap file with retained, total and discarded counts, and is the repeatable check. The daemon log carries the same counts once per process under `agent.bootstrap_file_truncated` when a file is first cut and again whenever its size changes; logs are best-effort, so the absence of the line in a recent trace does not mean the file fits.
+
+Fix it by shortening the file, or set `compact_context = false` in the agent's runtime profile (the cap becomes 20000 characters). An agent with no `runtime_profile` needs one created and assigned first. `prompt_injection_mode` controls skills, not this cap.
+
 ### Gateway unreachable
 
 <div class="os-tabs-src">
@@ -273,7 +287,7 @@ zeroclaw channel doctor
 `zeroclaw channel doctor` constructs transport adapters without the daemon's live SOP engine and
 audit handles. It can check ordinary channel transports, but it does not prove that MQTT,
 filesystem, or AMQP SOP dispatch can start a run. For those sources, start `zeroclaw daemon` with
-`sop.sops_dir` configured, then inspect the source connection and `SOP ingress` log events. An AMQP
+the SOP runtime enabled (`sop.sops_dir` set to a non-empty value; unset by default, which disables it; the documented value is `shared/sops`), then inspect the source connection and `SOP ingress` log events. An AMQP
 channel using `dispatch = "sop"` or `"sop_and_agent_loop"` fails closed at daemon startup when the
 SOP handles are unavailable; it is intentionally omitted from the doctor work list in that state.
 
@@ -338,7 +352,7 @@ See [Security → Autonomy levels](../security/autonomy.md).
 
 ### Tool invocations fail inside Docker sandbox
 
-- Container image isn't pulled, run `docker pull <image>` for whatever you have configured under `[security.sandbox].image` (default: `alpine:latest`)
+- Container image isn't pulled, run `docker pull <image>` for the image the sandbox uses. That is `sandbox_image` on the active risk profile (`[risk_profiles.<name>].sandbox_image`), or `alpine:latest` when it is unset
 - Docker daemon not reachable from the ZeroClaw user, check `docker info`
 - Tool needs a device that's not passed through, extend `allow_devices`
 

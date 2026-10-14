@@ -77,11 +77,17 @@ fn redirect_policy() -> reqwest::redirect::Policy {
 }
 
 fn http_client_builder(timeout_secs: u64) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .connect_timeout(Duration::from_secs(5))
-        .redirect(redirect_policy())
-        .user_agent("ZeroClaw/0.1 (link-enricher)")
+    // The SSRF redirect policy and identity stay as they are; only the
+    // deployment's runtime proxy is applied on top, like every other
+    // outbound client in this crate.
+    zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(redirect_policy())
+            .user_agent("ZeroClaw/0.1 (link-enricher)"),
+        "channel.link_enricher",
+    )
 }
 
 fn http_client(timeout_secs: u64) -> reqwest::Result<reqwest::Client> {

@@ -13,7 +13,7 @@ The generated **ZeroClaw** sections below each reflect a specific source: the cu
 | Experimental | 🧪 | Present but may change; validate before depending on it |
 | Planned | 📋 | Tracked but not yet implemented |
 | None | ❌ | Not available on that runtime |
-| Unknown | ❓ | Parity not yet recorded for that runtime |
+| Unknown | ❓ | Support not established: not yet assessed or the available evidence is inconclusive |
 
 ## Runtime and deployment modes
 
@@ -61,10 +61,11 @@ or tool registries the tables above are generated from.
 |---|---|---|---|
 | Deterministic SOP engine (trigger match, approval gates, audited runs) | 🧪 | ❌ | 🟡 |
 
-ZeroClaw's `SopEngine` is present but still maturing: MQTT, filesystem, and AMQP
-are wired live fan-in sources, while webhook, cron, peripheral, and calendar
-triggers are defined and matched but not yet routed to a live source, so the
-capability is **experimental**. OpenClaw has no deterministic-procedure engine
+ZeroClaw's `SopEngine` is present but still maturing: authenticated webhooks,
+MQTT, filesystem, AMQP, and the daemon's cron maintenance tick are wired live
+fan-in sources, while peripheral and calendar triggers are defined and matched
+but not yet routed to a live source, so the capability is **experimental**.
+OpenClaw has no deterministic-procedure engine
 (its exec-approval flow is a per-tool permission prompt, not a step runner), so
 it is **none**. Hermes ships cron and webhook "routines" that pair a trigger with
 a free-form agent prompt but no deterministic multi-step engine, approval gates,

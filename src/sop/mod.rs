@@ -5,9 +5,14 @@ use anyhow::Result;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 pub fn handle_command(command: crate::SopCommands, config: &crate::config::Config) -> Result<()> {
-    let workspace_dir = &config.data_dir;
+    // SOP definitions resolve against the install root, so the documented
+    // `shared/sops` lands at `<install>/shared/sops` — the same root the web/RPC
+    // author writes to. Loading them from `data_dir` instead would never see
+    // authored SOPs.
+    let install_root = config.install_root_dir();
     let default_mode = parse_execution_mode(&config.sop.default_execution_mode);
-    let sops = load_sops(workspace_dir, config.sop.sops_dir.as_deref(), default_mode);
+    let (sops, load_failures) =
+        load_sops_report(&install_root, config.sop.sops_dir.as_deref(), default_mode);
 
     match command {
         crate::SopCommands::List => {
@@ -54,7 +59,29 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                 None => sops.iter().collect(),
             };
 
+            // A SOP whose files fail to parse or validate never loads; report
+            // it instead of silently leaving it out.
+            let failed: Vec<_> = load_failures
+                .iter()
+                .filter(|(dir, _)| name.as_ref().is_none_or(|n| n == dir))
+                .collect();
+            for (dir, error) in &failed {
+                println!(
+                    "  {}",
+                    get_required_cli_string_with_args(
+                        "cli-sop-load-failed",
+                        &[("name", dir.as_str()), ("error", error.as_str())],
+                    )
+                );
+            }
+
             if targets.is_empty() {
+                if !failed.is_empty() {
+                    anyhow::bail!(get_required_cli_string_with_args(
+                        "cli-sop-load-failed-summary",
+                        &[("count", &failed.len().to_string())],
+                    ));
+                }
                 if let Some(n) = &name {
                     anyhow::bail!("SOP not found: {n}");
                 }
@@ -62,9 +89,18 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                 return Ok(());
             }
 
-            let mut any_warnings = false;
+            let mut any_warnings = !failed.is_empty();
             for sop in &targets {
-                let warnings = validate_sop(sop);
+                let mut warnings = validate_sop(sop);
+                if let Some(spec) = &sop.decision
+                    && !config.decision_models.contains_key(&spec.model)
+                {
+                    warnings.push(format!(
+                        "[decision] model '{}' is not configured in [decision_models]; \
+                         runs will fall back to the strictest mode",
+                        spec.model
+                    ));
+                }
                 if warnings.is_empty() {
                     println!(
                         "  {}",
@@ -83,6 +119,12 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
                         println!("       - {w}");
                     }
                 }
+            }
+            if !failed.is_empty() {
+                anyhow::bail!(get_required_cli_string_with_args(
+                    "cli-sop-load-failed-summary",
+                    &[("count", &failed.len().to_string())],
+                ));
             }
             if !any_warnings {
                 println!();
@@ -209,7 +251,8 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
         // the gateway in main.rs; they never reach this local handler.
         crate::SopCommands::Approve { .. }
         | crate::SopCommands::Deny { .. }
-        | crate::SopCommands::Pending => anyhow::bail!(
+        | crate::SopCommands::Pending
+        | crate::SopCommands::Logs { .. } => anyhow::bail!(
             "This command talks to the running daemon over the gateway; \
              it is not handled by the local SOP CLI."
         ),
@@ -228,11 +271,23 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             Ok(())
         }
         crate::SopCommands::Delete { name } => {
-            let dir = resolve_sops_dir(workspace_dir, config.sop.sops_dir.as_deref());
+            let dir = resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
             delete_sop(&dir, &name)?;
             println!(
                 "{}",
                 get_required_cli_string_with_args("cli-sop-deleted", &[("name", &name)])
+            );
+            Ok(())
+        }
+        crate::SopCommands::Rename { from, to } => {
+            let dir = resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
+            rename_sop_typed(&dir, &from, &to, default_mode)?;
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-renamed",
+                    &[("from", &from), ("to", &to)]
+                )
             );
             Ok(())
         }
@@ -245,6 +300,23 @@ mod tests {
     use crate::sop::types::SopManifest;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rename_confirmation_string_resolves_with_both_names() {
+        // The rename subcommand's only user-facing text. A missing Fluent key
+        // renders as `{cli-sop-renamed}` rather than failing the build, so
+        // assert on the rendered string.
+        let rendered = get_required_cli_string_with_args(
+            "cli-sop-renamed",
+            &[("from", "deploy-prod"), ("to", "deploy-production")],
+        );
+        assert!(
+            !rendered.starts_with('{'),
+            "cli-sop-renamed must exist in the CLI catalogue: {rendered}"
+        );
+        assert!(rendered.contains("deploy-prod"), "{rendered}");
+        assert!(rendered.contains("deploy-production"), "{rendered}");
+    }
 
     #[test]
     fn parse_steps_basic() {
@@ -449,6 +521,7 @@ type = "manual"
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
 
         let warnings = validate_sop(&sop);
@@ -484,6 +557,7 @@ type = "manual"
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
             agent: None,
+            decision: None,
         };
 
         let warnings = validate_sop(&sop);
@@ -492,15 +566,16 @@ type = "manual"
 
     #[test]
     fn resolve_sops_dir_default() {
-        let ws = Path::new("/home/user/.zeroclaw/workspace");
-        let dir = resolve_sops_dir(ws, None);
-        assert_eq!(dir, ws.join("sops"));
+        // Unset falls back to the canonical `<install>/shared/sops`.
+        let install_root = Path::new("/test/install");
+        let dir = resolve_sops_dir(install_root, None);
+        assert_eq!(dir, install_root.join("shared").join("sops"));
     }
 
     #[test]
     fn resolve_sops_dir_override() {
-        let ws = Path::new("/home/user/.zeroclaw/workspace");
-        let dir = resolve_sops_dir(ws, Some("/custom/sops"));
+        let install_root = Path::new("/test/install");
+        let dir = resolve_sops_dir(install_root, Some("/custom/sops"));
         assert_eq!(dir, PathBuf::from("/custom/sops"));
     }
 

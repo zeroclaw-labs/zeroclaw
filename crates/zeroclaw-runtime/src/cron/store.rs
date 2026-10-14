@@ -5,12 +5,78 @@ use crate::cron::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+
+static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
+
+// A process-owned token is only safe to preserve during startup recovery while
+// its manual-run guard is still alive. The database cannot represent that
+// distinction, so keep the live set in process memory and fail closed for any
+// current-process token whose guard has terminated.
+static LIVE_AGENT_CLAIM_TOKENS: LazyLock<Mutex<HashSet<(std::path::PathBuf, String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+static FORCED_RELEASE_FAILURES: LazyLock<Mutex<HashSet<std::path::PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn cron_process_lock_owner() -> &'static str {
+    CRON_PROCESS_LOCK_OWNER.get_or_init(|| Uuid::new_v4().to_string())
+}
+
+fn new_agent_lock_token() -> String {
+    format!("{}:{}", cron_process_lock_owner(), Uuid::new_v4())
+}
+
+fn register_live_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+    let mut claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    claims.insert((
+        cron_db_path(config),
+        job_id.to_string(),
+        lock_token.to_string(),
+    ));
+}
+
+pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+    let mut claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    claims.remove(&(
+        cron_db_path(config),
+        job_id.to_string(),
+        lock_token.to_string(),
+    ));
+}
+
+#[cfg(test)]
+pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
+    let mut failures = FORCED_RELEASE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let db_path = cron_db_path(config);
+    if enabled {
+        failures.insert(db_path);
+    } else {
+        failures.remove(&db_path);
+    }
+}
+
+#[cfg(test)]
+fn should_force_release_failure(config: &Config) -> bool {
+    FORCED_RELEASE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&cron_db_path(config))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunCompletionAction {
@@ -227,6 +293,48 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     Ok(job)
 }
 
+/// The error a lookup for an absent job produces.
+///
+/// Ownership refusals reuse it, so a job owned by someone else is
+/// indistinguishable from one that does not exist. Keeping the wording in one
+/// place is what makes that property structural rather than coincidental.
+#[must_use]
+pub fn job_not_found(job_id: &str) -> anyhow::Error {
+    anyhow::Error::msg(format!("Cron job '{job_id}' not found"))
+}
+
+/// Read a job only when `agent_alias` is its current owner. The ownership
+/// predicate belongs to this SELECT so an operator rename that commits before
+/// the read cannot leave the caller with a stale authorization.
+///
+/// A job owned by someone else reports the same error an absent one reports,
+/// so the guard cannot confirm that it exists. Rows predating the
+/// `agent_alias` column belong to no agent and are reachable only from the
+/// unscoped operator surfaces.
+pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Result<CronJob> {
+    let Some(mut job) = with_read_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+             FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+        )?;
+
+        let mut rows = stmt.query(params![job_id, agent_alias])?;
+        if let Some(row) = rows.next()? {
+            map_cron_job_row(row).map_err(Into::into)
+        } else {
+            Err(job_not_found(job_id))
+        }
+    })?
+    else {
+        return Err(job_not_found(job_id));
+    };
+
+    resolve_declarative_shell_output_format(config, &mut job);
+    Ok(job)
+}
+
 /// Raw DB row for a job, with no config overlay applied. `shell_output_format`
 /// on the returned job is exactly what's stored in the `cron_jobs` column —
 /// for a declarative job that is a stale/default value, not the canonical
@@ -246,11 +354,11 @@ fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
         if let Some(row) = rows.next()? {
             map_cron_job_row(row).map_err(Into::into)
         } else {
-            anyhow::bail!("Cron job '{job_id}' not found")
+            Err(job_not_found(job_id))
         }
     })?
     else {
-        anyhow::bail!("Cron job '{job_id}' not found")
+        return Err(job_not_found(job_id));
     };
     Ok(job)
 }
@@ -260,8 +368,8 @@ pub fn resolve_job_id_or_name(
     id_or_name: &str,
     agent_alias: &str,
 ) -> Result<String> {
-    // Fast path: try exact ID lookup first.
-    if let Ok(job) = get_job(config, id_or_name) {
+    // Fast path: exact ID, scoped the same way the name fallback below is.
+    if let Ok(job) = get_job_for_agent(config, id_or_name, agent_alias) {
         return Ok(job.id);
     }
 
@@ -282,10 +390,33 @@ pub fn resolve_job_id_or_name(
     }
 }
 
-pub fn remove_job(config: &Config, id: &str) -> Result<()> {
+/// Delete a job only if `agent_alias` owns it, in one statement.
+///
+/// The agent-facing tools authorize with a scoped read and then write. Ownership
+/// can change without the job id changing — the operator's agent-rename cascade
+/// does exactly that — so a rename landing between the two lets the former owner
+/// still delete the job. Matching both columns in the `DELETE` closes that window.
+/// A row owned by someone else reports the same not-found error as a missing one,
+/// so the guard does not become an existence oracle.
+pub fn remove_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<()> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
-            .context("Failed to delete cron job")
+        // Owner-guarded job removal deletes the history in the SAME
+        // transaction: the run rows no longer cascade, and the ownership
+        // guard stays on the job delete — history goes only when the
+        // guarded job delete matched.
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx
+            .execute(
+                "DELETE FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+                params![id, agent_alias],
+            )
+            .context("Failed to delete cron job")?;
+        if changed > 0 {
+            tx.execute("DELETE FROM cron_runs WHERE job_id = ?1", params![id])
+                .context("Failed to delete cron job run history")?;
+        }
+        tx.commit().context("Failed to commit cron job removal")?;
+        Ok(changed)
     })?;
 
     if changed == 0 {
@@ -297,7 +428,52 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
             .with_category(::zeroclaw_log::EventCategory::Cron)
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
-            .with_attrs(::serde_json::json!({"job_id": id})),
+            .with_attrs(::serde_json::json!({"job_id": id, "agent_alias": agent_alias})),
+        "Removed cron job"
+    );
+    Ok(())
+}
+
+pub fn remove_job(config: &Config, id: &str) -> Result<()> {
+    let (jobs_deleted, runs_deleted) = with_initialized_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        // Operator-initiated removal deletes the job AND its history —
+        // explicitly, now that run rows no longer cascade (they must
+        // survive the completion-time auto-delete of one-shots). A job id
+        // whose row is already gone but whose retained history remains
+        // (a completed auto-delete one-shot, quarantined or owned) is a
+        // valid removal target: history-only removal succeeds. When
+        // NEITHER exists the transaction is rolled back and nothing is
+        // deleted — an unknown id must never destroy data while
+        // reporting failure.
+        let runs_deleted = tx
+            .execute("DELETE FROM cron_runs WHERE job_id = ?1", params![id])
+            .context("Failed to delete cron job run history")?;
+        let jobs_deleted = tx
+            .execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
+            .context("Failed to delete cron job")?;
+        if jobs_deleted == 0 && runs_deleted == 0 {
+            drop(tx);
+            return Ok((0usize, 0usize));
+        }
+        tx.commit().context("Failed to commit cron job removal")?;
+        Ok((jobs_deleted, runs_deleted))
+    })?;
+
+    if jobs_deleted == 0 && runs_deleted == 0 {
+        anyhow::bail!("Cron job '{id}' not found");
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+            .with_category(::zeroclaw_log::EventCategory::Cron)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({
+                "job_id": id,
+                "runs_deleted": runs_deleted,
+                "history_only": jobs_deleted == 0,
+            })),
         "Removed cron job"
     );
     Ok(())
@@ -328,16 +504,27 @@ pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<Cron
     Ok(jobs)
 }
 
-/// Delete every cron job owned by `agent_alias`, returning the row count
-/// (`cron_runs` cascade via their `job_id` FK). A job whose owning agent is gone
-/// can never run, so the agent-deletion cascade removes it
+/// Delete every cron job owned by `agent_alias` and its run history,
+/// returning the job row count. A job whose owning agent is gone can never
+/// run, so the agent deletion removes it.
 pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute(
-            "DELETE FROM cron_jobs WHERE agent_alias = ?1",
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM cron_runs WHERE owner_agent = ?1 OR job_id IN
+                 (SELECT id FROM cron_jobs WHERE agent_alias = ?1)",
             params![agent_alias],
         )
-        .context("Failed to delete cron jobs for agent")
+        .context("Failed to delete run history for agent's cron jobs")?;
+        let changed = tx
+            .execute(
+                "DELETE FROM cron_jobs WHERE agent_alias = ?1",
+                params![agent_alias],
+            )
+            .context("Failed to delete cron jobs for agent")?;
+        tx.commit()
+            .context("Failed to commit agent cron job removal")?;
+        Ok(changed)
     })?;
     Ok(changed)
 }
@@ -348,14 +535,73 @@ pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize>
 /// is a direct column update.
 pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usize> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs SET agent_alias = ?2 WHERE agent_alias = ?1",
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx
+            .execute(
+                "UPDATE cron_jobs SET agent_alias = ?2 WHERE agent_alias = ?1",
+                params![from, to],
+            )
+            .context("Failed to rename cron job owner")?;
+        // Run rows follow the rename through their durable CLEANUP owner —
+        // including retained rows whose job is already gone — while the
+        // historical executing_agent stays the immutable at-time-of-action
+        // fact.
+        tx.execute(
+            "UPDATE cron_runs SET owner_agent = ?2 WHERE owner_agent = ?1",
             params![from, to],
         )
-        .context("Failed to rename cron job owner")
+        .context("Failed to re-point run-history cleanup owner")?;
+        tx.commit().context("Failed to commit cron owner rename")?;
+        Ok(changed)
     })?;
     Ok(changed)
 }
+
+/// The agent a job executes under and is cleaned up by: its stored alias when
+/// that names an ENABLED configured agent, otherwise the single enabled agent
+/// claiming the id through `[agents.<x>].cron_jobs`. A stored alias is not
+/// re-checked against live `cron_jobs` membership (a declarative move is
+/// reconciled by sync, not here), but a disabled agent runs nothing through
+/// either arm — otherwise ownership recovery, which stamps a then-enabled
+/// claimant onto the row, would turn a job that is refused today into one
+/// that keeps running after its agent is disabled. Because the fallback is the
+/// same unique-claimant rule recovery and declarative sync apply, a job that
+/// recovery leaves unowned is not executed under an arbitrary claimant.
+pub(crate) fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
+    if !job.agent_alias.is_empty()
+        && let Some((alias, agent)) = config.agents.get_key_value(job.agent_alias.as_str())
+        && agent.enabled
+    {
+        return Some(alias.as_str());
+    }
+    config.agent_for_cron_job(&job.id)
+}
+
+/// Log attributes explaining why a job has no owner, so an operator can tell
+/// a contested claim (remove one) from a disabled-only claim (enable the
+/// agent) from an unclaimed job (add a claim) or a stale stored alias.
+pub(crate) fn ownership_refusal_attrs(config: &Config, job: &CronJob) -> serde_json::Value {
+    let (claim, claimants): (&str, Vec<&str>) = match config.cron_job_claim(&job.id) {
+        zeroclaw_config::schema::CronJobClaim::Unclaimed => ("unclaimed", Vec::new()),
+        zeroclaw_config::schema::CronJobClaim::DisabledOnly => ("disabled_only", Vec::new()),
+        zeroclaw_config::schema::CronJobClaim::Sole(alias) => ("sole", vec![alias]),
+        zeroclaw_config::schema::CronJobClaim::Contested(aliases) => ("contested", aliases),
+    };
+    let stored_alias_disabled = config
+        .agents
+        .get(job.agent_alias.as_str())
+        .is_some_and(|agent| !agent.enabled);
+    serde_json::json!({
+        "job_id": job.id,
+        "stored_alias": job.agent_alias,
+        "stored_alias_disabled": stored_alias_disabled,
+        "claim": claim,
+        "claimants": claimants,
+    })
+}
+
+pub(crate) const NO_OWNER_MESSAGE: &str = "Cron job has no single owning agent; exactly one \
+                                           enabled [agents.<x>].cron_jobs list must claim it";
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let lim = config.scheduler.max_tasks.max(1);
@@ -391,6 +637,23 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                         );
                         continue;
                     }
+                    // Selected before it is claimed: a job with no single
+                    // owner must not be claimed, refused, and released every
+                    // poll — that would spin forever at the head of the queue
+                    // and hold a max_tasks slot without ever advancing.
+                    if resolve_owning_agent(config, &job).is_none() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(ownership_refusal_attrs(config, &job)),
+                            NO_OWNER_MESSAGE
+                        );
+                        continue;
+                    }
                     resolve_declarative_shell_output_format(config, &mut job);
                     jobs.push(job);
                 }
@@ -412,6 +675,19 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     Ok(jobs.into_iter().take(lim).collect())
 }
 
+/// Every overdue row, including rows with no single owner, because the two
+/// startup modes need the unfiltered view for different reasons.
+///
+/// With `catch_up_on_startup` disabled, startup skips or advances missed
+/// occurrences: an unowned one-shot has to be visible here to be retired or
+/// advanced, rather than staying overdue until a claim appears and the stale
+/// occurrence fires.
+///
+/// With catch-up enabled, the row is surfaced and then refused by the
+/// dispatch guard, which releases its lock; it stays overdue until ownership
+/// becomes resolvable. That is the intended behavior for enabled catch-up,
+/// and it cannot execute meanwhile: `due_jobs` excludes it from ordinary
+/// polling and every execution path refuses an unowned row.
 pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let Some(jobs) = with_read_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -464,6 +740,30 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
 }
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
+    update_job_inner(config, job_id, None, patch)
+}
+
+/// Patch a job only if `agent_alias` owns it, with the ownership test carried
+/// into the `UPDATE` itself rather than performed as a separate read. See
+/// `remove_job_for_agent` for why the separate read is not enough.
+pub fn update_job_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    patch: CronJobPatch,
+) -> Result<CronJob> {
+    // Read-side check first so an ordinary miss gets the usual error before any
+    // work happens; the WHERE guard below is what makes the write itself safe.
+    get_job_for_agent(config, job_id, agent_alias)?;
+    update_job_inner(config, job_id, Some(agent_alias), patch)
+}
+
+fn update_job_inner(
+    config: &Config,
+    job_id: &str,
+    owner: Option<&str>,
+    patch: CronJobPatch,
+) -> Result<CronJob> {
     // Start from the raw DB row, not the config-resolved `get_job()` view:
     // for a declarative job, `shell_output_format` isn't DB-owned, so an
     // unrelated patch (e.g. toggling `enabled`) must not re-persist the
@@ -490,6 +790,23 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.enabled = enabled;
     }
     if let Some(delivery) = patch.delivery {
+        // A declarative job's delivery is owned by `[cron.<id>].delivery` in
+        // config.toml. Writing it here would appear to succeed and then be
+        // silently reverted by `sync_declarative_jobs` on the next daemon
+        // start, which rewrites every declarative column from the config.
+        // Reject at this boundary rather than persist a value the next sync
+        // discards, matching how `shell_output_format` is handled below.
+        //
+        // Ownership is checked before shape: a declarative job rejects any
+        // delivery patch, so reporting a missing recipient first would imply
+        // that correcting it would let the write through.
+        if job.source == "declarative" {
+            anyhow::bail!(
+                "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
+                 config.toml for a declarative job, not the database. Edit the config \
+                 and restart the daemon."
+            );
+        }
         // Match add_*_job: announce delivery must include channel + to.
         validate_delivery_config(Some(&delivery))?;
         job.delivery = delivery;
@@ -548,13 +865,13 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         // there (NULL, garbage, or a future value) with a value the DB doesn't
         // own. Omit the column from the UPDATE for declarative rows so the
         // non-owned shadow stays untouched.
-        if job.source == "declarative" {
+        let changed = if job.source == "declarative" {
             conn.execute(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
                      allowed_tools = ?12, next_run = ?13, uses_memory = ?14
-                 WHERE id = ?15",
+                 WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
                 params![
                     job.expression,
                     job.command,
@@ -571,6 +888,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                     job.next_run.to_rfc3339(),
                     if job.uses_memory { 1 } else { 0 },
                     job.id,
+                    owner,
                 ],
             )
         } else {
@@ -579,7 +897,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
                      allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
-                 WHERE id = ?16",
+                 WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
                 params![
                     job.expression,
                     job.command,
@@ -600,10 +918,17 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                         CronShellOutputFormat::Raw => "raw",
                     },
                     job.id,
+                    owner,
                 ],
             )
         }
         .context("Failed to update cron job")?;
+
+        // Zero rows means the guard matched nothing: the job moved to another
+        // owner between the read above and this write.
+        if changed == 0 {
+            anyhow::bail!("Cron job '{job_id}' not found");
+        }
         Ok(())
     })?;
 
@@ -728,10 +1053,93 @@ pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bo
     })
 }
 
+/// Claim a job only while it is still owned by `agent_alias`.
+///
+/// The owner predicate is part of the atomic claim update. This is the
+/// linearization point for an agent-facing manual trigger: a rename that wins
+/// before this statement prevents the former owner from executing the job.
+pub fn claim_job_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let token = claim_job_for_agent_with_token(config, job_id, agent_alias, now)?;
+    if let Some(token) = token.as_deref() {
+        // This compatibility wrapper cannot own a guard, so it must not leave
+        // a token marked live beyond the claim operation itself.
+        finish_agent_claim(config, job_id, token);
+    }
+    Ok(token.is_some())
+}
+
+/// Claim an agent-owned job and return the opaque claim token.
+///
+/// The token identifies this specific execution. It lets cleanup release only
+/// the claim it acquired, so a cancelled run cannot clear a later execution's
+/// lock for the same job.
+pub fn claim_job_for_agent_with_token(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let lock_token = new_agent_lock_token();
+    register_live_agent_claim(config, job_id, &lock_token);
+    let result = with_initialized_connection(config, |conn| {
+        let claimed = conn
+            .execute(
+                "UPDATE cron_jobs
+                 SET locked_at = ?1, lock_token = ?2
+                 WHERE id = ?3 AND agent_alias = ?4 AND locked_at IS NULL",
+                params![now.to_rfc3339(), lock_token, job_id, agent_alias],
+            )
+            .context("Failed to claim agent-owned cron job for execution")?;
+        Ok(if claimed == 1 {
+            Some(lock_token.clone())
+        } else {
+            None
+        })
+    });
+    match result {
+        Ok(Some(token)) => Ok(Some(token)),
+        Ok(None) => {
+            finish_agent_claim(config, job_id, &lock_token);
+            Ok(None)
+        }
+        Err(error) => {
+            finish_agent_claim(config, job_id, &lock_token);
+            Err(error)
+        }
+    }
+}
+
+/// Release an agent claim only when it still owns the supplied token.
+pub fn release_job_for_token(config: &Config, job_id: &str, lock_token: &str) -> Result<bool> {
+    #[cfg(test)]
+    if should_force_release_failure(config) {
+        anyhow::bail!("forced cron lock release failure for test");
+    }
+
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs
+             SET locked_at = NULL, lock_token = NULL
+             WHERE id = ?1 AND lock_token = ?2",
+            params![job_id, lock_token],
+        )
+        .context("Failed to release cron job lock")
+    })?;
+    if changed == 1 {
+        finish_agent_claim(config, job_id, lock_token);
+    }
+    Ok(changed == 1)
+}
+
 pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            "UPDATE cron_jobs SET locked_at = NULL, lock_token = NULL WHERE id = ?1",
             params![job_id],
         )
         .context("Failed to release cron job lock")?;
@@ -739,23 +1147,88 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
-pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+fn clear_stale_locks_inner(config: &Config, before_update: impl FnOnce()) -> Result<usize> {
+    // Keep the registry lock through the snapshot and the cleanup UPDATE. A
+    // new manual claim registers its token before writing the row; holding the
+    // same lock here makes that admission wait until recovery has finished, so
+    // recovery cannot clear a claim that was admitted during its stale-token
+    // snapshot.
+    let claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let db_path = cron_db_path(config);
+    let live_tokens = claims
+        .iter()
+        .filter_map(|(path, _, token)| (path == &db_path).then_some(token.clone()))
+        .collect::<HashSet<_>>();
+
+    before_update();
+
     let cleared = with_read_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
-            [],
-        )
-        .context("Failed to clear stale cron job locks")
+        let changed = if live_tokens.is_empty() {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET locked_at = NULL, lock_token = NULL
+                 WHERE locked_at IS NOT NULL",
+                [],
+            )?
+        } else {
+            let placeholders = std::iter::repeat_n("?", live_tokens.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE cron_jobs
+                 SET locked_at = NULL, lock_token = NULL
+                 WHERE locked_at IS NOT NULL
+                   AND (lock_token IS NULL OR lock_token NOT IN ({placeholders}))"
+            );
+            conn.execute(&sql, rusqlite::params_from_iter(live_tokens.iter()))?
+        };
+        Ok(changed)
     })?;
     Ok(cleared.unwrap_or(0))
 }
 
+pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+    clear_stale_locks_inner(config, || {})
+}
+
+/// The three independent outcomes recorded per run beside the derived
+/// `status` rollup: did the turn itself complete (`ok | error`), what
+/// happened to the configured delivery attempt
+/// (`not_required | delivered | failed | skipped`), and did the
+/// conversation-binding append land (`not_bound | persisted | failed`;
+/// always `not_bound` until conversation binding exists).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOutcomes<'a> {
+    pub execution: &'a str,
+    pub delivery: &'a str,
+    pub persistence: &'a str,
+}
+
+/// The immutable provenance stamped on a run record, side by side, as
+/// at-time-of-action facts: the initiating principal (serialized verbatim)
+/// and the executing agent's canonical alias. Later job renames or owner
+/// changes never rewrite what a historical row reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunProvenance<'a> {
+    pub principal: Option<&'a zeroclaw_api::ingress::InternalPrincipal>,
+    pub executing_agent: Option<&'a str>,
+    /// The job's `source` (`imperative` / `declarative`) at time of action,
+    /// so a run row retained past its job's deletion stays reachable by the
+    /// declarative cleanup that owns that id space.
+    pub job_source: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn record_run(
     config: &Config,
     job_id: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     status: &str,
+    outcomes: RunOutcomes<'_>,
+    provenance: RunProvenance<'_>,
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
@@ -773,6 +1246,8 @@ pub fn record_run(
             started_at,
             finished_at,
             status,
+            outcomes,
+            provenance,
             bounded_output.as_deref(),
             duration_ms,
         )?;
@@ -783,6 +1258,22 @@ pub fn record_run(
     })
 }
 
+/// Inside a persist transaction: verify the job row still exists. An
+/// operator's `remove_job` can complete while a manual (or scheduled) run
+/// is still executing; the removal deleted the job AND its history, and a
+/// completion that then persisted its row would resurrect an orphan record
+/// the operator explicitly purged. Deletion wins: the persist fails and
+/// rolls back.
+fn ensure_job_still_exists(conn: &Connection, job_id: &str) -> Result<()> {
+    let present: i64 = conn
+        .prepare("SELECT count(*) FROM cron_jobs WHERE id = ?1")?
+        .query_row(params![job_id], |row| row.get(0))?;
+    if present == 0 {
+        anyhow::bail!("cron job '{job_id}' was removed while its run was executing");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_manual_run_result(
     config: &Config,
@@ -790,6 +1281,8 @@ pub(crate) fn persist_manual_run_result(
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     status: &str,
+    outcomes: RunOutcomes<'_>,
+    provenance: RunProvenance<'_>,
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
@@ -798,6 +1291,8 @@ pub(crate) fn persist_manual_run_result(
     with_initialized_connection(config, |conn| {
         let tx = conn.unchecked_transaction()?;
 
+        ensure_job_still_exists(&tx, &job.id)?;
+
         insert_run_and_prune(
             &tx,
             config,
@@ -805,6 +1300,8 @@ pub(crate) fn persist_manual_run_result(
             started_at,
             finished_at,
             status,
+            outcomes,
+            provenance,
             bounded_output.as_deref(),
             duration_ms,
         )?;
@@ -831,6 +1328,8 @@ pub(crate) fn persist_run_result(
     finished_at: DateTime<Utc>,
     job_state_at: DateTime<Utc>,
     status: &str,
+    outcomes: RunOutcomes<'_>,
+    provenance: RunProvenance<'_>,
     output: Option<&str>,
     duration_ms: i64,
     action: RunCompletionAction,
@@ -840,6 +1339,8 @@ pub(crate) fn persist_run_result(
     with_initialized_connection(config, |conn| {
         let tx = conn.unchecked_transaction()?;
 
+        ensure_job_still_exists(&tx, &job.id)?;
+
         insert_run_and_prune(
             &tx,
             config,
@@ -847,6 +1348,8 @@ pub(crate) fn persist_run_result(
             started_at,
             finished_at,
             status,
+            outcomes,
+            provenance,
             bounded_output.as_deref(),
             duration_ms,
         )?;
@@ -887,12 +1390,21 @@ fn insert_run_and_prune(
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     status: &str,
+    outcomes: RunOutcomes<'_>,
+    provenance: RunProvenance<'_>,
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
+    let principal_json = provenance
+        .principal
+        .map(serde_json::to_string)
+        .transpose()
+        .context("Failed to serialize run principal")?;
     conn.execute(
-        "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms,
+                                execution, delivery, persistence, principal, executing_agent,
+                                job_source, owner_agent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             job_id,
             started_at.to_rfc3339(),
@@ -900,6 +1412,15 @@ fn insert_run_and_prune(
             status,
             output,
             duration_ms,
+            outcomes.execution,
+            outcomes.delivery,
+            outcomes.persistence,
+            principal_json,
+            provenance.executing_agent,
+            provenance.job_source,
+            // The cleanup owner STARTS as the executing agent and then
+            // follows renames; the executing_agent column above never does.
+            provenance.executing_agent,
         ],
     )
     .context("Failed to insert cron run")?;
@@ -957,30 +1478,85 @@ fn truncate_cron_output(output: &str) -> String {
     truncated
 }
 
+const RUN_SELECT_COLUMNS: &str = "id, job_id, started_at, finished_at, status, output, duration_ms,
+                    execution, delivery, persistence, principal, executing_agent, job_source,
+                    owner_agent";
+
+fn map_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronRun> {
+    Ok(CronRun {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        started_at: parse_rfc3339(&row.get::<_, String>(2)?).map_err(sql_conversion_error)?,
+        finished_at: parse_rfc3339(&row.get::<_, String>(3)?).map_err(sql_conversion_error)?,
+        status: row.get(4)?,
+        output: row.get(5)?,
+        duration_ms: row.get(6)?,
+        execution: row.get(7)?,
+        delivery: row.get(8)?,
+        persistence: row.get(9)?,
+        principal: row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok()),
+        executing_agent: row.get(11)?,
+        job_source: row.get(12)?,
+        owner_agent: row.get(13)?,
+    })
+}
+
 pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<CronRun>> {
     let Some(runs) = with_read_connection(config, |conn| {
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
-        let mut stmt = conn.prepare(
-            "SELECT id, job_id, started_at, finished_at, status, output, duration_ms
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_SELECT_COLUMNS}
              FROM cron_runs
              WHERE job_id = ?1
              ORDER BY started_at DESC, id DESC
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        ))?;
 
-        let rows = stmt.query_map(params![job_id, lim], |row| {
-            Ok(CronRun {
-                id: row.get(0)?,
-                job_id: row.get(1)?,
-                started_at: parse_rfc3339(&row.get::<_, String>(2)?)
-                    .map_err(sql_conversion_error)?,
-                finished_at: parse_rfc3339(&row.get::<_, String>(3)?)
-                    .map_err(sql_conversion_error)?,
-                status: row.get(4)?,
-                output: row.get(5)?,
-                duration_ms: row.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![job_id, lim], map_run_row)?;
+
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(runs)
+}
+
+/// Owner-scoped run-history read: the ownership predicate rides the SAME
+/// query that returns the rows, so authorization and retrieval can never
+/// straddle a concurrent rename or owner re-point — the row set is decided
+/// atomically by one statement. A row belongs to the caller when its
+/// durable cleanup owner matches; a legacy row recorded before ownership
+/// existed belongs to whoever currently owns the live job.
+pub fn list_runs_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    limit: usize,
+) -> Result<Vec<CronRun>> {
+    let Some(runs) = with_read_connection(config, |conn| {
+        let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_SELECT_COLUMNS}
+             FROM cron_runs
+             WHERE job_id = ?1
+               AND (owner_agent = ?2
+                    OR (owner_agent IS NULL
+                        AND EXISTS (SELECT 1 FROM cron_jobs
+                                    WHERE id = ?1 AND agent_alias = ?2)))
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?3"
+        ))?;
+
+        let rows = stmt.query_map(params![job_id, agent_alias, lim], map_run_row)?;
 
         let mut runs = Vec::new();
         for row in rows {
@@ -1167,9 +1743,20 @@ pub fn sync_declarative_jobs(
         // declarative jobs only when cron storage already exists. A fresh
         // workspace with nothing to sync should stay DB-free on daemon start.
         let _ = with_existing_initialized_connection(config, |conn| {
-            let deleted = conn
+            // Job and history go together or not at all: with the run-row
+            // foreign key gone, only a transaction keeps removal atomic.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM cron_runs WHERE job_source = 'declarative' OR job_id IN
+                     (SELECT id FROM cron_jobs WHERE source = 'declarative')",
+                [],
+            )
+            .context("Failed to remove stale declarative cron run history")?;
+            let deleted = tx
                 .execute("DELETE FROM cron_jobs WHERE source = 'declarative'", [])
                 .context("Failed to remove stale declarative cron jobs")?;
+            tx.commit()
+                .context("Failed to commit stale declarative cron removal")?;
             if deleted > 0 {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -1205,16 +1792,52 @@ pub fn sync_declarative_jobs(
 
             for db_id in &db_ids {
                 if !config_ids.contains(db_id.as_str()) {
-                    conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![db_id])
+                    // Job and history go together or not at all: with the
+                    // run-row foreign key gone, only a transaction keeps
+                    // removal atomic.
+                    let tx = conn.unchecked_transaction()?;
+                    tx.execute("DELETE FROM cron_runs WHERE job_id = ?1", params![db_id])
+                        .with_context(|| {
+                            format!(
+                                "Failed to remove run history of stale declarative cron job '{db_id}'"
+                            )
+                        })?;
+                    tx.execute("DELETE FROM cron_jobs WHERE id = ?1", params![db_id])
                         .with_context(|| {
                             format!("Failed to remove stale declarative cron job '{db_id}'")
                         })?;
+                    tx.commit().with_context(|| {
+                        format!("Failed to commit removal of stale declarative cron job '{db_id}'")
+                    })?;
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_attrs(::serde_json::json!({"job_id": db_id})),
                         "Removed declarative cron job no longer in config"
                     );
+                }
+            }
+
+            // Retained run rows whose declarative job is already gone (a
+            // completed auto-delete one-shot) are reachable only through
+            // their own `job_source` stamp: purge the ones whose id has
+            // left the config, exactly as the live-job pass above does.
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT job_id FROM cron_runs WHERE job_source = 'declarative'",
+            )?;
+            let run_ids: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+            for run_id in &run_ids {
+                if !config_ids.contains(run_id.as_str()) {
+                    conn.execute("DELETE FROM cron_runs WHERE job_id = ?1", params![run_id])
+                        .with_context(|| {
+                            format!(
+                                "Failed to remove retained run history of removed declarative cron job '{run_id}'"
+                            )
+                        })?;
                 }
             }
         }
@@ -1224,7 +1847,16 @@ pub fn sync_declarative_jobs(
             let expression = schedule_cron_expression(&schedule).unwrap_or_default();
             let schedule_json = serde_json::to_string(&schedule)?;
             let job_type = &decl.job_type;
-            let session_target = decl.session_target.as_deref().unwrap_or("isolated");
+            // Persist the canonical enum, not the raw config string. `try_parse`
+            // trims and lowercases; the stored-row `parse` path does not, so a
+            // value like `"  MAIN  "` would otherwise reload as Isolated.
+            let session_target = match decl.session_target.as_deref() {
+                Some(raw) => SessionTarget::try_parse(raw).map_err(|err| {
+                    anyhow::Error::msg(format!("Declarative cron job '{id}': {err}"))
+                })?,
+                None => SessionTarget::Isolated,
+            };
+            let session_target = session_target.as_str();
             let delivery = match &decl.delivery {
                 Some(d) => convert_delivery_decl(d),
                 None => DeliveryConfig::default(),
@@ -1318,20 +1950,36 @@ pub fn sync_declarative_jobs(
                 );
             } else {
                 // Reverse-resolve the owning agent from
-                // `[agents.<x>].cron_jobs` membership. Orphan declarative
-                // entries that no agent claims are skipped with a warning
-                // rather than silently bound to a magic alias.
+                // `[agents.<x>].cron_jobs` membership. A declarative entry
+                // that no enabled agent claims, or that more than one claims,
+                // is skipped with a warning rather than bound to a magic or
+                // arbitrary alias that execution would then honor.
                 let Some(agent_alias) = config.agent_for_cron_job(id) else {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"job_id": id})),
-                        "Skipping declarative cron job: no [agents.<x>].cron_jobs entry claims this id"
+                        "Skipping declarative cron job: exactly one enabled [agents.<x>].cron_jobs entry must claim this id"
                     );
                     continue;
                 };
                 let next_run = next_run_for_schedule(&schedule, now)?;
+                // A declarative id is a stable, operator-chosen config key
+                // that can be reassigned to a different agent. Quarantined
+                // history under this id (owner unknown, job gone) must not
+                // be resurrected into the NEW job's owner scope through the
+                // live-job arm of the owner-scoped read — purge it before
+                // the job row exists.
+                conn.execute(
+                    "DELETE FROM cron_runs
+                     WHERE job_id = ?1 AND owner_agent IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM cron_jobs j WHERE j.id = ?1)",
+                    params![id],
+                )
+                .with_context(|| {
+                    format!("Failed to purge quarantined history for reassigned cron id '{id}'")
+                })?;
                 conn.execute(
                     "INSERT INTO cron_jobs (
                         id, expression, command, schedule, job_type, prompt, name,
@@ -1409,6 +2057,11 @@ fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Resul
         }
     }
 
+    if let Some(raw) = decl.session_target.as_deref() {
+        SessionTarget::try_parse(raw)
+            .map_err(|err| anyhow::Error::msg(format!("Declarative cron job '{id}': {err}")))?;
+    }
+
     Ok(())
 }
 
@@ -1445,8 +2098,8 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
     }
 }
 
-fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(cron_jobs)")?;
+fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let col_name: String = row.get(1)?;
@@ -1461,7 +2114,7 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
     // Tolerate "duplicate column name" errors to handle the race where
     // another process adds the column between our PRAGMA check and ALTER.
     match conn.execute(
-        &format!("ALTER TABLE cron_jobs ADD COLUMN {name} {sql_type}"),
+        &format!("ALTER TABLE {table} ADD COLUMN {name} {sql_type}"),
         [],
     ) {
         Ok(_) => Ok(()),
@@ -1471,12 +2124,14 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err), "name": name})),
-                "Column cron_jobs. already exists (concurrent migration)"
+                    .with_attrs(
+                        ::serde_json::json!({"error": format!("{}", err), "table": table, "name": name})
+                    ),
+                "Column already exists (concurrent migration)"
             );
             Ok(())
         }
-        Err(e) => Err(e).with_context(|| format!("Failed to add cron_jobs.{name}")),
+        Err(e) => Err(e).with_context(|| format!("Failed to add {table}.{name}")),
     }
 }
 
@@ -1513,13 +2168,12 @@ fn with_existing_initialized_connection<T>(
             db_path.display().to_string()
         )
     })?;
-
-    initialize_schema(&conn)?;
+    initialize_schema(&conn, config)?;
 
     f(&conn).map(Some)
 }
 
-fn with_initialized_connection<T>(
+pub(super) fn with_initialized_connection<T>(
     config: &Config,
     f: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
@@ -1545,8 +2199,7 @@ fn with_initialized_connection<T>(
 
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
-
-    initialize_schema(&conn)?;
+    initialize_schema(&conn, config)?;
 
     f(&conn)
 }
@@ -1601,6 +2254,9 @@ fn apply_run_completion_state(
             }
         }
         RunCompletionAction::Delete => {
+            // Deletes the JOB only: the run row inserted moments earlier in
+            // this same transaction survives as the one-shot's durable
+            // record (status, outcome triple, provenance).
             let changed = conn
                 .execute("DELETE FROM cron_jobs WHERE id = ?1", params![job.id])
                 .context("Failed to delete completed one-shot cron job")?;
@@ -1613,7 +2269,49 @@ fn apply_run_completion_state(
     Ok(())
 }
 
-fn initialize_schema(conn: &Connection) -> Result<()> {
+/// Prepare a freshly opened connection: pragmas, schema, and every required
+/// recovery and data migration. Store operations run only after this
+/// returns `Ok`, so a failure here — including lock contention that
+/// outlasts the busy window in ANY phase — refuses the operation before it
+/// starts rather than letting it run against an incompletely recovered or
+/// migrated database.
+fn initialize_schema(conn: &Connection, config: &Config) -> Result<()> {
+    apply_schema_and_migrations(conn, config).map_err(|err| {
+        let contended = err
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+            .any(is_lock_contention);
+        if contended {
+            err.context(MIGRATION_CONTENTION_CONTEXT)
+        } else {
+            err
+        }
+    })
+}
+
+fn apply_schema_and_migrations(conn: &Connection, config: &Config) -> Result<()> {
+    // Wait for a competing writer instead of failing on first contention,
+    // and WAL so readers never block a migration commit — as the SOP, task,
+    // cert, and ACP stores do. Unlike them, synchronous stays FULL: a commit
+    // lost to power failure here can re-run a one-shot job's side effect or
+    // resurrect a removed job, so cron keeps the pre-WAL durability.
+    // Set before recovery below so its write transactions are covered too;
+    // contention that outlasts the busy window fails the open closed.
+    conn.execute_batch(
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = FULL;",
+    )
+    .context("Failed to set cron DB connection pragmas")?;
+
+    // Before anything references cron_runs: in the between-DROP-and-RENAME
+    // state an interrupted (predecessor, non-atomic) rebuild leaves behind,
+    // the stranded working table is the ONLY holder of the run history, and
+    // creating cron_runs first would fork the history away from it. The
+    // beside-cron_runs stranded state is instead merged later, once the
+    // additive migrations guarantee every stranded column exists.
+    recover_stranded_cron_runs_table(conn)?;
+
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS cron_jobs (
@@ -1646,7 +2344,13 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             status      TEXT NOT NULL,
             output      TEXT,
             duration_ms INTEGER,
-            FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+            execution   TEXT,
+            delivery    TEXT,
+            persistence TEXT,
+            principal   TEXT,
+            executing_agent TEXT,
+            job_source  TEXT,
+            owner_agent TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
@@ -1654,34 +2358,518 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     )
     .context("Failed to initialize cron schema")?;
 
-    add_column_if_missing(conn, "schedule", "TEXT")?;
-    add_column_if_missing(conn, "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
-    add_column_if_missing(conn, "prompt", "TEXT")?;
-    add_column_if_missing(conn, "name", "TEXT")?;
-    add_column_if_missing(conn, "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
-    add_column_if_missing(conn, "model", "TEXT")?;
-    add_column_if_missing(conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(conn, "delivery", "TEXT")?;
-    add_column_if_missing(conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "allowed_tools", "TEXT")?;
-    add_column_if_missing(conn, "source", "TEXT DEFAULT 'imperative'")?;
-    add_column_if_missing(conn, "uses_memory", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "cron_jobs", "schedule", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "job_type",
+        "TEXT NOT NULL DEFAULT 'shell'",
+    )?;
+    add_column_if_missing(conn, "cron_jobs", "prompt", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "name", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "session_target",
+        "TEXT NOT NULL DEFAULT 'isolated'",
+    )?;
+    add_column_if_missing(conn, "cron_jobs", "model", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "cron_jobs", "delivery", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "delete_after_run",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "cron_jobs", "allowed_tools", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "source", "TEXT DEFAULT 'imperative'")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "uses_memory",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
     // Rows written before the column existed get an empty alias; the
     // scheduler treats those as orphans (skip with warning) rather than
     // coercing them to a magic alias.
-    add_column_if_missing(conn, "agent_alias", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "cron_jobs", "agent_alias", "TEXT NOT NULL DEFAULT ''")?;
     // In-flight execution lock: RFC3339 timestamp of when a run claimed this job,
     // or NULL when idle. `due_jobs`/`all_overdue_jobs` skip locked rows so a job that
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
-    add_column_if_missing(conn, "locked_at", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "locked_at", "TEXT")?;
+    // Agent-triggered claims also carry an opaque per-execution token. Startup
+    // recovery preserves only tokens whose manual-run guards are still live in
+    // this process; all other locks are eligible for cleanup.
+    add_column_if_missing(conn, "cron_jobs", "lock_token", "TEXT")?;
     add_column_if_missing(
         conn,
+        "cron_jobs",
         "shell_output_format",
         "TEXT NOT NULL DEFAULT 'wrapped'",
     )?;
 
+    // The separated run-outcome triple beside the derived `status` rollup.
+    // Nullable: rows written before these columns existed stay NULL, which
+    // reads as "not recorded" rather than being backfilled with a guess.
+    add_column_if_missing(conn, "cron_runs", "execution", "TEXT")?;
+    add_column_if_missing(conn, "cron_runs", "delivery", "TEXT")?;
+    add_column_if_missing(conn, "cron_runs", "persistence", "TEXT")?;
+    // Immutable run provenance: the stamped initiating principal (verbatim
+    // JSON) and the executing agent's alias at time of action. Nullable:
+    // pre-existing rows read back as absent, never backfilled.
+    add_column_if_missing(conn, "cron_runs", "principal", "TEXT")?;
+    add_column_if_missing(conn, "cron_runs", "executing_agent", "TEXT")?;
+    add_column_if_missing(conn, "cron_runs", "job_source", "TEXT")?;
+    // Durable CURRENT cleanup owner of a run row: stamped at insert and
+    // re-pointed by renames, unlike the immutable historical
+    // executing_agent, so owner-scoped deletion can always find retained
+    // rows whose job is gone.
+    add_column_if_missing(conn, "cron_runs", "owner_agent", "TEXT")?;
+
+    merge_stranded_cron_runs_rows(conn)?;
+    drop_cron_runs_job_fk(conn)?;
+    recover_config_only_ownership(conn, config)?;
+    run_ownership_migration(conn)?;
+
+    #[cfg(feature = "plugins-wasm")]
+    super::outbox::initialize_schema(conn)?;
+
     Ok(())
+}
+
+/// True when SQLite reports lock contention with another connection.
+fn is_lock_contention(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::DatabaseBusy
+                || e.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
+/// Context added at the `initialize_schema` boundary when lock contention
+/// defeated any preparation phase: the caller's operation was refused
+/// before it started and is safe to retry once the competing writer
+/// finishes.
+const MIGRATION_CONTENTION_CONTEXT: &str = concat!(
+    "cron database is locked by another process while required recovery or migration is ",
+    "incomplete; the operation was not started and can be retried"
+);
+
+/// Begin an IMMEDIATE transaction for a recovery or migration write: the
+/// write lock is taken up front, so the busy timeout applies to acquiring
+/// it — unlike a deferred transaction's read-to-write upgrade, which SQLite
+/// fails immediately without consulting the busy handler.
+fn begin_immediate<'c>(conn: &'c Connection, phase: &str) -> Result<Transaction<'c>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .with_context(|| format!("Failed to begin cron {phase} transaction"))
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let count: i64 = conn
+        .prepare("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+        .query_row(params![name], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// `PRAGMA user_version` step claimed by the one-time run-history ownership
+/// migration. The cron database's marker is a monotonic ladder: a future data
+/// migration claims the next integer and gates on `< its step`, never reusing
+/// or lowering an earlier one. The marker commits in the same transaction as
+/// the migration's writes, so "column exists but the data migration never ran"
+/// is not a reachable durable state: either both committed or the migration
+/// re-runs.
+///
+/// Ownership recovered from configuration deliberately does NOT advance this
+/// marker: `recover_config_only_ownership` runs on every open, because a claim
+/// can become resolvable at any later time.
+const CRON_OWNERSHIP_MIGRATION_VERSION: i64 = 1;
+
+/// Whether the ownership data migration has reached the current step.
+fn ownership_migration_complete(conn: &Connection) -> Result<bool> {
+    let migrated: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("Failed to read cron DB migration marker")?;
+    Ok(migrated >= CRON_OWNERSHIP_MIGRATION_VERSION)
+}
+
+/// Recover ownership that lives only in configuration (the unique-claimant
+/// rule of `Config::agent_for_cron_job`; contested, disabled-only and
+/// unclaimed ids keep an empty alias), on every open rather than once: a
+/// claim can become resolvable long after the upgrade (an agent re-enabled, a
+/// contested id disambiguated, a claim added), and nothing else ever writes
+/// `agent_alias` onto an existing row. The probe reads only `cron_jobs`, which
+/// holds one row per scheduled job, and the write lock is taken only when at
+/// least one unowned row actually resolves — a permanently unowned row must not
+/// cost every open a write transaction.
+fn recover_config_only_ownership(conn: &Connection, config: &Config) -> Result<()> {
+    let resolvable: Vec<(String, &str)> = unowned_job_ids(conn)?
+        .into_iter()
+        .filter_map(|id| config.agent_for_cron_job(&id).map(|owner| (id, owner)))
+        .collect();
+    if resolvable.is_empty() {
+        return Ok(());
+    }
+
+    let tx = begin_immediate(conn, "config ownership recovery")?;
+    let mut stamped = 0usize;
+    for (id, owner) in resolvable {
+        let changed = tx
+            .execute(
+                "UPDATE cron_jobs SET agent_alias = ?2
+                 WHERE id = ?1 AND (agent_alias IS NULL OR trim(agent_alias) = '')",
+                params![id, owner],
+            )
+            .context("Failed to stamp the config-resolved owner on a legacy cron job")?;
+        if changed == 0 {
+            continue;
+        }
+        // The job's own unowned history gets the same owner immediately, so a
+        // later completion-time auto-delete cannot strand it: once the job row
+        // is gone, nothing can resolve that ownership again.
+        tx.execute(
+            "UPDATE cron_runs SET owner_agent = ?2 WHERE job_id = ?1 AND owner_agent IS NULL",
+            params![id, owner],
+        )
+        .context("Failed to stamp run-history ownership recovered from config")?;
+        stamped += 1;
+    }
+    tx.commit()
+        .context("Failed to commit config ownership recovery")?;
+
+    if stamped > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Cron)
+                .with_attrs(::serde_json::json!({"count": stamped})),
+            "cron jobs owned only through config membership were stamped with their owner"
+        );
+    }
+    Ok(())
+}
+
+/// Ids of jobs carrying no stored owner. A non-text id (SQLite does not
+/// enforce the declared type of a `TEXT PRIMARY KEY`) is skipped rather than
+/// failing the open: one malformed row must not make every cron read and write
+/// unusable.
+fn unowned_job_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM cron_jobs WHERE agent_alias IS NULL OR trim(agent_alias) = ''")?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, rusqlite::types::Value>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(|value| match value {
+            rusqlite::types::Value::Text(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    Ok(ids)
+}
+
+/// One-time ownership migration for rows written before the cleanup owner
+/// existed, gated on the persisted completion marker so no per-open scan
+/// is paid afterwards. The body is idempotent (it touches only NULL-owner
+/// rows), so an interrupted attempt re-runs to completion on a later open.
+/// Contention past the busy timeout fails the open: an operation is never
+/// authorized against a database whose ownership migration has not
+/// provably completed.
+///
+/// A NULL-owner row whose job is LIVE has an unambiguous current owner:
+/// the job row itself (renames update it). Stamp those. A NULL-owner row
+/// with NO live job is different — the immutable executing_agent cannot
+/// stand in for the current owner (a pre-owner-schema rename updated only
+/// live jobs, and a reused alias may denote a different agent), so those
+/// rows are QUARANTINED: no agent-scoped read, skipped by the owner
+/// cascade. They can still be removed by job id through remove_job, and a
+/// declarative id being reassigned purges them before the new job exists.
+fn run_ownership_migration(conn: &Connection) -> Result<()> {
+    if ownership_migration_complete(conn)? {
+        return Ok(());
+    }
+
+    let tx = begin_immediate(conn, "ownership migration")?;
+    // Re-checked under the write lock: a concurrent open may have
+    // completed the migration while we waited for the transaction.
+    if ownership_migration_complete(&tx)? {
+        return Ok(());
+    }
+    // A fresh database — and one whose rows were all stamped at insert —
+    // has nothing to migrate: skip the scans and just record completion.
+    let needs_data_pass: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM cron_runs WHERE owner_agent IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to probe for unmigrated run-history rows")?;
+    if needs_data_pass {
+        tx.execute(
+            "UPDATE cron_runs
+             SET owner_agent = (SELECT j.agent_alias FROM cron_jobs j
+                                WHERE j.id = cron_runs.job_id)
+             WHERE owner_agent IS NULL
+               AND EXISTS (SELECT 1 FROM cron_jobs j
+                           WHERE j.id = cron_runs.job_id
+                             AND j.agent_alias IS NOT NULL
+                             AND j.agent_alias != '')",
+            [],
+        )
+        .context("Failed to stamp run-history ownership from live jobs")?;
+    }
+    tx.execute_batch(&format!(
+        "PRAGMA user_version = {CRON_OWNERSHIP_MIGRATION_VERSION}"
+    ))
+    .context("Failed to record the ownership migration marker")?;
+    tx.commit()
+        .context("Failed to commit the ownership migration")?;
+
+    if needs_data_pass {
+        warn_if_quarantined(conn)?;
+    }
+    Ok(())
+}
+
+/// Emit the operator-facing notice for run-history rows whose current
+/// ownership is unreconstructible. Worded as standing state, not an event,
+/// because the migration can legitimately re-run over a database an earlier
+/// build already migrated (it never wrote the marker) and re-observe the
+/// same rows.
+fn warn_if_quarantined(conn: &Connection) -> Result<()> {
+    let quarantined: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM cron_runs r
+             WHERE r.owner_agent IS NULL
+               AND NOT EXISTS (SELECT 1 FROM cron_jobs j WHERE j.id = r.job_id)",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to count quarantined run-history rows")?;
+    if quarantined > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Cron)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"count": quarantined})),
+            "cron run history rows have unreconstructible ownership and are quarantined (no agent-scoped access; removable by job id)"
+        );
+    }
+    Ok(())
+}
+
+/// Complete the between-DROP-and-RENAME state an interrupted non-atomic
+/// (predecessor) `cron_runs` rebuild can leave behind: the working table
+/// exists and `cron_runs` does not, so the working table IS the run
+/// history. Runs before schema creation or column migration ever
+/// references `cron_runs`, because recreating the table first would strand
+/// that history. Columns the stranded table predates are added by the
+/// additive migration that follows.
+///
+/// The other stranded shape — a working table beside a live `cron_runs` —
+/// is handled by `merge_stranded_cron_runs_rows` after the additive
+/// migrations instead, where the live table is guaranteed to carry every
+/// stranded column.
+fn recover_stranded_cron_runs_table(conn: &Connection) -> Result<()> {
+    // Only the sole-working-table state is this phase's to lock for; the
+    // beside-table state belongs to the later merge.
+    if !table_exists(conn, "cron_runs_no_fk")? || table_exists(conn, "cron_runs")? {
+        return Ok(());
+    }
+    let tx = begin_immediate(conn, "stranded-table rename recovery")?;
+    // Re-checked under the write lock: a concurrent open may have finished
+    // the recovery between the probe above and here — a verified
+    // completion, unlike contention, which fails the open.
+    if !table_exists(&tx, "cron_runs_no_fk")? || table_exists(&tx, "cron_runs")? {
+        return Ok(());
+    }
+    tx.execute_batch("ALTER TABLE cron_runs_no_fk RENAME TO cron_runs;")
+        .context("Failed to finish interrupted cron_runs rebuild")?;
+    tx.commit()
+        .context("Failed to commit cron_runs rebuild recovery")
+}
+
+/// Merge a working table stranded BESIDE `cron_runs` back into it and give
+/// the merged rows the same one-time ownership migration a direct upgrade
+/// gets, scoped to exactly the rows that arrived here — never re-running
+/// the global pass, which would re-stamp modern rows whose NULL owner is
+/// deliberate (no executing agent was known at insert).
+///
+/// Runs after the additive migrations, so every column the stranded table
+/// shares with the schema exists on `cron_runs`; the merge list is the
+/// case-insensitive intersection in canonical casing, which also keeps a
+/// stranded column this schema does not know from breaking the merge.
+/// Whatever prefix the interrupted attempt committed, every run row is in
+/// `cron_runs`, in the working table, or (by id) in both, so INSERT OR
+/// IGNORE plus dropping the working table restores a clean single-table
+/// state without loss or duplication.
+fn merge_stranded_cron_runs_rows(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "cron_runs_no_fk")? {
+        return Ok(());
+    }
+    // Stranded rows may reference jobs that no longer exist, and the
+    // surviving cron_runs in this state is exactly the legacy FK-bearing
+    // shape, so enforcement would reject the merge. The pragma is a no-op
+    // inside a transaction; toggle it around one.
+    conn.execute_batch("PRAGMA foreign_keys = OFF")
+        .context("Failed to suspend FK enforcement for cron_runs recovery")?;
+    let merged = merge_stranded_rows_locked(conn);
+    let restored = conn
+        .execute_batch("PRAGMA foreign_keys = ON")
+        .context("Failed to restore FK enforcement after cron_runs recovery");
+    let quarantined = merged?;
+    restored?;
+    if quarantined > 0 {
+        warn_if_quarantined(conn)?;
+    }
+    Ok(())
+}
+
+fn merge_stranded_rows_locked(conn: &Connection) -> Result<i64> {
+    fn column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(names)
+    }
+
+    let tx = begin_immediate(conn, "stranded-table merge recovery")?;
+    // Re-checked under the write lock: a concurrent open may have already
+    // merged and dropped the working table — a verified completion, unlike
+    // contention, which fails the open.
+    if !table_exists(&tx, "cron_runs_no_fk")? {
+        return Ok(0);
+    }
+    let ours = column_names(&tx, "cron_runs")?;
+    let theirs = column_names(&tx, "cron_runs_no_fk")?;
+    let column_list = ours
+        .iter()
+        .filter(|ours_name| {
+            theirs
+                .iter()
+                .any(|theirs_name| theirs_name.eq_ignore_ascii_case(ours_name))
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    tx.execute_batch(&format!(
+        "INSERT OR IGNORE INTO cron_runs ({column_list})
+            SELECT {column_list} FROM cron_runs_no_fk;"
+    ))
+    .context("Failed to recover interrupted cron_runs rebuild state")?;
+    tx.execute(
+        "UPDATE cron_runs
+         SET owner_agent = (SELECT j.agent_alias FROM cron_jobs j
+                            WHERE j.id = cron_runs.job_id)
+         WHERE owner_agent IS NULL
+           AND id IN (SELECT id FROM cron_runs_no_fk)
+           AND EXISTS (SELECT 1 FROM cron_jobs j
+                       WHERE j.id = cron_runs.job_id
+                         AND j.agent_alias IS NOT NULL
+                         AND j.agent_alias != '')",
+        [],
+    )
+    .context("Failed to stamp ownership of recovered run-history rows")?;
+    let quarantined: i64 = tx
+        .query_row(
+            "SELECT count(*) FROM cron_runs r
+             WHERE r.owner_agent IS NULL
+               AND r.id IN (SELECT id FROM cron_runs_no_fk)
+               AND NOT EXISTS (SELECT 1 FROM cron_jobs j WHERE j.id = r.job_id)",
+            [],
+            |row| row.get(0),
+        )
+        .context("Failed to count quarantined recovered rows")?;
+    tx.execute_batch("DROP TABLE cron_runs_no_fk;")
+        .context("Failed to drop the recovered cron_runs working table")?;
+    tx.commit()
+        .context("Failed to commit cron_runs rebuild recovery")?;
+    Ok(quarantined)
+}
+
+/// One-time rebuild for legacy databases whose `cron_runs` still declares
+/// `FOREIGN KEY (job_id) ... ON DELETE CASCADE`: the cascade silently erased
+/// a one-shot's just-written run record when its successful completion
+/// auto-deleted the job, defeating the immutable run-record contract. Run
+/// history must outlive completion-time job deletion; operator-initiated
+/// removals delete it explicitly instead.
+///
+/// Atomic: the copy/drop/rename runs as one transaction. Partial state a
+/// predecessor's non-atomic attempt left behind is handled earlier in
+/// `initialize_schema` by `recover_stranded_cron_runs_table` and
+/// `merge_stranded_cron_runs_rows`. A table already without the foreign
+/// key is left untouched.
+fn drop_cron_runs_job_fk(conn: &Connection) -> Result<()> {
+    let has_fk = {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_list(cron_runs)")?;
+        let mut rows = stmt.query([])?;
+        rows.next()?.is_some()
+    };
+    if !has_fk {
+        return Ok(());
+    }
+
+    let tx = begin_immediate(conn, "foreign-key rebuild")?;
+    // Re-checked under the write lock: a concurrent open may have rebuilt
+    // the table while we waited for the transaction.
+    let still_has_fk = {
+        let mut stmt = tx.prepare("PRAGMA foreign_key_list(cron_runs)")?;
+        let mut rows = stmt.query([])?;
+        rows.next()?.is_some()
+    };
+    if !still_has_fk {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE cron_runs_no_fk (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id      TEXT NOT NULL,
+            started_at  TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            output      TEXT,
+            duration_ms INTEGER,
+            execution   TEXT,
+            delivery    TEXT,
+            persistence TEXT,
+            principal   TEXT,
+            executing_agent TEXT,
+            job_source  TEXT,
+            owner_agent TEXT
+        );
+        INSERT INTO cron_runs_no_fk (id, job_id, started_at, finished_at, status, output,
+                                     duration_ms, execution, delivery, persistence,
+                                     principal, executing_agent, job_source, owner_agent)
+            SELECT id, job_id, started_at, finished_at, status, output,
+                   duration_ms, execution, delivery, persistence,
+                   principal, executing_agent, job_source, owner_agent
+            FROM cron_runs;
+        DROP TABLE cron_runs;
+        ALTER TABLE cron_runs_no_fk RENAME TO cron_runs;
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);",
+    )
+    .context("Failed to rebuild cron_runs without the job foreign key")?;
+    tx.commit()
+        .context("Failed to commit cron_runs rebuild transaction")?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn claim_job_in_config(config: &mut Config, alias: &str, enabled: bool, ids: &[&str]) {
+    config.agents.insert(
+        alias.to_string(),
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled,
+            cron_jobs: ids.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        },
+    );
 }
 
 #[cfg(test)]
@@ -1692,13 +2880,200 @@ mod tests {
     use zeroclaw_config::schema::Config;
 
     fn test_config(tmp: &TempDir) -> Config {
-        let config = Config {
+        let mut config = Config {
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        // Selection only offers jobs whose owner resolves, so the fixture's
+        // default owner must exist as an enabled agent, as it would live.
+        claim_job_in_config(&mut config, "test-agent", true, &[]);
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config
+    }
+
+    #[test]
+    fn scoped_remove_refuses_a_job_owned_by_another_agent() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        let refused = remove_job_for_agent(&config, &job.id, "other-agent");
+        assert!(refused.is_err(), "a foreign job must not be deletable");
+        assert!(
+            get_job(&config, &job.id).is_ok(),
+            "the job must survive a refused delete"
+        );
+
+        remove_job_for_agent(&config, &job.id, "owner-agent").unwrap();
+        assert!(
+            get_job(&config, &job.id).is_err(),
+            "the owner may delete it"
+        );
+    }
+
+    #[test]
+    fn scoped_remove_guarded_delete_refuses_a_stale_owner() {
+        // The race the separate read cannot cover: the caller was authorized, then
+        // the operator's rename cascade moved the job to another agent. Matching
+        // both columns in the DELETE means the stale authorization writes nothing.
+        //
+        // `remove_job_for_agent` has no preliminary read, so this reaches the
+        // guarded DELETE itself. It is a stale-owner write, not a deterministic
+        // interleaving: the rename lands before the call rather than between a
+        // successful read and the write.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        // Stand-in for the rename landing between check and write.
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = remove_job_for_agent(&config, &job.id, "owner-agent");
+        assert!(
+            stale.is_err(),
+            "an authorization from before the rename must not delete the job"
+        );
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().agent_alias,
+            "new-owner",
+            "the job must remain with its new owner"
+        );
+    }
+
+    #[test]
+    fn scoped_update_read_check_refuses_a_stale_owner() {
+        // This one stops at `update_job_for_agent`'s preliminary ownership read,
+        // so it never reaches the guarded UPDATE. The test below covers that
+        // statement directly.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        assert!(job.enabled);
+
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "an authorization from before the rename must not patch the job"
+        );
+        assert!(
+            get_job(&config, &job.id).unwrap().enabled,
+            "the job's state must be untouched by the refused patch"
+        );
+    }
+
+    #[test]
+    fn scoped_update_guarded_write_refuses_a_stale_owner() {
+        // Calls `update_job_inner` directly with the stale owner, which is what
+        // the guarded UPDATE sees once the preliminary read is out of the way.
+        // Without the `agent_alias` term in the WHERE clause this patch lands.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        assert!(job.enabled);
+
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let stale = update_job_inner(
+            &config,
+            &job.id,
+            Some("owner-agent"),
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(
+            stale.is_err(),
+            "the guarded UPDATE must match no row for the former owner"
+        );
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(after.enabled, "the refused patch must not change the job");
+        assert_eq!(
+            after.agent_alias, "new-owner",
+            "the job must remain with its new owner"
+        );
+    }
+
+    #[test]
+    fn scoped_update_still_works_for_the_owner() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        let updated = update_job_for_agent(
+            &config,
+            &job.id,
+            "owner-agent",
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!updated.enabled);
+        assert!(!get_job(&config, &job.id).unwrap().enabled);
+    }
+
+    #[test]
+    fn the_operator_shell_update_path_is_not_agent_scoped() {
+        // update_shell_job_with_approval is the gateway API's and the CLI's entry
+        // point. Its agent_alias names whose risk profile validates a command, NOT
+        // the job's owner — patching an agent-type job's prompt is not agent-gated
+        // and may name a different agent entirely. Scoping it once broke exactly
+        // that, so pin the behaviour here rather than only in the gateway crate.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        crate::cron::update_shell_job_with_approval(
+            &config,
+            "some-other-agent",
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed by the operator".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .expect("an operator patch must not require owning the job");
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.name.as_deref(), Some("renamed by the operator"));
+        assert_eq!(updated.agent_alias, "owner-agent", "ownership is unchanged");
+    }
+
+    #[test]
+    fn unscoped_helpers_still_serve_operator_callers() {
+        // The gateway and scheduler call these with no agent in hand; scoping the
+        // agent-facing paths must not take that away.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!get_job(&config, &job.id).unwrap().enabled);
+        remove_job(&config, &job.id).unwrap();
+        assert!(get_job(&config, &job.id).is_err());
     }
 
     fn cron_dir(config: &Config) -> std::path::PathBuf {
@@ -1809,6 +3184,158 @@ mod tests {
         assert!(
             claim_job(&config, &job.id, now).unwrap(),
             "claim should win again after release"
+        );
+    }
+
+    #[test]
+    fn agent_claim_rechecks_owner_at_the_claim_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        // Simulate a successful scoped authorization followed by the operator's
+        // rename before the effect. The guarded UPDATE must reject the stale owner.
+        assert_eq!(
+            get_job_for_agent(&config, &job.id, "owner-agent")
+                .unwrap()
+                .agent_alias,
+            "owner-agent"
+        );
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let now = Utc::now();
+        assert!(!claim_job_for_agent(&config, &job.id, "owner-agent", now).unwrap());
+        assert!(claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
+        assert!(!claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
+        release_job(&config, &job.id).unwrap();
+    }
+
+    #[test]
+    fn agent_claim_token_prevents_late_release_from_clearing_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        let first = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("first claim should win");
+        release_job_for_token(&config, &job.id, &first).unwrap();
+
+        let second = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("replacement claim should win");
+        assert!(!release_job_for_token(&config, &job.id, &first).unwrap());
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(release_job_for_token(&config, &job.id, &second).unwrap());
+    }
+
+    #[test]
+    fn clear_stale_locks_preserves_current_process_agent_claim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        let token = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("agent claim should win");
+        assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(release_job_for_token(&config, &job.id, &token).unwrap());
+    }
+
+    #[test]
+    fn clear_stale_locks_serializes_new_agent_claims() {
+        let tmp = TempDir::new().unwrap();
+        let config = std::sync::Arc::new(test_config(&tmp));
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        // A legacy/scheduled claim has no token and is eligible for startup
+        // recovery. The concurrent agent claim must not be able to register
+        // and write its replacement while recovery is between its snapshot and
+        // cleanup UPDATE.
+        assert!(claim_job(&config, &job.id, now).unwrap());
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let claim_config = config.clone();
+        let claim_job_id = job.id.clone();
+        let claim_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            claim_job_for_agent_with_token(&claim_config, &claim_job_id, "owner-agent", Utc::now())
+        });
+
+        let cleared = clear_stale_locks_inner(&config, || {
+            started_rx.recv().unwrap();
+            go_tx.send(()).unwrap();
+
+            // `claim_job_for_agent_with_token` has been released to run, but
+            // its registration must wait for recovery's registry guard.
+            assert!(LIVE_AGENT_CLAIM_TOKENS.try_lock().is_err());
+        })
+        .unwrap();
+        assert_eq!(cleared, 1, "the pre-existing stale claim should be cleared");
+
+        let token = claim_thread
+            .join()
+            .unwrap()
+            .unwrap()
+            .expect("the new claim should win after recovery");
+        assert!(
+            !claim_job_for_agent(&config, &job.id, "owner-agent", Utc::now()).unwrap(),
+            "a second execution must remain blocked by the admitted claim"
+        );
+        assert!(release_job_for_token(&config, &job.id, &token).unwrap());
+    }
+
+    #[test]
+    fn agent_run_history_rechecks_owner_in_the_history_query() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now,
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("owner-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("private output"),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "owner-agent", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        assert!(
+            list_runs_for_agent(&config, &job.id, "owner-agent", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "new-owner", 10)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -1970,6 +3497,1890 @@ mod tests {
             .unwrap();
         assert!(columns.iter().any(|name| name == "source"));
         assert!(columns.iter().any(|name| name == "uses_memory"));
+    }
+
+    #[test]
+    fn legacy_cron_runs_schema_gains_outcome_columns() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let cron_dir = cron_dir(&config);
+        std::fs::create_dir_all(&cron_dir).unwrap();
+        let db_path = cron_db(&config);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+             VALUES ('legacy-runs', '*/5 * * * *', 'echo legacy', ?1, ?2)",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+             VALUES ('legacy-runs', ?1, ?2, 'ok', 'done', 5)",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Reading through the public API migrates first; the pre-migration
+        // row reads back with the triple absent, not defaulted.
+        let runs = list_runs(&config, "legacy-runs", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(runs[0].execution.is_none());
+        assert!(runs[0].delivery.is_none());
+        assert!(runs[0].persistence.is_none());
+
+        // A run recorded after migration carries all three axes.
+        record_run(
+            &config,
+            "legacy-runs",
+            now + ChronoDuration::seconds(1),
+            now + ChronoDuration::seconds(2),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "delivered",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
+                job_source: None,
+            },
+            Some("done"),
+            1000,
+        )
+        .unwrap();
+        let runs = list_runs(&config, "legacy-runs", 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+        assert_eq!(runs[0].delivery.as_deref(), Some("delivered"));
+        assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
+
+        let conn = Connection::open(&db_path).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(cron_runs)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for name in ["execution", "delivery", "persistence"] {
+            assert!(columns.iter().any(|c| c == name), "missing {name}");
+        }
+    }
+
+    #[test]
+    fn legacy_fk_cron_runs_rebuild_preserves_rows_and_drops_cascade() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let cron_dir = cron_dir(&config);
+        std::fs::create_dir_all(&cron_dir).unwrap();
+        let db_path = cron_db(&config);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+             VALUES ('legacy-fk', '*/5 * * * *', 'echo legacy', ?1, ?2)",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+             VALUES ('legacy-fk', ?1, ?2, 'ok', 'done', 5)",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Opening through the public API rebuilds the table: the row
+        // survives the rebuild and the cascade is gone.
+        let runs = list_runs(&config, "legacy-fk", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let fk_count: i64 = conn
+            .prepare("SELECT count(*) FROM pragma_foreign_key_list('cron_runs')")
+            .unwrap()
+            .query_row([], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_count, 0, "rebuild must drop the job foreign key");
+        // Deleting the job no longer erases the history.
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        conn.execute("DELETE FROM cron_jobs WHERE id = 'legacy-fk'", [])
+            .unwrap();
+        drop(conn);
+        let runs = list_runs(&config, "legacy-fk", 10).unwrap();
+        assert_eq!(runs.len(), 1, "run history must outlive the job row");
+    }
+
+    fn legacy_fk_cron_runs_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+    }
+
+    fn insert_legacy_run_with_id(conn: &Connection, table: &str, job_id: &str, id: i64) {
+        let now = Utc::now();
+        conn.execute(
+            &format!(
+                "INSERT INTO {table} (id, job_id, started_at, finished_at, status, output, duration_ms)
+                 VALUES ({id}, ?1, ?2, ?3, 'ok', 'done', 5)"
+            ),
+            params![
+                job_id,
+                now.to_rfc3339(),
+                (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn interrupted_fk_rebuild_recovers_without_data_loss() {
+        // State A: an earlier attempt was interrupted after copying into the
+        // working table but before dropping the original — both tables
+        // exist, the original still carries the foreign key and the row.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );
+            INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+            VALUES ('interrupted-a', '* * * * *', 'echo a', '2026-01-01T00:00:00Z',
+                    '2026-01-01T00:05:00Z');",
+        )
+        .unwrap();
+        legacy_fk_cron_runs_schema(&conn);
+        insert_legacy_run_with_id(&conn, "cron_runs", "interrupted-a", 1);
+        conn.execute_batch(
+            "CREATE TABLE cron_runs_no_fk (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                execution   TEXT,
+                delivery    TEXT,
+                persistence TEXT,
+                principal   TEXT,
+                executing_agent TEXT,
+                job_source  TEXT
+            );",
+        )
+        .unwrap();
+        insert_legacy_run_with_id(&conn, "cron_runs_no_fk", "interrupted-a", 1);
+        // A stranded row whose job is gone: the surviving cron_runs still
+        // declares the FK, so the merge must run with enforcement off or
+        // this row is lost.
+        insert_legacy_run_with_id(&conn, "cron_runs_no_fk", "gone-job", 2);
+        drop(conn);
+
+        let runs = list_runs(&config, "interrupted-a", 10).unwrap();
+        assert_eq!(runs.len(), 1, "row must survive exactly once, {runs:?}");
+        assert_eq!(
+            list_runs(&config, "gone-job", 10).unwrap().len(),
+            1,
+            "an orphan stranded row must merge despite the legacy FK"
+        );
+
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        let temp_gone: i64 = conn
+            .prepare(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'cron_runs_no_fk'",
+            )
+            .unwrap()
+            .query_row([], |row| row.get(0))
+            .unwrap();
+        assert_eq!(temp_gone, 0);
+        let fk_count: i64 = conn
+            .prepare("SELECT count(*) FROM pragma_foreign_key_list('cron_runs')")
+            .unwrap()
+            .query_row([], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_count, 0);
+        drop(conn);
+
+        // State B: interrupted after the drop; a later startup recreated a
+        // fresh empty `cron_runs` while the history sat stranded in the
+        // working table.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER
+            );
+            CREATE TABLE cron_runs_no_fk (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                execution   TEXT,
+                delivery    TEXT,
+                persistence TEXT,
+                principal   TEXT,
+                executing_agent TEXT,
+                job_source  TEXT
+            );",
+        )
+        .unwrap();
+        insert_legacy_run_with_id(&conn, "cron_runs_no_fk", "interrupted-b", 1);
+        drop(conn);
+
+        let runs = list_runs(&config, "interrupted-b", 10).unwrap();
+        assert_eq!(runs.len(), 1, "stranded history must be recovered");
+    }
+
+    #[test]
+    fn manual_persist_fails_after_concurrent_job_removal() {
+        // An operator's remove_job completes while a manual run is still
+        // executing: the completion must fail and roll back rather than
+        // resurrect an orphan row the operator explicitly purged.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        remove_job(&config, &job.id).unwrap();
+
+        let now = Utc::now();
+        let err = persist_manual_run_result(
+            &config,
+            &job,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("late"),
+            5,
+        )
+        .expect_err("persist must fail once the job is removed");
+        assert!(err.to_string().contains("was removed"), "{err}");
+        assert!(list_runs(&config, &job.id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_removal_purges_retained_one_shot_history() {
+        // A retained one-shot record (its job already auto-deleted) is
+        // owned by its stamped executor: deleting that agent's cron state
+        // must find and purge it even with no live job row to walk.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+        record_run(
+            &config,
+            "gone-one-shot",
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("retired-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(list_runs(&config, "gone-one-shot", 10).unwrap().len(), 1);
+
+        remove_jobs_by_agent(&config, "retired-agent").unwrap();
+        assert!(list_runs(&config, "gone-one-shot", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn declarative_sync_purges_retained_history_of_removed_declarations() {
+        // A completed declarative At one-shot leaves only its retained run
+        // row behind; removing the declaration from config must purge it
+        // through the row's own job_source stamp.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["still-declared"]);
+        let now = Utc::now();
+        record_run(
+            &config,
+            "completed-decl-one-shot",
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("declarative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        // Reconcile with a config that still declares a DIFFERENT job but
+        // no longer declares the completed one.
+        let decls = decls_map(vec![make_shell_decl(
+            "still-declared",
+            "0 2 * * *",
+            "echo backup",
+        )]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        assert!(
+            list_runs(&config, "completed-decl-one-shot", 10)
+                .unwrap()
+                .is_empty(),
+            "retained declarative history must be purged with its declaration"
+        );
+        // The still-declared job's state is untouched.
+        assert!(get_job(&config, "still-declared").is_ok());
+    }
+
+    #[test]
+    fn predecessor_stranded_table_without_new_columns_recovers() {
+        // The actual predecessor migration's working table predates the
+        // later additive columns; recovery must merge by the columns the
+        // stranded table really has, not the current full set.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER
+            );
+            CREATE TABLE cron_runs_no_fk (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                execution   TEXT,
+                delivery    TEXT,
+                persistence TEXT,
+                principal   TEXT,
+                executing_agent TEXT
+            );",
+        )
+        .unwrap();
+        insert_legacy_run_with_id(&conn, "cron_runs_no_fk", "predecessor-strand", 1);
+        drop(conn);
+
+        // Recovery through the public open path must preserve the row even
+        // though the stranded table lacks job_source and owner_agent.
+        let runs = list_runs(&config, "predecessor-strand", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(runs[0].job_source.is_none());
+        assert!(runs[0].owner_agent.is_none());
+
+        // A subsequent open finds a clean single-table state.
+        let runs = list_runs(&config, "predecessor-strand", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn owner_scoped_read_carries_ownership_through_rename() {
+        // The ownership predicate rides the read itself, so a rename or
+        // owner re-point between any prior check and the read changes what
+        // the read returns: the former owner receives neither output nor
+        // provenance, on the live and the retained path alike.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+
+        // Live path: owned job with a run row.
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("live-secret"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "test-agent", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        rename_jobs_by_agent(&config, "test-agent", "agent-b").unwrap();
+        assert!(
+            list_runs_for_agent(&config, &job.id, "test-agent", 10)
+                .unwrap()
+                .is_empty(),
+            "the former owner must receive nothing after the rename"
+        );
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "agent-b", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Retained path: a one-shot record with no live job.
+        record_run(
+            &config,
+            "retained-scoped",
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("agent-c"),
+                job_source: Some("imperative"),
+            },
+            Some("retained-secret"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, "retained-scoped", "agent-c", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        rename_jobs_by_agent(&config, "agent-c", "agent-d").unwrap();
+        assert!(
+            list_runs_for_agent(&config, "retained-scoped", "agent-c", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_runs_for_agent(&config, "retained-scoped", "agent-d", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Legacy rows without an owner resolve through the LIVE job's
+        // current owner only.
+        let legacy_job = add_job(&config, "test-agent", "*/5 * * * *", "echo legacy").unwrap();
+        record_run(
+            &config,
+            &legacy_job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
+                job_source: Some("imperative"),
+            },
+            Some("legacy-row"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, &legacy_job.id, "test-agent", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            list_runs_for_agent(&config, &legacy_job.id, "someone-else", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Predecessor-shaped fixture: cron_runs carries the provenance columns
+    /// but not yet `owner_agent`.
+    fn pre_owner_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL,
+                last_run         TEXT,
+                last_status      TEXT,
+                last_output      TEXT,
+                agent_alias      TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                execution   TEXT,
+                delivery    TEXT,
+                persistence TEXT,
+                principal   TEXT,
+                executing_agent TEXT,
+                job_source  TEXT
+            );",
+        )
+        .unwrap();
+    }
+
+    fn insert_pre_owner_run(conn: &Connection, job_id: &str, executor: &str, output: &str) {
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output,
+                                    duration_ms, execution, delivery, persistence,
+                                    executing_agent, job_source)
+             VALUES (?1, ?2, ?3, 'ok', ?4, 5,
+                     'ok', 'not_required', 'not_bound', ?5, 'imperative')",
+            params![
+                job_id,
+                now.to_rfc3339(),
+                (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+                output,
+                executor,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_pre_owner_job(conn: &Connection, id: &str, alias: &str) {
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run, agent_alias)
+             VALUES (?1, '*/5 * * * *', 'echo live', ?2, ?3, ?4)",
+            params![
+                id,
+                now.to_rfc3339(),
+                (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                alias,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn open_recovers_a_sole_stranded_working_table() {
+        // A predecessor (non-atomic) rebuild interrupted between DROP TABLE
+        // cron_runs and the RENAME leaves the working table as the ONLY
+        // holder of run history. The next open must complete that rename
+        // before anything else references cron_runs, carry the rows through
+        // the additive column migrations exactly once, and give them the
+        // same ownership migration a direct upgrade gets.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_owner_schema(&conn);
+        insert_pre_owner_job(&conn, "live-legacy", "agent-a");
+        insert_pre_owner_run(&conn, "live-legacy", "agent-a", "live-output");
+        insert_pre_owner_run(&conn, "gone-one-shot", "agent-a", "orphan");
+        let now = Utc::now();
+        conn.execute_batch("ALTER TABLE cron_runs RENAME TO cron_runs_no_fk;")
+            .unwrap();
+        drop(conn);
+
+        // Recovery, migration, and the ownership backfill through the
+        // public open path.
+        let runs = list_runs_for_agent(&config, "live-legacy", "agent-a", 10).unwrap();
+        assert_eq!(runs.len(), 1, "recovered live row must reach its owner");
+        assert_eq!(runs[0].owner_agent.as_deref(), Some("agent-a"));
+        assert!(
+            list_runs_for_agent(&config, "gone-one-shot", "agent-a", 10)
+                .unwrap()
+                .is_empty(),
+            "recovered orphan must be quarantined, not attributed"
+        );
+        assert_eq!(list_runs(&config, "gone-one-shot", 10).unwrap().len(), 1);
+
+        with_initialized_connection(&config, |conn| {
+            let stranded: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'cron_runs_no_fk'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(stranded, 0, "the working table must be gone after recovery");
+            let live_rows: i64 = conn.query_row(
+                "SELECT count(*) FROM cron_runs WHERE job_id = 'live-legacy'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(live_rows, 1, "rows must survive exactly once");
+            Ok(())
+        })
+        .unwrap();
+
+        // All later columns must be usable: a fresh run persists with full
+        // provenance on the recovered table.
+        let job = get_job(&config, "live-legacy").unwrap();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(7),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("agent-a"),
+                job_source: Some("imperative"),
+            },
+            Some("fresh"),
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, "live-legacy", "agent-a", 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn interrupted_owner_migration_completes_on_a_later_open() {
+        // The state a crash leaves when the owner_agent column addition
+        // reached disk but the data migration did not: column present,
+        // owners NULL, completion marker unset. A later open must finish
+        // the migration rather than skip it forever — otherwise the live
+        // row becomes permanently unowned the moment its job goes away.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_owner_schema(&conn);
+        conn.execute("ALTER TABLE cron_runs ADD COLUMN owner_agent TEXT", [])
+            .unwrap();
+        insert_pre_owner_job(&conn, "live-legacy", "agent-a");
+        insert_pre_owner_run(&conn, "live-legacy", "agent-a", "live-output");
+        drop(conn);
+
+        let runs = list_runs_for_agent(&config, "live-legacy", "agent-a", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].owner_agent.as_deref(),
+            Some("agent-a"),
+            "a later open must complete the interrupted ownership migration"
+        );
+
+        rename_jobs_by_agent(&config, "agent-a", "agent-b").unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, "live-legacy", "agent-b", 10)
+                .unwrap()
+                .len(),
+            1,
+            "the completed migration must follow renames"
+        );
+        assert!(
+            list_runs_for_agent(&config, "live-legacy", "agent-a", 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        remove_jobs_by_agent(&config, "agent-b").unwrap();
+        assert!(
+            list_runs(&config, "live-legacy", 10).unwrap().is_empty(),
+            "owner-scoped deletion must find the migrated row"
+        );
+    }
+
+    /// The true pre-`agent_alias` shape: the job row has no owner column at
+    /// all, so ownership exists only as `[agents.<alias>].cron_jobs`
+    /// membership, and run history predates the provenance columns.
+    fn pre_agent_alias_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id          TEXT PRIMARY KEY,
+                expression  TEXT NOT NULL,
+                command     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                next_run    TEXT NOT NULL,
+                last_run    TEXT,
+                last_status TEXT,
+                last_output TEXT
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER
+            );",
+        )
+        .unwrap();
+    }
+
+    fn insert_pre_agent_alias_job(conn: &Connection, id: &str) {
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+             VALUES (?1, '0 2 * * *', 'echo legacy', ?2, ?3)",
+            params![
+                id,
+                now.to_rfc3339(),
+                (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Build a pre-`agent_alias` database holding `job_id` and one run row.
+    fn seed_pre_agent_alias_db(config: &Config, job_id: &str) {
+        std::fs::create_dir_all(cron_dir(config)).unwrap();
+        let conn = Connection::open(cron_db(config)).unwrap();
+        pre_agent_alias_schema(&conn);
+        insert_pre_agent_alias_job(&conn, job_id);
+        insert_legacy_run_with_id(&conn, "cron_runs", job_id, 1);
+    }
+
+    #[test]
+    fn config_only_ownership_is_recovered_through_the_whole_lifecycle() {
+        // Before `cron_jobs.agent_alias` existed, the owner lived only in
+        // `[agents.<alias>].cron_jobs`, and the scheduler still runs such a
+        // job through that fallback. Ownership is therefore recoverable, not
+        // unknown: the upgrade must stamp it so the owner keeps reading and
+        // purging its own history — including after completion-time
+        // auto-delete removes the job row that held the config link.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        seed_pre_agent_alias_db(&config, "daily-report");
+
+        let runs = list_runs_for_agent(&config, "daily-report", "agent-a", 10).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "the config-resolved owner must read its own history: {runs:?}"
+        );
+        assert_eq!(runs[0].owner_agent.as_deref(), Some("agent-a"));
+        assert_eq!(
+            get_job(&config, "daily-report").unwrap().agent_alias,
+            "agent-a",
+            "the recovered owner must become a stored fact on the job row"
+        );
+
+        // A rename re-points the stored owner, and history follows it.
+        rename_jobs_by_agent(&config, "agent-a", "agent-b").unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, "daily-report", "agent-b", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            list_runs_for_agent(&config, "daily-report", "agent-a", 10)
+                .unwrap()
+                .is_empty(),
+            "the former alias must read nothing after the rename"
+        );
+
+        // Completion-time auto-delete removes only the job row; the durable
+        // owner on the run row is what keeps the retained history reachable.
+        with_initialized_connection(&config, |conn| {
+            conn.execute("DELETE FROM cron_jobs WHERE id = 'daily-report'", [])
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+        let retained = list_runs_for_agent(&config, "daily-report", "agent-b", 10).unwrap();
+        assert_eq!(
+            retained.len(),
+            1,
+            "retained history must survive auto-delete for its owner: {retained:?}"
+        );
+
+        remove_jobs_by_agent(&config, "agent-b").unwrap();
+        assert!(
+            list_runs(&config, "daily-report", 10).unwrap().is_empty(),
+            "owner-scoped cleanup must purge the retained row"
+        );
+    }
+
+    #[test]
+    fn recovered_stranded_history_gets_the_config_resolved_owner() {
+        // History recovered from an interrupted rebuild must reach the owner
+        // that only config knew, whichever of the two stamping passes (the
+        // merge's scoped one or the migration's) gets there first.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_agent_alias_schema(&conn);
+        insert_pre_agent_alias_job(&conn, "daily-report");
+        // An interrupted predecessor rebuild left the history beside the
+        // live table.
+        conn.execute_batch(
+            "CREATE TABLE cron_runs_no_fk (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER
+            );",
+        )
+        .unwrap();
+        insert_legacy_run_with_id(&conn, "cron_runs_no_fk", "daily-report", 7);
+        drop(conn);
+
+        let runs = list_runs_for_agent(&config, "daily-report", "agent-a", 10).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "merged history must reach its config-resolved owner: {runs:?}"
+        );
+        assert_eq!(runs[0].owner_agent.as_deref(), Some("agent-a"));
+    }
+
+    #[test]
+    fn ownership_recovered_when_the_claim_becomes_resolvable_later() {
+        // A claim can become resolvable long after the upgrade. Recovery is
+        // therefore not latched to the first post-upgrade open: re-enabling
+        // the owning agent restores its access, and the job's history is
+        // stamped at that moment so a later auto-delete cannot strand it.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", false, &["daily-report"]);
+        seed_pre_agent_alias_db(&config, "daily-report");
+
+        assert!(
+            list_runs_for_agent(&config, "daily-report", "agent-a", 10)
+                .unwrap()
+                .is_empty(),
+            "a disabled claimant owns nothing"
+        );
+
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        let runs = list_runs_for_agent(&config, "daily-report", "agent-a", 10).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "re-enabling the claimant restores ownership: {runs:?}"
+        );
+        assert_eq!(runs[0].owner_agent.as_deref(), Some("agent-a"));
+
+        with_initialized_connection(&config, |conn| {
+            conn.execute("DELETE FROM cron_jobs WHERE id = 'daily-report'", [])
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+        assert_eq!(
+            list_runs_for_agent(&config, "daily-report", "agent-a", 10)
+                .unwrap()
+                .len(),
+            1,
+            "history stamped at recovery survives the job row"
+        );
+    }
+
+    #[test]
+    fn a_non_text_job_id_does_not_brick_the_store() {
+        // SQLite does not enforce the declared type of a TEXT PRIMARY KEY, so
+        // a malformed row can exist. Recovery must skip it rather than fail
+        // every cron read and write on every open.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_agent_alias_schema(&conn);
+        insert_pre_agent_alias_job(&conn, "daily-report");
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+             VALUES (X'00ff', '0 2 * * *', 'echo blob', ?1, ?2)",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        insert_legacy_run_with_id(&conn, "cron_runs", "daily-report", 1);
+        drop(conn);
+
+        let runs = list_runs_for_agent(&config, "daily-report", "agent-a", 10).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "the well-formed job is still recovered: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn declarative_sync_skips_a_contested_id() {
+        // Sync must not insert a job under an arbitrary one of two claimants:
+        // the stored alias is what execution honors first, so a coin-flip
+        // insert would become a coin-flip authority on every later run.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        claim_job_in_config(&mut config, "agent-b", true, &["daily-report"]);
+        let decls = decls_map(vec![make_shell_decl(
+            "daily-report",
+            "0 2 * * *",
+            "echo report",
+        )]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert!(
+            get_job(&config, "daily-report").is_err(),
+            "a contested declarative id must not be inserted under either claimant"
+        );
+    }
+
+    #[test]
+    fn overdue_query_keeps_unowned_rows_for_startup_retirement() {
+        // due_jobs never offers an unowned row, but all_overdue_jobs must:
+        // with catch-up disabled, startup skips or advances the missed
+        // occurrence, and an invisible row would instead fire stale once a
+        // claim appears. With catch-up enabled the row is refused at
+        // dispatch and simply stays overdue.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        claim_job_in_config(&mut config, "agent-b", true, &["daily-report"]);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_agent_alias_schema(&conn);
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+             VALUES ('daily-report', '0 2 * * *', 'echo legacy', '2000-01-01T00:00:00Z',
+                     '2000-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let now = Utc::now();
+        assert!(
+            due_jobs(&config, now).unwrap().is_empty(),
+            "contested: never selected"
+        );
+        assert_eq!(
+            all_overdue_jobs(&config, now).unwrap().len(),
+            1,
+            "the overdue view must still surface it for retirement"
+        );
+    }
+
+    #[test]
+    fn a_disabled_agent_runs_nothing_through_its_stored_alias() {
+        // Recovery stamps a then-enabled claimant onto the row. Disabling
+        // that agent afterwards must stop the job, or "disabled" would only
+        // hold until the first open while the agent was enabled.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "* * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        assert_eq!(due_jobs(&config, Utc::now()).unwrap().len(), 1);
+
+        config.agents.get_mut("test-agent").unwrap().enabled = false;
+        assert!(resolve_owning_agent(&config, &job).is_none());
+        assert!(
+            due_jobs(&config, Utc::now()).unwrap().is_empty(),
+            "a disabled agent's job must not be selected"
+        );
+        let attrs = ownership_refusal_attrs(&config, &job);
+        assert_eq!(attrs["stored_alias_disabled"], true, "{attrs}");
+    }
+
+    #[test]
+    fn contested_config_ownership_stays_fail_closed() {
+        // `Config::agents` is a hash map, so two enabled claimants resolve
+        // arbitrarily per process. Stamping either one would make a coin-flip
+        // authority durable, so the upgrade leaves the row unowned.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        claim_job_in_config(&mut config, "agent-b", true, &["daily-report"]);
+        seed_pre_agent_alias_db(&config, "daily-report");
+
+        for who in ["agent-a", "agent-b"] {
+            assert!(
+                list_runs_for_agent(&config, "daily-report", who, 10)
+                    .unwrap()
+                    .is_empty(),
+                "{who} must not read contested history"
+            );
+        }
+        assert_eq!(
+            get_job(&config, "daily-report").unwrap().agent_alias,
+            "",
+            "a contested id keeps its empty alias"
+        );
+        remove_jobs_by_agent(&config, "agent-a").unwrap();
+        assert_eq!(
+            list_runs(&config, "daily-report", 10).unwrap().len(),
+            1,
+            "an agent-scoped cascade must not purge contested history"
+        );
+    }
+
+    #[test]
+    fn unclaimed_and_disabled_config_ownership_stay_fail_closed() {
+        // An imperative legacy job nobody claims, and an empty-alias job
+        // claimed only by a disabled agent (which the scheduler's config
+        // fallback also refuses), are genuinely owner-unknown and stay
+        // quarantined.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-off", false, &["disabled-owner"]);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_agent_alias_schema(&conn);
+        insert_pre_agent_alias_job(&conn, "nobody-claims");
+        insert_pre_agent_alias_job(&conn, "disabled-owner");
+        insert_legacy_run_with_id(&conn, "cron_runs", "nobody-claims", 1);
+        insert_legacy_run_with_id(&conn, "cron_runs", "disabled-owner", 2);
+        drop(conn);
+
+        for (job, who) in [
+            ("nobody-claims", "agent-off"),
+            ("disabled-owner", "agent-off"),
+        ] {
+            assert!(
+                list_runs_for_agent(&config, job, who, 10)
+                    .unwrap()
+                    .is_empty(),
+                "{job} must stay unowned"
+            );
+            assert_eq!(
+                list_runs(&config, job, 10).unwrap().len(),
+                1,
+                "{job} row is kept"
+            );
+        }
+    }
+
+    #[test]
+    fn a_database_migrated_by_the_earlier_head_still_recovers_config_ownership() {
+        // The previously shipped head recorded the migration marker and
+        // stamped ownership only from a stored alias, leaving config-only
+        // owners NULL. Recovery is not gated on that marker, so such a
+        // database is repaired on its next open.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        claim_job_in_config(&mut config, "agent-a", true, &["daily-report"]);
+        let seeded = add_job(&config, "agent-a", "*/5 * * * *", "echo ok").unwrap();
+        with_initialized_connection(&config, |conn| {
+            let now = Utc::now();
+            conn.execute(
+                "INSERT INTO cron_jobs (id, expression, command, schedule, job_type, created_at,
+                                        next_run, agent_alias)
+                 VALUES ('daily-report', '0 2 * * *', 'echo legacy', '0 2 * * *', 'shell', ?1,
+                         ?2, '')",
+                params![
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                ],
+            )
+            .map_err(anyhow::Error::from)?;
+            conn.execute(
+                "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output,
+                                        duration_ms, executing_agent, job_source, owner_agent)
+                 VALUES ('daily-report', ?1, ?2, 'ok', 'legacy-output', 5, NULL, NULL, NULL)",
+                params![
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+                ],
+            )
+            .map_err(anyhow::Error::from)?;
+            conn.execute_batch("PRAGMA user_version = 1")
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+        assert!(get_job(&config, &seeded.id).is_ok(), "fixture job survives");
+
+        let runs = list_runs_for_agent(&config, "daily-report", "agent-a", 10).unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "a database at step 1 must still get the config-membership backfill: {runs:?}"
+        );
+        assert_eq!(runs[0].owner_agent.as_deref(), Some("agent-a"));
+    }
+
+    #[test]
+    fn upgrade_stamps_live_job_ownership_and_quarantines_orphans() {
+        // Pre-owner lifecycle under test, in order: agent A executed two
+        // jobs; the owner was renamed A -> B on the pre-owner schema
+        // (updating only the LIVE job row); one job still lives, the other
+        // auto-deleted. On upgrade, the live row's ownership is stamped
+        // from the job row — the one unambiguous source of CURRENT
+        // ownership, which honors the rename — while the orphan's owner is
+        // unreconstructible and the row is quarantined. Historical
+        // executor attribution never changes either way.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_owner_schema(&conn);
+        insert_pre_owner_job(&conn, "live-legacy", "agent-a");
+        insert_pre_owner_run(&conn, "live-legacy", "agent-a", "live-output");
+        insert_pre_owner_run(&conn, "gone-one-shot", "agent-a", "orphan-secret");
+        // The pre-owner schema's rename A -> B reaches only live job rows.
+        conn.execute(
+            "UPDATE cron_jobs SET agent_alias = 'agent-b' WHERE agent_alias = 'agent-a'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT agent_alias FROM cron_jobs WHERE id = 'live-legacy'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "agent-b",
+            "fixture: the pre-upgrade rename must actually move the live job"
+        );
+        drop(conn);
+
+        // Upgrade through the public open path.
+        // Live row: stamped to the job's CURRENT owner B; executor stays A.
+        let runs = list_runs_for_agent(&config, "live-legacy", "agent-b", 10).unwrap();
+        assert_eq!(runs.len(), 1, "current owner must read the stamped row");
+        assert_eq!(runs[0].owner_agent.as_deref(), Some("agent-b"));
+        assert_eq!(runs[0].executing_agent.as_deref(), Some("agent-a"));
+        assert!(
+            list_runs_for_agent(&config, "live-legacy", "agent-a", 10)
+                .unwrap()
+                .is_empty(),
+            "a reused alias must not read the renamed owner's row"
+        );
+
+        // Orphan row: unreconstructible owner — quarantined for everyone.
+        for who in ["agent-a", "agent-b"] {
+            assert!(
+                list_runs_for_agent(&config, "gone-one-shot", who, 10)
+                    .unwrap()
+                    .is_empty(),
+                "{who} must not read the quarantined row"
+            );
+        }
+        remove_jobs_by_agent(&config, "agent-a").unwrap();
+        assert_eq!(
+            list_runs(&config, "gone-one-shot", 10).unwrap().len(),
+            1,
+            "the owner cascade must not purge quarantined rows"
+        );
+        let orphan = &list_runs(&config, "gone-one-shot", 10).unwrap()[0];
+        assert_eq!(orphan.executing_agent.as_deref(), Some("agent-a"));
+        assert!(orphan.owner_agent.is_none());
+
+        // Removal by job id is the supported escape hatch: history-only
+        // removal succeeds and purges the quarantined record.
+        remove_job(&config, "gone-one-shot").unwrap();
+        assert!(list_runs(&config, "gone-one-shot", 10).unwrap().is_empty());
+    }
+
+    /// Open a second connection to the cron DB and take the write lock, so
+    /// the store's next open contends with a live writer.
+    fn hold_write_lock(config: &Config) -> Connection {
+        let conn = Connection::open(cron_db(config)).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn
+    }
+
+    /// Assert an operation was refused with the retryable contention
+    /// refusal, raised by the named preparation phase — not merely any
+    /// error, and not an earlier phase standing in for the one under test.
+    fn assert_refused_for_contention<T: std::fmt::Debug>(
+        result: Result<T>,
+        phase: &str,
+        what: &str,
+    ) {
+        let err = result.expect_err(what);
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(MIGRATION_CONTENTION_CONTEXT),
+            "{what}: expected the contention refusal, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("Failed to begin cron {phase} transaction")),
+            "{what}: expected the refusal from the {phase} phase, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn contended_merge_refuses_the_operation_and_never_collides_ids() {
+        // The beside-table stranded state with an EMPTY live cron_runs is
+        // the dangerous one: if an operation were authorized before the
+        // merge completed, its new row could occupy the stranded row's id
+        // and the later INSERT OR IGNORE would discard the only copy of
+        // the history. Under contention the operation must be refused
+        // outright — fail closed, retryable — and after the writer goes
+        // away the stranded row must survive exactly once.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "agent-a", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        with_initialized_connection(&config, |conn| {
+            conn.execute_batch(
+                "CREATE TABLE cron_runs_no_fk (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id      TEXT NOT NULL,
+                    started_at  TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    output      TEXT,
+                    duration_ms INTEGER,
+                    executing_agent TEXT,
+                    job_source  TEXT
+                );",
+            )
+            .map_err(anyhow::Error::from)?;
+            conn.execute(
+                "INSERT INTO cron_runs_no_fk (id, job_id, started_at, finished_at, status,
+                                              output, duration_ms, executing_agent, job_source)
+                 VALUES (1, ?1, ?2, ?3, 'ok', 'stranded-history', 5, 'agent-a', 'imperative')",
+                params![
+                    job.id,
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+                ],
+            )
+            .map_err(anyhow::Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let outcomes = RunOutcomes {
+            execution: "ok",
+            delivery: "not_required",
+            persistence: "not_bound",
+        };
+        let provenance = RunProvenance {
+            principal: None,
+            executing_agent: Some("agent-a"),
+            job_source: Some("imperative"),
+        };
+
+        let holder = hold_write_lock(&config);
+        let refused = record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(7),
+            "ok",
+            outcomes,
+            provenance,
+            Some("new-run"),
+            7,
+        );
+        assert_refused_for_contention(
+            refused,
+            "stranded-table merge recovery",
+            "an operation must be refused while required recovery is blocked",
+        );
+        drop(holder);
+
+        // The refused operation must not have written anything: after the
+        // writer releases, the merge completes and the stranded row is the
+        // only row, keeping its original id.
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].output.as_deref(), Some("stranded-history"));
+
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(7),
+            "ok",
+            outcomes,
+            provenance,
+            Some("new-run"),
+            7,
+        )
+        .unwrap();
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 2, "no id collision may discard either row");
+        assert!(
+            runs.iter()
+                .any(|r| r.output.as_deref() == Some("stranded-history")),
+            "the stranded row must survive the whole sequence"
+        );
+    }
+
+    #[test]
+    fn contended_sole_table_recovery_refuses_the_operation() {
+        // Between-DROP-and-RENAME state under a live writer: the rename
+        // recovery cannot run, so the open must fail rather than proceed
+        // against a database with no usable cron_runs.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        std::fs::create_dir_all(cron_dir(&config)).unwrap();
+        let conn = Connection::open(cron_db(&config)).unwrap();
+        pre_owner_schema(&conn);
+        insert_pre_owner_job(&conn, "live-legacy", "agent-a");
+        insert_pre_owner_run(&conn, "live-legacy", "agent-a", "sole-history");
+        // WAL, as any database this store has ever opened is: the pragma
+        // phase must pass so the lock blocks the rename recovery itself.
+        conn.execute_batch(
+            "ALTER TABLE cron_runs RENAME TO cron_runs_no_fk;
+             PRAGMA journal_mode = WAL;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let holder = hold_write_lock(&config);
+        assert_refused_for_contention(
+            list_runs(&config, "live-legacy", 10),
+            "stranded-table rename recovery",
+            "the open must fail while the rename recovery is blocked",
+        );
+        drop(holder);
+
+        let runs = list_runs(&config, "live-legacy", 10).unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].output.as_deref(), Some("sole-history"));
+    }
+
+    #[test]
+    fn contended_owner_migration_refuses_the_operation() {
+        // Modern schema, completion marker unset (the previous-build
+        // upgrade state): the ownership migration is required, so a
+        // contended open is refused; the next uncontended open completes
+        // the migration and ownership works.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "agent-a", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("agent-a"),
+                job_source: Some("imperative"),
+            },
+            Some("kept"),
+            5,
+        )
+        .unwrap();
+        with_initialized_connection(&config, |conn| {
+            conn.execute_batch(
+                "PRAGMA user_version = 0;
+                 UPDATE cron_runs SET owner_agent = NULL;",
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+
+        let holder = hold_write_lock(&config);
+        assert_refused_for_contention(
+            list_runs(&config, &job.id, 10),
+            "ownership migration",
+            "the open must fail while the required migration is blocked",
+        );
+        drop(holder);
+
+        let runs = list_runs_for_agent(&config, &job.id, "agent-a", 10).unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(
+            runs[0].owner_agent.as_deref(),
+            Some("agent-a"),
+            "the next uncontended open must complete the migration"
+        );
+    }
+
+    #[test]
+    fn merge_recovery_stamps_only_merged_rows() {
+        // A stranded working table can be merged into a database whose
+        // ownership migration already completed. The merged pre-owner rows
+        // get the one-time stamping, scoped to them alone: a modern row
+        // whose NULL owner is deliberate (no executing agent known at
+        // insert) must stay unowned.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "agent-a", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
+                job_source: Some("imperative"),
+            },
+            Some("deliberately-unowned"),
+            5,
+        )
+        .unwrap();
+
+        with_initialized_connection(&config, |conn| {
+            conn.execute_batch(
+                "CREATE TABLE cron_runs_no_fk (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id      TEXT NOT NULL,
+                    started_at  TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    output      TEXT,
+                    duration_ms INTEGER,
+                    execution   TEXT,
+                    delivery    TEXT,
+                    persistence TEXT,
+                    principal   TEXT,
+                    executing_agent TEXT,
+                    job_source  TEXT
+                );",
+            )
+            .map_err(anyhow::Error::from)?;
+            conn.execute(
+                "INSERT INTO cron_runs_no_fk (id, job_id, started_at, finished_at, status,
+                                              output, duration_ms, executing_agent, job_source)
+                 VALUES (9001, ?1, ?2, ?3, 'ok', 'stranded-output', 5, 'agent-a', 'imperative')",
+                params![
+                    job.id,
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+                ],
+            )
+            .map_err(anyhow::Error::from)?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Next open merges the stranded table into the migrated database.
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        let merged = runs
+            .iter()
+            .find(|r| r.output.as_deref() == Some("stranded-output"))
+            .unwrap();
+        assert_eq!(
+            merged.owner_agent.as_deref(),
+            Some("agent-a"),
+            "the merged pre-owner row must get the one-time stamping"
+        );
+        let modern = runs
+            .iter()
+            .find(|r| r.output.as_deref() == Some("deliberately-unowned"))
+            .unwrap();
+        assert!(
+            modern.owner_agent.is_none(),
+            "a modern deliberately-unowned row must not be re-stamped by recovery"
+        );
+    }
+
+    #[test]
+    fn remove_job_of_unknown_id_deletes_nothing() {
+        // An unknown id must never destroy data while reporting failure:
+        // the not-found bail rolls the transaction back.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("keep-me"),
+            5,
+        )
+        .unwrap();
+
+        assert!(remove_job(&config, "no-such-id").is_err());
+        assert!(get_job(&config, &job.id).is_ok(), "job must survive");
+        assert_eq!(
+            list_runs(&config, &job.id, 10).unwrap().len(),
+            1,
+            "history must survive a failed removal"
+        );
+    }
+
+    #[test]
+    fn declarative_id_reuse_does_not_resurrect_quarantined_history() {
+        // Declarative ids are stable operator-chosen config keys. When a
+        // key is reassigned, quarantined history under it must be purged
+        // rather than resurrected into the new owner's read scope through
+        // the live-job arm of the owner-scoped read.
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["daily-report"]);
+        let now = Utc::now();
+        // Quarantined predecessor history under the config key: owner
+        // unknown, job gone.
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output,
+                                        duration_ms, executing_agent, job_source)
+                 VALUES ('daily-report', ?1, ?2, 'ok', 'previous-owner-secret', 5,
+                         'agent-old', 'declarative')",
+                params![
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+                ],
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+
+        let decls = decls_map(vec![make_shell_decl(
+            "daily-report",
+            "0 2 * * *",
+            "echo report",
+        )]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job = get_job(&config, "daily-report").unwrap();
+        assert!(
+            list_runs_for_agent(&config, "daily-report", &job.agent_alias, 10)
+                .unwrap()
+                .is_empty(),
+            "the reassigned key's new owner must not inherit quarantined history"
+        );
+        assert!(
+            list_runs(&config, "daily-report", 10).unwrap().is_empty(),
+            "quarantined history must be purged when the id is reassigned"
+        );
+    }
+
+    #[test]
+    fn retained_history_cleanup_survives_owner_rename() {
+        // Complete a one-shot as agent A (job auto-deleted, row retained),
+        // rename A to B: the historical executor stays A, but the durable
+        // cleanup owner follows to B — deleting B purges the record, and a
+        // NEW agent reusing the alias A owns none of it.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+        record_run(
+            &config,
+            "renamed-one-shot",
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("agent-a"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        rename_jobs_by_agent(&config, "agent-a", "agent-b").unwrap();
+        let runs = list_runs(&config, "renamed-one-shot", 10).unwrap();
+        assert_eq!(
+            runs[0].executing_agent.as_deref(),
+            Some("agent-a"),
+            "historical attribution is immutable"
+        );
+        assert_eq!(
+            runs[0].owner_agent.as_deref(),
+            Some("agent-b"),
+            "cleanup ownership follows the rename"
+        );
+
+        // Alias reuse: deleting a NEW agent called agent-a must not purge
+        // agent-b's retained record.
+        remove_jobs_by_agent(&config, "agent-a").unwrap();
+        assert_eq!(list_runs(&config, "renamed-one-shot", 10).unwrap().len(), 1);
+
+        // Deleting the current owner purges it.
+        remove_jobs_by_agent(&config, "agent-b").unwrap();
+        assert!(
+            list_runs(&config, "renamed-one-shot", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scoped_removal_purges_history_with_ownership_guard() {
+        // The owner-qualified removal path deletes job and history in one
+        // transaction — and a mismatched owner deletes neither.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        assert!(remove_job_for_agent(&config, &job.id, "someone-else").is_err());
+        assert_eq!(list_runs(&config, &job.id, 10).unwrap().len(), 1);
+
+        remove_job_for_agent(&config, &job.id, "test-agent").unwrap();
+        assert!(get_job(&config, &job.id).is_err());
+        assert!(
+            list_runs(&config, &job.id, 10).unwrap().is_empty(),
+            "owner-qualified removal must not leave history behind"
+        );
+    }
+
+    #[test]
+    fn run_provenance_survives_job_and_owner_renames() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            "original-agent",
+            Some("nightly".to_string()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "do the thing",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let stamped = zeroclaw_api::ingress::InternalPrincipal::Cron {
+            job_id: job.id.clone(),
+            job_name: job.name.clone(),
+        };
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: Some(&stamped),
+                executing_agent: Some("original-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        // Rename the job and its owning agent AFTER the run persisted.
+        update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed".to_string()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rename_jobs_by_agent(&config, "original-agent", "renamed-agent").unwrap(),
+            1
+        );
+
+        // The historical row still reports the values stamped at dispatch,
+        // not the current metadata.
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].principal.as_ref(), Some(&stamped));
+        assert_eq!(
+            runs[0].principal,
+            Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+                job_id: job.id.clone(),
+                job_name: Some("nightly".to_string()),
+            })
+        );
+        assert_eq!(runs[0].executing_agent.as_deref(), Some("original-agent"));
     }
 
     #[test]
@@ -2589,6 +6000,9 @@ mod tests {
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
         };
         config.cron.insert("raw-shadow".to_string(), decl);
+        // Selection only offers a declarative job that exactly one enabled
+        // agent claims, as a live config would.
+        seed_claiming_agent(&mut config, &["raw-shadow"]);
 
         // --- NULL shadow ---
         // DB column is NULL (from the nullable table above), config says Raw.
@@ -2721,6 +6135,9 @@ mod tests {
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
         };
         config.cron.insert("blob-shadow".to_string(), decl);
+        // Selection only offers a declarative job that exactly one enabled
+        // agent claims, as a live config would.
+        seed_claiming_agent(&mut config, &["blob-shadow"]);
 
         // get_job must succeed despite the BLOB shadow: the ownership branch
         // skips reading column 21 for declarative rows entirely.
@@ -2782,7 +6199,26 @@ mod tests {
         for idx in 0..3 {
             let start = base + ChronoDuration::seconds(idx);
             let end = start + ChronoDuration::milliseconds(100);
-            record_run(&config, &job.id, start, end, "ok", Some("done"), 100).unwrap();
+            record_run(
+                &config,
+                &job.id,
+                start,
+                end,
+                "ok",
+                RunOutcomes {
+                    execution: "ok",
+                    delivery: "not_required",
+                    persistence: "not_bound",
+                },
+                RunProvenance {
+                    principal: None,
+                    executing_agent: None,
+                    job_source: None,
+                },
+                Some("done"),
+                100,
+            )
+            .unwrap();
         }
 
         let runs = list_runs(&config, &job.id, 10).unwrap();
@@ -2801,6 +6237,16 @@ mod tests {
             start,
             start + ChronoDuration::milliseconds(5),
             "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
+                job_source: None,
+            },
             Some("ok"),
             5,
         )
@@ -2824,6 +6270,16 @@ mod tests {
             Utc::now(),
             Utc::now(),
             "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
+                job_source: None,
+            },
             Some(&output),
             1,
         )
@@ -2966,14 +6422,7 @@ mod tests {
     /// Seed an enabled agent that claims `ids` via its `cron_jobs` list so
     /// `sync_declarative_jobs` can resolve an owning agent for each entry.
     fn seed_claiming_agent(config: &mut Config, ids: &[&str]) {
-        config.agents.insert(
-            "test-agent".to_string(),
-            zeroclaw_config::schema::AliasedAgentConfig {
-                enabled: true,
-                cron_jobs: ids.iter().map(|s| (*s).to_string()).collect(),
-                ..Default::default()
-            },
-        );
+        claim_job_in_config(config, "test-agent", true, ids);
     }
 
     #[test]
@@ -3126,6 +6575,77 @@ mod tests {
     }
 
     #[test]
+    fn sync_validates_session_target() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_agent_decl("bad-session", "0 2 * * *", "do stuff");
+        decl.session_target = Some("shared".to_string());
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "unknown session_target must be rejected like an unknown job_type"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("session_target"), "got {err}");
+        assert!(err.contains("isolated"), "got {err}");
+        assert!(err.contains("main"), "got {err}");
+    }
+
+    #[test]
+    fn sync_agent_job_persists_session_target_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["main-session"]);
+
+        let (id, mut decl) = make_agent_decl("main-session", "*/15 * * * *", "continue the thread");
+        decl.session_target = Some("main".to_string());
+        let decls = decls_map(vec![(id, decl)]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job = get_job(&config, "main-session").unwrap();
+        assert_eq!(job.session_target, SessionTarget::Main);
+    }
+
+    #[test]
+    fn sync_agent_job_persists_canonical_session_target_from_whitespace_padded_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["padded-main"]);
+
+        let (id, mut decl) = make_agent_decl("padded-main", "*/15 * * * *", "continue the thread");
+        decl.session_target = Some("  MAIN  ".to_string());
+        let decls = decls_map(vec![(id, decl)]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Reload through the stored-row parser, which does not trim. A raw
+        // `"  MAIN  "` column would come back Isolated and the scheduler
+        // would start a fresh session instead of main.
+        let job = get_job(&config, "padded-main").unwrap();
+        assert_eq!(job.session_target, SessionTarget::Main);
+    }
+
+    #[test]
+    fn sync_validates_session_target_on_shell_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_shell_decl("bad-shell-session", "0 2 * * *", "echo ok");
+        decl.session_target = Some("shared".to_string());
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "unknown session_target must fail closed for shell declarations too"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("session_target"), "got {err}");
+    }
+
+    #[test]
     fn sync_agent_job_inserts_correctly() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
@@ -3217,13 +6737,22 @@ schedule = { kind = "every", every_ms = 300000 }
     fn skip_missed_run_advances_recurring_job_next_run() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
+        // Keep the reference one second before a minute boundary so the test
+        // exercises the exact rollover that made the old wall-clock assertion
+        // flaky. The explicit UTC zone keeps the expected occurrence stable
+        // across developer and CI machine timezones.
+        let reference = "2026-08-25T12:34:59Z".parse::<DateTime<Utc>>().unwrap();
+        let schedule = Schedule::Cron {
+            expr: "* * * * *".to_string(),
+            tz: Some("UTC".to_string()),
+        };
 
         // Add a cron job that will be "overdue" — its next_run is set based
         // on the schedule from the current time, so we need to make it past.
-        let job = add_job(&config, "test-agent", "* * * * *", "echo test").unwrap();
+        let job = add_job_with_schedule(&config, "test-agent", &schedule, "echo test").unwrap();
 
         // Force next_run into the past so the job appears overdue.
-        let past = Utc::now() - ChronoDuration::hours(1);
+        let past = reference - ChronoDuration::hours(1);
         with_initialized_connection(&config, |conn| {
             conn.execute(
                 "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
@@ -3236,20 +6765,23 @@ schedule = { kind = "every", every_ms = 300000 }
 
         // Verify it is overdue now.
         assert!(
-            !all_overdue_jobs(&config, Utc::now()).unwrap().is_empty(),
+            !all_overdue_jobs(&config, reference).unwrap().is_empty(),
             "job with past next_run must appear in overdue"
         );
 
         // Skip the missed run.
         let reloaded = get_job(&config, &job.id).unwrap();
-        skip_missed_run(&config, &reloaded, Utc::now()).unwrap();
+        skip_missed_run(&config, &reloaded, reference).unwrap();
 
-        // The job's next_run should now be in the future.
+        // The job's next_run should be the first occurrence after the same
+        // reference instant supplied to skip_missed_run.
         let updated = get_job(&config, &job.id).unwrap();
+        let expected_next_run = "2026-08-25T12:35:00Z".parse::<DateTime<Utc>>().unwrap();
         assert!(
-            updated.next_run > Utc::now(),
+            updated.next_run > reference,
             "skip_missed_run must advance next_run to the future"
         );
+        assert_eq!(updated.next_run, expected_next_run);
         assert!(updated.enabled, "recurring job must stay enabled");
     }
 
@@ -3398,6 +6930,52 @@ schedule = { kind = "every", every_ms = 300000 }
             resolved, mine.id,
             "name must resolve to the caller's own job, not the other agent's"
         );
+    }
+
+    #[test]
+    fn resolve_job_id_or_name_cannot_reach_another_agents_job_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let theirs = add_shell_job(
+            &config,
+            "agent-b",
+            Some("secret_job".into()),
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        let err = resolve_job_id_or_name(&config, &theirs.id, "agent-a").unwrap_err();
+        assert!(
+            err.to_string().contains("No cron job found"),
+            "another agent's job must be unreachable by ID, got: {err}"
+        );
+    }
+
+    #[test]
+    fn get_job_for_agent_reports_another_agents_job_as_missing() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let theirs = add_shell_job(
+            &config,
+            "agent-b",
+            None,
+            Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "echo b",
+            None,
+        )
+        .unwrap();
+
+        assert!(get_job_for_agent(&config, &theirs.id, "agent-b").is_ok());
+        let err = get_job_for_agent(&config, &theirs.id, "agent-a").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
     }
 
     #[test]
@@ -3649,6 +7227,75 @@ schedule = { kind = "every", every_ms = 300000 }
         assert!(
             err.to_string().contains("config.toml"),
             "the core update_job boundary must reject a config-owned mutation, not silently ignore it: {err}"
+        );
+    }
+
+    /// Regression: a declarative job's delivery is owned by
+    /// `[cron.<id>].delivery`. Persisting a CLI patch here would look like it
+    /// worked and then be silently reverted by `sync_declarative_jobs` on the
+    /// next daemon start, which rewrites every declarative column from config.
+    /// The second half of this test proves that revert, so the guard is
+    /// justified by the behaviour rather than by assertion.
+    #[test]
+    fn update_job_rejects_delivery_for_declarative_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["decl-job"]);
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("decl-job".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo ok".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
+        config.cron.insert("decl-job".to_string(), decl);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let err = update_job(
+            &config,
+            "decl-job",
+            CronJobPatch {
+                delivery: Some(DeliveryConfig {
+                    mode: "announce".to_string(),
+                    channel: Some("telegram".to_string()),
+                    to: Some("111".to_string()),
+                    thread_id: None,
+                    best_effort: true,
+                }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config.toml"),
+            "the rejection must point at the canonical source: {msg}"
+        );
+        assert!(
+            msg.contains("[cron.decl-job].delivery"),
+            "the rejection must name the exact config key to edit: {msg}"
+        );
+
+        // The stored job is untouched, and a sync would have reverted it anyway.
+        let after = get_job(&config, "decl-job").unwrap();
+        assert_eq!(after.delivery.mode, "none");
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert_eq!(
+            get_job(&config, "decl-job").unwrap().delivery.mode,
+            "none",
+            "sync rewrites declarative delivery from config, which is why the patch is rejected"
         );
     }
 

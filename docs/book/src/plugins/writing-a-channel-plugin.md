@@ -13,13 +13,10 @@ and understand crate setup, the `__config` rule, logging, and install. It is
 checked against `wit/v0/channel.wit` and the host adapter in
 `crates/zeroclaw-plugins/src/wasm_channel.rs`.
 
-> **Wiring status.** The host side of channel plugins is complete and
-> unit-covered: `WasmChannel` implements the runtime's `Channel` trait, and
-> `PluginHost::channel_plugin_details()` exposes discovered channel plugins.
-> The remaining seam is orchestrator registration plus the per-vendor host
-> listener; until that lands, a channel plugin loads and passes its contract
-> tests but is not yet constructed by a running daemon. Build against the
-> contract now; the contract is what freezes.
+> **Wiring status.** Channel plugins are constructed by a running daemon. An
+> installed package bound through `[channels.plugin.<alias>]` is admitted at
+> startup and supervised exactly like a native channel. See
+> [Activating a channel plugin](#activating-a-channel-plugin) below.
 
 ## The lifecycle
 
@@ -28,17 +25,27 @@ ways, and each drives a design decision in your code:
 
 1. **One warm store for the plugin's lifetime.** The host instantiates your
    component once (`WasmChannel::from_wasm`) and holds the store behind an
-   async mutex. Your component keeps state between calls: connection handles,
-   caches, sequence counters. The store is refueled before every call
-   (`call_plugin!` in `component.rs`), so a long-lived channel gets a fresh
-   fuel budget per call rather than draining over its lifetime.
-2. **Configuration arrives before anything else.** The host calls your
-   `configure` export exactly once, at load, before any other call. The
-   argument is a JSON object of your channel's resolved settings, secrets
-   already decrypted, supplied only when the manifest grants `config_read`
-   (otherwise you receive `{}`, per `resolve_configure_json` in
-   `wasm_channel.rs`). Parse it, validate it, store it in your component's
-   state; return an error string to fail the load if the config is unusable.
+   async mutex. The component may keep guest-owned protocol state between
+   calls, but operator config remains host-owned. A compliant plugin **must**
+   call `config.get` and `secrets.get` in every operation that needs them and
+   must not copy their results into warm guest state. The host drops its
+   materialized view after each call, but it cannot stop malicious guest code
+   from retaining returned JSON or plaintext. The store is refueled before
+   every call (`call_channel!` in `component.rs`), so a long-lived channel gets
+   a fresh fuel budget per call rather than draining over its lifetime.
+2. **Configuration is requested at point of use.** The host calls your
+   no-argument `configure` export exactly once, at load, before any other
+   export. Call `config.get` for the typed public JSON object validated against
+   your manifest's `config_schema`; properties marked `x-secret = true` are
+   omitted and must be read through `secrets.get`. Public and secret reads in
+   `configure`, or in any later operational export, share one resolved config
+   revision. A same-binding public config plus credential rotation is therefore
+   visible together on the next operation. Calls during instantiation and
+   static discovery return `unavailable` without resolving config. Static
+   discovery includes `name`, `plugin-info`, `get-channel-capabilities`,
+   `self-handle`, `self-addressed-mention`, and `multi-message-delay-ms`;
+   changing bot/account identity or other static metadata requires channel
+   lifecycle reconstruction.
 3. **You do not listen; the host feeds you.** The WASI context has no network
    listener capability. Inbound traffic reaches you through the imported
    `inbound` interface: the host runs the actual listener (webhook server,
@@ -54,7 +61,7 @@ Five functions have no Rust trait default and must genuinely work
 | Export | Contract |
 |--------|----------|
 | `name` | Human-readable channel name. |
-| `configure` | Receive the resolved config JSON once at load; error string fails the load. |
+| `configure` | Complete load-time initialization. It takes no arguments; call `config.get` and `secrets.get` for one current revision. An error string fails the load. |
 | `send` | Deliver a `send-message` (content, recipient, optional subject/thread/attachments) to the platform. |
 | `poll-message` | Non-blocking: return the next inbound message or `none` immediately. Never block; the host's poll bridge handles pacing. |
 | `get-channel-capabilities` | Return the bitmask of optional methods you actually implement. Called once at load. |
@@ -62,13 +69,24 @@ Five functions have no Rust trait default and must genuinely work
 The poll bridge deserves a note: the host runs a poll-to-push loop
 (`listen` in `wasm_channel.rs`) that calls `poll-message` with exponential
 backoff from 50ms to 500ms while the queue is empty, resetting on traffic. If
-your `poll-message` traps, the host marks the channel poll-unhealthy, logs,
-and backs off; a plugin whose poll keeps trapping reports unhealthy through
-`health_check` even if it exports no `health-check` of its own. Trapping in
-`poll-message` is therefore visible, not fatal, but it makes your channel
-useless. Keep it simple: drain the queue, translate, return.
+your `poll-message` traps, the host logs it, backs off, and reports the channel
+unhealthy in the gateway's `/health` snapshot, even if you export no
+`health-check` of your own. A trap leaves the instance unable to run any
+export, so the host discards it and the next call builds a new one, running
+`configure` again. The message the trapping poll had taken off the queue is
+lost; later messages still arrive. Any export that traps or misses the call
+deadline is replaced the same way, while an error string your export returns
+leaves the instance in place. A rebuild reconnects a gateway-style
+plugin, so the host budgets them: it rebuilds at once while failures average
+no more than one every five minutes, allowing a burst of three, and beyond
+that waits for the budget to refill, failing calls in the meantime without
+running your plugin. A missed deadline in `request-approval` or
+`request-choice`, which wait for a person to answer, does not count against
+the budget. An export that routinely needs longer than the deadline, such as
+a large upload, calls for a higher `plugins.limits.call_timeout_ms`. Keep it
+simple: drain the queue, translate, return.
 
-## Capability flags: the 22 optional methods
+## Capability flags: the {{#include ../_snippets/plugin-channel-flag-count.md}} optional methods
 
 Everything else in the interface is gated by `channel-capabilities` flags.
 The pattern (identical to the memory world):
@@ -84,17 +102,48 @@ flags declaration, which is the source of truth. In summary, the groups:
 
 | Group | Flags | What implementing buys you |
 |-------|-------|---------------------------|
-| Health | `health-check` | Report platform reachability; combined with poll health by the host adapter. |
+| Health | `health-check` | Report whether the channel works. The host asks about every 30 seconds while listening and shows the answer, combined with poll health, in `/health` (see [Health checks](#health-checks)). |
 | Identity | `self-handle`, `self-addressed-mention`, `drop-self-message` | Self-loop protection (the runtime drops the bot's own messages) and correct @-mention forms in the per-channel system prompt. The host caches `self-handle` and `self-addressed-mention` at load; they are read once. |
 | Typing | `start-typing`, `stop-typing` | Composing indicators while the agent thinks. |
 | Drafts | `supports-draft-updates`, `send-draft`, `update-draft`, `update-draft-progress`, `finalize-draft`, `cancel-draft` | Progressive message editing: the runtime streams the response into an editable platform message instead of waiting for completion. Implement all six together or none. |
 | Multi-message streaming | `supports-multi-message-streaming`, `multi-message-delay-ms` | Paragraph-by-paragraph delivery with a minimum inter-message delay (default 800ms, cached at load). |
 | Moderation | `add-reaction`, `remove-reaction`, `pin-message`, `unpin-message`, `redact-message` | Emoji reactions, pinning, message deletion. |
 | Interaction | `request-approval`, `request-choice`, `supports-free-form-ask` | Tool-call approval prompts and multiple-choice questions presented natively on the platform. |
+| Webhook ingress | `webhook-ingress` | Serve inbound webhooks: the gateway mounts your `webhook-path` segment under `/plugin/<segment>` and passes each request to `parse-webhook`, which verifies platform authenticity and returns messages or a challenge reply. Implement both exports together. |
 
 Start with the required {{#include ../_snippets/plugin-channel-required-count.md}} plus `health-check`, and add groups as the
 platform supports them. Advertising a flag you have not implemented is worse
 than omitting it: the host will call your export and trust the answer.
+
+### Health checks
+
+While the channel listens, the host calls `health-check` on the running
+instance between polls: right after the first poll, then about every 30
+seconds. The answer becomes the channel's component in the gateway's `/health`
+snapshot, `channel:plugin.<alias>`:
+
+- `starting` until the first answer. A first answer of `false` also reads
+  `starting` until the next check, so a plugin still completing its handshake
+  is not reported as failed.
+- `ok` while the latest answer is `true`.
+- `error` when the latest answer is `false`, when the check traps or misses
+  the call deadline, when `poll-message` traps, or when no answer has arrived
+  for two intervals plus two call deadlines (two minutes with the default
+  30-second deadline).
+
+`zeroclaw channel doctor` also calls `health-check`, once, on a freshly
+configured instance.
+
+Because the check repeats, answer from state the plugin already holds: whether
+its connection is up, or how its last exchange with the platform went. A
+network request in `health-check` runs on every check and delays the next
+poll; if you verify credentials over the network, keep the last result and
+refresh it on your own schedule. A check that traps or misses the call
+deadline discards the instance, and the host rebuilds it with `configure`, so a
+gateway-style plugin loses its connection; after each such failure the host
+waits twice as long before the next check, up to ten minutes. The host also
+puts off a check while one more failure would make a rebuild wait, so a failed
+check never by itself makes one wait.
 
 ### The approval surface
 
@@ -151,23 +200,33 @@ mod component {
         features: ["plugins-wit-v0"],
     });
 
-    use std::cell::RefCell;
-
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities,
         Guest as Channel, InboundMessage, SendMessage,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
+    use zeroclaw::plugin::config::get as config_get;
     use zeroclaw::plugin::inbound::inbound_poll;
+    use zeroclaw::plugin::secrets::get as secret_get;
 
-    struct State {
-        api_token: String,
-        default_recipient: Option<String>,
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ChannelConfig {
+        api_base: String,
     }
 
-    // One warm instance per plugin: interior mutability holds parsed config.
-    thread_local! {
-        static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    fn current_config() -> Result<ChannelConfig, String> {
+        let json = config_get().map_err(|_| "public config is unavailable".to_string())?;
+        serde_json::from_str(&json).map_err(|e| format!("invalid config JSON: {e}"))
+    }
+
+    fn current_api_token() -> Result<String, String> {
+        secret_get("api_token").map_err(|_| "api_token is unavailable".to_string())
+    }
+
+    fn current_inputs() -> Result<(ChannelConfig, String), String> {
+        // Both imports in this export share one resolved canonical revision.
+        Ok((current_config()?, current_api_token()?))
     }
 
     struct MyChannel;
@@ -177,29 +236,17 @@ mod component {
             "my-platform".to_string()
         }
 
-        fn configure(config: String) -> Result<(), String> {
-            let parsed: serde_json::Value = serde_json::from_str(&config)
-                .map_err(|e| format!("invalid config JSON: {e}"))?;
-            let token = parsed["api_token"]
-                .as_str()
-                .ok_or("api_token is required")?
-                .to_string();
-            STATE.with(|s| {
-                *s.borrow_mut() = Some(State {
-                    api_token: token,
-                    default_recipient: parsed["default_recipient"]
-                        .as_str()
-                        .map(str::to_string),
-                });
-            });
-            Ok(())
+        fn configure() -> Result<(), String> {
+            let (config, api_token) = current_inputs()?;
+            validate_configuration(&config.api_base, &api_token)
         }
 
         fn send(message: SendMessage) -> Result<(), String> {
+            let (config, api_token) = current_inputs()?;
             // Outbound platform delivery via wasi:http
-            // (requires the http_client permission in the manifest).
-            // ...
-            Ok(())
+            // (requires the http_client permission in the manifest). Build the
+            // request from this call's values; never retain a second copy.
+            send_to_platform(&config.api_base, &api_token, message)
         }
 
         fn poll_message() -> Option<InboundMessage> {
@@ -212,7 +259,7 @@ mod component {
         }
 
         fn health_check() -> bool {
-            STATE.with(|s| s.borrow().is_some())
+            current_inputs().is_ok()
         }
 
         // Every other method: a stub returning the WIT-documented default.
@@ -224,9 +271,12 @@ mod component {
 }
 ```
 
-The `thread_local` + `RefCell` pattern is how a component holds state without
-`static mut`: wasm components are single-threaded, so this is safe and idiom
-for wit-bindgen guests.
+`current_inputs` is deliberately called at point of use. The host binds both
+imports to this admitted package, `channel` capability, and alias; reads in one
+export share one resolved config revision, while the next export can observe a
+same-binding public config plus credential rotation. `ChannelConfig` is a
+per-call typed view and is dropped with the token. Do not add a `thread_local`
+config or credential cache.
 
 ## Manifest and permissions
 
@@ -235,8 +285,196 @@ for wit-bindgen guests.
 For a channel: `capabilities` containing `channel`, and almost certainly both
 `config_read` (no platform works without credentials) and `http_client`. The
 channel adapter implements outbound `wasi:http`, but links it only after that
-grant is validated; without both pieces, `send` has no network path to the
-platform.
+grant is validated, and the grant alone still reaches nothing: the host owns
+the egress policy, which is deny-by-default. The operator must list the
+platform's API hosts under `plugins.entries.<key>.egress_hosts` for that
+channel instance before `send` has a network path; any destination outside
+that list is refused before a packet leaves, and a granted host that resolves
+to a loopback, private, or link-local address is refused too unless it is also
+listed under `egress_allow_private`. Declare the platform's API hosts in your
+manifest's `[egress]` table. When an operator binds an instance with
+`zeroclaw plugin bind <package> --channel-alias <alias> --egress declared`,
+that declaration is seeded into the new instance's `egress_hosts` and printed;
+`--egress none` binds it with no network reach instead. For a channel instance
+the declaration counts with any governed transport, `http_client`,
+`websocket_client`, or `socket_client`, so a channel that speaks only over a
+socket is seeded the same way. A host that is deployment configuration, such as
+a self-hosted server, is not yours to declare: say in your README that the
+operator grants it.
+
+Pair `config_read` with the schema consumed by `ChannelConfig`:
+
+```toml
+name = "my-platform"
+version = "0.1.0"
+wasm_path = "my_platform.wasm"
+capabilities = ["channel"]
+permissions = ["config_read", "http_client"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+required = ["api_base", "api_token"]
+
+[config_schema.properties.api_base]
+type = "string"
+minLength = 1
+
+[config_schema.properties.api_token]
+type = "string"
+minLength = 1
+x-secret = true
+```
+
+The host validates both properties as one object. `config.get` returns typed
+JSON containing `api_base` and omits `api_token`, which is available only through
+`secrets.get`. Because both are required, withholding `config_read` fails closed
+before guest code runs instead of starting a channel without required config.
+Each channel instance selects the `plugins.entries` key derived from its full
+package, `channel` capability, and binding identity while reusing this one
+package-owned schema. Identical aliases in different packages therefore remain
+isolated. The key exists once an operator binds an alias:
+`zeroclaw plugin bind` creates that instance's entry, and both it and
+`zeroclaw plugin info` list each of this schema's `required` keys as set or
+missing, with the `zeroclaw config set` command for a missing one. A secret
+key's command prompts for the value without echo, and no value is ever
+printed. The command is printed only for a property name in the portable key
+grammar (1 to 128 ASCII letters, digits, `_`, `-`, or `.`); any other name is
+reported with the config file row to edit instead, so keep required property
+names inside it. When the entry does not exist yet, as for a binding written
+by hand, `plugin info` prints the `plugin bind` command that creates it in
+place of the keys, once per egress decision when your manifest declares
+destinations, since `config set` resolves only an entry that exists.
+
+Call `config.get` and `secrets.get` inside each operation that uses them. The
+host resolves at most one canonical revision for that call and drops its view
+afterward. A public config plus credential rotation within the same logical
+binding is visible together on the next operation without daemon reload or
+channel reconstruction. Changing the bot/account identity, advertised
+capabilities, self-handle, mention, or other load-time metadata requires channel
+lifecycle reconstruction because those exports are read once during static
+discovery.
+
+For an optional schema whose empty object is valid, an instance denied the
+effective `config_read` grant can load, but `config.get` and `secrets.get` return
+`access-denied`. Either import returns `unavailable` during instantiation or
+static discovery, after resolver/validation failure, or when the shared host-call
+budget is exhausted. `secrets.get` additionally returns `not-found` for a name
+that is absent or not marked `x-secret = true`.
+
+## Activating a channel plugin
+
+An installed package does nothing until an operator binds it to a logical
+channel instance. The binding names the package and nothing else; the alias
+is the instance's identity. The operator path is `zeroclaw plugin bind`, which
+writes the binding, seeds the instance's config entry, and reports what the
+instance still needs before it can start:
+
+```bash
+zeroclaw plugin bind acme.chat --channel-alias operations --egress declared
+```
+
+`--egress declared` grants the destinations the manifest declares, and
+`--egress none` binds with no network reach. The flag matters only when the
+command creates the instance's config entry, and it is required then if the
+manifest declares destinations and the package holds a transport that can
+reach them (`http_client`, `websocket_client`, or `socket_client`).
+`zeroclaw plugin install <source> --channel-alias operations` runs the same
+ceremony during installation; there the flag governs only the channel
+instance's entry, and a tool entry of the same package is seeded as install
+always seeds it.
+[Binding a channel instance](./index.md#binding-a-channel-instance) describes
+it in full.
+
+In `config.toml`, an instance that is bound and routed to an agent looks like
+this:
+
+```toml
+[plugins]
+enabled = true
+
+[channels.plugin.operations]
+package = "acme.chat"
+enabled = true
+
+[agents.support]
+channels = ["plugin.operations"]
+```
+
+`plugin bind` writes only the `[channels.plugin.operations]` table and the
+instance's `[[plugins.entries]]` row. A new binding is written with `package`
+and the default `enabled = true`. Two steps stay explicit operator
+decisions that the command never makes: turning the plugin system on
+(`plugins.enabled`), and ownership, adding `plugin.operations` to an enabled
+agent's `channels` list (`agents.<agent>.channels`). The readiness report the
+command prints, which `zeroclaw plugin info` repeats, names the first
+precondition still unmet and, where one exists, the command that meets it.
+
+The alias becomes an ordinary channel reference, so `plugin.operations` is
+routed, supervised, restarted, and addressed exactly like `telegram.main`.
+Two aliases may name one package; each gets its own instance, its own store,
+and its own `plugins.entries` key, so they share no state.
+
+An instance is admitted only when all of the following hold. Each is a
+deliberate fail-closed gate, and a declaration that misses one is inert rather
+than half-started:
+
+- `plugins.enabled` is true.
+- The declaration's `enabled` is true.
+- The named package is installed and its manifest declares the `channel`
+  capability.
+- Some **enabled** agent lists `plugin.<alias>` in its `channels`. An
+  unreferenced binding would run a listener with nowhere to deliver.
+
+Admission happens before any guest code runs: it is decided from manifests the
+package host already verified, so a package whose component is corrupt is
+planned and rejected identically to one that is sound. A package that passes
+admission but then fails to construct is logged and skipped, so one broken
+plugin cannot stop the daemon from starting your other channels.
+
+`plugins.max_active_instances` caps how many logical instances are admitted
+across all capabilities. Explicit channel bindings rank ahead of
+auto-discovered tools and skills, so a full plugin directory cannot displace a
+channel the operator configured by hand.
+
+`zeroclaw plugin bind` and `zeroclaw plugin info` ask the activation plan for
+this verdict rather than restating its rules, so the first unmet gate they
+report, the ceiling included, is the one the daemon applies to the same config
+and installed packages. A ready verdict means the instance is admitted, not
+that its component loads; `plugin info` reports that separately with its load
+check.
+
+The same admitted set drives all three loaders: the channel loader, the tool
+registry, and the plugin-skill loader. The ceiling is therefore one shared
+budget rather than a per-capability one. A package that provides both a channel and a
+tool really does spend two slots, and a tool or skill over the ceiling is not
+constructed at all. Admission is a pure function of your current config and
+installed packages: it holds no counter, so the tool registries rebuilt per
+agent, per CLI run, per delegate, and per SOP execution each re-derive the same
+set instead of exhausting the ceiling over a long-running daemon's lifetime.
+
+Tool and skill instances are *auto-discovered*, so they are admitted only when
+`plugins.auto_discover` is true. Explicit `[channels.plugin.<alias>]`
+declarations do not need it. With `plugins.enabled = true` and
+`auto_discover = false`, you get exactly the channel bindings you declared and
+nothing else.
+
+> **Migrating from `plugins.max_plugins`.** The old key was never enforced and
+> has been replaced by `plugins.max_active_instances`. The two count different
+> things: the old key counted installed packages, the new one counts admitted
+> logical instances, so a package providing both a channel and a tool consumes
+> two. Because the units differ, an existing `max_plugins` value is **not**
+> carried over: it is ignored, and the new key takes its default. Set
+> `max_active_instances` explicitly if you relied on a non-default ceiling.
+
+### What is not wired yet
+
+Plugin channels are constructed asynchronously, after the synchronous
+channel-map surfaces have already been built. Channel-addressed *tools*
+therefore cannot target a plugin channel yet. Inbound polling and outbound
+delivery through the supervised listener are unaffected; only tool-side
+addressing is missing.
 
 ## Build and install
 
@@ -246,10 +484,11 @@ platform.
 
 ## Testing against the host contract
 
-The host adapter's unit tests in `wasm_channel.rs` are the executable
-specification: they cover the configure jail (a plugin without `config_read`
-receives `{}`, never another channel's secrets), the inbound queue handoff,
-capability-gated dispatch, and poll-health accounting.
+The host adapter and config resolver tests are the executable specification:
+they cover typed materialization and schema validation, point-of-use public and
+secret scope, coherent same-revision rotation, denied grants, static-discovery
+denial, the inbound queue handoff, capability-gated dispatch, and poll-health
+accounting.
 
 To run your own component under those exact semantics, write an integration
 test that instantiates it through the real host adapter. `zeroclaw-plugins`
@@ -262,9 +501,10 @@ cargo add --dev zeroclaw-plugins \
   --no-default-features --features plugins-wasm-cranelift
 ```
 
-The test then loads your built component through `WasmChannel::from_wasm`
-with a test config, enqueues onto the `InboundQueue` handle it exposes, and
-asserts your `poll-message` drains and translates the message. That is the
+The test then wraps a `PluginConfigResolver::new` backed by the manifest and
+test operator values in `PluginHostServices`, loads your component through
+`WasmChannel::from_wasm`, enqueues onto the `InboundQueue` handle it exposes,
+and asserts your `poll-message` drains and translates the message. That is the
 same code path a production daemon will run; passing it is the strongest
 pre-distribution signal you can get without a live host.
 

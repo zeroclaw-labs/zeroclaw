@@ -1,8 +1,5 @@
 //! Buttoned tool-approval surface for the Discord channel.
 
-use std::collections::HashMap;
-
-use tokio::sync::oneshot;
 use zeroclaw_api::channel::ChannelApprovalResponse;
 
 use super::components::{ButtonStyle, DiscordActionRow, action_row, button};
@@ -126,16 +123,6 @@ pub(crate) fn approval_button_binding(
     )
 }
 
-pub(crate) fn resolve_parked_approval(
-    map: &mut HashMap<String, oneshot::Sender<ChannelApprovalResponse>>,
-    token: &str,
-    decision: ApprovalDecision,
-) -> bool {
-    map.remove(token)
-        .map(|sender| sender.send(decision.response()).is_ok())
-        .unwrap_or(false)
-}
-
 /// Build the approval action row for `token`: Allow-once / Session / Always /
 /// Deny. Returns the row plus the `(custom_id, decision)` bindings the caller
 /// must register in `PendingComponents` before sending — registering is what
@@ -208,87 +195,5 @@ mod tests {
         assert!(decisions.contains(&ApprovalDecision::AllowAlways));
         assert!(decisions.contains(&ApprovalDecision::Deny));
         assert_eq!(decisions.len(), 4);
-    }
-
-    // ── oneshot resolution (the payoff) ──────────────────────────────────
-
-    #[tokio::test]
-    async fn resolves_the_oneshot_with_the_bound_decision() {
-        // Every decision delivers its mapped wire response to the parked rx.
-        for (decision, expected) in [
-            (
-                ApprovalDecision::AllowOnce,
-                ChannelApprovalResponse::Approve,
-            ),
-            (
-                ApprovalDecision::AllowSession,
-                ChannelApprovalResponse::AlwaysApprove,
-            ),
-            (
-                ApprovalDecision::AllowAlways,
-                ChannelApprovalResponse::AlwaysApprove,
-            ),
-            (ApprovalDecision::Deny, ChannelApprovalResponse::Deny),
-        ] {
-            let mut map = HashMap::new();
-            let (tx, rx) = oneshot::channel();
-            map.insert("tok".to_string(), tx);
-
-            assert!(
-                resolve_parked_approval(&mut map, "tok", decision),
-                "live oneshot resolves"
-            );
-            assert_eq!(rx.await.unwrap(), expected, "decision: {decision:?}");
-            assert!(map.is_empty(), "entry removed (single-use)");
-        }
-    }
-
-    #[tokio::test]
-    async fn replay_resolves_nothing_after_first_click() {
-        let mut map = HashMap::new();
-        let (tx, _rx) = oneshot::channel();
-        map.insert("tok".to_string(), tx);
-
-        assert!(resolve_parked_approval(
-            &mut map,
-            "tok",
-            ApprovalDecision::Deny
-        ));
-        // A second click on the same (now-drained) token resolves nothing — the
-        // approval layer is single-use even if a stale button is clicked.
-        assert!(
-            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce),
-            "replay refused"
-        );
-    }
-
-    #[tokio::test]
-    async fn forged_or_unknown_token_resolves_nothing() {
-        let mut map = HashMap::new();
-        let (tx, _rx) = oneshot::channel();
-        map.insert("real".to_string(), tx);
-        // A token we never parked (forged, or for another approval) resolves
-        // nothing and leaves the real entry untouched.
-        assert!(!resolve_parked_approval(
-            &mut map,
-            "forged",
-            ApprovalDecision::AllowOnce
-        ));
-        assert!(map.contains_key("real"), "the real entry is not drained");
-    }
-
-    #[tokio::test]
-    async fn timed_out_receiver_reports_not_resolved() {
-        // request_approval drops the rx on timeout and removes the entry. If a
-        // late click somehow still held a sender, send() fails (receiver gone)
-        // → reported as not resolved, matching the deny-by-default outcome.
-        let mut map = HashMap::new();
-        let (tx, rx) = oneshot::channel();
-        map.insert("tok".to_string(), tx);
-        drop(rx); // receiver gone, as after a timeout
-        assert!(
-            !resolve_parked_approval(&mut map, "tok", ApprovalDecision::AllowOnce),
-            "send to a dropped receiver is not a successful resolve"
-        );
     }
 }

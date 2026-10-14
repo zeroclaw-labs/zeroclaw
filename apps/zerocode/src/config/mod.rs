@@ -1,17 +1,17 @@
 //! Local zerocode client configuration: theme and keybindings.
 //! Always read from the local `<config_dir>/zerocode-config.toml`, independent
 //! of the connection target. Layering: defaults -> file -> `ZEROCODE_*` env.
-#![allow(dead_code)]
 
 pub mod keybindings;
 
 use std::collections::HashMap;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::keymap::{Chord, GlobalAction, overrides::OverrideTable};
+use crate::keymap::{ChatTabAction, Chord, GlobalAction, overrides::OverrideTable};
 use crate::theme::{self, Theme};
 
 const FILE_NAME: &str = "zerocode-config.toml";
@@ -43,6 +43,68 @@ impl ChordSpec {
     }
 }
 
+fn migrate_legacy_ctrl_bindings(value: &mut toml::Value) -> bool {
+    let Some(rows) = value.as_table_mut() else {
+        return false;
+    };
+    let mut migrated = false;
+    for (_, value) in rows.iter_mut() {
+        migrated |= migrate_legacy_ctrl_value(value);
+    }
+    migrated
+}
+
+fn migrate_legacy_ctrl_value(value: &mut toml::Value) -> bool {
+    match value {
+        toml::Value::String(wire) => migrate_legacy_ctrl_wire(wire),
+        toml::Value::Array(values) => {
+            let mut migrated = false;
+            for value in values {
+                migrated |= migrate_legacy_ctrl_value(value);
+            }
+            migrated
+        }
+        _ => false,
+    }
+}
+
+fn migrate_legacy_ctrl_wire(wire: &mut String) -> bool {
+    let segments: Vec<&str> = wire.trim().split('+').collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    let Some(key) = segments.last() else {
+        return false;
+    };
+    let replacement = if matches!(
+        key.to_ascii_lowercase().as_str(),
+        "c" | "g" | "k" | "n" | "s" | "f1"
+    ) {
+        "control"
+    } else {
+        "primary"
+    };
+    let mut found_legacy = false;
+    let migrated = segments
+        .iter()
+        .map(|segment| {
+            if segment.eq_ignore_ascii_case("ctrl") {
+                found_legacy = true;
+                replacement
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    if found_legacy && migrated != wire.trim() {
+        *wire = migrated;
+        true
+    } else {
+        false
+    }
+}
+
 fn migrate_legacy_help_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -60,6 +122,39 @@ fn migrate_legacy_help_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
     }
 
     rows.insert(key, ChordSpec::Many(GlobalAction::Help.default_chords()));
+    true
+}
+
+fn migrate_legacy_copy_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
+    let key = ChatTabAction::CopySelection.action_key();
+    let Some(ChordSpec::Many(chords)) = rows.get(&key) else {
+        return false;
+    };
+    if chords.as_slice() != [Chord::char('y')] {
+        return false;
+    }
+
+    rows.insert(
+        key,
+        ChordSpec::Many(ChatTabAction::CopySelection.default_chords()),
+    );
+    true
+}
+
+fn migrate_legacy_chat_jump_binding(
+    rows: &mut HashMap<String, ChordSpec>,
+    action: ChatTabAction,
+    legacy: Chord,
+) -> bool {
+    let key = action.action_key();
+    let Some(ChordSpec::Many(chords)) = rows.get(&key) else {
+        return false;
+    };
+    if chords.as_slice() != std::slice::from_ref(&legacy) {
+        return false;
+    }
+
+    rows.insert(key, ChordSpec::Many(action.default_chords()));
     true
 }
 
@@ -104,17 +199,91 @@ impl ConnectionSection {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Hand-written so `auth_token` cannot reach a log, a panic message or a
+/// diagnostic dump. Every other field is ordinary connection metadata and is
+/// printed as usual.
+impl std::fmt::Debug for WssSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WssSection")
+            .field("uri", &self.uri)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("auth_token_file", &self.auth_token_file)
+            .field("auth_provider", &self.auth_provider)
+            .field("tls", &self.tls)
+            .field("relay_url", &self.relay_url)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct WssSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// Bearer presented as `auth_token` in the initialize handshake (a
+    /// gateway pairing token, or an OIDC access token together with
+    /// `auth_provider`). Remote daemons require it since the RFC 7141
+    /// enforcement boundary. The `ZEROCLAW_AUTH_TOKEN` environment
+    /// variable overrides this value, so the token can stay out of the
+    /// config file entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Path to a file holding the bearer, as an alternative to writing it
+    /// into this file. The file must be readable by its owner only; a
+    /// group- or world-readable one is refused rather than used. Takes
+    /// precedence over `auth_token` and yields to `ZEROCLAW_AUTH_TOKEN`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_file: Option<String>,
+    /// Provider selection for `auth_token` (e.g. `oidc.corp`). Defaults
+    /// to the daemon's `native` pairing provider when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<String>,
+    /// Gateway HTTP origin for interactive OIDC enrollment (e.g.
+    /// `https://gateway.example.com:9090`). Used only when
+    /// `auth_provider` names an `oidc.<alias>` provider and no
+    /// `auth_token` is available: zerocode then runs the device grant
+    /// through the gateway's enrollment API before connecting. The
+    /// token is held for the session only, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_url: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
+    /// Reach the daemon through a nominated relay at this `host:port` instead of
+    /// connecting to `uri` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Node-id of the target daemon to request from the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_node: Option<String>,
+    /// How many times to try the direct address before falling back to the relay
+    /// (default 2). Only relevant when both a direct address and a relay exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_attempts: Option<u32>,
+    /// Per-attempt timeout, in seconds, for a direct connect before falling back
+    /// to the relay (default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_timeout_secs: Option<u64>,
+    /// While connected through the relay, how often (seconds) to re-probe the
+    /// direct address and migrate back when it returns (default 30; 0 disables).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_secs: Option<u64>,
 }
 
 impl WssSection {
     fn is_empty(&self) -> bool {
-        self.uri.is_none() && self.tls.is_empty()
+        self.uri.is_none()
+            && self.tls.is_empty()
+            && self.relay_url.is_none()
+            && self.relay_node.is_none()
+            && self.direct_attempts.is_none()
+            && self.direct_timeout_secs.is_none()
+            && self.reprobe_secs.is_none()
+            && self.auth_token.is_none()
+            && self.auth_token_file.is_none()
+            && self.auth_provider.is_none()
+            && self.enroll_url.is_none()
     }
 }
 
@@ -124,6 +293,16 @@ pub(crate) struct WssTlsSection {
     pub skip_verify: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip_verify_routes: Vec<String>,
+    /// PEM CA certificate used to verify the daemon (mutual TLS). When set, the
+    /// server certificate is verified against this CA instead of the system roots.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ca_cert_path: String,
+    /// PEM client certificate presented to the daemon (mutual TLS).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_cert_path: String,
+    /// PEM client private key for `client_cert_path`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_key_path: String,
 }
 
 impl WssTlsSection {
@@ -132,12 +311,211 @@ impl WssTlsSection {
     }
 
     fn is_empty(&self) -> bool {
-        !self.skip_verify && self.skip_verify_routes.is_empty()
+        !self.skip_verify
+            && self.skip_verify_routes.is_empty()
+            && self.ca_cert_path.is_empty()
+            && self.client_cert_path.is_empty()
+            && self.client_key_path.is_empty()
     }
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Shared shell dock sizing bounds.
+pub(crate) const SIDEBAR_WIDTH_MIN: u16 = 18;
+pub(crate) const SIDEBAR_WIDTH_MAX: u16 = 40;
+pub(crate) const SIDEBAR_SESSIONS_PERCENT_MIN: u16 = 20;
+pub(crate) const SIDEBAR_SESSIONS_PERCENT_MAX: u16 = 80;
+pub(crate) const SIDEBAR_QUEUE_PERCENT_MIN: u16 = 1;
+pub(crate) const SIDEBAR_QUEUE_PERCENT_MAX: u16 = 99;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SidebarSide {
+    Left,
+    Right,
+}
+
+impl SidebarSide {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+
+    pub(crate) fn opposite(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SidebarSection {
+    /// Whether the Sessions dock section is shown. Toggled at runtime and persisted.
+    #[serde(default = "default_sidebar_visible")]
+    pub visible: bool,
+    /// Dock section preferences only; Plan content and lifecycle stay pane-owned.
+    #[serde(default = "default_true")]
+    pub queue_visible: bool,
+    #[serde(default = "default_true")]
+    pub plan_visible: bool,
+    /// Dock width in terminal columns, clamped at the shell boundary.
+    #[serde(default = "default_sidebar_width")]
+    pub width: u16,
+    /// Explicit dock side. `None` preserves the legacy Todo location
+    /// migration until the user switches the dock explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<SidebarSide>,
+    /// Percentage of the dock body allocated to Sessions when Plan is also
+    /// visible. Clamped at the shell boundary.
+    #[serde(default = "default_sidebar_sessions_percent")]
+    pub sessions_percent: u16,
+    /// Percentage of the lower dock region allocated to Queue while Plan is
+    /// visible. Clamped at the shell boundary.
+    #[serde(default = "default_sidebar_queue_percent")]
+    pub queue_percent: u16,
+}
+
+impl Default for SidebarSection {
+    fn default() -> Self {
+        Self {
+            visible: default_sidebar_visible(),
+            queue_visible: true,
+            plan_visible: true,
+            width: default_sidebar_width(),
+            side: None,
+            sessions_percent: default_sidebar_sessions_percent(),
+            queue_percent: default_sidebar_queue_percent(),
+        }
+    }
+}
+
+// ── Todo tracker ──────────────────────────────────────────────────────────────
+
+/// Where the todo tracker renders inside the Code pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TodoTrackerLocation {
+    Bottom,
+    Left,
+    #[default]
+    Right,
+}
+
+/// The `[todotracker]` section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TodoTrackerSection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub enabled_at_start: bool,
+    #[serde(default)]
+    pub location: TodoTrackerLocation,
+    #[serde(default = "default_todotracker_width")]
+    pub width: u16,
+    #[serde(default = "default_todotracker_max_height")]
+    pub max_height: u16,
+}
+
+impl Default for TodoTrackerSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_at_start: false,
+            location: TodoTrackerLocation::Right,
+            width: default_todotracker_width(),
+            max_height: default_todotracker_max_height(),
+        }
+    }
+}
+
+fn default_sidebar_visible() -> bool {
+    true
+}
+
+fn default_sidebar_width() -> u16 {
+    24
+}
+
+fn default_sidebar_sessions_percent() -> u16 {
+    60
+}
+
+fn default_sidebar_queue_percent() -> u16 {
+    50
+}
+
+impl TodoTrackerSection {
+    /// Legacy dimensions remain readable for compatibility, but the shell's
+    /// sidebar settings now own geometry. They cannot invalidate Plan toggles.
+    pub(crate) fn resolve(&self) -> TodoTrackerSettings {
+        TodoTrackerSettings {
+            enabled: self.enabled,
+            enabled_at_start: self.enabled_at_start,
+            location: match self.location {
+                TodoTrackerLocation::Bottom => TodoLocation::Bottom,
+                TodoTrackerLocation::Left => TodoLocation::Left,
+                TodoTrackerLocation::Right => TodoLocation::Right,
+            },
+            width: self.width.max(1),
+            max_height: self.max_height.max(1),
+        }
+    }
+}
+
+/// Where the todo tracker renders, as consumed by the
+/// [`TodoTracker`](crate::todo_tracker::TodoTracker) widget. This is the
+/// runtime mirror of [`TodoTrackerLocation`] (the serde section enum);
+/// keeping them distinct lets the widget stay independent of the on-disk
+/// serialization shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TodoLocation {
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Runtime `[todotracker]` settings, resolved from the config section by
+/// [`ZerocodeConfig::resolve_todo_tracker`]. Values are validated at that
+/// boundary, so downstream consumers can trust them as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TodoTrackerSettings {
+    pub enabled: bool,
+    pub enabled_at_start: bool,
+    pub location: TodoLocation,
+    pub width: u16,
+    pub max_height: u16,
+}
+
+impl Default for TodoTrackerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enabled_at_start: false,
+            location: TodoLocation::Right,
+            width: default_todotracker_width(),
+            max_height: default_todotracker_max_height(),
+        }
+    }
+}
+
+// ── Default helpers ───────────────────────────────────────────────────────────
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_todotracker_width() -> u16 {
+    32
+}
+
+fn default_todotracker_max_height() -> u16 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,10 +526,14 @@ pub(crate) struct ZerocodeConfig {
     pub theme: ThemeSection,
     #[serde(default, skip_serializing_if = "ConnectionSection::is_empty")]
     pub connection: ConnectionSection,
+    #[serde(default)]
+    pub sidebar: SidebarSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
     keybindings: HashMap<String, ChordSpec>,
+    #[serde(default)]
+    pub todotracker: TodoTrackerSection,
 }
 
 impl Default for ZerocodeConfig {
@@ -160,7 +542,9 @@ impl Default for ZerocodeConfig {
             locale: default_locale(),
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
+            sidebar: SidebarSection::default(),
             keybindings: HashMap::new(),
+            todotracker: TodoTrackerSection::default(),
         }
     }
 }
@@ -234,22 +618,138 @@ impl ZerocodeConfig {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
     }
+
+    /// Effective dock side, with the legacy Todo location providing the
+    /// read-only migration fallback until the user explicitly switches side.
+    pub(crate) fn effective_sidebar_side(&self) -> SidebarSide {
+        self.sidebar
+            .side
+            .unwrap_or(match self.todotracker.location {
+                TodoTrackerLocation::Left => SidebarSide::Left,
+                TodoTrackerLocation::Right | TodoTrackerLocation::Bottom => SidebarSide::Right,
+            })
+    }
+
+    pub(crate) fn effective_sidebar_width(&self) -> u16 {
+        self.sidebar
+            .width
+            .clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX)
+    }
+
+    pub(crate) fn effective_sidebar_sessions_percent(&self) -> u16 {
+        self.sidebar
+            .sessions_percent
+            .clamp(SIDEBAR_SESSIONS_PERCENT_MIN, SIDEBAR_SESSIONS_PERCENT_MAX)
+    }
+
+    pub(crate) fn effective_sidebar_queue_percent(&self) -> u16 {
+        self.sidebar
+            .queue_percent
+            .clamp(SIDEBAR_QUEUE_PERCENT_MIN, SIDEBAR_QUEUE_PERCENT_MAX)
+    }
+
+    /// Convert the `[todotracker]` section into the runtime settings type
+    /// used by [`TodoTracker`](crate::todo_tracker::TodoTracker).
+    pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
+        self.todotracker.resolve()
+    }
 }
 
 pub(crate) fn config_path(config_dir: &Path) -> PathBuf {
     config_dir.join(FILE_NAME)
 }
 
+/// The effective config: on-disk values with `ZEROCODE_*` env overrides
+/// applied on top. This is what runtime consumers (sessions, rendering) read.
+///
+/// Env overrides are process-transient and must never be written back to disk,
+/// so anything that *edits and saves* config must use [`load_persisted`]
+/// instead — otherwise saving one field would bake an env-injected value for
+/// an unrelated field into `zerocode-config.toml`.
 pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
+    let mut config = load_persisted(config_dir)?;
+    apply_env_overrides(&mut config)?;
+    Ok(config)
+}
+
+/// Resolve the effective `[todotracker]` settings for a session boundary,
+/// treating a **present-but-malformed** `[todotracker]` section as an error
+/// rather than silently falling back to defaults.
+///
+/// [`load_persisted`] deliberately tolerates a malformed section (so one bad
+/// block cannot blank unrelated config), which means a botched manual edit
+/// would otherwise resolve to defaults and silently reset a user's live
+/// tracker on restart/switch. This variant re-parses that one section strictly
+/// so the caller can preserve the current settings on failure; a *valid* or
+/// *absent* section resolves exactly as `ensure_and_load` would, with
+/// `ZEROCODE_todotracker__*` overrides applied.
+///
+/// Legacy numeric dimensions no longer control the dock and do not reject
+/// otherwise valid settings. Malformed fields and overrides still fail.
+pub(crate) fn resolve_todo_tracker_checked(config_dir: &Path) -> Result<TodoTrackerSettings> {
+    let path = config_path(config_dir);
+    if path.exists() {
+        let doc = load_document(&path)?;
+        if let Some(v) = doc.get("todotracker") {
+            // Strict parse: a malformed section is an error here, unlike the
+            // tolerant `load_persisted` path.
+            v.clone()
+                .try_into::<TodoTrackerSection>()
+                .with_context(|| format!("[todotracker] in {} is malformed", path.display()))?;
+        }
+    }
+    let config = ensure_and_load(config_dir)?;
+    Ok(config.resolve_todo_tracker())
+}
+
+/// The persisted `[todotracker]` section, parsed **strictly**.
+///
+/// [`load_persisted`] tolerates a malformed section by substituting defaults so
+/// one bad block cannot blank unrelated config. That is right for rendering,
+/// but wrong for an *editor*: editing a phantom default and saving it would
+/// overwrite the user's unparseable canonical text — the very text they need in
+/// order to repair it, on the supported manual-upgrade path. The Config pane
+/// uses this instead so it can refuse edits and surface the error.
+///
+/// `Ok(None)` means the section is absent (a fresh file), which is editable
+/// from defaults; `Err` means present-but-malformed.
+pub(crate) fn load_persisted_todotracker_strict(
+    config_dir: &Path,
+) -> Result<Option<TodoTrackerSection>> {
+    let path = config_path(config_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let doc = load_document(&path)?;
+    let Some(v) = doc.get("todotracker") else {
+        return Ok(None);
+    };
+    v.clone()
+        .try_into::<TodoTrackerSection>()
+        .map(Some)
+        .with_context(|| format!("[todotracker] in {} is malformed", path.display()))
+}
+
+/// The on-disk config exactly as persisted, with **no** env overrides applied.
+/// This is the correct base for read-modify-write edits (the Config pane), so
+/// a transient `ZEROCODE_*` value can never leak into the saved file.
+pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
     std::fs::create_dir_all(config_dir)
         .with_context(|| format!("creating config dir {}", config_dir.display()))?;
 
     let path = config_path(config_dir);
     if !path.exists() {
+        // Another writer may save a real config between the check above and
+        // this write, so the default is only ever created, never swapped in
+        // over a file that appeared meanwhile.
         let default = ZerocodeConfig::default();
         let body = toml::to_string_pretty(&default).context("serializing default config")?;
-        std::fs::write(&path, body)
+        crate::secure_file::create_private_if_absent(&path, body.as_bytes())
             .with_context(|| format!("writing default {}", path.display()))?;
+    } else {
+        // An existing file may predate the owner-only rule, and reading it
+        // does not go through the write funnel.
+        crate::secure_file::restrict_to_owner(&path, config_dir)?;
     }
 
     let mut doc = load_document(&path)?;
@@ -279,8 +779,30 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
             ),
         }
     }
+    if let Some(v) = doc.get("sidebar") {
+        match v.clone().try_into::<SidebarSection>() {
+            Ok(section) => config.sidebar = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [sidebar] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
     if let Some(v) = doc.get("keybindings") {
-        match v.clone().try_into::<HashMap<String, ChordSpec>>() {
+        let mut migrated_value = v.clone();
+        let migrated_legacy = migrate_legacy_ctrl_bindings(&mut migrated_value);
+        if migrated_legacy {
+            // Rewrite legacy spellings before parsing the rows. A malformed,
+            // unrelated row must not leave otherwise valid legacy values in
+            // the file indefinitely; the tolerant loader still falls back to
+            // defaults for the malformed section below.
+            doc.insert("keybindings".to_string(), migrated_value.clone());
+            migrated_keybindings = true;
+        }
+        match migrated_value
+            .clone()
+            .try_into::<HashMap<String, ChordSpec>>()
+        {
             Ok(mut rows) => {
                 if migrate_legacy_help_binding(&mut rows) {
                     let key = GlobalAction::Help.action_key();
@@ -296,10 +818,49 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
                         .insert(key, value);
                     migrated_keybindings = true;
                 }
+                if migrate_legacy_copy_binding(&mut rows) {
+                    let key = ChatTabAction::CopySelection.action_key();
+                    let value = toml::Value::try_from(ChordSpec::Many(
+                        ChatTabAction::CopySelection.default_chords(),
+                    ))
+                    .context("serializing migrated Copy binding")?;
+                    let bindings = doc
+                        .get_mut("keybindings")
+                        .and_then(toml::Value::as_table_mut)
+                        .context("accessing parsed keybindings table")?;
+                    bindings.insert(key, value);
+                    migrated_keybindings = true;
+                }
+                for (action, legacy) in [
+                    (ChatTabAction::JumpStart, Chord::char('g')),
+                    (ChatTabAction::JumpEnd, Chord::char('G')),
+                ] {
+                    if !migrate_legacy_chat_jump_binding(&mut rows, action, legacy) {
+                        continue;
+                    }
+                    let key = action.action_key();
+                    let value = toml::Value::try_from(ChordSpec::Many(action.default_chords()))
+                        .context("serializing migrated chat jump binding")?;
+                    let bindings = doc
+                        .get_mut("keybindings")
+                        .and_then(toml::Value::as_table_mut)
+                        .context("accessing parsed keybindings table")?;
+                    bindings.insert(key, value);
+                    migrated_keybindings = true;
+                }
                 config.keybindings = rows;
             }
             Err(e) => eprintln!(
                 "zerocode: ignoring [keybindings] in {} ({e}); using defaults",
+                path.display()
+            ),
+        }
+    }
+    if let Some(v) = doc.get("todotracker") {
+        match v.clone().try_into::<TodoTrackerSection>() {
+            Ok(section) => config.todotracker = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [todotracker] in {} ({e}); using default",
                 path.display()
             ),
         }
@@ -309,15 +870,23 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
         write_document(&path, &doc)?;
     }
 
-    apply_env_overrides(&mut config)?;
     Ok(config)
 }
 
 /// Load the on-disk file as a raw `toml::Table`. A missing or empty file
 /// yields an empty table; any other section the running struct does not
 /// model is carried through untouched so a partial write never clobbers it.
+///
+/// Any other read failure is an error, not an empty table: every persist
+/// rebuilds the whole file from this document and publishes it by rename, so
+/// treating an unreadable file as empty would replace the user's config,
+/// its `[connection.wss]` bearer included, with whatever is being saved.
 fn load_document(path: &Path) -> Result<toml::Table> {
-    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     if raw.trim().is_empty() {
         return Ok(toml::Table::new());
     }
@@ -325,9 +894,39 @@ fn load_document(path: &Path) -> Result<toml::Table> {
 }
 
 /// Serialize a mutated document table back to disk.
+///
+/// The configuration file carries a hand-written `[connection.wss]
+/// auth_token` whenever the operator uses the persistent path instead of
+/// `ZEROCLAW_AUTH_TOKEN`, and every persist here rewrites the whole file. So
+/// this is the one funnel that decides the file's mode, and it writes
+/// owner-only and atomically: a partial rewrite cannot lose a token that was
+/// already there, and a file that predates this is repaired rather than left
+/// world-readable.
 fn write_document(path: &Path, doc: &toml::Table) -> Result<()> {
     let body = toml::to_string_pretty(doc).context("serializing config")?;
-    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))
+    crate::secure_file::write_private_atomic(path, body.as_bytes())
+}
+
+fn write_document_atomically(path: &Path, body: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".zerocode-config-")
+        .tempfile_in(parent)
+        .with_context(|| format!("creating temporary config beside {}", path.display()))?;
+    temporary
+        .write_all(body.as_bytes())
+        .with_context(|| format!("writing temporary config beside {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("flushing temporary config beside {}", path.display()))?;
+    temporary.persist(path).map_err(|error| {
+        anyhow::Error::msg(format!("replacing {}: {}", path.display(), error.error))
+    })?;
+    Ok(())
 }
 
 /// Mutable borrow of `key`'s sub-table, inserting an empty one when absent.
@@ -336,6 +935,166 @@ fn section_mut<'a>(doc: &'a mut toml::Table, key: &str) -> Result<&'a mut toml::
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .ok_or_else(|| anyhow::Error::msg(format!("'{key}' is not a table")))
+}
+
+/// Persist one sidebar leaf without rewriting unrelated TOML formatting.
+/// Returns whether a valid environment override will shadow the saved value on
+/// the next effective load.
+fn persist_sidebar_leaf(
+    config_dir: &Path,
+    leaf: &str,
+    replacement: toml_edit::Item,
+    shadowed: bool,
+) -> Result<bool> {
+    std::fs::create_dir_all(config_dir)
+        .with_context(|| format!("creating config dir {}", config_dir.display()))?;
+    let path = config_path(config_dir);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let semantic: toml::Table = if raw.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?
+    };
+    if let Some(value) = semantic.get("sidebar") {
+        value
+            .clone()
+            .try_into::<SidebarSection>()
+            .with_context(|| {
+                format!(
+                    "refusing to update {leaf} in malformed [sidebar] section in {}",
+                    path.display()
+                )
+            })?;
+    }
+
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parsing {} for an in-place edit", path.display()))?;
+    let sidebar = doc
+        .entry("sidebar")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let sidebar = sidebar.as_table_like_mut().ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "refusing to update non-table [sidebar] in {}",
+            path.display()
+        ))
+    })?;
+    let mut replacement = replacement;
+    if let Some(existing) = sidebar.get_mut(leaf) {
+        if let (Some(existing), Some(replacement)) =
+            (existing.as_value(), replacement.as_value_mut())
+        {
+            *replacement.decor_mut() = existing.decor().clone();
+        }
+        *existing = replacement;
+    } else {
+        sidebar.insert(leaf, replacement);
+    }
+    write_document_atomically(&path, &doc.to_string())?;
+    Ok(shadowed)
+}
+
+/// Persist the sidebar visibility toggle, writing only `[sidebar].visible`.
+pub(crate) fn persist_sidebar_visible(config_dir: &Path, visible: bool) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__visible")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .is_some_and(|effective| effective != visible);
+    persist_sidebar_leaf(config_dir, "visible", toml_edit::value(visible), shadowed)
+}
+
+pub(crate) fn persist_sidebar_side(config_dir: &Path, side: SidebarSide) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__side")
+        .ok()
+        .and_then(|value| match value.as_str() {
+            "left" => Some(SidebarSide::Left),
+            "right" => Some(SidebarSide::Right),
+            _ => None,
+        })
+        .is_some_and(|effective| effective != side);
+    persist_sidebar_leaf(
+        config_dir,
+        "side",
+        toml_edit::value(side.as_str()),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_queue_visible(config_dir: &Path, visible: bool) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__queue_visible")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .is_some_and(|effective| effective != visible);
+    persist_sidebar_leaf(
+        config_dir,
+        "queue_visible",
+        toml_edit::value(visible),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_plan_visible(config_dir: &Path, visible: bool) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__plan_visible")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .is_some_and(|effective| effective != visible);
+    persist_sidebar_leaf(
+        config_dir,
+        "plan_visible",
+        toml_edit::value(visible),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_width(config_dir: &Path, width: u16) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__width")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|value| value.clamp(SIDEBAR_WIDTH_MIN, SIDEBAR_WIDTH_MAX))
+        .is_some_and(|effective| effective != width);
+    persist_sidebar_leaf(
+        config_dir,
+        "width",
+        toml_edit::value(i64::from(width)),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_sessions_percent(
+    config_dir: &Path,
+    sessions_percent: u16,
+) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__sessions_percent")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|value| value.clamp(SIDEBAR_SESSIONS_PERCENT_MIN, SIDEBAR_SESSIONS_PERCENT_MAX))
+        .is_some_and(|effective| effective != sessions_percent);
+    persist_sidebar_leaf(
+        config_dir,
+        "sessions_percent",
+        toml_edit::value(i64::from(sessions_percent)),
+        shadowed,
+    )
+}
+
+pub(crate) fn persist_sidebar_queue_percent(config_dir: &Path, queue_percent: u16) -> Result<bool> {
+    let shadowed = std::env::var("ZEROCODE_sidebar__queue_percent")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .map(|value| value.clamp(SIDEBAR_QUEUE_PERCENT_MIN, SIDEBAR_QUEUE_PERCENT_MAX))
+        .is_some_and(|effective| effective != queue_percent);
+    persist_sidebar_leaf(
+        config_dir,
+        "queue_percent",
+        toml_edit::value(i64::from(queue_percent)),
+        shadowed,
+    )
 }
 
 /// Persist the selected theme name, editing only the `[theme]` section.
@@ -406,6 +1165,35 @@ pub(crate) fn persist_wss_route_ack(config_dir: &Path, uri: &str) -> Result<()> 
     if !already {
         routes.push(toml::Value::String(uri.to_string()));
     }
+    write_document(&path, &doc)
+}
+
+/// Persist the entire `[todotracker]` section, editing only that section.
+/// Other sections (theme, keybindings, connection, etc.) are preserved.
+///
+/// This is the owning read-modify-write boundary. Refuse to replace a current
+/// section that is unparseable, even if the caller's older snapshot
+/// and proposed section are valid.
+pub(crate) fn persist_todotracker(config_dir: &Path, section: &TodoTrackerSection) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    if let Some(value) = doc.get("todotracker") {
+        value
+            .clone()
+            .try_into::<TodoTrackerSection>()
+            .with_context(|| {
+                format!(
+                    "refusing to overwrite the malformed [todotracker] section in {}",
+                    path.display()
+                )
+            })?;
+    }
+    let serialized = toml::Value::try_from(section)
+        .context("serializing todotracker section")?
+        .as_table()
+        .cloned()
+        .unwrap_or_default();
+    doc.insert("todotracker".to_string(), toml::Value::Table(serialized));
     write_document(&path, &doc)
 }
 
@@ -481,6 +1269,11 @@ fn flatten_table(table: &OverrideTable) -> HashMap<String, ChordSpec> {
 
 /// Apply every `ZEROCODE_<dotted__path>=value` env var. Hard-errors on any var
 /// that does not resolve to a known config path.
+///
+/// Canonical spelling: the `ZEROCODE_` prefix followed by the lowercase dotted
+/// config path with `.` written as `__` — e.g. `ZEROCODE_todotracker__enabled=false`
+/// sets `todotracker.enabled`. This mirrors the daemon's `ZEROCLAW_<path>` form.
+/// Overrides are process-transient and are never written back to disk.
 fn apply_env_overrides(config: &mut ZerocodeConfig) -> Result<()> {
     let mut entries: Vec<(String, String, String)> = std::env::vars()
         .filter_map(|(k, v)| {
@@ -502,6 +1295,9 @@ fn apply_env_overrides(config: &mut ZerocodeConfig) -> Result<()> {
 
 /// Set a leaf at a dotted `path` via a serde roundtrip through `toml::Value`.
 /// No field names are hardcoded: the struct's serialized shape is the registry.
+/// The string value is parsed into the correct TOML type by inspecting the
+/// existing field value (string → string, bool → bool, integer → integer,
+/// etc.).
 fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
     target: &mut T,
     path: &str,
@@ -525,10 +1321,54 @@ fn set_prop<T: Serialize + serde::de::DeserializeOwned>(
     let table = cursor.as_table_mut().ok_or_else(|| {
         anyhow::Error::msg(format!("path '{path}' did not resolve to a config field"))
     })?;
+    // Optional side is absent from the serialized shape until explicitly set.
+    if *leaf == "side"
+        && parents.len() == 1
+        && parents[0] == "sidebar"
+        && !table.contains_key(*leaf)
+    {
+        table.insert((*leaf).to_string(), toml::Value::String(value.to_string()));
+    }
     if !table.contains_key(*leaf) {
         anyhow::bail!("path '{path}' did not resolve to a config field");
     }
-    table.insert((*leaf).to_string(), toml::Value::String(value.to_string()));
+
+    // Parse the string into the correct TOML type by inspecting the existing
+    // field value. This lets env overrides like `ZEROCODE_todotracker__enabled=false`
+    // set a boolean without the caller knowing the field type.
+    let existing = table[*leaf].clone();
+    let new_value = match existing {
+        toml::Value::String(_) => toml::Value::String(value.to_string()),
+        toml::Value::Boolean(_) => toml::Value::Boolean(
+            value
+                .parse()
+                .with_context(|| format!("failed to parse '{value}' as bool for {path}"))?,
+        ),
+        toml::Value::Integer(_) => toml::Value::Integer(
+            value
+                .parse()
+                .with_context(|| format!("failed to parse '{value}' as integer for {path}"))?,
+        ),
+        toml::Value::Float(_) => toml::Value::Float(
+            value
+                .parse()
+                .with_context(|| format!("failed to parse '{value}' as float for {path}"))?,
+        ),
+        toml::Value::Array(_) => {
+            let parsed: Vec<toml::Value> = toml::from_str(value)
+                .with_context(|| format!("failed to parse '{value}' as array for {path}"))?;
+            toml::Value::Array(parsed)
+        }
+        toml::Value::Datetime(_) => toml::Value::Datetime(
+            value
+                .parse()
+                .with_context(|| format!("failed to parse '{value}' as datetime for {path}"))?,
+        ),
+        toml::Value::Table(_) => {
+            anyhow::bail!("cannot set a table field via set_prop: {path}")
+        }
+    };
+    table.insert((*leaf).to_string(), new_value);
 
     *target = root
         .try_into()
@@ -695,6 +1535,9 @@ mod tests {
 
     #[test]
     fn persist_agent_theme_round_trips_through_resolver() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         persist_agent_theme(dir.path(), "coder", "dracula").unwrap();
         let cfg = ensure_and_load(dir.path()).unwrap();
@@ -704,6 +1547,9 @@ mod tests {
 
     #[test]
     fn persist_agent_theme_clear_removes_entry() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         persist_agent_theme(dir.path(), "a", "dracula").unwrap();
         persist_agent_theme(dir.path(), "b", "nord_dark").unwrap();
@@ -727,6 +1573,9 @@ mod tests {
 
     #[test]
     fn persist_agent_theme_clear_is_noop_when_absent() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "[theme]\nname = \"nord_dark\"\n");
         persist_agent_theme_clear(dir.path(), "ghost").unwrap();
@@ -755,6 +1604,24 @@ mod tests {
 
     fn read(dir: &Path) -> String {
         std::fs::read_to_string(config_path(dir)).unwrap()
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_read_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not valid UTF-8, so the read fails for a reason other than absence.
+        let bytes: &[u8] = b"[connection.wss]\nauth_token = \"keep-me\"\n\xff\xfe\n";
+        std::fs::write(config_path(dir.path()), bytes).unwrap();
+
+        assert!(
+            persist_theme(dir.path(), "gruvbox").is_err(),
+            "a persist must not treat an unreadable config as empty"
+        );
+        assert_eq!(
+            std::fs::read(config_path(dir.path())).unwrap(),
+            bytes,
+            "the unreadable config must be left as it was"
+        );
     }
 
     #[test]
@@ -795,6 +1662,25 @@ mod tests {
     }
 
     #[test]
+    fn persist_keybind_row_emits_only_canonical_modifier_wires() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_keybind_row(
+            dir.path(),
+            "input_bar.clear_input",
+            vec![Chord::ctrl('c'), Chord::primary('u')],
+        )
+        .unwrap();
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        let row = doc["keybindings"]["input_bar.clear_input"]
+            .as_array()
+            .unwrap();
+        assert_eq!(row[0].as_str(), Some("control+c"));
+        assert_eq!(row[1].as_str(), Some("primary+u"));
+        assert!(!read(dir.path()).contains("ctrl+"));
+    }
+
+    #[test]
     fn persist_keybindings_replaces_only_its_section() {
         let dir = tempfile::tempdir().unwrap();
         seed(
@@ -817,6 +1703,9 @@ mod tests {
 
     #[test]
     fn bad_keybindings_do_not_blank_theme() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         // `"+"` was historically unparseable; even if a future bug
         // re-introduces that, the theme must still load.
@@ -834,6 +1723,9 @@ mod tests {
 
     #[test]
     fn bad_theme_does_not_blank_keybindings() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(
             dir.path(),
@@ -846,6 +1738,9 @@ mod tests {
 
     #[test]
     fn legacy_help_defaults_migrate_without_touching_other_config() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(
             dir.path(),
@@ -870,7 +1765,10 @@ mod tests {
     }
 
     #[test]
-    fn customized_help_binding_is_not_migrated() {
+    fn customized_help_binding_migrates_legacy_primary() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         seed(
             dir.path(),
@@ -881,9 +1779,213 @@ mod tests {
         let resolved = cfg.resolve_keybindings().unwrap();
         assert_eq!(
             resolved["global"]["help"],
-            vec![Chord::char('?'), Chord::ctrl('h')]
+            vec![Chord::char('?'), Chord::primary('h')]
         );
-        assert!(read(dir.path()).contains("ctrl+h"));
+        assert!(read(dir.path()).contains("primary+h"));
+        assert!(!read(dir.path()).contains("ctrl+h"));
+    }
+
+    #[test]
+    fn legacy_ctrl_migration_preserves_scalar_array_and_unrelated_config() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "locale = \"en\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n\"global.help\" = [\"ctrl+c\", \"ctrl+f1\"]\n\n[future]\nkeep = true\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["input_bar"]["clear_input"],
+            vec![Chord::primary('u')]
+        );
+        assert_eq!(
+            resolved["global"]["help"],
+            vec![
+                Chord::ctrl('c'),
+                Chord::with(KeyCode::F(1), KeyModifiers::CONTROL),
+            ]
+        );
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["locale"].as_str(), Some("en"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+        assert_eq!(
+            doc["keybindings"]["input_bar.clear_input"].as_str(),
+            Some("primary+u")
+        );
+        let global = doc["keybindings"]["global.help"].as_array().unwrap();
+        assert_eq!(global[0].as_str(), Some("control+c"));
+        assert_eq!(global[1].as_str(), Some("control+f1"));
+    }
+
+    #[test]
+    fn legacy_ctrl_migration_uses_the_frozen_key_split() {
+        for key in ["c", "g", "k", "n", "s", "f1"] {
+            let mut wire = format!("ctrl+{key}");
+            assert!(migrate_legacy_ctrl_wire(&mut wire));
+            assert_eq!(wire, format!("control+{key}"));
+        }
+        for key in [
+            "a", "d", "e", "h", "p", "r", "u", "v", "w", "x", "enter", "up",
+        ] {
+            let mut wire = format!("ctrl+{key}");
+            assert!(migrate_legacy_ctrl_wire(&mut wire));
+            assert_eq!(wire, format!("primary+{key}"));
+        }
+        let mut canonical = "control+c".to_string();
+        assert!(!migrate_legacy_ctrl_wire(&mut canonical));
+        assert_eq!(canonical, "control+c");
+    }
+
+    #[test]
+    fn legacy_ctrl_migration_rewrites_before_tolerant_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n\"broken\" = [42]\n\n[future]\nkeep = true\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            cfg.keybindings.is_empty(),
+            "malformed rows still use defaults"
+        );
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["keybindings"]["input_bar.clear_input"].as_str(),
+            Some("primary+u")
+        );
+        assert_eq!(doc["keybindings"]["broken"][0].as_integer(), Some(42));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn canonical_keybindings_reload_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"input_bar.clear_input\" = \"primary+u\"\n\n[future]\nkeep = 1\n",
+        );
+
+        let _ = ensure_and_load(dir.path()).unwrap();
+        let first = read(dir.path());
+        let _ = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(read(dir.path()), first);
+    }
+
+    #[test]
+    fn legacy_copy_default_migrates_without_touching_other_config() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.copy_selection\" = [\"y\"]\n\"dashboard.up\" = [\"k\"]\n\n[future]\nkeep = 1\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["copy_selection"],
+            vec![
+                Chord::char('y'),
+                Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
+            ]
+        );
+        assert_eq!(resolved["dashboard"]["up"], vec![Chord::char('k')]);
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        let copy: Vec<Chord> = doc["keybindings"]["chat.copy_selection"]
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(copy, ChatTabAction::CopySelection.default_chords());
+        assert_eq!(doc["future"]["keep"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn customized_copy_binding_is_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.copy_selection\" = [\"y\", \"alt+c\"]\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["copy_selection"],
+            vec![Chord::char('y'), "alt+c".parse::<Chord>().unwrap()]
+        );
+        assert!(read(dir.path()).contains("alt+c"));
+    }
+
+    #[test]
+    fn bare_copy_binding_is_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.copy_selection\" = \"y\"\n\"global.help\" = [\"?\", \"f1\", \"ctrl+f1\"]\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(resolved["chat"]["copy_selection"], vec![Chord::char('y')]);
+        assert_eq!(
+            resolved["global"]["help"],
+            vec![Chord::char('?'), Chord::ctrl('g')]
+        );
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["keybindings"]["chat.copy_selection"].as_str(),
+            Some("y")
+        );
+    }
+
+    #[test]
+    fn legacy_chat_jump_defaults_migrate_without_touching_other_config() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.jump_start\" = [\"g\"]\n\"chat.jump_end\" = [\"G\"]\n\"dashboard.up\" = [\"k\"]\n\n[future]\nkeep = 1\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["jump_start"],
+            ChatTabAction::JumpStart.default_chords()
+        );
+        assert_eq!(
+            resolved["chat"]["jump_end"],
+            ChatTabAction::JumpEnd.default_chords()
+        );
+        assert_eq!(resolved["dashboard"]["up"], vec![Chord::char('k')]);
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["future"]["keep"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn customized_chat_jump_bindings_are_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.jump_start\" = [\"alt+home\"]\n\"chat.jump_end\" = \"G\"\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["jump_start"],
+            vec!["alt+home".parse::<Chord>().unwrap()]
+        );
+        assert_eq!(resolved["chat"]["jump_end"], vec![Chord::char('G')]);
     }
 
     #[test]
@@ -892,6 +1994,380 @@ mod tests {
         persist_theme(dir.path(), "gruvbox").unwrap();
         let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
         assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
+    }
+
+    // ── The config file is owner-only and written atomically ─────────
+    //
+    // The operator may keep the WSS bearer in `[connection.wss] auth_token`
+    // rather than `ZEROCLAW_AUTH_TOKEN`, and every persist rewrites the whole
+    // file, so this one funnel decides the file's mode and its atomicity.
+
+    #[cfg(unix)]
+    #[test]
+    fn write_document_creates_the_config_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        persist_theme(dir.path(), "gruvbox").unwrap();
+
+        let file_mode = std::fs::metadata(config_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "a fresh config file must be owner-only");
+        assert_eq!(dir_mode, 0o700, "the config dir must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_document_repairs_a_world_readable_config_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[connection.wss]\nuri = \"wss://daemon.example:8443\"\nauth_token = \"hand-written-bearer\"\n",
+        );
+        std::fs::set_permissions(
+            config_path(dir.path()),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        persist_theme(dir.path(), "gruvbox").unwrap();
+
+        let mode = std::fs::metadata(config_path(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an existing world-readable file must be repaired"
+        );
+        let body = read(dir.path());
+        assert!(
+            body.contains("hand-written-bearer"),
+            "repairing the mode must not lose the operator's token:\n{body}"
+        );
+    }
+
+    #[test]
+    fn write_document_is_atomic_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_theme(dir.path(), "gruvbox").unwrap();
+        persist_locale(dir.path(), "fr").unwrap();
+
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![FILE_NAME.to_string()],
+            "the publish must leave no staging file behind: {entries:?}"
+        );
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("gruvbox"));
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+    }
+
+    #[test]
+    fn persisted_auth_token_survives_unrelated_section_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[connection.wss]\nuri = \"wss://daemon.example:8443\"\nauth_token = \"hand-written-bearer\"\n",
+        );
+
+        persist_locale(dir.path(), "fr").unwrap();
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["connection"]["wss"]["auth_token"].as_str(),
+            Some("hand-written-bearer"),
+            "an unrelated persist must carry the token through untouched"
+        );
+        assert_eq!(doc["locale"].as_str(), Some("fr"));
+    }
+
+    #[test]
+    fn wss_section_debug_redacts_the_bearer() {
+        let section = WssSection {
+            uri: Some("wss://daemon.example:8443".into()),
+            auth_token: Some("super-secret-bearer".into()),
+            auth_provider: Some("oidc.corp".into()),
+            ..WssSection::default()
+        };
+        let rendered = format!("{section:?}");
+        assert!(
+            !rendered.contains("super-secret-bearer"),
+            "the bearer must never reach a diagnostic: {rendered}"
+        );
+        assert!(rendered.contains("REDACTED"), "{rendered}");
+        assert!(
+            rendered.contains("oidc.corp"),
+            "ordinary connection metadata still prints: {rendered}"
+        );
+    }
+
+    #[test]
+    fn sidebar_section_round_trips() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sidebar]\nvisible = false\nwidth = 30\n");
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.sidebar.visible);
+        assert_eq!(cfg.sidebar.width, 30);
+    }
+
+    #[test]
+    fn sidebar_partial_section_fills_field_defaults() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sidebar]\nvisible = false\n");
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.sidebar.visible);
+        assert_eq!(cfg.sidebar.width, 24, "unset width falls back to default");
+    }
+
+    #[test]
+    fn bad_sidebar_does_not_blank_theme() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[sidebar]\nvisible = \"nope\"\n",
+        );
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "dracula");
+        assert!(cfg.sidebar.visible, "bad [sidebar] drops to default");
+    }
+
+    #[test]
+    fn default_config_serializes_sidebar_for_env_overrides() {
+        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        assert!(
+            body.contains("[sidebar]") && body.contains("visible = true"),
+            "the default document must materialize [sidebar] so schema-mirror env overrides resolve; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn persist_sidebar_visible_preserves_other_sections() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        );
+        persist_sidebar_visible(dir.path(), false).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["sidebar"]["visible"].as_bool(), Some(false));
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(!cfg.sidebar.visible);
+        persist_sidebar_visible(dir.path(), true).unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(cfg.sidebar.visible);
+    }
+
+    #[test]
+    fn sidebar_leaf_writes_round_trip_side_width_and_split() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        persist_sidebar_side(dir.path(), SidebarSide::Left).unwrap();
+        persist_sidebar_width(dir.path(), 31).unwrap();
+        persist_sidebar_sessions_percent(dir.path(), 45).unwrap();
+        persist_sidebar_queue_percent(dir.path(), 65).unwrap();
+
+        let config = load_persisted(dir.path()).unwrap();
+        assert_eq!(config.sidebar.side, Some(SidebarSide::Left));
+        assert_eq!(config.sidebar.width, 31);
+        assert_eq!(config.sidebar.sessions_percent, 45);
+        assert_eq!(config.sidebar.queue_percent, 65);
+    }
+
+    #[test]
+    fn sidebar_effective_size_clamps_to_shell_bounds() {
+        let mut config = ZerocodeConfig::default();
+        config.sidebar.width = 1;
+        config.sidebar.sessions_percent = u16::MAX;
+        config.sidebar.queue_percent = u16::MAX;
+        assert_eq!(config.effective_sidebar_width(), SIDEBAR_WIDTH_MIN);
+        assert_eq!(
+            config.effective_sidebar_sessions_percent(),
+            SIDEBAR_SESSIONS_PERCENT_MAX
+        );
+        assert_eq!(
+            config.effective_sidebar_queue_percent(),
+            SIDEBAR_QUEUE_PERCENT_MAX
+        );
+        config.sidebar.width = u16::MAX;
+        config.sidebar.sessions_percent = 1;
+        config.sidebar.queue_percent = 1;
+        assert_eq!(config.effective_sidebar_width(), SIDEBAR_WIDTH_MAX);
+        assert_eq!(
+            config.effective_sidebar_sessions_percent(),
+            SIDEBAR_SESSIONS_PERCENT_MIN
+        );
+        assert_eq!(
+            config.effective_sidebar_queue_percent(),
+            SIDEBAR_QUEUE_PERCENT_MIN
+        );
+    }
+
+    #[test]
+    fn sidebar_leaf_write_preserves_comments_and_unknown_keys() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "# operator note\n[future] # keep this heading\nkeep   =   true # inline note\n\n[sidebar]\n# dock note\nvisible = false # keep this comment\nfuture_key = \"keep-me\"\n",
+        );
+
+        assert!(!persist_sidebar_visible(dir.path(), true).unwrap());
+        let after = read(dir.path());
+        assert!(after.contains("# operator note"));
+        assert!(after.contains("keep   =   true # inline note"));
+        assert!(after.contains("# dock note"));
+        assert!(after.contains("visible = true # keep this comment"));
+        assert!(after.contains("future_key = \"keep-me\""));
+    }
+
+    #[test]
+    fn sidebar_leaf_write_reports_valid_environment_shadowing() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _visible = EnvVarGuard::set("ZEROCODE_sidebar__visible", "false");
+        let _side = EnvVarGuard::set("ZEROCODE_sidebar__side", "left");
+        let _width = EnvVarGuard::set("ZEROCODE_sidebar__width", "30");
+        let _split = EnvVarGuard::set("ZEROCODE_sidebar__sessions_percent", "45");
+        let _queue_split = EnvVarGuard::set("ZEROCODE_sidebar__queue_percent", "40");
+
+        assert!(persist_sidebar_visible(dir.path(), true).unwrap());
+        assert!(persist_sidebar_side(dir.path(), SidebarSide::Right).unwrap());
+        assert!(persist_sidebar_width(dir.path(), 24).unwrap());
+        assert!(persist_sidebar_sessions_percent(dir.path(), 60).unwrap());
+        assert!(persist_sidebar_queue_percent(dir.path(), 50).unwrap());
+    }
+
+    #[test]
+    fn sidebar_leaf_write_refuses_malformed_or_non_table_data() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let before = "[sidebar]\nwidth = \"bad\"\n";
+        seed(dir.path(), before);
+        assert!(persist_sidebar_width(dir.path(), 28).is_err());
+        assert_eq!(read(dir.path()), before);
+
+        let before = "sidebar = \"not-a-table\"\n";
+        seed(dir.path(), before);
+        assert!(persist_sidebar_width(dir.path(), 28).is_err());
+        assert_eq!(read(dir.path()), before);
+    }
+
+    #[test]
+    fn effective_sidebar_side_migrates_legacy_todo_location_until_switch() {
+        let mut config = ZerocodeConfig::default();
+        config.todotracker.location = TodoTrackerLocation::Left;
+        assert_eq!(config.effective_sidebar_side(), SidebarSide::Left);
+        config.sidebar.side = Some(SidebarSide::Right);
+        assert_eq!(config.effective_sidebar_side(), SidebarSide::Right);
+    }
+
+    #[test]
+    fn sidebar_section_visibility_is_independent_and_preserves_document() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "# keep this note\n[sidebar]\nvisible = true # sessions\nwidth = 31\nside = \"left\"\nsessions_percent = 45\nqueue_percent = 65\nfuture_key = \"keep\"\n\n[todotracker]\nenabled = true\nenabled_at_start = true\nlocation = \"bottom\"\nwidth = 34\nmax_height = 7\n\n[future]\nkeep = true\n",
+        );
+        let initial = load_persisted(dir.path()).unwrap();
+        assert!(initial.sidebar.visible);
+        assert!(initial.sidebar.queue_visible);
+        assert!(initial.sidebar.plan_visible);
+        let before: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+
+        let writers: [fn(&Path, bool) -> Result<bool>; 3] = [
+            persist_sidebar_visible,
+            persist_sidebar_queue_visible,
+            persist_sidebar_plan_visible,
+        ];
+        let keys = ["visible", "queue_visible", "plan_visible"];
+        // Hide everything, then reopen each section independently.
+        for visible in [false, true] {
+            for (index, writer) in writers.iter().enumerate() {
+                assert!(!writer(dir.path(), visible).unwrap());
+                let cfg = load_persisted(dir.path()).unwrap();
+                let states = [
+                    cfg.sidebar.visible,
+                    cfg.sidebar.queue_visible,
+                    cfg.sidebar.plan_visible,
+                ];
+                for (other, state) in states.into_iter().enumerate() {
+                    assert_eq!(state, if other <= index { visible } else { !visible });
+                }
+                assert_eq!(cfg.todotracker, initial.todotracker);
+                let after: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+                for key in [
+                    "width",
+                    "side",
+                    "sessions_percent",
+                    "queue_percent",
+                    "future_key",
+                ] {
+                    assert_eq!(after["sidebar"][key], before["sidebar"][key]);
+                }
+                assert_eq!(after["sidebar"][keys[index]].as_bool(), Some(visible));
+                assert_eq!(after["future"], before["future"]);
+                assert!(read(dir.path()).contains("# keep this note"));
+                assert!(read(dir.path()).contains("# sessions"));
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_visibility_overrides_do_not_leak_into_sibling_writes() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _queue = EnvVarGuard::set("ZEROCODE_sidebar__queue_visible", "false");
+        let _plan = EnvVarGuard::set("ZEROCODE_sidebar__plan_visible", "false");
+        assert!(persist_sidebar_queue_visible(dir.path(), true).unwrap());
+        assert!(persist_sidebar_plan_visible(dir.path(), true).unwrap());
+        persist_sidebar_visible(dir.path(), false).unwrap();
+        let persisted = load_persisted(dir.path()).unwrap();
+        assert!(!persisted.sidebar.visible);
+        assert!(persisted.sidebar.queue_visible);
+        assert!(persisted.sidebar.plan_visible);
+        let effective = ensure_and_load(dir.path()).unwrap();
+        assert!(!effective.sidebar.queue_visible);
+        assert!(!effective.sidebar.plan_visible);
+        assert!(!persist_sidebar_queue_visible(dir.path(), false).unwrap());
+        assert!(!persist_sidebar_plan_visible(dir.path(), false).unwrap());
+    }
+
+    #[test]
+    fn sidebar_environment_side_and_splits_keep_strict_path_validation() {
+        let mut config = ZerocodeConfig::default();
+        assert!(config.sidebar.visible);
+        assert!(config.sidebar.queue_visible);
+        assert!(config.sidebar.plan_visible);
+        set_prop(&mut config, "sidebar.side", "left").unwrap();
+        set_prop(&mut config, "sidebar.width", "31").unwrap();
+        set_prop(&mut config, "sidebar.sessions_percent", "45").unwrap();
+        set_prop(&mut config, "sidebar.queue_percent", "65").unwrap();
+        assert_eq!(config.effective_sidebar_side(), SidebarSide::Left);
+        assert_eq!(config.effective_sidebar_width(), 31);
+        assert_eq!(config.effective_sidebar_sessions_percent(), 45);
+        assert_eq!(config.effective_sidebar_queue_percent(), 65);
+        assert!(set_prop(&mut config, "sidebar.side", "middle").is_err());
+        assert!(set_prop(&mut config, "sidebar.queue_visible", "invalid").is_err());
+        assert!(set_prop(&mut config, "sidebar.plan_visible", "invalid").is_err());
+        assert!(set_prop(&mut config, "sidebar.unknown", "true").is_err());
     }
 
     #[test]
@@ -907,6 +2383,19 @@ mod tests {
         assert_eq!(
             back.connection.wss.tls.skip_verify_routes,
             vec!["wss://host:9781"]
+        );
+    }
+
+    #[test]
+    fn a_token_file_alone_keeps_the_connection_section() {
+        let mut c = ZerocodeConfig::default();
+        c.connection.wss.auth_token_file = Some("/etc/zeroclaw/zerocode-bearer".to_string());
+        let body = toml::to_string_pretty(&c).unwrap();
+        let back: ZerocodeConfig = toml::from_str(&body).unwrap();
+        assert_eq!(
+            back.connection.wss.auth_token_file.as_deref(),
+            Some("/etc/zeroclaw/zerocode-bearer"),
+            "got:\n{body}"
         );
     }
 
@@ -934,6 +2423,9 @@ mod tests {
 
     #[test]
     fn first_run_file_has_no_connection_section() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         ensure_and_load(dir.path()).unwrap();
         let on_disk = read(dir.path());
@@ -970,6 +2462,9 @@ mod tests {
 
     #[test]
     fn persist_wss_route_ack_dedups() {
+        // Reads the environment via `ensure_and_load`; serialize against the
+        // env-mutating tests so a stray override cannot leak in.
+        let _guard = env_test_lock();
         let dir = tempfile::tempdir().unwrap();
         persist_wss_route_ack(dir.path(), "wss://a:1").unwrap();
         persist_wss_route_ack(dir.path(), "wss://a:1").unwrap();
@@ -1019,6 +2514,358 @@ mod tests {
         assert_eq!(
             doc["connection"]["wss"]["tls"]["skip_verify"].as_bool(),
             Some(true)
+        );
+    }
+
+    // ── Todo tracker persistence tests ──────────────────────────────────────
+
+    #[test]
+    fn persist_todotracker_writes_section_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord\"\n\n[future]\nkeep = true\n",
+        );
+        let section = TodoTrackerSection {
+            enabled: false,
+            enabled_at_start: true,
+            location: TodoTrackerLocation::Left,
+            width: 40,
+            max_height: 8,
+        };
+        persist_todotracker(dir.path(), &section).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+        assert_eq!(doc["todotracker"]["enabled"].as_bool(), Some(false));
+        assert_eq!(doc["todotracker"]["enabled_at_start"].as_bool(), Some(true));
+        assert_eq!(doc["todotracker"]["location"].as_str(), Some("left"));
+        assert_eq!(doc["todotracker"]["width"].as_integer(), Some(40));
+        assert_eq!(doc["todotracker"]["max_height"].as_integer(), Some(8));
+    }
+
+    #[test]
+    fn persist_todotracker_round_trips_through_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = TodoTrackerSection {
+            enabled: false,
+            enabled_at_start: true,
+            location: TodoTrackerLocation::Bottom,
+            width: 48,
+            max_height: 10,
+        };
+        persist_todotracker(dir.path(), &section).unwrap();
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert!(!cfg.todotracker.enabled);
+        assert!(cfg.todotracker.enabled_at_start);
+        assert_eq!(cfg.todotracker.location, TodoTrackerLocation::Bottom);
+        assert_eq!(cfg.todotracker.width, 48);
+        assert_eq!(cfg.todotracker.max_height, 10);
+    }
+
+    #[test]
+    fn persist_todotracker_creates_file_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = TodoTrackerSection {
+            enabled: false,
+            ..Default::default()
+        };
+        persist_todotracker(dir.path(), &section).unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["todotracker"]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn bad_todotracker_does_not_blank_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[todotracker]\nwidth = \"not_a_number\"\n",
+        );
+        // Asserts on-disk parsing/fallback, so read the persisted view: the
+        // effective view would also layer in any ambient `ZEROCODE_*` override.
+        let cfg = load_persisted(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "dracula");
+        assert_eq!(cfg.todotracker.width, default_todotracker_width());
+    }
+
+    // The tolerant `load_persisted` path substitutes defaults for a malformed
+    // `[todotracker]`, but the transition resolver must instead see an error so
+    // it can preserve the live tracker rather than silently reset to defaults.
+    #[test]
+    fn resolve_todo_tracker_checked_errors_on_malformed_section() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"dracula\"\n\n[todotracker]\nwidth = \"not_a_number\"\n",
+        );
+        let err = resolve_todo_tracker_checked(dir.path())
+            .expect_err("a malformed [todotracker] must surface as an error");
+        assert!(
+            format!("{err:#}").contains("[todotracker]")
+                && format!("{err:#}").contains("malformed"),
+            "error should name the malformed section, got: {err:#}"
+        );
+    }
+
+    // A valid section resolves normally through the checked path.
+    #[test]
+    fn resolve_todo_tracker_checked_ok_on_valid_section() {
+        // Resolves through `ensure_and_load`, which *reads* the environment, so
+        // this must serialize against the env-mutating tests below even though
+        // it sets nothing itself.
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[todotracker]\nwidth = 41\nmax_height = 6\n");
+        let settings =
+            resolve_todo_tracker_checked(dir.path()).expect("a valid [todotracker] must resolve");
+        assert_eq!(settings.width, 41);
+        assert_eq!(settings.max_height, 6);
+    }
+
+    // An absent section resolves to defaults (not an error).
+    #[test]
+    fn resolve_todo_tracker_checked_ok_when_section_absent() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[theme]\nname = \"dracula\"\n");
+        let settings = resolve_todo_tracker_checked(dir.path())
+            .expect("an absent [todotracker] must resolve to defaults");
+        assert_eq!(settings.width, default_todotracker_width());
+    }
+
+    // ── Env override tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn set_prop_todotracker_enabled() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "todotracker.enabled", "false").unwrap();
+        assert!(!c.todotracker.enabled);
+    }
+
+    #[test]
+    fn set_prop_todotracker_width() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "todotracker.width", "50").unwrap();
+        assert_eq!(c.todotracker.width, 50);
+    }
+
+    #[test]
+    fn set_prop_todotracker_location() {
+        let mut c = ZerocodeConfig::default();
+        set_prop(&mut c, "todotracker.location", "left").unwrap();
+        assert_eq!(c.todotracker.location, TodoTrackerLocation::Left);
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_width_from_file() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 0\nmax_height = 5\n",
+        )
+        .unwrap();
+
+        assert!(resolve_todo_tracker_checked(dir.path()).is_ok());
+        assert_eq!(load_persisted(dir.path()).unwrap().todotracker.width, 0);
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_max_height_from_file() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 32\nmax_height = 0\n",
+        )
+        .unwrap();
+
+        assert!(
+            resolve_todo_tracker_checked(dir.path()).is_ok(),
+            "legacy height must not reject settings for the shell-owned dock"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_width_from_env() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 32\nmax_height = 5\n",
+        )
+        .unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "0");
+
+        assert!(
+            resolve_todo_tracker_checked(dir.path()).is_ok(),
+            "legacy width override must not reject settings for the shell-owned dock"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_accepts_legacy_zero_max_height_from_env() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__max_height", "0");
+
+        assert!(
+            resolve_todo_tracker_checked(dir.path()).is_ok(),
+            "legacy height override must not reject settings for the shell-owned dock"
+        );
+    }
+
+    #[test]
+    fn resolve_todo_tracker_checked_accepts_positive_dimensions() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(dir.path()),
+            "[todotracker]\nwidth = 44\nmax_height = 9\n",
+        )
+        .unwrap();
+
+        let s = resolve_todo_tracker_checked(dir.path())
+            .expect("a valid section must still resolve unchanged");
+        assert_eq!(s.width, 44);
+        assert_eq!(s.max_height, 9);
+    }
+
+    // ── Single source of truth ──────────────────────────────────────────────
+    //
+    // `zerocode-config.toml` is the live source of truth for the tracker's
+    // display settings: a value persisted by the Config pane must be visible
+    // to the next session that resolves the file, never shadowed by a copy
+    // cached at first-session start. Sessions resolve the file at each session
+    // boundary, so this exercises that contract at the config layer: load,
+    // persist a change (as the Config pane does), load again.
+    #[test]
+    fn resolved_settings_track_edits_across_sessions() {
+        // Resolves the effective view, so serialize against the env-mutating
+        // tests below: `std::env` is process-global.
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+
+        // "Session 1" resolves the defaults.
+        let cfg1 = ensure_and_load(dir.path()).unwrap();
+        let t1 = cfg1.resolve_todo_tracker();
+
+        // A Config-pane save persists a changed field to the same file.
+        let mut tracker = cfg1.todotracker.clone();
+        tracker.width = t1.width + 7;
+        persist_todotracker(dir.path(), &tracker).unwrap();
+
+        // "Session 2" must resolve the *edited* value, not a cached copy.
+        let cfg2 = ensure_and_load(dir.path()).unwrap();
+        let t2 = cfg2.resolve_todo_tracker();
+        assert_eq!(
+            t2.width,
+            t1.width + 7,
+            "second session must see the persisted tracker width edit"
+        );
+    }
+    // ── Environment override contract ───────────────────────────────────────
+    //
+    // Canonical spelling is `ZEROCODE_<lowercase dotted path with __>`, e.g.
+    // `ZEROCODE_todotracker__enabled`. These exercise real environment
+    // variables through `ensure_and_load` rather than calling `set_prop`
+    // directly, so the public spelling stays covered.
+
+    use crate::test_support::{EnvVarGuard, env_test_lock};
+
+    #[test]
+    fn canonical_env_spelling_overrides_tracker_field() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__enabled", "false");
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            !cfg.todotracker.enabled,
+            "ZEROCODE_todotracker__enabled must reach the parser and win over the file"
+        );
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_tracker_width() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "41");
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.resolve_todo_tracker().width, 41);
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_default_sidebar_field() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_sidebar__visible", "false");
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            !cfg.sidebar.visible,
+            "a default config must materialize [sidebar] before schema-mirror overrides apply"
+        );
+    }
+
+    #[test]
+    fn unknown_env_path_is_rejected() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__nope", "1");
+
+        let err = ensure_and_load(dir.path()).expect_err("unknown path must hard-error");
+        assert!(format!("{err:#}").contains("did not resolve to a config field"));
+    }
+
+    // Env overrides are process-transient: `load_persisted` is the on-disk
+    // truth and must not see them, otherwise a Config-pane save of one field
+    // would bake an env-injected value for another field into the file.
+    #[test]
+    fn env_overrides_do_not_reach_the_persisted_view() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = TodoTrackerSection {
+            width: 30,
+            ..TodoTrackerSection::default()
+        };
+        persist_todotracker(dir.path(), &on_disk).unwrap();
+
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+
+        // Effective view honors the override...
+        assert_eq!(ensure_and_load(dir.path()).unwrap().todotracker.width, 77);
+        // ...while the persisted view keeps the real file contents.
+        assert_eq!(load_persisted(dir.path()).unwrap().todotracker.width, 30);
+    }
+
+    // Saving an unrelated field must rewrite the section from *disk* state, so
+    // an env-injected value for a different field is never written through.
+    #[test]
+    fn saving_unrelated_field_does_not_persist_env_value() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = TodoTrackerSection {
+            width: 30,
+            max_height: 5,
+            ..TodoTrackerSection::default()
+        };
+        persist_todotracker(dir.path(), &on_disk).unwrap();
+
+        let _v = EnvVarGuard::set("ZEROCODE_todotracker__width", "77");
+
+        // Edit an unrelated field starting from the persisted section.
+        let mut candidate = load_persisted(dir.path()).unwrap().todotracker;
+        candidate.max_height = 9;
+        persist_todotracker(dir.path(), &candidate).unwrap();
+
+        let reloaded = load_persisted(dir.path()).unwrap().todotracker;
+        assert_eq!(reloaded.max_height, 9, "the edited field must be saved");
+        assert_eq!(
+            reloaded.width, 30,
+            "the env-injected width must not be written to disk"
         );
     }
 }

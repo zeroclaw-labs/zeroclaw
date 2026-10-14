@@ -13,6 +13,57 @@ pub struct ExportFilter {
     pub until: Option<String>,
 }
 
+/// The composite scope of one principal's private memory (RFC 7141).
+///
+/// The owner is one dimension composed WITH, never instead of, the agent,
+/// namespace and tenant dimensions the shared plane already has: two agents
+/// hold two rows under the same visible key for the same principal, and a
+/// principal permitted only a non-default agent stores and reads under that
+/// agent. `None` for a dimension means the backend's default for it (the
+/// default agent, the default namespace, no tenant), not "any".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalScope {
+    /// The durable owner identity (the canonical principal id).
+    pub principal_id: String,
+    /// The agent alias the rows belong to; `None` = the default agent.
+    pub agent_alias: Option<String>,
+    /// The namespace; `None` = the default namespace.
+    pub namespace: Option<String>,
+    /// The tenant; `None` = no tenant.
+    pub tenant_id: Option<String>,
+}
+
+impl PrincipalScope {
+    /// A scope on the default agent and namespace with no tenant.
+    #[must_use]
+    pub fn new(principal_id: impl Into<String>) -> Self {
+        Self {
+            principal_id: principal_id.into(),
+            agent_alias: None,
+            namespace: None,
+            tenant_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_agent(mut self, agent_alias: Option<String>) -> Self {
+        self.agent_alias = agent_alias;
+        self
+    }
+
+    #[must_use]
+    pub fn with_namespace(mut self, namespace: Option<String>) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tenant(mut self, tenant_id: Option<String>) -> Self {
+        self.tenant_id = tenant_id;
+        self
+    }
+}
+
 /// A single memory entry
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
@@ -41,6 +92,14 @@ pub struct MemoryEntry {
     /// Tenant or end-user scope for multi-user memory isolation.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Owning principal for PRIVATE principal memory (RFC 7141). `None`
+    /// marks the shared/legacy plane: rows visible to unscoped
+    /// connections and agent-loop recall. A private row is visible only
+    /// through the principal-scoped operations, and the owner is an
+    /// additional dimension composed WITH (never replacing) the agent,
+    /// session, namespace, and tenant dimensions.
+    #[serde(default)]
+    pub principal_id: Option<String>,
     /// Resolved, human-readable agent alias for this row (the HashMap key
     /// in `Config::agents`, e.g. `"clamps"`). SQL-backed stores produce
     /// this via `LEFT JOIN agents ON agents.id = memories.agent_id`;
@@ -314,6 +373,110 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// would destroy sibling rows.
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool>;
 
+    // ── Private principal memory (RFC 7141) ─────────────────────────
+    //
+    // One principal's private plane: every operation carries the owner in
+    // the storage statement itself (atomic predicate), composed WITH the
+    // agent, session, namespace and tenant dimensions of the scope, and the
+    // legacy operations above never see private rows. The defaults FAIL
+    // CLOSED: a backend that has not implemented principal scoping refuses
+    // private-memory operations rather than silently un-scoping them.
+
+    /// Store into the scope's private memory. The owner and every other
+    /// scope dimension are written in the same statement that stores the row.
+    async fn store_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _key: &str,
+        _content: &str,
+        _category: MemoryCategory,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Recall within the scope's private memory only.
+    async fn recall_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// List within the scope's private memory only. The category predicate
+    /// is applied in storage, before any result limit.
+    async fn list_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _category: Option<&MemoryCategory>,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Get one row from the scope's private memory; other principals' rows
+    /// and shared-plane rows are invisible. Storage errors are errors, never
+    /// `None`.
+    async fn get_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Remove one row from the scope's private memory: the ownership
+    /// predicate and the delete are one statement.
+    async fn forget_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _key: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Count the rows in the scope's private memory.
+    async fn count_for_principal(&self, _scope: &PrincipalScope) -> anyhow::Result<usize> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Export the scope's private rows, owner preserved and keys as the
+    /// caller sees them. Ordinary [`Memory::export`] never returns private
+    /// rows; this is the explicit, owner-preserving path.
+    async fn export_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _filter: &ExportFilter,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Bulk-delete the scope's private rows in `namespace`. The owner
+    /// travels in the DELETE predicate; foreign and shared rows are never
+    /// touched.
+    async fn purge_namespace_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _namespace: &str,
+    ) -> anyhow::Result<usize> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Bulk-delete the scope's private rows for `session_id`, with the owner
+    /// in the DELETE predicate.
+    async fn purge_session_for_principal(
+        &self,
+        _scope: &PrincipalScope,
+        _session_id: &str,
+    ) -> anyhow::Result<usize> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
     /// Remove all memories whose `namespace` field equals the given value.
     /// Returns the number of deleted entries.
     /// Default: returns unsupported error. Backends that support bulk deletion override this.
@@ -480,15 +643,31 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let entries = self
-            .recall(query, limit * 2, session_id, since, until)
-            .await?;
-        let filtered: Vec<MemoryEntry> = entries
-            .into_iter()
-            .filter(|e| e.namespace == namespace)
-            .take(limit)
-            .collect();
-        Ok(filtered)
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let entries = self
+                .recall(query, fetch_limit, session_id, since, until)
+                .await?;
+            let backend_may_have_more = entries.len() >= fetch_limit;
+            let filtered: Vec<MemoryEntry> = entries
+                .into_iter()
+                .filter(|e| e.namespace == namespace)
+                .take(limit)
+                .collect();
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered);
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered);
+            }
+            fetch_limit = next_fetch_limit;
+        }
     }
 
     /// Bulk-export memories matching the given filter criteria.
@@ -727,6 +906,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_optional_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "id-1".into(),
             key: "favorite_language".into(),
             content: "Rust".into(),
@@ -783,6 +963,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_new_memory_plane_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "id-2".into(),
             key: "deployment_decision".into(),
             content: "Use staged rollout".into(),

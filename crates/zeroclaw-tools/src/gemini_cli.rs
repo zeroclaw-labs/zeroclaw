@@ -8,13 +8,8 @@ use zeroclaw_config::schema::GeminiCliConfig;
 
 use crate::coding_cli::{
     CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, DirectCodingCliExecutor,
-    add_safe_env,
+    add_coding_cli_env,
 };
-
-/// Environment variables safe to pass through to the `gemini` subprocess.
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
 
 pub struct GeminiCliTool {
     security: Arc<SecurityPolicy>,
@@ -76,10 +71,10 @@ impl Tool for GeminiCliTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
-        // Enforce act policy
+        // The production wrapper owns accounting; the adapter owns authorization.
         if let Err(error) = self
             .security
-            .enforce_tool_operation(ToolOperation::Act, "gemini_cli")
+            .authorize_tool_operation(ToolOperation::Act, "gemini_cli")
         {
             return Ok(ToolResult {
                 success: false,
@@ -158,7 +153,7 @@ impl Tool for GeminiCliTool {
         let mut cmd = CodingCliCommand::new("gemini", work_dir.clone(), self.config.timeout_secs);
         cmd.arg("-p").arg(prompt);
 
-        add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
+        add_coding_cli_env(&mut cmd, &self.config.env_passthrough);
 
         match self.executor.output(cmd).await {
             Ok(output) => {
@@ -265,7 +260,10 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = GeminiCliTool::new(security, test_config());
+        let tool = crate::wrappers::RateLimitedTool::new(
+            GeminiCliTool::new(security.clone(), test_config()),
+            security,
+        );
         let result = tool
             .execute(json!({"prompt": "hello"}))
             .await

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -163,7 +164,6 @@ impl Tool for ImageInfoTool {
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(path) => path,
             Err(e) => {
-                let _ = self.security.record_action();
                 let error = if e.kind() == std::io::ErrorKind::NotFound {
                     format!("File not found: {path_str}")
                 } else {
@@ -238,13 +238,19 @@ impl Tool for ImageInfoTool {
             let _ = write!(output, "\nDimensions: {w}x{h}");
         }
 
-        let _ = write!(output, "\n[IMAGE:{marker_path}]");
-
+        // The image is declared as an attachment rather than written into the
+        // text: marker syntax in a tool body is text, so an inline marker
+        // would never be promoted under the attachment-identity contract.
+        // The `File:` line above keeps the path visible to the model.
         Ok(ToolResult {
             success: true,
             output: output.into(),
             error: None,
-        })
+        }
+        .with_attachment(RenderedMarker {
+            target: marker_path.into_owned(),
+            kind: MarkerKind::Image,
+        }))
     }
 }
 
@@ -556,12 +562,23 @@ mod tests {
         assert!(result.output.contains("Format: png"));
         assert!(result.output.contains("Dimensions: 1x1"));
         assert!(!result.output.contains("data:"));
-        // The output carries an absolute-path [IMAGE:] marker so the
-        // multimodal pipeline can inline the image for vision models.
+        // The image is declared as an attachment carrying the canonical
+        // absolute path; the body keeps the File: line instead of marker
+        // syntax, which is text under the attachment-identity contract.
         let marker_path = expected_marker_path(&png_path).await;
+        assert_eq!(
+            result.output.attachments(),
+            &[RenderedMarker {
+                target: marker_path.clone(),
+                kind: MarkerKind::Image,
+            }],
+            "expected exactly one absolute-path image attachment, got: {}",
+            result.output
+        );
+        assert!(!result.output.contains("[IMAGE:"));
         assert!(
-            result.output.contains(&format!("[IMAGE:{marker_path}]")),
-            "expected absolute-path image marker, got: {}",
+            result.output.contains(&marker_path),
+            "the File: line must keep the absolute path: {}",
             result.output
         );
     }
@@ -644,19 +661,23 @@ mod tests {
             result.error
         );
         assert!(result.output.contains("Format: png"));
-        // Regression for a workspace-relative path must still be
-        // emitted as an absolute-path [IMAGE:] marker. Before the fix the tool
-        // echoed the relative input, which the marker promoter (anchored on a
-        // leading `/`) silently dropped, so the image never reached the model.
+        // Regression for a workspace-relative path: the attachment must still
+        // carry the canonical absolute path. Before the fix the tool echoed
+        // the relative input, which the promoter (anchored on a leading `/`)
+        // silently dropped, so the image never reached the model.
         let marker_path = expected_marker_path(&png_path).await;
-        assert!(
-            result.output.contains(&format!("[IMAGE:{marker_path}]")),
-            "expected absolute-path image marker, got: {}",
+        assert_eq!(
+            result.output.attachments(),
+            &[RenderedMarker {
+                target: marker_path.clone(),
+                kind: MarkerKind::Image,
+            }],
+            "expected absolute-path image attachment, got: {}",
             result.output
         );
         assert!(
             Path::new(&marker_path).is_absolute(),
-            "marker path must be absolute so the multimodal pipeline can load it"
+            "attachment target must be absolute so the multimodal pipeline can load it"
         );
     }
 
@@ -727,7 +748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_file_probe_consumes_action_budget() {
+    async fn wrapped_missing_file_probe_preserves_action_budget() {
         let root = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
@@ -736,18 +757,22 @@ mod tests {
             max_actions_per_hour: 1,
             ..SecurityPolicy::default()
         });
-        let tool = ImageInfoTool::new(security.clone());
+        let tool = wrapped_tool_with_security(security.clone());
 
         assert!(!security.is_rate_limited());
         let result = tool.execute(json!({"path": "missing.png"})).await.unwrap();
 
         assert!(!result.success);
+        assert!(
+            security.record_action(),
+            "failed call must release its reservation"
+        );
         assert!(security.is_rate_limited());
     }
 
     #[tokio::test]
-    async fn emits_inline_image_marker_with_absolute_path() {
-        // The image must be exposed to vision models via an [IMAGE:] marker
+    async fn declares_absolute_path_image_attachment() {
+        // The image must be exposed to vision models via an attachment
         // carrying the canonical absolute path, regardless of how the caller
         // spelled the input path
         let dir = TempDir::new().unwrap();
@@ -762,11 +787,16 @@ mod tests {
 
         assert!(result.success);
         let marker_path = expected_marker_path(&png_path).await;
-        assert!(
-            result.output.contains(&format!("[IMAGE:{marker_path}]")),
-            "expected absolute-path image marker, got: {}",
+        assert_eq!(
+            result.output.attachments(),
+            &[RenderedMarker {
+                target: marker_path,
+                kind: MarkerKind::Image,
+            }],
+            "expected absolute-path image attachment, got: {}",
             result.output
         );
+        assert!(!result.output.contains("[IMAGE:"));
         // No bare base64 blob should leak into the text output anymore.
         assert!(!result.output.contains("base64,"));
     }

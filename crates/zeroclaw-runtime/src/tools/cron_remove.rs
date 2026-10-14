@@ -115,7 +115,7 @@ impl Tool for CronRemoveTool {
             return Ok(blocked);
         }
 
-        match cron::remove_job(&self.config, &job_id) {
+        match cron::remove_job_for_agent(&self.config, &job_id, &self.agent_alias) {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Removed cron job {job_id}").into(),
@@ -365,6 +365,22 @@ mod tests {
         assert!(
             cron::get_job(&cfg, &theirs.id).is_ok(),
             "other agent's job must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn cannot_remove_another_agents_job_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = two_agent_config(&tmp);
+        let theirs = named_job(&cfg, OTHER_AGENT, "secret_job", "echo secret");
+
+        let tool = CronRemoveTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let result = tool.execute(json!({"job_id": theirs.id})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(
+            cron::get_job(&cfg, &theirs.id).is_ok(),
+            "other agent's job must survive removal by ID"
         );
     }
 }

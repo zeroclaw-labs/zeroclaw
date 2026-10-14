@@ -1,3 +1,7 @@
+use crate::agent::system_prompt::{
+    BOOTSTRAP_FILES, BOOTSTRAP_MAX_CHARS, COMPACT_BOOTSTRAP_MAX_CHARS, CONDITIONAL_BOOTSTRAP_FILES,
+    truncate_bootstrap_content,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::io::Write;
@@ -463,6 +467,33 @@ pub fn persist_model_cache(
     std::fs::create_dir_all(&cache_dir).context("Failed to create state dir for model cache")?;
 
     let cache_path = cache_dir.join(MODEL_CACHE_FILE);
+
+    // Cross-process advisory lock around the whole read-merge-publish
+    // sequence. The publish itself is collision-safe (exclusive temp file +
+    // atomic rename), but without serialization two concurrent refreshes can
+    // both read the same pre-refresh snapshot and the second rename silently
+    // discards the first one's provider entry — the lost-update window the
+    // collision-safe publish left open. Blocking (rather than failing) lets overlapping
+    // refreshes complete in sequence; the lock releases when the guard drops.
+    let lock_path = cache_dir.join(format!("{MODEL_CACHE_FILE}.lock"));
+    let cache_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "Failed to open model cache lock file at {}",
+                lock_path.display()
+            )
+        })?;
+    cache_lock.lock().with_context(|| {
+        format!(
+            "Failed to lock model cache for refresh at {}",
+            lock_path.display()
+        )
+    })?;
 
     // Load existing cache, starting fresh only when the file is genuinely
     // absent. A malformed or unreadable existing file is left untouched and
@@ -1145,8 +1176,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ));
             }
 
-            // API key presence
-            if family != "ollama" {
+            // Native Ollama services are credential-optional by declaration.
+            // Keep this narrow: other local-family diagnostics retain their
+            // established API-key warning behavior.
+            if !matches!(family, "ollama" | "hailo_ollama") {
                 if entry.api_key.as_deref().is_some() {
                     items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
                 } else {
@@ -1228,6 +1261,70 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         }
         if !found_any {
             items.push(DiagItem::error(cat, "no model providers configured"));
+        }
+    }
+
+    // TTS provider api_key presence. Unlike the model_provider check above,
+    // a missing key on `openai`, `elevenlabs`, or `google` is not "may rely
+    // on env vars or model_provider defaults" — `OpenAiTtsProvider::new` and
+    // its siblings (`crates/zeroclaw-channels/src/tts.rs`) bail on a
+    // missing/blank `api_key` before the entry is ever registered, so the
+    // provider silently drops out of `[providers.tts.*]` entirely.
+    // `edge` and `piper` have no key gate and are never checked here.
+    {
+        const TTS_KEY_GATED_FAMILIES: &[&str] = &["openai", "elevenlabs", "google"];
+        for (family, alias, entry) in config.providers.tts.iter_entries() {
+            if !TTS_KEY_GATED_FAMILIES.contains(&family) {
+                continue;
+            }
+            let label = format!("providers.tts.{family}.{alias}");
+            if entry
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|k| !k.is_empty())
+            {
+                items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "{label}: no api_key set — this provider will NOT register (not a soft fallback); set `[{label}].api_key` or remove the entry"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Transcription provider api_key presence — same shape as the TTS check
+    // above. `groq`, `openai`, `deepgram`, `assemblyai`, and `google` all
+    // gate registration on `api_key` in
+    // `crates/zeroclaw-channels/src/transcription.rs`. `local_whisper` has
+    // no api_key concept (its optional `bearer_token` is a different field)
+    // and is never checked here.
+    {
+        use zeroclaw_config::providers::TranscriptionProviderEntry;
+
+        for (family, alias, entry) in config.providers.transcription.iter_entries() {
+            let api_key = match entry {
+                TranscriptionProviderEntry::Groq(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::OpenAi(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::Deepgram(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::AssemblyAi(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::Google(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::LocalWhisper(_) => continue,
+            };
+            let label = format!("providers.transcription.{family}.{alias}");
+            if api_key.map(str::trim).is_some_and(|k| !k.is_empty()) {
+                items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "{label}: no api_key set — this provider will NOT register (not a soft fallback); set `[{label}].api_key` or remove the entry"
+                    ),
+                ));
+            }
         }
     }
 
@@ -1356,10 +1453,9 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Delegate agents: model_provider validity (resolved from model_provider alias)
-    let mut agent_names: Vec<_> = config.agents.keys().collect();
-    agent_names.sort();
-    for name in agent_names {
-        let agent = config.agents.get(name).unwrap();
+    let mut agents: Vec<_> = config.agents.iter().collect();
+    agents.sort_by_key(|(name, _)| *name);
+    for (name, agent) in agents {
         let provider_ref = agent.model_provider.as_str();
         if provider_ref.is_empty() {
             continue;
@@ -1389,13 +1485,28 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 }
 
+/// Render a validation warning as the operator-facing `doctor` line.
+///
+/// [`ValidationWarning::message`] is the stable English contract for API
+/// consumers, and its own documentation says user-facing surfaces localize from
+/// the code and fall back to the message only for unknown codes. This is that
+/// mapping for the CLI.
+///
+/// An earlier version of this helper existed for the skills prompt-injection
+/// deprecation and was removed with that warning. The withheld-capability
+/// notice and the disabled-audit notice are its current entries.
 fn localized_validation_warning_message(
     warning: &zeroclaw_config::validation_warnings::ValidationWarning,
 ) -> String {
     match warning.code.as_str() {
-        "skills_prompt_injection_mode_full_deprecated" => crate::i18n::get_required_cli_string(
-            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
-        ),
+        zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD => {
+            crate::i18n::get_required_cli_string("cli-doctor-verifiable-intent-tool-withheld")
+        }
+        zeroclaw_config::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD => {
+            crate::i18n::get_required_cli_string(
+                "cli-doctor-security-audit-disabled-drops-certificate-record",
+            )
+        }
         _ => warning.message.clone(),
     }
 }
@@ -1540,6 +1651,73 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
         let agent_ws = config.agent_workspace_dir(alias);
         check_agent_file(&agent_ws, "SOUL.md", alias, cat, items);
         check_agent_file(&agent_ws, "AGENTS.md", alias, cat, items);
+        check_agent_bootstrap_truncation(config, alias, &agent_ws, cat, items);
+    }
+}
+
+/// Prospective check of the per-file bootstrap cap the agent-loop and
+/// channel prompt paths apply, not a record of what any one turn sent:
+/// ACP (`Agent`) sessions build their prompt through
+/// `personality::load_personality_files`, whose separate file list and
+/// 20000-character cap this check does not describe; AIEOS identities are
+/// skipped because they load no Markdown bootstrap file at all; and
+/// `BOOTSTRAP.md` and `MEMORY.md` are only injected on turns that include
+/// them. Warns once per over-cap file with the counts the per-file stage
+/// retains, measured through the same function prompt injection uses. Files
+/// that are missing, empty, or under the cap stay silent.
+fn check_agent_bootstrap_truncation(
+    config: &Config,
+    alias: &str,
+    workspace_dir: &Path,
+    cat: &'static str,
+    items: &mut Vec<DiagItem>,
+) {
+    // AIEOS identities return from `append_project_context` before any
+    // Markdown bootstrap file loads; a configured-but-unloadable AIEOS
+    // identity falls back to the Markdown files, which doctor then
+    // under-reports rather than misreports.
+    let Some(agent_cfg) = config.agents.get(alias) else {
+        return;
+    };
+    if crate::identity::is_aieos_configured(&agent_cfg.identity) {
+        return;
+    }
+    let compact = config.effective_compact_context(alias);
+    let limit = if compact {
+        COMPACT_BOOTSTRAP_MAX_CHARS
+    } else {
+        BOOTSTRAP_MAX_CHARS
+    };
+    let profile = agent_cfg.runtime_profile.trim();
+    for &name in BOOTSTRAP_FILES.iter().chain(CONDITIONAL_BOOTSTRAP_FILES) {
+        let Ok(content) = std::fs::read_to_string(workspace_dir.join(name)) else {
+            continue;
+        };
+        let (_, Some(truncation)) = truncate_bootstrap_content(&content, limit) else {
+            continue;
+        };
+        let retained = truncation.retained_chars.to_string();
+        let total = truncation.total_chars.to_string();
+        let discarded = truncation.discarded_chars().to_string();
+        let limit_arg = limit.to_string();
+        let mut args = vec![
+            ("alias", alias),
+            ("file", name),
+            ("retained", retained.as_str()),
+            ("total", total.as_str()),
+            ("discarded", discarded.as_str()),
+            ("limit", limit_arg.as_str()),
+        ];
+        let key = if !compact {
+            "cli-doctor-bootstrap-file-truncated"
+        } else if profile.is_empty() {
+            "cli-doctor-bootstrap-file-truncated-compact-no-profile"
+        } else {
+            args.push(("profile", profile));
+            "cli-doctor-bootstrap-file-truncated-compact"
+        };
+        let msg = crate::i18n::get_required_cli_string_with_args(key, &args);
+        items.push(DiagItem::warn(cat, msg));
     }
 }
 
@@ -1878,6 +2056,53 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn local_hailo_alias_does_not_warn_for_missing_api_key() {
+        let mut config = Config::default();
+        config.providers.models.hailo_ollama.insert(
+            "edge".to_string(),
+            zeroclaw_config::schema::HailoOllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("qwen3:1.7b".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("hailo_ollama.edge: no api_key set")),
+            "local Hailo aliases must not receive a cloud-credential warning"
+        );
+    }
+
+    #[test]
+    fn non_hailo_local_alias_keeps_existing_missing_api_key_warning() {
+        let mut config = Config::default();
+        config.providers.models.llamacpp.insert(
+            "edge".to_string(),
+            zeroclaw_config::schema::LlamacppModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("local-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("llamacpp.edge: no api_key set")),
+            "other local families must retain their established API-key warning"
+        );
+    }
+
+    #[test]
     fn collapse_model_probes_groups_identical_and_breaks_divergent() {
         use ModelProbe::{Err as E, Ok as K};
         let probes = vec![
@@ -2014,6 +2239,142 @@ mod tests {
     }
 
     #[test]
+    fn tts_doctor_warns_for_keyless_gated_provider() {
+        let mut config = Config::default();
+        config.providers.tts.openai.insert(
+            "stoa".to_string(),
+            zeroclaw_config::schema::OpenAITtsProviderConfig {
+                base: zeroclaw_config::schema::TtsProviderConfig {
+                    uri: Some("http://localhost:8880/v1/audio/speech".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("providers.tts.openai.stoa"))
+            .expect("keyless openai TTS provider must produce a doctor item");
+        assert_eq!(item.severity, Severity::Warn);
+        assert!(
+            item.message.contains("will NOT register"),
+            "message: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn tts_doctor_ok_for_keyed_provider() {
+        let mut config = Config::default();
+        config.providers.tts.openai.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::OpenAITtsProviderConfig {
+                base: zeroclaw_config::schema::TtsProviderConfig {
+                    api_key: Some("sk-test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("providers.tts.openai.default"))
+            .expect("keyed openai TTS provider must produce a doctor item");
+        assert_eq!(item.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn tts_doctor_no_warning_for_keyless_families() {
+        let mut config = Config::default();
+        config.providers.tts.edge.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::EdgeTtsProviderConfig::default(),
+        );
+        config.providers.tts.piper.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::PiperTtsProviderConfig::default(),
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("providers.tts.edge") || m.contains("providers.tts.piper")),
+            "edge/piper have no api_key gate and must not produce an api_key item: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn transcription_doctor_warns_for_keyless_gated_provider() {
+        let mut config = Config::default();
+        config.providers.transcription.groq.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig::default(),
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("providers.transcription.groq.default"))
+            .expect("keyless groq transcription provider must produce a doctor item");
+        assert_eq!(item.severity, Severity::Warn);
+        assert!(
+            item.message.contains("will NOT register"),
+            "message: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn transcription_doctor_ok_for_keyed_provider() {
+        let mut config = Config::default();
+        config.providers.transcription.groq.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("gsk-test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("providers.transcription.groq.default"))
+            .expect("keyed groq transcription provider must produce a doctor item");
+        assert_eq!(item.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn transcription_doctor_no_warning_for_local_whisper() {
+        let mut config = Config::default();
+        config.providers.transcription.local_whisper.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+                uri: "http://localhost:8001/inference".to_string(),
+                bearer_token: None,
+                language: None,
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 30,
+            },
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("providers.transcription.local_whisper")),
+            "local_whisper has no api_key concept and must not produce an api_key item: {messages:?}"
+        );
+    }
+
+    #[test]
     fn context_window_diagnostics_distinguish_unset_explicit_and_zero_profiles() {
         let mut unset = Config::default();
         let profile = unset
@@ -2104,6 +2465,26 @@ mod tests {
         let ch_item = items.iter().find(|i| i.message.contains("channel"));
         assert!(ch_item.is_some());
         assert_eq!(ch_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn diagnose_surfaces_codex_cli_security_boundary_warning() {
+        let mut config = Config::default();
+        config.codex_cli.extra_args =
+            vec!["--sandbox".to_string(), "danger-full-access".to_string()];
+
+        let results = diagnose(&config);
+        let warning = results.iter().find(|item| {
+            item.category == "config"
+                && item.severity == Severity::Warn
+                && item.message.contains("Codex CLI argument")
+                && item.message.contains("--sandbox")
+                && item.message.contains("codex_cli.extra_args[0]")
+        });
+        assert!(
+            warning.is_some(),
+            "doctor should surface the canonical Codex CLI warning: {results:?}"
+        );
     }
 
     #[test]
@@ -2232,6 +2613,45 @@ mod tests {
         assert_eq!(
             canonicalize_provider_ref("openrouter.work"),
             "openrouter.work"
+        );
+    }
+
+    /// Lost-update regression: concurrent refreshes for different providers
+    /// each read-merge-publish the whole cache file, so without the advisory
+    /// lock one publish can silently drop another's entry. Every concurrently
+    /// written provider must survive.
+    #[test]
+    fn persist_model_cache_concurrent_refreshes_keep_every_provider() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+
+        let providers: Vec<String> = (0..8).map(|i| format!("provider{i}")).collect();
+        std::thread::scope(|scope| {
+            for provider in &providers {
+                let config = &config;
+                scope.spawn(move || {
+                    for round in 0..5 {
+                        persist_model_cache(config, provider, &[format!("m{round}")]).unwrap();
+                    }
+                });
+            }
+        });
+
+        let raw = std::fs::read_to_string(tmp.path().join("state/models_cache.json")).unwrap();
+        let cache: zeroclaw_config::schema::ModelCacheState = serde_json::from_str(&raw).unwrap();
+        let mut cached: Vec<&str> = cache
+            .entries
+            .iter()
+            .map(|e| e.model_provider.as_str())
+            .collect();
+        cached.sort_unstable();
+        let expected: Vec<String> = providers
+            .iter()
+            .map(|p| canonicalize_provider_ref(p))
+            .collect();
+        assert_eq!(
+            cached, expected,
+            "a concurrent refresh must not lose another provider's entry"
         );
     }
 
@@ -2944,21 +3364,286 @@ mod tests {
     }
 
     #[test]
-    fn skills_prompt_deprecation_warning_uses_fluent() {
+    fn check_workspace_reports_bootstrap_files_over_the_compact_cap() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        // No runtime profile: compact_context defaults on, so the cap is 6000.
+        add_enabled_agent(&mut config, "alpha");
+
+        let ws = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(7_000)).unwrap();
+        std::fs::write(ws.join("SOUL.md"), "s".repeat(100)).unwrap();
+        std::fs::write(ws.join("MEMORY.md"), "m".repeat(6_500)).unwrap();
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        let warns: Vec<&DiagItem> = items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .collect();
+        let warn_messages: Vec<&str> = warns.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(
+            warns.len(),
+            2,
+            "only the two over-cap rows: {warn_messages:?}"
+        );
+        assert!(warns.iter().any(|item| {
+            item.message.contains("[alpha] AGENTS.md: ")
+                && item
+                    .message
+                    .contains("per-file cap retains 6000 of 7000 chars (1000 discarded")
+        }));
+        assert!(warns.iter().any(|item| {
+            item.message.contains("[alpha] MEMORY.md: ")
+                && item
+                    .message
+                    .contains("per-file cap retains 6000 of 6500 chars (500 discarded")
+        }));
+        assert!(
+            warns
+                .iter()
+                .all(|item| item.message.contains("runtime_profile = \"<name>\"")),
+            "the no-profile variant says to create and assign a profile: {warn_messages:?}"
+        );
+        assert!(
+            !warns
+                .iter()
+                .any(|item| item.message.contains("[runtime_profiles.<profile>]")),
+            "the no-profile variant must not point at an unassigned profile section: {warn_messages:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("SOUL.md: per-file cap")),
+            "SOUL.md is under the cap and must stay quiet"
+        );
+    }
+
+    #[test]
+    fn check_workspace_names_the_assigned_profile_when_one_is_set() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        config.runtime_profiles.insert(
+            "nightly".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                compact_context: None,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "nightly".into(),
+                ..Default::default()
+            },
+        );
+
+        let ws = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("SOUL.md"), "s".repeat(100)).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(7_000)).unwrap();
+        std::fs::write(ws.join("MEMORY.md"), "m".repeat(6_500)).unwrap();
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        let agents_row = items
+            .iter()
+            .find(|item| {
+                item.message.contains("[alpha] AGENTS.md: ")
+                    && item
+                        .message
+                        .contains("per-file cap retains 6000 of 7000 chars")
+            })
+            .expect("one over-cap AGENTS.md row");
+        assert!(
+            agents_row
+                .message
+                .contains("per-file cap retains 6000 of 7000 chars (1000 discarded"),
+            "counts come through the shared helper: {}",
+            agents_row.message
+        );
+        assert!(
+            agents_row.message.contains("[runtime_profiles.nightly]"),
+            "the compact variant names the assigned profile: {}",
+            agents_row.message
+        );
+        assert!(
+            !agents_row.message.contains("<name>"),
+            "an assigned profile replaces the <name> placeholder: {}",
+            agents_row.message
+        );
+    }
+
+    #[test]
+    fn check_workspace_skips_bootstrap_truncation_for_aieos_identities() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        config.agents.insert(
+            "nova".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                identity: zeroclaw_config::schema::IdentityConfig {
+                    format: "aieos".into(),
+                    aieos_inline: Some(r#"{"identity":{"names":{"first":"Nova"}}}"#.into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let ws = config.agent_workspace_dir("nova");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(7_000)).unwrap();
+        std::fs::write(ws.join("SOUL.md"), "s".repeat(100)).unwrap();
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("per-file cap")),
+            "an AIEOS identity loads no Markdown bootstrap file, so no truncation row: {:?}",
+            items.iter().map(|i| i.message.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("[nova] SOUL.md present")),
+            "the SOUL.md presence row still appears"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("[nova] AGENTS.md present")),
+            "the AGENTS.md presence row still appears"
+        );
+    }
+
+    #[test]
+    fn check_workspace_uses_the_full_cap_when_compact_context_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        config.runtime_profiles.insert(
+            "wide".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                compact_context: Some(false),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "wide".into(),
+                ..Default::default()
+            },
+        );
+
+        let ws = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("SOUL.md"), b"# soul").unwrap();
+
+        // Over the compact cap but far under the full cap: no truncation row.
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(7_000)).unwrap();
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("per-file cap")),
+            "7000 chars is under the full cap and must stay quiet: {:?}",
+            items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+
+        // Over the 20000-char full cap: one row, without the compact knob.
+        std::fs::write(ws.join("AGENTS.md"), "a".repeat(20_500)).unwrap();
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+        let warns: Vec<&DiagItem> = items
+            .iter()
+            .filter(|item| item.severity == Severity::Warn)
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "only the over-cap AGENTS.md row: {}",
+            warns
+                .iter()
+                .map(|i| i.message.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        assert!(
+            warns[0].message.contains("[alpha] AGENTS.md: ")
+                && warns[0]
+                    .message
+                    .contains("per-file cap retains 20000 of 20500 chars (500 discarded")
+        );
+        assert!(
+            !warns[0].message.contains("compact_context = false"),
+            "the non-compact variant must not name the knob: {}",
+            warns[0].message
+        );
+    }
+
+    /// `doctor` renders this warning through Fluent rather than printing the
+    /// structured message verbatim. The structured message stays English on
+    /// purpose — API consumers key off a stable contract — so the two are
+    /// asserted to differ rather than to agree.
+    #[test]
+    fn verifiable_intent_withheld_warning_uses_fluent() {
+        let structured_message = "verifiable_intent.enabled is set, but the vi_verify tool is \
+                                  withheld from the model-visible registry until a credential \
+                                  chain verifier exists.";
         let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
-            "skills_prompt_injection_mode_full_deprecated",
-            "unlocalized fallback",
-            "skills.prompt_injection_mode",
+            zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD,
+            structured_message,
+            "verifiable_intent.enabled",
+        );
+
+        let expected =
+            crate::i18n::get_required_cli_string("cli-doctor-verifiable-intent-tool-withheld");
+        assert_eq!(localized_validation_warning_message(&warning), expected);
+        assert_ne!(
+            expected, structured_message,
+            "the localized line must not be the structured API message"
+        );
+        assert_ne!(
+            expected, "{cli-doctor-verifiable-intent-tool-withheld}",
+            "the Fluent key must resolve; a marker means it is absent from every catalog"
+        );
+
+        // The diagnostic path is what an operator edits, so it stays the
+        // config key rather than being folded into the localized sentence.
+        assert_eq!(warning.path, "verifiable_intent.enabled");
+    }
+
+    #[test]
+    fn disabled_security_audit_warning_uses_fluent() {
+        let structured_message = "structured API fallback";
+        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
+            zeroclaw_config::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+            structured_message,
+            "security.audit.enabled",
         );
 
         let expected = crate::i18n::get_required_cli_string(
-            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
+            "cli-doctor-security-audit-disabled-drops-certificate-record",
         );
         assert_eq!(localized_validation_warning_message(&warning), expected);
-        assert_ne!(expected, "unlocalized fallback");
+        assert_ne!(expected, structured_message);
         assert_ne!(
-            expected,
-            "{cli-doctor-skills-prompt-injection-mode-full-deprecated}"
+            expected, "{cli-doctor-security-audit-disabled-drops-certificate-record}",
+            "the Fluent key must resolve; a marker means it is absent from every catalog"
+        );
+        assert!(
+            expected.contains("Command execution is not audited"),
+            "the operator line must scope the gap to command execution: {expected}"
         );
     }
 

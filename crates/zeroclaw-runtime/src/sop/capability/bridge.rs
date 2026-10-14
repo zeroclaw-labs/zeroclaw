@@ -47,6 +47,7 @@ where
 /// `what` names the operation for thread naming and error text. The timeout runs
 /// inside the bridge runtime, so its elapsed branch drops the pending future
 /// before this function returns.
+#[cfg(test)]
 pub(super) fn run_bridged<T, F>(fut: F, timeout: Duration, what: &str) -> Result<T, String>
 where
     T: Send + 'static,
@@ -75,6 +76,57 @@ where
         Err(_) => {
             let _ = handle.join();
             Err(format!("{what} task died before reporting a result"))
+        }
+    }
+}
+
+/// Run a provider-backed bridge without flattening its typed error chain.
+///
+/// SOP delivery needs to distinguish an infrastructure failure created by the
+/// bridge from a terminal-completion cause reported by the model provider.
+pub(super) fn run_bridged_anyhow<T, F>(fut: F, timeout: Duration, what: &str) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    let timeout_error = format!(
+        "timed out after {}s waiting for the {what}",
+        timeout.as_secs()
+    );
+    let (tx, rx) = sync_channel(1);
+    let handle = std::thread::Builder::new()
+        .name(format!("sop-bridge-{what}"))
+        .spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt.block_on(async move {
+                    match tokio::time::timeout(timeout, fut).await {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::Error::msg(timeout_error)),
+                    }
+                }),
+                Err(error) => Err(anyhow::Error::msg(format!(
+                    "bridge runtime build failed: {error}"
+                ))),
+            };
+            let _ = tx.send(result);
+        })
+        .map_err(|error| {
+            anyhow::Error::msg(format!("failed to spawn the {what} bridge thread: {error}"))
+        })?;
+
+    match rx.recv() {
+        Ok(result) => {
+            let _ = handle.join();
+            result
+        }
+        Err(_) => {
+            let _ = handle.join();
+            Err(anyhow::Error::msg(format!(
+                "{what} task died before reporting a result"
+            )))
         }
     }
 }

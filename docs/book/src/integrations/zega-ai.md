@@ -38,9 +38,17 @@ ZeroClaw itself.
 > Connecting without setting the gateway port to match the active ZeroClaw
 > daemon will cause the bridge to report an offline/unreachable state before
 > pairing can occur.
+>
+> Remotely reachable gateways should use HTTPS or an authenticated tunnel (such as WireGuard, Tailscale, or an SSH tunnel) rather than plain HTTP to protect bearer credentials transmitted in the `Authorization` header.
 
 The bridge implements the two pairing contracts exposed by the ZeroClaw
 gateway and tries them in order:
+
+> **Pairing codes are case-sensitive, and their shape is configurable.**
+> `[gateway.pairing_code]` sets the length (`6`–`128`) and the character
+> family (`numeric`, `alphanumeric`, or `unambiguous`); the default is 32
+> case-sensitive alphanumeric characters. Transmit the code verbatim: do
+> not upper-case it, strip characters, or assume a fixed width.
 
 ### Enhanced route: `POST /api/pair`
 
@@ -48,7 +56,7 @@ Accepts a JSON body:
 
 ```json
 {
-  "code": "<6-digit pairing code>",
+  "code": "<pairing code>",
   "device_name": "ZEGA AI Bridge",
   "device_type": "api-bridge"
 }
@@ -67,7 +75,7 @@ Sends the pairing code in the `X-Pairing-Code` header:
 ```text
 POST /pair
 Content-Type: application/json
-X-Pairing-Code: <6-digit code>
+X-Pairing-Code: <pairing code>
 ```
 
 The bridge falls back to this route when the enhanced endpoint is
@@ -83,23 +91,24 @@ Upstream handler: `handle_pair`
 
 | Component | Role |
 |---|---|
-| `ZeroClawGatewayClient` | HTTP client with `AbortController` timeouts and automatic retry with exponential back-off. Falls back to an offline error state when the daemon is unreachable. |
+| `ZeroClawGatewayClient` | HTTP client with a 5-second default request and health timeout, `AbortController` cancellation, and automatic retry with exponential back-off. Falls back to an offline error state when the daemon is unreachable. |
 | `ZeroClawAuthManager` | Manages the pairing flow (enhanced → legacy fallback) and generates `Authorization: Bearer <token>` headers for authenticated endpoints. |
 | Version matrix | Client-side version check targeting numeric bounds `>=0.8.0 <0.9.0` (target `v0.8.3`). The current client helper strips prerelease suffixes prior to comparison and evaluates numeric components (`major.minor.patch`). This range reflects design intent and has **not** been verified against a live daemon. |
 
 ## What the smoke test covers
 
 The bridge ships a smoke test (`pnpm --filter @zega/zeroclaw-bridge test:smoke`)
-that validates the following **offline / unit-level** behavior:
+with 18 assertions that validate the following **offline / unit-level** behavior:
 
-- Numeric version parsing and comparison.
-- Version compatibility matrix for numeric bounds (compatible, too-old, exceeds-max).
-- Auth manager initialization and `Authorization` header formatting.
-- Gateway client offline resilience (graceful error state, no crash).
-- Error class hierarchy instantiation.
+- SemVer parsing and comparison.
+- Version compatibility boundaries (compatible, too old, exceeds the maximum).
+- Auth-manager token storage, bearer-header construction, and offline `getState()` behavior.
+- Gateway error constructors and fields.
 
 The smoke test does **not** start a ZeroClaw daemon, exchange a pairing
 code, or call any gateway endpoint over HTTP.
+
+It does not exercise the enhanced-to-legacy pairing fallback or rate-limit escalation branches.
 
 ## External reference
 

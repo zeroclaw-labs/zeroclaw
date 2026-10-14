@@ -23,6 +23,40 @@ Local-bound by default. Over-the-network access requires TLS termination at
 the gateway or in front of it; the per-property and PATCH endpoints are not
 safe to expose unauthenticated regardless of TLS posture.
 
+## Channel-plugin webhook ingress
+
+Builds with WASM plugin support expose `GET` and `POST /plugin/{path}` when a running,
+explicitly configured channel plugin claims that path. This is a raw transport
+boundary: the gateway preserves the HTTP method, raw query, body bytes, and
+lowercase UTF-8 headers in a typed request to the component's `parse-webhook`
+export. The component verifies its platform request with its scoped secret and
+returns either normalized messages or an explicit challenge reply. The request
+never runs an agent turn inline; replies never enter the agent queue.
+
+A claimed path must be 1–64 ASCII letters, digits,
+hyphens, or underscores. Duplicate or invalid claimants are rejected before the
+daemon atomically publishes its runtime route map.
+
+| Status | Public body | Meaning |
+|---|---|---|
+| `200` | empty or challenge text | The verified request delivered authorized messages, ignored duplicates/denied senders, or returned a response-only challenge of at most 4096 UTF-8 bytes. |
+| `400` | `invalid webhook` | The guest authenticated the request but rejected its payload shape. |
+| `401` | `unauthorized webhook` | Guest platform-authenticity verification failed. |
+| `404` | `webhook not found` | No live plugin channel owns the path. |
+| `405` | empty, `Allow: GET, POST` header | `HEAD` or another unsupported method; the component is not invoked. |
+| `429` | rate-limit JSON or `webhook queue full` | The canonical per-client webhook limit or the route's bounded queue rejected admission. |
+| `502` | `invalid webhook response` | A component response exceeded the 4096-byte limit. |
+| `503` | `webhook unavailable` | The component, host service, or downstream channel receiver is unavailable. |
+| `504` | `webhook processing timed out` | The ten-second request lifetime cancelled parsing or delivery. |
+
+The gateway never returns guest, Wasmtime, secret, config, or downstream error
+detail on this unauthenticated surface. Those details are bounded and logged
+with plugin attribution. The standard 64 KiB gateway body ceiling applies.
+After guest authentication, the host applies the live peer group for
+`plugin.<alias>` before idempotency reservation and delivery. Stable message IDs
+use route-namespaced, ownership-safe reservations: an in-flight duplicate waits
+for commit or rollback instead of being acknowledged prematurely.
+
 ## Discovering the surface
 
 Two endpoints answer the question "what can I do here?":
@@ -39,6 +73,26 @@ Two endpoints answer the question "what can I do here?":
 CORS preflight requests (those carrying `Access-Control-Request-Method`) get
 the standard preflight response and short-circuit before the schema body is
 returned.
+
+`GET /api/plugins` returns the authenticated, read-only package catalog used by
+the dashboard. It materializes one row per package name from host-admitted
+installed manifests and the already-cached registry, using the same unpinned
+registry selection rule as `plugin install`. Installed and registry records
+remain separate so clients can show both versions without guessing that an
+upgrade exists. The endpoint performs no registry fetch and no mutation.
+
+The route exists in every gateway build. When WASM plugin support is absent it
+returns `wasm_plugins_available: false` and an empty package source rather than
+a 404. `[plugins].enabled` is reported as configuration intent, not runtime
+health. Stable `issues` codes distinguish source failures from a valid empty
+catalog while detailed diagnostics remain in gateway logs. Registry download
+URLs and the cached registry URL are never returned; an available record only
+exposes inert `name@version` install identity.
+
+Catalog discovery runs on a blocking worker because host admission reads and
+verifies installed WASM payloads. Only one scan runs at a time; a concurrent
+request receives `503 Service Unavailable` and may retry. The endpoint does not
+cache admitted package state between requests.
 
 ## Per-property CRUD
 

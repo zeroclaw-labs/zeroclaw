@@ -6,69 +6,7 @@ import { getIntegrations } from '@/lib/api';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import type { BadgeTone } from '@/components/ui';
-
-/**
- * Derive a channel-type slug from an integration's display name so a card can
- * link into the schema-driven Channels config. Lower-cased, trimmed, with runs
- * of non-alphanumerics collapsed to a single hyphen and edges trimmed.
- * Returns `null` when nothing slug-worthy remains, signalling the caller to
- * fall back to the bare Channels section.
- */
-function channelSlug(name: string): string | null {
-  const slug = name
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  return slug.length > 0 ? slug : null;
-}
-
-// Config-backed automations in the ToolsAutomation bucket that live under a
-// schema [section] (or a dedicated page) rather than on the Tools page. Keyed
-// by integration display name (lower-cased); this is exactly the set surfaced
-// by Config::integration_descriptors(). Everything else in the bucket is a
-// built-in tool, which the Tools page manages.
-//
-// MAINTENANCE: keys mirror the descriptor `display_name`s and values mirror the
-// schema `#[prefix]` section keys (crates/zeroclaw-config/src/schema.rs:
-// Browser→`browser`, "Google Workspace"→`google_workspace`; Cron→the /cron
-// page). Renaming either in the schema requires updating this table, or the
-// deep-link silently falls back to /tools.
-const TOOLS_AUTOMATION_ROUTES: Record<string, string> = {
-  cron: '/cron',
-  browser: '/config/browser',
-  'google workspace': '/config/google_workspace',
-};
-
-/** Where an integration's "Configure / Set up" CTA should land, routed by
- *  category. Returns null when the integration isn't configurable — Platform
- *  entries (macOS / Linux / Windows) are compile-time OS facts with nothing to
- *  set up — so the card renders as an inert status tile instead of dead-ending
- *  on the bare /config root. AI-model providers go to the model-providers
- *  section, chat platforms to channels, built-in tools to the Tools page
- *  (allow/block per risk profile), and Cron (a config-backed automation) to its
- *  own page. */
-function configHref(name: string, category: string): string | null {
-  const c = category.toLowerCase();
-  // Compile-time OS facts (macOS/Linux/Windows) — nothing to configure.
-  if (c === 'platform') return null;
-
-  const slug = channelSlug(name);
-  if (c.includes('model')) {
-    return slug ? `/config/providers.models/${slug}` : '/config/providers.models';
-  }
-  if (c.includes('chat') || c.includes('channel')) {
-    return slug ? `/config/channels/${slug}` : '/config/channels';
-  }
-  if (c.includes('tool') || c.includes('automation')) {
-    // Config-backed automations (Cron, Browser, Google Workspace) deep-link to
-    // their own config; every other entry here is a built-in tool managed on
-    // the Tools page.
-    return TOOLS_AUTOMATION_ROUTES[name.trim().toLowerCase()] ?? '/tools';
-  }
-  // Unknown / future category — the config root still beats a broken link.
-  return '/config';
-}
+import { configHref } from '@/pages/integrations.logic';
 
 function statusBadge(status: Integration['status']) {
   switch (status) {
@@ -211,7 +149,7 @@ export default function Integrations() {
               {items.map((integration) => {
                 const badge = statusBadge(integration.status);
                 const BadgeIcon = badge.icon;
-                const href = configHref(integration.name, integration.category);
+                const href = configHref(integration.name, integration.category, integration.key);
                 const ctaLabel =
                   integration.status === 'Active'
                     ? t('integrations.configure')

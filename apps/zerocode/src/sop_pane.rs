@@ -10,9 +10,14 @@ use ratatui::{
 
 use crate::client::{
     FlowRole, GraphLayout, GraphNode, GraphPin, GraphWire, NodeKind, NodeRunState, PinClass,
-    PlannedToolCall, RpcClient, SopDraft, SopGraphView, SopStep, SopStepKind, StepFailure,
-    SwitchRule,
+    PlannedToolCall, RpcClient, SopDraft, SopGraphView, SopRunStatusView, SopRunSummaryView,
+    SopStep, SopStepKind, StepFailure, SwitchRule,
 };
+
+/// Minimum spacing between `sops/runs` polls. Run state moves faster than
+/// the dashboard's aggregate counters, so the SOP pane polls harder (2s vs
+/// the dashboard's 5s) while still coalescing the 200ms event-loop ticks.
+const RUNS_POLL_INTERVAL_SECS: u64 = 2;
 
 pub(crate) struct SopPane {
     rpc: Arc<RpcClient>,
@@ -40,6 +45,37 @@ pub(crate) struct SopPane {
     pan_y: u16,
     canvas_rect: Rect,
     pan_drag: Option<(u16, u16, u16, u16)>,
+    /// Aggregated live status per SOP name, refreshed by [`SopPane::tick`]
+    /// and rendered as the leading icon on each list row.
+    run_status: std::collections::HashMap<String, SopRunStatusView>,
+    last_runs_poll: Option<std::time::Instant>,
+    /// Gates every mutating surface (run, create, edit, delete, checkpoint
+    /// decisions) while leaving selection, graph viewing, run overlays, and
+    /// panning live. The TUI ships as a status view first; authoring and run
+    /// controls stay behind this flag until they are green-lit.
+    read_only: bool,
+    /// The receiver is the single source of truth for whether a refresh is in
+    /// flight. Keeping the RPC off the event loop prevents a degraded daemon
+    /// from freezing input and rendering for the client timeout window.
+    runs_poll_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<Result<Vec<SopRunSummaryView>, String>>>,
+    /// Poll freshness is independent from action errors. A failed refresh
+    /// retains the last successful map and marks it stale until recovery.
+    runs_poll_stale: bool,
+    /// Background SOP-name refresh. This is intentionally separate from the
+    /// run-status receiver so list refreshes cannot affect poll freshness or
+    /// later run-control conflict resolution.
+    list_refresh_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<Vec<String>, String>>>,
+    list_refresh_task: Option<tokio::task::JoinHandle<()>>,
+    /// A successful mutation projects locally first, then asks for one
+    /// authoritative replacement after any older list response is discarded.
+    list_refresh_follow_up: bool,
+    /// A request that spans a focus generation is no longer authoritative for
+    /// the pane the user re-entered. Queue one replacement after it settles.
+    list_refresh_stale_on_refocus: bool,
+    /// List-refresh failures retain the projected names and do not overwrite
+    /// the action error shown for create/save/delete/graph operations.
+    list_refresh_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -196,6 +232,36 @@ fn num_csv(list: &[u32]) -> String {
         .map(|n| n.to_string())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// What submitting the editor should do about the SOP's name.
+///
+/// `sops/save` persists under the submitted SOP's own name, so saving a
+/// renamed draft would write a second SOP and leave the original standing.
+/// The move is its own collision-checked call, and the edits have to land on
+/// the SOP they were made against first: moving first would strand a renamed
+/// SOP holding unsaved edits if the save then failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SopSubmitPlan {
+    Create,
+    Save,
+    SaveThenRename { from: String, to: String },
+}
+
+/// Decide the plan from the editor's mode, the name the edit started under,
+/// and the name the draft carries now. Both names arrive already trimmed, the
+/// same form `to_sop_json` persists.
+fn plan_submit(create: bool, original_name: Option<&str>, draft_name: &str) -> SopSubmitPlan {
+    if create {
+        return SopSubmitPlan::Create;
+    }
+    match original_name {
+        Some(original) if original != draft_name => SopSubmitPlan::SaveThenRename {
+            from: original.to_string(),
+            to: draft_name.to_string(),
+        },
+        _ => SopSubmitPlan::Save,
+    }
 }
 
 fn switch_to_text(rules: &[SwitchRule]) -> String {
@@ -399,6 +465,17 @@ fn trigger_source_walk(registry: &crate::client::TriggerSourceRegistryView) -> V
     sources
 }
 
+/// Actions gated off while the pane is a read-only status view. Everything
+/// that mutates SOPs or run state (run, authoring, checkpoint decisions) is
+/// blocked; selection, graph viewing, run watching, and panning stay live.
+fn blocked_when_read_only(action: crate::keymap::SopTabAction) -> bool {
+    use crate::keymap::SopTabAction as S;
+    matches!(
+        action,
+        S::Run | S::New | S::Edit | S::Delete | S::Approve | S::Deny
+    )
+}
+
 fn failure_label(f: &StepFailure) -> String {
     match f {
         StepFailure::Fail => "fail".to_string(),
@@ -460,6 +537,17 @@ impl RunOverlayView {
     }
 }
 
+fn parse_sop_names(value: serde_json::Value) -> Result<Vec<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        name: String,
+    }
+
+    serde_json::from_value::<Vec<Named>>(value)
+        .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+        .map_err(|error| format!("parse SOP list: {error}"))
+}
+
 impl SopPane {
     pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
         Self {
@@ -488,6 +576,16 @@ impl SopPane {
             pan_y: 0,
             canvas_rect: Rect::new(0, 0, 0, 0),
             pan_drag: None,
+            run_status: std::collections::HashMap::new(),
+            last_runs_poll: None,
+            read_only: true,
+            runs_poll_rx: None,
+            runs_poll_stale: false,
+            list_refresh_rx: None,
+            list_refresh_task: None,
+            list_refresh_follow_up: false,
+            list_refresh_stale_on_refocus: false,
+            list_refresh_error: None,
         }
     }
 
@@ -498,22 +596,210 @@ impl SopPane {
             .map(String::as_str)
     }
 
-    pub(crate) async fn refresh(&mut self) {
-        match self.rpc.sops_list().await {
-            Ok(value) => {
-                #[derive(serde::Deserialize)]
-                struct Named {
-                    name: String,
-                }
-                self.names = serde_json::from_value::<Vec<Named>>(value)
-                    .map(|v| v.into_iter().map(|n| n.name).collect())
-                    .unwrap_or_default();
-                self.error = None;
-                if self.list_state.selected().is_none() && !self.names.is_empty() {
-                    self.list_state.select(Some(0));
-                }
+    /// Whether the pane currently owns a text prompt.
+    ///
+    /// The read-only surface keeps Watch available, so its run-id prompt must
+    /// suppress global text chords just like the other zerocode inputs. Keep
+    /// this derived from the prompt buffers rather than introducing parallel
+    /// focus state.
+    pub(crate) fn wants_text_input(&self) -> bool {
+        self.run_input.is_some() || self.run_payload_input.is_some()
+    }
+
+    /// Let an active, non-empty prompt keep word-navigation chords that would
+    /// otherwise switch the global pane.
+    pub(crate) fn claims_pane_navigation(&self, key: &crossterm::event::KeyEvent) -> bool {
+        let has_text = self
+            .run_input
+            .as_ref()
+            .or(self.run_payload_input.as_ref())
+            .is_some_and(|buffer| !buffer.is_empty());
+        has_text && crate::keymap::input_bar_claims_pane_navigation(key)
+    }
+
+    /// Route bracketed paste into whichever SOP prompt is active.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if let Some(buffer) = self.run_input.as_mut() {
+            // Run IDs are single-line identifiers. Ignore terminal control
+            // characters rather than letting pasted newlines corrupt the RPC
+            // argument or trigger unrelated global handling.
+            buffer.extend(text.chars().filter(|character| !character.is_control()));
+        } else if let Some(buffer) = self.run_payload_input.as_mut() {
+            // JSON permits insignificant whitespace, including newlines.
+            buffer.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        }
+    }
+
+    /// Called on every event-loop tick while the SOP pane is focused. A single
+    /// unfiltered request covers every row, and the request runs outside the
+    /// event loop so a slow daemon cannot block terminal input or rendering.
+    pub(crate) fn tick(&mut self) {
+        self.drain_list_refresh();
+        self.drain_runs_poll();
+        if self.runs_poll_rx.is_some() {
+            return;
+        }
+        let should_poll = self
+            .last_runs_poll
+            .map(|t| t.elapsed().as_secs() >= RUNS_POLL_INTERVAL_SECS)
+            .unwrap_or(true);
+        if !should_poll {
+            return;
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.runs_poll_rx = Some(rx);
+        let rpc = Arc::clone(&self.rpc);
+        tokio::spawn(async move {
+            let result = rpc.sops_runs(None).await.map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn drain_runs_poll(&mut self) {
+        let Some(rx) = self.runs_poll_rx.as_mut() else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err("run-status poll ended without a response".to_string())
             }
-            Err(e) => self.error = Some(e.to_string()),
+        };
+
+        self.runs_poll_rx = None;
+        // The throttle window starts after the response, so a five-second
+        // timeout cannot cause an immediate retry on the next event-loop tick.
+        self.last_runs_poll = Some(std::time::Instant::now());
+        let Ok(runs) = result else {
+            self.runs_poll_stale = true;
+            return;
+        };
+
+        let mut by_sop: std::collections::HashMap<String, Vec<SopRunSummaryView>> =
+            std::collections::HashMap::new();
+        for run in runs {
+            by_sop.entry(run.sop_name.clone()).or_default().push(run);
+        }
+        self.run_status = by_sop
+            .into_iter()
+            .filter_map(|(name, runs)| aggregate_sop_status(&runs).map(|s| (name, s)))
+            .collect();
+        self.runs_poll_stale = false;
+    }
+
+    pub(crate) fn refresh(&mut self) {
+        if std::mem::take(&mut self.list_refresh_stale_on_refocus) && self.list_refresh_rx.is_some()
+        {
+            self.list_refresh_follow_up = true;
+        }
+        self.request_list_refresh(false);
+    }
+
+    pub(crate) fn on_pane_blur(&mut self) {
+        if self.list_refresh_rx.is_some() {
+            self.list_refresh_stale_on_refocus = true;
+        }
+    }
+
+    fn request_list_refresh(&mut self, reconcile_after_mutation: bool) {
+        if self.list_refresh_rx.is_some() {
+            if reconcile_after_mutation {
+                self.list_refresh_follow_up = true;
+            }
+            return;
+        }
+        self.start_list_refresh();
+    }
+
+    fn start_list_refresh(&mut self) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.list_refresh_rx = Some(rx);
+        let rpc = Arc::clone(&self.rpc);
+        self.list_refresh_task = Some(tokio::spawn(async move {
+            let result = rpc
+                .sops_list()
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(parse_sop_names);
+            let _ = tx.send(result);
+        }));
+    }
+
+    fn drain_list_refresh(&mut self) {
+        let Some(rx) = self.list_refresh_rx.as_mut() else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err("SOP list refresh ended without a response".to_string())
+            }
+        };
+
+        self.list_refresh_rx = None;
+        self.reap_list_refresh_task();
+        if self.list_refresh_follow_up {
+            self.list_refresh_follow_up = false;
+            self.start_list_refresh();
+            return;
+        }
+
+        match result {
+            Ok(names) => {
+                self.replace_names(names);
+                self.list_refresh_error = None;
+            }
+            Err(error) => self.list_refresh_error = Some(error),
+        }
+    }
+
+    fn replace_names(&mut self, names: Vec<String>) {
+        let previous_selected_name = self.selected_name().map(String::from);
+        let selected_index = self.list_state.selected();
+        self.names = names;
+        let selected = previous_selected_name
+            .as_ref()
+            .and_then(|name| self.names.iter().position(|candidate| candidate == name))
+            .or_else(|| {
+                (!self.names.is_empty())
+                    .then(|| selected_index.unwrap_or(0).min(self.names.len() - 1))
+            });
+        self.list_state.select(selected);
+        if previous_selected_name.as_deref() != self.selected_name() {
+            self.clear_selected_sop_state();
+        }
+    }
+
+    fn clear_selected_sop_state(&mut self) {
+        self.graph = SopGraphView::default();
+        self.overlay = None;
+        self.current_run_id = None;
+        self.run_input = None;
+        self.run_payload_input = None;
+    }
+
+    fn project_saved_name(&mut self, name: &str) {
+        if !self.names.iter().any(|candidate| candidate == name) {
+            self.names.push(name.to_string());
+            self.names.sort_unstable();
+        }
+        self.list_state
+            .select(self.names.iter().position(|candidate| candidate == name));
+    }
+
+    fn project_deleted_name(&mut self, name: &str) {
+        self.names.retain(|candidate| candidate != name);
+        self.list_state
+            .select((!self.names.is_empty()).then_some(0));
+        self.clear_selected_sop_state();
+    }
+
+    fn reap_list_refresh_task(&mut self) {
+        if let Some(task) = self.list_refresh_task.take() {
+            task.abort();
         }
     }
 
@@ -648,6 +934,9 @@ impl SopPane {
             Some(SopTabAction::Up) => self.select_prev(),
             Some(SopTabAction::Down) => self.select_next(),
             Some(SopTabAction::Enter) => self.load_selected_graph().await,
+            // Mutating actions are inert while the pane is a read-only status
+            // view; Watch stays live because it only loads a run overlay.
+            Some(action) if self.read_only && blocked_when_read_only(action) => {}
             Some(SopTabAction::Run) => self.start_run_payload().await,
             Some(SopTabAction::Watch) => self.run_input = Some(String::new()),
             Some(SopTabAction::New) => {
@@ -733,7 +1022,9 @@ impl SopPane {
                 {
                     if self.editor.is_some() {
                         self.focus_editor_step(step);
-                    } else {
+                    } else if !self.read_only {
+                        // Node clicks open the step editor, a mutating
+                        // surface — inert in the read-only status view.
                         self.open_editor_for_step(step).await;
                     }
                     return;
@@ -892,8 +1183,8 @@ impl SopPane {
             Ok(_) => {
                 self.status = Some(format!("deleted {name}"));
                 self.overlay = None;
-                self.list_state.select(None);
-                self.refresh().await;
+                self.project_deleted_name(&name);
+                self.request_list_refresh(true);
             }
             Err(e) => self.error = Some(e.to_string()),
         }
@@ -1252,38 +1543,42 @@ impl SopPane {
         }
         let create = ed.create;
         let name = ed.draft.name.trim().to_string();
-        // Identity in edit mode is the name the edit started from. sops/save
-        // persists under the draft's name and overwrites that directory, so a
-        // rename would silently fork (new dir, old left behind) or clobber a
-        // different SOP. Reject renames until an explicit rename flow exists.
-        if let Some(original) = ed.original_name.as_deref()
-            && name != original
-        {
-            self.error = Some(format!(
-                "Renaming an SOP is not supported yet. Set the name back to \
-                 '{original}', or create a new SOP and delete the old one."
-            ));
-            return;
+        let plan = plan_submit(create, ed.original_name.as_deref(), &name);
+        let mut sop = ed.to_sop_json();
+        // A rename saves against the name the edit started under, so the edits
+        // land on the SOP they were made against rather than creating a second
+        // one under the new name.
+        if let SopSubmitPlan::SaveThenRename { from, .. } = &plan {
+            sop["name"] = serde_json::Value::String(from.clone());
         }
-        let sop = ed.to_sop_json();
         let result = if create {
             self.rpc.sops_create(sop).await
         } else {
             self.rpc.sops_save(sop).await
         };
-        match result {
-            Ok(_) => {
-                self.editor = None;
-                self.status = Some(format!("saved {name}"));
-                self.error = None;
-                self.refresh().await;
-                if let Some(i) = self.names.iter().position(|n| n == &name) {
-                    self.list_state.select(Some(i));
-                    self.load_selected_graph().await;
-                }
-            }
-            Err(e) => self.error = Some(e.to_string()),
+        if let Err(e) = result {
+            self.error = Some(e.to_string());
+            return;
         }
+        if let SopSubmitPlan::SaveThenRename { from, to } = &plan
+            && let Err(e) = self.rpc.sops_rename(from, to).await
+        {
+            // The edits are on disk under the old name. Say so, rather than
+            // reporting a bare failure the author would read as losing them.
+            // The list still needs refreshing, but the new name must not be
+            // projected: nothing on disk answers to it.
+            self.error = Some(format!(
+                "Saved as '{from}', but renaming to '{to}' failed: {e}"
+            ));
+            self.request_list_refresh(true);
+            return;
+        }
+        self.editor = None;
+        self.status = Some(format!("saved {name}"));
+        self.error = None;
+        self.project_saved_name(&name);
+        self.request_list_refresh(true);
+        self.load_selected_graph().await;
     }
 
     async fn submit_run_input(&mut self) {
@@ -1364,6 +1659,21 @@ impl SopPane {
 
     pub(crate) fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::keymap::SopTabAction as S;
+        if self.read_only {
+            // Advertise only the surfaces that are live in the read-only
+            // status view; mutating chords are inert and stay out of help.
+            return crate::widgets::HelpNode::entries(crate::help::entries_for([
+                S::Up,
+                S::Down,
+                S::Enter,
+                S::Watch,
+                S::Toggle,
+                S::PanLeft,
+                S::PanRight,
+                S::PanUp,
+                S::PanDown,
+            ]));
+        }
         crate::widgets::HelpNode::entries(crate::help::entries_for([
             S::Up,
             S::Down,
@@ -1390,7 +1700,17 @@ impl SopPane {
         let items: Vec<ListItem> = self
             .names
             .iter()
-            .map(|n| ListItem::new(Line::from(n.clone())))
+            .map(|n| {
+                let line = match self.run_status.get(n) {
+                    Some(status) => Line::from(vec![
+                        Span::raw(status_icon(*status)),
+                        Span::raw(" "),
+                        Span::raw(n.clone()),
+                    ]),
+                    None => Line::from(n.clone()),
+                };
+                ListItem::new(line)
+            })
             .collect();
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title("SOPs"))
@@ -1402,7 +1722,8 @@ impl SopPane {
         let visual = self.layer == RenderLayer::Visual;
         let title = self.right_title();
 
-        if visual && self.error.is_none() {
+        let visible_error = self.visible_error();
+        if visual && visible_error.is_none() {
             self.render_canvas(f, cols[1], &title);
             return;
         }
@@ -1410,8 +1731,8 @@ impl SopPane {
         self.handle_rects.clear();
         self.wire_rects.clear();
 
-        let body = if let Some(err) = &self.error {
-            err.clone()
+        let body = if let Some(err) = visible_error {
+            err
         } else if editing {
             self.editor_lines().join("\n")
         } else {
@@ -1421,6 +1742,20 @@ impl SopPane {
             .block(Block::default().borders(Borders::ALL).title(title))
             .wrap(Wrap { trim: false });
         f.render_widget(para, cols[1]);
+    }
+
+    fn visible_error(&self) -> Option<String> {
+        let mut errors = Vec::new();
+        if let Some(action) = &self.error {
+            errors.push(action.clone());
+        }
+        if let Some(list) = &self.list_refresh_error {
+            errors.push(list.clone());
+        }
+        if self.runs_poll_stale {
+            errors.push(crate::i18n::t("zc-sop-runs-stale"));
+        }
+        (!errors.is_empty()).then(|| errors.join("\n"))
     }
 
     fn right_title(&self) -> String {
@@ -1483,9 +1818,13 @@ impl SopPane {
         };
         if empty {
             let msg = if editor.is_some() {
-                "(no steps; Ctrl+n to add, then click handles to wire)"
+                "(no steps; Ctrl+n to add, then click handles to wire)".to_string()
+            } else if self.read_only {
+                // Authoring keys are inert in the read-only status view;
+                // don't advertise them.
+                crate::i18n::t("zc-sop-empty-read-only")
             } else {
-                "(no nodes; press n to author, e to edit)"
+                "(no nodes; press n to author, e to edit)".to_string()
             };
             f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }), inner);
             return;
@@ -1884,6 +2223,14 @@ impl SopPane {
     }
 }
 
+impl Drop for SopPane {
+    fn drop(&mut self) {
+        if let Some(task) = self.list_refresh_task.take() {
+            task.abort();
+        }
+    }
+}
+
 const ACTIVE_SPINNER: [&str; 4] = ["|>", "/>", "->", "\\>"];
 
 fn state_marker(state: NodeRunState, active_frame: &str) -> String {
@@ -2152,6 +2499,70 @@ fn render_editor_card(
     );
 }
 
+/// Collapse one SOP's run rows into the single status its list row shows.
+///
+/// Live runs always win over history: while anything is active the row
+/// reflects the engine, not the archive. Within the active set the rule is
+/// "loudest first" — a run parked on an operator decision outranks one that
+/// is merely executing, because the former is the only one that needs the
+/// user. `Unknown` (a status from a newer daemon) is deliberately ranked
+/// below every status we understand: it must never mask a real
+/// needs-input signal, but it still surfaces when it is all we have.
+///
+/// With no active runs the row falls back to the most recently started
+/// record. `started_at` is RFC3339, so a lexicographic max is a chronological
+/// max.
+fn aggregate_sop_status(runs: &[SopRunSummaryView]) -> Option<SopRunStatusView> {
+    /// Higher wins. A terminal status on a run the engine still lists as
+    /// active is a race between the run finishing and this poll, so it sits
+    /// at the floor — below `Unknown`, which at least might be a live state
+    /// this build does not know yet. Everything stays eligible, so a lone
+    /// active run always yields something.
+    fn liveness_rank(status: SopRunStatusView) -> u8 {
+        if status.needs_input() {
+            4
+        } else if status == SopRunStatusView::Running {
+            3
+        } else if status == SopRunStatusView::Pending {
+            2
+        } else if status.is_terminal() {
+            0
+        } else {
+            1
+        }
+    }
+
+    let best_active = runs
+        .iter()
+        .filter(|r| r.active)
+        .max_by(|a, b| {
+            liveness_rank(a.status)
+                .cmp(&liveness_rank(b.status))
+                .then_with(|| a.started_at.cmp(&b.started_at))
+        })
+        .map(|r| r.status);
+    if best_active.is_some() {
+        return best_active;
+    }
+
+    runs.iter()
+        .max_by(|a, b| a.started_at.cmp(&b.started_at))
+        .map(|r| r.status)
+}
+
+/// Row icon for an aggregated status. The palette is the accepted SOP status
+/// language: yellow in flight, blue awaiting a person, green completed, red
+/// failed or cancelled, and neutral white for an unknown future state.
+fn status_icon(status: SopRunStatusView) -> &'static str {
+    match status {
+        SopRunStatusView::Pending | SopRunStatusView::Running => "🟡",
+        SopRunStatusView::WaitingApproval | SopRunStatusView::PausedCheckpoint => "🔵",
+        SopRunStatusView::Completed => "🟢",
+        SopRunStatusView::Failed | SopRunStatusView::Cancelled => "🔴",
+        SopRunStatusView::Unknown => "⚪",
+    }
+}
+
 fn render_node_card(
     f: &mut Frame,
     area: Rect,
@@ -2210,10 +2621,63 @@ fn render_node_card(
 
 #[cfg(test)]
 mod tests {
-    use super::{CARD_H, CARD_W, COL_GAP, ROW_GAP, layout_slots, trigger_source_walk};
-    use crate::client::NodePosition;
-    use crate::client::{BoundTriggerSourceView, GraphLayout, TriggerSourceRegistryView};
+    use super::{CARD_H, CARD_W, COL_GAP, ROW_GAP, SopPane, layout_slots, trigger_source_walk};
+    use crate::client::{
+        BoundTriggerSourceView, GraphLayout, NodePosition, RpcClient, TriggerSourceRegistryView,
+    };
+    use crate::jsonrpc::RpcOutbound;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn test_pane() -> SopPane {
+        let (tx, _rx) = mpsc::channel::<String>(4);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        SopPane::new(Arc::new(RpcClient::with_rpc(rpc)))
+    }
+
+    #[test]
+    fn read_only_gate_blocks_exactly_the_mutating_actions() {
+        use crate::keymap::SopTabAction as S;
+        // Mutating surfaces stay inert in the status view.
+        for action in [S::Run, S::New, S::Edit, S::Delete, S::Approve, S::Deny] {
+            assert!(super::blocked_when_read_only(action), "{action:?}");
+        }
+        // Selection, viewing, watching, and panning stay live.
+        for action in [
+            S::Up,
+            S::Down,
+            S::Enter,
+            S::Watch,
+            S::Toggle,
+            S::PanLeft,
+            S::PanRight,
+            S::PanUp,
+            S::PanDown,
+        ] {
+            assert!(!super::blocked_when_read_only(action), "{action:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_prompt_owns_text_navigation_and_bracketed_paste() {
+        let mut pane = test_pane();
+        assert!(!pane.wants_text_input());
+
+        pane.run_input = Some(String::new());
+        assert!(pane.wants_text_input());
+        assert!(!pane.claims_pane_navigation(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT,)));
+
+        pane.handle_paste("run-123\r\n");
+        assert_eq!(pane.run_input.as_deref(), Some("run-123"));
+        assert!(pane.claims_pane_navigation(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT,)));
+    }
+
+    #[test]
+    fn read_only_empty_state_comes_from_fluent_catalogue() {
+        assert_eq!(crate::i18n::t("zc-sop-empty-read-only"), "(no nodes)");
+    }
 
     #[test]
     fn honored_toml_coords_land_on_matching_slot() {
@@ -2331,5 +2795,741 @@ mod tests {
             "with no backend `sources` (old/failed response) the picker \
              reconstructs from bound + channel so it still works"
         );
+    }
+}
+
+#[cfg(test)]
+mod list_refresh_tests {
+    use super::SopPane;
+    use crate::client::{GraphNode, NodeKind, RpcClient};
+    use crate::jsonrpc::{JsonRpcError, RpcOutbound};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    fn list_pane() -> (SopPane, Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        (SopPane::new(rpc), outbound, rx)
+    }
+
+    async fn receive_list_request(rx: &mut mpsc::Receiver<String>) -> String {
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("SOP list request should be sent")
+            .expect("RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::SOPS_LIST);
+        request["id"].as_str().unwrap().to_string()
+    }
+
+    async fn drain_list_response(pane: &mut SopPane) {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            pane.drain_list_refresh();
+            if pane.list_refresh_rx.is_none() {
+                return;
+            }
+        }
+        panic!("completed SOP list refresh was not drained");
+    }
+
+    #[tokio::test]
+    async fn ordinary_refresh_requests_coalesce_while_one_is_in_flight() {
+        let (mut pane, outbound, mut rx) = list_pane();
+
+        pane.refresh();
+        pane.refresh();
+        let request_id = receive_list_request(&mut rx).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "coalesced refreshes must not send a second list request"
+        );
+
+        outbound.dispatch_response(&request_id, Some(json!([{ "name": "deploy" }])), None);
+        drain_list_response(&mut pane).await;
+        assert_eq!(pane.names, vec!["deploy".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn dropping_pane_aborts_pending_list_refresh() {
+        let (mut pane, outbound, mut rx) = list_pane();
+
+        pane.refresh();
+        let _request_id = receive_list_request(&mut rx).await;
+        assert_eq!(outbound.pending_count(), 1);
+
+        drop(pane);
+        for _ in 0..100 {
+            if outbound.pending_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            outbound.pending_count(),
+            0,
+            "dropping SopPane must cancel its pending list refresh RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_retains_names_and_does_not_clobber_action_error() {
+        let (mut pane, outbound, mut rx) = list_pane();
+        pane.names = vec!["deploy".to_string()];
+        pane.list_state.select(Some(0));
+        pane.error = Some("save failed".to_string());
+
+        pane.refresh();
+        let request_id = receive_list_request(&mut rx).await;
+        outbound.dispatch_response(
+            &request_id,
+            None,
+            Some(JsonRpcError {
+                code: -32000,
+                message: "list unavailable".to_string(),
+                data: None,
+            }),
+        );
+        drain_list_response(&mut pane).await;
+
+        assert_eq!(pane.names, vec!["deploy".to_string()]);
+        assert_eq!(pane.error.as_deref(), Some("save failed"));
+        assert_eq!(
+            pane.list_refresh_error.as_deref(),
+            Some("RPC sops/list: list unavailable (-32000)")
+        );
+        let visible = pane.visible_error().expect("both errors should be visible");
+        assert!(visible.contains("save failed"));
+        assert!(visible.contains("list unavailable"));
+    }
+
+    #[tokio::test]
+    async fn authoritative_refresh_clears_state_when_selected_sop_is_replaced() {
+        let (mut pane, outbound, mut rx) = list_pane();
+        pane.names = vec!["alpha".to_string(), "beta".to_string()];
+        pane.list_state.select(Some(0));
+        pane.graph.nodes.push(GraphNode {
+            step: 1,
+            title: "alpha step".to_string(),
+            kind: NodeKind::default(),
+            subtitle: None,
+            trigger_index: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
+        pane.overlay = Some(Default::default());
+        pane.current_run_id = Some("run-alpha".to_string());
+        pane.run_input = Some("run-alpha".to_string());
+        pane.run_payload_input = Some(r#"{"source":"alpha"}"#.to_string());
+
+        pane.refresh();
+        let request_id = receive_list_request(&mut rx).await;
+        outbound.dispatch_response(&request_id, Some(json!([{ "name": "beta" }])), None);
+        drain_list_response(&mut pane).await;
+
+        assert_eq!(pane.names, vec!["beta".to_string()]);
+        assert_eq!(pane.selected_name(), Some("beta"));
+        assert!(pane.graph.nodes.is_empty());
+        assert!(pane.overlay.is_none());
+        assert!(pane.current_run_id.is_none());
+        assert!(pane.run_input.is_none());
+        assert!(pane.run_payload_input.is_none());
+
+        let mut submit_stale_prompt = Box::pin(async {
+            if pane.run_input.is_some() {
+                pane.submit_run_input().await;
+            }
+        });
+        tokio::select! {
+            _ = &mut submit_stale_prompt => {}
+            raw = rx.recv() => {
+                let raw = raw.expect("RPC writer should remain connected");
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                panic!("stale alpha prompt issued an RPC for beta: {request}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_reconciliation_discards_old_response_and_starts_one_follow_up() {
+        let (mut pane, outbound, mut rx) = list_pane();
+        pane.names = vec!["old".to_string()];
+        pane.list_state.select(Some(0));
+
+        pane.refresh();
+        let old_request_id = receive_list_request(&mut rx).await;
+        pane.project_saved_name("new");
+        pane.request_list_refresh(true);
+
+        outbound.dispatch_response(&old_request_id, Some(json!([{ "name": "old" }])), None);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            pane.drain_list_refresh();
+            if !pane.list_refresh_follow_up && pane.list_refresh_rx.is_some() {
+                break;
+            }
+        }
+        assert_eq!(pane.names, vec!["new".to_string(), "old".to_string()]);
+        let follow_up_id = receive_list_request(&mut rx).await;
+        assert_ne!(follow_up_id, old_request_id);
+
+        outbound.dispatch_response(
+            &follow_up_id,
+            Some(json!([{ "name": "new" }, { "name": "old" }])),
+            None,
+        );
+        drain_list_response(&mut pane).await;
+        assert_eq!(pane.names, vec!["new".to_string(), "old".to_string()]);
+        assert_eq!(pane.selected_name(), Some("new"));
+        assert!(rx.try_recv().is_err(), "only one follow-up may be launched");
+    }
+
+    #[tokio::test]
+    async fn delayed_delete_projects_first_row_before_authoritative_replacement() {
+        let (mut pane, outbound, mut rx) = list_pane();
+        pane.names = vec!["alpha".to_string(), "beta".to_string()];
+        pane.list_state.select(Some(1));
+
+        let mut delete = Box::pin(pane.delete_selected());
+        let raw = tokio::time::timeout(Duration::from_millis(200), async {
+            tokio::select! {
+                raw = rx.recv() => raw.expect("RPC writer should remain connected"),
+                _ = &mut delete => panic!("delete must wait for its RPC response"),
+            }
+        })
+        .await
+        .expect("delete should send an RPC request");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::SOPS_DELETE);
+        let delete_id = request["id"].as_str().unwrap().to_string();
+        outbound.dispatch_response(&delete_id, Some(json!({})), None);
+        delete.await;
+
+        assert_eq!(pane.names, vec!["alpha".to_string()]);
+        assert_eq!(pane.selected_name(), Some("alpha"));
+
+        let list_id = receive_list_request(&mut rx).await;
+        outbound.dispatch_response(&list_id, Some(json!([{ "name": "alpha" }])), None);
+        drain_list_response(&mut pane).await;
+        assert_eq!(pane.names, vec!["alpha".to_string()]);
+        assert_eq!(pane.selected_name(), Some("alpha"));
+    }
+
+    #[tokio::test]
+    async fn mutation_projections_update_membership_and_selection_deterministically() {
+        let (mut pane, _outbound, _rx) = list_pane();
+        pane.names = vec!["alpha".to_string(), "beta".to_string()];
+        pane.list_state.select(Some(1));
+
+        pane.project_saved_name("gamma");
+        assert_eq!(
+            pane.names,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        assert_eq!(pane.selected_name(), Some("gamma"));
+
+        pane.project_saved_name("alpha");
+        assert_eq!(
+            pane.names,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        assert_eq!(pane.selected_name(), Some("alpha"));
+
+        pane.graph.nodes.push(GraphNode {
+            step: 1,
+            title: "deleted alpha".to_string(),
+            kind: NodeKind::default(),
+            subtitle: None,
+            trigger_index: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
+        pane.project_deleted_name("alpha");
+        assert_eq!(pane.names, vec!["beta".to_string(), "gamma".to_string()]);
+        assert_eq!(pane.selected_name(), Some("beta"));
+        assert!(
+            pane.graph.nodes.is_empty(),
+            "delete projection must not render the deleted SOP graph for the new selection"
+        );
+    }
+}
+
+#[cfg(test)]
+mod submit_plan_tests {
+    use super::{SopSubmitPlan, plan_submit};
+
+    #[test]
+    fn a_new_draft_is_always_a_create() {
+        assert_eq!(plan_submit(true, None, "deploy"), SopSubmitPlan::Create);
+        // Even if something left an original name behind, create mode wins:
+        // the editor is not editing an existing SOP.
+        assert_eq!(
+            plan_submit(true, Some("stale"), "deploy"),
+            SopSubmitPlan::Create
+        );
+    }
+
+    #[test]
+    fn an_unchanged_name_is_a_plain_save() {
+        assert_eq!(
+            plan_submit(false, Some("deploy"), "deploy"),
+            SopSubmitPlan::Save
+        );
+    }
+
+    #[test]
+    fn a_changed_name_saves_against_the_name_the_edit_started_under() {
+        // `from` must be the original. Saving under the draft's new name would
+        // write a second SOP and leave the original standing beside it.
+        assert_eq!(
+            plan_submit(false, Some("deploy"), "deploy-prod"),
+            SopSubmitPlan::SaveThenRename {
+                from: "deploy".to_string(),
+                to: "deploy-prod".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_case_only_change_is_a_rename() {
+        assert_eq!(
+            plan_submit(false, Some("deploy"), "Deploy"),
+            SopSubmitPlan::SaveThenRename {
+                from: "deploy".to_string(),
+                to: "Deploy".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_without_an_original_name_stays_a_save() {
+        // Nothing to move to, so the draft's own name is the only identity
+        // there is; save keeps its existing upsert behavior.
+        assert_eq!(plan_submit(false, None, "deploy"), SopSubmitPlan::Save);
+    }
+}
+
+#[cfg(test)]
+mod status_agg_tests {
+    use super::{RUNS_POLL_INTERVAL_SECS, SopPane, aggregate_sop_status, status_icon};
+    use crate::client::{RpcClient, SopRunStatusView, SopRunSummaryView};
+    use crate::jsonrpc::{JsonRpcError, RpcOutbound};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    fn run(status: SopRunStatusView, active: bool, started_at: &str) -> SopRunSummaryView {
+        SopRunSummaryView {
+            run_id: format!("run-{started_at}"),
+            sop_name: "deploy".to_string(),
+            status,
+            started_at: started_at.to_string(),
+            active,
+            ..SopRunSummaryView::default()
+        }
+    }
+
+    fn polling_pane() -> (SopPane, Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        (SopPane::new(rpc), outbound, rx)
+    }
+
+    async fn receive_poll(rx: &mut mpsc::Receiver<String>) -> String {
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("SOP status poll should not block the event loop")
+            .expect("RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], "sops/runs");
+        request["id"].as_str().unwrap().to_string()
+    }
+
+    async fn drain_poll(pane: &mut SopPane) {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            pane.tick();
+            if pane.runs_poll_rx.is_none() {
+                return;
+            }
+        }
+        panic!("completed SOP status poll was not drained");
+    }
+
+    fn make_poll_due(pane: &mut SopPane) {
+        pane.last_runs_poll =
+            Some(Instant::now() - Duration::from_secs(RUNS_POLL_INTERVAL_SECS.saturating_add(1)));
+    }
+
+    fn runs_response(status: &str) -> serde_json::Value {
+        json!({
+            "runs": [{
+                "run_id": "run-1",
+                "sop_name": "deploy",
+                "status": status,
+                "started_at": "2026-08-02T10:00:00Z",
+                "active": status == "running"
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn poll_health_retains_stale_icons_without_clobbering_action_errors() {
+        let (mut pane, outbound, mut write_rx) = polling_pane();
+
+        let started = Instant::now();
+        pane.tick();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "starting a poll must not wait for its RPC response"
+        );
+        let request_id = receive_poll(&mut write_rx).await;
+        pane.tick();
+        assert!(
+            write_rx.try_recv().is_err(),
+            "an in-flight poll must be the authority that suppresses duplicates"
+        );
+        outbound.dispatch_response(&request_id, Some(runs_response("running")), None);
+        drain_poll(&mut pane).await;
+
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running)
+        );
+        assert!(!pane.runs_poll_stale);
+        assert!(pane.last_runs_poll.is_some());
+
+        pane.error = Some("save failed".to_string());
+        make_poll_due(&mut pane);
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+        outbound.dispatch_response(
+            &request_id,
+            None,
+            Some(JsonRpcError {
+                code: -32000,
+                message: "daemon unavailable".to_string(),
+                data: None,
+            }),
+        );
+        drain_poll(&mut pane).await;
+
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running),
+            "a failed refresh must retain the last successful icons"
+        );
+        assert!(pane.runs_poll_stale);
+        assert_eq!(pane.error.as_deref(), Some("save failed"));
+        let stale_message = crate::i18n::t("zc-sop-runs-stale");
+        let first_visible_error = pane.visible_error().unwrap();
+        assert!(first_visible_error.contains("save failed"));
+        assert!(first_visible_error.contains(&stale_message));
+
+        pane.names = vec!["deploy".to_string()];
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| pane.render(frame, frame.area()))
+            .expect("render stale SOP status");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("🟡"));
+        assert!(rendered.contains("deploy"));
+        assert!(rendered.contains("save failed"));
+        assert!(rendered.contains(&stale_message));
+
+        pane.tick();
+        assert!(
+            write_rx.try_recv().is_err(),
+            "a failed response must still begin a fresh throttle window"
+        );
+        make_poll_due(&mut pane);
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+        outbound.dispatch_response(
+            &request_id,
+            None,
+            Some(JsonRpcError {
+                code: -32000,
+                message: "daemon unavailable".to_string(),
+                data: None,
+            }),
+        );
+        drain_poll(&mut pane).await;
+        assert_eq!(
+            pane.visible_error().as_deref(),
+            Some(first_visible_error.as_str()),
+            "repeated failures must leave the visible indication stable"
+        );
+
+        make_poll_due(&mut pane);
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+        outbound.dispatch_response(&request_id, Some(runs_response("completed")), None);
+        drain_poll(&mut pane).await;
+
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Completed)
+        );
+        assert!(!pane.runs_poll_stale, "recovery must clear stale health");
+        assert_eq!(
+            pane.visible_error().as_deref(),
+            Some("save failed"),
+            "poll recovery must not clear an independently owned action error"
+        );
+    }
+
+    /// The 🟡 responsiveness warning: a slow or hung daemon must not make the
+    /// pane feel frozen. The poll runs off the event loop, so many `tick()`
+    /// calls with a response that never arrives must all return promptly, must
+    /// not queue a second request, and must leave rendering working.
+    #[tokio::test]
+    async fn repeated_slow_polls_never_block_input_or_rendering() {
+        let (mut pane, outbound, mut write_rx) = polling_pane();
+        pane.names = vec!["deploy".to_string()];
+
+        pane.tick();
+        let request_id = receive_poll(&mut write_rx).await;
+
+        // The response deliberately never arrives: simulate a hung transport.
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        for _ in 0..200 {
+            let started = Instant::now();
+            make_poll_due(&mut pane);
+            pane.tick();
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "a tick with a poll still in flight must return immediately"
+            );
+            assert!(
+                write_rx.try_recv().is_err(),
+                "a pending poll must suppress new requests, not queue a backlog"
+            );
+            terminal
+                .draw(|frame| pane.render(frame, frame.area()))
+                .expect("rendering must keep working while a poll is hung");
+        }
+
+        // Once the slow response finally lands it is still applied normally.
+        outbound.dispatch_response(&request_id, Some(runs_response("running")), None);
+        drain_poll(&mut pane).await;
+        assert_eq!(
+            pane.run_status.get("deploy"),
+            Some(&SopRunStatusView::Running)
+        );
+    }
+
+    #[test]
+    fn no_runs_yields_no_status() {
+        assert_eq!(
+            aggregate_sop_status(&[]),
+            None,
+            "a SOP that never ran must render as a bare name, not an icon"
+        );
+    }
+
+    #[test]
+    fn single_active_running_wins() {
+        let runs = [run(SopRunStatusView::Running, true, "2026-08-02T10:00:00Z")];
+        assert_eq!(aggregate_sop_status(&runs), Some(SopRunStatusView::Running));
+    }
+
+    #[test]
+    fn active_waiting_approval_beats_active_running() {
+        let runs = [
+            run(SopRunStatusView::Running, true, "2026-08-02T12:00:00Z"),
+            run(
+                SopRunStatusView::WaitingApproval,
+                true,
+                "2026-08-02T09:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::WaitingApproval),
+            "needs-input outranks execution even when it started earlier — \
+             the row exists to tell the user someone is blocked on them"
+        );
+    }
+
+    #[test]
+    fn active_paused_checkpoint_also_outranks_running() {
+        let runs = [
+            run(SopRunStatusView::Running, true, "2026-08-02T12:00:00Z"),
+            run(
+                SopRunStatusView::PausedCheckpoint,
+                true,
+                "2026-08-02T11:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::PausedCheckpoint)
+        );
+    }
+
+    #[test]
+    fn active_running_beats_active_pending() {
+        let runs = [
+            run(SopRunStatusView::Pending, true, "2026-08-02T13:00:00Z"),
+            run(SopRunStatusView::Running, true, "2026-08-02T08:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Running),
+            "the most-alive active run drives the row"
+        );
+    }
+
+    #[test]
+    fn active_run_beats_newer_terminal_run() {
+        let runs = [
+            run(SopRunStatusView::Completed, false, "2026-08-02T23:00:00Z"),
+            run(SopRunStatusView::Failed, false, "2026-08-02T22:00:00Z"),
+            run(SopRunStatusView::Pending, true, "2026-08-02T01:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Pending),
+            "history never masks a live run, however recent the history is"
+        );
+    }
+
+    #[test]
+    fn terminal_only_picks_greatest_started_at() {
+        let runs = [
+            run(SopRunStatusView::Completed, false, "2026-08-01T10:00:00Z"),
+            run(SopRunStatusView::Failed, false, "2026-08-02T10:00:00Z"),
+            run(SopRunStatusView::Cancelled, false, "2026-07-30T10:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Failed),
+            "with nothing live the row shows the latest outcome"
+        );
+    }
+
+    #[test]
+    fn lone_active_unknown_still_surfaces() {
+        let runs = [run(SopRunStatusView::Unknown, true, "2026-08-02T10:00:00Z")];
+        assert_eq!(
+            aggregate_sop_status(&runs),
+            Some(SopRunStatusView::Unknown),
+            "an unrecognized status is not a reason to render nothing"
+        );
+    }
+
+    #[test]
+    fn active_unknown_loses_to_running_and_needs_input() {
+        let with_running = [
+            run(SopRunStatusView::Unknown, true, "2026-08-02T14:00:00Z"),
+            run(SopRunStatusView::Running, true, "2026-08-02T02:00:00Z"),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&with_running),
+            Some(SopRunStatusView::Running)
+        );
+
+        let with_waiting = [
+            run(SopRunStatusView::Unknown, true, "2026-08-02T14:00:00Z"),
+            run(
+                SopRunStatusView::WaitingApproval,
+                true,
+                "2026-08-02T02:00:00Z",
+            ),
+        ];
+        assert_eq!(
+            aggregate_sop_status(&with_waiting),
+            Some(SopRunStatusView::WaitingApproval),
+            "Unknown must never mask a run that is blocked on the user"
+        );
+    }
+
+    #[test]
+    fn active_terminal_row_loses_to_every_live_status() {
+        // A run the engine still lists as active but whose status already
+        // reads terminal is a poll racing the run's own completion; it must
+        // not outrank a genuinely live sibling.
+        let runs = [
+            run(SopRunStatusView::Completed, true, "2026-08-02T20:00:00Z"),
+            run(SopRunStatusView::Unknown, true, "2026-08-02T01:00:00Z"),
+        ];
+        assert_eq!(aggregate_sop_status(&runs), Some(SopRunStatusView::Unknown));
+    }
+
+    #[test]
+    fn unknown_is_neither_needs_input_nor_terminal() {
+        assert!(!SopRunStatusView::Unknown.needs_input());
+        assert!(!SopRunStatusView::Unknown.is_terminal());
+        // An inactive Unknown is still the latest record, so it wins the
+        // history fallback rather than being skipped.
+        let runs = [
+            run(SopRunStatusView::Completed, false, "2026-08-01T10:00:00Z"),
+            run(SopRunStatusView::Unknown, false, "2026-08-02T10:00:00Z"),
+        ];
+        assert_eq!(aggregate_sop_status(&runs), Some(SopRunStatusView::Unknown));
+    }
+
+    #[test]
+    fn icon_mapping_covers_every_status() {
+        assert_eq!(status_icon(SopRunStatusView::Pending), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::Running), "🟡");
+        assert_eq!(status_icon(SopRunStatusView::WaitingApproval), "🔵");
+        assert_eq!(status_icon(SopRunStatusView::PausedCheckpoint), "🔵");
+        assert_eq!(status_icon(SopRunStatusView::Failed), "🔴");
+        assert_eq!(status_icon(SopRunStatusView::Completed), "🟢");
+        assert_eq!(status_icon(SopRunStatusView::Cancelled), "🔴");
+        assert_eq!(status_icon(SopRunStatusView::Unknown), "⚪");
+    }
+
+    /// The specific regression the review named: under the previous palette a
+    /// cancelled run rendered the same glyph as a clean completion, so an
+    /// operator could not tell an aborted run from a successful one. These
+    /// two must never collapse to the same glyph again.
+    #[test]
+    fn cancelled_is_visually_distinct_from_completed() {
+        assert_ne!(
+            status_icon(SopRunStatusView::Cancelled),
+            status_icon(SopRunStatusView::Completed),
+            "a cancelled run must not look like a clean completion"
+        );
+    }
+
+    /// An unrecognised status from a newer daemon must still occupy a cell.
+    /// An empty glyph would shift the row text and break the mouse hit-test
+    /// alignment that `list_row_rects` depends on.
+    #[test]
+    fn every_status_icon_is_non_empty_and_single_width() {
+        for status in [
+            SopRunStatusView::Pending,
+            SopRunStatusView::Running,
+            SopRunStatusView::WaitingApproval,
+            SopRunStatusView::PausedCheckpoint,
+            SopRunStatusView::Completed,
+            SopRunStatusView::Failed,
+            SopRunStatusView::Cancelled,
+            SopRunStatusView::Unknown,
+        ] {
+            let icon = status_icon(status);
+            assert!(!icon.is_empty(), "{status:?} must render a visible glyph");
+            assert_eq!(
+                icon.chars().count(),
+                1,
+                "{status:?} must be one glyph so every row keeps the same width"
+            );
+        }
     }
 }

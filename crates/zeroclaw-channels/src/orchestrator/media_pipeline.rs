@@ -7,7 +7,7 @@ use zeroclaw_config::schema::MediaPipelineConfig;
 use super::super::transcription::TranscriptionManager;
 
 // Re-export media types from zeroclaw-types for backwards compatibility.
-pub use zeroclaw_api::media::{MediaAttachment, MediaKind};
+pub use zeroclaw_api::media::{MarkerKind, MediaAttachment, MediaKind, RenderedMarker};
 
 /// The media understanding pipeline.
 /// Consumes a message's text and attachments, returning enriched text with
@@ -42,9 +42,52 @@ impl<'a> MediaPipeline<'a> {
             return original_text.to_string();
         }
 
+        let mut text = original_text.to_string();
         let mut annotations = Vec::new();
 
         for attachment in attachments {
+            // Discord can render an image URL when saving the downloaded
+            // bytes fails. The typed envelope still owns those bytes, so
+            // replace exactly one channel-rendered URL marker with the inline
+            // representation this pipeline is about to add. Removing from
+            // the end preserves a sender-authored marker with the same URL in
+            // the message caption.
+            if self.vision_available
+                && self.config.describe_images
+                && let Some(target) = attachment.channel_rendered_remote_image_target()
+            {
+                text = remove_last_channel_image_marker(&text, target);
+            }
+
+            // A channel that saved these bytes and rendered a marker for them
+            // has already classified this attachment, with more to go on than
+            // the pipeline has: the payload, the sender's declared type, and
+            // the transport's own notion of what was sent. When it committed to
+            // an image or a document disposition, that verdict wins outright.
+            //
+            // Skipping the whole attachment — not just its image branch — is
+            // what keeps the two classifiers from contradicting each other.
+            // `kind()` resolves a single kind with the declared MIME first, so
+            // a `photo.jpg` sent as `video/mp4` routes to video here while the
+            // channel marked it an image; annotating it would put an image
+            // marker and a `[Video: ...]` note on one attachment. It also stops
+            // a channel-rendered `[Document: ...]` for a non-loadable image
+            // (HEIC, TIFF, SVG, BMP) from being re-decided as an image by
+            // `kind()` and gaining an `[IMAGE:data:...]` copy the provider
+            // rejects. Deferring likewise avoids a second, base64-inlined copy
+            // of an image the marker already carries, which would send it to
+            // the provider twice and persist megabytes of base64 into session
+            // history (the current turn is stored verbatim; only older turns
+            // get inline payloads collapsed).
+            //
+            // The verdict is read from the typed envelope, not by scanning the
+            // rendered text: the text also carries sender-authored content, so
+            // a caption that types `[IMAGE:/other.jpg]` has no channel
+            // provenance and cannot suppress a real attachment.
+            if attachment.channel_rendered_owned_disposition() {
+                continue;
+            }
+
             match attachment.kind() {
                 MediaKind::Audio if self.config.transcribe_audio => {
                     let annotation = self.process_audio(attachment).await;
@@ -75,9 +118,9 @@ impl<'a> MediaPipeline<'a> {
             enriched.push('\n');
         }
 
-        if !original_text.is_empty() {
+        if !text.is_empty() {
             enriched.push('\n');
-            enriched.push_str(original_text);
+            enriched.push_str(&text);
         }
 
         enriched.trim().to_string()
@@ -110,7 +153,12 @@ impl<'a> MediaPipeline<'a> {
 
     fn process_image(&self, attachment: &MediaAttachment) -> String {
         if self.vision_available {
-            let (mime, data) = image_payload_for_vision(attachment);
+            let Some((mime, data)) = image_payload_for_vision(attachment) else {
+                return format!(
+                    "[Image: {} attached, could not be read]",
+                    attachment.file_name
+                );
+            };
             let b64 = STANDARD.encode(data.as_ref());
             format!(
                 "[Image: {} attached, will be processed by vision model]\n[IMAGE:data:{};base64,{}]",
@@ -129,13 +177,28 @@ impl<'a> MediaPipeline<'a> {
     }
 }
 
-fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {
+fn remove_last_channel_image_marker(text: &str, target: &str) -> String {
+    let marker = format!("[IMAGE:{target}]");
+    let Some(start) = text.rfind(&marker) else {
+        return text.to_string();
+    };
+    let end = start + marker.len();
+    let mut cleaned = String::with_capacity(text.len() - marker.len());
+    cleaned.push_str(&text[..start]);
+    cleaned.push_str(&text[end..]);
+    cleaned
+}
+
+/// Resolve the bytes to inline for the vision model. Returns `None` when the
+/// attachment is known-bad, so the caller degrades to a text annotation instead
+/// of inlining bytes the decoder already rejected.
+fn image_payload_for_vision(attachment: &MediaAttachment) -> Option<(String, Cow<'_, [u8]>)> {
     let mime = attachment.mime_type.as_deref().unwrap_or("image/jpeg");
 
     #[cfg(feature = "image-normalization")]
     if is_webp_attachment(attachment, mime) {
         match webp_to_png(&attachment.data) {
-            Ok(png) => return ("image/png".to_string(), Cow::Owned(png)),
+            Ok(png) => return Some(("image/png".to_string(), Cow::Owned(png))),
             Err(err) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -146,13 +209,17 @@ fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u
                             "error": format!("{}", err),
                             "error_key": "media_pipeline_webp_to_png_failed",
                         })),
-                    "Media pipeline: failed to normalize WebP image for vision"
+                    "Media pipeline: dropping WebP image that failed to decode"
                 );
+                // The decoder has already proven these bytes are not a usable
+                // image. Forwarding them anyway earns a provider-side 400 that
+                // fails the entire turn, including the accompanying text.
+                return None;
             }
         }
     }
 
-    (mime.to_string(), Cow::Borrowed(&attachment.data))
+    Some((mime.to_string(), Cow::Borrowed(&attachment.data)))
 }
 
 #[cfg(feature = "image-normalization")]
@@ -190,6 +257,7 @@ mod tests {
             file_name: "voice.ogg".to_string(),
             data: vec![0u8; 100],
             mime_type: Some("audio/ogg".to_string()),
+            marker: None,
         }
     }
 
@@ -198,6 +266,7 @@ mod tests {
             file_name: "photo.jpg".to_string(),
             data: vec![0u8; 50],
             mime_type: Some("image/jpeg".to_string()),
+            marker: None,
         }
     }
 
@@ -206,6 +275,7 @@ mod tests {
             file_name: "clip.mp4".to_string(),
             data: vec![0u8; 200],
             mime_type: Some("video/mp4".to_string()),
+            marker: None,
         }
     }
 
@@ -215,6 +285,7 @@ mod tests {
             file_name: "file".to_string(),
             data: vec![],
             mime_type: Some("audio/ogg".to_string()),
+            marker: None,
         };
         assert_eq!(audio.kind(), MediaKind::Audio);
 
@@ -222,6 +293,7 @@ mod tests {
             file_name: "file".to_string(),
             data: vec![],
             mime_type: Some("image/png".to_string()),
+            marker: None,
         };
         assert_eq!(image.kind(), MediaKind::Image);
 
@@ -229,6 +301,7 @@ mod tests {
             file_name: "file".to_string(),
             data: vec![],
             mime_type: Some("video/mp4".to_string()),
+            marker: None,
         };
         assert_eq!(video.kind(), MediaKind::Video);
     }
@@ -239,6 +312,7 @@ mod tests {
             file_name: "voice.ogg".to_string(),
             data: vec![],
             mime_type: None,
+            marker: None,
         };
         assert_eq!(audio.kind(), MediaKind::Audio);
 
@@ -246,6 +320,7 @@ mod tests {
             file_name: "photo.png".to_string(),
             data: vec![],
             mime_type: None,
+            marker: None,
         };
         assert_eq!(image.kind(), MediaKind::Image);
 
@@ -253,6 +328,7 @@ mod tests {
             file_name: "clip.mp4".to_string(),
             data: vec![],
             mime_type: None,
+            marker: None,
         };
         assert_eq!(video.kind(), MediaKind::Video);
 
@@ -260,6 +336,7 @@ mod tests {
             file_name: "data.bin".to_string(),
             data: vec![],
             mime_type: None,
+            marker: None,
         };
         assert_eq!(unknown.kind(), MediaKind::Unknown);
     }
@@ -299,6 +376,271 @@ mod tests {
         assert!(result.contains("check this"));
     }
 
+    #[tokio::test]
+    async fn image_already_marked_by_channel_is_not_double_described() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // A channel (Telegram, Discord) that saved the file to disk emits a
+        // re-loadable path marker itself; the pipeline must not add a second,
+        // base64-inlined copy of the same image.
+        let original = "[IMAGE:/workspace/telegram_files/photo.jpg]\n\nlog this automatically";
+        let attachment = marked(
+            "photo.jpg",
+            "image/jpeg",
+            "/workspace/telegram_files/photo.jpg",
+        );
+        let result = pipeline.process(original, &[attachment]).await;
+        assert_eq!(
+            result, original,
+            "pre-marked image must pass through unchanged"
+        );
+        assert!(
+            !result.contains("base64"),
+            "no inline base64 may be added for a pre-marked image: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_image_marker_does_not_suppress_new_attachment() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // A quoted older image marker for a DIFFERENT file must not swallow
+        // the annotation for the newly attached one.
+        let original = "[IMAGE:/workspace/telegram_files/old_photo.png] earlier pic";
+        let result = pipeline.process(original, &[sample_image()]).await;
+        assert!(
+            result.contains("[IMAGE:data:image/jpeg;base64,"),
+            "new attachment must still be annotated: {result}"
+        );
+    }
+
+    /// An attachment as a channel hands it over when it rendered an image
+    /// marker: bytes plus the target and the `Image` disposition it committed
+    /// to.
+    fn marked(file_name: &str, mime: &str, marker_target: &str) -> MediaAttachment {
+        MediaAttachment {
+            file_name: file_name.to_string(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            mime_type: Some(mime.to_string()),
+            marker: Some(RenderedMarker {
+                target: marker_target.to_string(),
+                kind: MarkerKind::Image,
+            }),
+        }
+    }
+
+    /// An attachment a channel rendered as a `[Document: ...]` even though its
+    /// payload looks like an image: the non-loadable image-document case
+    /// (HEIC, TIFF, SVG, BMP). `kind()` still reports `Image`, so only the
+    /// recorded `Document` disposition can stop a second image annotation.
+    fn marked_document(file_name: &str, mime: &str, marker_target: &str) -> MediaAttachment {
+        MediaAttachment {
+            file_name: file_name.to_string(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            mime_type: Some(mime.to_string()),
+            marker: Some(RenderedMarker {
+                target: marker_target.to_string(),
+                kind: MarkerKind::Document,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn image_document_marked_by_channel_is_not_inlined() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // An image sent "as file" (extensionless, image MIME): the channel
+        // emits the same [IMAGE:<path>] marker as for photos, so the pipeline
+        // must not add a second, base64-inlined copy.
+        let attachment = marked("upload", "image/jpeg", "/workspace/telegram_files/upload");
+        let original = "[IMAGE:/workspace/telegram_files/upload]\n\nplease describe";
+        let result = pipeline.process(original, &[attachment]).await;
+        assert_eq!(
+            result, original,
+            "channel-marked image document must pass through unchanged"
+        );
+        assert!(
+            !result.contains("IMAGE:data:"),
+            "no inline base64 may be added for a channel-marked image document: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_uuid_prefixed_marker_is_recognized_as_its_own_attachment() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // Discord saves under a uniqueness-prefixed name while the envelope
+        // keeps the sender's name, so the two never share a basename. Deferring
+        // on the recorded disposition, not on any name comparison, is what
+        // keeps this single-copy.
+        let saved = "/ws/discord_files/6f1e4a4c-2b77-4a2f-9d0e-5c1f0b3a7e11_photo.jpg";
+        let attachment = marked("photo.jpg", "image/jpeg", saved);
+        let original = format!("[IMAGE:{saved}]\n\nwhat is this?");
+
+        let result = pipeline.process(&original, &[attachment]).await;
+
+        assert_eq!(
+            result, original,
+            "a Discord-saved image must not be inlined a second time"
+        );
+        assert!(
+            !result.contains("IMAGE:data:"),
+            "uuid-prefixed save names must still join to their marker: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_remote_image_fallback_replaces_its_channel_marker() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+        let url = "https://cdn.discordapp.com/attachments/1/photo.jpg";
+        let attachment = MediaAttachment {
+            file_name: "photo.jpg".to_string(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            mime_type: Some("image/jpeg".to_string()),
+            marker: Some(RenderedMarker {
+                target: url.to_string(),
+                kind: MarkerKind::Image,
+            }),
+        };
+        let original = format!("caption\n\n[IMAGE:{url}]");
+
+        let result = pipeline.process(&original, &[attachment]).await;
+
+        assert!(
+            !result.contains(url),
+            "the fallback URL must be replaced: {result}"
+        );
+        assert_eq!(
+            result.matches("[IMAGE:data:").count(),
+            1,
+            "the typed bytes must produce one inline image marker: {result}"
+        );
+        assert!(result.contains("caption"));
+    }
+
+    #[test]
+    fn discord_remote_image_fallback_removes_only_the_last_matching_marker() {
+        let url = "https://cdn.discordapp.com/attachments/1/photo.jpg";
+        let original = format!("[IMAGE:{url}] is part of the caption\n\n[IMAGE:{url}]");
+
+        let result = remove_last_channel_image_marker(&original, url);
+
+        assert_eq!(result, format!("[IMAGE:{url}] is part of the caption\n\n"));
+    }
+
+    #[tokio::test]
+    async fn sender_authored_marker_cannot_suppress_a_real_attachment() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // The sender typed a marker in the caption, but the real attachment
+        // carries no channel-rendered disposition. Deference reads the typed
+        // envelope, not the text, so the sender's marker cannot impersonate a
+        // channel verdict and drop the only copy of the bytes.
+        let mut attachment = sample_image();
+        attachment.marker = None;
+        let original = "[IMAGE:/ws/telegram_files/photo.jpg] describe the attached one";
+
+        let result = pipeline.process(original, &[attachment]).await;
+
+        assert!(
+            result.contains("[IMAGE:data:image/jpeg;base64,"),
+            "a sender-authored marker must not drop the only copy of the bytes: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn contradictory_signals_cannot_produce_contradictory_annotations() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // `kind()` reads the declared MIME and says video; the channel read
+        // the name and the payload and marked it an image. One attachment
+        // must not end up with both an image marker and a video note.
+        let attachment = MediaAttachment {
+            file_name: "photo.jpg".to_string(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            mime_type: Some("video/mp4".to_string()),
+            marker: Some(RenderedMarker {
+                target: "/ws/telegram_files/photo.jpg".to_string(),
+                kind: MarkerKind::Image,
+            }),
+        };
+        assert_eq!(
+            attachment.kind(),
+            MediaKind::Video,
+            "this test is only meaningful while the declared MIME wins routing"
+        );
+
+        let original = "[IMAGE:/ws/telegram_files/photo.jpg]\n\nwhat is this?";
+        let result = pipeline.process(original, &[attachment]).await;
+
+        assert_eq!(
+            result, original,
+            "the channel's rendered verdict must stand alone"
+        );
+        assert!(
+            !result.contains("[Video:"),
+            "an image-marked attachment must not also be annotated as video: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmarked_attachment_is_always_annotated() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // A channel that supplies bytes without rendering a marker gets the
+        // pipeline's annotation even when the text mentions a same-named file.
+        let original = "[IMAGE:/ws/telegram_files/photo.jpg] and also photo.jpg";
+        let result = pipeline.process(original, &[sample_image()]).await;
+
+        assert!(
+            result.contains("[IMAGE:data:image/jpeg;base64,"),
+            "an attachment with no channel marker must be annotated: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_rendered_document_is_not_reclassified_as_image() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        // The reviewer's boundary: a non-loadable image document (HEIC) the
+        // channel deliberately rendered as `[Document: ...]`. `kind()` still
+        // reports Image from the MIME, so without the recorded Document
+        // disposition the pipeline would add an `[IMAGE:data:...]` copy the
+        // provider then rejects.
+        let attachment =
+            marked_document("photo.heic", "image/heic", "/ws/telegram_files/photo.heic");
+        assert_eq!(
+            attachment.kind(),
+            MediaKind::Image,
+            "this test is only meaningful while the declared image MIME wins routing"
+        );
+
+        let original = "[Document: photo.heic] /ws/telegram_files/photo.heic\n\nwhat is this?";
+        let result = pipeline.process(original, &[attachment]).await;
+
+        assert_eq!(
+            result, original,
+            "the channel's document verdict must stand alone"
+        );
+        assert!(
+            !result.contains("IMAGE:data:"),
+            "a channel-rendered document must not gain an inline image copy: {result}"
+        );
+        assert!(
+            !result.contains("[Image:"),
+            "a channel-rendered document must not gain an image annotation: {result}"
+        );
+    }
+
     #[cfg(feature = "image-normalization")]
     #[tokio::test]
     async fn webp_image_is_normalized_to_png_for_vision() {
@@ -317,6 +659,7 @@ mod tests {
             file_name: "sticker.webp".to_string(),
             data: cursor.into_inner(),
             mime_type: Some("image/webp".to_string()),
+            marker: None,
         };
 
         let result = pipeline.process("what is this?", &[sticker]).await;
@@ -324,6 +667,38 @@ mod tests {
         assert!(result.contains("[IMAGE:data:image/png;base64,"));
         assert!(!result.contains("[IMAGE:data:image/webp;base64,"));
         assert!(result.contains("what is this?"));
+    }
+
+    #[cfg(feature = "image-normalization")]
+    #[tokio::test]
+    async fn corrupt_webp_is_dropped_rather_than_inlined() {
+        // The decoder has already proven these bytes are unusable. Inlining
+        // them anyway earns a provider-side 400 that fails the whole turn,
+        // taking the user's text down with it.
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        let sticker = MediaAttachment {
+            file_name: "sticker.webp".to_string(),
+            data: b"RIFF\x00\x00\x00\x00WEBPnot-a-real-webp".to_vec(),
+            mime_type: Some("image/webp".to_string()),
+            marker: None,
+        };
+
+        let result = pipeline.process("what is this?", &[sticker]).await;
+
+        assert!(
+            !result.contains("[IMAGE:data:"),
+            "corrupt WebP must not be inlined: {result}"
+        );
+        assert!(
+            result.contains("could not be read"),
+            "annotation must state the image was dropped: {result}"
+        );
+        assert!(
+            result.contains("what is this?"),
+            "user text must survive: {result}"
+        );
     }
 
     #[tokio::test]

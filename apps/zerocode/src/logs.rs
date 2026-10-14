@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::client::{LogsQueryParams, RpcClient, RpcNotification};
+use crate::text_selection::{TextRowBreak, TextSelection, TextSnapshot, row_breaks_for_lines};
 use crate::theme;
 
 const MAX_EVENTS: usize = 2000;
@@ -20,6 +22,74 @@ const LOGS_EVENT_METHOD: &str = "logs/event";
 const INITIAL_LOAD: usize = 200;
 const PAGE_SIZE: usize = 100;
 const SCROLL_LINES: usize = 3;
+const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogsTextSurface {
+    List,
+    Detail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogsTextSelection {
+    surface: LogsTextSurface,
+    selection: TextSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogsCopyTarget {
+    text: String,
+    anchor: Rect,
+    surface: LogsTextSurface,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogsCopyMenu {
+    rect: Rect,
+    target: LogsCopyTarget,
+    surface: LogsTextSurface,
+}
+
+impl LogsCopyMenu {
+    fn action_contains(&self, column: u16, row: u16) -> bool {
+        self.rect.width > 2
+            && self.rect.height > 2
+            && crate::mouse::in_rect(
+                column,
+                row,
+                Rect::new(self.rect.x + 1, self.rect.y + 1, self.rect.width - 2, 1),
+            )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogsCopyFeedback {
+    rect: Rect,
+    surface: LogsTextSurface,
+    shown_at: Instant,
+}
+
+fn copy_menu_rect(column: u16, row: u16, bounds: Rect) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+
+    if bounds.width < 3 || bounds.height < 3 {
+        return None;
+    }
+    let width = (UnicodeWidthStr::width(crate::i18n::t("zc-logs-copy").as_str()) as u16 + 4)
+        .min(bounds.width)
+        .max(3);
+    let height = 3;
+    let max_x = bounds.x.saturating_add(bounds.width.saturating_sub(width));
+    let max_y = bounds
+        .y
+        .saturating_add(bounds.height.saturating_sub(height));
+    Some(Rect::new(
+        column.clamp(bounds.x, max_x),
+        row.clamp(bounds.y, max_y),
+        width,
+        height,
+    ))
+}
 
 // ── OTel severity buckets ────────────────────────────────────────
 
@@ -245,7 +315,7 @@ impl LogDetail {
         self.raw.get("attributes").unwrap_or(&NULL)
     }
 
-    fn detail_lines(&self) -> Vec<Line<'static>> {
+    fn detail_lines(&self, active_log_path: Option<&str>) -> Vec<Line<'static>> {
         let label_style = theme::dim_style();
         let val_style = theme::body_style();
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -373,6 +443,12 @@ impl LogDetail {
                 crate::i18n::t("zc-logs-preview-only"),
                 theme::dim_style(),
             )));
+            if let Some(path) = active_log_path {
+                lines.push(Line::from(Span::styled(
+                    crate::i18n::t_args("zc-logs-persisted-path", &[("path", path)]),
+                    theme::dim_style(),
+                )));
+            }
         }
 
         lines
@@ -475,15 +551,34 @@ pub(crate) struct Logs {
     search_active: bool,
     search_buf: String,
     search_query: String, // committed query (applied on Enter)
+    run_filter_active: bool,
+    run_filter_buf: String,
+    sop_run_id: Option<String>,
+    /// Segment-aware cursor from the previous page. Preferred over
+    /// `next_cursor_offset`: it is the only cursor that can advance once
+    /// the oldest event on a page lives in a rotated archive segment.
+    next_cursor_segment: Option<String>,
     next_cursor_offset: Option<u64>,
     next_cursor_legacy: Option<(String, String)>,
     at_end: bool,
+    /// True when the daemon could not read part of the retained history. The
+    /// status line says so, because `at_end` alone would present a truncated
+    /// buffer as the whole stream.
+    history_incomplete: bool,
     loading: bool,
+    active_log_path: Option<String>,
     // Viewport
     list_height: u16,
     last_list_area: Rect,
     last_detail_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
+    list_snapshot: Option<TextSnapshot>,
+    list_snapshot_event_ids: Vec<String>,
+    detail_snapshot: Option<TextSnapshot>,
+    detail_snapshot_event_id: Option<String>,
+    text_selection: Option<LogsTextSelection>,
+    copy_menu: Option<LogsCopyMenu>,
+    copy_feedback: Option<LogsCopyFeedback>,
 }
 
 impl Logs {
@@ -505,14 +600,27 @@ impl Logs {
             search_active: false,
             search_buf: String::new(),
             search_query: String::new(),
+            run_filter_active: false,
+            run_filter_buf: String::new(),
+            sop_run_id: None,
+            next_cursor_segment: None,
             next_cursor_offset: None,
             next_cursor_legacy: None,
             at_end: false,
+            history_incomplete: false,
             loading: false,
+            active_log_path: None,
             list_height: 0,
             last_list_area: Rect::default(),
             last_detail_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
+            list_snapshot: None,
+            list_snapshot_event_ids: Vec::new(),
+            detail_snapshot: None,
+            detail_snapshot_event_id: None,
+            text_selection: None,
+            copy_menu: None,
+            copy_feedback: None,
         }
     }
 
@@ -520,64 +628,125 @@ impl Logs {
         self.rpc.logs_subscribe().await?;
         self.subscribed = true;
         // Load initial history
-        self.load_page(None, None).await;
+        self.load_page(None, None, None).await;
         Ok(())
     }
 
     /// Fetch a page of older events. If `cursor` is None, fetches the newest.
     async fn load_page(
         &mut self,
+        cursor_segment: Option<String>,
         cursor_offset: Option<u64>,
         cursor_legacy: Option<(String, String)>,
     ) {
         self.loading = true;
+        // Set when a cursor-bearing response turns out to contain only events
+        // already in the buffer, which means the cursor bought no older
+        // history and paging cannot advance past it.
+        let mut stale_cursor_no_progress = false;
+        // Cursor precedence: segment cursor first (only one that can cross
+        // into a rotated archive), then plain byte offset, then the legacy
+        // `(ts, id)` pair for daemons predating either field. Send only
+        // the winning cursor to keep the request unambiguous.
+        let has_segment = cursor_segment.is_some();
+        let has_offset = !has_segment && cursor_offset.is_some();
+        let has_legacy = !has_segment && !has_offset && cursor_legacy.is_some();
+        let has_cursor = has_segment || has_offset || has_legacy;
         let params = LogsQueryParams {
-            until_ts: cursor_legacy.as_ref().map(|(ts, _)| ts.clone()),
-            until_id: cursor_legacy.as_ref().map(|(_, id)| id.clone()),
-            until_line_offset: cursor_offset,
+            until_ts: if has_legacy {
+                cursor_legacy.as_ref().map(|(ts, _)| ts.clone())
+            } else {
+                None
+            },
+            until_id: if has_legacy {
+                cursor_legacy.as_ref().map(|(_, id)| id.clone())
+            } else {
+                None
+            },
+            until_line_offset: if has_offset { cursor_offset } else { None },
+            until_segment_cursor: cursor_segment,
             severity_min: Some(self.min_severity),
             q: if self.search_query.is_empty() {
                 None
             } else {
                 Some(self.search_query.clone())
             },
+            sop_run_id: self.sop_run_id.clone(),
             hide_internal: true,
-            limit: Some(if cursor_offset.is_none() && cursor_legacy.is_none() {
-                INITIAL_LOAD
-            } else {
-                PAGE_SIZE
-            }),
+            limit: Some(if has_cursor { PAGE_SIZE } else { INITIAL_LOAD }),
             ..Default::default()
         };
-        let has_cursor = cursor_offset.is_some() || cursor_legacy.is_some();
         match self.rpc.logs_query(params).await {
             Ok(result) => {
+                self.active_log_path = result.log_path;
                 // Events come newest-first from the daemon; reverse to chronological
                 let new_entries: Vec<LogEntry> = result
                     .events
                     .iter()
                     .rev()
+                    // New daemons apply this exact filter in the reader. Keep
+                    // the client guard too: an older RPC server may ignore the
+                    // newly added parameter, and must not make the run view
+                    // silently display unrelated rows.
+                    .filter(|event| {
+                        self.sop_run_id
+                            .as_deref()
+                            .is_none_or(|run_id| event_matches_sop_run_id(event, run_id))
+                    })
                     .filter_map(LogEntry::from_value)
                     .collect();
                 let prepended = new_entries.len();
                 if has_cursor && prepended > 0 {
-                    // Prepend older events before the existing buffer
-                    let mut combined = new_entries;
-                    combined.append(&mut self.events);
-                    self.events = combined;
-                    // Shift selection to keep the same item visible
-                    if let Some(sel) = self.list_state.selected() {
-                        self.list_state.select(Some(sel + prepended));
+                    // Prepend older events before the existing buffer.
+                    // Deduplicate by id: a daemon predating segment cursors
+                    // answers an unresolvable one with the newest page rather
+                    // than the empty at-end sentinel current daemons return,
+                    // and prepending that without deduplication would show the
+                    // same events twice and scramble the chronological order.
+                    let existing_ids: std::collections::HashSet<String> =
+                        self.events.iter().map(|e| e.id.clone()).collect();
+                    let deduped: Vec<LogEntry> = new_entries
+                        .into_iter()
+                        .filter(|e| !existing_ids.contains(&e.id))
+                        .collect();
+                    let actually_prepended = deduped.len();
+                    if actually_prepended > 0 {
+                        let mut combined = deduped;
+                        combined.append(&mut self.events);
+                        self.events = combined;
+                        // Shift selection to keep the same item visible
+                        if let Some(sel) = self.list_state.selected() {
+                            self.list_state.select(Some(sel + actually_prepended));
+                        }
+                    } else {
+                        // Every returned event was a duplicate, so this page
+                        // carried no older history. Stop paging rather than
+                        // treating it as an ordinary older page.
+                        //
+                        // Recorded as a flag rather than returning early: the
+                        // cleanup at the end of this function clears
+                        // `self.loading`, and skipping it would leave the pane
+                        // on its loading indicator forever, with
+                        // `maybe_load_older`'s `!self.loading` guard blocking
+                        // every later attempt.
+                        stale_cursor_no_progress = true;
                     }
                 } else if !has_cursor {
                     self.events = new_entries;
                 }
-                // Prefer the byte-offset cursor (independent of id ordering);
-                // fall back to the legacy `[timestamp, id]` pair when the
-                // daemon has not been upgraded to expose it.
+                // Prefer the segment cursor (crosses rotated archives);
+                // fall back to the byte-offset cursor (independent of id
+                // ordering), then to the legacy `[timestamp, id]` pair when
+                // the daemon has not been upgraded to expose them.
+                self.next_cursor_segment = result.next_segment_cursor;
                 self.next_cursor_offset = result.next_cursor_line_offset;
                 self.next_cursor_legacy = result.next_cursor;
-                self.at_end = result.at_end;
+                // A no-progress page means this cursor cannot advance, so
+                // whatever `at_end` describes must not re-enable paging.
+                self.at_end = result.at_end || stale_cursor_no_progress;
+                // Sticky: a later page reading cleanly does not restore the
+                // segment this one could not read.
+                self.history_incomplete |= result.incomplete;
             }
             Err(_) => {
                 // Query unavailable (old daemon without logs/query, or no log file).
@@ -603,14 +772,23 @@ impl Logs {
 
         // Reset pagination so subsequent scroll-to-top loads can
         // fetch history matching the new filter set.
+        self.next_cursor_segment = None;
         self.next_cursor_offset = None;
         self.next_cursor_legacy = None;
         self.at_end = false;
+        // The buffer is refetched from scratch under the new filter, so a
+        // gap reported for the old one says nothing about the new pages. A
+        // segment that is still unreadable sets this again on the next query.
+        self.history_incomplete = false;
 
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
             self.follow = false;
             self.list_state.select(None);
+            self.detail = DetailState::Loading;
+            self.detail_request_id = None;
+            self.detail_scroll = 0;
+            self.clear_surface_transients(LogsTextSurface::Detail);
             return;
         }
 
@@ -640,7 +818,11 @@ impl Logs {
         loop {
             match self.notif_rx.try_recv() {
                 Ok(notif) if notif.method == LOGS_EVENT_METHOD => {
-                    if let Some(entry) = LogEntry::from_live_value(notif.params) {
+                    let matches_run = self
+                        .sop_run_id
+                        .as_deref()
+                        .is_none_or(|run_id| event_matches_sop_run_id(&notif.params, run_id));
+                    if matches_run && let Some(entry) = LogEntry::from_live_value(notif.params) {
                         self.events.push(entry);
                     }
                 }
@@ -672,6 +854,13 @@ impl Logs {
         filtered.get(sel).copied()
     }
 
+    fn message_at_filtered_position(&self, position: usize) -> Option<String> {
+        let event_idx = self.filtered_indices().get(position).copied()?;
+        self.events
+            .get(event_idx)
+            .map(|entry| entry.message.clone())
+    }
+
     /// Per-tick work: drain events, update follow selection, lazy-fetch
     /// detail body. Async for the detail RPC.
     pub(crate) async fn tick(&mut self) {
@@ -691,6 +880,7 @@ impl Logs {
         // Drain + follow re-anchor again so events arriving between tick
         // and draw render this frame. Detail body is fetched only in tick.
         self.drain_notifications();
+        self.expire_copy_feedback();
 
         let filtered = self.filtered_indices();
 
@@ -710,7 +900,7 @@ impl Logs {
             .split(area);
 
         // Status bar
-        let help: String = if self.search_active {
+        let help: String = if self.search_active || self.run_filter_active {
             format!(
                 "Enter:{apply}  Esc:{cancel}",
                 apply = crate::i18n::t("zc-logs-search-action-apply"),
@@ -730,6 +920,14 @@ impl Logs {
             } else {
                 Span::raw("")
             },
+            if self.history_incomplete {
+                Span::styled(
+                    format!("{} ", crate::i18n::t("zc-logs-status-partial")),
+                    theme::warn_style(),
+                )
+            } else {
+                Span::raw("")
+            },
             if !self.subscribed {
                 Span::styled("[no sub] ", theme::warn_style())
             } else {
@@ -740,7 +938,13 @@ impl Logs {
         frame.render_widget(Paragraph::new(status), chunks[0]);
 
         // Filter bar (always visible)
-        let filter_line = if self.search_active {
+        let filter_line = if self.run_filter_active {
+            Line::from(vec![
+                Span::styled(" run:", theme::dim_style()),
+                Span::styled(&self.run_filter_buf, theme::input_style()),
+                Span::styled("\u{2588}", theme::accent_style()),
+            ])
+        } else if self.search_active {
             Line::from(vec![
                 Span::styled(" sev\u{2265}", theme::dim_style()),
                 Span::styled(
@@ -769,6 +973,17 @@ impl Logs {
                 spans.push(Span::styled(&self.search_query, theme::accent_style()));
                 spans.push(Span::styled("  (c:clear)", theme::dim_style()));
             }
+            if let Some(run_id) = &self.sop_run_id {
+                spans.push(Span::styled(
+                    format!(" {}: ", crate::i18n::t("zc-logs-run-filter-label")),
+                    theme::dim_style(),
+                ));
+                spans.push(Span::styled(run_id, theme::accent_style()));
+                spans.push(Span::styled(
+                    format!("  ({})", crate::i18n::t("zc-logs-run-filter-clear")),
+                    theme::dim_style(),
+                ));
+            }
             Line::from(spans)
         };
         frame.render_widget(Paragraph::new(filter_line), chunks[1]);
@@ -790,8 +1005,12 @@ impl Logs {
             self.draw_detail(frame, hsplit[1]);
         } else {
             self.last_detail_area = None;
+            self.clear_snapshot(LogsTextSurface::Detail);
             self.draw_list(frame, content_chunk, &filtered);
         }
+
+        self.render_copy_feedback(frame);
+        self.render_copy_menu(frame);
 
         // Footer: ?=help hint at bottom-left.
         frame.render_widget(
@@ -822,18 +1041,30 @@ impl Logs {
             })
             .collect();
 
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::dim_style());
+        let inner = block.inner(area);
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(theme::dim_style()),
-            )
+            .block(block)
             .highlight_style(theme::selected_style());
 
         frame.render_stateful_widget(list, area, &mut self.list_state);
+        let row_breaks = vec![TextRowBreak::Hard; usize::from(inner.height)];
+        let visible_event_ids = filtered
+            .iter()
+            .skip(self.list_state.offset())
+            .take(usize::from(inner.height))
+            .map(|&idx| self.events[idx].id.clone())
+            .collect();
+        self.set_list_snapshot(
+            TextSnapshot::capture(frame, inner, row_breaks),
+            visible_event_ids,
+        );
+        self.render_text_selection(frame, LogsTextSurface::List);
     }
 
-    fn draw_detail(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_detail(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let block = Block::default()
             .title(Span::styled(" Detail ", theme::title_style()))
             .borders(Borders::ALL)
@@ -842,40 +1073,507 @@ impl Logs {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let Some(_idx) = self.selected_event_idx() else {
-            let hint = Paragraph::new(Span::styled(
+        let lines = if self.selected_event_idx().is_none() {
+            vec![Line::from(Span::styled(
                 crate::i18n::t("zc-logs-no-event-selected"),
                 theme::dim_style(),
-            ));
-            frame.render_widget(hint, inner);
-            return;
+            ))]
+        } else if let Some(detail) = self.current_resolved_detail() {
+            detail.detail_lines(self.active_log_path.as_deref())
+        } else {
+            vec![Line::from(Span::styled(
+                crate::i18n::t("zc-logs-loading"),
+                theme::dim_style(),
+            ))]
         };
-
-        let lines = match &self.detail {
-            DetailState::Ready(d) => d.detail_lines(),
-            DetailState::Loading => {
-                vec![Line::from(Span::styled(
-                    crate::i18n::t("zc-logs-loading"),
-                    theme::dim_style(),
-                ))]
-            }
-        };
+        let row_breaks = row_breaks_for_lines(&lines, inner.width)
+            .into_iter()
+            .skip(usize::from(self.detail_scroll))
+            .take(usize::from(inner.height))
+            .chain(std::iter::repeat(TextRowBreak::Hard))
+            .take(usize::from(inner.height))
+            .collect();
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((self.detail_scroll, 0));
         frame.render_widget(para, inner);
+        let selected_event_id = self
+            .selected_event_idx()
+            .map(|idx| self.events[idx].id.clone());
+        self.set_detail_snapshot(
+            TextSnapshot::capture(frame, inner, row_breaks),
+            selected_event_id,
+        );
+        self.render_text_selection(frame, LogsTextSurface::Detail);
+    }
+
+    fn snapshot(&self, surface: LogsTextSurface) -> Option<&TextSnapshot> {
+        match surface {
+            LogsTextSurface::List => self.list_snapshot.as_ref(),
+            LogsTextSurface::Detail => self.detail_snapshot.as_ref(),
+        }
+    }
+
+    fn set_list_snapshot(&mut self, snapshot: TextSnapshot, event_ids: Vec<String>) {
+        let changed = self.list_snapshot.as_ref().is_some_and(|current| {
+            current != &snapshot || self.list_snapshot_event_ids != event_ids
+        });
+        if changed {
+            self.clear_surface_transients(LogsTextSurface::List);
+        }
+        self.list_snapshot = Some(snapshot);
+        self.list_snapshot_event_ids = event_ids;
+    }
+
+    fn set_detail_snapshot(&mut self, snapshot: TextSnapshot, event_id: Option<String>) {
+        let changed = self.detail_snapshot.as_ref().is_some_and(|current| {
+            current != &snapshot || self.detail_snapshot_event_id != event_id
+        });
+        if changed {
+            self.clear_surface_transients(LogsTextSurface::Detail);
+        }
+        self.detail_snapshot = Some(snapshot);
+        self.detail_snapshot_event_id = event_id;
+    }
+
+    fn clear_snapshot(&mut self, surface: LogsTextSurface) {
+        match surface {
+            LogsTextSurface::List => {
+                self.list_snapshot = None;
+                self.list_snapshot_event_ids.clear();
+            }
+            LogsTextSurface::Detail => {
+                self.detail_snapshot = None;
+                self.detail_snapshot_event_id = None;
+            }
+        }
+        self.clear_surface_transients(surface);
+    }
+
+    fn clear_surface_transients(&mut self, surface: LogsTextSurface) {
+        if self
+            .text_selection
+            .is_some_and(|selection| selection.surface == surface)
+        {
+            self.text_selection = None;
+        }
+        if self
+            .copy_menu
+            .as_ref()
+            .is_some_and(|menu| menu.surface == surface || menu.target.surface == surface)
+        {
+            self.copy_menu = None;
+        }
+        if self
+            .copy_feedback
+            .is_some_and(|feedback| feedback.surface == surface)
+        {
+            self.copy_feedback = None;
+        }
+    }
+
+    fn surface_at(&self, column: u16, row: u16) -> Option<LogsTextSurface> {
+        [LogsTextSurface::List, LogsTextSurface::Detail]
+            .into_iter()
+            .find(|&surface| {
+                self.snapshot(surface)
+                    .and_then(|snapshot| snapshot.point_at(column, row))
+                    .is_some()
+            })
+    }
+
+    fn begin_text_drag(&mut self, column: u16, row: u16) -> bool {
+        let Some(surface) = self.surface_at(column, row) else {
+            self.clear_copy_interaction();
+            return false;
+        };
+        let Some(snapshot) = self.snapshot(surface) else {
+            return false;
+        };
+        let Some(point) = snapshot.point_at(column, row) else {
+            return false;
+        };
+        if snapshot.row_text_bounds(point.row).is_none() {
+            self.clear_copy_interaction();
+            return false;
+        }
+
+        self.follow = false;
+        self.copy_menu = None;
+        self.copy_feedback = None;
+        self.text_selection = Some(LogsTextSelection {
+            surface,
+            selection: TextSelection {
+                anchor: point,
+                head: point,
+                dragged: false,
+            },
+        });
+        true
+    }
+
+    fn update_text_drag(&mut self, column: u16, row: u16) -> bool {
+        let Some(current) = self.text_selection else {
+            return false;
+        };
+        let Some(head) = self
+            .snapshot(current.surface)
+            .and_then(|snapshot| snapshot.point_at(column, row))
+        else {
+            return false;
+        };
+        self.text_selection = Some(LogsTextSelection {
+            surface: current.surface,
+            selection: TextSelection {
+                anchor: current.selection.anchor,
+                head,
+                dragged: head != current.selection.anchor,
+            },
+        });
+        true
+    }
+
+    fn finish_text_drag(&mut self) {
+        if self
+            .text_selection
+            .is_some_and(|selection| !selection.selection.dragged)
+        {
+            self.text_selection = None;
+        }
+    }
+
+    fn selected_text_target(&self) -> Option<LogsCopyTarget> {
+        let current = self.text_selection?;
+        if current.surface == LogsTextSurface::Detail {
+            self.current_resolved_detail()?;
+        }
+        let snapshot = self.snapshot(current.surface)?;
+        Some(LogsCopyTarget {
+            text: snapshot.selected_text(current.selection)?,
+            anchor: snapshot.selection_anchor_rect(current.selection)?,
+            surface: current.surface,
+        })
+    }
+
+    fn selected_list_row_target(&self) -> Option<LogsCopyTarget> {
+        let snapshot = self.list_snapshot.as_ref()?;
+        let selected = self.list_state.selected()?;
+        let visible_row = selected.checked_sub(self.list_state.offset())?;
+        let row = u16::try_from(visible_row).ok()?;
+        if row >= snapshot.area.height {
+            return None;
+        }
+        Some(LogsCopyTarget {
+            text: self.message_at_filtered_position(selected)?,
+            anchor: Rect::new(
+                snapshot.area.x,
+                snapshot.area.y + row,
+                snapshot.area.width,
+                1,
+            ),
+            surface: LogsTextSurface::List,
+        })
+    }
+
+    fn clear_copy_interaction(&mut self) {
+        self.text_selection = None;
+        self.copy_menu = None;
+        self.copy_feedback = None;
+    }
+
+    fn copy_target(&mut self, target: LogsCopyTarget) -> bool {
+        if target.text.is_empty() {
+            return false;
+        }
+        crate::mouse::copy_osc52(&target.text);
+        self.text_selection = None;
+        self.copy_menu = None;
+        self.copy_feedback = self
+            .feedback_rect(target.anchor, target.surface)
+            .map(|rect| LogsCopyFeedback {
+                rect,
+                surface: target.surface,
+                shown_at: Instant::now(),
+            });
+        true
+    }
+
+    fn copy_current_selection_or_row(&mut self) -> bool {
+        let target = if self.text_selection.is_some() {
+            self.selected_text_target()
+        } else {
+            self.selected_list_row_target()
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.copy_target(target)
+    }
+
+    fn copy_detail(&mut self) -> bool {
+        let Some(detail) = self.current_resolved_detail() else {
+            return false;
+        };
+        let text = detail.clipboard_text();
+        let anchor = self
+            .detail_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.area)
+            .or(self.last_detail_area)
+            .unwrap_or_default();
+        self.copy_target(LogsCopyTarget {
+            text,
+            anchor,
+            surface: LogsTextSurface::Detail,
+        })
+    }
+
+    fn open_copy_menu(&mut self, column: u16, row: u16) -> bool {
+        let Some(clicked_surface) = self.surface_at(column, row) else {
+            self.copy_menu = None;
+            return false;
+        };
+        let Some(clicked_snapshot) = self.snapshot(clicked_surface) else {
+            return false;
+        };
+        let menu_bounds = match clicked_surface {
+            LogsTextSurface::List => self.last_list_area,
+            LogsTextSurface::Detail => self.last_detail_area.unwrap_or(clicked_snapshot.area),
+        };
+        let target = if self.text_selection.is_some() {
+            let Some(selected) = self.selected_text_target() else {
+                return false;
+            };
+            selected
+        } else {
+            let Some(point) = clicked_snapshot.point_at(column, row) else {
+                return false;
+            };
+            match clicked_surface {
+                LogsTextSurface::List => {
+                    let filtered_position = self.list_state.offset() + usize::from(point.row);
+                    let Some(text) = self.message_at_filtered_position(filtered_position) else {
+                        return false;
+                    };
+                    LogsCopyTarget {
+                        text,
+                        anchor: Rect::new(
+                            clicked_snapshot.area.x,
+                            clicked_snapshot.area.y + point.row,
+                            clicked_snapshot.area.width,
+                            1,
+                        ),
+                        surface: clicked_surface,
+                    }
+                }
+                LogsTextSurface::Detail => {
+                    let Some(detail) = self.current_resolved_detail() else {
+                        return false;
+                    };
+                    LogsCopyTarget {
+                        text: detail.clipboard_text(),
+                        anchor: clicked_snapshot.area,
+                        surface: clicked_surface,
+                    }
+                }
+            }
+        };
+        let Some(rect) = copy_menu_rect(column, row, menu_bounds) else {
+            return false;
+        };
+        self.copy_feedback = None;
+        self.copy_menu = Some(LogsCopyMenu {
+            rect,
+            target,
+            surface: clicked_surface,
+        });
+        true
+    }
+
+    fn current_resolved_detail(&self) -> Option<&LogDetail> {
+        let selected_idx = self.selected_event_idx()?;
+        let selected_id = self.events.get(selected_idx)?.id.as_str();
+        if self.detail_request_id.as_deref() != Some(selected_id) {
+            return None;
+        }
+        match &self.detail {
+            DetailState::Ready(detail) => Some(detail),
+            DetailState::Loading => None,
+        }
+    }
+
+    fn activate_copy_menu(&mut self) -> bool {
+        let Some(menu) = self.copy_menu.take() else {
+            return false;
+        };
+        self.copy_target(menu.target)
+    }
+
+    fn confirm_copy_menu_key(&mut self) -> bool {
+        self.activate_copy_menu();
+        false
+    }
+
+    fn dismiss_copy_menu_key(&mut self) -> bool {
+        self.copy_menu = None;
+        false
+    }
+
+    fn feedback_rect(&self, anchor: Rect, surface: LogsTextSurface) -> Option<Rect> {
+        use unicode_width::UnicodeWidthStr;
+
+        let bounds = self.snapshot(surface)?.area;
+        let label = crate::i18n::t("zc-logs-copied");
+        let width = (UnicodeWidthStr::width(label.as_str()) as u16).min(bounds.width);
+        if width == 0 || bounds.height == 0 {
+            return None;
+        }
+        let max_x = bounds.x.saturating_add(bounds.width.saturating_sub(width));
+        let center = anchor.x.saturating_add(anchor.width / 2);
+        let x = center.saturating_sub(width / 2).clamp(bounds.x, max_x);
+        let y = anchor.y.clamp(bounds.y, bounds.y + bounds.height - 1);
+        Some(Rect::new(x, y, width, 1))
+    }
+
+    fn expire_copy_feedback(&mut self) {
+        if self
+            .copy_feedback
+            .is_some_and(|feedback| feedback.shown_at.elapsed() >= COPY_FEEDBACK_TTL)
+        {
+            self.copy_feedback = None;
+        }
+    }
+
+    fn render_text_selection(&self, frame: &mut ratatui::Frame, surface: LogsTextSurface) {
+        let Some(current) = self
+            .text_selection
+            .filter(|selection| selection.surface == surface)
+        else {
+            return;
+        };
+        if let Some(snapshot) = self.snapshot(surface) {
+            snapshot.render_selection(frame, current.selection, theme::selected_bg_style());
+        }
+    }
+
+    fn render_copy_feedback(&self, frame: &mut ratatui::Frame) {
+        let Some(feedback) = self.copy_feedback else {
+            return;
+        };
+        frame.render_widget(Clear, feedback.rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                crate::i18n::t("zc-logs-copied"),
+                theme::success_style().add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center),
+            feedback.rect,
+        );
+    }
+
+    fn render_copy_menu(&self, frame: &mut ratatui::Frame) {
+        let Some(menu) = &self.copy_menu else {
+            return;
+        };
+        frame.render_widget(Clear, menu.rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                crate::i18n::t("zc-logs-copy"),
+                theme::accent_style().add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::accent_style()),
+            ),
+            menu.rect,
+        );
     }
 
     // ── Key handling ─────────────────────────────────────────────
 
     pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
+        use crate::keymap::LogsTabAction;
+
+        if self.run_filter_active {
+            return self.handle_run_filter_key(key).await;
+        }
         if self.search_active {
+            self.copy_menu = None;
+            self.text_selection = None;
+            self.copy_feedback = None;
             return self.handle_search_key(key).await;
         }
+        if self.copy_menu.is_some() {
+            match key.code {
+                KeyCode::Enter => return self.confirm_copy_menu_key(), // keyguard: transient copy-menu confirmation
+                KeyCode::Esc => return self.dismiss_copy_menu_key(), // keyguard: transient copy-menu dismissal
+                _ => self.copy_menu = None,
+            }
+        }
+        if matches!(
+            LogsTabAction::from_chord(&key),
+            Some(LogsTabAction::CopySelection)
+        ) {
+            self.copy_current_selection_or_row();
+            return false;
+        }
+        self.text_selection = None;
+        self.copy_feedback = None;
         if self.detail_open {
             return self.handle_detail_key(key).await;
         }
         self.handle_normal_key(key).await
+    }
+
+    async fn handle_run_filter_key(&mut self, key: KeyEvent) -> bool {
+        use crate::keymap::SearchBoxAction;
+        match SearchBoxAction::from_chord(&key) {
+            Some(SearchBoxAction::Accept) => {
+                let run_id = self.run_filter_buf.trim();
+                self.sop_run_id = (!run_id.is_empty()).then(|| run_id.to_string());
+                self.run_filter_active = false;
+                self.reload_for_run_filter().await;
+            }
+            Some(SearchBoxAction::Cancel) => {
+                self.run_filter_active = false;
+                self.run_filter_buf = self.sop_run_id.clone().unwrap_or_default();
+            }
+            Some(SearchBoxAction::Backspace) => {
+                self.run_filter_buf.pop();
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.run_filter_buf.push(c);
+                }
+            }
+        }
+        false
+    }
+
+    async fn reload_for_run_filter(&mut self) {
+        self.events.clear();
+        self.list_state.select(None);
+        // A new run filter is a new query: every cursor from the old one,
+        // including the segment cursor into rotated archives, is stale, and a
+        // gap reported for the old query says nothing about the new pages.
+        self.next_cursor_segment = None;
+        self.next_cursor_offset = None;
+        self.next_cursor_legacy = None;
+        self.at_end = false;
+        self.history_incomplete = false;
+        self.detail_open = false;
+        self.detail = DetailState::Loading;
+        self.detail_request_id = None;
+        self.load_page(None, None, None).await;
+        let filtered = self.filtered_indices();
+        self.follow = true;
+        if !filtered.is_empty() {
+            self.list_state.select(Some(filtered.len() - 1));
+        }
     }
 
     async fn handle_search_key(&mut self, key: KeyEvent) -> bool {
@@ -896,7 +1594,9 @@ impl Logs {
             }
             _ => {
                 if let KeyCode::Char(c) = key.code
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
                 {
                     self.search_buf.push(c);
                 }
@@ -921,13 +1621,20 @@ impl Logs {
                 self.refilter(anchor);
             }
             Some(LogsTabAction::CopyDetail) => {
-                if let DetailState::Ready(d) = &self.detail {
-                    crate::mouse::copy_osc52(&d.clipboard_text());
-                }
+                self.copy_detail();
             }
             Some(LogsTabAction::BeginSearch) => {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
+            }
+            Some(LogsTabAction::BeginRunFilter) => {
+                self.run_filter_active = true;
+                self.run_filter_buf = self.sop_run_id.clone().unwrap_or_default();
+            }
+            Some(LogsTabAction::ClearRunFilter) if self.sop_run_id.is_some() => {
+                self.sop_run_id = None;
+                self.run_filter_buf.clear();
+                self.reload_for_run_filter().await;
             }
             Some(LogsTabAction::DetailScrollDown) => {
                 self.detail_scroll = self.detail_scroll.saturating_add(1);
@@ -988,6 +1695,15 @@ impl Logs {
             Some(LogsTabAction::BeginSearch) => {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
+            }
+            Some(LogsTabAction::BeginRunFilter) => {
+                self.run_filter_active = true;
+                self.run_filter_buf = self.sop_run_id.clone().unwrap_or_default();
+            }
+            Some(LogsTabAction::ClearRunFilter) if self.sop_run_id.is_some() => {
+                self.sop_run_id = None;
+                self.run_filter_buf.clear();
+                self.reload_for_run_filter().await;
             }
             Some(LogsTabAction::OpenDetail) if self.selected_event_idx().is_some() => {
                 self.detail_open = true;
@@ -1055,10 +1771,16 @@ impl Logs {
         if sel == 0
             && !self.at_end
             && !self.loading
-            && (self.next_cursor_offset.is_some() || self.next_cursor_legacy.is_some())
+            && (self.next_cursor_segment.is_some()
+                || self.next_cursor_offset.is_some()
+                || self.next_cursor_legacy.is_some())
         {
-            self.load_page(self.next_cursor_offset, self.next_cursor_legacy.clone())
-                .await;
+            self.load_page(
+                self.next_cursor_segment.clone(),
+                self.next_cursor_offset,
+                self.next_cursor_legacy.clone(),
+            )
+            .await;
         }
     }
 
@@ -1066,7 +1788,6 @@ impl Logs {
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, _content_area: Rect) {
         use crate::mouse;
-        use crossterm::event::MouseButton;
 
         let col = mouse.column;
         let row = mouse.row;
@@ -1077,14 +1798,42 @@ impl Logs {
             .last_detail_area
             .is_some_and(|r| mouse::in_rect(col, row, r));
 
+        if self.search_active {
+            self.copy_menu = None;
+        }
+        if let Some(menu) = &self.copy_menu
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            let activate = menu.action_contains(col, row);
+            if activate {
+                self.activate_copy_menu();
+            } else {
+                self.copy_menu = None;
+            }
+            return;
+        }
+
+        let opens_context_menu = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+            || (cfg!(target_os = "macos")
+                && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && mouse.modifiers.contains(KeyModifiers::CONTROL));
+        if opens_context_menu {
+            if !self.search_active {
+                self.open_copy_menu(col, row);
+            }
+            return;
+        }
+
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if in_list => {
-                if let Some(idx) = mouse::list_click_index(
-                    row,
-                    self.last_list_area,
-                    self.list_state.offset(),
-                    filtered_len,
-                ) {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_list
+                    && let Some(idx) = mouse::list_click_index(
+                        row,
+                        self.last_list_area,
+                        self.list_state.offset(),
+                        filtered_len,
+                    )
+                {
                     self.follow = false;
                     self.list_state.select(Some(idx));
                     if self.detail_open {
@@ -1096,9 +1845,20 @@ impl Logs {
                         self.detail_pct = 50;
                     }
                 }
-                // Clicks in detail area are ignored (no selection there).
+                if in_list || in_detail {
+                    self.begin_text_drag(col, row);
+                } else {
+                    self.clear_copy_interaction();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.update_text_drag(col, row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.finish_text_drag();
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.clear_copy_interaction();
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                 if in_detail {
                     if up {
@@ -1190,17 +1950,18 @@ impl Logs {
         }
     }
 
-    /// Whether the pane is in a text-input mode (search bar active).
+    /// Whether the pane is in a text-input mode (search or run filter active).
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.search_active
+        self.search_active || self.run_filter_active
     }
 
-    /// Route a bracketed-paste payload into the search buffer when the
-    /// search bar is open. Mirrors the char-insertion path in
-    /// `handle_search_key`; ignored when search isn't active so a stray
-    /// paste can't silently mutate hidden state.
+    /// Route a bracketed-paste payload into whichever filter editor is active.
+    /// Ignored outside text-input mode so a stray paste cannot mutate hidden
+    /// state.
     pub(crate) fn handle_paste(&mut self, text: &str) {
-        if self.search_active {
+        if self.run_filter_active {
+            self.run_filter_buf.push_str(text);
+        } else if self.search_active {
             self.search_buf.push_str(text);
         }
     }
@@ -1211,7 +1972,7 @@ impl crate::widgets::HelpContext for Logs {
         use crate::help::entries_for;
         use crate::keymap::LogsTabAction as L;
         use crate::widgets::{HelpEntry as E, HelpNode};
-        if self.search_active {
+        if self.search_active || self.run_filter_active {
             HelpNode::entries(entries_for([
                 crate::keymap::SearchBoxAction::Accept,
                 crate::keymap::SearchBoxAction::Cancel,
@@ -1227,10 +1988,13 @@ impl crate::widgets::HelpContext for Logs {
                 L::DetailWidenRight,
                 L::ToggleFollow,
                 L::BeginSearch,
+                L::BeginRunFilter,
+                L::ClearRunFilter,
                 L::IncreaseLevel,
                 L::DecreaseLevel,
                 L::ClearSearch,
                 L::CopyDetail,
+                L::CopySelection,
             ]))
         } else {
             let mut entries = entries_for([
@@ -1242,9 +2006,12 @@ impl crate::widgets::HelpContext for Logs {
                 L::OpenDetail,
                 L::ToggleFollow,
                 L::BeginSearch,
+                L::BeginRunFilter,
+                L::ClearRunFilter,
                 L::IncreaseLevel,
                 L::DecreaseLevel,
                 L::ClearSearch,
+                L::CopySelection,
             ]);
             entries.push(E::spacer());
             entries.push(E::desc(format!(
@@ -1257,9 +2024,30 @@ impl crate::widgets::HelpContext for Logs {
     }
 }
 
+/// Mirror the persisted reader's narrow SOP compatibility bridge for live
+/// broadcast events, which have not yet round-tripped through `logs/query`.
+fn event_matches_sop_run_id(event: &Value, run_id: &str) -> bool {
+    if event
+        .pointer("/zeroclaw/sop_run_id")
+        .and_then(Value::as_str)
+        == Some(run_id)
+        || event.pointer("/attributes/run_id").and_then(Value::as_str) == Some(run_id)
+    {
+        return true;
+    }
+    event
+        .get("message")
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.starts_with(&format!("SOP audit: run {run_id} ")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jsonrpc::RpcOutbound;
+    use crossterm::event::KeyModifiers;
+    use ratatui::{Terminal, backend::TestBackend};
+    use tokio::sync::mpsc;
 
     fn sample_entry() -> LogEntry {
         LogEntry {
@@ -1271,6 +2059,91 @@ mod tests {
             message: "TUI disconnected; session ended".into(),
             live_detail_fallback: None,
         }
+    }
+
+    fn test_logs() -> Logs {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        Logs::new(Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(
+            tx,
+        )))))
+    }
+
+    fn draw(logs: &mut Logs, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers,
+        }
+    }
+
+    #[tokio::test]
+    async fn search_input_owns_copy_chords() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        logs.list_state.select(Some(0));
+        draw(&mut logs, 100, 24);
+        logs.search_active = true;
+        logs.search_buf = "needle".into();
+        let list_area = logs.list_snapshot.as_ref().expect("list snapshot").area;
+
+        logs.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                list_area.x,
+                list_area.y,
+                KeyModifiers::NONE,
+            ),
+            Rect::new(0, 0, 100, 24),
+        );
+        assert!(logs.copy_menu.is_none());
+
+        for key in [
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+            KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            logs.handle_key(key).await;
+            assert_eq!(logs.search_buf, "needle");
+            assert!(logs.search_active);
+            assert!(
+                logs.copy_feedback.is_none(),
+                "copy chord must not target the selected row while search owns input"
+            );
+        }
+
+        logs.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(logs.search_buf, "needlex");
+
+        logs.search_active = false;
+        logs.search_buf = logs.search_query.clone();
+        assert!(logs.open_copy_menu(list_area.x, list_area.y));
+        logs.search_active = true;
+        logs.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert!(!logs.search_active);
+        assert!(logs.copy_menu.is_none());
+        assert!(logs.copy_feedback.is_none());
+
+        assert!(logs.open_copy_menu(list_area.x, list_area.y));
+        logs.search_active = true;
+        logs.search_buf = "cancelled".into();
+        logs.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+        assert!(!logs.search_active);
+        assert!(logs.copy_menu.is_none());
+        assert!(logs.copy_feedback.is_none());
     }
 
     #[test]
@@ -1287,7 +2160,7 @@ mod tests {
     #[test]
     fn preview_fallback_is_not_empty_and_notes_partial_payload() {
         let detail = LogDetail::from_preview(&sample_entry());
-        let lines = detail.detail_lines();
+        let lines = detail.detail_lines(None);
         assert!(!lines.is_empty());
         // The fallback must visibly signal the payload is partial so
         // the pane never silently masquerades as a full detail view.
@@ -1301,6 +2174,62 @@ mod tests {
         assert!(!text.contains(&crate::i18n::t("zc-logs-loading")));
     }
 
+    #[tokio::test]
+    async fn status_line_renders_partial_badge_from_catalogue() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        logs.history_incomplete = true;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+
+        // The badge must resolve from the ZeroCode Fluent catalogue rather
+        // than a bare literal, so non-English users see a localized marker.
+        let badge = crate::i18n::t("zc-logs-status-partial");
+        assert!(!badge.contains('{'), "key must resolve: {badge:?}");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains(&badge), "rendered: {rendered:?}");
+
+        // A fully readable history must not show the badge.
+        logs.history_incomplete = false;
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains(&badge), "rendered: {rendered:?}");
+    }
+
+    #[test]
+    fn preview_fallback_render_shows_active_persisted_path() {
+        let entry = sample_entry();
+        let detail = LogDetail::from_preview(&entry);
+        let rendered: String = detail
+            .detail_lines(Some("/var/lib/zeroclaw/runtime-trace.jsonl"))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.contains(&crate::i18n::t_args(
+            "zc-logs-persisted-path",
+            &[("path", "/var/lib/zeroclaw/runtime-trace.jsonl")],
+        )));
+    }
+
     #[test]
     fn full_payload_is_not_marked_preview_only() {
         let raw = serde_json::json!({
@@ -1312,12 +2241,13 @@ mod tests {
         let detail = LogDetail::new(raw);
         assert!(!detail.is_preview_only());
         let text: String = detail
-            .detail_lines()
+            .detail_lines(Some("/tmp/runtime-trace.jsonl"))
             .iter()
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
         assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
+        assert!(!text.contains("runtime-trace.jsonl"));
     }
 
     #[test]
@@ -1338,12 +2268,351 @@ mod tests {
         assert_eq!(detail.attributes()["model"], "switched-model");
 
         let text: String = detail
-            .detail_lines()
+            .detail_lines(None)
             .iter()
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
         assert!(text.contains("switched-model"));
         assert!(!text.contains(&crate::i18n::t("zc-logs-preview-only")));
+    }
+
+    #[test]
+    fn run_filter_matches_canonical_and_legacy_live_events() {
+        let run_id = "run-123-0001";
+        assert!(event_matches_sop_run_id(
+            &serde_json::json!({ "zeroclaw": { "sop_run_id": run_id } }),
+            run_id,
+        ));
+        assert!(event_matches_sop_run_id(
+            &serde_json::json!({ "attributes": { "run_id": run_id } }),
+            run_id,
+        ));
+        assert!(event_matches_sop_run_id(
+            &serde_json::json!({
+                "message": format!("SOP audit: run {run_id} started for 'review'")
+            }),
+            run_id,
+        ));
+        assert!(!event_matches_sop_run_id(
+            &serde_json::json!({ "attributes": { "run_id": "run-other" } }),
+            run_id,
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_drag_can_start_in_side_whitespace() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        draw(&mut logs, 90, 12);
+
+        let snapshot = logs.list_snapshot.as_ref().expect("list snapshot");
+        let row = snapshot.area.y;
+        let from_side = snapshot.area.x + snapshot.area.width - 1;
+        let into_text = snapshot.area.x + 5;
+        logs.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                from_side,
+                row,
+                KeyModifiers::NONE,
+            ),
+            Rect::new(0, 0, 90, 12),
+        );
+        logs.handle_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                into_text,
+                row,
+                KeyModifiers::NONE,
+            ),
+            Rect::new(0, 0, 90, 12),
+        );
+        logs.handle_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                into_text,
+                row,
+                KeyModifiers::NONE,
+            ),
+            Rect::new(0, 0, 90, 12),
+        );
+
+        let target = logs.selected_text_target().expect("drag selection");
+        assert_eq!(target.surface, LogsTextSurface::List);
+        assert!(target.text.contains("TUI disconnected; session ended"));
+        assert!(!logs.follow, "starting a selection must pause follow mode");
+    }
+
+    #[tokio::test]
+    async fn active_detail_selection_wins_over_right_clicked_list_row() {
+        let mut logs = test_logs();
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
+        logs.detail_open = true;
+        draw(&mut logs, 100, 18);
+
+        let detail = logs.detail_snapshot.as_ref().expect("detail snapshot");
+        let row = detail.area.y;
+        let start = detail.area.x;
+        let end = (start + 8).min(detail.area.x + detail.area.width - 1);
+        assert!(logs.begin_text_drag(start, row));
+        assert!(logs.update_text_drag(end, row));
+        logs.finish_text_drag();
+        let selected = logs.selected_text_target().expect("detail selection").text;
+
+        let list = logs.list_snapshot.as_ref().expect("list snapshot");
+        assert!(logs.open_copy_menu(list.area.x, list.area.y));
+        let menu = logs.copy_menu.as_ref().expect("copy menu");
+        assert_eq!(menu.target.text, selected);
+        assert_eq!(menu.target.surface, LogsTextSurface::Detail);
+        assert!(logs.copy_feedback.is_none(), "opening must not copy");
+
+        assert!(logs.activate_copy_menu());
+        assert!(logs.text_selection.is_none());
+        assert!(logs.copy_menu.is_none());
+        assert!(logs.copy_feedback.is_some());
+    }
+
+    #[tokio::test]
+    async fn copy_shortcut_prefers_selection_and_whole_detail_y_still_works() {
+        let mut logs = test_logs();
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
+        logs.detail_open = true;
+        draw(&mut logs, 100, 18);
+
+        let detail_area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
+        assert!(logs.begin_text_drag(detail_area.x, detail_area.y));
+        assert!(logs.update_text_drag(detail_area.x + 5, detail_area.y));
+        logs.finish_text_drag();
+        logs.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER))
+            .await;
+        assert!(logs.text_selection.is_none());
+        assert_eq!(
+            logs.copy_feedback.expect("selection feedback").surface,
+            LogsTextSurface::Detail,
+        );
+
+        logs.copy_feedback = None;
+        logs.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await;
+        assert!(logs.copy_feedback.is_some(), "whole-detail y still copies");
+    }
+
+    #[tokio::test]
+    async fn copy_shortcut_without_selection_copies_highlighted_list_row() {
+        let mut logs = test_logs();
+        let complete_message =
+            "second message continues far beyond the narrow terminal viewport without truncation";
+        for message in ["first", complete_message, "third"] {
+            let mut entry = sample_entry();
+            entry.message = message.to_string();
+            logs.events.push(entry);
+        }
+        logs.follow = false;
+        logs.list_state.select(Some(1));
+        draw(&mut logs, 80, 10);
+
+        let target = logs
+            .selected_list_row_target()
+            .expect("highlighted row target");
+        assert_eq!(target.text, complete_message);
+
+        logs.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER))
+            .await;
+        assert_eq!(
+            logs.copy_feedback.expect("row feedback").surface,
+            LogsTextSurface::List,
+        );
+    }
+
+    #[tokio::test]
+    async fn right_click_targets_complete_filtered_scrolled_row_and_dismisses() {
+        let mut logs = test_logs();
+        let messages = [
+            "first message continues far beyond the narrow terminal viewport without truncation",
+            "second message continues far beyond the narrow terminal viewport without truncation",
+            "third message continues far beyond the narrow terminal viewport without truncation",
+            "fourth message continues far beyond the narrow terminal viewport without truncation",
+            "fifth message continues far beyond the narrow terminal viewport without truncation",
+            "sixth message continues far beyond the narrow terminal viewport without truncation",
+        ];
+        logs.min_severity = SEV_INFO;
+        for (index, message) in messages.iter().enumerate() {
+            let mut excluded = sample_entry();
+            excluded.message = format!("excluded debug message {index}");
+            excluded.severity_number = SEV_DEBUG;
+            logs.events.push(excluded);
+
+            let mut entry = sample_entry();
+            entry.message = (*message).to_string();
+            logs.events.push(entry);
+        }
+        logs.follow = false;
+        logs.list_state.select(Some(messages.len() - 1));
+        draw(&mut logs, 70, 7);
+
+        let snapshot = logs.list_snapshot.as_ref().expect("list snapshot");
+        let visible_position = logs.list_state.offset();
+        assert!(visible_position > 0, "the fixture must scroll the list");
+        let expected = messages[visible_position];
+        assert!(
+            expected.len() > usize::from(snapshot.area.width),
+            "the fixture message must exceed the viewport width",
+        );
+        let column = snapshot.area.x;
+        let row = snapshot.area.y;
+        logs.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Right),
+                column,
+                row,
+                KeyModifiers::NONE,
+            ),
+            Rect::new(0, 0, 70, 7),
+        );
+
+        let menu = logs.copy_menu.as_ref().expect("right-click menu");
+        assert_eq!(menu.target.text, expected);
+        assert!(logs.copy_feedback.is_none(), "opening must not copy");
+
+        logs.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE,
+            ),
+            Rect::new(0, 0, 70, 7),
+        );
+        assert!(logs.copy_menu.is_none());
+        assert!(logs.copy_feedback.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn control_click_opens_the_copy_menu() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        draw(&mut logs, 70, 10);
+        let area = logs.list_snapshot.as_ref().expect("list snapshot").area;
+
+        logs.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x,
+                area.y,
+                KeyModifiers::CONTROL,
+            ),
+            Rect::new(0, 0, 70, 10),
+        );
+
+        assert!(logs.copy_menu.is_some());
+        assert!(logs.copy_feedback.is_none());
+    }
+
+    #[tokio::test]
+    async fn detail_scroll_snapshot_change_dismisses_selection_and_menu() {
+        let mut logs = test_logs();
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
+        logs.detail_open = true;
+        draw(&mut logs, 100, 12);
+
+        let area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
+        assert!(logs.begin_text_drag(area.x, area.y));
+        assert!(logs.update_text_drag(area.x + 5, area.y));
+        logs.finish_text_drag();
+        assert!(logs.open_copy_menu(area.x, area.y));
+
+        logs.detail_scroll = 1;
+        draw(&mut logs, 100, 12);
+        assert!(logs.text_selection.is_none());
+        assert!(logs.copy_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn filtering_to_no_rows_clears_stale_detail_copy_state() {
+        let mut logs = test_logs();
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
+        logs.detail_open = true;
+        draw(&mut logs, 100, 12);
+
+        let detail_area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
+        assert!(logs.open_copy_menu(detail_area.x, detail_area.y));
+
+        let anchor = logs.cursor_anchor();
+        logs.search_query = "does-not-match".into();
+        logs.refilter(anchor);
+
+        assert!(logs.list_state.selected().is_none());
+        assert!(matches!(logs.detail, DetailState::Loading));
+        assert!(logs.detail_request_id.is_none());
+        assert!(logs.copy_menu.is_none());
+        assert!(!logs.copy_detail());
+
+        draw(&mut logs, 100, 12);
+        let detail_area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
+        assert!(!logs.open_copy_menu(detail_area.x, detail_area.y));
+    }
+
+    #[tokio::test]
+    async fn identical_list_cells_with_new_event_id_dismiss_copy_menu() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        draw(&mut logs, 100, 12);
+
+        let list_area = logs.list_snapshot.as_ref().expect("list snapshot").area;
+        assert!(logs.open_copy_menu(list_area.x, list_area.y));
+
+        logs.events[0].id = "replacement-event-id".into();
+        draw(&mut logs, 100, 12);
+
+        assert!(logs.copy_menu.is_none());
+        assert_eq!(logs.list_snapshot_event_ids, ["replacement-event-id"]);
+    }
+
+    #[tokio::test]
+    async fn changed_detail_event_id_rejects_stale_resolved_payload() {
+        let mut logs = test_logs();
+        let entry = sample_entry();
+        logs.detail_request_id = Some(entry.id.clone());
+        logs.detail = DetailState::Ready(LogDetail::from_preview(&entry));
+        logs.events.push(entry);
+        logs.detail_open = true;
+        draw(&mut logs, 100, 12);
+
+        let detail_area = logs.detail_snapshot.as_ref().expect("detail snapshot").area;
+        assert!(logs.open_copy_menu(detail_area.x, detail_area.y));
+
+        logs.events[0].id = "replacement-event-id".into();
+        draw(&mut logs, 100, 12);
+
+        assert!(logs.copy_menu.is_none());
+        assert_eq!(
+            logs.detail_snapshot_event_id.as_deref(),
+            Some("replacement-event-id")
+        );
+        assert!(!logs.copy_detail());
+
+        assert!(logs.begin_text_drag(detail_area.x, detail_area.y));
+        assert!(logs.update_text_drag(detail_area.x + 5, detail_area.y));
+        logs.finish_text_drag();
+        assert!(logs.selected_text_target().is_none());
+        assert!(!logs.copy_current_selection_or_row());
+
+        let list_area = logs.list_snapshot.as_ref().expect("list snapshot").area;
+        assert!(!logs.open_copy_menu(list_area.x, list_area.y));
+        assert!(!logs.open_copy_menu(detail_area.x, detail_area.y));
     }
 }

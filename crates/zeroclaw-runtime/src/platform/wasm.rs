@@ -1,6 +1,6 @@
 //! WASM sandbox runtime — in-process tool isolation via `wasmi`.
 
-use super::traits::RuntimeAdapter;
+use super::traits::{RuntimeAdapter, ShellDialect};
 use zeroclaw_config::schema::WasmRuntimeConfig;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -264,11 +264,6 @@ impl RuntimeAdapter for WasmRuntime {
         "wasm"
     }
 
-    fn has_shell_access(&self) -> bool {
-        // WASM sandbox does NOT provide shell access — that's the point
-        false
-    }
-
     fn has_filesystem_access(&self) -> bool {
         self.config.allow_workspace_read || self.config.allow_workspace_write
     }
@@ -286,6 +281,10 @@ impl RuntimeAdapter for WasmRuntime {
 
     fn memory_budget(&self) -> u64 {
         self.config.memory_limit_mb.saturating_mul(1024 * 1024)
+    }
+
+    fn shell_dialect(&self) -> ShellDialect {
+        ShellDialect::None
     }
 
     fn build_shell_command(

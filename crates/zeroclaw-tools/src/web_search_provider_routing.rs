@@ -6,6 +6,9 @@ pub enum WebSearchProviderRoute {
     Tavily,
     Jina,
     Bocha,
+    AnySearch,
+    Serply,
+    Keenable,
 }
 
 /// Provider HTTP-failure status surfaced to the agent via the error message's
@@ -44,6 +47,9 @@ const SEARXNG_PROVIDER: &str = "searxng";
 const TAVILY_PROVIDER: &str = "tavily";
 const JINA_PROVIDER: &str = "jina";
 const BOCHA_PROVIDER: &str = "bocha";
+const ANYSEARCH_PROVIDER: &str = "anysearch";
+const SERPLY_PROVIDER: &str = "serply";
+const KEENABLE_PROVIDER: &str = "keenable";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -82,8 +88,25 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
                 used_fallback: false,
             }
         }
+        "anysearch" | "any-search" | "any_search" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::AnySearch,
+            canonical_provider: ANYSEARCH_PROVIDER,
+            used_fallback: false,
+        },
+        "serply" | "serply-search" | "serply_search" | "serply-io" | "serply_io" => {
+            WebSearchProviderResolution {
+                route: WebSearchProviderRoute::Serply,
+                canonical_provider: SERPLY_PROVIDER,
+                used_fallback: false,
+            }
+        }
+        "keenable" | "keenable-search" | "keenable_search" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::Keenable,
+            canonical_provider: KEENABLE_PROVIDER,
+            used_fallback: false,
+        },
         // Warns for unknown model_providers, falls back to default.
-        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina, Bocha.
+        // Known non-default model_providers are matched above.
         _ => WebSearchProviderResolution {
             route: WebSearchProviderRoute::DuckDuckGo,
             canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,
@@ -165,6 +188,44 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Bocha);
             assert_eq!(resolved.canonical_provider, BOCHA_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_anysearch() {
+        for alias in ["anysearch", "any-search", "any_search"] {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::AnySearch);
+            assert_eq!(resolved.canonical_provider, ANYSEARCH_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_serply() {
+        let serply_aliases = [
+            "serply",
+            "serply-search",
+            "serply_search",
+            "serply-io",
+            "serply_io",
+        ];
+        for alias in serply_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Serply);
+            assert_eq!(resolved.canonical_provider, SERPLY_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_keenable() {
+        let keenable_aliases = ["keenable", "keenable-search", "keenable_search"];
+        for alias in keenable_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Keenable);
+            assert_eq!(resolved.canonical_provider, KEENABLE_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }

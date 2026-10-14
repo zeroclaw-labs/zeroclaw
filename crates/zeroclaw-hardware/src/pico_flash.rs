@@ -295,14 +295,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_with_confirm_true_but_no_pico_returns_error() {
+    #[ignore = "may flash attached hardware"]
+    async fn execute_with_confirm_true_does_not_panic_when_explicitly_opted_in() {
+        const HARDWARE_TEST_OPT_IN: &str = "ZEROCLAW_RUN_PICO_HARDWARE_TESTS";
+
+        assert_eq!(
+            std::env::var(HARDWARE_TEST_OPT_IN).as_deref(),
+            Ok("1"),
+            "set {HARDWARE_TEST_OPT_IN}=1 to run this hardware-flashing test"
+        );
+
         // In CI there's no Pico attached — the tool should report missing device, not panic.
-        let result = tool()
+        tool()
             .execute(serde_json::json!({"confirm": true}))
             .await
             .unwrap();
-        // Either success (if a Pico happens to be connected) or the BOOTSEL error.
-        // What must NOT happen: panic or anyhow error propagation.
-        let _ = result; // just verify it didn't panic
     }
 }

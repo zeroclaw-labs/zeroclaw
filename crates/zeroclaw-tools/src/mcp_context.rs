@@ -10,12 +10,28 @@ use crate::tool_search::ToolAccessPolicy;
 use std::sync::Arc;
 use zeroclaw_config::schema::McpServerConfig;
 
-pub async fn build_pinned_resources_section(
+/// One pinned MCP resource, rendered for the system prompt and attributed to
+/// the exact-match selector name it was admitted under.
+///
+/// `key` is the `<server>__<uri>` name the access policy checked at assembly.
+/// It is what a later narrowing of the caller's tool selector is matched
+/// against, so admitted content can be withdrawn from the prompt when the
+/// grant that admitted it is withdrawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedResourceBlock {
+    pub key: String,
+    pub rendered: String,
+}
+
+/// Read every policy-admitted pinned resource and return it as an attributed
+/// block. [`render_pinned_resources_section`] turns the blocks into the prompt
+/// section; keeping the blocks lets the holder prune them later.
+pub async fn build_pinned_resource_blocks(
     registry: &Arc<McpRegistry>,
     configs: &[McpServerConfig],
     policy: Option<&ToolAccessPolicy>,
-) -> String {
-    let mut blocks = String::new();
+) -> Vec<PinnedResourceBlock> {
+    let mut blocks = Vec::new();
     for cfg in configs {
         for uri in &cfg.pinned_resources {
             let prefixed = format!("{}__{}", cfg.name, uri);
@@ -33,8 +49,10 @@ pub async fn build_pinned_resources_section(
             }
             match registry.read_resource(&prefixed).await {
                 Ok(contents) => {
-                    blocks.push_str(&wrap_resource_contents(&cfg.name, &prefixed, &contents));
-                    blocks.push('\n');
+                    blocks.push(PinnedResourceBlock {
+                        rendered: wrap_resource_contents(&cfg.name, &prefixed, &contents),
+                        key: prefixed,
+                    });
                 }
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -48,10 +66,32 @@ pub async fn build_pinned_resources_section(
             }
         }
     }
+    blocks
+}
+
+/// Render attributed pinned-resource blocks into the `## Pinned MCP Resources`
+/// prompt section. Empty input renders to an empty string, so a holder whose
+/// last block was pruned emits no section at all.
+#[must_use]
+pub fn render_pinned_resources_section(blocks: &[PinnedResourceBlock]) -> String {
     if blocks.is_empty() {
         return String::new();
     }
-    format!("## Pinned MCP Resources\n\n{blocks}")
+    let mut body = String::new();
+    for block in blocks {
+        body.push_str(&block.rendered);
+        body.push('\n');
+    }
+    format!("## Pinned MCP Resources\n\n{body}")
+}
+
+/// Convenience for callers that only ever need the rendered section.
+pub async fn build_pinned_resources_section(
+    registry: &Arc<McpRegistry>,
+    configs: &[McpServerConfig],
+    policy: Option<&ToolAccessPolicy>,
+) -> String {
+    render_pinned_resources_section(&build_pinned_resource_blocks(registry, configs, policy).await)
 }
 
 /// Escape the few characters that would break our attribute quoting.
@@ -124,6 +164,29 @@ pub fn render_prompt_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_section_is_the_attributed_blocks_in_order_and_empty_when_pruned() {
+        let block = |key: &str| PinnedResourceBlock {
+            key: key.into(),
+            rendered: format!("<mcp-resource uri=\"{key}\">body</mcp-resource>"),
+        };
+        let mut blocks = vec![block("srv__a"), block("srv__b")];
+        let section = render_pinned_resources_section(&blocks);
+        assert_eq!(
+            section,
+            "## Pinned MCP Resources\n\n\
+             <mcp-resource uri=\"srv__a\">body</mcp-resource>\n\
+             <mcp-resource uri=\"srv__b\">body</mcp-resource>\n"
+        );
+        // Pruning by key is what a holder does when the caller's selector
+        // narrows; the last block gone means no section at all.
+        blocks.retain(|b| b.key == "srv__b");
+        assert!(render_pinned_resources_section(&blocks).contains("srv__b"));
+        assert!(!render_pinned_resources_section(&blocks).contains("srv__a"));
+        blocks.clear();
+        assert_eq!(render_pinned_resources_section(&blocks), "");
+    }
     use crate::mcp_client::McpRegistry;
     use crate::mcp_prompt::{McpGetPromptResult, McpPromptMessage};
     use crate::mcp_resource::{McpResourceContent, McpResourceContents};

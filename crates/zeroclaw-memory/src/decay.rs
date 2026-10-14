@@ -43,6 +43,7 @@ mod tests {
 
     fn make_entry(category: MemoryCategory, score: Option<f64>, timestamp: &str) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "test".into(),
             content: "value".into(),

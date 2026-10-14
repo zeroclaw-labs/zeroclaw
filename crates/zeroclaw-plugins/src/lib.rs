@@ -2,18 +2,37 @@
 //! Plugins are WebAssembly components loaded via wasmtime that can extend
 //! ZeroClaw with custom tools and channels. Enable with a `plugins-wasm*` feature.
 
+pub mod catalog;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
+mod component_config;
+#[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_secrets;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_state;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_websocket;
+pub mod config;
+pub mod egress;
 pub mod endpoint;
 pub mod error;
+pub mod event;
 pub mod host;
 pub mod instance;
 pub mod registry;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod services;
 pub mod signature;
+#[cfg(feature = "plugins-wasmtime")]
+pub(crate) mod sockets;
+pub mod validate;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod wasi_http;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
 #[cfg(feature = "plugins-wasmtime")]
@@ -40,11 +59,36 @@ pub struct PluginManifest {
     /// for skill-only plugins, which carry no WASM payload.
     #[serde(default)]
     pub wasm_path: Option<String>,
+    /// Lowercase or uppercase hexadecimal SHA-256 of the exact WASM payload.
+    /// Required for executable plugins when signature policy is strict.
+    #[serde(default)]
+    pub wasm_sha256: Option<String>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
+    /// The compiled-in channel id this plugin *mirrors*, when it is a drop-in
+    /// for a built-in channel: the snake_case config id (`"telegram"`,
+    /// `"gmail_push"`).
+    ///
+    /// When set, the host admits one logical instance per configured and
+    /// enabled `[channels.<id>.<alias>]` and binds each to that alias, instead
+    /// of the single `[channels.plugin.<alias>]` declaration a novel channel
+    /// plugin uses. Canonical channel config stays the one home for those
+    /// settings: a mirror never gets a second config surface.
+    ///
+    /// `None` (the default) is a novel plugin with no built-in equivalent.
+    #[serde(default)]
+    pub provides: Option<String>,
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Draft 2020-12 JSON Schema for this plugin's private config object.
+    /// Required exactly when `config_read` is requested.
+    /// Direct top-level string properties marked `x-secret: true` are withheld
+    /// from public config and served through the scoped secrets import during
+    /// tool execution or channel service calls. Channel calls obtain the
+    /// remaining typed public object through the scoped config import.
+    #[serde(default)]
+    pub config_schema: Option<serde_json::Value>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
@@ -52,6 +96,28 @@ pub struct PluginManifest {
     /// Hex-encoded Ed25519 public key of the publisher who signed this manifest.
     #[serde(default)]
     pub publisher_key: Option<String>,
+    /// Destinations this plugin declares it needs.
+    ///
+    /// This is a signature-covered **attestation of intent**, never a grant:
+    /// nothing here confers network reach. The effective allowlist is the
+    /// operator's `plugins.entries[].egress_hosts`. Keeping the two apart is
+    /// what shuts the self-grant path — an unsigned component that writes its
+    /// own `[egress]` table still reaches nothing.
+    #[serde(default)]
+    pub egress: PluginEgressDeclaration,
+}
+
+/// The optional `[egress]` table of a plugin manifest.
+///
+/// Absent, empty, and "declares nothing" are the same state, so a manifest that
+/// predates this field parses unchanged and declares no destinations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginEgressDeclaration {
+    /// Exact hosts or `*.suffix` patterns, in the strict egress grammar
+    /// (`zeroclaw_infra::net_guard::normalize_egress_pattern`). Invalid grammar
+    /// rejects the whole manifest at discovery and at install.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 /// What a plugin can do.
@@ -76,6 +142,11 @@ pub enum PluginCapability {
 pub enum PluginPermission {
     /// Can make HTTP requests
     HttpClient,
+    /// Can open host-mediated outbound WebSocket connections.
+    #[serde(rename = "websocket_client")]
+    WebSocketClient,
+    /// Can open host-mediated outbound TCP, TLS, and STARTTLS connections.
+    SocketClient,
     /// Can read from the filesystem (within sandbox)
     FileRead,
     /// Can write to the filesystem (within sandbox)
@@ -87,6 +158,10 @@ pub enum PluginPermission {
     MemoryRead,
     /// Can write agent memory
     MemoryWrite,
+    /// Can read this exact plugin instance's encrypted durable state
+    StateRead,
+    /// Can write this exact plugin instance's encrypted durable state
+    StateWrite,
 }
 
 /// Information about a loaded plugin.

@@ -1,6 +1,10 @@
 //! Release invariants for published container variants and scheduled scans.
 
-use std::{fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 fn workflow(name: &str) -> String {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -12,6 +16,18 @@ fn repository_file(name: &str) -> String {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     fs::read_to_string(root.join(name))
         .unwrap_or_else(|error| panic!("failed to read {name}: {error}"))
+}
+
+fn builder_stage<'a>(containerfile: &'a str, name: &str) -> &'a str {
+    let builder = containerfile
+        .split_once(" AS builder")
+        .and_then(|(_, builder)| {
+            builder
+                .strip_prefix("\r\n")
+                .or_else(|| builder.strip_prefix('\n'))
+        })
+        .unwrap_or_else(|| panic!("{name} must define a builder stage"));
+    builder.split("\nFROM ").next().unwrap_or(builder)
 }
 
 fn top_level_job<'a>(workflow: &'a str, name: &str) -> &'a str {
@@ -31,6 +47,57 @@ fn top_level_job<'a>(workflow: &'a str, name: &str) -> &'a str {
         })
         .unwrap_or(rest.len());
     &rest[..end]
+}
+
+fn workflow_step<'a>(job: &'a str, name: &str) -> &'a str {
+    let marker = format!("\n      - name: {name}\n");
+    let (_, rest) = job
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("workflow job must contain the {name} step"));
+    let end = rest.find("\n      - ").unwrap_or(rest.len());
+    &rest[..end]
+}
+
+fn source_matrix_rows(workflow: &str) -> Vec<serde_json::Value> {
+    let branch = workflow
+        .split_once("          else\n            prebuilt_images=true\n")
+        .map(|(_, branch)| branch)
+        .expect("Docker workflow must define the full source-image matrix branch");
+    let branch = branch
+        .split_once("          echo \"prebuilt_images=$prebuilt_images\"")
+        .map(|(branch, _)| branch)
+        .expect("Docker workflow must publish the generated source-image matrix");
+
+    let matrix_json = branch
+        .split_once("source_matrix='")
+        .and_then(|(_, value)| value.split_once('\''))
+        .map(|(value, _)| value)
+        .expect("full source-image branch must initialize source_matrix as JSON");
+    let matrix: serde_json::Value =
+        serde_json::from_str(matrix_json).expect("source_matrix must contain valid JSON");
+    let mut rows = matrix["include"]
+        .as_array()
+        .expect("source_matrix must contain an include array")
+        .clone();
+
+    let mut additions = branch;
+    while let Some((_, rest)) = additions.split_once(".include += ") {
+        let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>();
+        let addition = stream
+            .next()
+            .expect("matrix append must contain JSON")
+            .expect("matrix append must contain valid JSON");
+        rows.extend(
+            addition
+                .as_array()
+                .expect("matrix append must contain a JSON array")
+                .iter()
+                .cloned(),
+        );
+        additions = &rest[stream.byte_offset()..];
+    }
+
+    rows
 }
 
 fn mount_option<'a>(mount: &'a str, names: &[&str]) -> Option<&'a str> {
@@ -56,6 +123,70 @@ fn cargo_cache_mounts(containerfile: &str) -> Vec<(&str, Option<&str>)> {
             })
         })
         .collect()
+}
+
+/// Digest shape, mirroring `xtask::generate::container_base::valid_digest`.
+fn has_pinned_digest(image_ref: &str) -> bool {
+    image_ref
+        .split_once("@sha256:")
+        .is_some_and(|(_, hex)| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// The image a `FROM` names, skipping flags such as `--platform=$BUILDPLATFORM`.
+/// The image is the first non-flag token, so the trailing `AS <stage>` is past it.
+fn from_image_ref(line: &str) -> Option<&str> {
+    let mut tokens = line.split_whitespace();
+    if !tokens.next()?.eq_ignore_ascii_case("FROM") {
+        return None;
+    }
+    tokens.find(|token| !token.starts_with("--"))
+}
+
+/// The stage a `FROM ... AS <stage>` declares.
+fn from_stage_name(line: &str) -> Option<&str> {
+    let mut after_as = line
+        .split_whitespace()
+        .skip_while(|token| !token.eq_ignore_ascii_case("AS"));
+    after_as.next()?;
+    after_as.next()
+}
+
+/// `FROM` references that are neither an earlier build stage nor pinned to a
+/// digest — directly, or through an `ARG` declared in the same file.
+fn unpinned_base_images(dockerfile: &str) -> Vec<&str> {
+    let args: HashMap<&str, &str> = dockerfile
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("ARG "))
+        .filter_map(|declaration| declaration.split_once('='))
+        .map(|(name, value)| (name.trim(), value.trim()))
+        .collect();
+
+    let mut stages: HashSet<&str> = HashSet::new();
+    let mut unpinned = Vec::new();
+
+    for line in dockerfile.lines() {
+        let Some(image_ref) = from_image_ref(line) else {
+            continue;
+        };
+
+        // An undeclared `${ARG}` resolves to nothing, which is not pinned.
+        let resolved = image_ref
+            .strip_prefix("${")
+            .and_then(|name| name.strip_suffix('}'))
+            .map_or(image_ref, |name| {
+                args.get(name).copied().unwrap_or_default()
+            });
+
+        if !stages.contains(image_ref) && !has_pinned_digest(resolved) {
+            unpinned.push(image_ref);
+        }
+
+        if let Some(stage) = from_stage_name(line) {
+            stages.insert(stage);
+        }
+    }
+
+    unpinned
 }
 
 #[test]
@@ -103,8 +234,8 @@ fn manual_stable_release_calls_container_matrix_at_release_tag() {
         publisher
             .matches("ref: ${{ inputs.release_ref || github.ref }}")
             .count(),
-        2,
-        "matrix resolution and image builds must use the requested immutable ref"
+        3,
+        "matrix resolution, image builds, and the relay image build must use the requested immutable ref"
     );
 }
 
@@ -185,7 +316,7 @@ fn compose_smoke_proves_override_precedence_through_the_published_port() {
         "- scripts/ci/smoke_docker_compose.sh",
         "matrix: ${{ fromJSON(needs.changes.outputs.source_matrix) }}",
         "\"gateway_smoke\":true",
-        "load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64') }}",
+        "load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' && !matrix.cargo_flags) }}",
         "if: matrix.gateway_smoke",
         "run: bash scripts/ci/smoke_docker_compose.sh",
     ] {
@@ -228,6 +359,173 @@ fn compose_smoke_proves_override_precedence_through_the_published_port() {
 }
 
 #[test]
+fn plugin_enabled_container_variants_stage_wit_and_have_source_build_coverage() {
+    for name in ["Dockerfile.alpine", "Dockerfile.debian"] {
+        let containerfile = repository_file(name);
+        let builder = builder_stage(&containerfile, name);
+        let wit_copy = builder
+            .find("COPY wit/ wit/")
+            .unwrap_or_else(|| panic!("{name} must stage the repository WIT contract"));
+        let dependency_build = builder
+            .find("$ZEROCLAW_CARGO_FLAGS;")
+            .unwrap_or_else(|| panic!("{name} must expose its feature-enabled dependency build"));
+        let source_copy = builder
+            .find("COPY crates/ crates/")
+            .unwrap_or_else(|| panic!("{name} must copy real crate sources"));
+        let source_build = builder
+            .rfind("$ZEROCLAW_CARGO_FLAGS;")
+            .unwrap_or_else(|| panic!("{name} must expose its feature-enabled source build"));
+        let cleanup_window = &builder[dependency_build..source_copy];
+        let cleanup_instructions: Vec<_> = cleanup_window
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("RUN "))
+            .collect();
+
+        assert!(
+            wit_copy < dependency_build
+                && dependency_build < source_copy
+                && source_copy < source_build,
+            "{name} must retain WIT across the dependency and real source builds"
+        );
+        assert_eq!(
+            cleanup_instructions,
+            ["RUN rm -rf src benches crates xtask tools/fill-translations"],
+            "{name} must keep the staged WIT contract through its source cleanup"
+        );
+    }
+
+    let workflow = workflow("docker-image-pr.yml");
+    let rows = source_matrix_rows(&workflow);
+    let cargo_flags = "--features plugins-wasm-runtime-only";
+    for (dockerfile, tag, cache_scope) in [
+        (
+            "Dockerfile.debian",
+            "zeroclaw-pr-source-debian-wasm:build",
+            "docker-source-debian-wasm",
+        ),
+        (
+            "Dockerfile.alpine",
+            "zeroclaw-pr-source-alpine-wasm:build",
+            "docker-source-alpine-wasm-amd64",
+        ),
+    ] {
+        let matches: Vec<_> = rows
+            .iter()
+            .filter(|row| row["dockerfile"] == dockerfile && row["cargo_flags"] == cargo_flags)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "source-image matrix must contain exactly one {dockerfile} plugin-build lane"
+        );
+        let row = matches[0];
+        assert_eq!(row["platform"], "linux/amd64");
+        assert_eq!(row["tag"], tag);
+        assert_eq!(row["cache-scope"], cache_scope);
+        assert_eq!(row["gateway_smoke"], false);
+    }
+
+    let mut cache_scopes = HashSet::new();
+    for row in &rows {
+        let cache_scope = row["cache-scope"]
+            .as_str()
+            .expect("every source-image lane must define a cache scope");
+        assert!(
+            cache_scopes.insert(cache_scope),
+            "source-image cache scope must be unique: {cache_scope}"
+        );
+    }
+
+    let source_images = top_level_job(&workflow, "source-images");
+    let build = workflow_step(
+        source_images,
+        "Build ${{ matrix.dockerfile }} (${{ matrix.platform }}) from source",
+    );
+    assert!(
+        build.contains(
+            "load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' && !matrix.cargo_flags) }}"
+        ) && build.contains(
+            "build-args: ${{ matrix.cargo_flags && format('ZEROCLAW_CARGO_FLAGS={0}', matrix.cargo_flags) || '' }}"
+        ),
+        "source-image build must pass feature flags conditionally and keep feature lanes build-only"
+    );
+    let alpine_smoke_guard = "if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' && !matrix.cargo_flags";
+    for step in ["Smoke Alpine binaries", "Smoke Alpine Compose runtime"] {
+        assert!(
+            workflow_step(source_images, step).contains(alpine_smoke_guard),
+            "{step} must exclude feature-only source-image lanes"
+        );
+    }
+}
+
+#[test]
+fn source_containerfiles_stage_nested_workspace_members_during_prefetch() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace: toml::Value = toml::from_str(&repository_file("Cargo.toml"))
+        .expect("root Cargo.toml must contain valid TOML");
+    let members = workspace["workspace"]["members"]
+        .as_array()
+        .expect("root Cargo.toml must define workspace members");
+    let nested_crate_members: Vec<_> = members
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .filter(|member| member.starts_with("crates/") && member.split('/').count() > 2)
+        .collect();
+
+    assert!(
+        !nested_crate_members.is_empty(),
+        "workspace fixture must exercise nested crate-member staging"
+    );
+
+    for name in ["Dockerfile", "Dockerfile.alpine", "Dockerfile.debian"] {
+        let containerfile = repository_file(name);
+        let builder = builder_stage(&containerfile, name);
+        let dependency_build = builder
+            .find("$ZEROCLAW_CARGO_FLAGS;")
+            .unwrap_or_else(|| panic!("{name} must expose its dependency build"));
+        let prefetch = &builder[..dependency_build];
+        let generic_fixture_manifests =
+            prefetch.contains("COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./");
+        let generic_fixture_lib_stubs = prefetch.contains("for d in crates/*/tests/fixtures/*/")
+            && prefetch.contains("printf '' > \"${d}src/lib.rs\"");
+
+        for member in &nested_crate_members {
+            let member_segments: Vec<_> = member.split('/').collect();
+            let generic_fixture_member = matches!(
+                member_segments.as_slice(),
+                ["crates", _, "tests", "fixtures", _]
+            );
+            let manifest_copy = format!("COPY --parents {member}/Cargo.toml ./");
+            assert!(
+                prefetch.contains(&manifest_copy)
+                    || (generic_fixture_member && generic_fixture_manifests),
+                "{name} must stage nested workspace manifest {member}/Cargo.toml before prefetch"
+            );
+
+            let mut found_target = false;
+            for target in ["src/lib.rs", "src/main.rs"] {
+                if root.join(member).join(target).is_file() {
+                    found_target = true;
+                    let stub = format!("{member}/{target}");
+                    assert!(
+                        prefetch.contains(&stub)
+                            || (generic_fixture_member
+                                && target == "src/lib.rs"
+                                && generic_fixture_lib_stubs),
+                        "{name} must stub nested workspace target {stub} before prefetch"
+                    );
+                }
+            }
+            assert!(
+                found_target,
+                "nested workspace member {member} must expose a default lib or bin target"
+            );
+        }
+    }
+}
+
+#[test]
 fn containerfile_serializes_shared_cargo_caches() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let containerfile =
@@ -266,5 +564,48 @@ fn cargo_cache_guard_parses_option_order_and_exact_values() {
         mounts[2].1,
         Some("locked"),
         "dst alias and reordered locked mount must be found"
+    );
+}
+
+#[test]
+fn published_relay_image_pins_its_base_images_by_digest() {
+    let dockerfile = repository_file("apps/zerorelay/Dockerfile");
+
+    let unpinned = unpinned_base_images(&dockerfile);
+    assert!(
+        unpinned.is_empty(),
+        "apps/zerorelay/Dockerfile ships as a signed release image, so a mutable \
+         base tag would let the published image drift from the pinned source ref; \
+         unpinned: {unpinned:?}"
+    );
+
+    // Pinning by hand would freeze a digest nothing keeps current. The generated
+    // zones are what put these pins under `cargo generate installers` and the
+    // `installer-drift` gate.
+    for zone in ["base-arg-rust-slim", "base-arg-distroless"] {
+        assert!(
+            dockerfile.contains(&format!("# >>> generated:{zone} from")),
+            "the relay's base pins must stay generator-maintained: \
+             missing generated:{zone} zone"
+        );
+    }
+}
+
+#[test]
+fn base_image_pin_guard_reads_args_flags_and_stage_references() {
+    let unpinned = unpinned_base_images(
+        "ARG PINNED=rust:1.98-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27\n\
+         ARG LOOSE=rust:1.98-slim\n\
+         FROM --platform=$BUILDPLATFORM ${PINNED} AS builder\n\
+         FROM ${LOOSE} AS loose\n\
+         FROM ${UNDECLARED} AS undeclared\n\
+         FROM debian:bookworm-slim AS bare\n\
+         FROM builder AS derived",
+    );
+
+    assert_eq!(
+        unpinned,
+        vec!["${LOOSE}", "${UNDECLARED}", "debian:bookworm-slim"],
+        "only digest-backed ARGs and earlier stages may pass the guard"
     );
 }
