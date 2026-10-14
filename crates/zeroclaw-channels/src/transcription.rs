@@ -113,7 +113,7 @@ fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'stati
 /// Channels that acknowledge vendor updates (Telegram long polling) must not
 /// retry a rejection that is terminal for this audio: the update pins the
 /// acknowledgement offset and head-of-line blocks every later message
-/// (#10863). Classification is deliberately conservative — the same rule the
+/// (#10863). Classification is deliberately conservative - the same rule the
 /// Telegram `getFile` classifier follows: only a substantiated,
 /// payload-specific terminal rejection is `Permanent`. Credential,
 /// configuration, rate-limit, and service-availability failures stay
@@ -126,7 +126,7 @@ pub(crate) enum TranscriptionFailure {
     /// malformed vendor response, unclassified error.
     Transient,
     /// Retrying the same audio can never succeed: the vendor or the local
-    /// pre-flight validation rejected *this payload* — over the size limit
+    /// pre-flight validation rejected *this payload* - over the size limit
     /// (413 or a local byte cap) or in an unsupported format (415 or a local
     /// extension check). Safe to acknowledge and move past.
     Permanent,
@@ -175,7 +175,7 @@ impl std::error::Error for TranscriptionError {}
 /// be rejected again no matter how often they are resent. A blanket 4xx rule
 /// would also swallow credential (401/403), rate-limit (409/425/429), and
 /// ambiguous 400/404/422 responses that may resolve once the operator fixes
-/// the deployment — exactly the distinction #10863 requires. Everything
+/// the deployment - exactly the distinction #10863 requires. Everything
 /// unrecognised stays transient and is retried instead.
 fn classify_transcription_http_status(status: reqwest::StatusCode) -> TranscriptionFailure {
     match status.as_u16() {
@@ -3141,7 +3141,7 @@ mod channel_builder_tests {
         // Everything else stays retryable: credential (401/403), rate-limit
         // (408/409/425/429), ambiguous 4xx, and every 5xx can resolve once
         // the deployment or the service recovers. A blanket 4xx rule would
-        // discard those messages permanently — the distinction #10863
+        // discard those messages permanently - the distinction #10863
         // requires.
         for code in [
             400_u16, 401, 403, 404, 408, 409, 422, 425, 429, 451, 500, 502, 503,

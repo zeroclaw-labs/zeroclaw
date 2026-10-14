@@ -5803,7 +5803,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 // offset (#10863): retrying the same bytes can never succeed,
                 // and a permanently pinned update head-of-line blocks every
                 // later message for the whole bot. Tell the sender and move
-                // on — the same contract as the duration and file-lookup
+                // on - the same contract as the duration and file-lookup
                 // drops above.
                 return match failure {
                     super::transcription::TranscriptionFailure::Permanent => {
@@ -7400,13 +7400,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ///
     /// Classification already keeps confidently permanent rejections off this
     /// path, so what remains here is a failure the vendor calls recoverable
-    /// — yet a persistently failing endpoint (an ASR service returning 500
+    /// - yet a persistently failing endpoint (an ASR service returning 500
     /// for one corrupted file, a download that never completes) would
     /// otherwise pin the offset indefinitely and head-of-line block every
     /// later update for the whole bot (#10863). Ten attempts bound the
     /// damage: fast-failing endpoints stall the batch for ~30 seconds, and
-    /// slow ones for at most ten attempt durations. Giving up is loud — an
-    /// ERROR with the update id and attempt count — because acknowledging a
+    /// slow ones for at most ten attempt durations. Giving up is loud - an
+    /// ERROR with the update id and attempt count - because acknowledging a
     /// recoverable failure means the message is lost; the log is the
     /// explicit, observable record the recovery policy requires.
     const MAX_TRANSIENT_UPDATE_ATTEMPTS: u32 = 10;
@@ -7525,7 +7525,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         "attempts": Self::MAX_TRANSIENT_UPDATE_ATTEMPTS,
                     })),
                 "Transient failure budget exhausted; acknowledging the update so \
-                 later updates can proceed — this message is lost"
+                 later updates can proceed - this message is lost"
             );
             *transient_retry = None;
             return UpdateOutcome::Advanced;
@@ -20756,7 +20756,7 @@ mod tests {
     }
 
     /// #10863 acceptance case 1: a voice update the transcription endpoint
-    /// terminally rejects (413 — the reported production shape) must be
+    /// terminally rejects (413 - the reported production shape) must be
     /// acknowledged with a sender notice, so a later update behind it in the
     /// ordered batch is still delivered.
     ///
@@ -20848,7 +20848,7 @@ mod tests {
 
     /// #10863 acceptance case 2: a recoverable transcription failure (500)
     /// must be retried at the same offset, and the voice message delivered
-    /// once the endpoint recovers — the retry path itself is preserved.
+    /// once the endpoint recovers - the retry path itself is preserved.
     #[tokio::test]
     async fn listen_recoverable_transcription_failure_retries_and_delivers() {
         use wiremock::matchers::{method, path_regex};
@@ -20974,7 +20974,7 @@ mod tests {
     }
 
     /// The terminal transcription drop is announced to the sender with the
-    /// dedicated notice — silence would look like the bot never heard the
+    /// dedicated notice - silence would look like the bot never heard the
     /// recording at all.
     #[tokio::test]
     async fn try_parse_voice_message_terminally_rejected_transcription_notifies_sender() {
