@@ -617,7 +617,7 @@ pub async fn dispatch_sop_event(
     audit: &SopAuditLogger,
     event: SopEvent,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, None, None, None).await
+    dispatch_sop_event_filtered(engine, audit, event, None, None, None, None).await
 }
 
 /// Dispatch an incoming event to one named SOP, after normal trigger matching.
@@ -629,7 +629,7 @@ pub async fn dispatch_sop_event_to(
     event: SopEvent,
     target_sop: &str,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop), None, None).await
+    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop), None, None, None).await
 }
 
 /// Dispatch to one named SOP with an active-run key shared by independent
@@ -648,6 +648,37 @@ pub async fn dispatch_sop_event_to_deduplicated(
         Some(target_sop),
         None,
         Some(dedup_key),
+        None,
+    )
+    .await
+}
+
+pub(crate) trait StartEffectGuard {}
+impl<T> StartEffectGuard for T {}
+
+type StartAuthorization<'a> =
+    dyn Fn(&super::Sop) -> Result<Box<dyn StartEffectGuard + 'a>, String> + Sync + 'a;
+
+/// RPC admission hook, borrowed only for this dispatch. It runs under the engine
+/// lock after decision-model waits, against the procedure that will actually
+/// start (including when a producer key would coalesce). No policy is stored on
+/// the engine or carried into running steps. Trusted non-RPC callers omit it.
+pub(crate) async fn dispatch_sop_event_to_authorized(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: &str,
+    dedup_key: Option<&str>,
+    authorize: &StartAuthorization<'_>,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(
+        engine,
+        audit,
+        event,
+        Some(target_sop),
+        None,
+        dedup_key,
+        Some(authorize),
     )
     .await
 }
@@ -668,6 +699,7 @@ async fn dispatch_sop_event_filtered(
     // Semantic key shared by fresh producers. Coalesces only while its run is
     // active; terminal retries remain possible.
     active_dedup: Option<&str>,
+    authorize: Option<&StartAuthorization<'_>>,
 ) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
@@ -802,6 +834,19 @@ async fn dispatch_sop_event_filtered(
         // follows the same single-run or atomic AMQP-batch path.
         let mut candidate_names = Vec::with_capacity(matched_names.len());
         for sop_name in &matched_names {
+            if let Some(authorize) = authorize {
+                let authorization = eng
+                    .get_sop(sop_name)
+                    .ok_or_else(|| format!("SOP '{sop_name}' is no longer loaded"))
+                    .and_then(authorize);
+                if let Err(reason) = authorization {
+                    results.push(DispatchResult::Skipped {
+                        sop_name: sop_name.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+            }
             if let Some(result) = coalesce_active_duplicate(&eng, sop_name, active_dedup) {
                 results.push(result);
             } else if let Some(result) =
@@ -1201,12 +1246,25 @@ async fn dispatch_sop_event_filtered(
                     SopAdmission::Admit => {}
                 }
                 let decision = decided.remove(sop_name).unwrap_or_default();
-                match eng.start_run_with_mode(
-                    sop_name,
-                    event.clone(),
-                    decision.mode,
-                    decision.parts,
-                ) {
+                let start = if let Some(authorize) = authorize {
+                    eng.with_nonblocking_store(|eng| {
+                        let sop = eng.get_sop(sop_name).ok_or_else(|| {
+                            anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                                "sop-rpc-definition-unavailable",
+                            ))
+                        })?;
+                        let _authority = authorize(sop).map_err(anyhow::Error::msg)?;
+                        eng.start_run_with_mode(
+                            sop_name,
+                            event.clone(),
+                            decision.mode,
+                            decision.parts,
+                        )
+                    })
+                } else {
+                    eng.start_run_with_mode(sop_name, event.clone(), decision.mode, decision.parts)
+                };
+                match start {
                     Ok(action) => {
                         let result =
                             record_started_run(&eng, sop_name, action, &mut pending_deterministic);
@@ -1565,6 +1623,7 @@ async fn dispatch_untrusted_fan_in_inner(
             .as_ref()
             .map(|(key, redelivered)| (key.as_str(), *redelivered)),
         active_dedup.as_deref(),
+        None,
     )
     .await;
     process_headless_results(&results);

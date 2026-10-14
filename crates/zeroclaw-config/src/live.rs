@@ -229,6 +229,25 @@ impl LiveConfigHandle {
         }
     }
 
+    /// One short paired read that may re-enter while an outer effect guard
+    /// already holds this storage. Unlike `read`, it cannot park behind a
+    /// writer waiting for that outer guard. Use only for bounded nested reads:
+    /// recurring recursive readers can starve publication. The returned guard
+    /// remains read-only, paired with its revision, and must not cross an await.
+    pub fn read_recursive(&self) -> LiveConfigReadGuard<'_> {
+        LiveConfigReadGuard {
+            guard: self.pair.read_recursive(),
+        }
+    }
+
+    /// Observe whether the canonical lock is available, for contention tests.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn try_read(&self) -> Option<LiveConfigReadGuard<'_>> {
+        self.pair
+            .try_read()
+            .map(|guard| LiveConfigReadGuard { guard })
+    }
+
     /// Clone the currently published config.
     pub fn snapshot(&self) -> Config {
         self.pair.read().config.clone()
