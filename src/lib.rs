@@ -46,6 +46,8 @@ pub mod auth;
 #[cfg(feature = "agent-runtime")]
 pub mod channels;
 pub mod commands;
+#[cfg(feature = "agent-runtime")]
+pub mod composition;
 pub mod config;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod cost;
