@@ -1591,6 +1591,17 @@ fn discord_reply_context(d: &serde_json::Value) -> Option<String> {
     Some(format!("> @{sender}:\n{quoted}"))
 }
 
+pub(crate) fn discord_message_content(d: &serde_json::Value, content: String) -> String {
+    // Only the sender's text may control dispatch, never the reply target.
+    if crate::orchestrator::is_channel_control_message("discord", &content) {
+        return content;
+    }
+    match discord_reply_context(d) {
+        Some(quote) => format!("{quote}\n\n{content}"),
+        None => content,
+    }
+}
+
 fn is_conversational_message_type(message_type: u64) -> bool {
     matches!(message_type, 0 | 19)
 }
@@ -3458,10 +3469,7 @@ impl Channel for DiscordChannel {
                         } else {
                             channel_id.clone()
                         },
-                        content: match discord_reply_context(d) {
-                            Some(quote) => format!("{quote}\n\n{final_content}"),
-                            None => final_content,
-                        },
+                        content: discord_message_content(d, final_content),
                         channel: "discord".to_string(),
                         channel_alias: Some(self.alias.clone()),
                         timestamp: std::time::SystemTime::now()

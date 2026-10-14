@@ -1765,6 +1765,14 @@ fn is_stop_command(content: &str) -> bool {
     base.eq_ignore_ascii_case("/stop")
 }
 
+/// Recognize sender controls before an adapter adds referenced-message context.
+#[cfg(feature = "channel-discord")]
+pub(crate) fn is_channel_control_message(channel_name: &str, content: &str) -> bool {
+    is_stop_command(content)
+        || parse_runtime_command(channel_name, content).is_some()
+        || parse_sop_gate_text_reply(content).is_some()
+}
+
 fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
     SendMessage::reply_to(msg, reply)
 }
@@ -10931,6 +10939,21 @@ fn text_gate_reply_matches_approval_route(
         })
 }
 
+fn parse_sop_gate_text_reply(content: &str) -> Option<(&str, &str)> {
+    // Edit/Revise require the internal marker's text payload; only text-free
+    // choices are valid in the exactly-two-token fallback form.
+    let mut words = content.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (Some(choice), Some(reference), None)
+            if zeroclaw_api::channel::GateChoiceKind::from_id(choice)
+                .is_some_and(|kind| !kind.collects_text()) =>
+        {
+            Some((choice, reference))
+        }
+        _ => None,
+    }
+}
+
 /// Resolve a SOP gate answered from a chat channel. Two answer forms converge
 /// here, per the channel-agnostic gate-prompt seam:
 ///
@@ -10981,17 +11004,8 @@ async fn dispatch_channel_sop_gate(
             }
         }
     } else if msg.internal_sop_event.is_none() {
-        // Text form: exactly two tokens, and the first must be a text-free
-        // choice. Edit/Revise stay marker-only (they carry a text payload a
-        // two-token reply cannot); approve/deny remain universally answerable.
-        let mut words = msg.content.split_whitespace();
-        match (words.next(), words.next(), words.next()) {
-            (Some(c), Some(r), None)
-                if zeroclaw_api::channel::GateChoiceKind::from_id(c)
-                    .is_some_and(|k| !k.collects_text()) =>
-            {
-                (Form::Text, c.to_ascii_lowercase(), r.to_string())
-            }
+        match parse_sop_gate_text_reply(&msg.content) {
+            Some((c, r)) => (Form::Text, c.to_ascii_lowercase(), r.to_string()),
             _ => return false,
         }
     } else {
@@ -36546,6 +36560,221 @@ BTC is currently around $65,000 based on latest tool output."#
             "Alice's first request must be interrupted by her own follow-up: {sent:?}"
         );
         assert_eq!(sent.len(), 2, "exactly two turns must complete: {sent:?}");
+    }
+
+    #[cfg(feature = "channel-discord")]
+    fn discord_reply_message(
+        id: &str,
+        sender_content: &str,
+        referenced_content: &str,
+    ) -> ChannelMessage {
+        let event = serde_json::json!({"referenced_message": {
+            "author": {"username": "helper"}, "content": referenced_content
+        }});
+        ChannelMessage {
+            content: crate::discord::discord_message_content(&event, sender_content.to_string()),
+            ..ChannelMessage::new(id, "alice", "room-1", "", "discord", 0)
+        }
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn discord_reply_preserves_sender_controls_without_promoting_quoted_controls() {
+        for content in [
+            "/stop",
+            " \t/StOp@helper \n",
+            "/stop now",
+            "/new",
+            "/clear",
+            "/MODEL@helper --user fast",
+            "/model --agent fast",
+            "/models",
+            "/config",
+            "/thinking high",
+            "/thinking invalid extra",
+            "approve run-1",
+            " \tDENY run-1\n",
+        ] {
+            let msg = discord_reply_message("control", content, "previous context");
+            assert_eq!(msg.content, content, "sender control must remain unchanged");
+            assert!(is_channel_control_message("discord", &msg.content));
+        }
+        for content in [
+            "ordinary reply",
+            "edit run-1",
+            "revise run-1",
+            "approve",
+            "approve run-1 extra",
+            "/clear extra",
+            "/unknown",
+        ] {
+            let msg = discord_reply_message("ordinary", content, "/stop\napprove run-1");
+            assert_eq!(
+                msg.content,
+                format!("> @helper:\n> /stop\n> approve run-1\n\n{content}")
+            );
+            assert!(!is_stop_command(&msg.content));
+            assert!(parse_runtime_command("discord", &msg.content).is_none());
+            assert!(parse_sop_gate_text_reply(&msg.content).is_none());
+        }
+        for event in [
+            serde_json::json!({}),
+            serde_json::json!({"referenced_message": null}),
+        ] {
+            assert_eq!(
+                crate::discord::discord_message_content(&event, "plain text".into()),
+                "plain text"
+            );
+        }
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[tokio::test]
+    async fn discord_reply_stop_cancels_active_turn_without_automatic_interruption() {
+        let channel_impl = Arc::new(SendMessageRecordingChannel {
+            channel_name: "discord",
+            ..Default::default()
+        });
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak_in_flight: Arc::new(AtomicUsize::new(0)),
+        });
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel_impl.clone(),
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let work = discord_reply_message("discord_work", "think slowly", "earlier question");
+        assert!(!interrupt_on_new_message_enabled(&ctx, &work));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let gated = started.notified();
+        tokio::pin!(gated);
+        gated.as_mut().enable();
+        let loop_task =
+            zeroclaw_spawn::spawn!(run_message_dispatch_loop(rx, AgentRouter::single(ctx), 2));
+        tx.send(work).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gated)
+            .await
+            .expect("turn must reach the gated provider");
+        tx.send(discord_reply_message(
+            "discord_stop",
+            "/stop",
+            "earlier question",
+        ))
+        .await
+        .unwrap();
+        let stop_sent =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent");
+        let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if channel_impl
+                    .sent_messages
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|m| m.content == stop_sent)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // Keep completion gated until cancellation drops the provider future.
+        // Releasing on acknowledgement alone races the cancellation select.
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), async {
+            while provider.in_flight.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // Release on failure too, so a broken control path cannot hang the test.
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("dispatch must finish")
+            .unwrap();
+        assert!(
+            stopped.is_ok(),
+            "reply /stop must report explicit cancellation"
+        );
+        assert!(
+            cancelled.is_ok(),
+            "cancellation must drop the active provider future"
+        );
+        assert_eq!(
+            provider.calls.lock().unwrap().len(),
+            1,
+            "/stop must not start an agent turn"
+        );
+        assert!(
+            provider.completed.lock().unwrap().is_empty(),
+            "the active turn must be cancelled"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[tokio::test]
+    async fn discord_reply_new_clears_existing_session() {
+        let channel: Arc<dyn Channel> = Arc::new(SendMessageRecordingChannel {
+            channel_name: "discord",
+            ..Default::default()
+        });
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel.clone(),
+            Arc::new(SlowModelProvider {
+                delay: Duration::ZERO,
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = discord_reply_message("discord_new", "/new", "previous context");
+        let key = runtime_conversation_history_key(&ctx, &msg);
+        ctx.conversation_histories
+            .lock()
+            .unwrap()
+            .put(key.clone(), vec![ChatMessage::user("old context")]);
+        assert!(handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await);
+        assert!(!ctx.conversation_histories.lock().unwrap().contains(&key));
+        assert!(take_pending_new_session(&ctx, &key));
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[tokio::test]
+    async fn discord_reply_sop_approval_uses_sender_text_and_existing_route_checks() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("discord.ops:room-1"));
+        let mut msg =
+            discord_reply_message("ordinary", "please explain", &format!("approve {run_id}"));
+        msg.channel_alias = Some("ops".into());
+        assert!(!dispatch_test_channel_sop_gate(&router, &msg, None).await);
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+        msg = discord_reply_message("approval", &format!("approve {run_id}"), "previous context");
+        msg.channel_alias = Some("ops".into());
+        assert!(dispatch_test_channel_sop_gate(&router, &msg, None).await);
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::Running)
+        );
     }
 
     /// `/stop` in a shared topic resolves only the in-flight request of the

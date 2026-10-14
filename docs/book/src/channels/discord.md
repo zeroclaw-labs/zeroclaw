@@ -105,9 +105,7 @@ search; the bot still replies normally either way.
   attached to the message it answers. Off by default, so answers are plain
   channel messages.
 
-When someone uses Discord's **Reply** on an earlier message, the agent sees
-that message quoted above theirs, so "this" or "like that" has something to
-point at. Replies to deleted messages arrive without the quote.
+When someone uses Discord's **Reply** on an earlier message, ordinary replies include that message quoted above theirs, so "this" or "like that" has something to point at. Sender commands such as `/stop` and `/new`, and two-token SOP approve/deny replies, bypass the quote so they reach control dispatch unchanged. Commands in the quoted message are context, not controls. Replies to deleted messages arrive without the quote.
 
 ## Troubleshooting
 
