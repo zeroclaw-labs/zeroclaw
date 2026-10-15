@@ -305,6 +305,12 @@ pub struct FakeTransport {
     /// connection with nothing new yet (`recv()` pends forever) — needed by
     /// tests that must keep a session alive past an empty script.
     pub pending_when_empty: bool,
+    /// Refuse writes with [`TransportError::Send`] once this many have been
+    /// accepted (`Some(0)` fails every write, `None` never fails). A socket
+    /// that always accepts the frame is the easy case; a test that claims to
+    /// cover a failed write needs a transport that can actually fail one, and
+    /// the count is what lets setup succeed before the writes under test fail.
+    pub fail_writes_after: Option<usize>,
 }
 
 impl FakeTransport {
@@ -315,6 +321,18 @@ impl FakeTransport {
             incoming: VecDeque::new(),
             sent: Arc::new(Mutex::new(Vec::new())),
             pending_when_empty,
+            fail_writes_after: None,
+        }
+    }
+
+    /// The same transport, but `send_text` fails once `accepted` writes have
+    /// gone through — `0` fails everything, `1` lets setup succeed and fails
+    /// what follows. `sent` still records the attempt, so a test can tell
+    /// "never tried" from "tried and failed".
+    pub fn failing_writes_after(accepted: usize, pending_when_empty: bool) -> Self {
+        Self {
+            fail_writes_after: Some(accepted),
+            ..Self::new(pending_when_empty)
         }
     }
 
@@ -337,8 +355,21 @@ impl Transport for FakeTransport {
         &mut self,
         s: String,
     ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
-        self.sent.lock().unwrap().push(s);
-        async { Ok(()) }
+        let attempt = {
+            let mut sent = self.sent.lock().unwrap();
+            sent.push(s);
+            sent.len()
+        };
+        let fail = self
+            .fail_writes_after
+            .is_some_and(|accepted| attempt > accepted);
+        async move {
+            if fail {
+                Err(TransportError::Send("fake: write refused".into()))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     fn recv(

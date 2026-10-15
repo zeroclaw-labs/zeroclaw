@@ -36,7 +36,7 @@ use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::transport::{ProxyConfig, Transport, TransportError, WsTransport};
 use crate::types::{AffectLabel, CloseReason, Model, Role, ServerEvent, SetupConfig};
@@ -150,6 +150,60 @@ impl From<TransportError> for SessionError {
     }
 }
 
+/// What the driver did with one non-audio control after taking it off the
+/// queue. Audio has no outcome: it is stale within milliseconds and is lossy
+/// by design.
+///
+/// Enqueuing says nothing about delivery — the driver may still be
+/// reconnecting, and the command it holds can be written, dropped with the
+/// dead connection, or refused by the transport. Reporting which of the three
+/// happened is what lets a caller tell a delivered reply from a lost one
+/// instead of assuming the queue spoke for the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlOutcome {
+    /// Handed to the transport, which accepted it.
+    Written,
+    /// Dropped without a write: the connection died while it was queued.
+    /// The control never reached the model; retrying it is the caller's call.
+    Discarded,
+    /// The transport refused the write. Carries the transport's own message.
+    Failed(String),
+}
+
+/// The outcome channel for one enqueued control.
+///
+/// Enqueue and outcome are separate so an event loop can keep pumping while a
+/// control is in flight: block on [`Self::outcome`] where blocking is safe, or
+/// poll [`Self::try_outcome`] from inside a `select!` loop and sweep what is
+/// still open at teardown.
+pub struct ControlReceipt(oneshot::Receiver<ControlOutcome>);
+
+impl ControlReceipt {
+    /// Wait for the driver's verdict. [`SessionError::Closed`] means the
+    /// driver died without reporting one — treat it as undelivered.
+    pub async fn outcome(self) -> Result<ControlOutcome, SessionError> {
+        self.0.await.map_err(|_| SessionError::Closed)
+    }
+
+    /// Wait for the verdict without consuming the receipt, for a loop that
+    /// holds several receipts and wants to wake on the oldest one. The value
+    /// is delivered once: after this resolves, [`Self::try_outcome`] reports
+    /// the receiver as closed.
+    pub async fn wait(&mut self) -> Result<ControlOutcome, SessionError> {
+        (&mut self.0).await.map_err(|_| SessionError::Closed)
+    }
+
+    /// Non-blocking peek for callers that cannot await here. `None` means the
+    /// driver has not decided yet.
+    pub fn try_outcome(&mut self) -> Option<Result<ControlOutcome, SessionError>> {
+        match self.0.try_recv() {
+            Ok(outcome) => Some(Ok(outcome)),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(SessionError::Closed)),
+        }
+    }
+}
+
 /// How the just-ended attempt terminated — drives the reconnect bookkeeping.
 /// `Resumable` (goAway / send / protocol error) is always a failure;
 /// `RemoteClose` (a clean WS close or a dropped stream) is a success only if the
@@ -164,8 +218,29 @@ enum EndKind {
 /// actual transport write (byte-identical to the old inline builders).
 enum Command {
     Audio(Vec<i16>),
-    ClientText(String),
-    ToolResponse(String),
+    /// Non-audio controls carry the channel the driver reports their
+    /// [`ControlOutcome`] on, so "accepted into the queue" never passes for
+    /// "written to the wire".
+    ClientText(String, oneshot::Sender<ControlOutcome>),
+    ToolResponse(String, oneshot::Sender<ControlOutcome>),
+}
+
+/// Tell the enqueuing caller what became of one control. A dropped receiver
+/// (caller gone) is not an error here.
+fn report(outcome: ControlOutcome, ack: oneshot::Sender<ControlOutcome>) {
+    let _ = ack.send(outcome);
+}
+
+/// Report a control the driver is about to drop without writing it. Silence
+/// here is what let a settled reply vanish while `send()` had already told its
+/// caller the reply was accepted.
+fn discard(cmd: Command) {
+    match cmd {
+        Command::Audio(_) => {}
+        Command::ClientText(_, ack) | Command::ToolResponse(_, ack) => {
+            report(ControlOutcome::Discarded, ack);
+        }
+    }
 }
 
 /// The public session handle: a cancel-safe event stream + an enqueue-only
@@ -290,19 +365,29 @@ impl Session {
     }
 
     /// Send a client text turn (kutsu uses this for GREET_CUE / RESUME_CUE).
-    pub async fn send_client_text(&self, text: &str) -> Result<(), SessionError> {
+    ///
+    /// Returns once the control is queued; the returned [`ControlReceipt`]
+    /// says whether the driver later wrote, dropped, or failed it. An error
+    /// here means the queue itself is gone (the driver has ended).
+    pub async fn send_client_text(&self, text: &str) -> Result<ControlReceipt, SessionError> {
+        let (ack, receipt) = oneshot::channel();
         self.cmd_tx
-            .send(Command::ClientText(text.to_string()))
+            .send(Command::ClientText(text.to_string(), ack))
             .await
-            .map_err(|_| SessionError::Closed)
+            .map_err(|_| SessionError::Closed)?;
+        Ok(ControlReceipt(receipt))
     }
 
     /// Acknowledge a tool call by id (kutsu owns the tool's semantics).
-    pub async fn send_tool_response(&self, call_id: &str) -> Result<(), SessionError> {
+    /// Carries the same delivery receipt as [`Self::send_client_text`]: an
+    /// acknowledgement the driver never writes is a model turn left waiting.
+    pub async fn send_tool_response(&self, call_id: &str) -> Result<ControlReceipt, SessionError> {
+        let (ack, receipt) = oneshot::channel();
         self.cmd_tx
-            .send(Command::ToolResponse(call_id.to_string()))
+            .send(Command::ToolResponse(call_id.to_string(), ack))
             .await
-            .map_err(|_| SessionError::Closed)
+            .map_err(|_| SessionError::Closed)?;
+        Ok(ControlReceipt(receipt))
     }
 
     /// A cloneable, `&self`-only handle for enqueuing client-text turns,
@@ -330,12 +415,14 @@ pub struct ClientTextSender {
 
 impl ClientTextSender {
     /// Send a client text turn. Identical wire effect to
-    /// [`Session::send_client_text`].
-    pub async fn send_client_text(&self, text: &str) -> Result<(), SessionError> {
+    /// [`Session::send_client_text`], including its delivery receipt.
+    pub async fn send_client_text(&self, text: &str) -> Result<ControlReceipt, SessionError> {
+        let (ack, receipt) = oneshot::channel();
         self.cmd_tx
-            .send(Command::ClientText(text.to_string()))
+            .send(Command::ClientText(text.to_string(), ack))
             .await
-            .map_err(|_| SessionError::Closed)
+            .map_err(|_| SessionError::Closed)?;
+        Ok(ControlReceipt(receipt))
     }
 }
 
@@ -572,8 +659,24 @@ async fn write_cmd<T: Transport>(transport: &mut T, cmd: Command) -> Result<(), 
             }
             r
         }
-        Command::ClientText(t) => transport.send_text(wire::build_client_content(&t)).await,
-        Command::ToolResponse(id) => transport.send_text(wire::build_tool_response(&id)).await,
+        Command::ClientText(t, ack) => {
+            let r = transport.send_text(wire::build_client_content(&t)).await;
+            report(outcome_of(&r), ack);
+            r
+        }
+        Command::ToolResponse(id, ack) => {
+            let r = transport.send_text(wire::build_tool_response(&id)).await;
+            report(outcome_of(&r), ack);
+            r
+        }
+    }
+}
+
+/// The write's verdict, in the shape the enqueuing caller is waiting for.
+fn outcome_of(r: &Result<(), TransportError>) -> ControlOutcome {
+    match r {
+        Ok(()) => ControlOutcome::Written,
+        Err(e) => ControlOutcome::Failed(e.to_string()),
     }
 }
 
@@ -673,10 +776,13 @@ async fn drain_backoff(cmd_rx: &mut mpsc::Receiver<Command>, delay: Duration) ->
         tokio::select! {
             _ = &mut sleep => return ControlFlow::Continue(()),
             cmd = cmd_rx.recv() => {
-                if cmd.is_none() {
-                    return ControlFlow::Break(());
+                match cmd {
+                    None => return ControlFlow::Break(()),
+                    // Drop the stale command and say so, so its sender can
+                    // tell a reply that reached the model from one that died
+                    // with the connection; keep waiting out the backoff.
+                    Some(c) => discard(c),
                 }
-                // Discard the stale command; keep waiting out the backoff.
             }
         }
     }
@@ -1024,8 +1130,8 @@ mod tests {
         ));
 
         // Enqueued while the transport is down (backoff).
-        s.send_client_text("settled reply").await.unwrap();
-        s.send_tool_response("call-1").await.unwrap();
+        let text = s.send_client_text("settled reply").await.unwrap();
+        let ack = s.send_tool_response("call-1").await.unwrap();
 
         // The reconnect is observable — this is the caller's recovery hook.
         assert!(matches!(
@@ -1036,6 +1142,21 @@ mod tests {
             })
         ));
 
+        // Dropping them is only half the contract: each sender must be told,
+        // so a caller can tell a reply that reached the model from one that
+        // died with the connection instead of assuming the queue spoke for
+        // the wire.
+        assert_eq!(
+            text.outcome().await.unwrap(),
+            ControlOutcome::Discarded,
+            "a reply dropped during backoff must report Discarded"
+        );
+        assert_eq!(
+            ack.outcome().await.unwrap(),
+            ControlOutcome::Discarded,
+            "a tool acknowledgement dropped during backoff must report Discarded"
+        );
+
         // Only the re-sent setup reached the reopened transport; the queued
         // control commands were dropped, NOT replayed.
         let sent = second_sent.lock().unwrap();
@@ -1045,6 +1166,53 @@ mod tests {
             "only setup replayed on reopen; control commands dropped: {sent:?}"
         );
         assert!(sent[0].contains("\"setup\""));
+    }
+
+    #[tokio::test]
+    async fn a_written_control_reports_written_and_a_refused_one_reports_failed() {
+        // The other two thirds of the outcome contract. A transport that
+        // always accepts the frame cannot establish the failure half, which is
+        // why `FakeTransport::failing_writes` exists.
+        let ok = FakeTransport::new(true);
+        let s = Session::connect_with_transport(cfg(), ok, no_reconnect())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.send_client_text("delivered")
+                .await
+                .unwrap()
+                .outcome()
+                .await
+                .unwrap(),
+            ControlOutcome::Written
+        );
+
+        let bad = FakeTransport::failing_writes_after(0, true);
+        let bad_sent = bad.sent.clone();
+        // Setup itself fails on this transport, and with no reconnector the
+        // driver ends; a control enqueued before that either reports the
+        // refused write or finds the driver already gone. Both are explicit
+        // failures — what must never happen is a silent success.
+        let s = Session::connect_with_transport(cfg(), bad, no_reconnect()).await;
+        if let Ok(s) = s {
+            match s.send_client_text("refused").await {
+                Ok(receipt) => match receipt.outcome().await {
+                    Ok(ControlOutcome::Failed(reason)) => {
+                        assert!(reason.contains("refused"), "carries the cause: {reason}")
+                    }
+                    Ok(ControlOutcome::Discarded) | Err(SessionError::Closed) => {}
+                    other => panic!("a refused write must not report success: {other:?}"),
+                },
+                Err(SessionError::Closed) => {}
+                Err(e) => panic!("unexpected enqueue error: {e}"),
+            }
+        }
+        // The attempt is recorded either way: "tried and failed" is not the
+        // same as "never tried".
+        assert!(
+            !bad_sent.lock().unwrap().is_empty(),
+            "the failing transport must still record the attempted write"
+        );
     }
 
     #[tokio::test]
