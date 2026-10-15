@@ -74,12 +74,16 @@ agent settles after a call has ended is dropped rather than spoken to whoever
 is on the line next.
 
 **When the connection drops.** The provider link reconnects transparently and
-anything queued meanwhile is discarded by the transport. Audio is lossy by
-design. A settled reply the model never confirmed is spoken again on the
-reopened connection. If the provider resumed the turn server-side, it may
-already have been heard, so the loss is reported instead of repeated. A
-function acknowledgement is never replayed, because the call it answers ended
-with the connection; its loss is logged with the call id.
+anything queued meanwhile can be discarded by the transport. Audio is lossy by
+design; the non-audio controls are not left to guesswork. Every reply and every
+function acknowledgement carries a receipt, and the broker waits for what the
+connection actually did with it: wrote it, dropped it with the dying socket, or
+refused it. A reply that was written reaches the model once. A reply that was
+lost comes back to the agent as a delivery failure rather than a silent
+success, so the next turn can take it into account. Nothing is re-sent behind
+the caller's back, which is what keeps the same sentence from being spoken
+twice. A function acknowledgement has no caller to answer, so its loss is
+logged with the call id and listed again when the call ends.
 
 **Privacy & cost.** A live session streams caller audio, and the transcripts
 and prompts derived from it, to the speech backend provider (Google Gemini

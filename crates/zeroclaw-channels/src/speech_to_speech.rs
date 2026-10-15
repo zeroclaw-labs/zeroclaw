@@ -6,7 +6,6 @@
 //! currently holds only the `Channel` skeleton — the audio seam and session
 //! handle land in a later task.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,7 +14,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::sync::{Notify, mpsc};
 
-use gemini_live::session::{ClientTextSender, Event, Session, SessionError};
+use gemini_live::session::{
+    ClientTextSender, ControlOutcome, ControlReceipt, Event, Session, SessionError,
+};
 use gemini_live::types::{FunctionDecl, Model, SetupConfig};
 use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
 use zeroclaw_config::paths::{normalize_lexical, resolve_under};
@@ -235,31 +236,45 @@ pub fn resolve_persona(cfg: &SpeechToSpeechConfig, workspace_dir: &Path) -> Resu
 /// same alias in separate conversation histories and lets [`Channel::send`]
 /// tell a reply for *this* call from one that belongs to a call already over.
 ///
-/// `pending_text` and `pending_acks` hold the non-audio controls the caller
-/// enqueued but the provider has not confirmed. The transport drops whatever
-/// is queued while it reconnects (audio is stale by then, and the crate
-/// leaves recovery to its caller), so without this the agent's settled reply
-/// or a function acknowledgement could vanish with `send()` already having
-/// reported success.
+/// Delivery of non-audio controls is settled per control, not guessed from a
+/// backlog: every `ClientText` and `ToolResponse` carries a receipt the
+/// transport driver resolves to written, discarded, or failed (see
+/// [`gemini_live::ControlOutcome`]). `send()` reports that verdict to its
+/// caller, so a reply the connection swallowed is a visible delivery failure
+/// rather than a success the agent never learns to doubt. Nothing is replayed
+/// blindly: exactly-once across a broken connection is not on offer, and an
+/// agent that knows its reply was lost can decide what to say next.
+///
+/// `lost_tool_acks` is the one piece of bookkeeping that remains, because a
+/// tool acknowledgement has no caller to return an error to: it names the
+/// model turns left waiting, for the teardown report.
 struct ActiveSession {
     id: String,
     sender: ClientTextSender,
-    /// Replies enqueued since the last confirmed turn, oldest first, kept so
-    /// a reopen can re-send them. Bounded: a long outage must not grow this
-    /// without limit, and re-speaking a stale backlog is worse than losing
-    /// its oldest entries.
-    pending_text: VecDeque<String>,
-    /// Tool-call ids acknowledged into the connection that has since died.
-    /// These are never replayed — the call they answer belonged to that
-    /// connection — but their loss is reported with the id so the operator
-    /// can correlate a model turn that never got its answer.
-    pending_acks: Vec<String>,
+    /// Tool-call ids whose acknowledgement the driver never wrote. Never
+    /// replayed — the call they answer belonged to the dead connection — but
+    /// reported with the id so an operator can correlate a model turn that
+    /// never got its answer.
+    lost_tool_acks: Vec<String>,
 }
 
-/// How many un-confirmed replies one call keeps for re-send across a reopen.
-/// Four covers the realistic case (a reply or two in flight when the socket
-/// drops) without letting a long outage queue a monologue.
-const MAX_PENDING_TEXT: usize = 4;
+/// How long [`Channel::send`] waits for the driver's verdict on one reply.
+/// The driver always answers eventually (written, discarded, or failed), but
+/// "eventually" spans a reconnect budget that can be long; a spoken reply
+/// older than this is stale anyway, and the orchestrator must not be pinned
+/// to a dead socket waiting for it.
+const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The driver's verdict on the oldest acknowledgement in flight. Pends forever
+/// when nothing is in flight, so it never wins a `select!` by default.
+async fn oldest_ack(
+    acks: &mut [(String, ControlReceipt)],
+) -> std::result::Result<ControlOutcome, SessionError> {
+    match acks.first_mut() {
+        Some((_, receipt)) => receipt.wait().await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Speech-to-speech broker channel — bridges a hosted bidirectional voice
 /// model into ZeroClaw. `send`/`listen` are minimal stubs for now; broker
@@ -341,8 +356,7 @@ impl SpeechToSpeechChannel {
         *self.active_session.lock().unwrap() = Some(ActiveSession {
             id: uuid::Uuid::new_v4().to_string(),
             sender: session.text_sender(),
-            pending_text: VecDeque::new(),
-            pending_acks: Vec::new(),
+            lost_tool_acks: Vec::new(),
         });
     }
 
@@ -364,119 +378,74 @@ impl SpeechToSpeechChannel {
         format!("{}:{session_id}", self.alias)
     }
 
-    /// Hold a tool-call id as unanswered until its write returns.
-    fn mark_ack_pending(&self, id: &str) {
-        if let Some(active) = self.active_session.lock().unwrap().as_mut() {
-            active.pending_acks.push(id.to_string());
-        }
-    }
-
-    /// Release an id once its acknowledgement left the transport (or failed
-    /// outright, which is reported by the caller).
-    fn clear_ack_pending(&self, id: &str) {
-        if let Some(active) = self.active_session.lock().unwrap().as_mut() {
-            active.pending_acks.retain(|pending| pending != id);
-        }
-    }
-
-    /// React to a transparent reconnect: everything the caller enqueued
-    /// during the outage was discarded by the transport, so re-send the
-    /// replies that have not been confirmed and report the acknowledgements
-    /// that cannot be (their tool call died with the old connection).
-    ///
-    /// Re-sending replies rather than dropping them is the recoverable half
-    /// the agent cannot redo on its own: it already considers that turn
-    /// answered.
-    ///
-    /// `resumed` decides whether re-sending is safe, and it is the reason this
-    /// is not the blind replay the transport crate warns against. A fresh
-    /// reopen (`resumed == false`) threw the turn away with the connection, so
-    /// nothing the caller heard survives and every unconfirmed reply has to be
-    /// spoken again. A resumed reopen kept the turn server-side, where a reply
-    /// that reached the socket first may already have been spoken; re-sending
-    /// there would race the provider's own resume and repeat a sentence to the
-    /// caller, so the loss is reported instead.
-    async fn replay_controls_after_reopen(&self, session: &Session, resumed: bool) {
-        let (replies, lost_acks, session_id) = {
+    /// Record a tool acknowledgement the driver never wrote, with the reason,
+    /// so the loss is correlated to the model turn still waiting for it.
+    fn note_lost_ack(&self, id: &str, reason: &str) {
+        let session_id = {
             let mut guard = self.active_session.lock().unwrap();
             match guard.as_mut() {
-                Some(active) => (
-                    active.pending_text.iter().cloned().collect::<Vec<_>>(),
-                    std::mem::take(&mut active.pending_acks),
-                    active.id.clone(),
-                ),
-                None => return,
+                Some(active) => {
+                    active.lost_tool_acks.push(id.to_string());
+                    active.id.clone()
+                }
+                None => String::new(),
             }
         };
-        if !lost_acks.is_empty() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "alias": self.alias,
-                        "session": session_id,
-                        "tool_call_ids": lost_acks,
-                    })),
-                "speech_to_speech: tool acknowledgements lost with the previous connection"
-            );
-        }
-        if replies.is_empty() {
-            return;
-        }
-        if resumed {
-            // The provider restored the turn state server-side, so a reply
-            // that reached the socket before it died may already have been
-            // spoken. Re-sending here is exactly the blind replay that races
-            // the server's own turn-resume and can repeat a sentence to the
-            // caller, so report what is unconfirmed and let the turn stand.
-            if let Some(active) = self.active_session.lock().unwrap().as_mut() {
-                active.pending_text.clear();
-            }
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "alias": self.alias,
-                        "session": session_id,
-                        "unconfirmed": replies.len(),
-                    })),
-                "speech_to_speech: provider resumed the turn; unconfirmed replies left unsent"
-            );
-            return;
-        }
-        let sender = session.text_sender();
-        let mut delivered = 0usize;
-        for reply in &replies {
-            match sender.send_client_text(reply).await {
-                Ok(()) => delivered += 1,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "alias": self.alias,
-                                "session": session_id,
-                                "error": e.to_string(),
-                            })),
-                        "speech_to_speech: could not re-send a reply after reconnect"
-                    );
-                    break;
-                }
-            }
-        }
         ::zeroclaw_log::record!(
-            INFO,
+            WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
                 ::serde_json::json!({
                     "alias": self.alias,
                     "session": session_id,
-                    "resent": delivered,
-                    "queued": replies.len(),
-                    "provider_resumed": resumed,
+                    "tool_call_id": id,
+                    "reason": reason,
                 })
             ),
-            "speech_to_speech: re-sent unconfirmed replies after reconnect"
+            "speech_to_speech: tool acknowledgement never reached the provider"
         );
+    }
+
+    /// Record the driver's verdict on one acknowledgement: a written one needs
+    /// nothing more, anything else is a model turn left waiting.
+    fn settle_ack(&self, id: &str, outcome: Result<ControlOutcome, SessionError>) {
+        match outcome {
+            Ok(ControlOutcome::Written) => {}
+            Ok(ControlOutcome::Discarded) => {
+                self.note_lost_ack(id, "discarded with the connection");
+            }
+            Ok(ControlOutcome::Failed(reason)) => {
+                self.note_lost_ack(id, &format!("write failed: {reason}"));
+            }
+            Err(e) => self.note_lost_ack(id, &e.to_string()),
+        }
+    }
+
+    /// Settle whatever acknowledgement receipts the driver has decided on and
+    /// keep the rest for the next pass. Polling rather than awaiting is the
+    /// point: the event loop must keep draining events even while the driver
+    /// is reconnecting, or the two deadlock waiting on each other.
+    fn settle_acks(&self, acks: &mut Vec<(String, ControlReceipt)>) {
+        acks.retain_mut(|(id, receipt)| match receipt.try_outcome() {
+            None => true,
+            Some(outcome) => {
+                self.settle_ack(id, outcome);
+                false
+            }
+        });
+    }
+
+    /// Tool-call ids this call failed to acknowledge. The acknowledgement path
+    /// has no caller to return an error to, so production reports the losses
+    /// in the teardown record (which reads the field directly) and tests
+    /// assert on them through this accessor.
+    #[cfg(test)]
+    fn lost_tool_acks(&self) -> Vec<String> {
+        self.active_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|active| active.lost_tool_acks.clone())
+            .unwrap_or_default()
     }
 
     /// Build a `ChannelMessage` carrying one call's history-scope identity:
@@ -601,6 +570,9 @@ impl SpeechToSpeechChannel {
         tx: mpsc::Sender<ChannelMessage>,
     ) -> Result<()> {
         self.attach_session(&session);
+        // Acknowledgements enqueued but not yet decided by the driver, with
+        // the tool call each answers.
+        let mut acks: Vec<(String, ControlReceipt)> = Vec::new();
         loop {
             let idle = tokio::time::sleep(self.idle_timeout);
             tokio::select! {
@@ -611,6 +583,15 @@ impl SpeechToSpeechChannel {
                 // it.
                 _ = self.stop.notified() => {
                     break;
+                }
+
+                // The driver decides a refused or discarded acknowledgement
+                // while it is reconnecting, when no event follows to wake this
+                // loop; wake on the oldest verdict so the loss is reported
+                // then, not at the idle timeout.
+                outcome = oldest_ack(&mut acks) => {
+                    let (id, _) = acks.remove(0);
+                    self.settle_ack(&id, outcome);
                 }
 
                 event = session.recv_event() => {
@@ -632,48 +613,20 @@ impl SpeechToSpeechChannel {
                             // hanging; the crate does not special-case tool
                             // names either (mirrors `ToolCall`'s own
                             // contract: "the caller decides its semantics").
-                            // The id is held as outstanding until the write
-                            // returns, so a connection that dies underneath
-                            // reports which call went unanswered instead of
-                            // dropping the ack silently.
-                            self.mark_ack_pending(&id);
+                            // The write itself is not awaited here: the driver
+                            // may be reconnecting, and blocking this loop on it
+                            // would stop draining events — the driver would
+                            // then block sending them, and the two would wait
+                            // on each other. Keep the receipt instead and
+                            // settle it below, which is also what turns a
+                            // discarded or refused acknowledgement into a
+                            // report naming the call left waiting.
                             match session.send_tool_response(&id).await {
-                                Ok(()) => self.clear_ack_pending(&id),
-                                Err(e) => {
-                                    self.clear_ack_pending(&id);
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Note
-                                        )
-                                        .with_attrs(::serde_json::json!({
-                                            "alias": self.alias,
-                                            "tool_call_id": id,
-                                            "error": e.to_string(),
-                                        })),
-                                        "speech_to_speech: tool acknowledgement was not delivered"
-                                    );
-                                }
+                                Ok(receipt) => acks.push((id.clone(), receipt)),
+                                Err(e) => self.note_lost_ack(&id, &e.to_string()),
                             }
                             if name == "end_session" {
                                 break;
-                            }
-                        }
-                        Some(Event::SessionOpened { is_reconnect: true, resumed }) => {
-                            // The transport dropped whatever was queued while
-                            // it reconnected. Audio stays lossy by design, but
-                            // the controls have defined outcomes: replies are
-                            // re-sent on the fresh connection, acknowledgements
-                            // are not (the call they answer belonged to the
-                            // dead one) and are reported with their id.
-                            self.replay_controls_after_reopen(&session, resumed).await;
-                        }
-                        Some(Event::TurnComplete) | Some(Event::Interrupted) => {
-                            // The model consumed the turn, so nothing relayed
-                            // before it still needs re-sending.
-                            if let Some(active) = self.active_session.lock().unwrap().as_mut() {
-                                active.pending_text.clear();
                             }
                         }
                         Some(Event::SessionClosed { .. }) | None => {
@@ -694,16 +647,27 @@ impl SpeechToSpeechChannel {
                     break;
                 }
             }
+            // One non-blocking pass over the acknowledgements in flight: the
+            // driver decides them on its own schedule, and this loop is the
+            // only thing that must not wait for it.
+            self.settle_acks(&mut acks);
+        }
+        // Acknowledgements still in flight when the call ends never reached
+        // the model: the connection is going away with them. Settle what the
+        // driver already decided, then count the rest as lost — an undecided
+        // write at teardown is not a delivered one.
+        self.settle_acks(&mut acks);
+        for (id, _) in acks {
+            self.note_lost_ack(&id, "call ended before the write was confirmed");
         }
         // Per the single-active-session assumption (see `active_session`'s
         // doc) this alias never has two sessions attached at once, so an
-        // unconditional clear is safe on every break path above. A reply the
-        // model never confirmed dies with the call — the caller hung up or the
-        // provider gave up before hearing it — and that is a delivery failure
-        // the orchestrator was told did not happen, so say so here.
+        // unconditional clear is safe on every break path above. Replies have
+        // already reported their own fate to the orchestrator through
+        // `send()`; what needs saying here is which tool calls died unanswered.
         let ended = self.active_session.lock().unwrap().take();
         if let Some(active) = ended
-            && (!active.pending_text.is_empty() || !active.pending_acks.is_empty())
+            && !active.lost_tool_acks.is_empty()
         {
             ::zeroclaw_log::record!(
                 WARN,
@@ -711,10 +675,9 @@ impl SpeechToSpeechChannel {
                     .with_attrs(::serde_json::json!({
                         "alias": self.alias,
                         "session": active.id,
-                        "unconfirmed_replies": active.pending_text.len(),
-                        "unanswered_tool_calls": active.pending_acks,
+                        "unanswered_tool_calls": active.lost_tool_acks,
                     })),
-                "speech_to_speech: call ended with control messages still unconfirmed"
+                "speech_to_speech: call ended with tool calls left unanswered"
             );
         }
         Ok(())
@@ -762,9 +725,15 @@ impl Channel for SpeechToSpeechChannel {
     /// (`SessionError::Closed`): only genuinely-unexpected relay failures
     /// surface as `Err`.
     ///
-    /// A reply that reaches the transport is also remembered until the model
-    /// confirms the turn, so a reconnect can re-send it instead of silently
-    /// swallowing it (see [`ActiveSession`]).
+    /// Delivery is reported, not assumed: this returns once the transport
+    /// driver has actually written the reply, and surfaces an `Err` when the
+    /// driver instead dropped it with a dying connection or the transport
+    /// refused the write. Queue acceptance is not success — that is what let a
+    /// settled reply vanish while the orchestrator was told it had been
+    /// relayed. Nothing is re-sent behind the caller's back: a reply whose
+    /// failure is visible can be reconsidered in the next turn, whereas a
+    /// blind replay can speak the same sentence twice to whoever is on the
+    /// line (see [`ActiveSession`]).
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let sender = {
             let mut guard = self.active_session.lock().unwrap();
@@ -793,50 +762,72 @@ impl Channel for SpeechToSpeechChannel {
                         );
                         return Ok(());
                     }
-                    if active.pending_text.len() == MAX_PENDING_TEXT {
-                        // Dropping the oldest keeps a long outage from queueing
-                        // a monologue, but it is still a reply that may never
-                        // be spoken — say so rather than losing it quietly,
-                        // which is the failure this bookkeeping exists to end.
-                        active.pending_text.pop_front();
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({
-                                "alias": self.alias,
-                                "session": active.id,
-                                "kept": MAX_PENDING_TEXT,
-                            })),
-                            "speech_to_speech: unconfirmed reply backlog is full; \
-                             the oldest reply will not be re-sent"
-                        );
-                    }
-                    active.pending_text.push_back(message.content.clone());
                     Some(active.sender.clone())
                 }
                 None => None,
             }
         };
         match sender {
-            Some(sender) => match sender.send_client_text(&message.content).await {
-                Ok(()) => Ok(()),
-                Err(SessionError::Closed) => {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            Some(sender) => {
+                let receipt = match sender.send_client_text(&message.content).await {
+                    Ok(receipt) => receipt,
+                    // The driver ended between attach and this call: a reply
+                    // arriving after hangup is a race, not a failure.
+                    Err(SessionError::Closed) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_attrs(::serde_json::json!({"alias": self.alias})),
-                        "speech_to_speech: send() raced session teardown; dropping reply"
-                    );
-                    Ok(())
+                            "speech_to_speech: send() raced session teardown; dropping reply"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::msg(format!(
+                            "speech_to_speech.{}: failed to relay reply into live session: {e}",
+                            self.alias
+                        )));
+                    }
+                };
+                match tokio::time::timeout(CONTROL_ACK_TIMEOUT, receipt.outcome()).await {
+                    Ok(Ok(ControlOutcome::Written)) => Ok(()),
+                    Ok(Ok(ControlOutcome::Discarded)) => Err(anyhow::Error::msg(format!(
+                        "speech_to_speech.{}: the reply was not delivered — the connection \
+                         dropped before it was written",
+                        self.alias
+                    ))),
+                    Ok(Ok(ControlOutcome::Failed(reason))) => Err(anyhow::Error::msg(format!(
+                        "speech_to_speech.{}: the provider refused the reply: {reason}",
+                        self.alias
+                    ))),
+                    // The driver ended without deciding; same race as above.
+                    Ok(Err(SessionError::Closed)) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"alias": self.alias})),
+                            "speech_to_speech: session ended before the reply was written"
+                        );
+                        Ok(())
+                    }
+                    Ok(Err(e)) => Err(anyhow::Error::msg(format!(
+                        "speech_to_speech.{}: failed to relay reply into live session: {e}",
+                        self.alias
+                    ))),
+                    Err(_) => Err(anyhow::Error::msg(format!(
+                        "speech_to_speech.{}: the reply was still unwritten after {}s — \
+                         the provider connection is not delivering",
+                        self.alias,
+                        CONTROL_ACK_TIMEOUT.as_secs()
+                    ))),
                 }
-                Err(e) => Err(anyhow::Error::msg(format!(
-                    "speech_to_speech.{}: failed to relay reply into live session: {e}",
-                    self.alias
-                ))),
-            },
+            }
             None => {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -908,20 +899,6 @@ mod tests {
         })
     }
 
-    /// A reconnector that hands out `next` once and then refuses, so a test
-    /// can script exactly one transparent reopen.
-    fn once(next: FakeTransport) -> Reconnector<FakeTransport> {
-        let mut slot = Some(next);
-        Box::new(move || {
-            let t = slot.take();
-            Box::pin(async move {
-                t.ok_or(SessionError::Transport(TransportError::Connect(
-                    "drained".into(),
-                )))
-            })
-        })
-    }
-
     /// Poll `sent` until `needle` shows up, or give up: the driver task writes
     /// enqueued commands asynchronously.
     async fn wait_for_sent(sent: &Arc<Mutex<Vec<String>>>, needle: &str) -> bool {
@@ -974,64 +951,103 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn controls_unconfirmed_at_a_reconnect_keep_a_defined_outcome() {
-        // Driven through `run_session`, the way production does: the transport
-        // drops whatever it holds while reconnecting, and `send()` has already
-        // told the orchestrator the reply was accepted. The two control classes
-        // therefore get defined, different outcomes — a settled reply that the
-        // model never confirmed is spoken again on the reopened connection,
-        // while a tool acknowledgement is never replayed: the call it answers
-        // died with the old connection.
-        let mut first = FakeTransport::new(false);
-        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
-        first.push_data(
-            br#"{"toolCall":{"functionCalls":[{"name":"consult_agent","id":"call-1","args":{"prompt":"what time is it"}}]}}"#.to_vec(),
-        );
-        first.push_close(1011, "server restart");
-        let second = FakeTransport::new(true);
-        let second_sent = second.sent.clone();
-
-        let session = Session::connect_with_transport(client_config(&cfg()), first, once(second))
-            .await
-            .unwrap();
-        let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string()));
-        let (tx, mut rx) = mpsc::channel(8);
+    /// Attach-and-drive scaffolding shared by the delivery tests: start
+    /// `run_session` on a spawned task and hand back the reply target of the
+    /// call it attaches.
+    async fn drive(
+        ch: &Arc<SpeechToSpeechChannel>,
+        session: Session,
+        tx: mpsc::Sender<ChannelMessage>,
+    ) -> (tokio::task::JoinHandle<Result<()>>, String) {
         let driver = {
-            let ch = Arc::clone(&ch);
+            let ch = Arc::clone(ch);
             tokio::spawn(async move { ch.run_session(session, tx).await })
         };
-
-        // The loop attaches the call before it processes anything, so the
-        // reply can be addressed to it the way the orchestrator would.
         let target = loop {
             if let Some(id) = ch.session_id() {
                 break ch.reply_target_for(&id);
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         };
-        // The consult turn reached the orchestrator: that is the tool call
-        // whose acknowledgement belongs to the connection about to die.
-        let consult = rx.recv().await.expect("consult turn must be relayed");
-        assert_eq!(consult.content, "what time is it");
+        (driver, target)
+    }
 
-        ch.send(&SendMessage::new("it is three o'clock", &target))
+    #[tokio::test]
+    async fn a_reply_enqueued_while_the_driver_reconnects_is_written_once_after_the_reopen() {
+        // The reviewer's connect/setup window: the reply is enqueued while the
+        // driver is inside the reconnect, so nothing is draining the queue. It
+        // must be written exactly once when the connection comes back — not
+        // dropped, and not written plus replayed.
+        let mut first = FakeTransport::new(false);
+        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        first.push_close(1011, "server restart");
+        let second = FakeTransport::new(true);
+        let second_sent = second.sent.clone();
+
+        // A reconnector parked until the test releases it: that is the window
+        // in which the reply is enqueued. It announces when the driver is
+        // inside it, because before that the driver is still in its backoff
+        // sleep, where a queued control is discarded by design.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut slot = Some((second, release_rx, entered_tx));
+        let gated: Reconnector<FakeTransport> = Box::new(move || {
+            let taken = slot.take();
+            Box::pin(async move {
+                match taken {
+                    Some((transport, release, entered)) => {
+                        let _ = entered.send(());
+                        let _ = release.await;
+                        Ok(transport)
+                    }
+                    None => Err(SessionError::Transport(TransportError::Connect(
+                        "drained".into(),
+                    ))),
+                }
+            })
+        });
+
+        let session = Session::connect_with_transport(client_config(&cfg()), first, gated)
             .await
-            .expect("relaying a reply is not itself a failure");
+            .unwrap();
+        let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string()));
+        let (tx, _rx) = mpsc::channel(8);
+        let (driver, target) = drive(&ch, session, tx).await;
 
+        // Only once the driver is inside the reconnect is the reply enqueued.
+        entered_rx
+            .await
+            .expect("the driver must enter the reconnect");
+        let reply = {
+            let ch = Arc::clone(&ch);
+            let target = target.clone();
+            tokio::spawn(async move {
+                ch.send(&SendMessage::new("it is three o'clock", &target))
+                    .await
+            })
+        };
+        // Give the send time to sit in the queue, then let the reopen happen.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = release_tx.send(());
+
+        reply
+            .await
+            .unwrap()
+            .expect("a reply written after the reopen is a delivered reply");
         assert!(
             wait_for_sent(&second_sent, "it is three o'clock").await,
-            "a reply the model never confirmed must be spoken again after the              reconnect, got {:?}",
+            "the queued reply must reach the reopened connection, got {:?}",
             second_sent.lock().unwrap()
         );
-        assert!(
-            !second_sent
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|frame| frame.contains("call-1")),
-            "the acknowledgement of a call from the dead connection must not be              replayed, got {:?}",
-            second_sent.lock().unwrap()
+        let spoken = second_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame.contains("it is three o'clock"))
+            .count();
+        assert_eq!(
+            spoken, 1,
+            "the reply must be written once, never written and replayed"
         );
 
         ch.stop().await;
@@ -1039,51 +1055,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_resend_after_reconnect_does_not_break_the_call() {
-        // Same outage, but the reopened connection dies too, so the re-send
-        // write fails. The broker reports the loss and lets the session end
-        // instead of unwinding the call or claiming delivery.
-        let mut first = FakeTransport::new(false);
-        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
-        first.push_close(1011, "server restart");
-        let mut second = FakeTransport::new(false);
-        second.push_data(br#"{"setupComplete":{}}"#.to_vec());
-        second.push_close(1011, "gone again");
-        let second_sent = second.sent.clone();
+    async fn a_reply_the_provider_refuses_is_reported_as_a_failure() {
+        // Queue acceptance used to pass for delivery. With a transport that
+        // accepts setup and then refuses every write, the reply never reaches
+        // the model, and `send()` has to say so rather than return Ok.
+        let fake = FakeTransport::failing_writes_after(1, true);
+        let sent = fake.sent.clone();
+        let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
+            .await
+            .unwrap();
+        let ch = SpeechToSpeechChannel::new("desk".to_string());
+        ch.attach_session(&session);
+        let target = ch.reply_target_for(&ch.session_id().expect("session attached"));
 
-        let session = Session::connect_with_transport(client_config(&cfg()), first, once(second))
+        let err = ch
+            .send(&SendMessage::new("it is three o'clock", &target))
+            .await
+            .expect_err("a refused write must not be reported as delivered");
+        assert!(
+            err.to_string().contains("refused"),
+            "the failure must name the cause, got {err}"
+        );
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .any(|frame| frame.contains("it is three o'clock")),
+            "the write must have been attempted: {:?}",
+            sent.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_earlier_turn_completion_does_not_cancel_a_newer_reply() {
+        // A completion buffered from an earlier turn used to clear every reply
+        // the broker was holding, including one the driver had not written yet.
+        // Delivery is now settled per reply, so a stale completion cannot
+        // retire a newer one.
+        let mut fake = FakeTransport::new(true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        fake.push_data(br#"{"serverContent":{"turnComplete":true}}"#.to_vec());
+        let sent = fake.sent.clone();
+        let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
             .await
             .unwrap();
         let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string()));
         let (tx, _rx) = mpsc::channel(8);
-        let driver = {
-            let ch = Arc::clone(&ch);
-            tokio::spawn(async move { ch.run_session(session, tx).await })
-        };
-        let target = loop {
-            if let Some(id) = ch.session_id() {
-                break ch.reply_target_for(&id);
+        let (driver, target) = drive(&ch, session, tx).await;
+
+        // The completion of the earlier turn is already in flight; the reply
+        // that follows it must still be delivered and reported as delivered.
+        ch.send(&SendMessage::new("the newer answer", &target))
+            .await
+            .expect("a newer reply must not be retired by an older completion");
+        assert!(
+            wait_for_sent(&sent, "the newer answer").await,
+            "the newer reply must reach the model, got {:?}",
+            sent.lock().unwrap()
+        );
+
+        ch.stop().await;
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_acknowledgement_that_is_never_written_is_reported_with_its_call_id() {
+        // The acknowledgement path has no caller to return an error to, so a
+        // write the transport refuses has to surface as a named loss: which
+        // model turn is still waiting for its answer.
+        let mut fake = FakeTransport::failing_writes_after(1, true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        fake.push_data(
+            br#"{"toolCall":{"functionCalls":[{"name":"consult_agent","id":"call-1","args":{"prompt":"what time is it"}}]}}"#.to_vec(),
+        );
+        let sent = fake.sent.clone();
+        let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
+            .await
+            .unwrap();
+        let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string()));
+        let (tx, mut rx) = mpsc::channel(8);
+        let (driver, _target) = drive(&ch, session, tx).await;
+
+        let consult = rx.recv().await.expect("consult turn must be relayed");
+        assert_eq!(consult.content, "what time is it");
+
+        // The acknowledgement is attempted and refused; the broker must notice
+        // rather than treat the enqueue as the answer.
+        let mut reported = Vec::new();
+        for _ in 0..2000 {
+            reported = ch.lost_tool_acks();
+            if !reported.is_empty() {
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        };
-        let _ = ch.send(&SendMessage::new("settled reply", &target)).await;
-
-        // The session ends once reconnection is exhausted; the loop returns
-        // normally rather than propagating the failed write.
-        driver.await.unwrap().unwrap();
-        assert!(
-            !second_sent
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|frame| frame.contains("settled reply")),
-            "a write that never left must not look delivered, got {:?}",
-            second_sent.lock().unwrap()
+        }
+        assert_eq!(
+            reported,
+            vec!["call-1".to_string()],
+            "the unanswered call must be named; written frames were {:?}",
+            sent.lock().unwrap()
         );
-        // The call is over, so a later reply is the documented no-op.
-        ch.send(&SendMessage::new("later", &target))
-            .await
-            .expect("a send after the session ended must not error");
+
+        ch.stop().await;
+        driver.await.unwrap().unwrap();
     }
 
     #[tokio::test]
