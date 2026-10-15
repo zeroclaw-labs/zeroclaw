@@ -119,6 +119,7 @@ fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'stati
 /// configuration, rate-limit, and service-availability failures stay
 /// `Transient`, because retrying a recoverable failure is safe while
 /// skipping a recoverable one loses a message.
+#[cfg(any(feature = "channel-telegram", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TranscriptionFailure {
     /// Retrying the same audio may succeed: transport failure, timeout,
@@ -139,24 +140,30 @@ pub(crate) enum TranscriptionFailure {
 /// the update and retrying it.
 #[derive(Debug)]
 pub(crate) struct TranscriptionError {
+    /// Retry classification read back with [`failure_kind`]; only compiled
+    /// when a channel that acknowledges vendor updates consumes it.
+    #[cfg(any(feature = "channel-telegram", test))]
     kind: TranscriptionFailure,
     message: String,
 }
 
 impl TranscriptionError {
-    fn new(kind: TranscriptionFailure, message: impl Into<String>) -> Self {
+    fn permanent(message: impl Into<String>) -> Self {
         Self {
-            kind,
+            #[cfg(any(feature = "channel-telegram", test))]
+            kind: TranscriptionFailure::Permanent,
             message: message.into(),
         }
     }
 
-    fn permanent(message: impl Into<String>) -> Self {
-        Self::new(TranscriptionFailure::Permanent, message)
-    }
-
     fn from_status(status: reqwest::StatusCode, message: impl Into<String>) -> Self {
-        Self::new(classify_transcription_http_status(status), message)
+        #[cfg(not(any(feature = "channel-telegram", test)))]
+        let _ = status;
+        Self {
+            #[cfg(any(feature = "channel-telegram", test))]
+            kind: classify_transcription_http_status(status),
+            message: message.into(),
+        }
     }
 }
 
@@ -177,6 +184,7 @@ impl std::error::Error for TranscriptionError {}
 /// ambiguous 400/404/422 responses that may resolve once the operator fixes
 /// the deployment - exactly the distinction #10863 requires. Everything
 /// unrecognised stays transient and is retried instead.
+#[cfg(any(feature = "channel-telegram", test))]
 fn classify_transcription_http_status(status: reqwest::StatusCode) -> TranscriptionFailure {
     match status.as_u16() {
         413 | 415 => TranscriptionFailure::Permanent,
@@ -189,6 +197,7 @@ fn classify_transcription_http_status(status: reqwest::StatusCode) -> Transcript
 /// Defaults to `Transient` when no [`TranscriptionError`] is in the chain:
 /// absence of evidence is not evidence of permanence, so transport errors,
 /// timeouts, and legacy plain-string failures all stay retryable.
+#[cfg(any(feature = "channel-telegram", test))]
 pub(crate) fn failure_kind(error: &anyhow::Error) -> TranscriptionFailure {
     error
         .downcast_ref::<TranscriptionError>()

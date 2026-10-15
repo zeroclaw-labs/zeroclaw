@@ -7401,14 +7401,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Classification already keeps confidently permanent rejections off this
     /// path, so what remains here is a failure the vendor calls recoverable
     /// - yet a persistently failing endpoint (an ASR service returning 500
-    /// for one corrupted file, a download that never completes) would
-    /// otherwise pin the offset indefinitely and head-of-line block every
-    /// later update for the whole bot (#10863). Ten attempts bound the
-    /// damage: fast-failing endpoints stall the batch for ~30 seconds, and
-    /// slow ones for at most ten attempt durations. Giving up is loud - an
-    /// ERROR with the update id and attempt count - because acknowledging a
-    /// recoverable failure means the message is lost; the log is the
-    /// explicit, observable record the recovery policy requires.
+    ///   for one corrupted file, a download that never completes) would
+    ///   otherwise pin the offset indefinitely and head-of-line block every
+    ///   later update for the whole bot (#10863). Ten attempts bound the
+    ///   damage: fast-failing endpoints stall the batch for ~30 seconds, and
+    ///   slow ones for at most ten attempt durations. Giving up is loud - an
+    ///   ERROR with the update id and attempt count - because acknowledging a
+    ///   recoverable failure means the message is lost; the log is the
+    ///   explicit, observable record the recovery policy requires.
     const MAX_TRANSIENT_UPDATE_ATTEMPTS: u32 = 10;
 
     /// Whether the tracked transient attempt counter for `uid` has reached
