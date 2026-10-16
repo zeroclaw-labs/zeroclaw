@@ -2468,6 +2468,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "dasp_sample"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9388,6 +9401,20 @@ dependencies = [
 
 [[package]]
 name = "serial_test"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c789ec87f4687d022a2405cf46e0cd6284889f1839de292cadeb6c6019506f2"
+dependencies = [
+ "dashmap",
+ "futures",
+ "lazy_static",
+ "log",
+ "parking_lot",
+ "serial_test_derive 0.10.0",
+]
+
+[[package]]
+name = "serial_test"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
@@ -9397,7 +9424,18 @@ dependencies = [
  "log",
  "once_cell",
  "parking_lot",
- "serial_test_derive",
+ "serial_test_derive 3.5.0",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b64f9e531ce97c88b4778aad0ceee079216071cffec6ac9b904277f8f92e7fe3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -13823,6 +13861,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-a2a"
+version = "0.8.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "futures-util",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serial_test 0.10.0",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
+ "zeroclaw-infra",
+]
+
+[[package]]
 name = "zeroclaw-api"
 version = "0.8.5"
 dependencies = [
@@ -14101,6 +14161,7 @@ dependencies = [
  "tower-http",
  "uuid",
  "wiremock",
+ "zeroclaw-a2a",
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
@@ -14574,7 +14635,7 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_json",
- "serial_test",
+ "serial_test 3.5.0",
  "sha2 0.10.9",
  "sys-locale",
  "tempfile",
@@ -14592,6 +14653,7 @@ dependencies = [
  "which",
  "windows-sys 0.61.2",
  "wiremock",
+ "zeroclaw-a2a",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-infra",

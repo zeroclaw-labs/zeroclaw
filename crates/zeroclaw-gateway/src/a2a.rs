@@ -8,9 +8,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-#[cfg(feature = "schema-export")]
-use schemars::JsonSchema;
-use serde::Deserialize;
 use uuid::Uuid;
 
 use zeroclaw_config::schema::Config;
@@ -33,10 +30,10 @@ const WELL_KNOWN_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 
 // Card DTOs (`AgentInterface`/`AgentCapabilities`/`AgentSkill`/`AgentCard`)
 // and Task/Message DTOs live in the shared wire-model source
-// `zeroclaw_api::a2a_wire`, used by both this inbound surface and the
+// `zeroclaw_a2a::a2a::a2a_wire`, used by both this inbound surface and the
 // outbound client in `zeroclaw-tools`. Re-exported here so the gateway's
 // existing construction sites keep working under `crate::a2a::AgentCard`.
-pub use zeroclaw_api::a2a_wire::{AgentCapabilities, AgentCard, AgentInterface, AgentSkill};
+pub use zeroclaw_a2a::a2a::a2a_wire::{AgentCapabilities, AgentCard, AgentInterface, AgentSkill};
 
 /// Runtime gateway endpoint used for A2A advertisement when the operator starts
 /// the gateway with CLI host/port overrides. This is created from the listener
@@ -55,6 +52,60 @@ impl AdvertisedGatewayEndpoint {
             host: host.into(),
             port,
         }
+    }
+}
+
+/// Gateway-side [`A2aExecutor`]: runs the inbound message through the agent
+/// loop and returns a completed task carrying the reply text. This is the
+/// host adapter the protocol crate calls into.
+pub(crate) struct GatewayA2aExecutor {
+    state: AppState,
+    alias: String,
+}
+
+impl GatewayA2aExecutor {
+    pub(crate) fn new(state: AppState, alias: impl Into<String>) -> Self {
+        Self {
+            state,
+            alias: alias.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl zeroclaw_a2a::a2a_server::A2aExecutor for GatewayA2aExecutor {
+    async fn execute(&self, message: zeroclaw_a2a::wire::Message) -> anyhow::Result<Task> {
+        let prompt = message
+            .parts
+            .iter()
+            .filter_map(|p| p.as_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // A supplied contextId is a continuation this stateless server cannot
+        // honor; the protocol layer already rejects it before reaching here.
+        let session_id = format!("a2a_{}_{}", self.alias, Uuid::new_v4());
+        let outcome =
+            run_gateway_chat_with_tools(&self.state, &prompt, Some(&session_id), Some(&self.alias))
+                .await?;
+
+        Ok(Task {
+            id: Uuid::new_v4().to_string(),
+            context_id: session_id,
+            status: TaskStatus {
+                state: TaskState::TaskStateCompleted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: vec![Artifact {
+                artifact_id: Uuid::new_v4().to_string(),
+                name: None,
+                description: None,
+                parts: vec![Part::text_str(outcome.response)],
+            }],
+            history: vec![],
+            metadata: None,
+        })
     }
 }
 
@@ -318,141 +369,36 @@ async fn handle_alias_card(
     }
 }
 
-/// JSON-RPC 2.0 request envelope for the A2A task endpoint. Only the v1
-/// `SendMessage` method (with `A2A-Version: 1.0`) is handled on this build;
-/// other methods return a JSON-RPC method-not-found.
-///
-/// This is the router-side request parser (fields private to this module).
-/// The shared `zeroclaw_api::a2a_wire::JsonRpcRequest` is the outbound
-/// construction shape; they are intentionally separate so the router keeps
-/// its parse-only surface.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct JsonRpcRequest {
-    #[serde(default)]
-    jsonrpc: String,
-    id: serde_json::Value,
-    method: String,
-    #[serde(default)]
-    params: serde_json::Value,
-}
-
 // Task/Message DTOs (`SendMessageParams`/`Message`/`Part`/`Artifact`/
 // `TaskStatus`/`Task`/`Role`/`TaskState`/`SendMessageResponse`) come from the
-// shared v1.0 wire-model `zeroclaw_api::a2a_wire`. Inbound constructs
+// shared v1.0 wire-model `zeroclaw_a2a::a2a::a2a_wire`. Inbound constructs
 // responses from them; outbound deserializes peer responses from the same
 // types. Re-exported under `crate::a2a::` aliases matching the old outbound
 // names so the construction sites below compile unchanged: `OutTask` →
 // `Task`, `OutArtifact` → `Artifact`, `OutPart` → `Part`,
 // `OutTaskStatus` → `TaskStatus`.
-pub use zeroclaw_api::a2a_wire::{
+pub use zeroclaw_a2a::a2a::a2a_wire::{
     Artifact, Message, Part, Role, SendMessageParams, SendMessageResponse, Task, TaskState,
     TaskStatus,
 };
 
-fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": { "code": code, "message": message },
-    })
-}
+// A2A `VersionNotSupportedError`, the JSON-RPC error shapes, and the
+// `google.rpc.ErrorInfo` `domain` now live in the protocol crate
+// (`zeroclaw_a2a::a2a_server::protocol`); the gateway reuses them directly.
 
-/// A2A `VersionNotSupportedError` in the conforming JSON-RPC shape (spec §5.4
-/// assigns it code `-32009`; §9.5 requires `error.data` to be an array of
-/// `@type`-tagged detail objects in ProtoJSON Any form, ideally a
-/// `google.rpc.ErrorInfo`). The official a2a-rs SDK uses code `-32009`,
-/// domain `a2a-protocol.org`, and a `VERSION_NOT_SUPPORTED` reason. Returning
-/// the generic InvalidParams code `-32602` (as a naive handler would) makes a
-/// version-negotiation failure indistinguishable from malformed parameters to
-/// standards-compliant clients.
-fn version_not_supported_error(
-    id: serde_json::Value,
-    advertised_version: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": -32009,
-            "message": format!(
-                "Unsupported A2A version '{advertised_version}': this server only speaks A2A {A2A_PROTOCOL_VERSION}"
-            ),
-            "data": [{
-                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                "reason": "VERSION_NOT_SUPPORTED",
-                "domain": A2A_ERROR_DOMAIN,
-                "metadata": { "requested_version": advertised_version }
-            }]
-        }
-    })
-}
-
-/// The A2A `google.rpc.ErrorInfo` `domain` used by the official SDK.
-const A2A_ERROR_DOMAIN: &str = "a2a-protocol.org";
-
-/// Whether a parsed `SendMessageParams` asks for `returnImmediately: true`
-/// (spec §4: return right after task creation without a terminal state). This
-/// server has no task store/state machine and always runs the turn
-/// synchronously, so honoring the flag is deferred; callers that request it
-/// are rejected rather than silently ignored.
-fn wants_return_immediately(params: &SendMessageParams) -> bool {
-    params
-        .configuration
-        .as_ref()
-        .map(|c| c.return_immediately)
-        .unwrap_or(false)
-}
-
-/// A2A `TaskNotFoundError` (`-32001`) in the conforming JSON-RPC shape (spec
-/// §5.4 assigns it code `-32001`; §9.5 requires `error.data` to be an array of
-/// `@type`-tagged `google.rpc.ErrorInfo` details). This server has no task
-/// store, so any supplied `taskId` is unresolvable and must be reported as a
-/// missing task — NOT `UnsupportedOperationError`, which would make a
-/// conforming client apply terminal/unsupported recovery to a task that never
-/// existed.
-fn task_not_found_error(id: serde_json::Value, task_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": -32001,
-            "message": format!(
-                "A2A task '{task_id}' does not exist or is not accessible on this server (no durable task store)"
-            ),
-            "data": [{
-                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                "reason": "TASK_NOT_FOUND",
-                "domain": A2A_ERROR_DOMAIN,
-                "metadata": { "task_id": task_id }
-            }]
-        }
-    })
-}
-
-/// A2A `UnsupportedOperationError` (`-32004`) with the conforming `data` array
-/// of `@type`-tagged `google.rpc.ErrorInfo` details.
-fn unsupported_operation_error(id: serde_json::Value, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": -32004,
-            "message": message,
-            "data": [{
-                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                "reason": "UNSUPPORTED_OPERATION",
-                "domain": A2A_ERROR_DOMAIN
-            }]
-        }
-    })
-}
+// The A2A error shapes (`VersionNotSupportedError`, `TaskNotFoundError`,
+// `UnsupportedOperationError`) and the `returnImmediately` probe now live in
+// the protocol crate (`zeroclaw_a2a::a2a_server::protocol` and
+// `zeroclaw_a2a::a2a_server::handle_jsonrpc`); the gateway delegates to them.
 
 async fn handle_alias_task(
     State(state): State<AppState>,
     axum::extract::Path(alias): axum::extract::Path<String>,
     headers: HeaderMap,
-    body: Result<Json<JsonRpcRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<
+        Json<zeroclaw_a2a::a2a_server::JsonRpcRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
@@ -478,7 +424,7 @@ async fn handle_alias_task(
         Err(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(jsonrpc_error(
+                Json(zeroclaw_a2a::a2a_server::jsonrpc_error(
                     serde_json::Value::Null,
                     -32700,
                     "Parse error: expected a JSON-RPC 2.0 request",
@@ -488,160 +434,12 @@ async fn handle_alias_task(
         }
     };
 
-    if req.jsonrpc != "2.0" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(jsonrpc_error(
-                req.id,
-                -32600,
-                "Invalid request: jsonrpc must be \"2.0\"",
-            )),
-        )
-            .into_response();
-    }
-
-    // A2A version negotiation (spec §5.x): the inbound serves A2A `1.0`.
-    // A request advertising a different `A2A-Version` is rejected with a
-    // `VersionNotSupportedError`, distinguished from generic JSON-RPC errors
-    // by the A2A `reason` field (UPPER_SNAKE_CASE, spec §5.4).
-    let advertised_version = headers
-        .get("A2A-Version")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .trim();
-    if advertised_version != A2A_PROTOCOL_VERSION {
-        return (
-            StatusCode::OK,
-            Json(version_not_supported_error(req.id, advertised_version)),
-        )
-            .into_response();
-    }
-
-    if req.method != "SendMessage" {
-        return (
-            StatusCode::OK,
-            Json(jsonrpc_error(
-                req.id,
-                -32601,
-                "Method not found: only SendMessage is supported on this build",
-            )),
-        )
-            .into_response();
-    }
-
-    let params: SendMessageParams = match serde_json::from_value(req.params) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::OK,
-                Json(jsonrpc_error(
-                    req.id,
-                    -32602,
-                    &format!("Invalid params: {e}"),
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    // Spec §4: `returnImmediately: true` means "return after task creation,
-    // even mid-processing." This server has no task store/state machine and
-    // always runs the turn synchronously, so it cannot honor that contract.
-    // Reject the flag explicitly (`UnsupportedOperationError`, code `-32004`)
-    // rather than silently ignoring it and returning a completed task to a
-    // caller that asked for an immediate non-terminal task.
-    if wants_return_immediately(&params) {
-        return (
-            StatusCode::OK,
-            Json(unsupported_operation_error(
-                req.id,
-                "returnImmediately=true is not supported by this server: it has no A2A task store and runs the turn synchronously. Use returnImmediately=false (the spec default) or target a peer that implements the non-terminal lifecycle.",
-            )),
-        )
-            .into_response();
-    }
-    // Spec §5.4: a supplied `taskId` must identify an existing accessible
-    // task. This stateless server has no task store, so any `taskId` is
-    // unknowable → report `TaskNotFoundError`, not an unsupported operation.
-    if let Some(tid) = params.message.task_id.as_deref() {
-        return (StatusCode::OK, Json(task_not_found_error(req.id, tid))).into_response();
-    }
-    // A context-only continuation this server cannot honor is an unsupported
-    // operation; reject explicitly rather than silently starting a new session.
-    if params.message.context_id.is_some() {
-        return (
-            StatusCode::OK,
-            Json(unsupported_operation_error(
-                req.id,
-                "contextId continuation is not supported by this server: it has no durable A2A task store and starts a fresh session per request. Omit contextId or target a peer that implements context continuation.",
-            )),
-        )
-            .into_response();
-    }
-
-    let prompt = params
-        .message
-        .parts
-        .iter()
-        .filter_map(|p| p.as_text())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if prompt.trim().is_empty() {
-        return (
-            StatusCode::OK,
-            Json(jsonrpc_error(
-                req.id,
-                -32602,
-                "Invalid params: message has no text parts",
-            )),
-        )
-            .into_response();
-    }
-
-    let session_id = format!("a2a_{alias}_{}", Uuid::new_v4());
-    match run_gateway_chat_with_tools(&state, &prompt, Some(&session_id), Some(&alias)).await {
-        Ok(outcome) => {
-            // v1.0 wire: Task uses TaskState enum (SCREAMING_SNAKE_CASE) and
-            // flattened Part (no `kind`); the SendMessage result is a
-            // SendMessageResponse oneof whose `task` branch carries the Task.
-            let task = Task {
-                id: Uuid::new_v4().to_string(),
-                context_id: session_id,
-                status: TaskStatus {
-                    state: TaskState::TaskStateCompleted,
-                    message: None,
-                    timestamp: None,
-                },
-                artifacts: vec![Artifact {
-                    artifact_id: Uuid::new_v4().to_string(),
-                    name: None,
-                    description: None,
-                    parts: vec![Part::text_str(outcome.response)],
-                }],
-                history: vec![],
-                metadata: None,
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": req.id,
-                    "result": SendMessageResponse::Task { task },
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::OK,
-            Json(jsonrpc_error(
-                req.id,
-                -32000,
-                &format!("Agent task failed: {e}"),
-            )),
-        )
-            .into_response(),
-    }
+    // Protocol handling (version negotiation, method/params validation, the
+    // sync-execution contract) lives in the protocol crate; the gateway keeps
+    // only its host duties: auth and the config/published checks above.
+    let advertised_version = headers.get("A2A-Version").and_then(|v| v.to_str().ok());
+    let executor = GatewayA2aExecutor::new(state.clone(), alias.clone());
+    zeroclaw_a2a::a2a_server::handle_jsonrpc(req, &executor, advertised_version).await
 }
 
 pub fn a2a_routes() -> Router<AppState> {
@@ -667,9 +465,20 @@ pub fn a2a_task_route() -> Router<AppState> {
     Router::new().route("/a2a/{alias}", post(handle_alias_task))
 }
 
+/// Build the protocol-layer server state for the gateway's routes: one
+/// registered agent per published alias, each wired to a gateway executor
+/// (agent loop) and a card producer (config + identity + skills).
+///
+/// Alias set is read once at route construction; config changes take effect on
+/// the next gateway reload, matching the pre-refactor behavior.
+#[cfg(feature = "a2a")]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_a2a::a2a_server::protocol::{
+        A2A_ERROR_DOMAIN, jsonrpc_error, task_not_found_error, unsupported_operation_error,
+        version_not_supported_error, wants_return_immediately,
+    };
     use zeroclaw_config::multi_agent::AgentA2aConfig;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 

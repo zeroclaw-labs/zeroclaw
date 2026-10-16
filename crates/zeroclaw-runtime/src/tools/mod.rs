@@ -1721,15 +1721,18 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // A2A outbound client (conditionally registered; opt-in via [a2a.client] enabled).
-    // The four a2a_* tools share one client holding the live config handle, so
-    // peer/credential/security resolution happens at call time (no stored peer Vec).
+    // The four a2a_* tools share one client bound to the live config handle:
+    // peer/credential/security/proxy resolution happens at call time through the
+    // host `A2aPeerSource` (no stored peer Vec, no policy snapshot), so a config
+    // reload takes effect on the next call. Falls back to a handle over the
+    // passed `root_config` when no live handle is provided.
     if root_config.a2a.client.enabled {
-        let live = live_config.clone().unwrap_or_else(|| {
+        let a2a_live = live_config.clone().unwrap_or_else(|| {
             zeroclaw_config::live::LiveConfig::new(root_config.clone()).handle()
         });
         // The zeroclaw dir (config file parent) + secrets.encrypt enable
-        // decrypting encrypted peer tokens via the canonical SecretStore,
-        // the same path http_request uses for its auth_secret values.
+        // decrypting encrypted peer tokens via the canonical SecretStore
+        // (host side, lazily per resolved peer).
         let a2a_zeroclaw_dir = root_config
             .config_path
             .parent()
@@ -1741,11 +1744,10 @@ fn all_tools_with_runtime_on_thread(
         // that created the task. Daemon restart (process exit) naturally
         // clears it (orphaned routes are stale after a restart).
         let a2a_route_cache = zeroclaw_tools::a2a_client::shared_a2a_route_cache();
-        match A2aHttpClient::new(
-            live,
+        match zeroclaw_tools::a2a_client::build_a2a_client(
+            a2a_live,
             root_config.a2a.client.request_timeout_secs,
             a2a_zeroclaw_dir,
-            root_config.secrets.encrypt,
             a2a_route_cache,
         ) {
             Ok(client) => {

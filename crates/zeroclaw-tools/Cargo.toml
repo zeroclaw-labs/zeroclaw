@@ -11,6 +11,7 @@ publish = true
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
+zeroclaw-a2a.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config = { workspace = true, default-features = false }
 zeroclaw-providers.workspace = true
