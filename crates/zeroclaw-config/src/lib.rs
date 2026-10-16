@@ -35,6 +35,7 @@ pub mod sections;
 pub mod skill_bundles;
 pub mod traits;
 pub mod typed_value;
+pub mod url_credentials;
 pub mod validation_warnings;
 pub mod write_lock;
 

@@ -238,6 +238,8 @@ pub fn make_prop_field(
     display_secret_terminals: &[&str],
     alias_source: Option<crate::traits::AliasSource>,
     multiline: bool,
+    credential_url: bool,
+    credential_url_terminals: &[&str],
 ) -> PropFieldInfo {
     let display_value = if is_secret || derived_from_secret {
         match table.and_then(|t| t.get(serde_name)) {
@@ -247,11 +249,16 @@ pub fn make_prop_field(
             }
             _ => crate::traits::UNSET_DISPLAY.to_string(),
         }
+    } else if credential_url
+        && let Some(shown) = credential_url_display(table.and_then(|t| t.get(serde_name)))
+    {
+        shown
     } else {
         toml_value_to_display_for_kind(
             table.and_then(|t| t.get(serde_name)),
             kind,
             display_secret_terminals,
+            credential_url_terminals,
         )
     };
     PropFieldInfo {
@@ -271,24 +278,33 @@ pub fn make_prop_field(
     }
 }
 
-/// Get a property value via serde serialization.
+/// Get a property value via serde serialization, as a display string: a
+/// secret reads as `**** (encrypted)` and a `#[credential_url]` field with
+/// its credential-bearing components masked.
 pub fn serde_get_prop<T: serde::Serialize>(
     target: &T,
     prefix: &str,
     name: &str,
     is_secret: bool,
+    credential_url: bool,
     kind: PropKind,
     display_secret_terminals: &[&str],
+    credential_url_terminals: &[&str],
 ) -> anyhow::Result<String> {
     if is_secret {
         return Ok("**** (encrypted)".to_string());
     }
     let serde_name = prop_name_to_serde_field(prefix, name)?;
     let table = toml::Value::try_from(target)?;
+    let value = table.as_table().and_then(|t| t.get(&serde_name));
+    if credential_url && let Some(shown) = credential_url_display(value) {
+        return Ok(shown);
+    }
     Ok(toml_value_to_display_for_kind(
-        table.as_table().and_then(|t| t.get(&serde_name)),
+        value,
         kind,
         display_secret_terminals,
+        credential_url_terminals,
     ))
 }
 
@@ -300,23 +316,175 @@ pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
     value_str: &str,
     kind: PropKind,
     is_option: bool,
+    credential_url: bool,
 ) -> anyhow::Result<()> {
     let serde_name = prop_name_to_serde_field(prefix, name)?;
     let mut table: toml::Table = toml::from_str(&toml::to_string(target)?)?;
+    // A `#[credential_url]` value read back masked takes the stored
+    // components it masked, so re-posting a displayed URL never stores the
+    // placeholder in place of the credential. An object, or each entry of an
+    // object array, is restored member by member once parsed, below.
+    let masked = credential_url && crate::url_credentials::carries_mask(value_str);
+    let structured = matches!(
+        kind,
+        PropKind::Object | PropKind::ObjectArray | PropKind::StringArray
+    );
+    let current = table.get(&serde_name).cloned();
+    let restored;
+    let value_str = if masked && !structured {
+        restored = crate::url_credentials::restore(
+            value_str,
+            current.as_ref().and_then(toml::Value::as_str),
+        )
+        .map_err(|error| anyhow::Error::new(error.at(name)))?;
+        restored.as_str()
+    } else {
+        value_str
+    };
     if (value_str.is_empty() || value_str == crate::traits::UNSET_DISPLAY || value_str == "****")
         && is_option
     {
         table.remove(&serde_name);
     } else {
-        let parsed = if kind == PropKind::ObjectArray && name.ends_with("read_memory_from") {
+        let mut parsed = if kind == PropKind::ObjectArray && name.ends_with("read_memory_from") {
             parse_memory_grant_array(value_str)?
         } else {
             parse_prop_value(value_str, kind)?
         };
+        if masked && structured {
+            restore_masked_value(&mut parsed, current.as_ref())
+                .map_err(|error| anyhow::Error::new(error.at(name)))?;
+        }
         table.insert(serde_name, parsed);
     }
     *target = toml::from_str(&toml::to_string(&table)?)?;
     Ok(())
+}
+
+/// Restore the masked URL components of each entry in `entries` from the one
+/// stored entry it was read from: the stored entry of the same `name`, so its
+/// other fields can change while its URL stays masked, or, for an entry
+/// without a name, the stored entry whose other fields all match. An entry
+/// that carries the placeholder but matches no stored entry,
+/// or more than one, is refused rather than stored with the placeholder.
+fn restore_masked_entries(
+    entries: &mut [toml::Value],
+    stored: &[toml::Value],
+) -> Result<(), crate::url_credentials::UnresolvedMask> {
+    for entry in entries {
+        let toml::Value::Table(fields) = entry else {
+            continue;
+        };
+        let masked: Vec<String> = fields
+            .iter()
+            .filter(|(_, value)| {
+                value
+                    .as_str()
+                    .is_some_and(crate::url_credentials::carries_mask)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if masked.is_empty() {
+            continue;
+        }
+        let sources: Vec<&toml::Table> = stored
+            .iter()
+            .filter_map(toml::Value::as_table)
+            .filter(|candidate| match fields.get("name") {
+                Some(name) => candidate.get("name") == Some(name),
+                None => fields
+                    .iter()
+                    .all(|(key, value)| masked.contains(key) || candidate.get(key) == Some(value)),
+            })
+            .collect();
+        let [source] = sources.as_slice() else {
+            return Err(crate::url_credentials::UnresolvedMask::entry(sources.len()));
+        };
+        restore_masked_fields(fields, Some(source))?;
+    }
+    Ok(())
+}
+
+/// Restore an object or object-array value a client wrote with masked URL
+/// members, against what is stored. Nothing stored leaves nothing to restore
+/// from, so a member carrying the placeholder is then refused.
+fn restore_masked_value(
+    parsed: &mut toml::Value,
+    current: Option<&toml::Value>,
+) -> Result<(), crate::url_credentials::UnresolvedMask> {
+    match parsed {
+        toml::Value::Array(entries) => {
+            let stored = match current {
+                Some(toml::Value::Array(stored)) => stored.as_slice(),
+                _ => &[],
+            };
+            if entries.iter().all(|entry| entry.as_str().is_some()) {
+                let mut urls: Vec<String> = entries
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                let stored: Vec<String> = stored
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                crate::url_credentials::restore_list(&mut urls, &stored)?;
+                for (entry, restored) in entries.iter_mut().zip(urls) {
+                    *entry = toml::Value::String(restored);
+                }
+                Ok(())
+            } else {
+                restore_masked_entries(entries, stored)
+            }
+        }
+        toml::Value::Table(fields) => {
+            restore_masked_fields(fields, current.and_then(toml::Value::as_table))
+        }
+        toml::Value::String(value) => {
+            *value = crate::url_credentials::restore(value, current.and_then(toml::Value::as_str))?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Restore each string member of `fields` that carries the placeholder from
+/// the same member of `source`, the stored object it was read from.
+fn restore_masked_fields(
+    fields: &mut toml::Table,
+    source: Option<&toml::Table>,
+) -> Result<(), crate::url_credentials::UnresolvedMask> {
+    for (key, value) in fields.iter_mut() {
+        let toml::Value::String(edited) = value else {
+            continue;
+        };
+        if crate::url_credentials::carries_mask(edited) {
+            *edited = crate::url_credentials::restore(
+                edited,
+                source
+                    .and_then(|source| source.get(key))
+                    .and_then(toml::Value::as_str),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn credential_url_display(value: Option<&toml::Value>) -> Option<String> {
+    match value? {
+        toml::Value::String(url) => Some(crate::url_credentials::mask(url)),
+        toml::Value::Array(urls) if urls.iter().all(|url| url.as_str().is_some()) => {
+            let masked = toml::Value::Array(
+                urls.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(|url| toml::Value::String(crate::url_credentials::mask(url)))
+                    .collect(),
+            );
+            Some(masked.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn toml_value_to_display(value: Option<&toml::Value>) -> String {
@@ -331,6 +499,7 @@ fn toml_value_to_display_for_kind(
     value: Option<&toml::Value>,
     kind: PropKind,
     display_secret_terminals: &[&str],
+    credential_url_terminals: &[&str],
 ) -> String {
     match kind {
         PropKind::Object | PropKind::ObjectArray => match value {
@@ -338,7 +507,11 @@ fn toml_value_to_display_for_kind(
             Some(toml::Value::String(s)) => s.clone(),
             Some(v) => {
                 let mut redacted = v.clone();
-                redact_toml_display_secrets(&mut redacted, display_secret_terminals);
+                redact_toml_display_secrets(
+                    &mut redacted,
+                    display_secret_terminals,
+                    credential_url_terminals,
+                );
                 redacted.to_string()
             }
         },
@@ -349,29 +522,53 @@ fn toml_value_to_display_for_kind(
 pub fn object_array_json_display_value(
     value: &impl serde::Serialize,
     display_secret_terminals: &[&str],
+    credential_url_terminals: &[&str],
 ) -> String {
     match serde_json::to_value(value) {
         Ok(mut value) => {
-            redact_json_display_secrets(&mut value, display_secret_terminals);
+            redact_json_display_secrets(
+                &mut value,
+                display_secret_terminals,
+                credential_url_terminals,
+            );
             serde_json::to_string(&value).unwrap_or_else(|_| "[]".to_string())
         }
         Err(_) => "[]".to_string(),
     }
 }
 
-fn redact_json_display_secrets(value: &mut serde_json::Value, display_secret_terminals: &[&str]) {
+/// Mask the display of an object or object array: every value under a
+/// secret terminal key wholly, and every string under a credential-URL
+/// terminal key in its credential-bearing components only.
+fn redact_json_display_secrets(
+    value: &mut serde_json::Value,
+    display_secret_terminals: &[&str],
+    credential_url_terminals: &[&str],
+) {
     match value {
         serde_json::Value::Array(items) => {
             for item in items {
-                redact_json_display_secrets(item, display_secret_terminals);
+                redact_json_display_secrets(
+                    item,
+                    display_secret_terminals,
+                    credential_url_terminals,
+                );
             }
         }
         serde_json::Value::Object(map) => {
             for (key, nested) in map.iter_mut() {
                 if display_key_is_secret_terminal(key, display_secret_terminals) {
                     mask_json_value(nested);
+                } else if let serde_json::Value::String(url) = nested
+                    && display_key_is_secret_terminal(key, credential_url_terminals)
+                {
+                    *url = crate::url_credentials::mask(url);
                 } else {
-                    redact_json_display_secrets(nested, display_secret_terminals);
+                    redact_json_display_secrets(
+                        nested,
+                        display_secret_terminals,
+                        credential_url_terminals,
+                    );
                 }
             }
         }
@@ -379,19 +576,36 @@ fn redact_json_display_secrets(value: &mut serde_json::Value, display_secret_ter
     }
 }
 
-fn redact_toml_display_secrets(value: &mut toml::Value, display_secret_terminals: &[&str]) {
+/// The TOML twin of [`redact_json_display_secrets`].
+pub(crate) fn redact_toml_display_secrets(
+    value: &mut toml::Value,
+    display_secret_terminals: &[&str],
+    credential_url_terminals: &[&str],
+) {
     match value {
         toml::Value::Array(items) => {
             for item in items {
-                redact_toml_display_secrets(item, display_secret_terminals);
+                redact_toml_display_secrets(
+                    item,
+                    display_secret_terminals,
+                    credential_url_terminals,
+                );
             }
         }
         toml::Value::Table(table) => {
             for (key, nested) in table.iter_mut() {
                 if display_key_is_secret_terminal(key, display_secret_terminals) {
                     mask_toml_value(nested);
+                } else if let toml::Value::String(url) = nested
+                    && display_key_is_secret_terminal(key, credential_url_terminals)
+                {
+                    *url = crate::url_credentials::mask(url);
                 } else {
-                    redact_toml_display_secrets(nested, display_secret_terminals);
+                    redact_toml_display_secrets(
+                        nested,
+                        display_secret_terminals,
+                        credential_url_terminals,
+                    );
                 }
             }
         }

@@ -1561,10 +1561,11 @@ fn report(plan: &ExportPlan, out: &Path, copied: &BundleCopy) {
         "\n{}",
         mt(
             "cli-agent-export-scrub-scope",
-            "⚠️  Scrubbing blanks the fields the schema marks secret. It is not credential \
-             detection: other config values travel as written, so a token in an MCP server's \
-             url, or a credential in its command or args, is carried and repeated in the \
-             manifest's risk flags."
+            "⚠️  Scrubbing blanks the fields the schema marks secret and cuts endpoint URLs \
+             with a userinfo, query or fragment down to their endpoint. It is not credential \
+             detection: other config values travel as written, so a token in a URL's path, or a \
+             credential in an MCP server's command or args, is carried, and command lines are \
+             repeated in the manifest's risk flags."
         )
     );
 

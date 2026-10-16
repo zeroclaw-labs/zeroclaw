@@ -201,6 +201,7 @@ pub struct A2aServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     /// Operator-supplied base URL advertised in agent card endpoints.
+    #[credential_url]
     pub public_base_url: String,
 }
 
@@ -325,6 +326,7 @@ pub struct A2aClientPeerConfig {
     /// Base URL of the remote A2A server origin, e.g.
     /// `https://team.example.com`. The well-known card path and the
     /// JSON-RPC task path are derived from this.
+    #[credential_url]
     pub base_url: String,
     /// Bearer token for the peer. A `${VAR}` value is resolved from the
     /// environment at call time; a literal value is used as-is. Empty
