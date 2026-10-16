@@ -14056,6 +14056,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-memory",
+ "zeroclaw-providers",
  "zeroclaw-runtime",
 ]
 
