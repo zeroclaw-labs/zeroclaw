@@ -14,7 +14,7 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::{Config, MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
-use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
+use zeroclaw_tool_call_parser::normalize_terminal_display_text;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CompletionLimit {
@@ -443,24 +443,8 @@ pub(crate) async fn finish_after_max_iterations(
             ));
         }
         SummaryCall::Done(Ok(resp)) => {
-            // When the provider omitted `input_tokens` on the accepted
-            // summary, carry a display-only estimate of the summary request
-            // so the context meter keeps its numerator after the final-summary
-            // event. Rejected attempts and accounting stay provider-reported.
-            let accepted_estimate = resp
-                .usage
-                .as_ref()
-                .and_then(|u| u.input_tokens)
-                .is_none()
-                .then(|| crate::agent::history::estimate_history_tokens(history) as u64)
-                .filter(|&est| est > 0);
-            if let Some(est) = accepted_estimate {
-                for summary in &mut summary_attempts {
-                    if summary.accepted {
-                        summary.estimated_input_tokens = Some(est);
-                    }
-                }
-            }
+            // The query seam captured any display-only estimate from its final
+            // request; rejected attempts and accounting stay provider-reported.
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
             resp
         }
@@ -478,7 +462,7 @@ pub(crate) async fn finish_after_max_iterations(
     // content and trailing terminal markers, then withhold text that looks
     // like an internal tool-protocol envelope. The summary call passes
     // `tools: None`, so the tools-free detector is the matching contract.
-    let display_text = strip_trailing_terminal_markers(&strip_think_tags(&raw_text));
+    let display_text = normalize_terminal_display_text(&raw_text);
     let protocol_suppressed =
         super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
     if protocol_suppressed {
@@ -923,6 +907,8 @@ mod graceful_summary_metering_tests {
         seen: Arc<std::sync::Mutex<Vec<String>>>,
         vision: bool,
         expected_request: Option<(&'static str, usize)>,
+        request_tokens: Arc<AtomicUsize>,
+        usage: Option<TokenUsage>,
     }
 
     #[async_trait]
@@ -950,6 +936,10 @@ mod graceful_summary_metering_tests {
             model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
+            self.request_tokens.store(
+                crate::agent::history::estimate_history_tokens(request.messages),
+                Ordering::SeqCst,
+            );
             if let Some((expected_model, token_budget)) = self.expected_request {
                 assert_eq!(model, expected_model);
                 assert!(request.tools.is_none());
@@ -968,7 +958,7 @@ mod graceful_summary_metering_tests {
             Ok(ChatResponse {
                 text: Some("wrap-up summary".to_string()),
                 tool_calls: Vec::new(),
-                usage: None,
+                usage: self.usage.clone(),
                 reasoning_content: None,
             })
         }
@@ -999,11 +989,19 @@ mod graceful_summary_metering_tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 *model = "summary-model".into();
                 messages.push(ChatMessage::user("hook context ".repeat(80)));
+                // This post-preparation marker is removed by the query seam,
+                // so its estimate must use the final sanitized request too.
+                messages.push(ChatMessage::user(format!(
+                    "[IMAGE:/tmp/{}.png]",
+                    "synthetic-hook-image".repeat(20)
+                )));
                 crate::hooks::HookResult::Continue(())
             }
         }
 
-        for budget in [512, 1] {
+        // The post-hook image is conservatively counted at 1,600 tokens before
+        // final sanitization; still force the obsolete history to be trimmed.
+        for budget in [2048, 1] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let provider = CapturingProvider {
                 seen: Arc::clone(&seen),
@@ -1020,6 +1018,7 @@ mod graceful_summary_metering_tests {
                 ChatMessage::assistant("latest completed work"),
             ];
             let mut crumb_present = false;
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
             let result = finish_after_max_iterations(
                 &mut None,
                 &provider,
@@ -1034,7 +1033,7 @@ mod graceful_summary_metering_tests {
                 String::new(),
                 "summary-hook-context",
                 &LoopKnobs::default(),
-                None,
+                Some(&event_tx),
                 None,
                 None,
                 None,
@@ -1063,12 +1062,31 @@ mod graceful_summary_metering_tests {
             assert!(!history.iter().any(|m| m.content.contains("obsolete")));
             assert!(!history.iter().any(|m| m.content.contains("hook context")));
             let captured = seen.lock().unwrap();
-            if budget == 512 {
+            if budget == 2048 {
                 assert!(result.unwrap().contains("execution-tree iteration budget"));
                 assert_eq!(captured.len(), 1);
                 assert!(captured[0].contains("latest real question"));
                 assert!(captured[0].contains("hook context"));
                 assert!(!captured[0].contains("obsolete"));
+                assert!(!captured[0].contains("synthetic-hook-image"));
+                let mut accepted_estimates = Vec::new();
+                while let Ok(event) = event_rx.try_recv() {
+                    if let TurnEvent::Usage {
+                        accepted: true,
+                        input_tokens,
+                        estimated_input_tokens,
+                        ..
+                    } = event
+                    {
+                        assert_eq!(input_tokens, None);
+                        accepted_estimates.push(estimated_input_tokens);
+                    }
+                }
+                assert_eq!(
+                    accepted_estimates,
+                    vec![Some(provider.request_tokens.load(Ordering::SeqCst) as u64)],
+                    "estimate must describe the dispatched post-hook, post-trim request"
+                );
             } else {
                 let error = result.unwrap_err();
                 let exceeded = super::super::context_window_exceeded_from_error(&error)
@@ -1082,6 +1100,61 @@ mod graceful_summary_metering_tests {
                         .any(|m| m.content.contains("execution-tree iteration budget"))
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_estimate_preserves_reported_usage_and_cached_floor() {
+        for (input_tokens, cached_input_tokens) in [
+            (None, None),
+            (None, Some(10_000)),
+            (Some(0), Some(0)),
+            (Some(17), Some(11)),
+        ] {
+            let provider = CapturingProvider {
+                usage: Some(TokenUsage {
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens: Some(3),
+                    cache_creation_input_tokens: None,
+                }),
+                ..Default::default()
+            };
+            let ctx = ToolLoopCostTrackingContext::usage_only();
+            let totals = Arc::clone(&ctx.turn_usage);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    Some(ctx),
+                    run_summary_with_events(&provider, String::new(), Some(&tx), None),
+                )
+                .await
+                .expect("summary succeeds");
+            let request_tokens = provider.request_tokens.load(Ordering::SeqCst) as u64;
+            let expected = input_tokens
+                .is_none()
+                .then_some(request_tokens.max(cached_input_tokens.unwrap_or(0)));
+            let mut usage = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let TurnEvent::Usage {
+                    input_tokens: reported,
+                    cached_input_tokens: cached,
+                    estimated_input_tokens,
+                    accepted,
+                    ..
+                } = event
+                {
+                    usage.push((reported, cached, estimated_input_tokens, accepted));
+                }
+            }
+            assert_eq!(
+                usage,
+                vec![(input_tokens, cached_input_tokens, expected, true)]
+            );
+            // Estimates never replace provider totals, even when larger.
+            let totals = *totals.lock();
+            assert_eq!(totals.input_tokens, input_tokens.unwrap_or(0));
+            assert_eq!(totals.output_tokens, 3);
         }
     }
 
@@ -1162,6 +1235,7 @@ mod graceful_summary_metering_tests {
                 seen: Arc::clone(&seen),
                 vision: true,
                 expected_request: Some(("summary-model", budget)),
+                ..Default::default()
             };
             let hook_calls = Arc::new(AtomicUsize::new(0));
             let mut hooks = crate::hooks::HookRunner::new();
