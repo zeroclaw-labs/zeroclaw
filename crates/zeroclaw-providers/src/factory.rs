@@ -291,13 +291,95 @@ fn merge_extra_body(
 /// boxing the trait object. Single source of the override chain — every compat
 /// impl funnels through here.
 pub fn apply_compat_options(
-    mut b: crate::compatible::OpenAiCompatibleBuilder,
+    b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
 ) -> Box<dyn ModelProvider> {
+    apply_compat_options_with_local_thinking(b, opts, None)
+}
+
+#[derive(Clone, Copy)]
+enum LocalThinkingWire {
+    Ollama,
+    Llamacpp,
+}
+
+/// The typed on/off control wins over request-body overrides, while an
+/// enabled request retains an explicitly configured non-none effort.
+fn local_thinking_effort(
+    opts: &ModelProviderRuntimeOptions,
+    extra: Option<&serde_json::Value>,
+    enabled: bool,
+) -> String {
+    if !enabled {
+        return "none".to_string();
+    }
+    extra
+        .and_then(|body| body.get("reasoning_effort"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|effort| !effort.is_empty() && *effort != "none")
+        .or_else(|| {
+            extra
+                .and_then(|body| body.get("reasoning"))
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|effort| !effort.is_empty() && *effort != "none")
+        })
+        .or_else(|| {
+            opts.reasoning_effort
+                .as_deref()
+                .filter(|effort| !effort.is_empty() && *effort != "none")
+        })
+        .unwrap_or("medium")
+        .to_string()
+}
+
+fn local_thinking_extra_body(
+    opts: &ModelProviderRuntimeOptions,
+    extra: Option<serde_json::Value>,
+    wire: LocalThinkingWire,
+    enabled: bool,
+) -> serde_json::Value {
+    let effort = local_thinking_effort(opts, extra.as_ref(), enabled);
+    let mut body = match extra {
+        Some(serde_json::Value::Object(body)) => body,
+        _ => serde_json::Map::new(),
+    };
+    body.insert("reasoning_effort".to_string(), effort.clone().into());
+    // Ollama also accepts the nested spelling. Keep conflicting manual
+    // overrides consistent with the typed control instead of depending on
+    // the backend's field precedence.
+    if let Some(serde_json::Value::Object(reasoning)) = body.get_mut("reasoning") {
+        reasoning.insert("effort".to_string(), effort.into());
+    }
+    if matches!(wire, LocalThinkingWire::Llamacpp) {
+        let kwargs = body
+            .entry("chat_template_kwargs")
+            .or_insert_with(|| serde_json::json!({}));
+        if !kwargs.is_object() {
+            *kwargs = serde_json::json!({});
+        }
+        if let serde_json::Value::Object(kwargs) = kwargs {
+            kwargs.insert("enable_thinking".to_string(), enabled.into());
+        }
+    }
+    serde_json::Value::Object(body)
+}
+
+fn apply_compat_options_with_local_thinking(
+    mut b: crate::compatible::OpenAiCompatibleBuilder,
+    opts: &ModelProviderRuntimeOptions,
+    thinking_wire: Option<LocalThinkingWire>,
+) -> Box<dyn ModelProvider> {
+    let local_thinking = thinking_wire.zip(opts.think.or(opts.reasoning_enabled));
     if let Some(t) = opts.provider_timeout_secs {
         b = b.timeout_secs(t);
     }
-    if let Some(ref effort) = opts.reasoning_effort {
+    if local_thinking.is_some() {
+        // The local control is materialized below as a top-level body field.
+        // This bypasses model-name gating and avoids serializing a second,
+        // conflicting reasoning_effort from the generic request struct.
+        b = b.reasoning_effort(None);
+    } else if let Some(ref effort) = opts.reasoning_effort {
         b = b.reasoning_effort(Some(effort.clone()));
     }
     if opts.reasoning_effort_passthrough {
@@ -341,10 +423,15 @@ pub fn apply_compat_options(
     // its own top-level key, so a chat-template payload rides the request body
     // even when `provider_extra` is unset. The builder exposes a single
     // `extra_body` slot, hence the merge here rather than two setter calls.
-    if let Some(extra) = merge_extra_body(
+    let extra = merge_extra_body(
         opts.provider_extra.as_ref(),
         opts.chat_template_kwargs.as_ref(),
-    ) {
+    );
+    let extra = match local_thinking {
+        Some((wire, enabled)) => Some(local_thinking_extra_body(opts, extra, wire, enabled)),
+        None => extra,
+    };
+    if let Some(extra) = extra {
         b = b.extra_body(extra);
     }
     let p = b.build();
@@ -1347,9 +1434,10 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(apply_compat_options(
+        Ok(apply_compat_options_with_local_thinking(
             build_ollama_compat_provider(alias, key, api_url, opts),
             opts,
+            Some(LocalThinkingWire::Ollama),
         ))
     }
 
@@ -1861,12 +1949,20 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("llama.cpp");
+        let mut responses_opts = opts.clone();
+        if let Some(enabled) = opts.think.or(opts.reasoning_enabled) {
+            responses_opts.reasoning_effort = Some(local_thinking_effort(
+                opts,
+                opts.provider_extra.as_ref(),
+                enabled,
+            ));
+        }
         if let Some(p) = build_responses_provider_if_requested(
             self.base.wire_api,
             alias,
             Some(base_url),
             Some(llama_cpp_key),
-            opts,
+            &responses_opts,
         ) {
             return Ok(p);
         }
@@ -1881,7 +1977,11 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
         if opts.merge_system_into_user {
             b = b.merge_system_into_user_preserving_native();
         }
-        Ok(apply_compat_options(b, opts))
+        Ok(apply_compat_options_with_local_thinking(
+            b,
+            opts,
+            Some(LocalThinkingWire::Llamacpp),
+        ))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -2031,6 +2131,397 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+    /// Exercise config resolution, the real family factory, and all compatible
+    /// request builders against an HTTP endpoint instead of inspecting a helper.
+    async fn capture_local_thinking_requests(
+        family: &str,
+        base: ModelProviderConfig,
+        runtime_enabled: Option<bool>,
+        runtime_effort: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        use axum::{Json, Router, response::IntoResponse, routing::post};
+        use futures_util::StreamExt;
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, StreamEvent, StreamOptions};
+        use zeroclaw_api::tool::ToolSpec;
+        use zeroclaw_config::schema::{Config, CustomModelProviderConfig};
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let responses_wire = base.wire_api == Some(WireApi::Responses);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let route_captured = Arc::clone(&captured);
+        let app = Router::new().route(
+            if responses_wire { "/v1/responses" } else { "/v1/chat/completions" },
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = Arc::clone(&route_captured);
+                async move {
+                    captured.lock().unwrap().push(body.clone());
+                    if responses_wire {
+                        let completed = serde_json::json!({
+                            "id": "resp_fixture", "object": "response", "status": "completed",
+                            "model": "fixture-qwen-local",
+                            "output": [{"id": "msg_fixture", "type": "message", "role": "assistant",
+                                "content": [{"type": "output_text", "text": "ok", "annotations": []}]}],
+                            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                        });
+                        return if body["stream"] == true {
+                            let delta = serde_json::json!({"type": "response.output_text.delta", "delta": "ok"});
+                            let terminal = serde_json::json!({"type": "response.completed", "response": completed});
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                                format!("data: {delta}\n\ndata: {terminal}\n\n"),
+                            ).into_response()
+                        } else {
+                            Json(completed).into_response()
+                        };
+                    }
+                    if body["stream"] == true {
+                        let delta = serde_json::json!({
+                            "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": null}]
+                        });
+                        let final_chunk = serde_json::json!({
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        });
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            format!("data: {delta}\n\ndata: {final_chunk}\n\ndata: [DONE]\n\n"),
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!({
+                            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local thinking fixture");
+        let uri = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        scopeguard::defer!(server.abort());
+
+        let model = base
+            .model
+            .clone()
+            .unwrap_or_else(|| "fixture-qwen-local".to_string());
+        let base = ModelProviderConfig {
+            uri: Some(uri),
+            model: Some(model.clone()),
+            api_key: Some("fixture-key".to_string()),
+            ..base
+        };
+        let mut config = Config::default();
+        config.runtime.reasoning_enabled = runtime_enabled;
+        config.runtime.reasoning_effort = runtime_effort.map(str::to_string);
+        match family {
+            "ollama" => {
+                config.providers.models.ollama.insert(
+                    "local".to_string(),
+                    OllamaModelProviderConfig {
+                        base,
+                        ..Default::default()
+                    },
+                );
+            }
+            "llamacpp" => {
+                config
+                    .providers
+                    .models
+                    .llamacpp
+                    .insert("local".to_string(), LlamacppModelProviderConfig { base });
+            }
+            "custom" => {
+                config
+                    .providers
+                    .models
+                    .custom
+                    .insert("local".to_string(), CustomModelProviderConfig { base });
+            }
+            _ => panic!("unsupported fixture family"),
+        }
+        let provider = crate::create_model_provider_from_ref(&config, &format!("{family}.local"))
+            .expect("resolve configured local provider");
+        let messages = vec![ChatMessage::user("Reply ok")];
+        assert_eq!(
+            provider
+                .chat_with_history(&messages, &model, None)
+                .await
+                .expect("text chat succeeds"),
+            "ok"
+        );
+        let tools = vec![ToolSpec::new(
+            "fixture_tool",
+            "A synthetic test tool",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+        let response = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                &model,
+                None,
+            )
+            .await
+            .expect("structured chat succeeds");
+        assert_eq!(response.text.as_deref(), Some("ok"));
+        for stream_tools in [None, Some(tools.as_slice())] {
+            let mut stream = provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: stream_tools,
+                    thinking: None,
+                },
+                &model,
+                None,
+                StreamOptions::new(true),
+            );
+            let mut text = String::new();
+            let mut finals = 0;
+            while let Some(event) = stream.next().await {
+                match event.expect("valid local thinking stream") {
+                    StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
+                    StreamEvent::Final => finals += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(text, "ok");
+            assert_eq!(finals, 1);
+        }
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(requests.len(), 4);
+        requests
+    }
+
+    #[tokio::test]
+    async fn local_thinking_alias_off_overrides_runtime_and_manual_fields() {
+        for family in ["ollama", "llamacpp"] {
+            let base = ModelProviderConfig {
+                think: Some(false),
+                provider_extra: Some(serde_json::json!({
+                    "reasoning_effort": "xhigh",
+                    "reasoning": {"effort": "xhigh", "summary": "auto"},
+                    "unrelated": "preserved"
+                })),
+                chat_template_kwargs: Some(serde_json::json!({
+                    "enable_thinking": true, "other_template_option": 7
+                })),
+                ..Default::default()
+            };
+            for request in
+                capture_local_thinking_requests(family, base, Some(true), Some("high")).await
+            {
+                assert_eq!(request["reasoning_effort"], "none", "{family}: {request}");
+                assert_eq!(request["reasoning"]["effort"], "none");
+                assert_eq!(request["reasoning"]["summary"], "auto");
+                assert_eq!(request["unrelated"], "preserved");
+                assert_eq!(request["chat_template_kwargs"]["other_template_option"], 7);
+                if family == "llamacpp" {
+                    assert_eq!(request["chat_template_kwargs"]["enable_thinking"], false);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_runtime_off_is_forwarded() {
+        for family in ["ollama", "llamacpp"] {
+            for request in capture_local_thinking_requests(
+                family,
+                ModelProviderConfig::default(),
+                Some(false),
+                Some("high"),
+            )
+            .await
+            {
+                assert_eq!(request["reasoning_effort"], "none", "{family}: {request}");
+                if family == "llamacpp" {
+                    assert_eq!(request["chat_template_kwargs"]["enable_thinking"], false);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_alias_on_overrides_runtime_off() {
+        for family in ["ollama", "llamacpp"] {
+            let base = ModelProviderConfig {
+                think: Some(true),
+                provider_extra: Some(serde_json::json!({"reasoning_effort": "none"})),
+                chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+                ..Default::default()
+            };
+            for request in
+                capture_local_thinking_requests(family, base, Some(false), Some("high")).await
+            {
+                assert_eq!(request["reasoning_effort"], "high", "{family}: {request}");
+                if family == "llamacpp" {
+                    assert_eq!(request["chat_template_kwargs"]["enable_thinking"], true);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_on_preserves_manual_effort_and_defaults_to_medium() {
+        for family in ["ollama", "llamacpp"] {
+            for (base, expected) in [
+                (
+                    ModelProviderConfig {
+                        provider_extra: Some(serde_json::json!({"reasoning_effort": "low"})),
+                        ..Default::default()
+                    },
+                    "low",
+                ),
+                (ModelProviderConfig::default(), "medium"),
+            ] {
+                for request in capture_local_thinking_requests(family, base, Some(true), None).await
+                {
+                    assert_eq!(request["reasoning_effort"], expected, "{family}: {request}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_nested_effort_and_precedence_reach_all_wires() {
+        for (family, wire_api) in [
+            ("ollama", None),
+            ("llamacpp", None),
+            ("llamacpp", Some(WireApi::Responses)),
+        ] {
+            for (extra, on_effort) in [
+                (serde_json::json!({"reasoning": {"effort": "low"}}), "low"),
+                (
+                    serde_json::json!({"reasoning_effort": "low", "reasoning": {"effort": "high"}}),
+                    "low",
+                ),
+                (
+                    serde_json::json!({"reasoning_effort": "none", "reasoning": {"effort": "low"}}),
+                    "low",
+                ),
+                (
+                    serde_json::json!({"reasoning_effort": "", "reasoning": {"effort": "low"}}),
+                    "low",
+                ),
+                (
+                    serde_json::json!({"reasoning_effort": 7, "reasoning": {"effort": "low"}}),
+                    "low",
+                ),
+                (serde_json::json!({"reasoning": {"effort": "none"}}), "high"),
+                (serde_json::json!({"reasoning": {"effort": ""}}), "high"),
+                (serde_json::json!({"reasoning": {"effort": 7}}), "high"),
+            ] {
+                for enabled in [true, false] {
+                    let base = ModelProviderConfig {
+                        think: Some(enabled),
+                        wire_api,
+                        provider_extra: Some(extra.clone()),
+                        ..Default::default()
+                    };
+                    let expected = if enabled { on_effort } else { "none" };
+                    for request in
+                        capture_local_thinking_requests(family, base, Some(!enabled), Some("high"))
+                            .await
+                    {
+                        assert_eq!(
+                            request["reasoning"]["effort"], expected,
+                            "{family}: {request}"
+                        );
+                        if wire_api != Some(WireApi::Responses) {
+                            assert_eq!(
+                                request["reasoning_effort"], expected,
+                                "{family}: {request}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_unset_leaves_backend_defaults_and_manual_controls() {
+        for family in ["ollama", "llamacpp"] {
+            for request in
+                capture_local_thinking_requests(family, ModelProviderConfig::default(), None, None)
+                    .await
+            {
+                assert!(request.get("reasoning_effort").is_none());
+                assert!(request.get("chat_template_kwargs").is_none());
+            }
+            let base = ModelProviderConfig {
+                provider_extra: Some(serde_json::json!({"reasoning_effort": "low"})),
+                chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
+                ..Default::default()
+            };
+            for request in capture_local_thinking_requests(family, base, None, None).await {
+                assert_eq!(request["reasoning_effort"], "low");
+                assert_eq!(request["chat_template_kwargs"]["enable_thinking"], false);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_does_not_change_other_provider_families() {
+        let base = ModelProviderConfig {
+            think: Some(false),
+            ..Default::default()
+        };
+        for request in capture_local_thinking_requests("custom", base, Some(false), None).await {
+            assert!(request.get("reasoning_effort").is_none());
+            assert!(request.get("chat_template_kwargs").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_llamacpp_responses_uses_reasoning_effort() {
+        for (think, runtime_enabled, expected) in [
+            (Some(false), Some(true), "none"),
+            (None, Some(false), "none"),
+            (Some(true), Some(false), "high"),
+        ] {
+            let base = ModelProviderConfig {
+                think,
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            };
+            for request in
+                capture_local_thinking_requests("llamacpp", base, runtime_enabled, Some("high"))
+                    .await
+            {
+                assert_eq!(request["reasoning"]["effort"], expected, "{request}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_thinking_gemma_4_26b_template_flag_reaches_all_request_paths() {
+        for enabled in [false, true] {
+            let base = ModelProviderConfig {
+                model: Some("gemma-4-26B-A4B-it".to_string()),
+                think: Some(enabled),
+                ..Default::default()
+            };
+            for request in capture_local_thinking_requests("llamacpp", base, None, None).await {
+                assert_eq!(request["model"], "gemma-4-26B-A4B-it");
+                assert_eq!(request["chat_template_kwargs"]["enable_thinking"], enabled);
+                assert_eq!(
+                    request["reasoning_effort"],
+                    if enabled { "medium" } else { "none" }
+                );
+            }
+        }
+    }
 
     #[test]
     fn cache_passthrough_runtime_option_reaches_provider_capability() {
