@@ -14,6 +14,52 @@ pub(crate) struct ResolvedVisionProvider {
     pub(crate) model: String,
 }
 
+/// The provider source a turn was built from, for resolving its vision route.
+///
+/// A turn that holds one asks this source for the configured vision route,
+/// with the turn's principal, instead of building the route from config; a
+/// refusal ends routing. A turn without one (a configless test agent) keeps
+/// the direct factory.
+#[derive(Clone, Copy)]
+pub(crate) struct VisionProviderSource<'a> {
+    pub(crate) source: &'a dyn crate::composition::ProviderSource,
+    pub(crate) agent_alias: &'a str,
+    pub(crate) principal: Option<&'a zeroclaw_api::principal::PrincipalId>,
+}
+
+impl<'a> VisionProviderSource<'a> {
+    /// The vision source for a turn bound to `binding` as `agent_alias`.
+    pub(crate) fn from_binding(
+        binding: &'a crate::composition::BoundCapabilities,
+        agent_alias: &'a str,
+    ) -> Self {
+        Self {
+            source: binding.capabilities.providers.as_ref(),
+            agent_alias,
+            principal: binding.principal.as_ref(),
+        }
+    }
+}
+
+/// The model a configured `<family>.<alias>` entry names, as the alias-aware
+/// vision factory reports it: `None` for a bare family, a colon ref, an alias
+/// with no configured entry, or an entry without a model.
+fn configured_route_model(config: &Config, provider_ref: &str) -> Option<String> {
+    let (family, alias) = provider_ref.split_once('.')?;
+    if family.contains(':') {
+        return None;
+    }
+    config
+        .providers
+        .models
+        .find(family, alias)?
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+}
+
 /// The exact `file_read` read ledger for one image-marker path: the
 /// string-level `is_path_allowed` check first (no filesystem access for a
 /// path it rejects), then the same symlink-aware readability check
@@ -64,6 +110,7 @@ pub(crate) async fn resolve_vision_provider(
     model: &str,
     dispatch_model: &str,
     security: Option<&SecurityPolicy>,
+    vision_source: Option<VisionProviderSource<'_>>,
 ) -> Result<(Option<ResolvedVisionProvider>, bool)> {
     let image_marker_count = multimodal::count_image_markers(history);
     let latest_user_image_marker_count = multimodal::count_latest_user_image_markers(history);
@@ -81,12 +128,42 @@ pub(crate) async fn resolve_vision_provider(
             // for this route would have been ignored. `config` is `None` only on
             // configless (test-builder) agents - every production agent/loop path
             // threads `Some`; that fallback keeps the prior legacy behavior.
-            let (vp_instance, alias_model) = match config {
-                Some(config) => {
+            //
+            // A turn built from a provider source asks that source for the
+            // route, with the turn's principal, so an image cannot move a
+            // supplied-capability turn onto a config-built provider. A refusal
+            // is final: routing does not retry through config.
+            let configured_vision_model = multimodal_config
+                .vision_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty());
+            let (vp_instance, alias_model) = match (vision_source, config) {
+                (Some(vision_source), Some(config)) => {
+                    let alias_model = configured_route_model(config, vp);
+                    let requested_model = configured_vision_model
+                        .map(ToString::to_string)
+                        .or_else(|| alias_model.clone())
+                        .unwrap_or_else(|| model.to_string());
+                    vision_source
+                        .source
+                        .vision_model_provider(&crate::composition::ProviderRequest {
+                            config,
+                            agent_alias: vision_source.agent_alias,
+                            provider_ref: Some(vp),
+                            model: Some(&requested_model),
+                            principal: vision_source.principal,
+                        })
+                        .map(|provider| (Box::new(provider) as Box<dyn ModelProvider>, alias_model))
+                }
+                (Some(_), None) => Err(anyhow::Error::msg(
+                    "a turn built from a provider source has no config to resolve its vision route",
+                )),
+                (None, Some(config)) => {
                     zeroclaw_providers::create_model_provider_from_ref_with_model(config, vp)
                         .map(|resolved| (resolved.provider, resolved.model))
                 }
-                None => zeroclaw_providers::create_model_provider(vp, None)
+                (None, None) => zeroclaw_providers::create_model_provider(vp, None)
                     .map(|provider| (provider, None)),
             }
             .map_err(|error| {
@@ -596,6 +673,7 @@ vision = false
             "primary-model",
             "primary-model",
             None,
+            None,
         )
         .await
         .err()
@@ -673,6 +751,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -743,6 +822,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -806,6 +886,7 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -874,6 +955,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -1074,6 +1156,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -1149,6 +1232,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("markers outside the read boundary must degrade, never fail the turn");
@@ -1174,6 +1258,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("missing files must degrade, never fail the turn");
@@ -1233,6 +1318,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .err()
@@ -1295,6 +1381,7 @@ vision = false
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -1373,6 +1460,7 @@ vision = false
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("a vision-capable primary serves image turns itself");
@@ -1453,6 +1541,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             Some(&security),
+            None,
         )
         .await
         .expect("the configured vision fallback must build");
@@ -1565,6 +1654,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             None,
+            None,
         )
         .await
         .expect("a configured vision-capable alias must build");
@@ -1614,6 +1704,7 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await
@@ -1692,6 +1783,7 @@ model = "vision-model"
             "primary-model",
             "primary-model",
             None,
+            None,
         )
         .await
         .expect("no capability error on a plain degrade");
@@ -1737,6 +1829,7 @@ model = "vision-model"
             "primary",
             "primary-model",
             "primary-model",
+            None,
             None,
         )
         .await

@@ -14,6 +14,9 @@ pub struct CronRunTool {
     /// Owning agent — another agent's job cannot be triggered from here.
     agent_alias: String,
     runtime: Arc<dyn RuntimeAdapter>,
+    /// The owning entry point binds its construction sources here. A bound
+    /// manual child uses them rather than constructing a config-backed set.
+    capabilities: crate::composition::CapabilitySlot,
     execution_capability: Option<AgentExecutionCapability>,
 }
 
@@ -92,8 +95,13 @@ impl CronRunTool {
             security,
             agent_alias: agent_alias.into(),
             runtime,
+            capabilities: Arc::new(std::sync::OnceLock::new()),
             execution_capability,
         }
+    }
+
+    pub(crate) fn capabilities_slot(&self) -> crate::composition::CapabilitySlot {
+        Arc::clone(&self.capabilities)
     }
 
     #[cfg(test)]
@@ -248,16 +256,33 @@ impl Tool for CronRunTool {
             self.agent_alias.clone(),
             lock_token,
         );
-        let result = cron::scheduler::run_manual_job_with_runtime_and_selection(
-            config,
-            &job,
-            cron::scheduler::CronDeliveryContext::ToolManual,
-            &None,
-            self.runtime.as_ref(),
-            approved,
-            selection,
-        )
-        .await;
+        let result = match self.capabilities.get() {
+            Some(bound) => {
+                cron::scheduler::run_manual_job_with_capabilities(
+                    config,
+                    &job,
+                    cron::scheduler::CronDeliveryContext::ToolManual,
+                    &None,
+                    self.runtime.as_ref(),
+                    approved,
+                    &bound.capabilities,
+                    selection,
+                )
+                .await
+            }
+            None => {
+                cron::scheduler::run_manual_job_with_runtime_and_selection(
+                    config,
+                    &job,
+                    cron::scheduler::CronDeliveryContext::ToolManual,
+                    &None,
+                    self.runtime.as_ref(),
+                    approved,
+                    selection,
+                )
+                .await
+            }
+        };
 
         claim.release();
 
@@ -420,6 +445,293 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert!(cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap());
         cron::release_job(&cfg, &job.id).unwrap();
+    }
+
+    fn registered_cron_tools(
+        config: &Arc<Config>,
+        execution_capability: AgentExecutionCapability,
+        capabilities: Option<&crate::composition::RuntimeCapabilities>,
+    ) -> crate::tools::AllToolsResult {
+        use crate::composition::ToolRequest;
+        use zeroclaw_api::memory_traits::Memory;
+
+        let security = test_security(config);
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::from(crate::platform::create_runtime(&config.runtime).unwrap());
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let workspace = config.agent_workspace_dir(TEST_AGENT);
+        let mut built = crate::tools::all_tools_with_runtime_context(
+            config.clone(),
+            &security,
+            &config.risk_profiles[TEST_AGENT],
+            TEST_AGENT,
+            runtime.clone(),
+            memory.clone(),
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &workspace,
+            &config.agents,
+            None,
+            config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(execution_capability),
+            None,
+        )
+        .unwrap();
+        if let Some(capabilities) = capabilities {
+            capabilities
+                .bind_registry(
+                    &mut built,
+                    &ToolRequest {
+                        config,
+                        agent_alias: TEST_AGENT,
+                        security: &security,
+                        runtime: &runtime,
+                        memory: &memory,
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        built
+    }
+
+    fn agent_job_config(tmp: &TempDir, provider_url: &str) -> (Arc<Config>, cron::CronJob) {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig, WireApi};
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        config.scheduler.enabled = true;
+        config.reliability.scheduler_retries = 0;
+        config.reliability.provider_retries = 0;
+        config.providers.models.openai.insert(
+            TEST_AGENT.into(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".into()),
+                    uri: Some(provider_url.into()),
+                    api_key: Some("fixture-key".into()),
+                    wire_api: Some(WireApi::ChatCompletions),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider =
+            format!("openai.{TEST_AGENT}").into();
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            Some("child".into()),
+            cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "say hello",
+            cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec![]),
+            true,
+        )
+        .unwrap();
+        (Arc::new(config), job)
+    }
+
+    /// Match the scheduler's same-binary isolation for process-global state.
+    /// A successful child must report this exact test, not an empty filter.
+    async fn run_cron_test_in_isolated_process(test_name: &str) -> bool {
+        const CHILD_ENV: &str = "ZEROCLAW_CRON_CAPABILITY_TEST_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(test_name) {
+            return false;
+        }
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .arg(test_name)
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, test_name)
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated cron test failed: {test_name}\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("running 1 test") && stdout.contains(test_name),
+            "the child must execute exactly the selected test: {test_name}\n{stdout}\n{stderr}"
+        );
+        true
+    }
+
+    /// Drive the factory's actual registered tool, not a separately built
+    /// CronRunTool. Serving and refusing sources must both keep the child off
+    /// the configured endpoint, and refusal must not escape via the adapter.
+    #[tokio::test]
+    async fn registered_cron_run_keeps_supplied_sources_and_lifecycle() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, STUB_REPLY, StubProvider, capabilities_with_providers,
+            counting_endpoint,
+        };
+        use crate::composition::{ProviderRequest, ProviderSource};
+        use zeroclaw_api::model_provider::ModelProvider;
+
+        struct CronProviders {
+            refuse: bool,
+            lifecycle: crate::live_config_authority::AgentLifecycleCoordinator,
+            seen: parking_lot::Mutex<Vec<(String, usize)>>,
+        }
+
+        impl ProviderSource for CronProviders {
+            fn model_provider(
+                &self,
+                request: &ProviderRequest<'_>,
+            ) -> anyhow::Result<Arc<dyn ModelProvider>> {
+                assert_eq!(
+                    request.principal, None,
+                    "cron retains its internal provenance"
+                );
+                self.seen.lock().push((
+                    request.agent_alias.into(),
+                    self.lifecycle.active_turn_count(request.agent_alias),
+                ));
+                if self.refuse {
+                    anyhow::bail!("the supplied cron source refuses");
+                }
+                Ok(Arc::new(StubProvider))
+            }
+        }
+
+        if run_cron_test_in_isolated_process(
+            "tools::cron_run::tests::registered_cron_run_keeps_supplied_sources_and_lifecycle",
+        )
+        .await
+        {
+            return;
+        }
+        for refuse in [false, true] {
+            let endpoint = counting_endpoint().await;
+            let tmp = TempDir::new().unwrap();
+            let (cfg, job) = agent_job_config(&tmp, &endpoint.url);
+            let authority = crate::LiveConfigAuthority::new((*cfg).clone());
+            let providers = Arc::new(CronProviders {
+                refuse,
+                lifecycle: authority.agent_lifecycle(),
+                seen: parking_lot::Mutex::new(Vec::new()),
+            });
+            let memory = Arc::new(RecordingMemory::default());
+            let capabilities = crate::composition::RuntimeCapabilities {
+                memory: memory.clone(),
+                tools: Arc::new(NoTools),
+                ..capabilities_with_providers(providers.clone())
+            };
+            let built =
+                registered_cron_tools(&cfg, authority.execution_capability(), Some(&capabilities));
+            let tool = built
+                .tools
+                .iter()
+                .find(|tool| tool.name() == "cron_run")
+                .expect("the production factory registers cron_run");
+            let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+            assert_eq!(result.success, !refuse, "{result:?}");
+            if !refuse {
+                assert!(result.output.contains(STUB_REPLY), "{result:?}");
+            }
+            let seen = providers.seen.lock().clone();
+            assert!(
+                !seen.is_empty()
+                    && seen
+                        .iter()
+                        .all(|(alias, active)| alias == TEST_AGENT && *active >= 1),
+                "the child asks the supplied provider under its owner's lease: {seen:?}"
+            );
+            let memory_seen = memory.agents.lock().clone();
+            assert!(
+                !memory_seen.is_empty() && memory_seen.iter().all(|alias| alias == TEST_AGENT),
+                "the child and isolated-failure cleanup use supplied memory: {memory_seen:?}"
+            );
+            assert_eq!(endpoint.connections(), 0, "no configured-provider fallback");
+            assert_eq!(authority.agent_lifecycle().active_turn_count(TEST_AGENT), 0);
+            let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].status, if refuse { "error" } else { "ok" });
+            assert!(
+                cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap()
+            );
+            cron::release_job(&cfg, &job.id).unwrap();
+
+            authority.close_agent_lifecycle();
+            let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+            assert!(!result.success, "a closed generation refuses: {result:?}");
+            assert!(result.output.contains("lifecycle generation is closing"));
+            assert_eq!(providers.seen.lock().len(), seen.len());
+            assert_eq!(memory.agents.lock().len(), memory_seen.len());
+            assert_eq!(endpoint.connections(), 0);
+            assert_eq!(cron::list_runs(&cfg, &job.id, 10).unwrap().len(), 1);
+            assert!(
+                cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap()
+            );
+            cron::release_job(&cfg, &job.id).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unbound_registered_cron_run_keeps_config_backed_agent_adapter() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        if run_cron_test_in_isolated_process(
+            "tools::cron_run::tests::unbound_registered_cron_run_keeps_config_backed_agent_adapter",
+        )
+        .await
+        {
+            return;
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "role": "assistant", "content": "config adapter reply" },
+                    "finish_reason": "stop"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tmp = TempDir::new().unwrap();
+        let (cfg, job) = agent_job_config(&tmp, &format!("{}/v1", server.uri()));
+        let authority = crate::LiveConfigAuthority::new((*cfg).clone());
+        let built = registered_cron_tools(&cfg, authority.execution_capability(), None);
+        let tool = built
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "cron_run")
+            .unwrap();
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(result.success, "{result:?}");
+        assert!(result.output.contains("config adapter reply"), "{result:?}");
+        assert_eq!(authority.agent_lifecycle().active_turn_count(TEST_AGENT), 0);
+        let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap());
+        cron::release_job(&cfg, &job.id).unwrap();
+        server.verify().await;
     }
 
     #[tokio::test]

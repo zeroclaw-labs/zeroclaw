@@ -1,6 +1,6 @@
 # Runtime composition contract (proposal)
 
-**Status:** proposed, not implemented. This page is the composition-API proposal that [#10993](https://github.com/zeroclaw-labs/zeroclaw/issues/10993) asks for before any caller moves. It delivers the first acceptance item of that issue and the design half of [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) R1. The only code that accompanies it is the type skeleton in `crates/zeroclaw-runtime/src/composition.rs`, which nothing consumes yet.
+**Status:** proposed; step 2 implemented. This page is the composition-API proposal that [#10993](https://github.com/zeroclaw-labs/zeroclaw/issues/10993) asks for before any caller moves. It delivers the first acceptance item of that issue and the design half of [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) R1. The contract lives in `crates/zeroclaw-runtime/src/composition.rs`. The runtime entry points listed under step 2 take it through `*_with_capabilities` forms, and their old signatures are adapters over a config-backed set; no caller has moved yet.
 
 The goal is the one RFC [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) set for Phase 2 D1: an agent runtime that an embedder can run with capabilities it supplies, where the runtime "has no knowledge of Telegram, Discord, Anthropic, or any specific tool implementation", and where the binary becomes a thin wiring layer.
 
@@ -95,9 +95,13 @@ pub struct RuntimeCapabilities {
 pub trait ProviderSource: Send + Sync {
     fn model_provider(&self, request: &ProviderRequest<'_>)
         -> anyhow::Result<Arc<dyn ModelProvider>>;
+    // Defaults to `model_provider`.
+    fn switched_model_provider(&self, request: &ProviderRequest<'_>)
+        -> anyhow::Result<Arc<dyn ModelProvider>>;
 }
+#[async_trait]
 pub trait MemorySource: Send + Sync {
-    fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>>;
+    async fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>>;
 }
 pub trait ToolSource: Send + Sync {
     fn tools(&self, request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>>;
@@ -107,7 +111,7 @@ pub trait ChannelSource: Send + Sync {
 }
 ```
 
-`ProviderRequest` carries the config, the agent alias, and an optional explicit provider reference. `MemoryRequest` carries the config and agent alias. `ToolRequest` carries the config, agent alias, resolved `SecurityPolicy`, selected `RuntimeAdapter`, and the agent's memory handle.
+`ProviderRequest` carries the config, the agent alias, an optional explicit provider reference, the model the runtime resolved, and the requesting principal when the entry point knows one (`Option<&PrincipalId>`). The principal is in the request from the start because adding a field to a trait request that embedders implement against is a breaking change later; a source may use it to choose credentials or quotas, and it grants nothing. `ProviderSource::switched_model_provider` serves an agent's mid-session model switch and defaults to `model_provider`; a source overrides it only when a switch resolves credentials or options differently from a session start, as the runtime's config-backed source does to keep the agent's existing switch behavior. `ProviderSource::vision_model_provider` serves the configured `[multimodal]` vision route for an image-bearing turn whose provider lacks vision, and also defaults to `model_provider`; a refusal ends vision routing rather than falling back to config, and the config-backed source overrides it to keep the existing alias-aware vision construction. `MemorySource::memory` is asynchronous because opening a store can touch disk or the network. `MemoryRequest` carries the config and agent alias. `ToolRequest` carries the config, agent alias, resolved `SecurityPolicy`, selected `RuntimeAdapter`, and the agent's memory handle.
 
 The runtime entry point these feed is proposed as follows. It is **not** in the skeleton, because it cannot exist without an implementation:
 
@@ -135,6 +139,22 @@ pub async fn run(runtime: Runtime) -> anyhow::Result<DaemonExit>;
 4. **One store per agent per generation.** Two memory requests for the same agent in one generation must reach the same underlying store. Today's code guarantees this implicitly by constructing from the same config; the contract makes it an obligation of the source.
 5. **The observer is process-level per generation.** It is an instance, not a source, because it is not resolved per agent.
 6. **Outbound only.** `ChannelSource` covers channels the runtime sends through: replies by alias, scheduled delivery, and approval prompts. Inbound turns arrive through `RuntimeIngress`, not through this contract.
+
+Retained sources can receive newer config snapshots during a live model refresh or newly admitted child work. Config-backed sources resolve each request against the supplied snapshot. Hosts must keep retained sources compatible with those snapshots, or rebuild affected sessions and registries when construction wiring changes. A full daemon reload drains old work before replacing its capability set.
+
+### Which principal each caller passes
+
+`ProviderRequest.principal` is the principal the entry point resolved for the turn, and `None` when it has none. It never widens what a turn may do; a source may use it only to choose credentials or quotas. As callers move onto the contract, each passes:
+
+| Caller | Principal |
+| --- | --- |
+| CLI `agent` (interactive and one-shot) | `None`, as today |
+| RPC sessions (`session/new`, rehydration, model changes) | The connection's resolved principal |
+| Cron agent jobs | `None`: a job records no owning principal today. When job ownership lands, the job's owner |
+| SOP drivers and the heartbeat worker | `None`: they run as the daemon, not for a caller |
+| Channels orchestrator | `None` until inbound principal resolution supplies one through `RuntimeIngress` |
+
+With config-backed sources, a `None` principal constructs and switches exactly as the compatibility adapters do, which is what makes each move a no-op for existing configurations.
 
 ### Security policy stays with the runtime
 
@@ -182,7 +202,7 @@ Every step keeps existing configuration and effective permissions. Old entry poi
 | --- | --- | --- |
 | 0 | This proposal and the skeleton. No callers. | Review of the API boundary |
 | 1 | `DefaultCapabilities::from_config`: sources that wrap today's `create_*` functions unchanged | Parity tests for provider, memory, and tool-set resolution per agent |
-| 2 | Runtime entry points gain `*_with_capabilities` forms: `agent::loop_::run`, `process_message_shared`, `Agent::from_config*`, `assemble_owned_execution`. Old signatures delegate through `DefaultCapabilities` | Existing agent tests pass unchanged; policy-propagation regression tests |
+| 2 | Runtime entry points gain `*_with_capabilities` forms: `agent::loop_::run`, `process_message_shared`, `Agent::from_config*`, `assemble_owned_execution`, the delegate tool's target construction, and cron agent jobs. Old signatures delegate through a config-backed set that reproduces today's construction | Existing agent tests pass unchanged; policy-propagation regression tests; a stub `ProviderSource` receives the principal |
 | 3 | `src/main.rs` builds `DefaultCapabilities` once and calls the new forms for `agent` and `daemon` | Startup, cancellation, and shutdown regression coverage for CLI and daemon |
 | 4 | The channels starter, cron scheduler, SOP drivers, and `RpcContext` receive the generation's `RuntimeCapabilities`. The gateway starter is deleted at the v0.9.0 cut and receives no capabilities; its own construction disappears as its routes move to RPC | Parity for each migrated starter; no `create_*` calls left in the migrated starters. The gateway is not migrated in place: the check that it cannot re-couple is the dependency ratchet in step 7, not a rule |
 | 5 | Channels orchestrator's per-sender provider cache becomes a `ProviderSource` implementation; ACP moves to the new forms. Sequenced with #11012 | No `create_*` calls left in `zeroclaw-channels` |
@@ -195,7 +215,7 @@ Every step keeps existing configuration and effective permissions. Old entry poi
 The issue asks for any retained dependency to be explained rather than hidden behind an unused feature. The expected end state is:
 
 - **`zeroclaw-tools`: retained through v0.9.0, as an explained edge.** Tier-1 core tools are split across the two crates today (`shell` and `file_read` in the runtime; `file_write`, `file_edit`, `glob_search`, `content_search`, the memory tools, `git_operations`, and `web_fetch` in `zeroclaw-tools`), and tier-2 tools need runtime internals (the scheduler, canvas store, ask-user handle, SOP engine, session backend, and live config) that `ToolRequest` does not carry. Moving either behind an application `ToolSource` would leak those internals into a public contract. So step 7 moves only tier 3, and the ratchet names this edge. Dropping the dependency is v1.0.0 work.
-- **`zeroclaw-providers` and `zeroclaw-memory`: expected to remain for now**, for reasons outside turn composition: `doctor`, `quickstart`, `migration`, and vision routing construct providers or memory directly and are still hosted in this crate. Each is a separate extraction candidate under the holding-crate plan. Step 7's ratchet should allow exactly these edges and name them, so a new use fails the check.
+- **`zeroclaw-providers` and `zeroclaw-memory`: expected to remain for now**, for reasons outside turn composition: `doctor`, `quickstart` and `migration` construct providers or memory directly and are still hosted in this crate, and the config-backed sources build through these crates. Vision routing is inside turn composition: an image-bearing turn asks its provider source for the configured vision route (`ProviderSource::vision_model_provider`, with the turn's principal), and only the config-backed source builds that route from config. Each is a separate extraction candidate under the holding-crate plan. Step 7's ratchet should allow exactly these edges and name them, so a new use fails the check.
 
 ## Acceptance mapping
 
@@ -212,4 +232,4 @@ The issue asks for any retained dependency to be explained rather than hidden be
 These were open when this page was first proposed. The v0.9.0 architecture review settled both.
 
 1. **`run_turn` versus waiting for `RuntimeIngress`.** `run_turn` ships and stays minimal, as a client of the same session actor that `session/prompt` uses. It does not wait for #11012.
-2. **Whether `ProviderSource` receives the requesting principal.** Yes, from the first implementation slice: `ProviderRequest` gains `principal: Option<&PrincipalId>` when the capability-taking constructors land. Adding a field to an embedder-implemented request type later would be a breaking change. The skeleton on this page does not carry the field yet.
+2. **Whether `ProviderSource` receives the requesting principal.** Yes, from the first implementation slice: `ProviderRequest` gains `principal: Option<&PrincipalId>` when the capability-taking constructors land. Adding a field to an embedder-implemented request type later would be a breaking change. The capability-taking constructors carry it.
