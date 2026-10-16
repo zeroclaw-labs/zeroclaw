@@ -83,7 +83,7 @@ fn resolve_audio_format(file_name: &str) -> Result<(String, &'static str)> {
             "transcription: unsupported audio format"
         );
         // The same bytes fail this check deterministically: payload-specific,
-        // terminal, safe to acknowledge upstream (#10863).
+        // terminal, safe to acknowledge upstream.
         anyhow::Error::from(TranscriptionError::permanent(format!(
             "Unsupported audio format '.{extension}'. \
              accepted: flac, mp3, mp4, mpeg, mpga, m4a, ogg, opus, wav, webm"
@@ -112,8 +112,8 @@ fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'stati
 ///
 /// Channels that acknowledge vendor updates (Telegram long polling) must not
 /// retry a rejection that is terminal for this audio: the update pins the
-/// acknowledgement offset and head-of-line blocks every later message
-/// (#10863). Classification is deliberately conservative - the same rule the
+/// acknowledgement offset and head-of-line blocks every later message.
+/// Classification is deliberately conservative - the same rule the
 /// Telegram `getFile` classifier follows: only a substantiated,
 /// payload-specific terminal rejection is `Permanent`. Credential,
 /// configuration, rate-limit, and service-availability failures stay
@@ -182,7 +182,8 @@ impl std::error::Error for TranscriptionError {}
 /// be rejected again no matter how often they are resent. A blanket 4xx rule
 /// would also swallow credential (401/403), rate-limit (409/425/429), and
 /// ambiguous 400/404/422 responses that may resolve once the operator fixes
-/// the deployment - exactly the distinction #10863 requires. Everything
+/// the deployment - exactly the distinction the acknowledgement contract
+/// requires. Everything
 /// unrecognised stays transient and is retried instead.
 #[cfg(any(feature = "channel-telegram", test))]
 fn classify_transcription_http_status(status: reqwest::StatusCode) -> TranscriptionFailure {
@@ -3136,7 +3137,7 @@ mod channel_builder_tests {
         );
     }
 
-    // ── Failure classification (#10863) ─────────────────────────
+    // ── Failure classification ────────────────────────────────────
 
     #[test]
     fn http_status_classification_is_terminal_only_for_payload_specific_rejections() {
@@ -3150,8 +3151,8 @@ mod channel_builder_tests {
         // Everything else stays retryable: credential (401/403), rate-limit
         // (408/409/425/429), ambiguous 4xx, and every 5xx can resolve once
         // the deployment or the service recovers. A blanket 4xx rule would
-        // discard those messages permanently - the distinction #10863
-        // requires.
+        // discard those messages permanently - the distinction this
+        // classification exists to keep.
         for code in [
             400_u16, 401, 403, 404, 408, 409, 422, 425, 429, 451, 500, 502, 503,
         ] {

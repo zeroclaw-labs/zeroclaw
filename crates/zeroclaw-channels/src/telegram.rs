@@ -1296,7 +1296,7 @@ pub(crate) enum VoiceDropReason {
     EmptyTranscript,
     /// The transcription endpoint terminally rejected *this* recording
     /// (over its size/duration limit, or an unsupported format). Retrying
-    /// the same bytes would pin the offset forever (#10863), so the update
+    /// the same bytes would pin the offset forever, so the update
     /// is acknowledged and the sender is told.
     TranscriptionRejected,
 }
@@ -5800,7 +5800,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     "Voice transcription failed"
                 );
                 // A terminal rejection of *this* recording must not hold the
-                // offset (#10863): retrying the same bytes can never succeed,
+                // offset: retrying the same bytes can never succeed,
                 // and a permanently pinned update head-of-line blocks every
                 // later message for the whole bot. Tell the sender and move
                 // on - the same contract as the duration and file-lookup
@@ -7403,7 +7403,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// - yet a persistently failing endpoint (an ASR service returning 500
     ///   for one corrupted file, a download that never completes) would
     ///   otherwise pin the offset indefinitely and head-of-line block every
-    ///   later update for the whole bot (#10863). Ten attempts bound the
+    ///   later update for the whole bot. Ten attempts bound the
     ///   damage: fast-failing endpoints stall the batch for ~30 seconds, and
     ///   slow ones for at most ten attempt durations. Giving up is loud - an
     ///   ERROR with the update id and attempt count - because acknowledging a
@@ -7513,8 +7513,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // An update that already burned through its transient budget is
         // acknowledged without another attempt: spending one more
         // download/transcription round on it would defeat the bound, and the
-        // ERROR below is the explicit record that the message is lost
-        // (#10863).
+        // ERROR below is the explicit record that the message is lost.
         if Self::transient_retry_exhausted(uid, transient_retry) {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -20755,7 +20754,7 @@ mod tests {
         handle.abort();
     }
 
-    /// #10863 acceptance case 1: a voice update the transcription endpoint
+    /// Acceptance case 1: a voice update the transcription endpoint
     /// terminally rejects (413 - the reported production shape) must be
     /// acknowledged with a sender notice, so a later update behind it in the
     /// ordered batch is still delivered.
@@ -20846,7 +20845,7 @@ mod tests {
         handle.abort();
     }
 
-    /// #10863 acceptance case 2: a recoverable transcription failure (500)
+    /// Acceptance case 2: a recoverable transcription failure (500)
     /// must be retried at the same offset, and the voice message delivered
     /// once the endpoint recovers - the retry path itself is preserved.
     #[tokio::test]
@@ -20934,7 +20933,7 @@ mod tests {
 
     /// An update that already exhausted its transient budget is acknowledged
     /// without another parse attempt, so a persistently failing endpoint can
-    /// no longer pin the offset forever (#10863). The budget gate sits ahead
+    /// no longer pin the offset forever. The budget gate sits ahead
     /// of parsing: this update costs no I/O at all.
     #[tokio::test]
     async fn process_update_acknowledges_update_after_transient_budget_exhausted() {
