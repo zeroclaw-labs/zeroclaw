@@ -1200,6 +1200,19 @@ fn ensure_open_skills_repo(
     Some(repo_dir)
 }
 
+/// `git` for the open-skills clone and pull. The sync runs inside the daemon
+/// and channel turns, where nobody can answer a prompt. `output()` already
+/// closes stdin, but git asks for credentials on the controlling terminal, so
+/// without `GIT_TERMINAL_PROMPT=0` a remote that wants them (a deleted or
+/// private repository answers that way over HTTPS) prints
+/// `Username for 'https://github.com':` and waits. With it, git fails at once
+/// and the local copy keeps being used.
+fn open_skills_git_command() -> Command {
+    let mut command = Command::new("git");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
 fn clone_open_skills_repo(repo_dir: &Path) -> bool {
     if let Some(parent) = repo_dir.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
@@ -1216,7 +1229,7 @@ fn clone_open_skills_repo(repo_dir: &Path) -> bool {
         return false;
     }
 
-    let output = Command::new("git")
+    let output = open_skills_git_command()
         .args(["clone", "--depth", "1", OPEN_SKILLS_REPO_URL])
         .arg(repo_dir)
         .output();
@@ -1263,7 +1276,7 @@ fn pull_open_skills_repo(repo_dir: &Path) -> bool {
         return true;
     }
 
-    let output = Command::new("git")
+    let output = open_skills_git_command()
         .arg("-C")
         .arg(repo_dir)
         .args(["pull", "--ff-only"])
@@ -4818,6 +4831,18 @@ description = "fine"
             "no drops expected with allow_scripts=true; got: {dropped:?}"
         );
     }
+    #[test]
+    fn open_skills_git_never_prompts_for_credentials() {
+        let command = open_skills_git_command();
+        assert_eq!(command.get_program(), "git");
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "GIT_TERMINAL_PROMPT" && value == Some("0".as_ref())),
+            "the open-skills sync must not let git ask for credentials on the terminal"
+        );
+    }
+
     #[test]
     fn open_skills_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
