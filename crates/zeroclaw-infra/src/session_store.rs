@@ -341,6 +341,10 @@ impl SessionStore {
     /// the same key.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
+        self.delete_session_unlocked(session_key)
+    }
+
+    fn delete_session_unlocked(&self, session_key: &str) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
         let crumb_path = self.trim_breadcrumb_path(session_key);
         if !is_regular_jsonl_session_file(&path) {
@@ -483,6 +487,27 @@ impl SessionBackend for SessionStore {
         self.append(session_key, message)
     }
 
+    fn append_authorized(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+        committed: &mut dyn FnMut(),
+    ) -> std::io::Result<usize> {
+        let _guard = self.mutation_guard()?;
+        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Session not found",
+            ));
+        }
+        let _authority = authorize(None)?;
+        let count = self.try_load(session_key)?.len() + 1;
+        self.append_unlocked(session_key, message)?;
+        committed();
+        Ok(count)
+    }
+
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         self.remove_last(session_key)
     }
@@ -578,6 +603,29 @@ impl SessionBackend for SessionStore {
         self.clear_messages(session_key)
     }
 
+    fn with_session_owner(
+        &self,
+        _session_key: &str,
+        effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let _guard = self.mutation_guard()?;
+        effect(None)
+    }
+
+    fn delete_session_authorized(
+        &self,
+        session_key: &str,
+        expected_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        let _guard = self.mutation_guard()?;
+        let _authority = authorize(None)?;
+        if expected_owner.is_some() {
+            return Ok(false);
+        }
+        self.delete_session_unlocked(session_key)
+    }
+
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         self.delete_session(session_key)
     }
@@ -591,6 +639,101 @@ impl SessionBackend for SessionStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guarded_jsonl_append_requires_existing_authorized_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        store.append("s", &ChatMessage::user("before")).unwrap();
+        let called = std::cell::Cell::new(false);
+        let denied = backend.append_authorized(
+            "s",
+            &ChatMessage::assistant("denied"),
+            &|owner| {
+                assert_eq!(owner, None);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "revoked",
+                ))
+            },
+            &mut || called.set(true),
+        );
+        assert_eq!(
+            denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!called.get());
+        assert_eq!(store.load("s").len(), 1);
+        let count = backend
+            .append_authorized(
+                "s",
+                &ChatMessage::assistant("allowed"),
+                &|owner| {
+                    assert_eq!(owner, None);
+                    Ok(Box::new(()))
+                },
+                &mut || called.set(true),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(called.get());
+        assert_eq!(store.load("s").len(), 2);
+        backend.delete_session("s").unwrap();
+        assert_eq!(
+            backend
+                .append_authorized(
+                    "s",
+                    &ChatMessage::assistant("recreated"),
+                    &|_| panic!("missing row cannot be authorized"),
+                    &mut || panic!("missing row cannot publish effects"),
+                )
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!backend.session_exists("s"));
+    }
+
+    #[test]
+    fn no_state_backend_admits_locked_live_owner_without_persisting_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        // Named admin creators may keep a live owner even though JSONL cannot
+        // persist attribution; scoped creation already refuses this backend.
+        assert!(backend.set_session_principal("s", "user:alice").is_err());
+        let calls = std::cell::Cell::new(0);
+        backend
+            .set_session_state_authorized(
+                "s",
+                "running",
+                Some("turn"),
+                Some("user:alice"),
+                &|owner| {
+                    assert_eq!(owner, Some("user:alice"));
+                    calls.set(calls.get() + 1);
+                    Ok(Box::new(()))
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(backend.get_session_state("s").unwrap().is_none());
+        assert!(
+            backend
+                .set_session_state_authorized(
+                    "s",
+                    "running",
+                    Some("turn"),
+                    Some("user:alice"),
+                    &|_| Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "revoked"
+                    ))
+                )
+                .is_err()
+        );
+    }
+
     use super::*;
     use std::path::Path;
     use std::sync::{Arc, mpsc};
