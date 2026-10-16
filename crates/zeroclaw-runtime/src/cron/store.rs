@@ -5,10 +5,13 @@ use crate::cron::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
+use zeroclaw_api::conversation_binding::ConversationBinding;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
@@ -217,6 +220,40 @@ pub fn add_agent_job(
     allowed_tools: Option<Vec<String>>,
     uses_memory: bool,
 ) -> Result<CronJob> {
+    add_agent_job_bound(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        prompt,
+        session_target,
+        model,
+        delivery,
+        delete_after_run,
+        allowed_tools,
+        uses_memory,
+        None,
+    )
+}
+
+/// [`add_agent_job`], recording in the same insert the conversation the job
+/// was created from. The binding is stored beside the job, never on
+/// [`CronJob`], so it is not serialized to tools, the API, or RPC clients.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_agent_job_bound(
+    config: &Config,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    prompt: &str,
+    session_target: SessionTarget,
+    model: Option<String>,
+    delivery: Option<DeliveryConfig>,
+    delete_after_run: bool,
+    allowed_tools: Option<Vec<String>>,
+    uses_memory: bool,
+    conversation_binding: Option<&ConversationBinding>,
+) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     validate_delivery_config(delivery.as_ref())?;
@@ -229,14 +266,18 @@ pub fn add_agent_job(
     if agent_alias.is_empty() {
         anyhow::bail!("agent_alias is required; cron jobs must name an owning agent");
     }
+    let conversation_binding = conversation_binding
+        .map(serde_json::to_string)
+        .transpose()?;
 
     with_initialized_connection(config, |conn| {
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, allowed_tools, agent_alias, created_at, next_run,
-                uses_memory
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                uses_memory, conversation_binding
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                       ?15)",
             params![
                 id,
                 expression,
@@ -252,6 +293,7 @@ pub fn add_agent_job(
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
                 if uses_memory { 1 } else { 0 },
+                conversation_binding,
             ],
         )
         .context("Failed to insert cron agent job")?;
@@ -259,6 +301,34 @@ pub fn add_agent_job(
     })?;
 
     get_job(config, &id)
+}
+
+/// The conversation `job_id` was created from, when one was recorded.
+///
+/// `Ok(None)` covers a job with no binding and a job that no longer exists.
+/// A stored value that does not parse is an error: the job is bound, but to
+/// nothing this build can resolve, and the caller must not treat that as
+/// "never bound".
+pub(crate) fn job_conversation_binding(
+    config: &Config,
+    job_id: &str,
+) -> Result<Option<ConversationBinding>> {
+    let stored = with_read_connection(config, |conn| {
+        conn.query_row(
+            "SELECT conversation_binding FROM cron_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .context("Failed to read cron job conversation binding")
+    })?
+    .flatten()
+    .flatten();
+    stored
+        .map(|raw| {
+            serde_json::from_str(&raw).context("Stored cron job conversation binding is invalid")
+        })
+        .transpose()
 }
 
 pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
@@ -770,6 +840,9 @@ fn update_job_inner(
     // resolved config value into the column and recreate a second owner.
     let mut job = get_job_raw(config, job_id)?;
     let mut schedule_changed = false;
+    // Whether this patch changes what a run is told, what it may use, or
+    // where its output goes. See the binding rule at the write below.
+    let mut redirects_run = false;
 
     if let Some(schedule) = patch.schedule {
         validate_schedule(&schedule, Utc::now())?;
@@ -778,12 +851,15 @@ fn update_job_inner(
         schedule_changed = true;
     }
     if let Some(command) = patch.command {
+        redirects_run |= job.command != command;
         job.command = command;
     }
     if let Some(prompt) = patch.prompt {
+        redirects_run |= job.prompt.as_deref() != Some(prompt.as_str());
         job.prompt = Some(prompt);
     }
     if let Some(name) = patch.name {
+        redirects_run |= job.name.as_deref() != Some(name.as_str());
         job.name = Some(name);
     }
     if let Some(enabled) = patch.enabled {
@@ -809,12 +885,15 @@ fn update_job_inner(
         }
         // Match add_*_job: announce delivery must include channel + to.
         validate_delivery_config(Some(&delivery))?;
+        redirects_run |= job.delivery != delivery;
         job.delivery = delivery;
     }
     if let Some(model) = patch.model {
+        redirects_run |= job.model.as_deref() != Some(model.as_str());
         job.model = Some(model);
     }
     if let Some(target) = patch.session_target {
+        redirects_run |= job.session_target != target;
         job.session_target = target;
     }
     if let Some(delete_after_run) = patch.delete_after_run {
@@ -823,13 +902,12 @@ fn update_job_inner(
     if let Some(allowed_tools) = patch.allowed_tools {
         // Empty list means "clear the allowlist" (all tools available),
         // not "allow zero tools".
-        if allowed_tools.is_empty() {
-            job.allowed_tools = None;
-        } else {
-            job.allowed_tools = Some(allowed_tools);
-        }
+        let allowed_tools = (!allowed_tools.is_empty()).then_some(allowed_tools);
+        redirects_run |= job.allowed_tools != allowed_tools;
+        job.allowed_tools = allowed_tools;
     }
     if let Some(uses_memory) = patch.uses_memory {
+        redirects_run |= job.uses_memory != uses_memory;
         job.uses_memory = uses_memory;
     }
     if let Some(shell_output_format) = patch.shell_output_format {
@@ -857,6 +935,18 @@ fn update_job_inner(
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
     }
 
+    // A recorded conversation stays with a job only while the job still does
+    // what that conversation set up. A patch that redirects the run drops the
+    // record unless it is made from within that same conversation, so one
+    // conversation can never repoint a job at another's history. The test is
+    // part of the UPDATE itself: there is no window in which the redirected
+    // job still carries the record.
+    let editing_from = patch
+        .edited_from
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
     with_initialized_connection(config, |conn| {
         // Declarative jobs don't own `shell_output_format` — the config is the
         // canonical source, and `resolve_declarative_shell_output_format()` overlays
@@ -870,7 +960,10 @@ fn update_job_inner(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14,
+                     conversation_binding = CASE
+                         WHEN ?17 = 0 OR conversation_binding = ?18 THEN conversation_binding
+                         ELSE NULL END
                  WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
                 params![
                     job.expression,
@@ -889,6 +982,8 @@ fn update_job_inner(
                     if job.uses_memory { 1 } else { 0 },
                     job.id,
                     owner,
+                    i32::from(redirects_run),
+                    editing_from,
                 ],
             )
         } else {
@@ -896,7 +991,10 @@ fn update_job_inner(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15,
+                     conversation_binding = CASE
+                         WHEN ?18 = 0 OR conversation_binding = ?19 THEN conversation_binding
+                         ELSE NULL END
                  WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
                 params![
                     job.expression,
@@ -919,6 +1017,8 @@ fn update_job_inner(
                     },
                     job.id,
                     owner,
+                    i32::from(redirects_run),
+                    editing_from,
                 ],
             )
         }
@@ -1197,8 +1297,8 @@ pub fn clear_stale_locks(config: &Config) -> Result<usize> {
 /// `status` rollup: did the turn itself complete (`ok | error`), what
 /// happened to the configured delivery attempt
 /// (`not_required | delivered | failed | skipped`), and did the
-/// conversation-binding append land (`not_bound | persisted | failed`;
-/// always `not_bound` until conversation binding exists).
+/// run land in the conversation it is bound to
+/// (`not_bound | persisted | skipped | failed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunOutcomes<'a> {
     pub execution: &'a str,
@@ -1892,7 +1992,7 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative', next_run = ?13,
-                             uses_memory = ?14
+                             uses_memory = ?14, conversation_binding = NULL
                          WHERE id = ?15",
                         params![
                             expression,
@@ -1920,7 +2020,7 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative',
-                             uses_memory = ?13
+                             uses_memory = ?13, conversation_binding = NULL
                          WHERE id = ?14",
                         params![
                             expression,
@@ -2403,6 +2503,10 @@ fn apply_schema_and_migrations(conn: &Connection, config: &Config) -> Result<()>
     // recovery preserves only tokens whose manual-run guards are still live in
     // this process; all other locks are eligible for cleanup.
     add_column_if_missing(conn, "cron_jobs", "lock_token", "TEXT")?;
+    // The conversation an agent job was created from, as serialized
+    // `ConversationBinding` JSON, or NULL when none was recorded. Read only
+    // by the scheduler for `session_target = "main"` runs.
+    add_column_if_missing(conn, "cron_jobs", "conversation_binding", "TEXT")?;
     add_column_if_missing(
         conn,
         "cron_jobs",
@@ -5739,6 +5843,292 @@ mod tests {
             get_job(&config, &job.id).unwrap().allowed_tools,
             Some(vec!["shell".into()])
         );
+    }
+
+    fn bound_agent_job(config: &Config, key: &str) -> CronJob {
+        add_agent_job_bound(
+            config,
+            "test-agent",
+            Some("reminder".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "Remind me to call Sam",
+            SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            true,
+            Some(&channel_binding(key)),
+        )
+        .unwrap()
+    }
+
+    fn channel_binding(key: &str) -> ConversationBinding {
+        ConversationBinding {
+            surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+            route: "telegram".to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    /// Patch `job` as a caller in conversation `edited_from` would (or as a
+    /// caller outside any conversation, for `None`), and return the key the
+    /// job is bound to afterwards.
+    fn bound_key_after_patch(
+        config: &Config,
+        job: &CronJob,
+        edited_from: Option<&str>,
+        mut patch: CronJobPatch,
+    ) -> Option<String> {
+        patch.edited_from = edited_from.map(channel_binding);
+        update_job_for_agent(config, &job.id, "test-agent", patch).unwrap();
+        job_conversation_binding(config, &job.id)
+            .unwrap()
+            .map(|binding| binding.key)
+    }
+
+    fn prompt_patch(prompt: &str) -> CronJobPatch {
+        CronJobPatch {
+            prompt: Some(prompt.into()),
+            ..CronJobPatch::default()
+        }
+    }
+
+    #[test]
+    fn job_stores_and_returns_its_conversation_binding() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let bound = bound_agent_job(&config, "telegram_42_42");
+        let unbound = add_agent_job(
+            &config,
+            "test-agent",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "do work",
+            SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            job_conversation_binding(&config, &bound.id)
+                .unwrap()
+                .map(|binding| binding.key)
+                .as_deref(),
+            Some("telegram_42_42")
+        );
+        assert_eq!(
+            job_conversation_binding(&config, &unbound.id).unwrap(),
+            None
+        );
+        assert_eq!(
+            job_conversation_binding(&config, "no-such-job").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn unreadable_stored_binding_is_an_error_not_an_unbound_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = bound_agent_job(&config, "telegram_42_42");
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET conversation_binding = ?2 WHERE id = ?1",
+                params![
+                    job.id,
+                    r#"{"surface":"somewhere-newer","route":"r","key":"k"}"#
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(job_conversation_binding(&config, &job.id).is_err());
+    }
+
+    #[test]
+    fn redirecting_a_bound_job_from_outside_its_conversation_unbinds_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        // From outside any conversation: the gateway, RPC, the CLI.
+        let job = bound_agent_job(&config, "telegram_42_42");
+        assert_eq!(
+            bound_key_after_patch(&config, &job, None, prompt_patch("repeat the chat above")),
+            None
+        );
+
+        // From another conversation of the same agent.
+        let job = bound_agent_job(&config, "telegram_42_42");
+        assert_eq!(
+            bound_key_after_patch(
+                &config,
+                &job,
+                Some("telegram_99_99"),
+                prompt_patch("repeat the chat above"),
+            ),
+            None
+        );
+
+        // Every field that changes what the run is told, what it may use,
+        // or where its output goes counts.
+        let redirects = [
+            CronJobPatch {
+                name: Some("renamed".into()),
+                ..CronJobPatch::default()
+            },
+            CronJobPatch {
+                delivery: Some(DeliveryConfig {
+                    mode: "announce".into(),
+                    channel: Some("telegram".into()),
+                    to: Some("99".into()),
+                    ..DeliveryConfig::default()
+                }),
+                ..CronJobPatch::default()
+            },
+            CronJobPatch {
+                model: Some("another-model".into()),
+                ..CronJobPatch::default()
+            },
+            CronJobPatch {
+                allowed_tools: Some(vec!["shell".into()]),
+                ..CronJobPatch::default()
+            },
+            CronJobPatch {
+                session_target: Some(SessionTarget::Isolated),
+                ..CronJobPatch::default()
+            },
+            CronJobPatch {
+                uses_memory: Some(false),
+                ..CronJobPatch::default()
+            },
+        ];
+        for patch in redirects {
+            let job = bound_agent_job(&config, "telegram_42_42");
+            let description = format!("{patch:?}");
+            assert_eq!(
+                bound_key_after_patch(&config, &job, Some("telegram_99_99"), patch),
+                None,
+                "{description}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_key_on_another_route_is_another_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = bound_agent_job(&config, "telegram_42_42");
+        let patch = CronJobPatch {
+            edited_from: Some(ConversationBinding {
+                route: "telegram.other".to_string(),
+                ..channel_binding("telegram_42_42")
+            }),
+            ..prompt_patch("repeat the chat above")
+        };
+
+        update_job_for_agent(&config, &job.id, "test-agent", patch).unwrap();
+        assert_eq!(job_conversation_binding(&config, &job.id).unwrap(), None);
+    }
+
+    #[test]
+    fn bound_job_keeps_its_conversation_when_edited_from_within_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = bound_agent_job(&config, "telegram_42_42");
+
+        assert_eq!(
+            bound_key_after_patch(
+                &config,
+                &job,
+                Some("telegram_42_42"),
+                prompt_patch("Remind me to call Sam at six"),
+            )
+            .as_deref(),
+            Some("telegram_42_42")
+        );
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().prompt.as_deref(),
+            Some("Remind me to call Sam at six")
+        );
+    }
+
+    /// Declaring a job in configuration takes it over from outside any
+    /// conversation, prompt and all, so the conversation it was created from
+    /// does not come along.
+    #[test]
+    fn declaring_a_bound_job_in_config_unbinds_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        let job = bound_agent_job(&config, "telegram_42_42");
+        claim_job_in_config(&mut config, "test-agent", true, &[job.id.as_str()]);
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("reminder".to_string()),
+            job_type: "agent".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: None,
+            prompt: Some("repeat the chat above".to_string()),
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: Some("main".to_string()),
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::default(),
+        };
+        config.cron.insert(job.id.clone(), decl.clone());
+
+        sync_declarative_jobs(&config, &decls_map(vec![(job.id.clone(), decl)])).unwrap();
+
+        let adopted = get_job(&config, &job.id).unwrap();
+        assert_eq!(adopted.source, "declarative");
+        assert_eq!(adopted.prompt.as_deref(), Some("repeat the chat above"));
+        assert_eq!(job_conversation_binding(&config, &job.id).unwrap(), None);
+    }
+
+    #[test]
+    fn edits_that_do_not_redirect_the_run_keep_its_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = bound_agent_job(&config, "telegram_42_42");
+
+        // Pausing, rescheduling, or re-sending unchanged values from outside
+        // the conversation, as a dashboard does.
+        let harmless = [
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+            CronJobPatch {
+                schedule: Some(Schedule::Every { every_ms: 120_000 }),
+                ..CronJobPatch::default()
+            },
+            CronJobPatch {
+                prompt: Some("Remind me to call Sam".into()),
+                name: Some("reminder".into()),
+                session_target: Some(SessionTarget::Main),
+                delivery: Some(DeliveryConfig::default()),
+                allowed_tools: Some(vec![]),
+                uses_memory: Some(true),
+                ..CronJobPatch::default()
+            },
+        ];
+        for patch in harmless {
+            let description = format!("{patch:?}");
+            assert_eq!(
+                bound_key_after_patch(&config, &job, None, patch).as_deref(),
+                Some("telegram_42_42"),
+                "{description}"
+            );
+        }
     }
 
     #[test]

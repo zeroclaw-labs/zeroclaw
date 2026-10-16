@@ -102,6 +102,27 @@ pub trait SessionBackend: Send + Sync {
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
 
+    /// Append `messages` as one exchange that is meant to land whole or not
+    /// at all. The default appends one by one and, when one fails, takes the
+    /// ones already written back with `remove_last`; it is best effort, and a
+    /// backend whose own write can fail after changing the store should
+    /// override this with a transaction. On `Err` the caller must not assume
+    /// what the store holds: it reads the transcript back (`try_load`) to
+    /// find out.
+    fn append_exchange(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let mut written = 0;
+        for message in messages {
+            if let Err(error) = self.append(session_key, message) {
+                while written > 0 && matches!(self.remove_last(session_key), Ok(true)) {
+                    written -= 1;
+                }
+                return Err(error);
+            }
+            written += 1;
+        }
+        Ok(())
+    }
+
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 
@@ -411,6 +432,45 @@ pub struct SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default exchange append is best effort: when a message fails
+    /// after earlier ones were written, those are taken back, so the store
+    /// ends as it started.
+    #[test]
+    fn default_append_exchange_takes_back_what_a_failure_leaves_behind() {
+        struct SecondAppendFails {
+            messages: std::sync::Mutex<Vec<ChatMessage>>,
+        }
+        impl SessionBackend for SecondAppendFails {
+            fn load(&self, _key: &str) -> Vec<ChatMessage> {
+                self.messages.lock().unwrap().clone()
+            }
+            fn append(&self, _key: &str, message: &ChatMessage) -> std::io::Result<()> {
+                let mut messages = self.messages.lock().unwrap();
+                if messages.len() == 1 {
+                    return Err(std::io::Error::other("simulated write failure"));
+                }
+                messages.push(message.clone());
+                Ok(())
+            }
+            fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+                Ok(self.messages.lock().unwrap().pop().is_some())
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+        }
+
+        let backend = SecondAppendFails {
+            messages: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = backend.append_exchange(
+            "s1",
+            &[ChatMessage::user("first"), ChatMessage::assistant("second")],
+        );
+        assert!(result.is_err());
+        assert!(backend.load("s1").is_empty());
+    }
 
     #[test]
     fn session_metadata_is_constructible() {

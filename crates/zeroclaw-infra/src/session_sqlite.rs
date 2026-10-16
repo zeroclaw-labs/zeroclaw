@@ -896,9 +896,39 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let conn = self.conn.lock();
+        self.append_exchange(session_key, std::slice::from_ref(message))
+    }
+
+    /// The row inserts and the metadata update land in one transaction, so a
+    /// failure part-way changes nothing: an error after the first insert no
+    /// longer leaves a message the metadata does not count, or half of an
+    /// exchange, behind.
+    fn append_exchange(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
-        Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        for message in messages {
+            Self::append_on(&tx, session_key, message, &now).map_err(std::io::Error::other)?;
+        }
+        tx.commit().map_err(std::io::Error::other)
+    }
+
+    /// Strict read: a query that fails is an error, never an empty transcript.
+    fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .map_err(std::io::Error::other)?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
     }
 
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
@@ -968,9 +998,10 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
 
-        let last_id: Option<i64> = conn
+        let last_id: Option<i64> = tx
             .query_row(
                 "SELECT id FROM sessions WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
                 params![session_key],
@@ -982,16 +1013,16 @@ impl SessionBackend for SqliteSessionBackend {
             return Ok(false);
         };
 
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
+        // The delete and the count update commit together or not at all.
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])
             .map_err(std::io::Error::other)?;
-
-        // Update metadata count
-        conn.execute(
+        tx.execute(
             "UPDATE session_metadata SET message_count = MAX(0, message_count - 1)
              WHERE session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
 
         Ok(true)
     }
@@ -1665,6 +1696,73 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn append_exchange_lands_whole_with_one_metadata_update() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+
+        backend
+            .append_exchange(
+                "s1",
+                &[
+                    ChatMessage::user("[cron:job-1 reminder] Remind me"),
+                    ChatMessage::assistant("Reminder sent."),
+                ],
+            )
+            .unwrap();
+
+        let loaded = backend.try_load("s1").unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[2].content, "Reminder sent.");
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.message_count, 3);
+    }
+
+    /// The case the owner has to survive: the insert succeeds and the
+    /// metadata update that follows it fails. In one transaction the insert
+    /// goes with it, so the transcript and its count are as before.
+    #[test]
+    fn append_exchange_whose_metadata_update_fails_leaves_nothing_behind() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER metadata_update_fails AFTER UPDATE ON session_metadata                  BEGIN SELECT RAISE(ABORT, 'metadata update failed'); END;",
+            )
+            .unwrap();
+
+        let result = backend.append_exchange(
+            "s1",
+            &[
+                ChatMessage::user("[cron:job-1 reminder] Remind me"),
+                ChatMessage::assistant("Reminder sent."),
+            ],
+        );
+        assert!(result.is_err());
+        let loaded = backend.try_load("s1").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(backend.get_session_metadata("s1").unwrap().message_count, 1);
+    }
+
+    #[test]
+    fn try_load_reports_a_broken_store_instead_of_an_empty_one() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .conn
+            .lock()
+            .execute_batch("DROP TABLE sessions;")
+            .unwrap();
+
+        assert!(backend.try_load("s1").is_err());
+        assert!(backend.load("s1").is_empty());
     }
 
     #[test]
