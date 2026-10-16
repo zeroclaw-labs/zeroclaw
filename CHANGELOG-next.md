@@ -52,6 +52,7 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 
 ### Security and Supply Chain
 
+- Ratify and implement the canonical `sandbox_policy` filesystem contract (RFC #6996, #7821): one resolver feeding application-layer path guards, legacy-field compatibility mapping, always-on default write guardrails with per-entry exceptions, subagent/bounded-delegation narrowing over effective capability sets, and removal of inert network fields. Legacy `allowed_roots` now derives a real write allowlist under unrestricted profiles, with a one-time upgrade warning naming the affected profile and the restoring edit.
 - Reject plugin `wasm_path` traversal before discovery or installation, closing the arbitrary-write issue tracked as **GHSA-93f6-34w8-5g98**.
 - Patch the Wasmtime sandbox escape, upgrade the Wasmtime stack for RUSTSEC-2026-0222, and remove obsolete advisory exceptions (#10508, #9589, #8781).
 - Enforce Landlock `allowed_roots` tiers, retain DNS and TLS configuration access, and apply `forbidden_paths` underneath allowed roots and workspaces (#10100, #10098, #9937).
@@ -92,6 +93,12 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 
 ## Breaking Changes
 
+- **Sandbox policy is now enforced at the application layer immediately (RFC #6996, #7821).** `sandbox_policy` on a risk profile is the canonical filesystem model: `deny_read`/`allow_read`/`deny_write` are checked by file, search, and Git tools even when no OS sandbox backend is active. Three intentional narrowing changes ship with it:
+  - **Default write guardrails are always on.** A default deny-write list (shell configs, Git control surfaces, `.env`, `.mcp.json`, editor/agent control directories, and ZeroClaw's own `config.toml`, `.secret_key`, `auth-profiles.json`, `IDENTITY.md`, `SOUL.md`, `shared/skills/`) blocks writes that previously succeeded. There is deliberately no switch that disables the whole list; relax one entry at a time with `sandbox_policy.guardrail_exceptions = [".vscode/settings.json"]` (a non-empty list emits a WARN).
+  - **Legacy `allowed_roots` now derives a write allowlist.** A profile with `workspace_only = false` (including `Full` autonomy) and a non-empty `allowed_roots` previously meant "extra roots, writes unrestricted elsewhere"; the canonical resolver now confines writes to the workspace, `/tmp`, and the listed roots. The first start after upgrade warns once, naming the profile; to restore the old behavior, remove `allowed_roots` or set an explicit `sandbox_policy.allow_write`.
+  - **Explicit `allow_write` is authoritative over `workspace_only`.** `workspace_only` now scopes only the implicit workspace grant; an explicit canonical `allow_write` (including an explicit `[]`) replaces it — name `"."` in the list to keep the workspace writable.
+  - Network-shaped `sandbox_policy` fields (`allowed_domains`, `denied_domains`, `allow_unix_sockets`, raw `bubblewrap_args`) are rejected at parse time instead of being silently ignored; they return with the separately reviewed network-policy RFC.
+  - Rollback for a blocked write: add the specific path to `guardrail_exceptions`, or revert the deployment — no persisted-data migration is involved.
 - **Typed plugin instance configuration is mandatory.** Plugins that read operator configuration must declare a schema and use the full instance key shown by `zeroclaw plugin info <package>`; legacy package- or binding-only entries are not consulted (#9126).
 - **Skill HTTP requests are now fail-closed.** Placeholders are URL-component values and can no longer inject `/`, `?`, `&`, or `#`; redirects and ambient proxy variables are ignored; destinations must resolve directly to admitted public addresses. Update affected skill manifests to use direct URLs and data-only placeholders (#10369).
 - **The legacy node transport is retired.** Delete `[node_transport]` from `config.toml`; `[nodes]` remains supported. External Rust users must remove imports of `NodeTransport`, `sign_request`, and `verify_request`, and should rotate the retired secret anywhere it was reused (#10289).
