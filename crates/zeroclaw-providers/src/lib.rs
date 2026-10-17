@@ -2988,6 +2988,135 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn factory_applies_configured_vision_to_request_body() {
+        use axum::extract::State;
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+
+        async fn capture_chat_request(
+            State(capture): State<Arc<Mutex<Vec<serde_json::Value>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            capture.lock().unwrap().push(body);
+            Json(serde_json::json!({"choices": [{"message": {"content": "ok"}}]}))
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/chat/completions", post(capture_chat_request))
+            .with_state(Arc::clone(&captured));
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let image = "[IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==]";
+        let messages = vec![ChatMessage::user(format!("look at this {image}"))];
+
+        // vision = Some(true): the configured override must reach the
+        // serializer, so the image marker becomes an image_url part.
+        let on = ModelProviderRuntimeOptions {
+            vision: Some(true),
+            ..Default::default()
+        };
+        let provider = create_model_provider_with_options(
+            &format!("custom:http://{addr}"),
+            Some("test-key"),
+            &on,
+        )
+        .unwrap();
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        let body = captured.lock().unwrap().pop().unwrap();
+        let user_content = &body["messages"][0]["content"];
+        assert!(
+            user_content.is_array(),
+            "vision=true should emit image parts, got: {user_content}"
+        );
+
+        // vision = Some(false): markers stay text.
+        let off = ModelProviderRuntimeOptions {
+            vision: Some(false),
+            ..Default::default()
+        };
+        let provider = create_model_provider_with_options(
+            &format!("custom:http://{addr}"),
+            Some("test-key"),
+            &off,
+        )
+        .unwrap();
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        let body = captured.lock().unwrap().pop().unwrap();
+        let user_content = &body["messages"][0]["content"];
+        assert!(
+            user_content.is_string(),
+            "vision=false should keep the image marker as text, got: {user_content}"
+        );
+        assert!(user_content.as_str().unwrap().contains("[IMAGE:"));
+
+        // vision = Some(true) + merge_system_into_user = true: the system
+        // prompt is folded into the first user message, and the user's image
+        // marker must still be converted (the pre-fix `!merge` gate lost it).
+        let merged_options = ModelProviderRuntimeOptions {
+            vision: Some(true),
+            merge_system_into_user: true,
+            ..Default::default()
+        };
+        let provider = create_model_provider_with_options(
+            &format!("llamacpp:http://{addr}"),
+            Some("test-key"),
+            &merged_options,
+        )
+        .unwrap();
+        let merged_messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user(format!("look at this {image}")),
+        ];
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &merged_messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .unwrap();
+        let body = captured.lock().unwrap().pop().unwrap();
+        let user_content = &body["messages"][0]["content"];
+        assert!(
+            user_content.is_array(),
+            "vision=true with system merge should emit image parts, got: {user_content}"
+        );
+
+        server.abort();
+    }
+
     #[test]
     fn factory_leaves_have_stable_request_identity() {
         for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
