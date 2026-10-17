@@ -25,6 +25,11 @@ pub const BOOTSTRAP_FILES: &[&str] =
 /// present, `MEMORY.md` only when memory is injected. `doctor` scans both
 /// lists.
 pub const CONDITIONAL_BOOTSTRAP_FILES: &[&str] = &["BOOTSTRAP.md", "MEMORY.md"];
+/// Header over the injected bootstrap files when every file fits its cap.
+const BOOTSTRAP_FILES_HEADER: &str = "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n";
+/// Header used instead when any file was cut, so it agrees with the
+/// truncation marker rather than forbidding the read that recovers the rest.
+const TRUNCATED_BOOTSTRAP_FILES_HEADER: &str = "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT re-read them with file_read, except a file marked as truncated: its remainder is not loaded, so read that file with file_read before relying on it.\n\n";
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
 
@@ -48,31 +53,44 @@ fn load_openclaw_bootstrap_files(
     max_chars_per_file: usize,
     inject_memory: bool,
 ) {
-    prompt.push_str(
-        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
-    );
+    // Render the files first: the header depends on whether any was cut.
+    let mut files = String::new();
+    let mut any_truncated = false;
 
     for filename in BOOTSTRAP_FILES {
-        inject_workspace_file(prompt, workspace_dir, filename, max_chars_per_file);
+        any_truncated |=
+            inject_workspace_file(&mut files, workspace_dir, filename, max_chars_per_file);
     }
 
     // BOOTSTRAP.md — only if it exists (first-run ritual)
     let bootstrap_name = CONDITIONAL_BOOTSTRAP_FILES[0];
     if workspace_dir.join(bootstrap_name).exists() {
-        inject_workspace_file(prompt, workspace_dir, bootstrap_name, max_chars_per_file);
+        any_truncated |= inject_workspace_file(
+            &mut files,
+            workspace_dir,
+            bootstrap_name,
+            max_chars_per_file,
+        );
     }
 
     // MEMORY.md — curated long-term memory (main session only).
     // Skipped when the agent runs without persistent memory (e.g. ACP sessions)
     // so that stale long-term memory does not leak into isolated contexts.
     if inject_memory {
-        inject_workspace_file(
-            prompt,
+        any_truncated |= inject_workspace_file(
+            &mut files,
             workspace_dir,
             CONDITIONAL_BOOTSTRAP_FILES[1],
             max_chars_per_file,
         );
     }
+
+    prompt.push_str(if any_truncated {
+        TRUNCATED_BOOTSTRAP_FILES_HEADER
+    } else {
+        BOOTSTRAP_FILES_HEADER
+    });
+    prompt.push_str(&files);
 }
 
 fn append_project_context(
@@ -688,6 +706,14 @@ pub fn truncate_bootstrap_content(
     }
 }
 
+/// Model-facing note appended after a capped bootstrap file. Shared by both
+/// prompt paths (this module and `personality`) so the wording cannot drift.
+pub fn bootstrap_truncation_marker(filename: &str, limit: usize) -> String {
+    format!(
+        "\n\n[... {filename} truncated at {limit} chars. The rest of this file is not loaded: read `{filename}` with file_read before relying on its later sections.]\n"
+    )
+}
+
 /// Last reported over-cap size per (path, limit) for
 /// [`note_bootstrap_truncation`]. The map keeps one entry per bootstrap
 /// file and limit in use, so its size is bounded by
@@ -754,12 +780,13 @@ fn clear_bootstrap_truncation(path: &std::path::Path, limit: usize) {
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
+/// Returns whether the file was cut at `max_chars`.
 fn inject_workspace_file(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
     filename: &str,
     max_chars: usize,
-) {
+) -> bool {
     use std::fmt::Write;
 
     let path = workspace_dir.join(filename);
@@ -767,26 +794,27 @@ fn inject_workspace_file(
         Ok(content) => {
             let (text, truncation) = truncate_bootstrap_content(&content, max_chars);
             if text.is_empty() && truncation.is_none() {
-                return;
+                return false;
             }
             if let Some(truncation) = truncation {
                 prompt.push_str(text);
-                let _ = writeln!(
-                    prompt,
-                    "\n\n[... {filename} truncated at {max_chars} chars — use `read {filename}` for full file]\n"
-                );
+                prompt.push_str(&bootstrap_truncation_marker(filename, max_chars));
+                prompt.push('\n');
                 let _ = note_bootstrap_truncation(&path, filename, truncation, max_chars);
+                true
             } else {
                 prompt.push_str(text);
                 prompt.push_str("\n\n");
                 // The file fits the cap now: forget the last over-cap size
                 // so a later return to it warns again.
                 clear_bootstrap_truncation(&path, max_chars);
+                false
             }
         }
         Err(_) => {
             // Missing-file marker (matches OpenClaw behavior)
             let _ = writeln!(prompt, "[File not found: {filename}]\n");
+            false
         }
     }
 }
@@ -1538,17 +1566,48 @@ mod tests {
         let prompt = build_system_prompt(workspace.path(), "model", &[], &[], None, Some(6_000));
 
         let expected_tail = format!(
-            "{}\n\n[... AGENTS.md truncated at 6000 chars — use `read AGENTS.md` for full file]",
+            "{}\n\n[... AGENTS.md truncated at 6000 chars. The rest of this file is not loaded: read `AGENTS.md` with file_read before relying on its later sections.]",
             "a".repeat(6_000)
         );
         assert!(
             prompt.contains(&expected_tail),
-            "prompt must contain the 6000-char cut followed by the existing marker"
+            "prompt must contain the 6000-char cut followed by the marker"
         );
         assert!(
             !prompt.contains(&"a".repeat(6_001)),
             "the cut must drop the 6001st char"
         );
+    }
+
+    #[test]
+    fn truncated_bootstrap_header_allows_reading_the_rest() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(workspace.path().join("AGENTS.md"), "a".repeat(7_000))
+            .expect("write AGENTS.md");
+
+        let prompt = build_system_prompt(workspace.path(), "model", &[], &[], None, Some(6_000));
+
+        assert!(
+            prompt.contains(TRUNCATED_BOOTSTRAP_FILES_HEADER),
+            "a truncated file must switch to the header that allows reading it"
+        );
+        assert!(
+            !prompt.contains(BOOTSTRAP_FILES_HEADER),
+            "the header must not forbid reading a truncated file"
+        );
+    }
+
+    #[test]
+    fn untruncated_bootstrap_header_is_unchanged() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(workspace.path().join("AGENTS.md"), "short rules").expect("write AGENTS.md");
+
+        let prompt = build_system_prompt(workspace.path(), "model", &[], &[], None, Some(6_000));
+
+        assert!(prompt.contains(
+            "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\nshort rules\n\n"
+        ));
+        assert!(!prompt.contains("truncated at"));
     }
 
     #[test]

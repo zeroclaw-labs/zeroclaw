@@ -1,7 +1,6 @@
 //! Personality system — loads workspace identity files (SOUL.md, IDENTITY.md,
 //! USER.md) and injects them into the system prompt pipeline.
 
-use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 /// Maximum characters per personality file before truncation.
@@ -93,12 +92,11 @@ impl PersonalityProfile {
         for file in &self.files {
             out.push_str(&file.content);
             if file.truncated {
-                let _ = writeln!(
-                    out,
-                    "\n\n[... {name} truncated at {limit} chars — use `read {name}` for full file]\n",
-                    name = file.name,
-                    limit = MAX_FILE_CHARS,
-                );
+                out.push_str(&crate::agent::system_prompt::bootstrap_truncation_marker(
+                    &file.name,
+                    MAX_FILE_CHARS,
+                ));
+                out.push('\n');
             } else {
                 out.push_str("\n\n");
             }
@@ -317,6 +315,14 @@ mod tests {
         assert!(
             rendered.contains("SOUL.md truncated"),
             "expected filename in truncation notice: {rendered}"
+        );
+        assert!(
+            rendered.contains("read `SOUL.md` with file_read"),
+            "the notice must name the real read tool: {rendered}"
+        );
+        assert!(
+            !rendered.contains("use `read"),
+            "`read` is not a tool name: {rendered}"
         );
 
         let _ = std::fs::remove_dir_all(ws);
