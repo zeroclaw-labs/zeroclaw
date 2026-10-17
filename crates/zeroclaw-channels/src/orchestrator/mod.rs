@@ -10252,17 +10252,18 @@ async fn process_channel_message_body(
         outgoing_user_turn_raw_content.as_deref(),
     );
 
-    let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
-        let usage = ctx.snapshot_turn_usage();
-        (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
-            zeroclaw_api::observability_traits::TurnTokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-            },
-        )
-    });
+    let turn_usage = cost_tracking_context
+        .as_ref()
+        .map(|ctx| ctx.snapshot_turn_usage())
+        .filter(|usage| !usage.is_zero());
+    let turn_tokens_used =
+        turn_usage.map(|usage| zeroclaw_api::observability_traits::TurnTokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        });
+    let turn_cost_usd = turn_usage.and_then(|usage| usage.complete_cost());
     turn_guard.set_model_route(route.model_provider.clone(), route.model.clone());
-    turn_guard.set_usage(turn_tokens_used, None);
+    turn_guard.set_usage(turn_tokens_used, turn_cost_usd);
     turn_guard.finish();
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
