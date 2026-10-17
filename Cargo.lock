@@ -13979,6 +13979,7 @@ dependencies = [
  "parking_lot",
  "postgres",
  "rand 0.10.2",
+ "rcgen",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",

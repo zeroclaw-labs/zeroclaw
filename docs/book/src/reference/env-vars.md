@@ -104,3 +104,18 @@ A handful of fields live as schema fields, reachable via the standard mapping:
 4. **KiloCLI / Gemini CLI / Grok Build CLI process settings**: `[providers.models.kilocli.<alias>] binary_path`, `[providers.models.gemini_cli.<alias>] binary_path`, and `[providers.models.grok_cli.<alias>]` fields `binary_path`, required absolute `working_directory`, optional `extra_args`, and `max_acp_stdout_bytes`. Grok Build aliases may also list environment variable names in `env_passthrough` (tool credentials and the optional `XAI_API_KEY` auth bridge); values are resolved only when the child is spawned and are not stored in config. Authentication uses the CLI login cache by default. The exact name `XAI_API_KEY` is the documented native bridge for API-key auth when explicitly listed; other `XAI_*` and all `GROK_*` names are rejected.
 5. **Transcription / TTS keys**: `[transcription].api_key`, `[providers.tts.openai.<alias>].api_key`, `[providers.tts.elevenlabs.<alias>].api_key`, `[providers.tts.google.<alias>].api_key`.
 6. **Notion / WhatsApp**: `[notion].api_key`, `[channels.whatsapp.<alias>].ws_url` (test/proxy WebSocket override).
+
+## WebSocket CA certificates
+
+For built-in channel WebSocket connections, `SSL_CERT_FILE` may point to an
+operator-managed PEM certificate bundle. Its certificates are added to the
+bundled WebPKI roots for both direct and proxied `wss://` connections; certificate
+chain and hostname verification remain enabled. This supports private CAs used
+by local gateways or TLS-inspecting proxies without disabling verification.
+
+An unset or empty value keeps the bundled roots alone. A non-empty value pointing
+to an unreadable, empty, or invalid certificate bundle fails the connection.
+The file is read for each new connection, so certificate rotation takes effect
+on reconnect; existing connections are unchanged. Plain `ws://` connections do
+not use it. This bridge does not add native OS-store discovery or `SSL_CERT_DIR`
+support to the WebSocket transport.
