@@ -2932,6 +2932,10 @@ impl Chat {
                 Self::reject_stale_approval(&rpc, session_id.clone(), approval.request_id);
             }
             if let Some(elicitation) = elicitation {
+                state.record_elicitation_outcome(
+                    &elicitation.message,
+                    crate::i18n::t("zc-chat-elicitation-withdrawn"),
+                );
                 Self::answer_cancel(&rpc, elicitation.request_id);
             }
         }
@@ -3786,7 +3790,33 @@ impl Chat {
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
         self.drain_session_reattach_results();
+        self.answer_withdrawn_elicitations();
         self.maybe_refresh_git_branch();
+    }
+
+    /// Send the `cancel` every withdrawn elicitation still owes the daemon,
+    /// and note each one in its transcript. Runs after the resync drain, so
+    /// a note for a prompt dropped by a reload lands after the reloaded
+    /// history rather than being wiped by it.
+    fn answer_withdrawn_elicitations(&mut self) {
+        let rpc = self.rpc.clone();
+        let answer = |state: &mut ChatState| {
+            for withdrawn in state.take_withdrawn_elicitations() {
+                Self::answer_cancel(&rpc, withdrawn.request_id);
+                if withdrawn.note {
+                    state.record_elicitation_outcome(
+                        &withdrawn.question,
+                        crate::i18n::t("zc-chat-elicitation-withdrawn"),
+                    );
+                }
+            }
+        };
+        if let ChatPhase::Active(state) = &mut self.phase {
+            answer(state);
+        }
+        for state in self.background.iter_mut() {
+            answer(state);
+        }
     }
 
     #[cfg(test)]
@@ -4176,12 +4206,20 @@ impl Chat {
                     // Build the response without holding the modal borrow,
                     // then answer the daemon. For an invalid multi-select
                     // (bounds unmet) keep the modal open.
-                    let payload = state
-                        .pending_elicitation
-                        .as_ref()
-                        .and_then(|e| e.accept_content().map(|c| (e.request_id.clone(), c)));
-                    if let Some((id, content)) = payload {
-                        state.pending_elicitation = None;
+                    let payload = state.pending_elicitation.as_ref().and_then(|e| {
+                        e.accept_content()
+                            .map(|c| (e.request_id.clone(), c, e.answer_summary()))
+                    });
+                    if let Some((id, content, answer)) = payload
+                        && let Some(e) = state.pending_elicitation.take()
+                    {
+                        state.record_elicitation_outcome(
+                            &e.message,
+                            crate::i18n::t_args(
+                                "zc-chat-elicitation-answered",
+                                &[("answer", &answer)],
+                            ),
+                        );
                         state.mark_dirty_full();
                         self.rpc.respond_to_inbound_request(
                             id,
@@ -4196,6 +4234,10 @@ impl Chat {
                 }
                 Some(ModalAction::Cancel) => {
                     if let Some(e) = state.pending_elicitation.take() {
+                        state.record_elicitation_outcome(
+                            &e.message,
+                            crate::i18n::t("zc-chat-elicitation-cancelled"),
+                        );
                         state.mark_dirty_full();
                         let id = e.request_id;
                         self.rpc.respond_to_inbound_request(
@@ -7144,6 +7186,46 @@ fn render_tool_entry(
                 }
             }
         }
+        "ask_user" | "poll" => {
+            // The card is the durable record of a question (the daemon
+            // persists the tool call), so it leads with the question and
+            // lists the choices, in every disclosure. The generic preview
+            // showed the first bytes of key-sorted JSON, which put `channel`
+            // and `choices` ahead of the question and cut it off.
+            let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+            let question = parsed
+                .as_ref()
+                .and_then(|input| input.get("question"))
+                .and_then(serde_json::Value::as_str);
+            if let (Some(input), Some(question)) = (parsed.as_ref(), question) {
+                let (question, limited) = terminal_safe_tool_text_limited(
+                    question,
+                    TOOL_EXPANDED_MAX_BYTES,
+                    TOOL_EXPANDED_MAX_LINES,
+                );
+                display_limited |= limited;
+                push_text(lines, "question", &question);
+                let choices = input
+                    .get(if name == "poll" { "options" } else { "choices" })
+                    .and_then(serde_json::Value::as_array);
+                for (i, choice) in choices
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .enumerate()
+                {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}. {}", i + 1, preview(choice, 200)),
+                        theme::dim_style().add_modifier(sel_mod),
+                    )));
+                }
+                if matches!(disclosure, ToolDisclosure::Full) {
+                    display_limited |= render_generic_input(lines);
+                }
+            } else {
+                display_limited |= render_generic_input(lines);
+            }
+        }
         _ => display_limited |= render_generic_input(lines),
     }
 
@@ -7197,6 +7279,24 @@ fn render_tool_entry(
             display_limited |=
                 render_field(lines, &crate::i18n::t("zc-chat-tool-details"), details, 120);
         }
+    } else if let Some(res) = result
+        && matches!(name, "ask_user" | "poll")
+        && !res.starts_with("Error")
+    {
+        // The outcome of a question stands out like the answer line it
+        // replaced: the pick in yellow, or only the DISMISSED marker.
+        let res = preview(res, 200);
+        let answer = theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod);
+        let dim = theme::dim_style().add_modifier(sel_mod);
+        let (marked, rest) = match res.strip_prefix("DISMISSED") {
+            Some(rest) => ("DISMISSED", rest),
+            None => (res.as_str(), ""),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  result: ", dim),
+            Span::styled(marked.to_string(), answer),
+            Span::styled(rest.to_string(), dim),
+        ]));
     } else if let Some(res) = result {
         display_limited |= render_field(lines, "result", res, 200);
     }
@@ -9454,7 +9554,33 @@ pub struct PendingElicitation {
     pub selected: Vec<bool>,
 }
 
+/// A pending elicitation cleared without an answer, awaiting its `cancel`.
+#[derive(Debug, Clone)]
+struct WithdrawnElicitation {
+    request_id: serde_json::Value,
+    /// Whether to note the withdrawal in this state's transcript. False when
+    /// the state has already moved to a different session.
+    note: bool,
+    /// The question, to place the note after its tool card.
+    question: String,
+}
+
 impl PendingElicitation {
+    /// The chosen choice titles, comma-joined, for the transcript record.
+    fn answer_summary(&self) -> String {
+        if self.multi {
+            self.choices
+                .iter()
+                .zip(&self.selected)
+                .filter(|(_, on)| **on)
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            self.choices.get(self.cursor).cloned().unwrap_or_default()
+        }
+    }
+
     /// Number of currently-checked rows (multi-select only).
     pub fn selected_count(&self) -> usize {
         self.selected.iter().filter(|&&b| b).count()
@@ -9703,6 +9829,12 @@ pub struct ChatState {
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
+    /// Elicitations this state cleared without the user's answer (a reload,
+    /// a session reset, a newer prompt). The daemon is still waiting on each
+    /// one, so `Chat::answer_withdrawn_elicitations` sends it a `cancel` and
+    /// notes it in the transcript. Without this the tool call blocks until
+    /// its own timeout (600 s for `ask_user`) with nothing on screen.
+    withdrawn_elicitations: Vec<WithdrawnElicitation>,
     /// Why the sidebar shows this session red. Set when a turn ends
     /// `Failed`; cleared by the next prompt, a completed turn, a session
     /// reset, or a successful re-attach.
@@ -9873,6 +10005,7 @@ impl ChatState {
             streaming_thought: String::new(),
             pending_approval: None,
             pending_elicitation: None,
+            withdrawn_elicitations: Vec::new(),
             last_error: None,
             turn_in_flight: false,
             turn_generation: 0,
@@ -11299,8 +11432,66 @@ impl ChatState {
     /// before the first is answered is a protocol anomaly we resolve by
     /// keeping the newest).
     pub fn set_pending_elicitation(&mut self, e: PendingElicitation) {
+        self.withdraw_pending_elicitation(true);
         self.pending_elicitation = Some(e);
         self.mark_dirty_full();
+    }
+
+    /// Clear the pending elicitation without an answer, queueing the
+    /// `cancel` the daemon is waiting for. Every path that drops the modal
+    /// for a reason other than the user's answer goes through here.
+    fn withdraw_pending_elicitation(&mut self, note: bool) {
+        if let Some(e) = self.pending_elicitation.take() {
+            self.withdrawn_elicitations.push(WithdrawnElicitation {
+                request_id: e.request_id,
+                note,
+                question: e.message,
+            });
+            self.mark_dirty_full();
+        }
+    }
+
+    fn take_withdrawn_elicitations(&mut self) -> Vec<WithdrawnElicitation> {
+        std::mem::take(&mut self.withdrawn_elicitations)
+    }
+
+    /// Note how a question ended (answered, dismissed, withdrawn, expired),
+    /// but only when no `ask_user` / `poll` card on screen asked it. The
+    /// card is the record: it shows the question and choices in the agent's
+    /// turn, and its `result:` line shows the outcome once the tool returns,
+    /// so a line here would repeat both. The `elicitation/create` request
+    /// can reach the pane before the `ToolCall` update that draws the card
+    /// (the router drains inbound requests before notifications), which is
+    /// why nothing is written on arrival. With no matching card (an older
+    /// history, a card that never arrived) the line is appended so the
+    /// outcome is still on record.
+    fn record_elicitation_outcome(&mut self, question: &str, text: String) {
+        if self.elicitation_card_index(question).is_some() {
+            return;
+        }
+        self.entries
+            .push(ChatEntry::SystemMessage(Arc::<str>::from(text)));
+        self.mark_dirty_append();
+    }
+
+    /// The newest `ask_user` / `poll` card whose question is `question`.
+    fn elicitation_card_index(&self, question: &str) -> Option<usize> {
+        let question = question.trim();
+        self.entries.iter().rposition(|entry| {
+            let ChatEntry::Tool {
+                name, input_json, ..
+            } = entry
+            else {
+                return false;
+            };
+            matches!(name.as_ref(), "ask_user" | "poll")
+                && serde_json::from_str::<serde_json::Value>(input_json)
+                    .ok()
+                    .as_ref()
+                    .and_then(|input| input.get("question"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|q| q.trim() == question)
+        })
     }
 
     /// Commit any accumulated streaming thought as an entry. Called at the two
@@ -11612,6 +11803,16 @@ impl ChatState {
                 }
                 if let Some(message_count) = message_count {
                     self.message_count = message_count;
+                }
+                // The turn that asked is over, so the daemon stopped waiting
+                // (its tool timed out or the turn was cancelled). Close the
+                // stale modal and record that it went unanswered.
+                if let Some(e) = self.pending_elicitation.take() {
+                    self.record_elicitation_outcome(
+                        &e.message,
+                        crate::i18n::t("zc-chat-elicitation-expired"),
+                    );
+                    self.mark_dirty_full();
                 }
                 match outcome {
                     TurnEndOutcome::Completed => {
@@ -12165,7 +12366,7 @@ impl ChatState {
     fn prepare_for_reattach_resync(&mut self, mode: SessionResyncMode) {
         self.freeze_prompt_settled_stream();
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        self.withdraw_pending_elicitation(true);
         if mode == SessionResyncMode::Reattach {
             self.lag_reattach = None;
         }
@@ -12179,7 +12380,10 @@ impl ChatState {
     fn reset_turn_for_resync_reload(&mut self) {
         self.freeze_prompt_settled_stream();
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        // A prompt that arrived while the reload ran is still awaited by the
+        // daemon; dropping it silently left the tool call hanging until its
+        // timeout. Withdraw it so it is answered.
+        self.withdraw_pending_elicitation(true);
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.turn_in_flight = false;
@@ -12433,7 +12637,7 @@ impl ChatState {
         self.context_menu = None;
         self.copy_feedback = None;
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        self.withdraw_pending_elicitation(false);
         self.last_error = None;
         self.turn_in_flight = false;
         self.message_count = 0;
@@ -30684,6 +30888,301 @@ mod tests {
         assert!(
             s.pending_elicitation().is_none(),
             "a session switch must drop any stale elicitation modal"
+        );
+    }
+
+    #[test]
+    fn reset_for_session_queues_a_cancel_for_the_dropped_elicitation() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        let withdrawn = s.take_withdrawn_elicitations();
+        assert_eq!(withdrawn.len(), 1, "the daemon is still waiting on it");
+        assert_eq!(withdrawn[0].request_id, serde_json::json!("elicit-1"));
+        assert!(
+            !withdrawn[0].note,
+            "the old session's note does not belong in the new one"
+        );
+    }
+
+    fn system_texts(state: &ChatState) -> Vec<String> {
+        state
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::SystemMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression (2026-10-09): a prompt that arrives while a reattach reload
+    /// is in flight was installed, then wiped by the reload's turn reset with
+    /// no reply. The daemon's `ask_user` waited out its 600 s timeout and the
+    /// user never saw the question. It must be answered `cancel` and noted.
+    #[tokio::test]
+    async fn elicitation_installed_during_reload_is_answered_not_dropped() {
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        chat.session_resync_in_flight.insert(
+            "sess-1".to_string(),
+            ResyncInFlight {
+                mode: SessionResyncMode::Reattach,
+                owned_turn: None,
+            },
+        );
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-mid", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+
+        chat.apply_session_resync_result(SessionResyncResult {
+            session_id: "sess-1".to_string(),
+            result: Ok(SessionResyncSnapshot {
+                messages: Vec::new(),
+                message_count: 0,
+                plan: None,
+                turn_running: false,
+            }),
+        });
+        chat.answer_withdrawn_elicitations();
+
+        let frame = next_rpc_request(&mut writer_rx, "the dropped prompt must be answered").await;
+        assert_eq!(frame["id"], "e-mid");
+        assert_eq!(frame["result"]["action"], "cancel");
+        let state = active_state(&mut chat);
+        assert!(state.pending_elicitation.is_none());
+        let withdrawn = crate::i18n::t("zc-chat-elicitation-withdrawn");
+        assert_eq!(
+            system_texts(state).last(),
+            Some(&withdrawn),
+            "the note lands after the reloaded history"
+        );
+    }
+
+    /// The agent's turn as the daemon streams it before an `ask_user`: some
+    /// text, then the tool call whose card carries the question.
+    fn stream_ask_user_turn(state: &mut ChatState) {
+        state.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "Answer this one:".to_string(),
+        });
+        state.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-ask".to_string(),
+            name: "ask_user".to_string(),
+            raw_input: serde_json::json!({
+                "channel": "rpc",
+                "choices": ["Yes", "No"],
+                "question": "Pick one"
+            }),
+        });
+    }
+
+    fn rendered_transcript(state: &mut ChatState) -> String {
+        state.rebuild_lines(200);
+        rendered_text(&state.transcript_layout.view().cached_lines)
+    }
+
+    fn test_term() -> crate::config_manager::Term {
+        ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap()
+    }
+
+    // Keymap overrides are process-global; hold the test lock across the
+    // key dispatch so another test cannot remap Enter mid-test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn elicitation_question_choices_and_answer_are_recorded() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crossterm::event::{KeyCode, KeyModifiers};
+        crate::keymap::overrides::reset();
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        stream_ask_user_turn(active_state(&mut chat));
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-rec", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+        assert!(
+            system_texts(active_state(&mut chat)).is_empty(),
+            "the tool card is the record of the question; arrival adds no line"
+        );
+
+        let mut term = test_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+            .await;
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await;
+
+        let frame = next_rpc_request(&mut writer_rx, "the answer must be sent").await;
+        assert_eq!(frame["id"], "e-rec");
+        assert_eq!(frame["result"]["content"]["choice"], "choice-1");
+        let state = active_state(&mut chat);
+        state.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-ask".to_string(),
+            raw_output: "No".to_string(),
+        });
+        assert!(
+            system_texts(state).is_empty(),
+            "the card's result is the record of the answer; no extra line"
+        );
+        let text = rendered_transcript(state);
+        assert_eq!(
+            text.matches("Pick one").count(),
+            1,
+            "the question is shown once, on the card: {text}"
+        );
+        assert!(text.contains("  question: Pick one"), "{text}");
+        assert!(
+            text.contains("    2. No"),
+            "the choices stay on record: {text}"
+        );
+    }
+
+    /// Regression (dogfood, 2026-10-13 and 2026-10-17): the "asked" line was
+    /// written when `elicitation/create` arrived, which can be before the
+    /// agent's text and the `ask_user` `ToolCall` are drained, so it sat
+    /// above the agent label and repeated the card. The outcome line then
+    /// repeated the card's `result:`. Here the request lands first, the turn
+    /// streams in after it, a parallel tool call finishes, and the user
+    /// presses Esc. The question appears once, inside the agent's turn, and
+    /// no outcome line is added next to the card.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn elicitation_with_a_card_adds_no_outcome_line() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crossterm::event::{KeyCode, KeyModifiers};
+        crate::keymap::overrides::reset();
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-ord", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+        let state = active_state(&mut chat);
+        stream_ask_user_turn(state);
+        state.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-shell".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "ls"}),
+        });
+        state.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-shell".to_string(),
+            raw_output: "file.txt".to_string(),
+        });
+        state.browse_cursor = Some(2);
+
+        let mut term = test_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await;
+        let frame = next_rpc_request(&mut writer_rx, "the dismissal must be sent").await;
+        assert_eq!(frame["id"], "e-ord");
+        assert_eq!(frame["result"]["action"], "cancel");
+
+        let state = active_state(&mut chat);
+        let kinds: Vec<String> = state
+            .entries()
+            .iter()
+            .map(|entry| match entry {
+                ChatEntry::AgentMessage(_) => "agent".to_string(),
+                ChatEntry::Tool { name, .. } => format!("tool:{name}"),
+                ChatEntry::SystemMessage(text) => format!("system:{text}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "agent".to_string(),
+                "tool:ask_user".to_string(),
+                "tool:shell".to_string(),
+            ]
+        );
+        assert_eq!(
+            state.browse_cursor,
+            Some(2),
+            "the browse cursor is untouched"
+        );
+        let text = rendered_transcript(state);
+        assert_eq!(text.matches("Pick one").count(), 1, "{text}");
+        let label = text
+            .find(&crate::i18n::t("zc-chat-label-agent"))
+            .expect("agent label");
+        let question = text.find("question: Pick one").expect("card question");
+        assert!(
+            label < question,
+            "the card sits inside the agent turn: {text}"
+        );
+    }
+
+    #[test]
+    fn turn_complete_closes_a_stale_elicitation_and_records_it() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
+        assert!(
+            s.pending_elicitation().is_none(),
+            "nobody is waiting on a prompt once its turn ends"
+        );
+        assert!(
+            system_texts(&s).contains(&crate::i18n::t("zc-chat-elicitation-expired")),
+            "the unanswered outcome is recorded"
+        );
+    }
+
+    #[test]
+    fn ask_user_card_leads_with_the_question_and_lists_choices() {
+        // Key-sorted, as the daemon serializes tool input.
+        let input = serde_json::json!({
+            "channel": "rpc",
+            "choices": [
+                "A+B+C as proposed, filing all three upstream tonight",
+                "Only A and C now, B waits for the dogfood rebase",
+                "Something else (I'll type)"
+            ],
+            "question": "Which plan should I follow for the three bugs?",
+            "timeout_secs": 600
+        })
+        .to_string();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "ask_user",
+            &input,
+            Some("Only A and C now, B waits for the dogfood rebase"),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let text = rendered_text(&lines);
+        assert!(
+            text.contains("  question: Which plan should I follow for the three bugs?"),
+            "{text}"
+        );
+        assert!(text.contains("    1. A+B+C as proposed"), "{text}");
+        assert!(text.contains("    3. Something else (I'll type)"), "{text}");
+        assert!(
+            text.find("question:") < text.find("result:"),
+            "question before the outcome: {text}"
         );
     }
 
