@@ -16,6 +16,7 @@ use futures_util::TryStreamExt;
 use lettre::message::header::ContentType;
 use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
 use pulldown_cmark::{Options, Parser, html};
@@ -858,19 +859,20 @@ impl EmailChannel {
     }
 
     fn create_smtp_transport(&self) -> Result<SmtpTransport> {
-        let creds = self.smtp_credentials();
-        let transport = if self.config.smtp_tls {
-            SmtpTransport::relay(&self.config.smtp_host)?
-                .port(self.config.smtp_port)
-                .credentials(creds)
-                .build()
+        let host = &self.config.smtp_host;
+        // Same TLS setup as `SmtpTransport::starttls_relay` / `relay`.
+        let tls = if self.config.smtp_starttls {
+            Tls::Required(TlsParameters::new(host.clone())?)
+        } else if self.config.smtp_tls {
+            Tls::Wrapper(TlsParameters::new(host.clone())?)
         } else {
-            SmtpTransport::builder_dangerous(&self.config.smtp_host)
-                .port(self.config.smtp_port)
-                .credentials(creds)
-                .build()
+            Tls::None
         };
-        Ok(transport)
+        Ok(SmtpTransport::builder_dangerous(host)
+            .port(self.config.smtp_port)
+            .tls(tls)
+            .credentials(self.smtp_credentials())
+            .build())
     }
 
     /// Build the outbound `lettre` message for a `SendMessage`, including
@@ -1249,6 +1251,103 @@ mod tests {
         assert!(config.smtp_tls);
     }
 
+    /// How long a fake test server waits for the client, per accept and per
+    /// socket read or write, before it gives up so a regression fails the
+    /// test instead of hanging it.
+    const TEST_SERVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Accepts one client within [`TEST_SERVER_TIMEOUT`] and bounds its
+    /// reads and writes by the same timeout. Panics if no client connects.
+    fn accept_test_client(listener: &std::net::TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + TEST_SERVER_TIMEOUT;
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the client never connected to the test server"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("test server accept failed: {e}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(TEST_SERVER_TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(TEST_SERVER_TIMEOUT)).unwrap();
+        stream
+    }
+
+    /// Runs `Channel::send` against a one-shot plain-text SMTP server that
+    /// offers STARTTLS but refuses it, and returns the send result and the
+    /// commands the client sent.
+    async fn send_to_refusing_starttls_server(
+        smtp_tls: bool,
+        smtp_starttls: bool,
+    ) -> (Result<()>, Vec<String>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let stream = accept_test_client(&listener);
+            let mut writer = stream.try_clone().unwrap();
+            let mut commands = Vec::new();
+            writer.write_all(b"220 smtp.test ESMTP\r\n").unwrap();
+            for line in BufReader::new(stream).lines() {
+                let Ok(line) = line else { break };
+                let verb = line.split(' ').next().unwrap_or("").to_ascii_uppercase();
+                commands.push(verb.clone());
+                let reply: &[u8] = match verb.as_str() {
+                    "EHLO" => b"250-smtp.test\r\n250-STARTTLS\r\n250 AUTH PLAIN LOGIN\r\n",
+                    "STARTTLS" => b"454 TLS not available\r\n",
+                    _ => b"535 rejected by test server\r\n",
+                };
+                if writer.write_all(reply).is_err() || verb != "EHLO" {
+                    break;
+                }
+            }
+            commands
+        });
+
+        let channel = EmailChannel::new(
+            EmailConfig {
+                smtp_host: "127.0.0.1".to_string(),
+                smtp_port: port,
+                smtp_tls,
+                smtp_starttls,
+                username: "user@example.invalid".to_string(),
+                password: "secret".to_string(),
+                from_address: "bot@example.invalid".to_string(),
+                ..EmailConfig::default()
+            },
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let result = channel
+            .send(&SendMessage::new("hello", "peer@example.invalid"))
+            .await;
+        (result, server.join().unwrap())
+    }
+
+    #[tokio::test]
+    async fn send_with_smtp_starttls_upgrades_before_credentials() {
+        let (result, commands) = send_to_refusing_starttls_server(true, true).await;
+
+        assert!(result.is_err(), "a refused STARTTLS must fail the send");
+        assert_eq!(commands, ["EHLO", "STARTTLS"]);
+    }
+
+    #[tokio::test]
+    async fn send_without_tls_never_issues_starttls() {
+        let (_, commands) = send_to_refusing_starttls_server(false, false).await;
+
+        assert_eq!(commands.first().map(String::as_str), Some("EHLO"));
+        assert!(!commands.iter().any(|c| c == "STARTTLS"), "{commands:?}");
+    }
+
     #[test]
     fn default_idle_timeout_is_29_minutes() {
         assert_eq!(default_idle_timeout(), 1740);
@@ -1334,6 +1433,7 @@ mod tests {
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 465,
             smtp_tls: true,
+            smtp_starttls: false,
             username: "user@example.com".to_string(),
             password: "pass123".to_string(),
             smtp_username: None,
@@ -1364,6 +1464,7 @@ mod tests {
             smtp_host: "smtp.test.com".to_string(),
             smtp_port: 587,
             smtp_tls: true,
+            smtp_starttls: false,
             username: "user@test.com".to_string(),
             password: "secret".to_string(),
             smtp_username: None,
@@ -1393,6 +1494,7 @@ mod tests {
             smtp_host: "smtp.example.invalid".to_string(),
             smtp_port: 465,
             smtp_tls: true,
+            smtp_starttls: false,
             username: "private-user@example.invalid".to_string(),
             password: "secret".to_string(),
             smtp_username: None,
@@ -2190,6 +2292,7 @@ mod tests {
             smtp_host: "smtp.example.com".to_string(),
             smtp_port: 587,
             smtp_tls: true,
+            smtp_starttls: false,
             username: "user@example.com".to_string(),
             password: "password123".to_string(),
             smtp_username: None,
@@ -2227,6 +2330,7 @@ mod tests {
         assert_eq!(config.imap_port, 993); // default
         assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
+        assert!(!config.smtp_starttls); // default
         assert_eq!(config.idle_timeout_secs, 1740); // default
         assert_eq!(config.default_subject, "Re: Message"); // default
     }
