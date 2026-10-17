@@ -1017,11 +1017,18 @@ fn dispatch_trim_budget(limits: zeroclaw_config::schema::ResolvedContextLimits) 
     }
 }
 
+/// The uncalibrated estimate of a request and its shares, carried into the
+/// overflow error so the operator can see what filled the window:
+/// `(raw_estimated_tokens, system_tokens, tool_schema_tokens)`. All three are
+/// in raw-estimate units; calibration is applied only to the total.
+type RequestShares = (usize, usize, usize);
+
 fn context_window_exceeded_error(
     (provider_name, model): (&str, &str),
     limits: zeroclaw_config::schema::ResolvedContextLimits,
     tokens: u64,
     token_source: zeroclaw_api::agent::TokenCountSource,
+    (raw_estimated_tokens, system_tokens, tool_schema_tokens): RequestShares,
 ) -> anyhow::Error {
     let span = ::zeroclaw_log::info_span!(
         target: "zeroclaw_log_internal_scope",
@@ -1042,12 +1049,18 @@ fn context_window_exceeded_error(
                 "model_context_window": limits.model_context_window,
                 "model_context_window_source": format!("{:?}", limits.model_context_window_source),
                 "context_token_budget": limits.context_token_budget,
+                "raw_estimated_tokens": raw_estimated_tokens,
+                "system_tokens": system_tokens,
+                "tool_schema_tokens": tool_schema_tokens,
             })),
         "Provider-facing request exceeds the active model context window"
     );
     ContextWindowExceeded {
         estimated_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
         model_context_window: limits.model_context_window,
+        raw_estimated_tokens,
+        system_tokens,
+        tool_schema_tokens,
     }
     .into()
 }
@@ -2582,6 +2595,11 @@ async fn run_tool_call_loop_impl<'a>(
                 active_context_limits,
                 retained_tokens,
                 dispatch_token_source,
+                (
+                    reported_population_estimated,
+                    crate::agent::history::estimate_system_floor_tokens(&provider_request_messages),
+                    tool_schema_tokens,
+                ),
             ));
         }
 
