@@ -359,6 +359,15 @@ channel guest code; unknown, malformed, or out-of-range values fail instead of
 reaching the plugin. Memory plugins do not yet have a config import and must
 not request `config_read` until that ABI is added.
 
+Every value in an instance's `config` map is encrypted at rest, whatever the
+schema says. `zeroclaw config set plugins.entries.<key>.config.<name>` asks for
+an `x-secret` value with masked input and, unless `--no-interactive` is given,
+does not take one from the command line. A property the installed package
+declares without `x-secret` takes the value given on the command line, or
+prompts with echo when none is given. A name `config set` cannot match to an
+installed package's schema, for example on a row whose package is not installed,
+is treated as secret.
+
 Tool and channel components can request `state_read` and/or `state_write` for
 the `state` import. The host, not the guest, supplies the admitted package,
 capability, and binding namespace. Portable logical keys address authenticated

@@ -3799,6 +3799,56 @@ fn plugin_info_lines(
     lines
 }
 
+/// Whether `config set` takes `path` as a plain plugin setting rather than as
+/// secret input: `path` is `plugins.entries.<key>.config.<name>`, `<key>` is
+/// the row of an instance of an installed package, as `plugin info` lists
+/// them, that package's `config_schema` passes config admission, and it
+/// declares `<name>` with no `x-secret` marker reachable from it. Anything
+/// that cannot be established that way, including a plugins directory that
+/// is missing or cannot be read, is `false`, and the value stays secret input.
+///
+/// Discovery only reads the plugins directory: it is skipped when the
+/// directory is missing, since it would create one, and it takes no package
+/// lock.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_setting_is_plain(config: &crate::config::schema::Config, path: &str) -> bool {
+    let Some((key, name)) = path
+        .strip_prefix("plugins.entries.")
+        .and_then(|rest| rest.split_once(".config."))
+    else {
+        return false;
+    };
+    if !config.plugins.resolved_plugins_dir().is_dir() {
+        return false;
+    }
+    let host = match plugin_host_with_configured_security(config) {
+        Ok(host) => host,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{error:#}")})),
+                "Installed plugins could not be read; config set keeps masked input"
+            );
+            return false;
+        }
+    };
+    // The one installed package whose instance owns the row decides.
+    let Some(owner) = host
+        .list_plugins()
+        .iter()
+        .filter_map(|info| host.manifest(&info.name))
+        .find(|manifest| {
+            crate::plugins::channel_instance::instance_rows(config, manifest)
+                .is_ok_and(|rows| rows.iter().any(|row| row.key == key))
+        })
+    else {
+        return false;
+    };
+    zeroclaw::plugins::config::validate_manifest_config(owner).is_ok()
+        && crate::plugins::channel_instance::declares_plain_property(owner, name)
+}
+
 #[cfg(feature = "plugins-wasm")]
 fn plugin_host_with_configured_security(
     config: &crate::config::schema::Config,
@@ -11575,6 +11625,14 @@ Add pricing to the active provider profile or supply a catalog entry."
                         config.prop_fields().into_iter().map(|f| f.name).collect();
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
+                // Every value in a plugin instance's `config` map is stored
+                // encrypted, but only a property the installed package marks
+                // `x-secret` is secret input.
+                #[cfg(feature = "plugins-wasm")]
+                let plain_plugin_setting =
+                    !no_interactive && plugin_setting_is_plain(&config, &path);
+                #[cfg(not(feature = "plugins-wasm"))]
+                let plain_plugin_setting = false;
                 let selected_value = if no_interactive {
                     value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
@@ -11588,7 +11646,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                             "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         ))
                     })?
-                } else if Config::prop_is_secret(&path) {
+                } else if Config::prop_is_secret(&path) && !plain_plugin_setting {
                     if value.is_some() {
                         eprintln!(
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
@@ -11606,6 +11664,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                     secret_value
                 } else if let Some(val) = value {
                     val
+                } else if plain_plugin_setting {
+                    dialoguer::Input::<String>::new()
+                        .with_prompt(format!("Enter value for {path}"))
+                        .interact_text()?
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
                     let provider_ref = path
@@ -21272,6 +21334,167 @@ type = "string"
                 ..crate::config::schema::PluginChannelConfig::default()
             },
         );
+    }
+
+    /// `config set` takes a plugin setting as typed only for a property the
+    /// installed package declares without `x-secret`, on a row one of its
+    /// instances owns: the tool row, or a bound channel alias's row. Anything
+    /// else stays secret input.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn only_a_declared_non_secret_plugin_setting_is_plain_input() {
+        let tmp = tempfile::tempdir().expect("plugins dir");
+        let package = tmp.path().join("chat-bridge");
+        std::fs::create_dir_all(&package).expect("package dir");
+        std::fs::write(
+            package.join("manifest.toml"),
+            r#"name = "chat-bridge"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool", "channel"]
+permissions = ["config_read"]
+
+[config_schema]
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.guild_ids]
+type = "array"
+
+[config_schema.properties.bot_token]
+type = "string"
+x-secret = true
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(package.join("plugin.wasm"), b"\0asm").expect("write component");
+        // A second package that declares `bot_token` plainly: only the
+        // package that owns a row decides for it.
+        let relay = tmp.path().join("relay-bridge");
+        std::fs::create_dir_all(&relay).expect("package dir");
+        std::fs::write(
+            relay.join("manifest.toml"),
+            r#"name = "relay-bridge"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.bot_token]
+type = "string"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(relay.join("plugin.wasm"), b"\0asm").expect("write component");
+        let mut config = crate::config::schema::Config::default();
+        config.plugins.plugins_dir = tmp.path().display().to_string();
+        bind_channel_alias(&mut config, "acceptance", "chat-bridge", true);
+        let host = plugin_host_with_configured_security(&config).expect("plugin host");
+        let manifest = host
+            .manifest("chat-bridge")
+            .expect("the package is installed");
+        let tool_key = expected_instance_key(manifest);
+        let channel_key = expected_channel_instance_key(manifest, "acceptance");
+        let setting = |key: &str, name: &str| format!("plugins.entries.{key}.config.{name}");
+
+        for key in [&tool_key, &channel_key] {
+            assert!(plugin_setting_is_plain(&config, &setting(key, "guild_ids")));
+            assert!(
+                !plugin_setting_is_plain(&config, &setting(key, "bot_token")),
+                "an x-secret property stays secret input"
+            );
+            assert!(!plugin_setting_is_plain(
+                &config,
+                &setting(key, "undeclared")
+            ));
+        }
+        let unbound = expected_channel_instance_key(manifest, "unbound");
+        assert!(
+            !plugin_setting_is_plain(&config, &setting(&unbound, "guild_ids")),
+            "no instance owns the row of an alias nothing binds"
+        );
+        assert!(!plugin_setting_is_plain(
+            &config,
+            &format!("plugins.entries.{tool_key}.egress_hosts")
+        ));
+
+        let relay_key = expected_instance_key(host.manifest("relay-bridge").expect("installed"));
+        assert!(plugin_setting_is_plain(
+            &config,
+            &setting(&relay_key, "bot_token")
+        ));
+
+        let missing = tmp.path().join("missing");
+        config.plugins.plugins_dir = missing.display().to_string();
+        assert!(
+            !plugin_setting_is_plain(&config, &setting(&tool_key, "guild_ids")),
+            "without the installed package the schema is unknown"
+        );
+        assert!(
+            !missing.exists(),
+            "config set never creates the plugins directory"
+        );
+    }
+
+    /// A package whose schema puts a secret marker below a top-level
+    /// property, behind a `$ref`, in a `oneOf` branch, or writes it as
+    /// something other than `true`, never has a setting taken as plain, even
+    /// placed in the plugins directory by hand.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_hand_placed_schema_that_hides_a_secret_marker_keeps_masked_input() {
+        let tmp = tempfile::tempdir().expect("plugins dir");
+        let shapes = [
+            (
+                "nested-secret",
+                "auth",
+                "[config_schema.properties.auth]\ntype = \"object\"\nadditionalProperties = false\n\n\
+                 [config_schema.properties.auth.properties.token]\ntype = \"string\"\nx-secret = true\n",
+            ),
+            (
+                "ref-secret",
+                "creds",
+                "[config_schema.properties.creds]\n\"$ref\" = \"#/$defs/creds\"\n\n\
+                 [config_schema.\"$defs\".creds]\ntype = \"string\"\nx-secret = true\n",
+            ),
+            (
+                "oneof-secret",
+                "login",
+                "[config_schema.properties.login]\n\
+                 oneOf = [{ type = \"string\", x-secret = true }, { type = \"integer\" }]\n",
+            ),
+            (
+                "string-secret",
+                "token",
+                "[config_schema.properties.token]\ntype = \"string\"\nx-secret = \"true\"\n",
+            ),
+        ];
+        let mut config = crate::config::schema::Config::default();
+        config.plugins.plugins_dir = tmp.path().display().to_string();
+        for (package, property, schema) in shapes {
+            let manifest = format!(
+                "name = \"{package}\"\nversion = \"1.0.0\"\nwasm_path = \"plugin.wasm\"\n\
+                 capabilities = [\"tool\"]\npermissions = [\"config_read\"]\n\n\
+                 [config_schema]\ntype = \"object\"\nadditionalProperties = false\n\n{schema}"
+            );
+            let dir = tmp.path().join(package);
+            std::fs::create_dir_all(&dir).expect("package dir");
+            std::fs::write(dir.join("manifest.toml"), &manifest).expect("write manifest");
+            std::fs::write(dir.join("plugin.wasm"), b"\0asm").expect("write component");
+            let key = expected_instance_key(&manifest_from_toml(&manifest));
+
+            assert!(
+                !plugin_setting_is_plain(
+                    &config,
+                    &format!("plugins.entries.{key}.config.{property}")
+                ),
+                "{package}: {property} stays secret input"
+            );
+        }
     }
 
     /// The entries `plugin install` seeds for `manifest` under `config`,
