@@ -5120,6 +5120,9 @@ capabilities = ["tool"]
         let text = format!(
             r#"schema_version = {version}
 
+[tools]
+optional = []
+
 [providers.models.openai.default]
 model = "gpt-5"
 {onepassword}

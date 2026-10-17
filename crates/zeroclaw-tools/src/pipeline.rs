@@ -94,6 +94,16 @@ impl PipelineTool {
         }
     }
 
+    /// Narrow the existing context before sharing this pipeline. Surviving
+    /// children keep their identity and order; access policy is unchanged.
+    pub fn retain_context_tools(
+        mut self,
+        mut keep: impl FnMut(&dyn zeroclaw_api::tool::Tool) -> bool,
+    ) -> Self {
+        self.tools.retain(|tool| keep(tool.as_ref()));
+        self
+    }
+
     /// Find a tool by name in the registry.
     fn find_tool(&self, name: &str) -> Option<&dyn Tool> {
         self.tools

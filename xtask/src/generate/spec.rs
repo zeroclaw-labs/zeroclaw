@@ -561,6 +561,19 @@ pub fn dist_extra_features(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<
     required_registry_list(pkg, "dist_extra_features")
 }
 
+/// Selections published across the canonical release workflow target matrix.
+/// On-demand selections remain available without adding release artifacts.
+pub fn release_distributions(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<String>> {
+    let selections = required_registry_list(pkg, "release_distributions")?;
+    for id in &selections {
+        anyhow::ensure!(
+            matches!(Selection::from_id(id), Some(Selection::Dist)),
+            "release_distributions supports the standard `dist` selection; `{id}` is on-demand only"
+        );
+    }
+    Ok(selections)
+}
+
 /// Target-specific compatibility exclusions for standard distribution builds.
 /// Release workflows provide a target triple and never duplicate this policy.
 pub fn dist_target_exclusions(
@@ -820,7 +833,7 @@ pub(crate) fn features_outside_dist(manifest_dir: &Path) -> anyhow::Result<Vec<S
         .collect())
 }
 
-fn workspace_root_package(
+pub(super) fn workspace_root_package(
     meta: &cargo_metadata::Metadata,
 ) -> anyhow::Result<&cargo_metadata::Package> {
     meta.root_package()
@@ -865,7 +878,10 @@ pub fn resolve_feature_list_for_target(
     };
     anyhow::ensure!(!target.is_empty(), "target must not be empty");
     anyhow::ensure!(
-        matches!(selection, Selection::Dist | Selection::DistBroad),
+        matches!(
+            selection,
+            Selection::Dist | Selection::DistBroad | Selection::DistCompat
+        ),
         "target-specific exclusions are only defined for distribution selections"
     );
 
@@ -968,14 +984,16 @@ pub enum Selection {
     Full,
     /// Kernel only (`--no-default-features`).
     Minimal,
-    /// Standard binary distribution: lean Cargo defaults plus the explicit
-    /// registry-owned distribution additions. The set a single-artifact
-    /// package manager ships.
+    /// Standard binary distribution: Cargo defaults plus registry-owned
+    /// channels, plugin hosts and native adapters. Runtime tool selection
+    /// defaults to minimal; full uses the same artifact.
     Dist,
     /// Measurement-only broad distribution: `Dist` plus the canonical
     /// `channels-full` aggregate. Not offered by installer menus until a
     /// stable broad artifact lifecycle exists.
     DistBroad,
+    /// Compatibility alias for the standard distribution.
+    DistCompat,
     /// Every selectable feature (all − non_row − pure-alias). The docker
     /// `:all-features` kitchen sink.
     All,
@@ -992,6 +1010,7 @@ impl Selection {
             Selection::Minimal => "minimal",
             Selection::Dist => "dist",
             Selection::DistBroad => "dist-broad",
+            Selection::DistCompat => "dist-compat",
             Selection::All => "all",
             Selection::Features(_) => "custom",
         }
@@ -1003,8 +1022,9 @@ impl Selection {
         match self {
             Selection::Full => "default feature set",
             Selection::Minimal => "core only, no default features",
-            Selection::Dist => "lean standard distribution (recommended)",
+            Selection::Dist => "standard distribution, minimal/full tools (recommended)",
             Selection::DistBroad => "broad-channel distribution measurement build",
+            Selection::DistCompat => "standard distribution compatibility alias",
             Selection::All => "every feature including hardware and browser",
             Selection::Features(_) => "custom feature selection",
         }
@@ -1016,6 +1036,7 @@ impl Selection {
             Selection::Minimal,
             Selection::Dist,
             Selection::DistBroad,
+            Selection::DistCompat,
             Selection::Full,
             Selection::All,
         ]
@@ -1025,7 +1046,7 @@ impl Selection {
     pub fn menu() -> Vec<Selection> {
         Self::named()
             .into_iter()
-            .filter(|selection| !matches!(selection, Selection::DistBroad))
+            .filter(|selection| !matches!(selection, Selection::DistBroad | Selection::DistCompat))
             .collect()
     }
 
@@ -1051,14 +1072,18 @@ impl Selection {
         let mut set = match self {
             Selection::Minimal => Vec::new(),
             Selection::Full => ctx.expand("default"),
-            Selection::Dist | Selection::DistBroad => {
+            Selection::Dist | Selection::DistBroad | Selection::DistCompat => {
                 let mut s = ctx.expand("default");
                 for feature in ctx.dist_extra {
                     anyhow::ensure!(
                         ctx.all.contains(feature),
                         "unknown dist_extra_features entry `{feature}` (not in [features])"
                     );
-                    s.push(feature.clone());
+                    if ctx.non_row.contains(feature) {
+                        s.extend(ctx.expand(feature));
+                    } else {
+                        s.push(feature.clone());
+                    }
                 }
                 if matches!(self, Selection::DistBroad) {
                     s.extend(ctx.expand("channels-full"));
@@ -1336,6 +1361,87 @@ mod tests {
     }
 
     #[test]
+    fn standard_distribution_carries_full_adapters_and_compat_is_an_alias() {
+        let dist = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        let compat = resolve_feature_list(&root(), &Selection::DistCompat).unwrap();
+        let optional =
+            resolve_feature_list(&root(), &Selection::Features(vec!["tools-compat".into()]))
+                .unwrap();
+        assert!(
+            resolve_feature_list(&root(), &Selection::Full)
+                .unwrap()
+                .iter()
+                .all(|feature| !feature.starts_with("tool-") && feature != "tools-external")
+        );
+        for tool in zeroclaw_config::opt_in_tools::OptInTool::ALL {
+            assert!(compat.iter().any(|candidate| candidate == tool.feature()));
+        }
+        assert!(compat.contains(&"tools-external".to_string()));
+        assert_eq!(dist, compat);
+        assert!(optional.contains(&"tools-compat".to_string()));
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert!(
+                !resolve_feature_list_for_target(&root(), &Selection::DistCompat, Some(target))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let desktop =
+            std::fs::read_to_string(root().join("scripts/desktop/prepare-kernel.sh")).unwrap();
+        assert!(desktop.contains("--selection \"$DISTRIBUTION\" --target \"$triple\""));
+        assert!(desktop.contains("--no-default-features"));
+    }
+
+    #[test]
+    fn distributions_keep_supported_portable_plugin_hosts_without_default_activation() {
+        let defaults = resolve_feature_list(&root(), &Selection::Full).unwrap();
+        assert!(
+            !defaults
+                .iter()
+                .any(|feature| feature.starts_with("plugins-wasm"))
+        );
+        let config = zeroclaw_config::schema::Config::default();
+        assert!(!config.plugins.enabled);
+        assert!(!config.plugins.auto_discover);
+
+        for selection in [Selection::Dist, Selection::DistCompat] {
+            for target in [
+                "x86_64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-gnu",
+                "aarch64-unknown-linux-musl",
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+            ] {
+                let features =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert!(features.contains(&"agent-runtime".into()));
+                assert!(
+                    features.contains(&"plugins-wasm-cranelift".into()),
+                    "{target}"
+                );
+            }
+            for target in [
+                "arm-unknown-linux-gnueabihf",
+                "armv7-unknown-linux-gnueabihf",
+                "aarch64-linux-android",
+            ] {
+                let features =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert!(
+                    !features.contains(&"plugins-wasm-cranelift".into()),
+                    "{target}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn install_route_contract_rejects_duplicate_platforms() {
         let routes = install_routes().unwrap();
         let fast = route(&routes, RouteId::UnixFast);
@@ -1422,12 +1528,12 @@ mod tests {
         );
     }
 
-    /// Pins the lean contract by name on purpose: widening `dist` must be a
+    /// Pins the shipping contract by name on purpose: widening `dist` must be a
     /// deliberate, reviewed edit here, not a silent consequence of a registry
     /// change. The generator suites derive their expectations from the
     /// registry; this one stays the policy tripwire.
     #[test]
-    fn dist_matches_lean_release_contract() {
+    fn dist_matches_minimal_full_release_contract() {
         let features = resolve_feature_list(&root(), &Selection::Dist).unwrap();
         assert!(features.contains(&"channel-git".to_string()));
         let mut expected = resolve_feature_list(&root(), &Selection::Full).unwrap();
@@ -1437,9 +1543,14 @@ mod tests {
                 "channel-lark",
                 "channel-git",
                 "whatsapp-web",
+                "plugins-wasm-cranelift",
             ]
             .map(str::to_owned),
         );
+        expected.extend(
+            zeroclaw_config::opt_in_tools::OptInTool::ALL.map(|tool| tool.feature().to_string()),
+        );
+        expected.push("tools-external".into());
         expected.sort();
         expected.dedup();
         assert_eq!(features, expected);
@@ -1495,7 +1606,7 @@ mod tests {
     fn all_is_superset_of_dist() {
         let dist = resolve(&root(), &Selection::Dist).unwrap();
         let all = resolve(&root(), &Selection::All).unwrap();
-        // All includes optional features outside the lean distribution.
+        // All includes optional features outside the standard distribution.
         assert!(
             all.cargo_flags.contains("hardware"),
             "all is the kitchen sink"
@@ -1562,7 +1673,7 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        for selection in [Selection::Dist, Selection::DistBroad] {
+        for selection in [Selection::Dist, Selection::DistBroad, Selection::DistCompat] {
             let unfiltered = resolve_feature_list(&root(), &selection).unwrap();
             for (target, excluded) in &exclusions {
                 let resolved =
@@ -1604,14 +1715,17 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        assert_eq!(exclusions["aarch64-linux-android"], vec!["whatsapp-web"]);
+        assert_eq!(
+            exclusions["aarch64-linux-android"],
+            vec!["whatsapp-web", "plugins-wasm-cranelift"]
+        );
         assert_eq!(
             exclusions["arm-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
         assert_eq!(
             exclusions["armv7-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
     }
 
@@ -1626,7 +1740,9 @@ mod tests {
         let release =
             std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
                 .unwrap();
-        assert!(release.contains("features --selection dist --target \"${{ matrix.target }}\""));
+        assert!(release.contains(
+            "features --selection \"${{ matrix.distribution }}\" --target \"${{ matrix.target }}\""
+        ));
         assert!(!release.contains("excluded_features"));
         // The stable release build MUST pin --no-default-features against the
         // generator's explicit per-target list, exactly like the manual workflow.

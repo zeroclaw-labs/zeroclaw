@@ -1791,6 +1791,28 @@ fn resolve_elevated_tool(
     kind_label: &str,
     resolution_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
 ) -> Option<Box<dyn zeroclaw_api::tool::Tool>> {
+    resolve_skill_elevation(skill_name, tool, kind_label, |target_name| {
+        resolution_registry
+            .iter()
+            .find(|target| target.name() == target_name)
+            .map(|target| {
+                Box::new(crate::skills::skill_tool::SkillBuiltinTool::new(
+                    skill_name,
+                    tool,
+                    std::sync::Arc::clone(target),
+                    tool.locked_args.clone(),
+                )) as Box<dyn zeroclaw_api::tool::Tool>
+            })
+    })
+}
+
+/// Keep target validation and diagnostics at the original skill-conversion site.
+pub(crate) fn resolve_skill_elevation<T>(
+    skill_name: &str,
+    tool: &SkillTool,
+    kind_label: &str,
+    mut resolve: impl FnMut(&str) -> Option<T>,
+) -> Option<T> {
     let Some(target_name) = tool.target.as_deref() else {
         ::zeroclaw_log::record!(
             WARN,
@@ -1803,13 +1825,8 @@ fn resolve_elevated_tool(
         );
         return None;
     };
-    match resolution_registry.iter().find(|t| t.name() == target_name) {
-        Some(target) => Some(Box::new(crate::skills::skill_tool::SkillBuiltinTool::new(
-            skill_name,
-            tool,
-            std::sync::Arc::clone(target),
-            tool.locked_args.clone(),
-        ))),
+    match resolve(target_name) {
+        Some(target) => Some(target),
         None => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1867,9 +1884,38 @@ pub(crate) fn skills_to_tools_with_context_and_runtime_optional_nat64(
     runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
     nat64_prefixes: Option<&[zeroclaw_infra::net_guard::Nat64Prefix]>,
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
-    let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
+    prepare_skill_tools_with_runtime(
+        skills,
+        security,
+        runtime,
+        nat64_prefixes,
+        |tool| tool,
+        |skill_name, tool, kind_label| {
+            resolve_elevated_tool(skill_name, tool, kind_label, unfiltered_registry)
+        },
+    )
+}
+
+/// Prepare a whole batch in the original constructor order. Scoped assembly can
+/// defer binding an elevation without substituting an executable placeholder.
+pub(crate) fn prepare_skill_tools_with_runtime<T>(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+    runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
+    nat64_prefixes: Option<&[zeroclaw_infra::net_guard::Nat64Prefix]>,
+    mut ready: impl FnMut(Box<dyn zeroclaw_api::tool::Tool>) -> T,
+    mut resolve: impl FnMut(&str, &SkillTool, &str) -> Option<T>,
+) -> Vec<T> {
+    let mut tools = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            crate::tools::late_tool_search_observer::record(
+                "skill-constructor-enter",
+                &tool.kind,
+                0,
+                0,
+            );
             if !is_registered_skill_tool_kind(tool.kind.as_str()) {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -1890,31 +1936,41 @@ pub(crate) fn skills_to_tools_with_context_and_runtime_optional_nat64(
                         security.clone(),
                         runtime.clone(),
                     );
-                    tools.push(Box::new(zeroclaw_tools::wrappers::RateLimitedTool::new(
-                        inner,
-                        security.clone(),
-                    )));
+                    let wrapped =
+                        zeroclaw_tools::wrappers::RateLimitedTool::new(inner, security.clone());
+                    tools.push(ready(Box::new(wrapped)));
+                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                    crate::tools::late_tool_search_observer::record(
+                        "skill-constructor-return",
+                        &tool.kind,
+                        0,
+                        0,
+                    );
                 }
                 "http" => {
                     if let Some(nat64_prefixes) = nat64_prefixes {
-                        tools.push(Box::new(crate::skills::skill_http::SkillHttpTool::new(
+                        let http = crate::skills::skill_http::SkillHttpTool::new(
                             &skill.name,
                             tool,
                             nat64_prefixes,
-                        )));
+                        );
+                        tools.push(ready(Box::new(http)));
+                        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                        crate::tools::late_tool_search_observer::record(
+                            "skill-constructor-return",
+                            "http",
+                            0,
+                            0,
+                        );
                     }
                 }
                 "builtin" => {
-                    if let Some(t) =
-                        resolve_elevated_tool(&skill.name, tool, "builtin", unfiltered_registry)
-                    {
+                    if let Some(t) = resolve(&skill.name, tool, "builtin") {
                         tools.push(t);
                     }
                 }
                 "mcp" => {
-                    if let Some(t) =
-                        resolve_elevated_tool(&skill.name, tool, "MCP", unfiltered_registry)
-                    {
+                    if let Some(t) = resolve(&skill.name, tool, "MCP") {
                         tools.push(t);
                     }
                 }

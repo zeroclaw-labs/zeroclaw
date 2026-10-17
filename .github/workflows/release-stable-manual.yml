@@ -209,6 +209,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        target: [x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, armv7-unknown-linux-gnueabihf, arm-unknown-linux-gnueabihf, aarch64-apple-darwin, x86_64-apple-darwin, aarch64-linux-android, x86_64-pc-windows-msvc]
+        # >>> generated:release-distributions by `cargo generate installers` - do not edit <<<
+        distribution: ["dist"]
+# >>> end generated:release-distributions <<<
         include:
           # Use ubuntu-22.04 for Linux builds to link against glibc 2.35,
           # ensuring compatibility with Ubuntu 22.04+ (#3573).
@@ -278,7 +282,7 @@ jobs:
       # time. The per-(os, target) prefix keeps each leg's cache isolated.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          prefix-key: ${{ matrix.os }}-${{ matrix.target }}
+          prefix-key: ${{ matrix.os }}-${{ matrix.target }}-${{ matrix.distribution }}
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -315,11 +319,11 @@ jobs:
           fi
           # Resolve the feature set from the canonical registry
           # (`cargo generate features`), the single source of truth that
-          # install.sh and packaging surfaces also consume. `dist` is the lean
-          # standard distribution set and carries the default leaves, so every
+          # install.sh and packaging surfaces also consume. `dist` carries
+          # default leaves and adapters for minimal/full runtime selection. Every
           # target builds with --no-default-features against the explicit list,
           # with no implicit feature drift.
-          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection "${{ matrix.distribution }}" --target "${{ matrix.target }}")"
           echo "Resolved features: $FEATURES"
           # MUSL targets build via cross-rs (cross-compiled in a container);
           # all other targets use the host cargo toolchain directly.

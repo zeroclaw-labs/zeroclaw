@@ -2196,8 +2196,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/webhook", post(handle_webhook))
         .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
-        // ── Claude Code runner hooks ──
-        .route("/hooks/claude-code", post(api::handle_claude_code_hook))
+        .merge(optional_tool_routes())
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/version/check", get(version::handle_version_check))
@@ -3230,6 +3229,15 @@ fn require_gateway_chat_agent_alias(
         );
         anyhow::Error::msg("webhook chat requires at least one configured [agents.<alias>] entry")
     })
+}
+
+/// Routes owned by opt-in tools, present only when the tool is compiled in.
+fn optional_tool_routes() -> Router<AppState> {
+    let router: Router<AppState> = Router::new();
+    // Claude Code runner hooks
+    #[cfg(feature = "tool-claude-code-runner")]
+    let router = router.route("/hooks/claude-code", post(api::handle_claude_code_hook));
+    router
 }
 
 fn optional_channel_routes() -> Router<AppState> {
@@ -8737,6 +8745,8 @@ data: [DONE]\n\n";
         let tmp = tempfile::tempdir().expect("production receipt fixture temp dir");
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
         state.publish_test_config(|config| {
+            // Selection admits the tool; the existing allowlist still controls execution.
+            config.tools.optional = vec!["calculator".into()];
             config
                 .risk_profiles
                 .get_mut("fixture")
