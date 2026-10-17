@@ -63,6 +63,7 @@ COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
 COPY apps/zerorelay/Cargo.toml apps/zerorelay/Cargo.toml
 COPY tools/fill-translations/Cargo.toml tools/fill-translations/Cargo.toml
 COPY xtask/Cargo.toml xtask/Cargo.toml
+COPY vendor/ vendor/
 RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay/src tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
