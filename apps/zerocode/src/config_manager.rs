@@ -40,6 +40,14 @@ pub(crate) fn mouse_shift_capture_sequence(capture: bool) -> &'static str {
     if capture { "\x1b[>1s" } else { "\x1b[>0s" }
 }
 
+// Config/list displays string arrays as TOML values. Accept JSON too for
+// older responders, without dropping unresolved strings containing escapes.
+fn string_array_entries(raw: &str) -> Option<Vec<String>> {
+    serde_json::from_str(raw)
+        .ok()
+        .or_else(|| raw.parse::<toml::Value>().ok()?.try_into().ok())
+}
+
 fn type_template_label(template: &ConfigTemplateEntry) -> String {
     template
         .path
@@ -485,6 +493,8 @@ pub(crate) struct App {
     // Enum/bool select state
     select_cursor: usize,
     select_items: Vec<String>,
+    // Attempt-local ordered selection; None retains the scalar/text editor.
+    array_selection: Option<Vec<String>>,
     status_msg: Option<String>,
     application_feedback: crate::config_application::ApplicationFeedback,
     // Filter state: None = inactive, Some(buf) = active filter
@@ -562,6 +572,7 @@ impl App {
             secret_map_entry_key: None,
             select_cursor: 0,
             select_items: Vec::new(),
+            array_selection: None,
             status_msg: None,
             application_feedback: crate::config_application::ApplicationFeedback::new(),
             filter: None,
@@ -884,7 +895,21 @@ impl App {
                 )
             }
             Screen::FieldEdit { field_idx, .. } => {
-                if self.is_select_edit() {
+                if self.array_selection.is_some() {
+                    format!(
+                        " {}={}  {}={}  {}={}",
+                        tab_key(T::Enter),
+                        crate::i18n::t("zc-config-action-toggle-selection"),
+                        editor_key(E::Save),
+                        crate::i18n::t("zc-config-footer-action-save"),
+                        tab_key(T::Back),
+                        crate::i18n::t(if self.detail_filter().is_some() {
+                            "zc-config-footer-action-clear-filter"
+                        } else {
+                            "zc-config-footer-action-cancel"
+                        }),
+                    )
+                } else if self.is_select_edit() {
                     if self.detail_filter().is_some() {
                         let help = crate::i18n::t("zc-config-footer-action-help");
                         format!(
@@ -1683,20 +1708,28 @@ impl App {
                     }
                 }
             }
-            Screen::FieldEdit { .. } => {
-                if self.is_select_edit() {
-                    let visible = self.filtered_indices(&self.select_items);
-                    let cursor = if self.detail_filter().is_some() {
-                        self.filter_cursor
-                    } else {
-                        self.select_cursor
-                    };
-                    if let Some(&orig) = visible.get(cursor) {
-                        self.deactivate_filter();
-                        self.commit_select(orig).await?;
-                    }
-                }
+            Screen::FieldEdit { .. } => self.activate_select_row().await?,
+        }
+        Ok(())
+    }
+
+    /// Mouse activation of the highlighted choice. An array picker stays open
+    /// after a toggle, so it keeps the search, as Enter does.
+    async fn activate_select_row(&mut self) -> Result<()> {
+        if !self.is_select_edit() {
+            return Ok(());
+        }
+        let visible = self.filtered_indices(&self.select_items);
+        let cursor = if self.detail_filter().is_some() {
+            self.filter_cursor
+        } else {
+            self.select_cursor
+        };
+        if let Some(&orig) = visible.get(cursor) {
+            if self.array_selection.is_none() {
+                self.deactivate_filter();
             }
+            self.commit_select(orig).await?;
         }
         Ok(())
     }
@@ -3844,25 +3877,10 @@ impl App {
             }
         }
 
-        // Alias-reference fields resolve their picker list generically from
-        // the field's `alias_source` — no per-path special-casing.
-        if let Some(source) = self.fields[idx].alias_source {
+        if self.fields[idx].alias_source.is_some() {
             self.status_msg = Some(crate::i18n::t("zc-config-status-loading-aliases"));
             let _ = self.draw(term);
-            match self.rpc.config_resolve_alias_source(source).await {
-                Ok(values) if !values.is_empty() => {
-                    self.select_cursor =
-                        values.iter().position(|v| v == &field_current).unwrap_or(0);
-                    self.select_items = values;
-                    self.status_msg = None;
-                }
-                Ok(_) => {
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-aliases"));
-                }
-                Err(_) => {
-                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-fetch-failed"));
-                }
-            }
+            self.resolve_field_aliases(idx).await;
         }
 
         if let Screen::FieldList {
@@ -3881,7 +3899,52 @@ impl App {
         }
     }
 
+    async fn resolve_field_aliases(&mut self, idx: usize) {
+        let Some(source) = self.fields[idx].alias_source else {
+            return;
+        };
+        match self.rpc.config_resolve_alias_source(source).await {
+            Ok(mut values) if !values.is_empty() => {
+                if self.fields[idx].kind == PropKind::StringArray {
+                    let field = &self.fields[idx];
+                    let current = if field.populated {
+                        field.value.as_ref().and_then(|v| v.as_str()).unwrap_or("")
+                    } else {
+                        "[]"
+                    };
+                    // Do not replace an unreadable saved list with an empty selection.
+                    let Some(selected) = string_array_entries(current) else {
+                        return;
+                    };
+                    for entry in &selected {
+                        if !values.contains(entry) {
+                            values.push(entry.clone());
+                        }
+                    }
+                    self.array_selection = Some(selected);
+                    self.select_cursor = 0;
+                } else {
+                    let current = self.fields[idx].value.as_ref().and_then(|v| v.as_str());
+                    self.select_cursor = values
+                        .iter()
+                        .position(|v| Some(v.as_str()) == current)
+                        .unwrap_or(0);
+                }
+                self.select_items = values;
+                self.status_msg = None;
+            }
+            Ok(_) => {
+                self.status_msg = Some(crate::i18n::t("zc-config-status-no-aliases"));
+            }
+            Err(_) => {
+                self.status_msg = Some(crate::i18n::t("zc-config-status-alias-fetch-failed"));
+            }
+        }
+    }
+
     fn prepare_edit_at(&mut self, idx: usize) {
+        self.array_selection = None;
+        self.deactivate_filter();
         let kind = self.fields[idx].kind;
         self.secret_map_entry_key = None;
         let value = if self.fields[idx].populated {
@@ -3917,8 +3980,7 @@ impl App {
                 // Deserialize the JSON array into one entry-per-line for editing.
                 self.select_items.clear();
                 let raw = value.unwrap_or_default();
-                let entries: Vec<String> =
-                    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default();
+                let entries = string_array_entries(&raw).unwrap_or_default();
                 self.edit_buf = entries.join("\n");
             }
             _ => {
@@ -3930,7 +3992,7 @@ impl App {
     }
 
     fn is_select_edit(&self) -> bool {
-        !self.select_items.is_empty()
+        self.array_selection.is_some() || !self.select_items.is_empty()
     }
 
     // ── Filter helpers ───────────────────────────────────────────
@@ -4251,13 +4313,21 @@ impl App {
                 Some(ConfigEditorAction::Save) => {
                     if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                         let prop = self.fields[*field_idx].path.clone();
-                        let entries: Vec<String> = self
-                            .edit_buf
-                            .lines()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .collect();
+                        let original = self.fields[*field_idx]
+                            .value
+                            .as_ref()
+                            .and_then(|value| value.as_str())
+                            .and_then(string_array_entries);
+                        let entries = match original {
+                            Some(entries) if entries.join("\n") == self.edit_buf => entries,
+                            _ => self
+                                .edit_buf
+                                .lines()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect(),
+                        };
                         let value = serde_json::Value::Array(
                             entries.into_iter().map(serde_json::Value::String).collect(),
                         );
@@ -4355,6 +4425,12 @@ impl App {
     }
 
     async fn handle_select_edit(&mut self, key: KeyEvent) -> Result<()> {
+        if self.array_selection.is_some()
+            && crate::keymap::ConfigEditorAction::from_chord(&key)
+                == Some(crate::keymap::ConfigEditorAction::Save)
+        {
+            return self.save_array_selection().await;
+        }
         let visible = self.filtered_indices(&self.select_items);
 
         match self.handle_filter_key(key, visible.len()) {
@@ -4362,7 +4438,9 @@ impl App {
             FilterAction::Cancel => return self.cancel_filter().await,
             FilterAction::Accept => {
                 if let Some(&orig) = visible.get(self.filter_cursor) {
-                    self.deactivate_filter();
+                    if self.array_selection.is_none() {
+                        self.deactivate_filter();
+                    }
                     return self.commit_select(orig).await;
                 }
                 return Ok(());
@@ -4394,6 +4472,16 @@ impl App {
     }
 
     async fn commit_select(&mut self, orig_idx: usize) -> Result<()> {
+        if let Some(selected) = &mut self.array_selection {
+            if let Some(chosen) = self.select_items.get(orig_idx) {
+                if selected.contains(chosen) {
+                    selected.retain(|entry| entry != chosen);
+                } else {
+                    selected.push(chosen.clone());
+                }
+            }
+            return Ok(());
+        }
         if let Some(chosen) = self.select_items.get(orig_idx)
             && let Screen::FieldEdit { field_idx, .. } = &self.screen
         {
@@ -4418,7 +4506,36 @@ impl App {
         Ok(())
     }
 
+    async fn save_array_selection(&mut self) -> Result<()> {
+        if let Some(selected) = &self.array_selection
+            && let Screen::FieldEdit { field_idx, .. } = &self.screen
+        {
+            let prop = self.fields[*field_idx].path.clone();
+            let value = serde_json::json!(selected);
+            match self.rpc.config_set(&prop, value).await {
+                Ok(revision) => {
+                    self.application_feedback
+                        .record_saved(prop.clone(), revision);
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-field-set",
+                        &[("prop", &prop)],
+                    ));
+                    self.pop_to_field_list_keep_cursor().await?;
+                }
+                Err(e) => {
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-set-failed",
+                        &[("err", &e.to_string())],
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn pop_to_field_list(&mut self) -> Result<()> {
+        self.array_selection = None;
+        self.deactivate_filter();
         if let Screen::FieldEdit {
             section_idx,
             prefix,
@@ -4438,6 +4555,8 @@ impl App {
     }
 
     async fn pop_to_field_list_keep_cursor(&mut self) -> Result<()> {
+        self.array_selection = None;
+        self.deactivate_filter();
         if let Screen::FieldEdit {
             section_idx,
             prefix,
@@ -5305,7 +5424,18 @@ impl App {
                 .iter()
                 .map(|&i| {
                     ListItem::new(Line::from(Span::styled(
-                        self.select_items[i].clone(),
+                        match &self.array_selection {
+                            Some(selected) => format!(
+                                "[{}] {}",
+                                if selected.contains(&self.select_items[i]) {
+                                    "x"
+                                } else {
+                                    " "
+                                },
+                                self.select_items[i]
+                            ),
+                            None => self.select_items[i].clone(),
+                        },
                         theme::body_style(),
                     )))
                 })
@@ -5838,7 +5968,35 @@ impl App {
                     .get(*field_idx)
                     .map(|f| f.kind == PropKind::StringArray)
                     .unwrap_or(false);
-                if self.is_select_edit() {
+                if self.array_selection.is_some() {
+                    let entries = vec![
+                        nav(),
+                        k(A::Enter, "zc-config-action-toggle-selection"),
+                        E::new(
+                            vec![editor_key(crate::keymap::ConfigEditorAction::Save)],
+                            crate::i18n::t("zc-config-help-save-array"),
+                        ),
+                        if self.detail_filter().is_some() {
+                            clear_filter()
+                        } else {
+                            filter()
+                        },
+                        if self.detail_filter().is_some() {
+                            E::key(
+                                format!(
+                                    "{0}, {0}",
+                                    editor_key(crate::keymap::ConfigEditorAction::Cancel)
+                                ),
+                                crate::i18n::t("zc-config-help-cancel"),
+                            )
+                        } else {
+                            k(A::Back, "zc-config-help-cancel")
+                        },
+                        help(),
+                        E::key("Mouse", crate::i18n::t("zc-config-help-mouse-toggle")),
+                    ];
+                    HelpNode::entries(entries)
+                } else if self.is_select_edit() {
                     if self.detail_filter().is_some() {
                         HelpNode::entries(vec![
                             nav(),
@@ -8446,6 +8604,13 @@ mod tests {
     /// and answers config/set and config/list. List responses echo the
     /// two-field tabbed fixture, applying the saved value to a.second.
     fn responding_manager() -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
+        responding_manager_with_aliases(None, false)
+    }
+
+    fn responding_manager_with_aliases(
+        aliases: Option<Vec<String>>,
+        canonical_array_readback: bool,
+    ) -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
         use crate::jsonrpc::RpcOutbound;
         use tokio::sync::mpsc;
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(16);
@@ -8467,7 +8632,22 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(method.clone());
                 let id = req["id"].as_str().unwrap_or_default().to_string();
-                let result = if method == crate::client::method::CONFIG_SET {
+                if method == crate::client::method::CONFIG_RESOLVE_ALIAS_SOURCE && aliases.is_none()
+                {
+                    outbound_for_task.dispatch_response(
+                        &id,
+                        None,
+                        Some(crate::jsonrpc::JsonRpcError {
+                            code: -32601,
+                            message: "Unsupported method".into(),
+                            data: None,
+                        }),
+                    );
+                    continue;
+                }
+                let result = if method == crate::client::method::CONFIG_RESOLVE_ALIAS_SOURCE {
+                    serde_json::json!({ "values": aliases.as_ref().unwrap() })
+                } else if method == crate::client::method::CONFIG_SET {
                     saved = Some((
                         req["params"]["prop"]
                             .as_str()
@@ -8486,7 +8666,15 @@ mod tests {
                     if let Some((prop, value)) = &saved
                         && prop == "a.second"
                     {
-                        second.value = Some(value.clone());
+                        if canonical_array_readback && value.is_array() {
+                            second.kind = PropKind::StringArray;
+                            second.alias_source = Some(crate::wire::AliasSource::Channels);
+                            second.value = Some(serde_json::json!(
+                                toml::Value::try_from(value).unwrap().to_string()
+                            ));
+                        } else {
+                            second.value = Some(value.clone());
+                        }
                         second.populated = true;
                     }
                     serde_json::json!({ "entries": [
@@ -8515,6 +8703,236 @@ mod tests {
             }
         });
         (manager, calls)
+    }
+
+    async fn array_picker_manager(
+        current: &[&str],
+        aliases: Option<Vec<String>>,
+    ) -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (mut manager, calls) = responding_manager_with_aliases(aliases, true);
+        let first = field("a.first");
+        let mut second = field_with_value(
+            PropKind::StringArray,
+            &toml::Value::try_from(current).unwrap().to_string(),
+            true,
+        );
+        second.path = "a.second".into();
+        second.alias_source = Some(crate::wire::AliasSource::Channels);
+        manager.fields = vec![first, second];
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.resolve_field_aliases(1).await;
+        (manager, calls)
+    }
+
+    #[tokio::test]
+    async fn array_picker_mouse_toggle_keeps_search() {
+        let (mut manager, _calls) = array_picker_manager(
+            &["z.old"],
+            Some(vec!["a.live".into(), "b.new".into(), "b.next".into()]),
+        )
+        .await;
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        manager.activate_select_row().await.unwrap();
+        assert_eq!(
+            manager.array_selection.as_ref().unwrap(),
+            &["z.old", "b.new"]
+        );
+        assert_eq!(manager.detail_filter().map(String::as_str), Some("b"));
+        assert_eq!(manager.filtered_indices(&manager.select_items).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn array_picker_stages_filtered_toggles_and_saves_ordered_unresolved_values() {
+        let (mut manager, calls) = array_picker_manager(
+            &["z.old", "a.live", "missing"],
+            Some(vec!["a.live".into(), "b.new".into(), "z.old".into()]),
+        )
+        .await;
+        assert!(manager.select_items.contains(&"missing".into()));
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        for c in "b.new".chars() {
+            manager
+                .handle_field_edit(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.array_selection.as_ref().unwrap(),
+            &["z.old", "a.live", "missing", "b.new"]
+        );
+        assert_eq!(*calls.lock().unwrap(), vec!["config/resolve-alias-source"]);
+        assert!(matches!(manager.screen, Screen::FieldEdit { .. }));
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(
+            string_array_entries(manager.fields[1].value.as_ref().unwrap().as_str().unwrap()),
+            Some(vec![
+                "z.old".into(),
+                "a.live".into(),
+                "missing".into(),
+                "b.new".into()
+            ])
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["config/resolve-alias-source", "config/set", "config/list"]
+        );
+        assert!(manager.array_selection.is_none());
+        assert!(manager.filter.is_none());
+        manager.prepare_edit_at(1);
+        manager.resolve_field_aliases(1).await;
+        assert_eq!(
+            manager.array_selection.as_ref().unwrap(),
+            &["z.old", "a.live", "missing", "b.new"]
+        );
+    }
+
+    #[tokio::test]
+    async fn array_picker_cancel_does_not_write_and_reentry_discards_staging() {
+        let (mut manager, calls) =
+            array_picker_manager(&["a.live"], Some(vec!["a.live".into(), "b.new".into()])).await;
+        manager.select_cursor = 1;
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["config/resolve-alias-source", "config/list"]
+        );
+        assert!(manager.array_selection.is_none());
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        manager.fields[1] = field_with_value(PropKind::StringArray, r#"["a.live"]"#, true);
+        manager.fields[1].alias_source = Some(crate::wire::AliasSource::Channels);
+        manager.prepare_edit_at(1);
+        manager.resolve_field_aliases(1).await;
+        assert_eq!(manager.array_selection.as_ref().unwrap(), &["a.live"]);
+    }
+
+    #[tokio::test]
+    async fn array_picker_removes_unresolved_entries_and_saves_empty_array() {
+        let (mut manager, calls) =
+            array_picker_manager(&["missing"], Some(vec!["a.live".into()])).await;
+        manager.select_cursor = 1;
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(
+            string_array_entries(manager.fields[1].value.as_ref().unwrap().as_str().unwrap()),
+            Some(vec![])
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["config/resolve-alias-source", "config/set", "config/list"]
+        );
+    }
+
+    #[tokio::test]
+    async fn array_picker_resolver_failure_or_empty_options_retains_text_fallback() {
+        for aliases in [None, Some(vec![])] {
+            let (mut manager, _) = array_picker_manager(&["old", "missing"], aliases).await;
+            assert!(!manager.is_select_edit());
+            assert_eq!(manager.edit_buf, "old\nmissing");
+            manager
+                .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+            assert_eq!(
+                string_array_entries(manager.fields[1].value.as_ref().unwrap().as_str().unwrap()),
+                Some(vec!["old".into(), "missing".into()])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn array_picker_preserves_toml_quoted_and_escaped_unresolved_entries() {
+        let current = [
+            "known",
+            "missing\"name",
+            r"missing\path",
+            " padded ",
+            "two\nlines",
+        ];
+        for aliases in [Some(vec!["known".into(), "new".into()]), None, Some(vec![])] {
+            let (mut manager, _) = array_picker_manager(&current, aliases).await;
+            if manager.array_selection.is_some() {
+                manager.select_cursor = 1;
+                manager
+                    .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+                manager
+                    .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+            }
+            manager
+                .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+            assert_eq!(
+                string_array_entries(manager.fields[1].value.as_ref().unwrap().as_str().unwrap()),
+                Some(current.iter().map(|s| s.to_string()).collect())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scalar_alias_picker_still_commits_a_string_on_enter() {
+        let (mut manager, calls) =
+            array_picker_manager(&[], Some(vec!["a.live".into(), "b.new".into()])).await;
+        manager.fields[1].kind = PropKind::AliasRef;
+        manager.fields[1].value = Some(serde_json::json!("b.new"));
+        manager.prepare_edit_at(1);
+        manager.resolve_field_aliases(1).await;
+        assert!(manager.array_selection.is_none());
+        assert_eq!(manager.select_cursor, 1);
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!("b.new")));
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == "config/set")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

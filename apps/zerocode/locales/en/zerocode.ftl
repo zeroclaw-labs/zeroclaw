@@ -844,3 +844,5 @@ zc-config-application-awaiting = Awaiting acknowledgement
 zc-config-application-scope-unavailable = Change scope unavailable
 zc-config-application-retired = Target retired
 zc-config-application-whole-config = Whole configuration; individual changed paths are unavailable
+zc-config-action-toggle-selection = Toggle selection
+zc-config-help-mouse-toggle = Click, scroll, double-click to toggle selection
