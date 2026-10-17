@@ -5211,8 +5211,8 @@ fn egress_repair_incomplete_line(package: &str, reason: &str, instance_key: &str
 
 /// The migration diagnostic, on the surface an operator already
 /// runs: for every instance of an installed plugin whose transport can use a
-/// declaration (`http_client` for the default tool binding, any governed
-/// transport for a bound channel alias), a terse report of the destinations
+/// declaration (any governed transport, for the default tool binding and for
+/// a bound channel alias alike), a terse report of the destinations
 /// it declares that its instance row does not grant — denials waiting to
 /// happen — and the exact command that closes the gap.
 ///
@@ -5315,8 +5315,8 @@ fn egress_deployment_gap_line(config: &crate::config::schema::Config) -> Option<
 /// `config set` replaces the list. This function only renders the plan.
 ///
 /// Every instance row of the package is reported on its own, in the order
-/// [`crate::plugins::channel_instance::instance_rows`] yields them, and under
-/// its own transport rule: the default tool binding first, named by the bare
+/// [`crate::plugins::channel_instance::instance_rows`] yields them: the
+/// default tool binding first, named by the bare
 /// package exactly as before, then each bound channel alias, named
 /// `package (plugin.<alias>)`.
 #[cfg(feature = "plugins-wasm")]
@@ -5363,14 +5363,14 @@ fn instance_row_egress_gap_lines(
     row: &crate::plugins::channel_instance::PluginInstanceRow,
     runtime: &crate::plugins::egress_ceremony::EgressRuntimeInputs,
 ) -> Vec<String> {
-    use crate::plugins::channel_instance::{declared_hosts_for_row, row_has_usable_transport};
+    use crate::plugins::channel_instance::{
+        declared_hosts_for_row, manifest_has_governed_transport,
+    };
     use crate::plugins::egress_ceremony::{plan_egress_gap, resolve_grant_state};
 
-    // Each row applies its own transport rule: `http_client` for the
-    // default tool binding, any governed transport for a channel row. A
-    // row whose transport cannot use a declaration is skipped, as a tool
-    // package without `http_client` always was.
-    if !row_has_usable_transport(manifest, row) {
+    // Every row applies the same transport rule: any governed transport. A
+    // row of a package without one cannot use a declaration and is skipped.
+    if !manifest_has_governed_transport(manifest) {
         return Vec::new();
     }
     let package = manifest.name.as_str();
@@ -5961,8 +5961,7 @@ async fn publish_and_seed_plugin(
             .manifest(&name)
             .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
         let rows = instance_rows(config, manifest)?;
-        // The default tool binding's declaration, under that row's own
-        // transport rule.
+        // The default tool binding's declaration.
         let declared = rows
             .iter()
             .find(|row| !row.is_channel())
@@ -22603,14 +22602,14 @@ type = "string"
         );
     }
 
-    /// The transport rule differs by row, on purpose. A channel row uses its
-    /// declaration through any governed transport, so a socket-only or
-    /// WebSocket-only channel is seeded and diagnosed. The default tool
-    /// binding keeps its `http_client`-only rule unchanged. Without any
-    /// governed transport no row can use the declaration.
+    /// Every row uses its declaration through any governed transport, the
+    /// default tool binding's row as much as a channel row, so a socket-only
+    /// or WebSocket-only package is seeded and diagnosed whichever it
+    /// provides. Without any governed transport no row can use the
+    /// declaration.
     #[test]
     #[cfg(feature = "plugins-wasm")]
-    fn declared_hosts_count_any_governed_transport_for_channel_rows_but_only_http_for_tool_rows() {
+    fn declared_hosts_count_any_governed_transport_for_every_row() {
         use crate::plugins::channel_instance::{declared_hosts_for_row, instance_rows};
 
         let mut config = crate::config::schema::Config::default();
@@ -22633,35 +22632,151 @@ type = "string"
             (manifest, rows)
         };
 
-        for permission in ["socket_client", "websocket_client"] {
-            let (manifest, rows) = rows_for(&[permission]);
-            assert_eq!(
-                declared_hosts_for_row(&manifest, &rows[1]),
-                declared,
-                "a channel row uses its declaration through {permission}"
-            );
-            assert!(
-                declared_hosts_for_row(&manifest, &rows[0]).is_empty(),
-                "the tool row keeps its http_client-only rule, so {permission} alone uses no \
-                 declaration"
-            );
+        // Every permission, and exactly the three transports use the
+        // declaration. The match does not compile once a permission is added
+        // until it is sorted into one side.
+        use zeroclaw::plugins::PluginPermission as P;
+        for permission in [
+            P::HttpClient,
+            P::WebSocketClient,
+            P::SocketClient,
+            P::FileRead,
+            P::FileWrite,
+            P::ConfigRead,
+            P::MemoryRead,
+            P::MemoryWrite,
+            P::StateRead,
+            P::StateWrite,
+        ] {
+            let uses_declaration = match permission {
+                P::HttpClient | P::WebSocketClient | P::SocketClient => true,
+                P::FileRead
+                | P::FileWrite
+                | P::ConfigRead
+                | P::MemoryRead
+                | P::MemoryWrite
+                | P::StateRead
+                | P::StateWrite => false,
+            };
+            let name = serde_json::to_value(permission).expect("a permission serializes");
+            let (manifest, rows) = rows_for(&[name.as_str().expect("a permission is a string")]);
+            let expected = if uses_declaration {
+                declared.clone()
+            } else {
+                Vec::new()
+            };
+            for row in &rows {
+                assert_eq!(
+                    declared_hosts_for_row(&manifest, row),
+                    expected,
+                    "{permission:?}: {row:?}"
+                );
+            }
         }
+    }
 
-        let (manifest, rows) = rows_for(&["http_client"]);
-        for row in &rows {
-            assert_eq!(
-                declared_hosts_for_row(&manifest, row),
-                declared,
-                "http_client serves both rows: {row:?}"
+    /// A tool package's declaration counts through any governed transport.
+    /// For an installed package with no row yet, `plugin list` reports the
+    /// command that creates the row with the declared host. `plugin install`
+    /// creates the row seeded with that host, which closes the gap. A row an
+    /// earlier install left empty, as one for a WebSocket- or socket-only tool
+    /// was, is reported with the command that grants the host. A tool that
+    /// speaks only over a WebSocket or a socket is handled as an HTTP tool is.
+    /// Without a transport nothing is reported, and install creates the row
+    /// with an empty grant.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_tool_declaration_is_seeded_and_reported_through_any_governed_transport() {
+        use crate::plugins::egress_ceremony::{egress_create_command, egress_set_command};
+        use zeroclaw::plugins::host::PluginHost;
+
+        const HOST: &str = "relay.example.net";
+        for (permissions, uses_declaration) in [
+            ("\"http_client\"", true),
+            ("\"websocket_client\"", true),
+            ("\"socket_client\"", true),
+            ("", false),
+        ] {
+            let manifest_toml = format!(
+                "name = \"relay-tool\"\n\
+                 version = \"1.0.0\"\n\
+                 wasm_path = \"plugin.wasm\"\n\
+                 capabilities = [\"tool\"]\n\
+                 permissions = [{permissions}]\n\
+                 [egress]\n\
+                 hosts = [\"{HOST}\"]\n"
             );
-        }
+            let source = tempfile::tempdir().expect("source dir");
+            std::fs::write(source.path().join("manifest.toml"), &manifest_toml)
+                .expect("write manifest");
+            std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+            let manifest = manifest_from_toml(&manifest_toml);
+            let key = expected_instance_key(&manifest);
+            let tmp = tempfile::tempdir().expect("config dir");
+            let mut config = config_in_dir(tmp.path());
 
-        let (manifest, rows) = rows_for(&["memory_read"]);
-        for row in &rows {
+            let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+            if uses_declaration {
+                let command =
+                    egress_create_command(egress_command_config_dir(&config), &key, &[HOST.into()]);
+                assert!(
+                    lines.len() == 1 && lines[0].contains(&command),
+                    "[{permissions}]: `plugin list` names the command that creates the row with \
+                     the declared host: {lines:?}"
+                );
+            } else {
+                assert!(lines.is_empty(), "[{permissions}]: {lines:?}");
+            }
+
+            let plugins = tempfile::tempdir().expect("plugins dir");
+            let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+            let admitted = host
+                .admit_source(source.path().to_str().unwrap())
+                .expect("admit");
+            Box::pin(publish_and_seed_plugin(
+                &mut host,
+                &mut config,
+                admitted,
+                None,
+                crate::plugins::channel_instance::EgressDecision::SeedDeclared,
+                |_| {},
+            ))
+            .await
+            .expect("install");
+            let granted = config
+                .plugins
+                .entries
+                .iter()
+                .find(|entry| entry.name == key)
+                .map(|entry| entry.egress_hosts.clone());
+            let expected = if uses_declaration {
+                vec![HOST.to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(granted, Some(expected), "[{permissions}]: the seeded grant");
             assert!(
-                declared_hosts_for_row(&manifest, row).is_empty(),
-                "without a governed transport no row can use the declaration: {row:?}"
+                egress_grant_gap_lines(&config, &manifest)
+                    .expect("gap lines must build")
+                    .is_empty(),
+                "[{permissions}]: nothing is left to report after install"
             );
+
+            for entry in &mut config.plugins.entries {
+                entry.egress_hosts.clear();
+            }
+            let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+            if uses_declaration {
+                let command =
+                    egress_set_command(egress_command_config_dir(&config), &key, &[HOST.into()]);
+                assert!(
+                    lines.len() == 1 && lines[0].contains(&command),
+                    "[{permissions}]: an existing empty row gets the command that grants the \
+                     declared host: {lines:?}"
+                );
+            } else {
+                assert!(lines.is_empty(), "[{permissions}]: {lines:?}");
+            }
         }
     }
 
@@ -23134,8 +23249,7 @@ type = "string"
     /// the `[channels.plugin.<alias>]` binding and the instance's row in one
     /// save, grants the row exactly the canonical declaration, and prints the
     /// grant with the command that edits it. A socket-only channel is seeded
-    /// the same way: a channel row counts every governed transport, where the
-    /// default tool binding counts only `http_client`.
+    /// the same way: a row counts every governed transport.
     #[tokio::test]
     #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
     async fn bind_creates_the_binding_and_seeds_the_declaration_on_declared() {

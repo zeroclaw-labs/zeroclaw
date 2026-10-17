@@ -830,7 +830,6 @@ cli-quickstart-plugins-missing-row = {$name} has no config entry, so Quickstart 
 cli-quickstart-plugins-row-skipped = {$name} stays installed without a config entry, so it reaches no network destination. To create the entry later, without network access, run: {$command}
 cli-quickstart-plugins-grant-declared-later = To let {$name} reach its {$count} declared destination(s), also run this after creating the entry: {$command}
 cli-quickstart-plugins-no-declared-hosts = {$name} requests network access but declares no destinations, so its config entry grants none. To grant the hosts your deployment uses, append them to this command as one comma-separated value: {$command}
-cli-quickstart-plugins-declared-hosts-not-granted = {$name} declares these destinations: {$hosts}. Quickstart offers to grant declared destinations only to plugins that request http_client, so its config entry grants none of them. To grant them, run: {$command}
 cli-quickstart-plugins-activation-heading = Activating plugins turns on {$settings}, which activates:
 cli-quickstart-plugins-activation-tool = tool plugin {$name}
 cli-quickstart-plugins-activation-skill = skill plugin {$name}

@@ -296,8 +296,10 @@ pub fn channel_instance_row(
     }))
 }
 
-/// Whether `row`'s instance holds a transport that can reach a declared
-/// destination.
+/// The declared destinations an instance row of `manifest`'s package can use:
+/// the manifest's `[egress]` hosts when it requests a governed transport
+/// ([`manifest_has_governed_transport`]), otherwise none. Empty as well when
+/// the manifest declares nothing.
 ///
 /// A declaration counts only with a transport that can use it. A row persists
 /// across `plugin remove`, so a grant seeded for a version that could not
@@ -305,34 +307,17 @@ pub fn channel_instance_row(
 /// the same package adds a transport. That later install meets an existing
 /// row, which is never extended, so the operator grants it deliberately.
 ///
-/// The two kinds of row count different transports, on purpose. A channel row
-/// counts any governed transport ([`manifest_has_governed_transport`]): a
-/// channel that speaks only over a socket, such as IRC, email or MQTT, or only
-/// over a WebSocket relay would otherwise never have its declaration seeded or
-/// its gap reported. The default tool binding keeps the rule the tool ceremony
-/// shipped with, `http_client` only, which predates the WebSocket and socket
-/// transports. Widening it changes what `plugin install` grants and what
-/// `plugin list` reports for tool packages already installed, so it is left to
-/// a change of its own. What `plugin install` and `plugin bind` seed and what
-/// `plugin list` reports all come from [`declared_hosts_for_row`], so each
-/// follows this rule and no other.
-#[must_use]
-pub fn row_has_usable_transport(manifest: &PluginManifest, row: &PluginInstanceRow) -> bool {
-    if row.is_channel() {
-        manifest_has_governed_transport(manifest)
-    } else {
-        manifest.permissions.contains(&PluginPermission::HttpClient)
-    }
-}
-
-/// The declared destinations `row`'s instance can use: the manifest's
-/// `[egress]` hosts when [`row_has_usable_transport`] holds, otherwise none.
-/// Empty as well when the manifest declares nothing.
+/// Every row counts the same transports, the default tool binding's as much as
+/// a channel instance's: a package that speaks only over a socket, such as
+/// IRC, email or MQTT, or only over a WebSocket relay would otherwise never
+/// have its declaration seeded or its gap reported. What `plugin install` and
+/// `plugin bind` seed and what `plugin list` reports all come from here, so
+/// each follows this rule and no other.
 ///
 /// This is the declaration, never a grant: nothing here confers network reach.
 #[must_use]
-pub fn declared_hosts_for_row(manifest: &PluginManifest, row: &PluginInstanceRow) -> Vec<String> {
-    if row_has_usable_transport(manifest, row) {
+pub fn declared_hosts_for_row(manifest: &PluginManifest, _row: &PluginInstanceRow) -> Vec<String> {
+    if manifest_has_governed_transport(manifest) {
         manifest.egress.hosts.clone()
     } else {
         Vec::new()

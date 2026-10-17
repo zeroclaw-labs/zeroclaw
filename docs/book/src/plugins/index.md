@@ -457,7 +457,11 @@ state on the command line, as described in
 
 - For a row it **creates**, it seeds the declaration into `egress_hosts`,
   prints each destination it granted, and prints the `zeroclaw config set`
-  command that edits the grant later.
+  command that edits the grant later. A declaration counts only when the
+  manifest requests a transport that can use it: `http_client`,
+  `websocket_client`, or `socket_client`. A declaration without one is not
+  seeded, and a later version that adds a transport meets the existing row,
+  which is never extended.
 - For a row that **already exists** (an upgrade, a reinstall, or a row you
   authored), it changes nothing. It prints the difference instead: destinations
   the manifest declares that the row does not grant, destinations the row
@@ -524,9 +528,9 @@ expands inside its double quotes, and a single quote is an ordinary character
 there), so it is never trusted with one.
 
 `zeroclaw plugin list` repeats the same comparison as a standing diagnostic,
-one instance at a time: the default tool binding of every installed tool plugin
-holding `http_client`, and every bound channel alias whose package holds
-`http_client`, `websocket_client`, or `socket_client`, printed as
+one instance at a time, for every installed plugin holding `http_client`,
+`websocket_client`, or `socket_client`: a tool plugin's default tool binding,
+printed as the package name, and every bound channel alias, printed as
 `package (plugin.<alias>)`. For each, one line names the destinations it
 declares that its row does not grant, since requests there are denied, plus the
 command that closes the gap; for an instance with no row yet, that command
@@ -534,14 +538,13 @@ creates the row with the grant. A channel instance with no row yet whose alias
 the config alias grammar rejects, such as a hand-written
 `[channels.plugin.ops-team]`, gets the grammar's reason and the table to rename
 instead, since the command that creates the row validates the whole
-configuration and would refuse that alias. A channel instance counts every
-transport the egress authority governs because a channel that speaks only over
+configuration and would refuse that alias. Every instance counts every
+transport the egress authority governs because a plugin that speaks only over
 a socket or a WebSocket, such as IRC or MQTT, would otherwise never be
-reported; a tool row keeps the `http_client` rule it shipped with. The reverse
-is never flagged. A grant with no matching declaration is a first-class path,
-not a finding: the plugin whose destination is deployment configuration (a
-self-hosted Gitea, a LAN Nextcloud) cannot have that host declared by its
-author, so you author it.
+reported. The reverse is never flagged. A grant with no matching declaration
+is a first-class path, not a finding: the plugin whose destination is
+deployment configuration (a self-hosted Gitea, a LAN Nextcloud) cannot have
+that host declared by its author, so you author it.
 
 When the instance's row still carries a pre-1.0 key (a package name rather than
 the `zpi1_…` key), `plugin list` always prints the rename described above,
@@ -746,8 +749,8 @@ still apply:
 
 - **Declaration versus grant.** Quickstart shows you the manifest's `[egress]`
   declaration, which grants nothing by itself. Whenever it creates a row for a
-  package whose manifest requests `http_client` and declares destinations, the
-  only declaration a created row is seeded with, you choose whether the new
+  package whose manifest requests a network transport and declares destinations,
+  the only declaration a created row is seeded with, you choose whether the new
   row grants them, whether the package is new or was already installed
   without its row. The question starts on installing without network access,
   which leaves `egress_hosts` empty and prints the command that grants the
@@ -758,8 +761,8 @@ still apply:
   Quickstart prints to create a missing row never grants network access; a
   grant is always a command of its own. The `plugin install --no-verify`
   command Quickstart prints for a plugin that fails the load check is the
-  plugin CLI's install, which, as always, seeds a row it creates with the
-  destinations the manifest declares for `http_client`.
+  plugin CLI's install, which seeds a row it creates with the destinations the
+  manifest declares for `http_client`, `websocket_client`, or `socket_client`.
 - **An existing row is never extended.** When the instance's
   `[[plugins.entries]]` row already exists, Quickstart leaves its
   `egress_hosts`, `egress_allow_private`, and settings exactly as they are. It

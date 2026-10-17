@@ -920,7 +920,7 @@ fn tool_row(
 /// Whether `zeroclaw plugin list` prints update steps for `row` of
 /// `manifest`'s package, with `config` as it stands: the lines it prints for
 /// one row under an accepted deployment
-/// ([`crate::instance_row_egress_gap_lines`]), which apply the row's own
+/// ([`crate::instance_row_egress_gap_lines`]), which apply the shared
 /// transport rule. Under a deployment-wide refusal it prints that refusal
 /// once, for every plugin, and no row's steps
 /// ([`crate::egress_deployment_gap_line`]).
@@ -1941,8 +1941,8 @@ fn install_unverified<P: QuickstartPrompter>(name: &str, prompter: &mut P) -> Pr
 /// Whether creating `row`, the default tool binding's row of `manifest`'s
 /// package, grants anything the operator must decide on: only when the
 /// declaration `plugin install` would seed into it is not empty. That rule,
-/// `http_client` and a declaration for a tool row, is
-/// [`declared_hosts_for_row`]'s; this does not restate it.
+/// a governed transport and a declaration, is [`declared_hosts_for_row`]'s;
+/// this does not restate it.
 fn asks_for_egress(manifest: &PluginManifest, row: &PluginInstanceRow) -> bool {
     !canonical_hosts(&declared_hosts_for_row(manifest, row)).is_empty()
 }
@@ -1983,22 +1983,12 @@ fn egress_decision<P: QuickstartPrompter>(
 
 /// The line for `row`, a row this run created, when `manifest` requests a
 /// transport the egress authority governs and the row was not offered a
-/// declaration to grant ([`asks_for_egress`]): its config entry grants
-/// nothing, and the line says what grants reach. `None` when the manifest
-/// requests no such transport, or the question decided the grant.
-///
-/// The manifest's own `[egress]` declaration tells the two cases apart, not
-/// the row's, which for a tool row counts only with `http_client`
-/// ([`declared_hosts_for_row`]):
-///
-/// - Nothing declared: the grant is the deployment's own hosts, which only
-///   the operator knows. The command carries no placeholder host, which would
-///   be written into the grant as printed; it refuses until the operator
-///   appends them.
-/// - Hosts declared for another transport, such as `websocket_client` or
-///   `socket_client` alone: the line names them, canonical and terminal-safe,
-///   as the summary listed them, and gives the command that grants exactly
-///   them. Running it stays the operator's act.
+/// declaration to grant ([`asks_for_egress`]): nothing usable is declared, so
+/// its config entry grants nothing. The grant is the deployment's own hosts,
+/// which only the operator knows. The command carries no placeholder host,
+/// which would be written into the grant as printed; it refuses until the
+/// operator appends them. `None` when the manifest requests no such
+/// transport, or the question decided the grant.
 fn ungranted_transport_line(
     config: &Config,
     manifest: &PluginManifest,
@@ -2007,30 +1997,16 @@ fn ungranted_transport_line(
     if !manifest_has_governed_transport(manifest) || asks_for_egress(manifest, row) {
         return None;
     }
-    let name = terminal_safe(&manifest.name);
-    let config_dir = crate::egress_command_config_dir(config);
-    let declared = canonical_hosts(&manifest.egress.hosts);
-    if declared.is_empty() {
-        let command = config_set_command_to_complete_for(
-            ShellDialect::host(),
-            config_dir,
-            &egress_hosts_path(&row.key),
-        );
-        return Some(qta(
-            "cli-quickstart-plugins-no-declared-hosts",
-            &[("name", &name), ("command", &command)],
-        ));
-    }
-    let hosts: Vec<String> = declared.iter().map(|host| terminal_safe(host)).collect();
+    let command = config_set_command_to_complete_for(
+        ShellDialect::host(),
+        crate::egress_command_config_dir(config),
+        &egress_hosts_path(&row.key),
+    );
     Some(qta(
-        "cli-quickstart-plugins-declared-hosts-not-granted",
+        "cli-quickstart-plugins-no-declared-hosts",
         &[
-            ("name", &name),
-            ("hosts", &hosts.join(", ")),
-            (
-                "command",
-                &egress_set_command(config_dir, &row.key, &declared),
-            ),
+            ("name", &terminal_safe(&manifest.name)),
+            ("command", &command),
         ],
     ))
 }
@@ -2302,8 +2278,8 @@ fn create_row_command(config: &Config, instance_key: &str) -> String {
 /// The optional line that follows [`create_row_command`]: the command that
 /// grants the destinations the manifest declares, which resolves once the row
 /// exists. `declared` is the declaration `plugin install` would seed into the
-/// row, [`declared_hosts_for_row`], which for a tool row counts only with
-/// `http_client`. `None` when it is empty, since there is nothing to grant.
+/// row, [`declared_hosts_for_row`]. `None` when it is empty, since there is
+/// nothing to grant.
 fn declared_grant_line(
     config: &Config,
     name: &str,
@@ -3359,14 +3335,12 @@ permissions = ["http_client"]
         server.verify().await;
     }
 
-    /// Destinations declared for a transport the tool row is not seeded for,
-    /// a WebSocket or a socket without `http_client`: nothing is asked and the
-    /// created row grants nothing, as with nothing declared. The line names
-    /// the declared hosts, as the summary listed them, and gives the command
-    /// that grants exactly those, never the line that says nothing is
-    /// declared.
+    /// Destinations declared for a WebSocket or a socket without `http_client`
+    /// are offered as HTTP destinations are: the network access question is
+    /// asked, starting closed, and granting seeds the created row with them.
+    /// The line that says nothing is declared is never printed.
     #[tokio::test]
-    async fn destinations_declared_for_another_transport_get_their_grant_command() {
+    async fn destinations_declared_for_a_websocket_or_socket_get_the_network_question() {
         const WS_HOST: &str = "ws.example.com";
         for transport in ["websocket_client", "socket_client"] {
             let manifest = format!(
@@ -3382,9 +3356,13 @@ permissions = ["http_client"]
             let server = MockServer::start().await;
             let selection = serve_manifest(&server, &manifest).await;
             let mut workspace = Workspace::new();
-            // Install the unsigned package anyway, then decline activation.
-            let mut prompter =
-                ScriptedPrompter::new([Answer::Confirm(Some(true)), Answer::Confirm(Some(false))]);
+            // Install the unsigned package anyway, grant the declared
+            // destination, then decline activation.
+            let mut prompter = ScriptedPrompter::new([
+                Answer::Confirm(Some(true)),
+                Answer::Select(Some(GRANT)),
+                Answer::Confirm(Some(false)),
+            ]);
 
             let phase = run(&mut workspace, &selection, &mut prompter)
                 .await
@@ -3398,15 +3376,20 @@ permissions = ["http_client"]
                 }],
                 "{transport}"
             );
+            assert_eq!(
+                prompter.select_defaults,
+                vec![WITHHOLD],
+                "{transport}: the network access question is asked, starting closed"
+            );
             assert!(
-                prompter.choice_lists.is_empty() && prompter.fields.is_empty(),
-                "{transport}: no network access or settings question"
+                prompter.fields.is_empty(),
+                "{transport}: no settings question"
             );
             let key = instance_key_of(&manifest);
             assert_eq!(
                 workspace.row(&key).map(|row| row.egress_hosts.clone()),
-                Some(Vec::new()),
-                "{transport}: the row is created with an empty grant"
+                Some(vec![WS_HOST.to_string()]),
+                "{transport}: granting seeds the created row with the declared host"
             );
             let output = prompter.output();
             assert!(
@@ -3415,27 +3398,6 @@ permissions = ["http_client"]
                     &[("list", WS_HOST)]
                 ))),
                 "{transport}: the summary lists the declared host: {output}"
-            );
-            let grant = egress_set_command(
-                crate::egress_command_config_dir(&workspace.config),
-                &key,
-                &[WS_HOST.to_string()],
-            );
-            assert!(
-                grant.contains("--config-dir") && grant.contains(&egress_hosts_path(&key)),
-                "{grant}"
-            );
-            assert!(
-                prompter.said.contains(&indented(&qta(
-                    "cli-quickstart-plugins-declared-hosts-not-granted",
-                    &[
-                        ("name", FIXTURE_NAME),
-                        ("hosts", WS_HOST),
-                        ("command", &grant)
-                    ],
-                ))),
-                "{transport}: the line names the declared host and the command that grants \
-                 it: {output}"
             );
             let nothing_declared = qta(
                 "cli-quickstart-plugins-no-declared-hosts",
@@ -4168,67 +4130,59 @@ permissions = ["http_client"]
         );
     }
 
+    /// An installed package that requests only a WebSocket or a socket and is
+    /// missing its row gets the fresh-install question for its declared
+    /// destinations, as an HTTP package does, and granting creates the row
+    /// with them.
     #[tokio::test]
-    async fn an_installed_package_missing_its_row_names_destinations_it_does_not_grant() {
+    async fn an_installed_non_http_package_missing_its_row_gets_the_fresh_install_decision() {
         const WS_HOST: &str = "ws.example.com";
-        let manifest = format!(
-            "name = \"{FIXTURE_NAME}\"\n\
-             version = \"0.1.0\"\n\
-             wasm_path = \"tool-fixture.wasm\"\n\
-             capabilities = [\"tool\"]\n\
-             permissions = [\"websocket_client\"]\n\
-             \n\
-             [egress]\n\
-             hosts = [\"{WS_HOST}\"]\n"
-        );
-        let server = MockServer::start().await;
-        serve_valid_archive(&server, 0).await;
-        let mut workspace = Workspace::new();
-        install_with_manifest(&workspace, FIXTURE_NAME, &manifest);
-        let selection = selection(fixture_entry(&server, Some(archive_digest())));
-        // No network access question for this transport; activation declined.
-        let mut prompter = ScriptedPrompter::new([Answer::Confirm(Some(false))]);
+        for transport in ["websocket_client", "socket_client"] {
+            let manifest = format!(
+                "name = \"{FIXTURE_NAME}\"\n\
+                 version = \"0.1.0\"\n\
+                 wasm_path = \"tool-fixture.wasm\"\n\
+                 capabilities = [\"tool\"]\n\
+                 permissions = [\"{transport}\"]\n\
+                 \n\
+                 [egress]\n\
+                 hosts = [\"{WS_HOST}\"]\n"
+            );
+            let server = MockServer::start().await;
+            serve_valid_archive(&server, 0).await;
+            let mut workspace = Workspace::new();
+            install_with_manifest(&workspace, FIXTURE_NAME, &manifest);
+            let selection = selection(fixture_entry(&server, Some(archive_digest())));
+            // The egress decision, then activation declined.
+            let mut prompter =
+                ScriptedPrompter::new([Answer::Select(Some(GRANT)), Answer::Confirm(Some(false))]);
 
-        let phase = run(&mut workspace, &selection, &mut prompter)
-            .await
-            .expect("the phase completes");
+            let phase = run(&mut workspace, &selection, &mut prompter)
+                .await
+                .expect("the phase completes");
 
-        prompter.assert_done();
-        assert_eq!(
-            phase.outcomes,
-            vec![PackageOutcome::AlreadyInstalled {
-                name: FIXTURE_NAME.to_string(),
-                seeded_row: true,
-            }]
-        );
-        assert!(
-            prompter.choice_lists.is_empty(),
-            "no network access question"
-        );
-        let key = instance_key_of(&manifest);
-        assert_eq!(
-            workspace.row(&key).map(|row| row.egress_hosts.clone()),
-            Some(Vec::new()),
-            "the missing row is created with an empty grant"
-        );
-        let grant = egress_set_command(
-            crate::egress_command_config_dir(&workspace.config),
-            &key,
-            &[WS_HOST.to_string()],
-        );
-        assert!(
-            prompter.said.contains(&indented(&qta(
-                "cli-quickstart-plugins-declared-hosts-not-granted",
-                &[
-                    ("name", FIXTURE_NAME),
-                    ("hosts", WS_HOST),
-                    ("command", &grant)
-                ],
-            ))),
-            "the created row's ungranted destinations are named with their grant command: {}",
-            prompter.output()
-        );
-        server.verify().await;
+            prompter.assert_done();
+            assert_eq!(
+                phase.outcomes,
+                vec![PackageOutcome::AlreadyInstalled {
+                    name: FIXTURE_NAME.to_string(),
+                    seeded_row: true,
+                }],
+                "{transport}"
+            );
+            assert_eq!(
+                prompter.select_defaults,
+                vec![WITHHOLD],
+                "{transport}: the fresh-install question is asked, starting closed"
+            );
+            let key = instance_key_of(&manifest);
+            assert_eq!(
+                workspace.row(&key).map(|row| row.egress_hosts.clone()),
+                Some(vec![WS_HOST.to_string()]),
+                "{transport}: granting creates the missing row with the declared host"
+            );
+            server.verify().await;
+        }
     }
 
     #[tokio::test]
@@ -4514,7 +4468,7 @@ permissions = ["http_client"]
 
     /// The status of an installed package whose legacy row `plugin list` does
     /// not report gives the rename without the `plugin list` command. That is
-    /// a tool without `http_client`, whose row `plugin list` never reports,
+    /// a tool without a governed transport, whose row `plugin list` never reports,
     /// and any tool under a deployment-wide refusal, which `plugin list`
     /// reports once in place of every row's steps. No command that creates or
     /// grants a row is printed either way.
@@ -4764,8 +4718,8 @@ wasm_path = "tool-fixture.wasm"
 capabilities = ["tool"]
 permissions = ["http_client"]
 "#;
-        // A declaration without `http_client`, the one transport it counts
-        // with: the row is owed, and nothing is granted from it.
+        // A declaration without a governed transport, the only transports it
+        // counts with: the row is owed, and nothing is granted from it.
         let offline = r#"name = "offline-tool"
 version = "0.1.0"
 wasm_path = "tool-fixture.wasm"
@@ -4829,7 +4783,8 @@ capabilities = ["tool"]
 
         // Each row the instance is owed comes with the command that creates
         // it with an empty grant. Only the manifest that declares a
-        // destination `http_client` can reach adds the separate grant line.
+        // destination a governed transport can reach adds the separate grant
+        // line.
         for (name, manifest, granted) in [
             ("net-tool", networked, true),
             ("open-tool", undeclared, false),
@@ -4861,7 +4816,7 @@ capabilities = ["tool"]
             assert_eq!(
                 text.contains(&format!("plugins.entries.{key}.egress_hosts")),
                 granted,
-                "{name}: a grant command only for a declaration `http_client` reaches: {text}"
+                "{name}: a grant command only for a declaration a transport reaches: {text}"
             );
         }
         assert!(

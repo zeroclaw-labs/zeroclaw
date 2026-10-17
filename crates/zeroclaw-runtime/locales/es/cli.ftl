@@ -737,7 +737,6 @@ cli-quickstart-plugins-missing-row = {$name} no tiene entrada de configuración,
 cli-quickstart-plugins-row-skipped = {$name} sigue instalado sin entrada de configuración, así que no alcanza ningún destino de red. Para crear más adelante la entrada sin acceso a la red, ejecuta: {$command}
 cli-quickstart-plugins-grant-declared-later = Para que {$name} alcance sus {$count} destino(s) declarados, ejecuta también esto después de crear la entrada: {$command}
 cli-quickstart-plugins-no-declared-hosts = {$name} solicita acceso a la red pero no declara destinos, así que su entrada de configuración no concede ninguno. Para conceder los hosts que usa tu despliegue, añádelos al final de este comando como un único valor separado por comas: {$command}
-cli-quickstart-plugins-declared-hosts-not-granted = {$name} declara estos destinos: {$hosts}. Quickstart solo ofrece conceder los destinos declarados a los complementos que solicitan http_client, así que su entrada de configuración no concede ninguno de ellos. Para concederlos, ejecuta: {$command}
 cli-quickstart-plugins-activation-heading = Activar los complementos habilita {$settings}, lo que activa:
 cli-quickstart-plugins-activation-tool = complemento de herramienta {$name}
 cli-quickstart-plugins-activation-skill = complemento de skill {$name}

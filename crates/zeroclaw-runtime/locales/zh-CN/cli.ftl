@@ -736,7 +736,6 @@ cli-quickstart-plugins-missing-row = {$name} 没有配置条目，因此 Quickst
 cli-quickstart-plugins-row-skipped = {$name} 仍已安装但没有配置条目，因此无法访问任何网络目标。之后可用以下命令创建不授予网络访问的条目：{$command}
 cli-quickstart-plugins-grant-declared-later = 如需让 {$name} 访问其声明的 {$count} 个目标，请在创建条目后再运行：{$command}
 cli-quickstart-plugins-no-declared-hosts = {$name} 请求网络访问，但未声明任何目标，因此其配置条目未授予任何目标。要授予你的部署所用的主机，请将这些主机作为一个以逗号分隔的值追加到此命令末尾：{$command}
-cli-quickstart-plugins-declared-hosts-not-granted = {$name} 声明了以下目标：{$hosts}。Quickstart 仅对请求 http_client 的插件提供授予声明目标的选项，因此其配置条目未授予其中任何目标。如需授予，请运行：{$command}
 cli-quickstart-plugins-activation-heading = 激活插件会开启 {$settings}，从而激活：
 cli-quickstart-plugins-activation-tool = 工具插件 {$name}
 cli-quickstart-plugins-activation-skill = 技能插件 {$name}

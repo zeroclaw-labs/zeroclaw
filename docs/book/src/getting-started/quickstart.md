@@ -131,7 +131,7 @@ at a time, through the pipeline `zeroclaw plugin install` uses:
    plugin that the daemon then skips at startup. That command is the plugin
    CLI, not Quickstart: it asks no signature question and no network access
    question, and a config entry it creates is seeded with the destinations the
-   manifest declares for `http_client`.
+   manifest declares for `http_client`, `websocket_client`, or `socket_client`.
 3. It prints what the plugin is and what it asks for: name, version, author,
    description, capabilities, permissions, and the network destinations its
    manifest declares. Publisher text is stripped of terminal control sequences
@@ -148,7 +148,8 @@ at a time, through the pipeline `zeroclaw plugin install` uses:
    `strict` mode such a plugin is refused at step 2 instead. When Quickstart
    can read the plugins directory, a picked plugin that is already installed
    shows the same line, without the question.
-5. For a plugin that requests `http_client` and declares destinations, you
+5. For a plugin that requests a network transport (`http_client`,
+   `websocket_client`, or `socket_client`) and declares destinations, you
    choose to grant the declared destinations, install without network access,
    or skip the plugin. The choice starts on installing without network access,
    so accepting it as offered grants nothing. Installing without network
@@ -161,11 +162,7 @@ at a time, through the pipeline `zeroclaw plugin install` uses:
    prints a `zeroclaw config set --no-interactive` command for the entry's
    `egress_hosts` with no value: append the hosts your deployment uses as one
    comma-separated value. Run as printed, that command is refused for the
-   missing value and writes nothing. A plugin that declares destinations and
-   requests `websocket_client` or `socket_client` but not `http_client` gets
-   no question either: its config entry grants none of them, and Quickstart
-   prints the `zeroclaw config set` command that grants exactly those
-   destinations.
+   missing value and writes nothing.
 6. For a plugin whose manifest has a `config_schema`, Quickstart prompts for
    the settings it describes: required properties first, optional ones only if
    you ask for them. Properties marked `x-secret` are masked as you type them,
@@ -206,8 +203,8 @@ settings only.
 
 A plugin that is already installed is not downloaded, upgraded, or prompted for
 settings again. Quickstart only creates its config entry when that entry is
-missing. A new entry is a new grant, so for a plugin that requests
-`http_client` and declares destinations you first see what the plugin is and
+missing. A new entry is a new grant, so for a plugin that requests a network
+transport and declares destinations you first see what the plugin is and
 make the same choice as for a fresh install: grant the declared destinations,
 create the entry without network access, or skip, which leaves the entry absent
 and prints the command that creates it later. That command creates the entry
@@ -266,14 +263,14 @@ satisfy that schema until the plugin's publisher fixes it. A plugin whose
 config entry is missing, for example because you skipped creating it, is not
 reported active either: `zeroclaw config set` only changes entries that exist,
 so its status prints the command that creates the entry instead. That command
-grants no network access; for a plugin that requests `http_client` and
+grants no network access; for a plugin that requests a network transport and
 declares destinations, a separate line gives the command that grants them once
 the entry exists. When the config still holds the plugin's pre-1.0 entry,
 named only after the package, its status prints neither command, since a new
 entry beside the old one would leave the old entry's settings and network grant
 behind. It names the instance key to rename the old entry to instead. When
 `zeroclaw plugin list` prints the update steps for that entry, which it does
-for a plugin that requests `http_client` unless the deployment refuses every
+for a plugin with a network transport unless the deployment refuses every
 plugin's network grant, the status also gives that command: its steps include
 any network grant the renamed entry still needs. A plugin with nothing to
 configure and no network access needs no config entry.
