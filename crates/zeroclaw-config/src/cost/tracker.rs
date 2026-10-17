@@ -743,7 +743,7 @@ impl CostTracker {
         let mut storage = self.lock_storage();
         storage.ensure_period_cache_current_at(period)?;
         let period = storage.reporting_period();
-        let records = storage.current_month_records(period)?;
+        let (records, _) = storage.current_month_records(period)?;
         Ok(build_model_stats(records.iter()))
     }
 
@@ -752,11 +752,11 @@ impl CostTracker {
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
     ) -> Result<CostSummary> {
-        let (daily_cost, monthly_cost, records) = {
+        let (daily_cost, monthly_cost, records, rejected_records) = {
             let mut storage = self.lock_storage();
             let (d, m) = storage.get_aggregated_costs()?;
-            let recs = storage.records_in_bounds(from, to)?;
-            (d, m, recs)
+            let (recs, rejected) = storage.records_in_bounds(from, to)?;
+            (d, m, recs, rejected)
         };
         let total_cost: f64 = records.iter().map(|r| r.usage.cost_usd).sum();
         let total_tokens: u64 = records.iter().map(|r| r.usage.total_tokens).sum();
@@ -773,6 +773,7 @@ impl CostTracker {
             monthly_cost_usd: monthly_cost,
             total_tokens,
             request_count,
+            rejected_records,
             by_model,
             by_agent,
         })
@@ -826,14 +827,14 @@ impl CostTracker {
         agent_filter: Option<&str>,
         period: ReportingPeriod,
     ) -> Result<CostSummary> {
-        let (daily_cost, monthly_cost, period, current_month_records) = {
+        let (daily_cost, monthly_cost, period, current_month_records, rejected_records) = {
             let mut storage = self.lock_storage();
             storage.ensure_period_cache_current_at(period)?;
             let period = storage.reporting_period();
             let daily_cost = storage.daily_cost_usd;
             let monthly_cost = storage.monthly_cost_usd;
-            let records = storage.current_month_records(period)?;
-            (daily_cost, monthly_cost, period, records)
+            let (records, rejected) = storage.current_month_records(period)?;
+            (daily_cost, monthly_cost, period, records, rejected)
         };
 
         let (session_cost, total_tokens, request_count) = {
@@ -895,6 +896,7 @@ impl CostTracker {
             monthly_cost_usd: monthly_total,
             total_tokens,
             request_count,
+            rejected_records,
             by_model,
             by_agent,
         })
@@ -1132,6 +1134,8 @@ struct CostSummaryAccumulator {
     total_tokens: u64,
     /// Number of scanned usage records.
     request_count: usize,
+    /// Ledger lines the scan could not read as complete records.
+    rejected_records: usize,
     /// Per-model rollup keyed by model id.
     by_model: HashMap<String, ModelStats>,
     /// Per-agent rollup keyed by agent alias.
@@ -1160,6 +1164,7 @@ impl CostSummaryAccumulator {
             monthly_cost_usd: self.monthly_cost,
             total_tokens: self.total_tokens,
             request_count: self.request_count,
+            rejected_records: self.rejected_records,
             by_model: self.by_model,
             by_agent: self.by_agent,
         }
@@ -1266,12 +1271,18 @@ impl CostStorage {
         Ok(())
     }
 
-    fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
+    /// Scan every non-empty ledger line, handing each complete record to
+    /// `on_record`. Returns the number of lines that could not be read as
+    /// complete records: a line whose single parse fails and whose
+    /// concatenated-record recovery also fails leaves unreadable bytes
+    /// behind. Callers use that count to report the ledger as incomplete;
+    /// the raw lines are never rewritten.
+    fn for_each_record<F>(&self, mut on_record: F) -> Result<usize>
     where
         F: FnMut(CostRecord),
     {
         if !self.path.exists() {
-            return Ok(());
+            return Ok(0);
         }
 
         let file = File::open(&self.path).with_context(|| {
@@ -1282,6 +1293,7 @@ impl CostStorage {
         })?;
         let reader = BufReader::new(file);
 
+        let mut rejected_records = 0_usize;
         for (line_number, line) in reader.lines().enumerate() {
             let raw_line = line.with_context(|| {
                 format!(
@@ -1298,9 +1310,11 @@ impl CostStorage {
 
             match serde_json::from_str::<CostRecord>(trimmed) {
                 Ok(record) => on_record(record),
-                Err(_) => {
-                    if let Err(error) = Self::recover_concatenated_records(trimmed, &mut on_record)
+                Err(parse_error) => {
+                    if let Err(recovery_error) =
+                        Self::recover_concatenated_records(trimmed, &mut on_record)
                     {
+                        rejected_records += 1;
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -1311,7 +1325,8 @@ impl CostStorage {
                             .with_attrs(::serde_json::json!({
                                 "path": self.path.display().to_string(),
                                 "line": line_number + 1,
-                                "error": error.to_string(),
+                                "parse_error": parse_error.to_string(),
+                                "recovery_error": recovery_error.to_string(),
                             })),
                             "skipping malformed cost record"
                         );
@@ -1320,7 +1335,7 @@ impl CostStorage {
             }
         }
 
-        Ok(())
+        Ok(rejected_records)
     }
 
     fn rebuild_aggregates(&mut self, day: NaiveDate, year: i32, month: u32) -> Result<()> {
@@ -1463,23 +1478,23 @@ impl CostStorage {
     /// Snapshot every record whose timestamp falls within the current
     /// calendar month. Used to build per-agent rollups without folding a
     /// new aggregate table into the JSONL file.
-    fn current_month_records(&self, period: ReportingPeriod) -> Result<Vec<CostRecord>> {
+    fn current_month_records(&self, period: ReportingPeriod) -> Result<(Vec<CostRecord>, usize)> {
         let mut out = Vec::new();
-        self.for_each_record(|record| {
+        let rejected_records = self.for_each_record(|record| {
             if period.contains_month(record.usage.timestamp) {
                 out.push(record);
             }
         })?;
-        Ok(out)
+        Ok((out, rejected_records))
     }
 
     fn records_in_bounds(
         &mut self,
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
-    ) -> Result<Vec<CostRecord>> {
+    ) -> Result<(Vec<CostRecord>, usize)> {
         let mut out = Vec::new();
-        self.for_each_record(|record| {
+        let rejected_records = self.for_each_record(|record| {
             let ts = record.usage.timestamp;
             if from.is_some_and(|f| ts < f) {
                 return;
@@ -1489,18 +1504,19 @@ impl CostStorage {
             }
             out.push(record);
         })?;
-        Ok(out)
+        Ok((out, rejected_records))
     }
 
     fn summary_for_task(&mut self, task_id: &str, period: ReportingPeriod) -> Result<CostSummary> {
         self.ensure_period_cache_current_at(period)?;
         let period = self.reporting_period();
         let mut summary = CostSummaryAccumulator::default();
-        self.for_each_record(|record| {
+        let rejected_records = self.for_each_record(|record| {
             if record.task_id.as_deref() == Some(task_id) {
                 summary.record(&record, period);
             }
         })?;
+        summary.rejected_records = rejected_records;
         Ok(summary.finish())
     }
 
@@ -3572,5 +3588,113 @@ mod tests {
             ),
             "day D must read zero descendant spend: the older record was dropped"
         );
+    }
+
+    #[test]
+    fn torn_trailing_line_is_reported_as_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let valid_usage = TokenUsage::new("test/model", 1000, 0, 0, 1.0, 1.0, 0.0);
+        let valid_record = CostRecord::new("session-a", valid_usage.clone());
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&storage_path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(&valid_record).unwrap()).unwrap();
+        // A daemon killed mid-append leaves a truncated object at EOF.
+        writeln!(
+            file,
+            "{{\"usage\":{{\"timestamp\":\"2026-10-01T12:00:00Z\",\"cost_usd\":0.5"
+        )
+        .unwrap();
+        file.sync_all().unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let summary = tracker.get_summary_in_bounds(None, None).unwrap();
+
+        assert_eq!(summary.request_count, 1, "the intact record still counts");
+        assert!((summary.session_cost_usd - valid_usage.cost_usd).abs() < f64::EPSILON);
+        // `/api/cost` serializes `CostSummary` directly, so the wire field is
+        // what tells a consumer the totals above are incomplete.
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["rejected_records"], serde_json::json!(1));
+
+        // The torn bytes stay on disk: the reader never rewrites the ledger.
+        let raw = fs::read_to_string(&storage_path).unwrap();
+        assert!(raw.contains("\"cost_usd\":0.5"));
+    }
+
+    #[test]
+    fn torn_tail_after_a_complete_record_is_reported_as_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let valid_usage = TokenUsage::new("test/model", 1000, 0, 0, 1.0, 1.0, 0.0);
+        let valid_record = CostRecord::new("session-a", valid_usage);
+
+        // Concatenated-record recovery keeps the complete prefix, but the
+        // unreadable tail still makes the line incomplete.
+        let mut line = serde_json::to_string(&valid_record).unwrap();
+        line.push_str("{\"usage\":{\"timestamp\":\"2026-10-01T12:00:00Z\",\"cost_usd\":0.5");
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&storage_path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+        file.sync_all().unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let summary = tracker.get_summary_in_bounds(None, None).unwrap();
+
+        assert_eq!(summary.request_count, 1, "recovery keeps the prefix");
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["rejected_records"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn fully_recovered_concatenated_records_are_not_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let first = CostRecord::new(
+            "session-a",
+            TokenUsage::new("test/model", 1000, 0, 0, 1.0, 1.0, 0.0),
+        );
+        let second = CostRecord::new(
+            "session-b",
+            TokenUsage::new("test/model", 2000, 0, 0, 1.0, 1.0, 0.0),
+        );
+
+        let mut line = serde_json::to_string(&first).unwrap();
+        line.push_str(&serde_json::to_string(&second).unwrap());
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&storage_path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+        file.sync_all().unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let summary = tracker.get_summary_in_bounds(None, None).unwrap();
+
+        assert_eq!(summary.request_count, 2, "both complete records count");
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["rejected_records"], serde_json::json!(0));
     }
 }
