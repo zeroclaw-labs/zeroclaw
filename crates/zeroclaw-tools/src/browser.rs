@@ -2809,6 +2809,10 @@ mod tests {
             BrowserBackendKind::AgentBrowser
         );
         assert_eq!(
+            BrowserBackendKind::parse(" AGENT-BROWSER ").unwrap(),
+            BrowserBackendKind::AgentBrowser
+        );
+        assert_eq!(
             BrowserBackendKind::parse("rust-native").unwrap(),
             BrowserBackendKind::RustNative
         );
