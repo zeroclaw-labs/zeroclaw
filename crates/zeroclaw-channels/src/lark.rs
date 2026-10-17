@@ -1639,10 +1639,30 @@ impl LarkChannel {
                                 None => continue,
                             }
                         }
-                        "post" => match parse_post_content_details(&lark_msg.content) {
-                            Some(details) => (details.text, details.mentioned_open_ids),
-                            None => continue,
-                        },
+                        "post" => {
+                            let (mut text, mentioned) =
+                                match parse_post_content_details(&lark_msg.content) {
+                                    Some(details) => (details.text, details.mentioned_open_ids),
+                                    None => (String::new(), Vec::new()),
+                                };
+                            for image_key in extract_post_image_keys(&lark_msg.content) {
+                                let marker = match self
+                                    .download_image_as_marker(&lark_msg.message_id, &image_key)
+                                    .await
+                                {
+                                    Some(marker) => marker,
+                                    None => {
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"image_key": image_key})), "WS: failed to download image in post");
+                                        format!("[IMAGE:{image_key} | download failed]")
+                                    }
+                                };
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(&marker);
+                            }
+                            (text, mentioned)
+                        }
                         "image" => {
                             let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
                                 Ok(v) => v,
@@ -2703,10 +2723,38 @@ impl LarkChannel {
                     None => return messages,
                 }
             }
-            "post" => match parse_post_content_details(content_str) {
-                Some(details) => (details.text, details.mentioned_open_ids),
-                None => return messages,
-            },
+            "post" => {
+                let (mut text, mentioned) = match parse_post_content_details(content_str) {
+                    Some(details) => (details.text, details.mentioned_open_ids),
+                    None => (String::new(), Vec::new()),
+                };
+                for image_key in extract_post_image_keys(content_str) {
+                    let marker = match self
+                        .download_image_as_marker(evt_message_id, &image_key)
+                        .await
+                    {
+                        Some(marker) => marker,
+                        None => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"key": image_key})),
+                                "failed to download image in post"
+                            );
+                            format!("[IMAGE:{image_key} | download failed]")
+                        }
+                    };
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&marker);
+                }
+                (text, mentioned)
+            }
             "image" => {
                 let image_key = serde_json::from_str::<serde_json::Value>(content_str)
                     .ok()
@@ -4080,6 +4128,14 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
             parsed
                 .as_object()
                 .and_then(|m| m.values().find(|v| v.is_object()))
+        })
+        .or_else(|| {
+            // Flat post bodies (no `zh_cn`/`en_us` wrapper) carry `title` and
+            // `content` at the top level; use the body itself as the locale.
+            parsed
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|_| &parsed)
         })?;
 
     let mut text = String::new();
@@ -4154,6 +4210,39 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
             mentioned_open_ids,
         })
     }
+}
+
+/// Collect `img` element `image_key`s from a Feishu post body, in order and
+/// deduplicated (the same key may appear under `content` and `content_v2`).
+fn extract_post_image_keys(content: &str) -> Vec<String> {
+    fn walk(value: &serde_json::Value, keys: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, keys);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if map.get("tag").and_then(|t| t.as_str()) == Some("img")
+                    && let Some(key) = map.get("image_key").and_then(|k| k.as_str())
+                    && !keys.iter().any(|k| k == key)
+                {
+                    keys.push(key.to_string());
+                }
+                for value in map.values() {
+                    walk(value, keys);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    walk(&parsed, &mut keys);
+    keys
 }
 
 fn parse_list_content(content: &str) -> Option<String> {
@@ -4314,6 +4403,25 @@ mod tests {
 
     fn make_channel() -> LarkChannel {
         make_channel_with_peers(vec!["ou_testuser123".into()])
+    }
+
+    #[test]
+    fn flat_post_with_image_parses_text_and_image_keys() {
+        // Real payload shape from a Feishu "图文" (post) message: no
+        // `zh_cn`/`en_us` wrapper, top-level `title`/`content`, and an `img`
+        // element whose image_key must be collected for download.
+        let content = r#"{"title":"","content":[[{"tag":"img","image_key":"img_v3_02161_test","width":156,"height":84}],[{"tag":"text","text":" 图里显示什么","style":[]}]],"content_v2":[[{"tag":"img","image_key":"img_v3_02161_test","width":156,"height":84}],[{"tag":"text","text":" 图里显示什么","style":[]}]]}"#;
+
+        let details = parse_post_content_details(content).expect("flat post should parse");
+        assert!(
+            details.text.contains("图里显示什么"),
+            "unexpected text: {:?}",
+            details.text
+        );
+
+        // `content_v2` repeats the same key; the extractor deduplicates.
+        let keys = extract_post_image_keys(content);
+        assert_eq!(keys, vec!["img_v3_02161_test".to_string()]);
     }
 
     async fn post_lark_challenge(
