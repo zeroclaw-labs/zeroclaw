@@ -82,10 +82,12 @@ fn resolve_audio_format(file_name: &str) -> Result<(String, &'static str)> {
                 .with_attrs(::serde_json::json!({"extension": extension})),
             "transcription: unsupported audio format"
         );
-        anyhow::Error::msg(format!(
+        // The same bytes fail this check deterministically: payload-specific,
+        // terminal, safe to acknowledge upstream.
+        anyhow::Error::from(TranscriptionError::permanent(format!(
             "Unsupported audio format '.{extension}'. \
              accepted: flac, mp3, mp4, mpeg, mpga, m4a, ogg, opus, wav, webm"
-        ))
+        )))
     })?;
     Ok((normalized_name, mime))
 }
@@ -94,12 +96,154 @@ fn resolve_audio_format(file_name: &str) -> Result<(String, &'static str)> {
 /// Enforces the 25 MB cloud API cap. Returns `(normalized_filename, mime_type)` on success.
 fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'static str)> {
     if audio_data.len() > MAX_AUDIO_BYTES {
-        bail!(
+        return Err(TranscriptionError::permanent(format!(
             "Audio file too large ({} bytes, max {MAX_AUDIO_BYTES})",
             audio_data.len()
-        );
+        ))
+        .into());
     }
     resolve_audio_format(file_name)
+}
+
+// ── Failure classification ──────────────────────────────────────
+
+/// Whether retrying a failed transcription with the *same* audio payload can
+/// ever succeed.
+///
+/// Channels that acknowledge vendor updates (Telegram long polling) must not
+/// retry a rejection that is terminal for this audio: the update pins the
+/// acknowledgement offset and head-of-line blocks every later message.
+/// Classification is deliberately conservative - the same rule the
+/// Telegram `getFile` classifier follows: only a substantiated,
+/// payload-specific terminal rejection is `Permanent`. Credential,
+/// configuration, rate-limit, and service-availability failures stay
+/// `Transient`, because retrying a recoverable failure is safe while
+/// skipping a recoverable one loses a message.
+#[cfg(any(feature = "channel-telegram", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranscriptionFailure {
+    /// Retrying the same audio may succeed: transport failure, timeout,
+    /// 408/429/5xx, 401/403 credentials, unrecognised or state-dependent 4xx,
+    /// malformed vendor response, unclassified error.
+    Transient,
+    /// Retrying the same audio can never succeed: the vendor or the local
+    /// pre-flight validation rejected *this payload* - over the size limit
+    /// (413 or a local byte cap) or in an unsupported format (415 or a local
+    /// extension check). Safe to acknowledge and move past.
+    Permanent,
+}
+
+/// A transcription failure carrying its retry classification.
+///
+/// Providers return this inside the `anyhow` chain so channels can recover
+/// the classification with [`failure_kind`] and choose between acknowledging
+/// the update and retrying it.
+#[derive(Debug)]
+pub(crate) struct TranscriptionError {
+    /// Retry classification read back with [`failure_kind`]; only compiled
+    /// when a channel that acknowledges vendor updates consumes it.
+    #[cfg(any(feature = "channel-telegram", test))]
+    kind: TranscriptionFailure,
+    message: String,
+}
+
+impl TranscriptionError {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            #[cfg(any(feature = "channel-telegram", test))]
+            kind: TranscriptionFailure::Permanent,
+            message: message.into(),
+        }
+    }
+
+    /// Build a classified error from an HTTP status (see
+    /// [`classify_transcription_http_status`]).
+    fn from_status(status: reqwest::StatusCode, message: impl Into<String>) -> Self {
+        #[cfg(not(any(feature = "channel-telegram", test)))]
+        let _ = status;
+        Self {
+            #[cfg(any(feature = "channel-telegram", test))]
+            kind: classify_transcription_http_status(status),
+            message: message.into(),
+        }
+    }
+
+    /// Explicitly retryable error for steps that do NOT carry the raw audio
+    /// payload. A 413/415 on an AssemblyAI `create`/`poll` JSON request is a
+    /// metadata-level failure, not a payload rejection: classifying it as
+    /// permanent would acknowledge and drop the audio on a transient fault.
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            #[cfg(any(feature = "channel-telegram", test))]
+            kind: TranscriptionFailure::Transient,
+            message: message.into(),
+        }
+    }
+}
+
+/// Extract an operator-readable detail string from a failed transcription
+/// HTTP response WITHOUT assuming the body is JSON.
+///
+/// Upstream proxies, CDNs, and gateways answer 413/415 with plain-text or
+/// HTML error pages; attempting `resp.json()` first would fail with an
+/// untyped parse error and misclassify a permanent payload rejection as a
+/// retryable transient one. When the body happens to be JSON, pull the
+/// vendor error message out of it; otherwise keep the raw body text.
+async fn error_body_detail(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let trimmed = body.trim();
+    let message = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|value| {
+            value["err_msg"]
+                .as_str()
+                .or_else(|| value["error"].as_str())
+                .or_else(|| value["error"]["message"].as_str())
+                .map(str::to_string)
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| trimmed.to_string());
+    format!("{status}: {message}")
+}
+
+impl std::fmt::Display for TranscriptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for TranscriptionError {}
+
+/// Classify an HTTP status from a transcription endpoint.
+///
+/// Only 413 (Payload Too Large) and 415 (Unsupported Media Type) are
+/// substantiated payload-specific terminal rejections: the same bytes will
+/// be rejected again no matter how often they are resent. A blanket 4xx rule
+/// would also swallow credential (401/403), rate-limit (409/425/429), and
+/// ambiguous 400/404/422 responses that may resolve once the operator fixes
+/// the deployment - exactly the distinction the acknowledgement contract
+/// requires. Everything
+/// unrecognised stays transient and is retried instead.
+#[cfg(any(feature = "channel-telegram", test))]
+fn classify_transcription_http_status(status: reqwest::StatusCode) -> TranscriptionFailure {
+    match status.as_u16() {
+        413 | 415 => TranscriptionFailure::Permanent,
+        _ => TranscriptionFailure::Transient,
+    }
+}
+
+/// Recover the retry classification from a transcription error chain.
+///
+/// Defaults to `Transient` when no [`TranscriptionError`] is in the chain:
+/// absence of evidence is not evidence of permanence, so transport errors,
+/// timeouts, and legacy plain-string failures all stay retryable.
+#[cfg(any(feature = "channel-telegram", test))]
+pub(crate) fn failure_kind(error: &anyhow::Error) -> TranscriptionFailure {
+    error
+        .downcast_ref::<TranscriptionError>()
+        .map(|classified| classified.kind)
+        .unwrap_or(TranscriptionFailure::Transient)
 }
 
 // ── TranscriptionProvider trait ─────────────────────────────────
@@ -428,18 +572,18 @@ impl TranscriptionProvider for DeepgramProvider {
             .context("Failed to send transcription request to Deepgram")?;
 
         let status = resp.status();
+        if !status.is_success() {
+            return Err(TranscriptionError::from_status(
+                status,
+                format!("Deepgram API error ({})", error_body_detail(resp).await),
+            )
+            .into());
+        }
+
         let body: serde_json::Value = resp
             .json()
             .await
             .context("Failed to parse Deepgram response")?;
-
-        if !status.is_success() {
-            let error_msg = body["err_msg"]
-                .as_str()
-                .or_else(|| body["error"].as_str())
-                .unwrap_or("unknown error");
-            bail!("Deepgram API error ({}): {}", status, error_msg);
-        }
 
         let text = body["results"]["channels"][0]["alternatives"][0]["transcript"]
             .as_str()
@@ -456,6 +600,10 @@ impl TranscriptionProvider for DeepgramProvider {
 pub struct AssemblyAiProvider {
     alias: String,
     api_key: String,
+    /// Base URL for the AssemblyAI v2 API. Production constructors pin the
+    /// public endpoint; the field exists so tests can point the provider at a
+    /// local mock server.
+    api_base: String,
 }
 
 impl AssemblyAiProvider {
@@ -474,6 +622,7 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            api_base: "https://api.assemblyai.com/v2".to_string(),
         })
     }
 
@@ -497,6 +646,7 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            api_base: "https://api.assemblyai.com/v2".to_string(),
         })
     }
 }
@@ -515,7 +665,7 @@ impl TranscriptionProvider for AssemblyAiProvider {
 
         // Step 1: Upload the audio file.
         let upload_resp = client
-            .post("https://api.assemblyai.com/v2/upload")
+            .post(format!("{}/upload", self.api_base))
             .header("Authorization", &self.api_key)
             .header("Content-Type", "application/octet-stream")
             .body(audio_data.to_vec())
@@ -525,15 +675,21 @@ impl TranscriptionProvider for AssemblyAiProvider {
             .context("Failed to upload audio to AssemblyAI")?;
 
         let upload_status = upload_resp.status();
+        if !upload_status.is_success() {
+            return Err(TranscriptionError::from_status(
+                upload_status,
+                format!(
+                    "AssemblyAI upload error ({})",
+                    error_body_detail(upload_resp).await
+                ),
+            )
+            .into());
+        }
+
         let upload_body: serde_json::Value = upload_resp
             .json()
             .await
             .context("Failed to parse AssemblyAI upload response")?;
-
-        if !upload_status.is_success() {
-            let error_msg = upload_body["error"].as_str().unwrap_or("unknown error");
-            bail!("AssemblyAI upload error ({}): {}", upload_status, error_msg);
-        }
 
         let upload_url = upload_body["upload_url"]
             .as_str()
@@ -545,7 +701,7 @@ impl TranscriptionProvider for AssemblyAiProvider {
         });
 
         let create_resp = client
-            .post("https://api.assemblyai.com/v2/transcript")
+            .post(format!("{}/transcript", self.api_base))
             .header("Authorization", &self.api_key)
             .json(&transcript_req)
             .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
@@ -554,26 +710,27 @@ impl TranscriptionProvider for AssemblyAiProvider {
             .context("Failed to create AssemblyAI transcription")?;
 
         let create_status = create_resp.status();
+        if !create_status.is_success() {
+            // Step 2 exchanges JSON metadata (no raw audio bytes): a 413/415
+            // here is NOT a payload rejection and must stay retryable.
+            return Err(TranscriptionError::transient(format!(
+                "AssemblyAI transcription error ({})",
+                error_body_detail(create_resp).await
+            ))
+            .into());
+        }
+
         let create_body: serde_json::Value = create_resp
             .json()
             .await
             .context("Failed to parse AssemblyAI create response")?;
-
-        if !create_status.is_success() {
-            let error_msg = create_body["error"].as_str().unwrap_or("unknown error");
-            bail!(
-                "AssemblyAI transcription error ({}): {}",
-                create_status,
-                error_msg
-            );
-        }
 
         let transcript_id = create_body["id"]
             .as_str()
             .context("AssemblyAI response missing 'id'")?;
 
         // Step 3: Poll for completion.
-        let poll_url = format!("https://api.assemblyai.com/v2/transcript/{transcript_id}");
+        let poll_url = format!("{}/transcript/{transcript_id}", self.api_base);
         let poll_interval = std::time::Duration::from_secs(3);
         let poll_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
 
@@ -589,15 +746,20 @@ impl TranscriptionProvider for AssemblyAiProvider {
                 .context("Failed to poll AssemblyAI transcription")?;
 
             let poll_status = poll_resp.status();
+            if !poll_status.is_success() {
+                // Same as the create step: JSON polling carries no audio
+                // payload, so even 413/415 stays a retryable failure.
+                return Err(TranscriptionError::transient(format!(
+                    "AssemblyAI poll error ({})",
+                    error_body_detail(poll_resp).await
+                ))
+                .into());
+            }
+
             let poll_body: serde_json::Value = poll_resp
                 .json()
                 .await
                 .context("Failed to parse AssemblyAI poll response")?;
-
-            if !poll_status.is_success() {
-                let error_msg = poll_body["error"].as_str().unwrap_or("unknown poll error");
-                bail!("AssemblyAI poll error ({}): {}", poll_status, error_msg);
-            }
 
             let status_str = poll_body["status"].as_str().unwrap_or("unknown");
 
@@ -630,6 +792,9 @@ pub struct GoogleSttProvider {
     alias: String,
     api_key: String,
     language_code: String,
+    /// Recognize endpoint. Production constructors pin the public endpoint;
+    /// the field exists so tests can point the provider at a local mock server.
+    endpoint: String,
 }
 
 impl GoogleSttProvider {
@@ -649,6 +814,7 @@ impl GoogleSttProvider {
             alias: alias.to_string(),
             api_key,
             language_code: config.language_code.clone(),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
         })
     }
 
@@ -678,6 +844,7 @@ impl GoogleSttProvider {
                 .clone()
                 .filter(|language| !language.trim().is_empty())
                 .unwrap_or_else(|| "en-US".to_string()),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
         })
     }
 
@@ -692,7 +859,7 @@ impl GoogleSttProvider {
     fn build_request(&self, request_body: &serde_json::Value) -> Result<reqwest::RequestBuilder> {
         Ok(
             zeroclaw_config::schema::build_runtime_proxy_client("transcription.google")
-                .post(GOOGLE_STT_ENDPOINT)
+                .post(&self.endpoint)
                 .header(GOOGLE_API_KEY_HEADER, self.sensitive_api_key_header()?)
                 .json(request_body)
                 .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS)),
@@ -727,8 +894,17 @@ impl TranscriptionProvider for GoogleSttProvider {
             Some("ogg" | "opus") => "OGG_OPUS",
             Some("mp3") => "MP3",
             Some("webm") => "WEBM_OPUS",
-            Some(ext) => bail!("Google STT does not support '.{ext}' input"),
-            None => bail!("Google STT requires a file extension"),
+            Some(ext) => {
+                return Err(TranscriptionError::permanent(format!(
+                    "Google STT does not support '.{ext}' input"
+                ))
+                .into());
+            }
+            None => {
+                return Err(
+                    TranscriptionError::permanent("Google STT requires a file extension").into(),
+                );
+            }
         };
 
         let audio_content =
@@ -752,15 +928,18 @@ impl TranscriptionProvider for GoogleSttProvider {
             .context("Failed to send transcription request to Google STT")?;
 
         let status = resp.status();
+        if !status.is_success() {
+            return Err(TranscriptionError::from_status(
+                status,
+                format!("Google STT API error ({})", error_body_detail(resp).await),
+            )
+            .into());
+        }
+
         let body: serde_json::Value = resp
             .json()
             .await
             .context("Failed to parse Google STT response")?;
-
-        if !status.is_success() {
-            let error_msg = body["error"]["message"].as_str().unwrap_or("unknown error");
-            bail!("Google STT API error ({}): {}", status, error_msg);
-        }
 
         let text = body["results"][0]["alternatives"][0]["transcript"]
             .as_str()
@@ -870,11 +1049,12 @@ impl TranscriptionProvider for LocalWhisperProvider {
 
     async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
         if audio_data.len() > self.max_audio_bytes {
-            bail!(
+            return Err(TranscriptionError::permanent(format!(
                 "Audio file too large ({} bytes, local_whisper max {})",
                 audio_data.len(),
                 self.max_audio_bytes
-            );
+            ))
+            .into());
         }
 
         let (normalized_name, mime) = resolve_audio_format(file_name)?;
@@ -914,7 +1094,11 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        bail!("Transcription API error ({}): {}", status, body.trim());
+        return Err(TranscriptionError::from_status(
+            status,
+            format!("Transcription API error ({}): {}", status, body.trim()),
+        )
+        .into());
     }
 
     let body: serde_json::Value = resp
@@ -1194,11 +1378,12 @@ impl TranscriptionManager {
         if let Some(max_audio_bytes) = self.max_audio_bytes
             && audio_data.len() > max_audio_bytes
         {
-            bail!(
+            return Err(TranscriptionError::permanent(format!(
                 "Audio file too large ({} bytes, global max {})",
                 audio_data.len(),
                 max_audio_bytes
-            );
+            ))
+            .into());
         }
         Ok(())
     }
@@ -1939,6 +2124,7 @@ mod tests {
             alias: "default".to_string(),
             api_key: "api-key-123".to_string(),
             language_code: "en-US".to_string(),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
         };
         let body = serde_json::json!({
             "config": { "languageCode": "en-US" },
@@ -1975,6 +2161,7 @@ mod tests {
             alias: "default".to_string(),
             api_key: api_key.to_string(),
             language_code: "en-US".to_string(),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
         };
 
         let err = match provider.build_request(&serde_json::json!({})) {
@@ -2895,5 +3082,252 @@ mod channel_builder_tests {
             manager_from_snapshot(&enabled_but_empty).is_none(),
             "a manager that cannot be built is reported once and the channel stays up"
         );
+    }
+
+    // ── Failure classification ────────────────────────────────────
+
+    #[test]
+    fn http_status_classification_is_terminal_only_for_payload_specific_rejections() {
+        for code in [413_u16, 415] {
+            assert_eq!(
+                classify_transcription_http_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                TranscriptionFailure::Permanent,
+                "{code} rejects this payload no matter how often it is resent"
+            );
+        }
+        // Everything else stays retryable: credential (401/403), rate-limit
+        // (408/409/425/429), ambiguous 4xx, and every 5xx can resolve once
+        // the deployment or the service recovers. A blanket 4xx rule would
+        // discard those messages permanently - the distinction this
+        // classification exists to keep.
+        for code in [
+            400_u16, 401, 403, 404, 408, 409, 422, 425, 429, 451, 500, 502, 503,
+        ] {
+            assert_eq!(
+                classify_transcription_http_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                TranscriptionFailure::Transient,
+                "{code} can resolve without changing the payload"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_kind_defaults_to_transient_without_classified_error_in_chain() {
+        let plain = anyhow::Error::msg("Failed to send transcription request to Groq");
+        assert_eq!(failure_kind(&plain), TranscriptionFailure::Transient);
+        let wrapped = anyhow::Error::msg("outer context").context("inner");
+        assert_eq!(failure_kind(&wrapped), TranscriptionFailure::Transient);
+    }
+
+    #[test]
+    fn failure_kind_recovers_classification_through_context_layers() {
+        let classified: anyhow::Error =
+            TranscriptionError::permanent("Audio file too large (10 bytes, max 5)").into();
+        let wrapped = classified.context("transcribe failed");
+        assert_eq!(failure_kind(&wrapped), TranscriptionFailure::Permanent);
+    }
+
+    #[test]
+    fn local_validation_rejections_are_classified_permanent() {
+        let big = vec![0u8; MAX_AUDIO_BYTES + 1];
+        let too_large = validate_audio(&big, "test.ogg").unwrap_err();
+        assert_eq!(
+            failure_kind(&too_large),
+            TranscriptionFailure::Permanent,
+            "the same bytes fail the byte cap deterministically"
+        );
+        let unsupported = validate_audio(&[0u8; 100], "test.aac").unwrap_err();
+        assert_eq!(
+            failure_kind(&unsupported),
+            TranscriptionFailure::Permanent,
+            "the same filename fails the format check deterministically"
+        );
+        // Error text must stay operator-readable through the typed wrapper.
+        assert!(too_large.to_string().contains("too large"));
+        assert!(unsupported.to_string().contains("Unsupported audio format"));
+    }
+
+    #[tokio::test]
+    async fn whisper_style_http_errors_carry_the_classification() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(413).set_body_string("audio duration exceeds limit"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .mount(&server)
+            .await;
+
+        let config = TranscriptionConfig {
+            api_key: Some("test-groq-key".to_string()),
+            api_url: server.uri(),
+            ..TranscriptionConfig::default()
+        };
+        let provider = GroqProvider::from_config("groq", &config).unwrap();
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Permanent);
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Transient);
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Transient);
+    }
+
+    #[tokio::test]
+    async fn deepgram_non_json_413_is_classified_permanent() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A proxy/CDN in front of Deepgram answers 413 with an HTML page.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(413)
+                    .set_body_string("<html>413 Request Entity Too Large</html>"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // A native Deepgram JSON error body keeps the vendor message readable.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(413)
+                    .set_body_json(serde_json::json!({"err_msg": "payload too large"})),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = DeepgramProvider {
+            alias: "deepgram".to_string(),
+            api_url: server.uri(),
+            api_key: "test-key".to_string(),
+            model: "nova-2".to_string(),
+            language: None,
+        };
+
+        // Non-JSON 413: must NOT fall into the JSON-parse failure path (that
+        // untyped error would classify as Transient and retry the same bytes).
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Permanent);
+        assert!(err.to_string().contains("413"));
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Permanent);
+        assert!(err.to_string().contains("payload too large"));
+    }
+
+    #[tokio::test]
+    async fn assemblyai_upload_413_is_permanent_but_metadata_413_stays_transient() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Case 1: the upload step carries raw audio bytes - a 413 there IS a
+        // payload rejection and must classify permanent.
+        Mock::given(method("POST"))
+            .and(path("/v2/upload"))
+            .respond_with(
+                ResponseTemplate::new(413).set_body_string("nginx: 413 Request Entity Too Large"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Case 2: upload succeeds, then the JSON metadata request is answered
+        // with a non-JSON 413 - no audio bytes are involved, so this stays
+        // retryable instead of acknowledging and dropping the audio.
+        Mock::given(method("POST"))
+            .and(path("/v2/upload"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"upload_url": "https://cdn.example/voice.ogg"}),
+                ),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/transcript"))
+            .respond_with(ResponseTemplate::new(413).set_body_string("<html>413</html>"))
+            .mount(&server)
+            .await;
+
+        let provider = AssemblyAiProvider {
+            alias: "assemblyai".to_string(),
+            api_key: "test-key".to_string(),
+            api_base: format!("{}/v2", server.uri()),
+        };
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure_kind(&err),
+            TranscriptionFailure::Permanent,
+            "upload-step 413 rejects the payload itself"
+        );
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure_kind(&err),
+            TranscriptionFailure::Transient,
+            "metadata-step 413 carries no audio and must stay retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_stt_non_json_413_is_classified_permanent() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(413).set_body_string("request too large"))
+            .mount(&server)
+            .await;
+
+        let provider = GoogleSttProvider {
+            alias: "google".to_string(),
+            api_key: "test-key".to_string(),
+            language_code: "en-US".to_string(),
+            endpoint: server.uri(),
+        };
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Permanent);
+        assert!(err.to_string().contains("413"));
     }
 }
