@@ -121,7 +121,7 @@ fn shell_command(command: &CodingCliCommand) -> String {
         .join(" ")
 }
 
-fn shell_escape(value: &std::ffi::OsStr) -> String {
+pub(crate) fn shell_escape(value: &std::ffi::OsStr) -> String {
     let value = value.to_string_lossy();
     if value
         .chars()
