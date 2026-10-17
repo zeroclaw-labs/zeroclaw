@@ -276,6 +276,9 @@ struct ExistsProbe {
 struct ExistsState {
     entries: HashMap<String, (bool, Instant)>,
     pending: HashSet<String>,
+    /// A lookup was skipped because every slot was busy. The next finished
+    /// check bumps `generation` so the skipped path is asked for again.
+    starved: bool,
 }
 
 impl ExistsProbe {
@@ -297,7 +300,9 @@ impl ExistsProbe {
         {
             return exists;
         }
-        if !state.pending.contains(path) && state.pending.len() < MAX_PENDING_CHECKS {
+        if !state.pending.contains(path) && state.pending.len() >= MAX_PENDING_CHECKS {
+            state.starved = true;
+        } else if !state.pending.contains(path) {
             state.pending.insert(path.to_string());
             let owned = path.to_string();
             let spawned = std::thread::Builder::new()
@@ -323,7 +328,8 @@ impl ExistsProbe {
             state.entries.clear();
         }
         state.entries.insert(path, (exists, Instant::now()));
-        if shown != exists {
+        let starved = std::mem::take(&mut state.starved);
+        if shown != exists || starved {
             self.generation.fetch_add(1, Ordering::AcqRel);
         }
     }
@@ -530,6 +536,36 @@ mod tests {
         probe.wait_idle();
         assert_eq!(probe.generation.load(Ordering::Acquire), 1);
         assert!(probe.lookup("/slow/mount/file"));
+    }
+
+    #[test]
+    fn a_lookup_skipped_while_busy_triggers_a_retry() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let probe: &'static ExistsProbe =
+            Box::leak(Box::new(ExistsProbe::new(Box::new(move |path| {
+                if path.starts_with("/slow/") {
+                    let _ = release_rx.lock().unwrap().recv();
+                    return false;
+                }
+                true
+            }))));
+        for idx in 0..MAX_PENDING_CHECKS {
+            assert!(!probe.lookup(&format!("/slow/{idx}")));
+        }
+        assert!(!probe.lookup("/fast/file"), "every slot is busy");
+
+        for _ in 0..MAX_PENDING_CHECKS {
+            release_tx.send(()).unwrap();
+        }
+        probe.wait_idle();
+        assert!(
+            probe.generation.load(Ordering::Acquire) > 0,
+            "a freed slot must ask the pane to retry the skipped path"
+        );
+        assert!(!probe.lookup("/fast/file"), "retry schedules the check");
+        probe.wait_idle();
+        assert!(probe.lookup("/fast/file"));
     }
 
     #[test]
