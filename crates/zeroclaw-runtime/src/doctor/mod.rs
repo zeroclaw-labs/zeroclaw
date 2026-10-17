@@ -2467,24 +2467,69 @@ mod tests {
         assert_eq!(ch_item.unwrap().severity, Severity::Warn);
     }
 
+    /// The Codex argument warning is raised where the tool is compiled in. In
+    /// a build without it, an enabled `[codex_cli]` is reported once, as
+    /// compiled out, and its arguments, which reach no process, are not.
     #[test]
-    fn diagnose_surfaces_codex_cli_security_boundary_warning() {
+    fn diagnose_surfaces_codex_cli_warnings_for_the_build() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
         let mut config = Config::default();
+        config.codex_cli.enabled = true;
         config.codex_cli.extra_args =
             vec!["--sandbox".to_string(), "danger-full-access".to_string()];
 
         let results = diagnose(&config);
-        let warning = results.iter().find(|item| {
+        let argument_warning = results.iter().find(|item| {
             item.category == "config"
                 && item.severity == Severity::Warn
                 && item.message.contains("Codex CLI argument")
                 && item.message.contains("--sandbox")
                 && item.message.contains("codex_cli.extra_args[0]")
         });
-        assert!(
-            warning.is_some(),
-            "doctor should surface the canonical Codex CLI warning: {results:?}"
-        );
+        let compiled_out = results
+            .iter()
+            .filter(|item| item.message.contains("tool-codex-cli"))
+            .count();
+        if OptInTool::CodexCli.compiled() {
+            assert!(
+                argument_warning.is_some(),
+                "doctor should surface the canonical Codex CLI warning: {results:?}"
+            );
+            assert_eq!(compiled_out, 0, "{results:?}");
+        } else {
+            assert!(argument_warning.is_none(), "{results:?}");
+            assert_eq!(compiled_out, 1, "{results:?}");
+        }
+    }
+
+    /// A build without an opt-in tool reports an enabled section for it once,
+    /// as compiled out, and nothing about the tool's own settings; a build
+    /// with the tool reports no such line.
+    #[test]
+    fn diagnose_reports_an_enabled_tool_the_build_lacks_once() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
+
+        let results = diagnose(&config);
+        let compiled_out: Vec<_> = results
+            .iter()
+            .filter(|item| item.message.contains("tool-project-intel"))
+            .collect();
+        if OptInTool::ProjectIntel.compiled() {
+            assert!(compiled_out.is_empty(), "{results:?}");
+        } else {
+            assert_eq!(compiled_out.len(), 1, "{results:?}");
+            assert_eq!(compiled_out[0].severity, Severity::Warn);
+            assert!(compiled_out[0].message.contains("project_intel.enabled"));
+            assert!(
+                !results
+                    .iter()
+                    .any(|item| item.message.contains("templates_dir")),
+                "nothing about the settings of a tool the build lacks: {results:?}"
+            );
+        }
     }
 
     #[test]

@@ -8,12 +8,14 @@ import contextlib
 import http.client
 import io
 import json
+import socket
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -295,6 +297,100 @@ class PluginSmokeProviderTest(unittest.TestCase):
             provider.main(["one-line", "--text=--hello"])
 
         self.assertEqual(output.getvalue(), "--hello\n")
+
+
+class PluginSmokeProviderLiteralIdentityTest(unittest.TestCase):
+    def test_serves_and_releases_listener_without_reverse_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch(
+                "http.server.socket.getfqdn",
+                side_effect=AssertionError("reverse lookup must not run"),
+            ) as lookup:
+                closed_sockets = []
+                original_close = provider.ThreadingHTTPServer.server_close
+
+                def close_control(server: provider.ThreadingHTTPServer) -> None:
+                    original_close(server)
+                    closed_sockets.append(server.socket)
+
+                control = None
+                with mock.patch.object(
+                    provider.ThreadingHTTPServer, "server_close", new=close_control
+                ):
+                    try:
+                        with self.assertRaisesRegex(
+                            AssertionError, "reverse lookup must not run"
+                        ):
+                            control = provider.ThreadingHTTPServer(
+                                ("127.0.0.1", 0),
+                                provider.make_handler(
+                                    Path(directory) / "control.log",
+                                    Path(directory) / "control.script",
+                                ),
+                            )
+                    finally:
+                        if control is not None:
+                            control.server_close()
+                self.assertEqual(len(closed_sockets), 1)
+                self.assertEqual(closed_sockets[0].fileno(), -1)
+                lookup.assert_called_once_with("127.0.0.1")
+                lookup.reset_mock()
+
+                running = RunningProvider(Path(directory))
+                try:
+                    running.__enter__()
+                    port_text = running.port_file.read_text().strip()
+                    self.assertTrue(port_text.isdecimal())
+                    port = int(port_text)
+                    self.assertGreater(port, 0)
+                    self.assertLessEqual(port, 65535)
+                    running.set_script("config-echo")
+
+                    first = running.post(
+                        {"messages": [USER], "tools": [OTHER_TOOL, ECHO_TOOL]}
+                    )
+                    choice = first["choices"][0]
+                    self.assertEqual(choice["finish_reason"], "tool_calls")
+                    call = choice["message"]["tool_calls"][0]["function"]
+                    self.assertEqual(call["name"], "config-echo")
+                    self.assertEqual(call["arguments"], ARGUMENTS)
+
+                    second = running.post(
+                        {
+                            "messages": [
+                                USER,
+                                asked_for("config-echo"),
+                                answered("text=HELLO"),
+                            ],
+                            "tools": [OTHER_TOOL, ECHO_TOOL],
+                        }
+                    )
+                    self.assertEqual(second["choices"][0]["finish_reason"], "stop")
+                    self.assertEqual(
+                        second["choices"][0]["message"]["content"],
+                        provider.TURN_COMPLETE,
+                    )
+                    self.assertEqual(
+                        running.summary("config-echo"),
+                        {
+                            "requests": "2",
+                            "tools_offered": "2",
+                            "offered": "yes",
+                            "tool_name": "config-echo",
+                            "tool_results": "1",
+                            "tool_result": "text=HELLO",
+                        },
+                    )
+                finally:
+                    if running.thread.ident is not None:
+                        running.__exit__(None, None, None)
+                    self.assertFalse(running.thread.is_alive())
+
+                lookup.assert_not_called()
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    listener.bind(("127.0.0.1", port))
+                    listener.listen(1)
 
 
 if __name__ == "__main__":

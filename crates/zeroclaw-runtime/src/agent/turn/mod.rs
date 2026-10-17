@@ -7068,6 +7068,7 @@ mod sop_step_reassembly_tests {
             },
             ..Config::default()
         };
+        config.tools.optional = vec!["file_download".into()];
         config.risk_profiles.insert(
             "stepper".to_string(),
             RiskProfileConfig {

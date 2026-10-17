@@ -83,6 +83,9 @@ pub struct ToolSearchTool {
 }
 
 impl ToolSearchTool {
+    /// The native creator's callable name; ownership is claimed on creation.
+    pub const NAME: &'static str = "tool_search";
+
     pub fn new(deferred: DeferredMcpToolSet, activated: Arc<Mutex<ActivatedToolSet>>) -> Self {
         Self {
             deferred: Mutex::new(Some(deferred)),
@@ -174,7 +177,7 @@ impl ToolSearchTool {
 #[async_trait]
 impl Tool for ToolSearchTool {
     fn name(&self) -> &str {
-        "tool_search"
+        Self::NAME
     }
 
     fn description(&self) -> &str {

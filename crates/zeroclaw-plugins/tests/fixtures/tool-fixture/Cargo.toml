@@ -12,6 +12,7 @@ doctest = false
 test = false
 
 [features]
+namespace-tool-search = []
 namespace-mcp-tool = []
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

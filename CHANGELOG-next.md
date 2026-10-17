@@ -10,6 +10,17 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 - **Plugin and skill boundaries get substantially tighter:** typed instance configuration, scoped secrets, host-owned egress, bounded exports, path-traversal protection, and fail-closed skill HTTP execution now cover the main package and network trust boundaries (#9126, #9128, #9137, #9403, #9582, #10369, GHSA-93f6-34w8-5g98).
 - **Operator feedback improves across surfaces:** Matrix, Telegram, Slack, WhatsApp Web, SOP, MCP, logs, queued messages, and clipboard flows expose clearer progress and recovery behavior (#8443, #9822, #8985, #9385, #9476, #9196, #10057, #10096).
 - **Release portability improves:** routine builders move to Rust 1.98 while source compatibility remains at Rust 1.96, release tools use pinned binaries, MUSL and Alpine coverage expands, and the coordinated 23-crate workspace gains protected crates.io publication (#9527, #10122, #10174, #9286, #9514, #10158).
+- **Tool selection:** Full stays the default; minimal is an opt-in `[tools]` setting.
+  Set `optional = []` for minimal: eleven built-ins in Chat and eight in Code/ACP,
+  or name extras to add to it. Setup and config generation write `optional = ["*"]`,
+  and configs without `[tools]` or `optional` load full. Existing explicit
+  selections are preserved. Prerequisites, permissions, approvals and Code/ACP
+  memory exclusions still apply.
+- **Build capabilities:** `dist` adds a plugin host and Cranelift; minimal changes the runtime catalog.
+  Standard builds still carry native compatibility adapters. Plugin activation,
+  trust and grants remain explicit. Minimal alone does not establish optimized
+  binary-size savings. The ten-target archive matrix and names are unchanged;
+  Android remains experimental.
 
 ## What's New
 

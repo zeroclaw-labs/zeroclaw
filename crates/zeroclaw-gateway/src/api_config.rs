@@ -4683,6 +4683,54 @@ mod tests {
         );
     }
 
+    /// Enabling an opt-in tool through the config API follows the build. A
+    /// build without Microsoft 365 saves the section without its credentials
+    /// and says once that the tool is compiled out; a build with it still
+    /// refuses the section until its credentials are set.
+    #[tokio::test]
+    async fn patch_enabling_an_opt_in_tool_follows_whether_the_build_carries_it() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([{
+                    "op": "replace",
+                    "path": "/microsoft365/enabled",
+                    "value": true
+                }])),
+            )
+            .await,
+        )
+        .await;
+
+        if OptInTool::Microsoft365.compiled() {
+            assert_ne!(status, StatusCode::OK, "{json}");
+            assert!(
+                json.to_string().contains("microsoft365.tenant_id"),
+                "{json}"
+            );
+            assert!(!state.config.read().microsoft365.enabled);
+        } else {
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["saved"], true);
+            assert!(state.config.read().microsoft365.enabled);
+            let compiled_out: Vec<_> = json["warnings"]
+                .as_array()
+                .expect("warnings is an array")
+                .iter()
+                .filter(|warning| warning["code"] == "tool_compiled_out")
+                .collect();
+            assert_eq!(compiled_out.len(), 1, "{json}");
+            assert_eq!(compiled_out[0]["path"], "microsoft365.enabled");
+        }
+    }
+
     #[tokio::test]
     async fn patch_allow_from_deny_all_persists_and_reloads_tool_policy() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5529,6 +5577,31 @@ mod tests {
         // Don't save — file does not exist.
         let drift = compute_drift(&cfg).await;
         assert!(drift.is_empty());
+    }
+
+    /// An upgraded file without `[tools]`, or with a `[tools]` section that
+    /// omits `optional`, loads full both through the loader and through the
+    /// plain parse drift compares against, so it reports no drift.
+    #[tokio::test]
+    async fn compute_drift_ignores_an_omitted_tools_selector() {
+        let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
+        for raw in [
+            format!("schema_version = {version}\n"),
+            format!("schema_version = {version}\n[tools]\n"),
+        ] {
+            let (_tmp, path) = temp_config_path();
+            tokio::fs::write(&path, &raw).await.unwrap();
+            let mut cfg = zeroclaw_config::migration::migrate_to_current_salvaged(&raw).config;
+            cfg.config_path = path.clone();
+            assert_eq!(cfg.tools.optional, ["*"], "{raw}");
+
+            let drift = try_compute_drift(&cfg).await.expect("drift");
+            assert!(
+                drift.iter().all(|entry| !entry.path.starts_with("tools")),
+                "{raw}: {drift:?}"
+            );
+            assert!(drift.is_empty(), "{raw}: {drift:?}");
+        }
     }
 
     #[tokio::test]
