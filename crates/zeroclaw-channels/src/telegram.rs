@@ -3182,8 +3182,21 @@ impl TelegramChannel {
         }
     }
 
+    /// Message body for an ordinary or edited inbound update.
+    ///
+    /// Telegram delivers edits as `edited_message` (and channel posts as
+    /// `edited_channel_post`). The long-poll used to request only `message`,
+    /// so an edit that added an @-mention never reached the mention gate.
+    fn update_message<'a>(update: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+        update
+            .get("message")
+            .or_else(|| update.get("edited_message"))
+            .or_else(|| update.get("channel_post"))
+            .or_else(|| update.get("edited_channel_post"))
+    }
+
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
-        let message = update.get("message")?;
+        let message = Self::update_message(update)?;
         let chat_id = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
@@ -3196,7 +3209,7 @@ impl TelegramChannel {
     }
 
     fn extract_media_group_key(update: &serde_json::Value) -> Option<MediaGroupKey> {
-        let message = update.get("message")?;
+        let message = Self::update_message(update)?;
         let chat_id = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
@@ -3213,8 +3226,7 @@ impl TelegramChannel {
     }
 
     fn update_message_id(update: &serde_json::Value) -> Option<i64> {
-        update
-            .get("message")
+        Self::update_message(update)
             .and_then(|message| message.get("message_id"))
             .and_then(serde_json::Value::as_i64)
     }
@@ -5665,7 +5677,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
-        let message = update.get("message")?;
+        let message = Self::update_message(update)?;
 
         let text = message.get("text").and_then(serde_json::Value::as_str)?;
 
@@ -8094,7 +8106,7 @@ impl Channel for TelegramChannel {
                 "offset": offset,
                 "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": 0,
-                "allowed_updates": ["message", "callback_query"]
+                "allowed_updates": ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"]
             });
             match self.http_client().post(&url).json(&probe).send().await {
                 Err(e) => {
@@ -8222,7 +8234,7 @@ impl Channel for TelegramChannel {
                 "offset": offset,
                 "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": poll_timeout_secs,
-                "allowed_updates": ["message", "callback_query"]
+                "allowed_updates": ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"]
             });
 
             let resp = match self.http_client().post(&url).json(&body).send().await {
@@ -16489,6 +16501,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_message_accepts_edited_message_mention() {
+        // Regression for #11713: an edit that adds @bot must be visible to the
+        // mention gate. Telegram delivers that as `edited_message`.
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 12,
+            "edited_message": {
+                "message_id": 45,
+                "text": "please help @mybot",
+                "edit_date": 1_700_000_000,
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "group"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("edited_message with an @-mention must parse");
+        assert!(parsed.content.contains("please help"));
+    }
+
+    #[test]
     fn parse_update_message_mention_only_group_preserves_mention_in_body() {
         let mention_only = true;
         let ch = TelegramChannel::new(
@@ -23057,7 +23108,13 @@ mod tests {
 
         let mock_server = MockServer::start().await;
         let get_updates_path = r"/bot[^/]+/getUpdates$";
-        let allowed_updates = serde_json::json!(["message", "callback_query"]);
+        let allowed_updates = serde_json::json!([
+            "message",
+            "edited_message",
+            "channel_post",
+            "edited_channel_post",
+            "callback_query"
+        ]);
 
         Mock::given(method("POST"))
             .and(path_regex(get_updates_path))
