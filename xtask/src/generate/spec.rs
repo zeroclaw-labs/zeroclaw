@@ -972,9 +972,10 @@ pub enum Selection {
     /// registry-owned distribution additions. The set a single-artifact
     /// package manager ships.
     Dist,
-    /// Measurement-only broad distribution: `Dist` plus the canonical
-    /// `channels-full` aggregate. Not offered by installer menus until a
-    /// stable broad artifact lifecycle exists.
+    /// Broad distribution: `Dist` plus the canonical `channels-full`
+    /// aggregate, published as the multi-arch `dist-broad` container image for
+    /// channels outside the lean standard distribution. Still not offered by
+    /// installer menus.
     DistBroad,
     /// Every selectable feature (all − non_row − pure-alias). The docker
     /// `:all-features` kitchen sink.
