@@ -114,6 +114,12 @@ fn append_project_context(
 
 /// Build the default system prompt.
 ///
+/// This convenience wrapper (like [`build_system_prompt_with_tool_calls`] and
+/// [`build_system_prompt_with_mode`]) describes a messaging-channel surface, so
+/// existing channel callers keep their prompt unchanged. A caller that is not
+/// a messaging channel should use [`build_system_prompt_with_mode_and_autonomy`]
+/// and pass `is_messaging_channel_turn: false`.
+///
 /// Reports no shell: callers that know their runtime adapter should use
 /// [`build_system_prompt_with_mode_and_autonomy`] and pass its
 /// `shell_profile` so the model is told which dialect to write.
@@ -164,6 +170,7 @@ pub fn build_system_prompt_with_tool_calls(
         true,
         show_tool_calls,
         None,
+        true,
     )
 }
 
@@ -197,6 +204,7 @@ pub fn build_system_prompt_with_mode(
         true,
         false,
         None,
+        true,
     )
 }
 
@@ -225,6 +233,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // guidance entirely). Resolved from `RuntimeAdapter::shell_profile` so the
     // reported shell cannot drift from the executed one.
     shell_profile: Option<&ShellProfile>,
+    // Whether this turn is on a messaging channel surface. The caller owns
+    // this per-turn fact; it must not come from process-wide channel config.
+    is_messaging_channel_turn: bool,
 ) -> String {
     build_system_prompt_with_mode_and_effective_tools(
         workspace_dir,
@@ -242,6 +253,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         inject_memory,
         show_tool_calls,
         shell_profile,
+        is_messaging_channel_turn,
     )
 }
 
@@ -266,6 +278,9 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     inject_memory: bool,
     show_tool_calls: bool,
     shell_profile: Option<&ShellProfile>,
+    // Whether this turn is on a messaging channel surface. The caller owns
+    // this per-turn fact; it must not come from process-wide channel config.
+    is_messaging_channel_turn: bool,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -542,9 +557,10 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         }
     }
 
-    // ── 8. Channel Capabilities (full copy skipped in compact_context
-    //       mode; the timestamp orientation below emits in both modes) ──
-    if !compact_context {
+    // ── 8. Channel Capabilities (full copy skipped in compact_context mode
+    //       and for non-messaging surfaces; the timestamp orientation below
+    //       emits in both modes) ──
+    if !compact_context && is_messaging_channel_turn {
         prompt.push_str("## Channel Capabilities\n\n");
         prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
         prompt
@@ -570,7 +586,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
             prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
         }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
-    } // end if !compact_context (full Channel Capabilities copy)
+    } // end full Channel Capabilities copy
 
     // Emitted unconditionally: small local models mistake the enrichment
     // prefix for log/API data without this orientation. The prefix format
@@ -829,6 +845,7 @@ mod tests {
             false,
             false,
             None,
+            true,
         );
 
         assert!(prompt.contains("INLINE_FALLBACK_INSTRUCTIONS"));
@@ -851,6 +868,7 @@ mod tests {
             true,
             false,
             None,
+            true,
         )
     }
 
@@ -876,6 +894,7 @@ mod tests {
             true,
             false,
             None,
+            true,
         )
     }
 
@@ -902,6 +921,7 @@ mod tests {
             true,
             false,
             shell_profile,
+            false,
         )
     }
 
@@ -1037,6 +1057,7 @@ mod tests {
             true,
             false,
             Some(&profile),
+            false,
         );
         assert!(
             !prompt.contains("## Shell"),
@@ -1179,6 +1200,7 @@ mod tests {
             true,
             false,
             None,
+            true,
         )
     }
 
@@ -1436,6 +1458,7 @@ mod tests {
             true,
             false,
             None,
+            true,
         );
 
         let safety = prompt.find("## Safety").expect("safety framing");
@@ -1491,6 +1514,7 @@ mod tests {
             true,
             false,
             None,
+            true,
         );
 
         assert_eq!(prompt.chars().count(), 8_000);
@@ -1863,6 +1887,68 @@ mod tests {
         assert!(
             !prompt.contains("Full autonomy removes the approval prompt"),
             "must not claim Full unconditionally removes prompts"
+        );
+    }
+
+    /// The CLI / coding surface must not be told it is a messaging bot.
+    ///
+    /// `## Channel Capabilities` states that the agent's reply is delivered to a
+    /// user's channel and describes voice-note/TTS behaviour. That is correct for
+    /// chat surfaces and actively misleading everywhere else: a model running the
+    /// agent loop under it self-describes as "a personal assistant" with no coding
+    /// persona. Fails on the old behaviour, which emitted the section for every
+    /// surface.
+    #[test]
+    fn channel_capabilities_are_omitted_for_non_channel_surfaces() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let tools: Vec<(&str, &str)> = vec![("file_edit", "edit files")];
+
+        let channel = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "m",
+            &tools,
+            &[],
+            None,
+            None,
+            None,
+            true,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
+            false,
+            0,
+            true,
+            false,
+            None,
+            true,
+        );
+        let cli = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "m",
+            &tools,
+            &[],
+            None,
+            None,
+            None,
+            true,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
+            false,
+            0,
+            true,
+            false,
+            None,
+            false,
+        );
+
+        assert!(
+            channel.contains("Channel Capabilities"),
+            "chat surfaces must keep the channel section"
+        );
+        assert!(
+            !cli.contains("Channel Capabilities"),
+            "CLI surface must not receive the channel section"
+        );
+        assert!(
+            !cli.contains("messaging bot"),
+            "CLI surface must not be told it is a messaging bot"
         );
     }
 }
