@@ -1,3 +1,6 @@
+use crate::backup_codec::{
+    BACKUP_KEY_DOMAIN, BackupFormat, FORMAT_FILE, PayloadCodec, is_payload_rejection, random_salt,
+};
 use crate::helpers::filesystem_boundary::{
     FilesystemBoundaryError, copy_file_atomic, create_dir_path_nofollow,
     open_absolute_dir_nofollow, open_dir_nofollow, open_file_nofollow, write_file_atomic,
@@ -13,6 +16,38 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
+use zeroclaw_config::secrets::SecretStore;
+use zeroize::Zeroizing;
+
+/// Output directory used before `destination_dir` was honoured. Backups there
+/// stay listable, verifiable, and restorable after the destination changes.
+const LEGACY_BACKUPS_DIR: &str = "backups";
+
+/// Where backups are written and how their files are stored.
+#[derive(Clone)]
+pub struct BackupOptions {
+    /// Output directory, relative to the shared data directory.
+    pub destination_dir: String,
+    /// Gzip each stored file.
+    pub compress: bool,
+    /// Encrypt each stored file with a key derived from `key_store`.
+    pub encrypt: bool,
+    /// Holds the install key. New backups need it only when `encrypt` is on;
+    /// encrypted backups always need it to be verified or restored.
+    pub key_store: Option<SecretStore>,
+}
+
+impl Default for BackupOptions {
+    /// Plain copies under `backups/`, the behaviour of the legacy constructors.
+    fn default() -> Self {
+        Self {
+            destination_dir: LEGACY_BACKUPS_DIR.to_string(),
+            compress: false,
+            encrypt: false,
+            key_store: None,
+        }
+    }
+}
 
 /// Shared-data backup tool: create, list, verify, and restore timestamped backups
 /// with SHA-256 manifest integrity checking.
@@ -22,6 +57,7 @@ pub struct BackupTool {
     include_dirs: Vec<String>,
     max_keep: usize,
     security: Arc<SecurityPolicy>,
+    options: BackupOptions,
 }
 
 impl BackupTool {
@@ -63,7 +99,15 @@ impl BackupTool {
             include_dirs,
             max_keep,
             security: Arc::new(scoped_security),
+            options: BackupOptions::default(),
         }
+    }
+
+    /// Apply the configured destination, compression, and encryption.
+    #[must_use]
+    pub fn with_options(mut self, options: BackupOptions) -> Self {
+        self.options = options;
+        self
     }
 
     fn cmd_create(
@@ -75,18 +119,20 @@ impl BackupTool {
             return Ok(rejected(tool_text("tool-backup-error-max-keep")));
         }
 
+        let destination = self.destination()?;
+
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         let name = format!("backup-{ts}");
         let (workspace_path, workspace) = self.open_workspace()?;
-        let backups_path = workspace_path.join("backups");
-        self.authorize_write(&backups_path)?;
+        let backups_path = workspace_path.join(&destination);
+        self.authorize_write_prefixes(&workspace_path, &destination)?;
 
         // Validate every source tree before creating the backup directory so
         // a stable symlink rejection cannot leave a partial backup behind.
         let mut sources = Vec::new();
         for sub in &self.include_dirs {
             let relative = contained_relative_path(sub)?.to_path_buf();
-            if overlaps_backups_output(&relative) {
+            if self.overlaps_output(&relative)? {
                 return Ok(rejected(tool_text_arg(
                     "tool-backup-error-source-overlap",
                     "path",
@@ -105,11 +151,24 @@ impl BackupTool {
             }
         }
 
+        // Resolve the payload encoding before writing anything: when encryption
+        // cannot be honoured the backup is refused, never written as plaintext.
+        let (codec, format) = match self.new_backup_encoding() {
+            Ok(encoding) => encoding,
+            Err(reason) => {
+                return Ok(rejected(tool_text_arg(
+                    "tool-backup-error-encrypt-unavailable",
+                    "reason",
+                    &reason,
+                )));
+            }
+        };
+
         #[cfg(windows)]
         {
             let existing = open_dir_no_symlinks_checked(
                 &workspace,
-                Path::new("backups"),
+                &destination,
                 &workspace_path,
                 &self.security,
             )?
@@ -126,6 +185,9 @@ impl BackupTool {
         let backup_path = backups_path.join(&name);
         self.authorize_write(&backup_path)?;
         self.authorize_write(&backup_path.join("manifest.json"))?;
+        if format.is_some() {
+            self.authorize_write(&backup_path.join(FORMAT_FILE))?;
+        }
         for (relative, src) in &sources {
             self.authorize_write_prefixes(&backup_path, relative)?;
             validate_copy_destination(
@@ -139,7 +201,7 @@ impl BackupTool {
         }
 
         cancellation.checkpoint()?;
-        let backups = create_dir_path_nofollow(&workspace, Path::new("backups"))?;
+        let backups = create_dir_path_nofollow(&workspace, &destination)?;
         cancellation.checkpoint()?;
         backups.create_dir(&name)?;
         let backup = open_dir_nofollow(&backups, Path::new(&name))?;
@@ -155,14 +217,27 @@ impl BackupTool {
                 &workspace_path.join(&relative),
                 &dst,
                 &destination_path,
+                &relative,
+                (&codec, Direction::Encode),
                 &self.security,
                 cancellation,
             )?;
         }
 
+        if let Some(format) = &format {
+            // Written before the manifest so `verify` covers it too.
+            self.authorize_write(&backup_path.join(FORMAT_FILE))?;
+            cancellation.checkpoint()?;
+            write_file_atomic(
+                &backup,
+                Path::new(FORMAT_FILE),
+                serde_json::to_string_pretty(format)?.as_bytes(),
+            )?;
+        }
+
         cancellation.checkpoint()?;
         let checksums = compute_checksums(&backup, &backup_path, &self.security)?;
-        let file_count = checksums.len();
+        let file_count = stored_file_count(&checksums);
         let manifest = serde_json::to_string_pretty(&checksums)?;
         self.authorize_write(&backup_path.join("manifest.json"))?;
         cancellation.checkpoint()?;
@@ -176,6 +251,9 @@ impl BackupTool {
             output: json!({
                 "backup": name,
                 "file_count": file_count,
+                "location": portable_path(&destination),
+                "compressed": format.as_ref().is_some_and(|format| format.compressed),
+                "encrypted": format.as_ref().is_some_and(|format| format.encryption.is_some()),
             })
             .to_string()
             .into(),
@@ -251,57 +329,197 @@ impl BackupTool {
         Ok(())
     }
 
+    fn destination(&self) -> anyhow::Result<PathBuf> {
+        Ok(contained_relative_path(&self.options.destination_dir)?.to_path_buf())
+    }
+
+    /// Directories that can hold backups: the destination, then the legacy
+    /// output directory when the destination has moved away from it.
+    fn backup_locations(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let destination = self.destination()?;
+        let legacy = Path::new(LEGACY_BACKUPS_DIR);
+        let mut locations = vec![destination.clone()];
+        if !(paths_overlap(&destination, legacy)
+            && destination.components().count() == legacy.components().count())
+        {
+            locations.push(legacy.to_path_buf());
+        }
+        Ok(locations)
+    }
+
+    fn overlaps_output(&self, path: &Path) -> anyhow::Result<bool> {
+        Ok(self
+            .backup_locations()?
+            .iter()
+            .any(|location| paths_overlap(path, location)))
+    }
+
+    /// Payload encoding for a new backup. The error is the reason encryption
+    /// cannot be honoured.
+    fn new_backup_encoding(&self) -> Result<(PayloadCodec, Option<BackupFormat>), String> {
+        let compress = self.options.compress;
+        if !self.options.encrypt {
+            let format = compress.then(|| BackupFormat::new(true, None));
+            return Ok((PayloadCodec::new(compress, None), format));
+        }
+        let store = self
+            .options
+            .key_store
+            .as_ref()
+            .ok_or_else(|| "no secret store is configured".to_string())?;
+        let salt = random_salt();
+        let key = Zeroizing::new(
+            store
+                .keyed_digest_or_create(BACKUP_KEY_DOMAIN, &salt)
+                .map_err(|error| error.to_string())?,
+        );
+        Ok((
+            PayloadCodec::new(compress, Some(key)),
+            Some(BackupFormat::new(compress, Some(&salt))),
+        ))
+    }
+
+    /// The format descriptor of an existing backup; `None` for plain copies.
+    fn read_backup_format(
+        &self,
+        backup: &Dir,
+        backup_path: &Path,
+        name: &str,
+    ) -> anyhow::Result<Option<BackupFormat>> {
+        let unreadable =
+            || boundary_violation(tool_text_arg("tool-backup-error-format", "name", name));
+        match backup.symlink_metadata(FORMAT_FILE) {
+            Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => {}
+            Ok(_) => return Err(unreadable()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let format_path = backup_path.join(FORMAT_FILE);
+        self.authorize_read(&format_path)?;
+        let data = read_file_to_string_nofollow(
+            backup,
+            Path::new(FORMAT_FILE),
+            &format_path,
+            &self.security,
+        )?;
+        let format: BackupFormat = serde_json::from_str(&data).map_err(|_| unreadable())?;
+        format.validate().map_err(|_| unreadable())?;
+        Ok(Some(format))
+    }
+
+    /// Decoder for an existing backup. Opening an encrypted backup never
+    /// provisions a key: a new key could not decrypt it.
+    fn existing_backup_codec(
+        &self,
+        format: Option<&BackupFormat>,
+        name: &str,
+    ) -> anyhow::Result<PayloadCodec> {
+        let Some(format) = format else {
+            return Ok(PayloadCodec::default());
+        };
+        let salt = format.key_salt().map_err(|_| {
+            boundary_violation(tool_text_arg("tool-backup-error-format", "name", name))
+        })?;
+        let key = match salt {
+            None => None,
+            Some(salt) => {
+                let key_unavailable = |reason: &str| {
+                    boundary_violation(tool_text_arg(
+                        "tool-backup-error-key-unavailable",
+                        "reason",
+                        reason,
+                    ))
+                };
+                let store = self
+                    .options
+                    .key_store
+                    .as_ref()
+                    .ok_or_else(|| key_unavailable("no secret store is configured"))?;
+                let key = store
+                    .keyed_digest(BACKUP_KEY_DOMAIN, &salt)
+                    .map_err(|error| key_unavailable(&error.to_string()))?;
+                Some(Zeroizing::new(key))
+            }
+        };
+        Ok(PayloadCodec::new(format.compressed, key))
+    }
+
+    /// Find a named backup in the destination, then the legacy directory.
+    fn find_backup(
+        &self,
+        workspace: &Dir,
+        workspace_path: &Path,
+        name: &str,
+    ) -> anyhow::Result<Option<(PathBuf, Dir)>> {
+        for location in self.backup_locations()? {
+            let Some(backups) =
+                open_dir_no_symlinks_checked(workspace, &location, workspace_path, &self.security)?
+            else {
+                continue;
+            };
+            let backup_path = workspace_path.join(&location).join(name);
+            match open_named_backup(&backups, name, &backup_path, &self.security) {
+                Ok(dir) => return Ok(Some((backup_path, dir))),
+                Err(error) if is_not_found(&error) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
     fn cmd_list(&self) -> anyhow::Result<ToolResult> {
         let (workspace_path, workspace) = self.open_workspace()?;
-        let backups_path = workspace_path.join("backups");
-        let Some(backups) = open_dir_no_symlinks_checked(
-            &workspace,
-            Path::new("backups"),
-            &workspace_path,
-            &self.security,
-        )?
-        else {
-            return Ok(ToolResult {
-                success: true,
-                output: "[]".into(),
-                error: None,
-            });
-        };
-        let dirs = list_backup_names(&backups, &backups_path, &self.security)?;
         let mut items = Vec::new();
-        for name in dirs {
-            let backup_path = backups_path.join(&name);
-            let backup = open_named_backup(&backups, &name, &backup_path, &self.security)?;
-            self.authorize_read(&backup_path)?;
-            let file_count = match backup.symlink_metadata("manifest.json") {
-                Ok(meta) if meta.is_file() && !meta.is_symlink() => {
-                    let manifest_path = backup_path.join("manifest.json");
-                    self.authorize_read(&manifest_path)?;
-                    let data = read_file_to_string_nofollow(
-                        &backup,
-                        Path::new("manifest.json"),
-                        &manifest_path,
-                        &self.security,
-                    )?;
-                    let map: HashMap<String, String> =
-                        serde_json::from_str(&data).unwrap_or_default();
-                    map.len()
-                }
-                Ok(_) => 0,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-                Err(error) => return Err(error.into()),
+        for location in self.backup_locations()? {
+            let backups_path = workspace_path.join(&location);
+            let Some(backups) = open_dir_no_symlinks_checked(
+                &workspace,
+                &location,
+                &workspace_path,
+                &self.security,
+            )?
+            else {
+                continue;
             };
-            let meta = backup.dir_metadata()?;
-            let created = meta
-                .created()
-                .or_else(|_| meta.modified())
-                .map(cap_std::time::SystemTime::into_std)?;
-            let dt: chrono::DateTime<chrono::Utc> = created.into();
-            items.push(json!({
-                "name": name,
-                "file_count": file_count,
-                "created": dt.to_rfc3339(),
-            }));
+            let dirs = list_backup_names(&backups, &backups_path, &self.security)?;
+            for name in dirs {
+                let backup_path = backups_path.join(&name);
+                let backup = open_named_backup(&backups, &name, &backup_path, &self.security)?;
+                self.authorize_read(&backup_path)?;
+                let file_count = match backup.symlink_metadata("manifest.json") {
+                    Ok(meta) if meta.is_file() && !meta.is_symlink() => {
+                        let manifest_path = backup_path.join("manifest.json");
+                        self.authorize_read(&manifest_path)?;
+                        let data = read_file_to_string_nofollow(
+                            &backup,
+                            Path::new("manifest.json"),
+                            &manifest_path,
+                            &self.security,
+                        )?;
+                        let map: HashMap<String, String> =
+                            serde_json::from_str(&data).unwrap_or_default();
+                        stored_file_count(&map)
+                    }
+                    Ok(_) => 0,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => return Err(error.into()),
+                };
+                let format = self.read_backup_format(&backup, &backup_path, &name)?;
+                let meta = backup.dir_metadata()?;
+                let created = meta
+                    .created()
+                    .or_else(|_| meta.modified())
+                    .map(cap_std::time::SystemTime::into_std)?;
+                let dt: chrono::DateTime<chrono::Utc> = created.into();
+                items.push(json!({
+                    "name": name,
+                    "file_count": file_count,
+                    "created": dt.to_rfc3339(),
+                    "location": portable_path(&location),
+                    "compressed": format.as_ref().is_some_and(|format| format.compressed),
+                    "encrypted": format.as_ref().is_some_and(|format| format.encryption.is_some()),
+                }));
+            }
         }
         Ok(ToolResult {
             success: true,
@@ -315,31 +533,14 @@ impl BackupTool {
             return Ok(rejected(error.to_string()));
         }
         let (workspace_path, workspace) = self.open_workspace()?;
-        let backups_path = workspace_path.join("backups");
-        let Some(backups) = open_dir_no_symlinks_checked(
-            &workspace,
-            Path::new("backups"),
-            &workspace_path,
-            &self.security,
-        )?
+        let Some((backup_path, backup)) =
+            self.find_backup(&workspace, &workspace_path, backup_name)?
         else {
             return Ok(rejected(tool_text_arg(
                 "tool-backup-error-not-found",
                 "name",
                 backup_name,
             )));
-        };
-        let backup_path = backups_path.join(backup_name);
-        let backup = match open_named_backup(&backups, backup_name, &backup_path, &self.security) {
-            Ok(dir) => dir,
-            Err(error) if is_not_found(&error) => {
-                return Ok(rejected(tool_text_arg(
-                    "tool-backup-error-not-found",
-                    "name",
-                    backup_name,
-                )));
-            }
-            Err(error) => return Err(error),
         };
         let manifest_path = backup_path.join("manifest.json");
         reject_symlink(&backup, Path::new("manifest.json"))?;
@@ -374,13 +575,38 @@ impl BackupTool {
                 "error": "unexpected",
             }));
         }
+
+        // A checksum only shows the stored bytes are unchanged since the
+        // manifest was written; an encoded backup must also decode.
+        let format = self.read_backup_format(&backup, &backup_path, backup_name)?;
+        if format.is_some() {
+            let codec = self.existing_backup_codec(format.as_ref(), backup_name)?;
+            let mut undecodable = Vec::new();
+            walk_and_decode(
+                &backup,
+                Path::new(""),
+                &backup_path,
+                &codec,
+                &self.security,
+                None,
+                &mut undecodable,
+            )?;
+            undecodable.sort();
+            for path in undecodable {
+                mismatches.push(json!({
+                    "file": path,
+                    "error": "undecodable",
+                }));
+            }
+        }
+
         let pass = mismatches.is_empty();
         Ok(ToolResult {
             success: pass,
             output: json!({
                 "backup": backup_name,
                 "pass": pass,
-                "checked": expected.len(),
+                "checked": stored_file_count(&expected),
                 "mismatches": mismatches,
             })
             .to_string()
@@ -403,13 +629,8 @@ impl BackupTool {
             return Ok(rejected(error.to_string()));
         }
         let (workspace_path, workspace) = self.open_workspace()?;
-        let backups_path = workspace_path.join("backups");
-        let Some(backups) = open_dir_no_symlinks_checked(
-            &workspace,
-            Path::new("backups"),
-            &workspace_path,
-            &self.security,
-        )?
+        let Some((backup_path, backup)) =
+            self.find_backup(&workspace, &workspace_path, backup_name)?
         else {
             return Ok(rejected(tool_text_arg(
                 "tool-backup-error-not-found",
@@ -417,18 +638,9 @@ impl BackupTool {
                 backup_name,
             )));
         };
-        let backup_path = backups_path.join(backup_name);
-        let backup = match open_named_backup(&backups, backup_name, &backup_path, &self.security) {
-            Ok(dir) => dir,
-            Err(error) if is_not_found(&error) => {
-                return Ok(rejected(tool_text_arg(
-                    "tool-backup-error-not-found",
-                    "name",
-                    backup_name,
-                )));
-            }
-            Err(error) => return Err(error),
-        };
+        let format = self.read_backup_format(&backup, &backup_path, backup_name)?;
+        // Resolve the key before the dry run so a missing key shows up early.
+        let codec = self.existing_backup_codec(format.as_ref(), backup_name)?;
 
         self.authorize_read(&backup_path)?;
         // Collect restorable subdirectories (skip manifest.json).
@@ -439,12 +651,12 @@ impl BackupTool {
                 .file_name()
                 .into_string()
                 .map_err(|_| boundary_violation(tool_text("tool-backup-error-non-utf8")))?;
-            if name == "manifest.json" {
+            if name == "manifest.json" || name == FORMAT_FILE {
                 continue;
             }
             let source_path = backup_path.join(&name);
             self.authorize_read(&source_path)?;
-            if overlaps_backups_output(Path::new(&name)) {
+            if self.overlaps_output(Path::new(&name))? {
                 return Ok(rejected(tool_text_arg(
                     "tool-backup-error-source-overlap",
                     "path",
@@ -478,6 +690,8 @@ impl BackupTool {
                     "dry_run": true,
                     "backup": backup_name,
                     "would_restore": restore_items,
+                    "compressed": format.as_ref().is_some_and(|format| format.compressed),
+                    "encrypted": format.as_ref().is_some_and(|format| format.encryption.is_some()),
                 })
                 .to_string()
                 .into(),
@@ -512,6 +726,38 @@ impl BackupTool {
             )?;
         }
 
+        // Decode every stored file before writing the first one, so a tampered
+        // or wrongly keyed backup restores nothing rather than part of itself.
+        if !codec.is_identity() {
+            let mut undecodable = Vec::new();
+            for sub in &restore_items {
+                let src = open_dir_no_symlinks_checked(
+                    &backup,
+                    Path::new(sub),
+                    &backup_path,
+                    &self.security,
+                )?
+                .ok_or_else(|| anyhow::Error::msg(format!("Backup entry disappeared: {sub}")))?;
+                walk_and_decode(
+                    &src,
+                    Path::new(sub),
+                    &backup_path.join(sub),
+                    &codec,
+                    &self.security,
+                    Some(cancellation),
+                    &mut undecodable,
+                )?;
+            }
+            undecodable.sort();
+            if let Some(path) = undecodable.first() {
+                return Ok(rejected(tool_text_arg(
+                    "tool-backup-error-payload",
+                    "path",
+                    path,
+                )));
+            }
+        }
+
         for sub in &restore_items {
             cancellation.checkpoint()?;
             let src = open_dir_no_symlinks_checked(
@@ -531,6 +777,8 @@ impl BackupTool {
                 &source_path,
                 &dst,
                 &destination_path,
+                Path::new(sub),
+                (&codec, Direction::Decode),
                 &self.security,
                 cancellation,
             )?;
@@ -865,13 +1113,25 @@ fn validate_backup_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn overlaps_backups_output(path: &Path) -> bool {
-    let Some(std::path::Component::Normal(first)) = path.components().next() else {
-        return false;
-    };
-    // Keep the reserved output name conservative on case-sensitive volumes too;
-    // another platform may alias `Backups` and `backups`.
-    first.to_string_lossy().eq_ignore_ascii_case("backups")
+/// True when one path is a prefix of the other. Compared without case even on
+/// case-sensitive volumes, since another platform may alias `Backups` and
+/// `backups`.
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a.components().zip(b.components()).all(|(a, b)| {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    })
+}
+
+/// A backup-relative path with `/` separators, as the manifest stores it.
+fn portable_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Files a backup holds for the operator, excluding its format descriptor.
+fn stored_file_count(checksums: &HashMap<String, String>) -> usize {
+    checksums.keys().filter(|path| *path != FORMAT_FILE).count()
 }
 
 fn ensure_readable(security: &SecurityPolicy, path: &Path) -> anyhow::Result<()> {
@@ -1053,11 +1313,25 @@ fn authorize_deletion_tree(
     Ok(())
 }
 
+/// Which way a copy runs through the payload codec.
+#[derive(Clone, Copy)]
+enum Direction {
+    /// Source data into a backup.
+    Encode,
+    /// Backup data back to the source tree.
+    Decode,
+}
+
+/// Copy a tree through `codec`. `relative` is the tree's path inside the
+/// backup, which each encrypted file is bound to.
+#[allow(clippy::too_many_arguments)]
 fn copy_dir_recursive(
     src: &Dir,
     src_path: &Path,
     dst: &Dir,
     dst_path: &Path,
+    relative: &Path,
+    transform: (&PayloadCodec, Direction),
     security: &SecurityPolicy,
     cancellation: &BlockingOperationCancellation,
 ) -> anyhow::Result<()> {
@@ -1116,17 +1390,25 @@ fn copy_dir_recursive(
                 &source_child_path,
                 &dst_child,
                 &destination_child_path,
+                &relative.join(&name),
+                transform,
                 security,
                 cancellation,
             )?;
         } else if file_type.is_file() {
             reject_symlink(dst, Path::new(&name))?;
             ensure_readable(security, &source_child_path)?;
-            let mut input = open_file_nofollow(src, Path::new(&name))?;
+            let input = open_file_nofollow(src, Path::new(&name))?;
             ensure_readable(security, &source_child_path)?;
             let permissions = input.metadata()?.permissions();
             cancellation.checkpoint()?;
-            copy_file_atomic(dst, Path::new(&name), &mut input, Some(permissions))?;
+            let (codec, direction) = transform;
+            let stored_name = portable_path(&relative.join(&name));
+            let mut reader = match direction {
+                Direction::Encode => codec.encoder(&stored_name, Box::new(input)),
+                Direction::Decode => codec.decoder(&stored_name, Box::new(input)),
+            };
+            copy_file_atomic(dst, Path::new(&name), &mut reader, Some(permissions))?;
             cancellation.after_file_copy(&destination_child_path);
         } else {
             return Err(boundary_violation(tool_text_arg(
@@ -1305,7 +1587,7 @@ fn walk_and_hash(
             let child = open_dir_nofollow(dir, Path::new(&name))?;
             walk_and_hash(&child, &path, &child_path, map, security)?;
         } else if file_type.is_file() {
-            let rel = path.to_string_lossy().replace('\\', "/");
+            let rel = portable_path(&path);
             if rel == "manifest.json" {
                 continue;
             }
@@ -1322,6 +1604,72 @@ fn walk_and_hash(
             }
             let hash = hex::encode(hasher.finalize());
             map.insert(rel, hash);
+        } else {
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-special-file",
+                "path",
+                &path.display().to_string(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Decode every stored file under `dir` into a sink, collecting the paths
+/// that fail authentication or decompression.
+fn walk_and_decode(
+    dir: &Dir,
+    relative: &Path,
+    absolute_path: &Path,
+    codec: &PayloadCodec,
+    security: &SecurityPolicy,
+    cancellation: Option<&BlockingOperationCancellation>,
+    undecodable: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    ensure_readable(security, absolute_path)?;
+    for entry in dir.entries()? {
+        if let Some(cancellation) = cancellation {
+            cancellation.checkpoint()?;
+        }
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = relative.join(&name);
+        let child_path = absolute_path.join(&name);
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(boundary_violation(tool_text_arg(
+                "tool-backup-error-symlink",
+                "path",
+                &path.display().to_string(),
+            )));
+        }
+        ensure_readable(security, &child_path)?;
+        if file_type.is_dir() {
+            let child = open_dir_nofollow(dir, Path::new(&name))?;
+            walk_and_decode(
+                &child,
+                &path,
+                &child_path,
+                codec,
+                security,
+                cancellation,
+                undecodable,
+            )?;
+        } else if file_type.is_file() {
+            let rel = portable_path(&path);
+            if rel == "manifest.json" || rel == FORMAT_FILE {
+                continue;
+            }
+            let input = open_file_nofollow(dir, Path::new(&name))?;
+            ensure_readable(security, &child_path)?;
+            match std::io::copy(
+                &mut codec.decoder(&rel, Box::new(input)),
+                &mut std::io::sink(),
+            ) {
+                Ok(_) => {}
+                Err(error) if is_payload_rejection(&error) => undecodable.push(rel),
+                Err(error) => return Err(error.into()),
+            }
         } else {
             return Err(boundary_violation(tool_text_arg(
                 "tool-backup-error-special-file",
@@ -2322,6 +2670,380 @@ mod tests {
         assert_eq!(items.len(), 2);
         // Newest first by name (ISO8601 names sort lexicographically).
         assert!(items[0]["name"].as_str().unwrap() >= items[1]["name"].as_str().unwrap());
+    }
+
+    const SECRET: &[u8] = b"api_key = \"sk-live-backup-plaintext\"";
+    const BRAIN_LEN: usize = 200_000;
+
+    fn seed(workspace: &Path) {
+        std::fs::create_dir_all(workspace.join("config")).unwrap();
+        std::fs::write(workspace.join("config/config.toml"), SECRET).unwrap();
+        std::fs::create_dir_all(workspace.join("memory/nested")).unwrap();
+        std::fs::write(
+            workspace.join("memory/nested/brain.db"),
+            vec![7u8; BRAIN_LEN],
+        )
+        .unwrap();
+    }
+
+    fn options(destination: &str, compress: bool, encrypt: bool) -> BackupOptions {
+        BackupOptions {
+            destination_dir: destination.into(),
+            compress,
+            encrypt,
+            key_store: None,
+        }
+    }
+
+    fn tool_with(workspace: &Path, key_dir: Option<&Path>, options: BackupOptions) -> BackupTool {
+        make_tool_at(workspace, AutonomyLevel::Supervised).with_options(BackupOptions {
+            key_store: key_dir.map(|dir| SecretStore::new(dir, true)),
+            ..options
+        })
+    }
+
+    async fn create_ok(tool: &BackupTool) -> serde_json::Value {
+        let created = tool.execute(json!({"command": "create"})).await.unwrap();
+        assert!(created.success, "create failed: {:?}", created.error);
+        serde_json::from_str(&created.output).unwrap()
+    }
+
+    async fn restore(tool: &BackupTool, name: &str) -> ToolResult {
+        tool.execute(json!({"command": "restore", "backup_name": name, "confirm": true}))
+            .await
+            .unwrap()
+    }
+
+    fn files_under(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(files_under(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[tokio::test]
+    async fn encrypted_backup_holds_no_plaintext_and_restores_the_original() {
+        let workspace = TempDir::new().unwrap();
+        let keys = TempDir::new().unwrap();
+        seed(workspace.path());
+        let tool = tool_with(
+            workspace.path(),
+            Some(keys.path()),
+            options("state/backups", true, true),
+        );
+
+        let created = create_ok(&tool).await;
+        assert_eq!(created["encrypted"], true);
+        assert_eq!(created["compressed"], true);
+        assert_eq!(created["location"], "state/backups");
+        assert_eq!(created["file_count"], 2);
+        let name = created["backup"].as_str().unwrap();
+        let backup_dir = workspace.path().join("state/backups").join(name);
+        assert!(backup_dir.join(FORMAT_FILE).is_file());
+        assert!(!workspace.path().join("backups").exists());
+        for file in files_under(&backup_dir) {
+            let bytes = std::fs::read(&file).unwrap();
+            assert!(
+                !contains(&bytes, b"sk-live-backup-plaintext"),
+                "{} holds plaintext",
+                file.display()
+            );
+        }
+
+        let verified = tool
+            .execute(json!({"command": "verify", "backup_name": name}))
+            .await
+            .unwrap();
+        assert!(verified.success, "verify failed: {}", verified.output);
+
+        std::fs::write(workspace.path().join("config/config.toml"), "changed").unwrap();
+        std::fs::write(workspace.path().join("memory/nested/brain.db"), "changed").unwrap();
+        let restored = restore(&tool, name).await;
+        assert!(restored.success, "restore failed: {:?}", restored.error);
+        assert_eq!(
+            std::fs::read(workspace.path().join("config/config.toml")).unwrap(),
+            SECRET
+        );
+        assert_eq!(
+            std::fs::read(workspace.path().join("memory/nested/brain.db")).unwrap(),
+            vec![7u8; BRAIN_LEN]
+        );
+
+        let listed = tool.execute(json!({"command": "list"})).await.unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_str(&listed.output).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["encrypted"], true);
+        assert_eq!(items[0]["location"], "state/backups");
+        assert_eq!(items[0]["file_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn encrypt_without_a_key_store_refuses_and_writes_nothing() {
+        let workspace = TempDir::new().unwrap();
+        seed(workspace.path());
+        let tool = tool_with(workspace.path(), None, options("state/backups", true, true));
+
+        let created = tool.execute(json!({"command": "create"})).await.unwrap();
+        assert!(!created.success);
+        assert!(created.error.unwrap().contains("encryption"));
+        assert!(!workspace.path().join("state").exists());
+        assert!(!workspace.path().join("backups").exists());
+    }
+
+    #[tokio::test]
+    async fn encrypted_backup_under_another_install_key_restores_nothing() {
+        let workspace = TempDir::new().unwrap();
+        let original_keys = TempDir::new().unwrap();
+        let other_keys = TempDir::new().unwrap();
+        seed(workspace.path());
+        let name = create_ok(&tool_with(
+            workspace.path(),
+            Some(original_keys.path()),
+            options("backups", false, true),
+        ))
+        .await["backup"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        SecretStore::new(other_keys.path(), true)
+            .keyed_digest_or_create(b"provision", b"")
+            .unwrap();
+        let other = tool_with(
+            workspace.path(),
+            Some(other_keys.path()),
+            options("backups", false, true),
+        );
+        std::fs::write(workspace.path().join("config/config.toml"), "current").unwrap();
+
+        let restored = restore(&other, &name).await;
+        assert!(!restored.success);
+        assert!(restored.error.unwrap().contains("authentication"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("config/config.toml")).unwrap(),
+            "current"
+        );
+
+        let verified = other
+            .execute(json!({"command": "verify", "backup_name": name}))
+            .await
+            .unwrap();
+        assert!(!verified.success);
+        let output: serde_json::Value = serde_json::from_str(&verified.output).unwrap();
+        assert!(
+            output["mismatches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["error"] == "undecodable")
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_an_encrypted_backup_never_creates_a_missing_key() {
+        let workspace = TempDir::new().unwrap();
+        let original_keys = TempDir::new().unwrap();
+        let empty_keys = TempDir::new().unwrap();
+        seed(workspace.path());
+        let name = create_ok(&tool_with(
+            workspace.path(),
+            Some(original_keys.path()),
+            options("backups", false, true),
+        ))
+        .await["backup"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let keyless = tool_with(
+            workspace.path(),
+            Some(empty_keys.path()),
+            options("backups", false, false),
+        );
+        let dry_run = keyless
+            .execute(json!({"command": "restore", "backup_name": name}))
+            .await
+            .unwrap();
+        assert!(!dry_run.success);
+        assert!(dry_run.error.unwrap().contains("secret store key"));
+        assert!(!empty_keys.path().join(".secret_key").exists());
+    }
+
+    #[tokio::test]
+    async fn tampered_encrypted_file_fails_verify_and_restores_nothing() {
+        let workspace = TempDir::new().unwrap();
+        let keys = TempDir::new().unwrap();
+        seed(workspace.path());
+        let tool = tool_with(
+            workspace.path(),
+            Some(keys.path()),
+            options("backups", true, true),
+        );
+        let name = create_ok(&tool).await["backup"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let stored = workspace
+            .path()
+            .join("backups")
+            .join(&name)
+            .join("memory/nested/brain.db");
+        let mut bytes = std::fs::read(&stored).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 1;
+        std::fs::write(&stored, bytes).unwrap();
+
+        let verified = tool
+            .execute(json!({"command": "verify", "backup_name": name}))
+            .await
+            .unwrap();
+        assert!(!verified.success);
+
+        std::fs::write(
+            workspace.path().join("config/config.toml"),
+            "current-config",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("memory/nested/brain.db"),
+            "current-brain",
+        )
+        .unwrap();
+        let restored = restore(&tool, &name).await;
+        assert!(!restored.success);
+        assert!(restored.error.unwrap().contains("memory/nested/brain.db"));
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("config/config.toml")).unwrap(),
+            "current-config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("memory/nested/brain.db")).unwrap(),
+            "current-brain"
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_backup_stores_gzip_and_restores() {
+        let workspace = TempDir::new().unwrap();
+        seed(workspace.path());
+        let tool = tool_with(workspace.path(), None, options("backups", true, false));
+        let created = create_ok(&tool).await;
+        assert_eq!(created["compressed"], true);
+        assert_eq!(created["encrypted"], false);
+        let name = created["backup"].as_str().unwrap();
+
+        let stored = std::fs::read(
+            workspace
+                .path()
+                .join("backups")
+                .join(name)
+                .join("memory/nested/brain.db"),
+        )
+        .unwrap();
+        assert_eq!(&stored[..2], &[0x1f, 0x8b]);
+        assert!(stored.len() < BRAIN_LEN / 10);
+
+        std::fs::write(workspace.path().join("memory/nested/brain.db"), "changed").unwrap();
+        let restored = restore(&tool, name).await;
+        assert!(restored.success, "restore failed: {:?}", restored.error);
+        assert_eq!(
+            std::fs::read(workspace.path().join("memory/nested/brain.db")).unwrap(),
+            vec![7u8; BRAIN_LEN]
+        );
+    }
+
+    #[tokio::test]
+    async fn destination_is_honoured_and_legacy_backups_stay_reachable() {
+        let workspace = TempDir::new().unwrap();
+        seed(workspace.path());
+        let legacy = create_ok(&make_tool(&workspace)).await;
+        let legacy_name = legacy["backup"].as_str().unwrap().to_owned();
+        assert_eq!(legacy["location"], "backups");
+        assert!(
+            !workspace
+                .path()
+                .join("backups")
+                .join(&legacy_name)
+                .join(FORMAT_FILE)
+                .exists()
+        );
+
+        let tool = tool_with(
+            workspace.path(),
+            None,
+            options("state/backups", false, false),
+        );
+        // Backup names have one-second resolution.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let current = create_ok(&tool).await;
+        let current_name = current["backup"].as_str().unwrap();
+        assert!(
+            workspace
+                .path()
+                .join("state/backups")
+                .join(current_name)
+                .join("manifest.json")
+                .is_file()
+        );
+
+        let listed = tool.execute(json!({"command": "list"})).await.unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_str(&listed.output).unwrap();
+        let locations: Vec<_> = items
+            .iter()
+            .map(|item| {
+                (
+                    item["name"].as_str().unwrap(),
+                    item["location"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert!(locations.contains(&(current_name, "state/backups")));
+        assert!(locations.contains(&(legacy_name.as_str(), "backups")));
+
+        std::fs::write(workspace.path().join("config/config.toml"), "changed").unwrap();
+        let restored = restore(&tool, &legacy_name).await;
+        assert!(restored.success, "restore failed: {:?}", restored.error);
+        assert_eq!(
+            std::fs::read(workspace.path().join("config/config.toml")).unwrap(),
+            SECRET
+        );
+    }
+
+    #[tokio::test]
+    async fn destination_must_stay_inside_the_data_dir_and_off_its_sources() {
+        let workspace = TempDir::new().unwrap();
+        seed(workspace.path());
+        for destination in [
+            "../escape",
+            "/tmp/zeroclaw-backups",
+            "memory/backups",
+            "CONFIG",
+        ] {
+            let tool = tool_with(workspace.path(), None, options(destination, false, false));
+            let created = tool.execute(json!({"command": "create"})).await.unwrap();
+            assert!(!created.success, "{destination} was accepted");
+        }
+        assert!(!workspace.path().join("memory/backups").exists());
+        // `CONFIG` aliases `config` on case-insensitive volumes: nothing was added.
+        assert_eq!(
+            std::fs::read_dir(workspace.path().join("config"))
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[cfg(unix)]
