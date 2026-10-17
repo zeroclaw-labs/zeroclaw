@@ -66,6 +66,30 @@ impl Channel for AskUserApprovalBridge {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        self.fan_out(recipient, request, None).await
+    }
+
+    /// Fan out with the caller's response budget, handed to each
+    /// back-channel's own `request_approval_attributed_with_timeout`, so a
+    /// back-channel with a shorter built-in deadline does not cut a longer
+    /// budget short. A configured approval route keeps its own timeout.
+    async fn request_approval_attributed_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        self.fan_out(recipient, request, Some(timeout)).await
+    }
+}
+
+impl AskUserApprovalBridge {
+    async fn fan_out(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: Option<std::time::Duration>,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
         let inherited_route = if let Some(route) = &self.route {
             match resolve_routed_approval(&self.handles, route, recipient, request).await {
                 // Cross-crate construction: `AttributedApprovalResponse` is
@@ -108,10 +132,19 @@ impl Channel for AskUserApprovalBridge {
             // that synthesizes `Some(Deny)` on timeout reports that provenance
             // here, and calling `request_approval` would discard it and relabel
             // the runtime's deny as the operator's.
-            match channel
-                .request_approval_attributed(recipient, request)
-                .await
-            {
+            let answer = match timeout {
+                Some(timeout) => {
+                    channel
+                        .request_approval_attributed_with_timeout(recipient, request, timeout)
+                        .await
+                }
+                None => {
+                    channel
+                        .request_approval_attributed(recipient, request)
+                        .await
+                }
+            };
+            match answer {
                 // The deciding back-channel's name travels back on the response
                 // itself, so a concurrent fan-out on the same bridge instance
                 // cannot overwrite this call's attribution.

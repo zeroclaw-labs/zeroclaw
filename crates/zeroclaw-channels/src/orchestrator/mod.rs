@@ -7725,6 +7725,32 @@ impl ApprovalTypingChannel {
     fn new(inner: Arc<dyn Channel>, typing: Arc<ScopedTypingController>) -> Self {
         Self { inner, typing }
     }
+
+    /// Pause typing for the approval wait; resume only when the turn will
+    /// keep working (approved, or approval unsupported).
+    async fn paused_for_approval(
+        &self,
+        ask: impl std::future::Future<
+            Output = anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>>,
+        >,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        self.typing.pause().await;
+        let response = ask.await;
+        if response.as_ref().is_ok_and(|response| {
+            // Unsupported approval is not a denial: the runtime may continue
+            // under ordinary shell policy without granting approval.
+            response.as_ref().is_none_or(|response| {
+                matches!(
+                    response.response,
+                    zeroclaw_api::channel::ChannelApprovalResponse::Approve
+                        | zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
+                )
+            })
+        }) {
+            self.typing.resume().await;
+        }
+        response
+    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for ApprovalTypingChannel {
@@ -7779,25 +7805,25 @@ impl Channel for ApprovalTypingChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
-        self.typing.pause().await;
-        let response = self
-            .inner
-            .request_approval_attributed(recipient, request)
-            .await;
-        if response.as_ref().is_ok_and(|response| {
-            // Unsupported approval is not a denial: the runtime may continue
-            // under ordinary shell policy without granting approval.
-            response.as_ref().is_none_or(|response| {
-                matches!(
-                    response.response,
-                    zeroclaw_api::channel::ChannelApprovalResponse::Approve
-                        | zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
-                )
-            })
-        }) {
-            self.typing.resume().await;
-        }
-        response
+        self.paused_for_approval(self.inner.request_approval_attributed(recipient, request))
+            .await
+    }
+
+    /// Forward the caller's wait. The trait default would wrap
+    /// `request_approval_attributed`, so the inner channel would apply its
+    /// own tool-approval timeout and cut a longer wait (the budget
+    /// override prompt) short.
+    async fn request_approval_attributed_with_timeout(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        self.paused_for_approval(
+            self.inner
+                .request_approval_attributed_with_timeout(recipient, request, timeout),
+        )
+        .await
     }
 
     // Forward the turn-flush surface to the wrapped channel. Without this the
@@ -35516,6 +35542,95 @@ BTC is currently around $65,000 based on latest tool output."#
             vec!["cancelled".to_string()],
             "discard_draft_turn must reach the wrapped channel"
         );
+    }
+
+    /// The budget override prompt asks for a longer wait than a tool
+    /// approval; the typing wrapper must pass it to the channel it wraps
+    /// instead of letting the inner channel apply its own timeout.
+    #[tokio::test]
+    async fn approval_typing_channel_forwards_the_callers_timeout() {
+        use zeroclaw_api::channel::{
+            AttributedApprovalResponse, ChannelApprovalRequest, ChannelApprovalResponse,
+        };
+
+        #[derive(Default)]
+        struct TimeoutRecordingChannel {
+            asked_with: std::sync::Mutex<Option<Duration>>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for TimeoutRecordingChannel {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Channel(
+                    zeroclaw_api::attribution::ChannelKind::Cli,
+                )
+            }
+            fn alias(&self) -> &str {
+                "timeout-recording"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for TimeoutRecordingChannel {
+            fn name(&self) -> &str {
+                "timeout-recording"
+            }
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn request_approval_attributed(
+                &self,
+                _recipient: &str,
+                _request: &ChannelApprovalRequest,
+            ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+                Ok(Some(AttributedApprovalResponse::operator(
+                    ChannelApprovalResponse::Approve,
+                )))
+            }
+            async fn request_approval_attributed_with_timeout(
+                &self,
+                _recipient: &str,
+                _request: &ChannelApprovalRequest,
+                timeout: Duration,
+            ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+                *self.asked_with.lock().unwrap() = Some(timeout);
+                Ok(Some(AttributedApprovalResponse::operator(
+                    ChannelApprovalResponse::Approve,
+                )))
+            }
+        }
+
+        let inner = Arc::new(TimeoutRecordingChannel::default());
+        let channel: Arc<dyn Channel> = inner.clone();
+        let typing = Arc::new(ScopedTypingController::new(
+            Arc::clone(&channel),
+            "chat".to_string(),
+        ));
+        let wrapped = ApprovalTypingChannel::new(Arc::clone(&channel), typing);
+        let wait = Duration::from_secs(600);
+        let answer = wrapped
+            .request_approval_attributed_with_timeout(
+                "chat",
+                &ChannelApprovalRequest {
+                    tool_name: "cost_limit_override".to_string(),
+                    arguments_summary: "over the daily limit".to_string(),
+                    raw_arguments: None,
+                    position: None,
+                },
+                wait,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.map(|answer| answer.response),
+            Some(ChannelApprovalResponse::Approve)
+        );
+        assert_eq!(*inner.asked_with.lock().unwrap(), Some(wait));
     }
 
     #[tokio::test]
