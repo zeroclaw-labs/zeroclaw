@@ -153,7 +153,8 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
         natural_key,
         tab,
         group,
-        multiline
+        multiline,
+        empty_is_value
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -215,6 +216,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let mut prop_kind_tokens = Vec::new();
     let mut prop_display_secret_terminal_arms = Vec::new();
     let mut prop_is_option_flags = Vec::new();
+    let mut prop_empty_is_value_flags = Vec::new();
     let mut prop_is_secret_arms = Vec::new();
     let mut nested_prop_fields = Vec::new();
     let mut nested_get_prop = Vec::new();
@@ -2090,6 +2092,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             #prop_idx => <#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
         });
         prop_is_option_flags.push(is_option);
+        // `#[empty_is_value]` opts an `Option<String>` field out of the
+        // generic "empty string clears the Option" rule in `serde_set_prop`,
+        // so an explicit empty override stays distinct from an unset one.
+        prop_empty_is_value_flags.push(has_attr(field, "empty_is_value"));
 
         if is_vec {
             let inner_value_expr = if is_option {
@@ -2288,9 +2294,10 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 const KNOWN: &[&str] = &[#(#prop_names),*];
                 const KINDS: &[crate::config::PropKind] = &[#(#prop_kind_tokens),*];
                 const IS_OPTION: &[bool] = &[#(#prop_is_option_flags),*];
+                const EMPTY_IS_VALUE: &[bool] = &[#(#prop_empty_is_value_flags),*];
                 let idx = KNOWN.iter().position(|&n| n == name)
                     .ok_or_else(|| ::anyhow::Error::msg(::std::format!("Unknown property '{}'", name)))?;
-                crate::config::serde_set_prop(self, Self::configurable_prefix(), name, value_str, KINDS[idx], IS_OPTION[idx])
+                crate::config::serde_set_prop(self, Self::configurable_prefix(), name, value_str, KINDS[idx], IS_OPTION[idx], EMPTY_IS_VALUE[idx])
             }
 
             /// Check if a property name refers to a secret field (static, no instance needed).
