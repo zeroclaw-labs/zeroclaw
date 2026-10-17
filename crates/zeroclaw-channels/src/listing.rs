@@ -174,6 +174,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "voice-wake"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Speech-to-Speech"),
+        type_keys: &["speech_to_speech", "speech-to-speech"],
+        compiled: cfg!(feature = "channel-speech-to-speech"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("MQTT"),
         type_keys: &["mqtt"],
         compiled: cfg!(feature = "channel-mqtt"),

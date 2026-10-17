@@ -99,6 +99,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "voice_call",
     "voice_wake",
     "voice_duplex",
+    "speech_to_speech",
     "mqtt",
     "amqp",
     "filesystem",
