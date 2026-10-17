@@ -66,7 +66,8 @@ async fn unsupported_method() -> impl IntoResponse {
 }
 
 /// GET/POST `/plugin/{path}` — forward exact request bytes to the channel plugin
-/// that atomically claimed `path` during this daemon generation.
+/// that owns `path` in the route generation that is live when the request is
+/// queued.
 async fn handle_plugin_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -78,7 +79,8 @@ async fn handle_plugin_webhook(
     body: Bytes,
 ) -> Response {
     use zeroclaw_api::webhook::{
-        MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookOutcome, WebhookReject,
+        MAX_WEBHOOK_RESPONSE_BODY_BYTES, PluginWebhookSendError, RawWebhook, WebhookOutcome,
+        WebhookReject,
     };
 
     // Apply the same trusted-forwarded-aware client key and limiter as the
@@ -106,7 +108,7 @@ async fn handle_plugin_webhook(
             .into_response();
     }
 
-    let Some(sink) = registry.get(&path) else {
+    let Some(route) = registry.get(&path) else {
         return (StatusCode::NOT_FOUND, "webhook not found").into_response();
     };
     let headers = headers
@@ -133,12 +135,12 @@ async fn handle_plugin_webhook(
         )),
         reply,
     };
-    match sink.try_send(request) {
+    match route.try_send(request) {
         Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+        Err(PluginWebhookSendError::Full) => {
             return (StatusCode::TOO_MANY_REQUESTS, "webhook queue full").into_response();
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+        Err(PluginWebhookSendError::Closed) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "webhook unavailable").into_response();
         }
     }
