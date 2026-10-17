@@ -9718,16 +9718,16 @@ mod tests {
         // The path-read step stores raw bytes; PEM parsing happens in http_client().
         // Writing invalid PEM to a temp file: read succeeds (bytes stored), then
         // http_client() logs a WARN and falls back to system roots — no panic, no error.
-        let path = format!("/tmp/zeroclaw-test-invalid-pem-{}.pem", std::process::id());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("invalid.pem");
         std::fs::write(&path, b"not-a-valid-pem").unwrap();
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
             .base_url("https://example.com")
             .credential(None)
             .auth_style(AuthStyle::Bearer)
-            .tls_ca_cert_path(&path)
+            .tls_ca_cert_path(path.to_str().expect("UTF-8 test path"))
             .build();
-        std::fs::remove_file(&path).ok();
         assert!(
             p.tls_ca_cert_pem.is_some(),
             "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
@@ -9742,19 +9742,16 @@ mod tests {
     fn with_tls_ca_cert_path_invalid_pem_streaming_http_client_still_builds() {
         // Streaming requests use a separate client builder, so the TLS override
         // must degrade the same way there: warn, use system roots, and keep going.
-        let path = format!(
-            "/tmp/zeroclaw-test-invalid-pem-streaming-{}.pem",
-            std::process::id()
-        );
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("invalid.pem");
         std::fs::write(&path, b"not-a-valid-pem").unwrap();
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
             .base_url("https://example.com")
             .credential(None)
             .auth_style(AuthStyle::Bearer)
-            .tls_ca_cert_path(&path)
+            .tls_ca_cert_path(path.to_str().expect("UTF-8 test path"))
             .build();
-        std::fs::remove_file(&path).ok();
         assert!(
             p.tls_ca_cert_pem.is_some(),
             "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"

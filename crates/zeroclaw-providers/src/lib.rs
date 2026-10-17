@@ -2631,8 +2631,8 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_reads_cached_credentials_file() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-file", std::process::id());
-        let creds_dir = PathBuf::from(&fake_home).join(".qwen");
+        let fake_home = tempfile::tempdir().unwrap();
+        let creds_dir = fake_home.path().join(".qwen");
         std::fs::create_dir_all(&creds_dir).unwrap();
         let creds_path = creds_dir.join("oauth_creds.json");
         std::fs::write(
@@ -2641,7 +2641,10 @@ mod tests {
         )
         .unwrap();
 
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _home_guard = EnvGuard::set(
+            "HOME",
+            Some(fake_home.path().to_str().expect("UTF-8 test path")),
+        );
 
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
 
@@ -2655,8 +2658,11 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_returns_none_without_cache() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-empty", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let fake_home = tempfile::tempdir().unwrap();
+        let _home_guard = EnvGuard::set(
+            "HOME",
+            Some(fake_home.path().to_str().expect("UTF-8 test path")),
+        );
 
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
         assert!(context.credential.is_none());
