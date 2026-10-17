@@ -1391,6 +1391,34 @@ mod tests {
         assert!(!pending.lock().await.contains_key("cancelled"));
     }
 
+    #[tokio::test]
+    async fn pending_approval_guard_remove_takes_entry_and_disarms_drop() {
+        let pending = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        pending.lock().await.insert("removed".to_string(), ());
+        let mut guard = PendingApprovalGuard::new(Arc::clone(&pending), "removed".to_string());
+
+        guard.remove().await;
+        assert!(!pending.lock().await.contains_key("removed"));
+
+        // A still-armed guard would remove this re-registered entry on drop.
+        pending.lock().await.insert("removed".to_string(), ());
+        drop(guard);
+
+        assert!(pending.lock().await.contains_key("removed"));
+    }
+
+    #[tokio::test]
+    async fn pending_approval_guard_disarm_leaves_entry_on_drop() {
+        let pending = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        pending.lock().await.insert("claimed".to_string(), ());
+        let mut guard = PendingApprovalGuard::new(Arc::clone(&pending), "claimed".to_string());
+
+        guard.disarm();
+        drop(guard);
+
+        assert!(pending.lock().await.contains_key("claimed"));
+    }
+
     #[test]
     fn parse_approval_reply_accepts_canonical_forms() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
