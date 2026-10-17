@@ -373,18 +373,20 @@ rows live as `enc2:` ciphertext behind keyed blind indexes in
 key, storage, or integrity failure fail closed.
 
 State belongs to the instance identity (package name, capability, binding), the
-same identity its config entry uses, not to a publisher. `zeroclaw plugin remove`
-keeps both, so an upgrade (remove, then install) keeps its state. It also means a
-different package installed later under the same name inherits that instance's
-state and configured secrets. Removal keeps every `[channels.plugin.<alias>]`
-binding that names the package too, so the newcomer is bound to those aliases and
-their rows as well. `plugin remove` prints each binding it left behind and each
-kept row that still grants egress, naming what to delete: when the installed
-version provides a channel, the row under every bound alias's key, whatever
-else that version owns, and the default tool binding's row when the installed
-version owns instance state. Before installing an unrelated plugin under a
-removed plugin's name, delete its `[[plugins.entries]]` rows and those
-bindings, and treat its state as readable by the newcomer.
+same identity its config entry uses, not to a publisher. `zeroclaw plugin update`
+leaves both in place, and so does `zeroclaw plugin remove`, so an upgrade keeps
+its state whether it is an update or a removal followed by an install. It also
+means a different package installed later under the same name inherits that
+instance's state and configured secrets. Removal keeps every
+`[channels.plugin.<alias>]` binding that names the package too, so the newcomer
+is bound to those aliases and their rows as well. `plugin remove` prints each
+binding it left behind and each kept row that still grants egress, naming what
+to delete: when the installed version provides a channel, the row under every
+bound alias's key, whatever else that version owns, and the default tool
+binding's row when the installed version owns instance state. Before installing
+an unrelated plugin under a removed plugin's name, delete its
+`[[plugins.entries]]` rows and those bindings, and treat its state as readable
+by the newcomer.
 
 Pre-1.0 plugin authors must migrate explicitly: a manifest that requests
 `config_read` without `config_schema` is no longer discovered. Add a closed
@@ -789,6 +791,153 @@ its package summary says whether the manifest signature verifies against
 `plugins.security.trusted_publisher_keys`, and it installs a package whose
 signature does not verify only after you answer yes to a question that
 defaults to no; `signature_mode` still decides what admission refuses.
+
+## Updating a plugin
+
+`zeroclaw plugin update` replaces an installed package with another version of
+the same package and keeps everything that belongs to its instances:
+
+```bash
+# the version the registry selects for each named plugin
+zeroclaw plugin update my-plugin other-plugin
+
+# an exact version, newer or older than the installed one
+zeroclaw plugin update my-plugin@0.2.0
+
+# every installed plugin
+zeroclaw plugin update --all
+
+# a local package directory, for example a rebuilt plugin
+zeroclaw plugin update my-plugin --from ./my-plugin/
+```
+
+`--registry <url>` selects the registry as it does for `plugin install`. Update
+only replaces packages that are installed: an unknown name fails with a pointer
+to `plugin install`, and `plugin install` on an installed package fails with a
+pointer to `plugin update`. Packages are matched by name alone, so `--all` asks
+the registry about every installed package, including one you installed from a
+directory; name plugins explicitly when you run local builds. The update
+command is part of the registry lifecycle tracked in
+[#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) (R3).
+
+**Version selection.** A bare name takes the version `plugin install` would
+choose, the last entry the registry lists for that name, and `name@version`
+takes exactly that entry. ZeroClaw does not order versions to choose one, so a
+selected version that differs from the installed one is installed even when it
+is older. When both are semantic versions and the new one is older, the result
+line says so instead of reporting an update. Pinning the version you had is how
+you go back. When the selected
+version is the installed one, the plugin is reported up to date and nothing is
+downloaded. A `--from` package always replaces the installed one, even at the
+same version, so a rebuilt plugin can be reinstalled without a version bump.
+
+**Verification.** A replacement passes the checks a new install does before
+the installed package or its configuration changes: the archive digest when
+the registry entry lists one, the manifest's name and version against the
+registry entry, signature policy, the payload digest, the config schema, and
+the load check against this host's WIT world with your `plugins.limits`. Update has no `--no-verify`. To install a package that does
+not load, remove the plugin and install it with `--no-verify`.
+
+**Added authority.** The host grants a plugin every permission its manifest
+requests. So an update is refused, before its component is compiled, when the
+new manifest requests a permission or capability the installed version does
+not, declares a new `provides` channel, or names a different publisher key
+than the installed version (or none, where the installed version named one).
+The key identifies a publisher only when `plugins.security.signature_mode` is
+`strict`, which verifies it; in `permissive` and `disabled` modes it is an
+unverified claim, and a key that appears where the installed version named none
+is not treated as a change. The refusal lists what the new version adds and the
+command that accepts exactly that, pinned to the version you reviewed:
+
+```text
+'my-plugin' 0.2.0 requests authority the installed version does not have:
+  + permission:http_client
+Nothing was changed. To accept it and update, run: zeroclaw --config-dir '/home/user/.zeroclaw' plugin update 'my-plugin@0.2.0' --allow-token 'permission:http_client'
+```
+
+`--allow-token` takes one complete item per flag and can be repeated:
+`permission:<name>`, `capability:<name>`, `provides:<id>`, or
+`publisher:<key>` (`publisher:unsigned` for a package that names no key).
+`--allow` takes the same items as one comma-separated list. The printed command
+uses `--allow-token`, so an item whose value holds a comma, such as a
+`provides` id, reaches the command whole. Either flag applies to one plugin at
+a time, and for a registry update that plugin must be pinned as
+`name@version`, so what you accept is the version you reviewed.
+Removing the plugin and installing the new
+version is the other way to accept it. Every value in the printed command is
+quoted for your shell, following the rules described under
+[Declaring and granting egress](#declaring-and-granting-egress).
+
+**What an update keeps.** Instance identity is the package name, capability,
+and binding, not the version, so the plugin's `[[plugins.entries]]` rows, their
+config values and secrets, `egress_hosts`, `egress_allow_private`, TLS
+profiles, and durable state carry over untouched. The egress rule of
+`plugin install` holds: an update never extends a grant, not even in a row it
+creates for an instance that had none. It prints the difference between the new
+declaration and the grant, with the command that applies it. When the new
+version's config schema rejects configuration an instance already has, for
+example a newly required setting, the update still completes and names the
+instance and the problem. That instance does not load until its configuration
+fits the new version. A package whose config row still uses the pre-1.0 key
+(named after the package) is not updated until that row is renamed, and the
+refusal prints the same guidance as `plugin install`.
+
+**Results.** Each plugin gets a result: updated, up to date, skipped (with
+`--all`, a package the registry does not list, or one an interrupted update
+left displaced, which it notes as displaced), needs approval, or not updated
+with the reason and the version that stays installed. One plugin failing does
+not stop the others. The command exits non-zero when any plugin was not updated
+or needs approval, so a script can branch on it.
+
+**Replacement and recovery.** An update changes the plugins directory only
+while it holds the same hidden lock as `plugin install` and `plugin remove`, so
+those changes never overlap, even across processes. The new package is verified
+first, then written in full to a hidden staging transaction, as install writes
+one. Only then does the update claim the installed directory into a hidden
+transaction of its own and check that it is still the package the update was
+prepared against, with the same manifest and component. It then moves the new package into place without
+overwriting anything, and if that move fails, it moves the previous package
+back. A failure before the claim leaves the installed package as it was, and a
+package that changed on disk since the update started is moved back and the
+update refused. If the process is stopped after the claim and before the new
+package is in place, the previous package survives in that hidden transaction,
+which discovery ignores, and the operating-system lease on it ends with the
+process. `plugin list` then notes
+the package as displaced, after waiting for any install, update or recovery in
+progress, and the next `zeroclaw plugin update <name>` moves it
+back before doing anything else, including before it reaches the registry, so
+recovery works offline. The update then goes on as usual, so for a package you
+installed from a directory, add `--from` with that directory, or the
+registry's package of that name may replace it. `--all` only points at that
+command, so a displaced package is never put back unless you name it, even one
+an update displaced while the batch was running. A
+replaced version is marked for deletion inside its transaction before it is
+deleted, so one that cannot be deleted is never put back: the warning names
+where it is, and the next update of the plugin deletes it. If even the marking
+fails, delete the directory the warning names by hand, because once the plugin
+is removed, `zeroclaw plugin update <name>` would put that copy back. A process
+stopped after the new package is in place but before the replaced version is
+marked leaves it the same way: the next update of the plugin deletes it, but
+after a `plugin remove`, `plugin list` notes it as displaced and a named update
+puts it back.
+
+The files are not flushed to disk before the renames, as with `plugin install`,
+so a power loss right after an update can leave the new package incomplete.
+Updating again does not repair it, because the damaged package already has the
+version the registry selects. If `zeroclaw plugin info <name>` says the plugin
+does not load, run `zeroclaw plugin remove <name>` and install it again; its
+configuration rows and grants survive the removal. If the plugin is no longer
+listed at all, delete its directory under `plugins_dir` by hand, then install
+it again.
+
+**Running daemon.** Update changes the installed package only and never signals
+a running daemon. Tool sets the daemon builds after the update load the new
+version, while channel instances keep the component they loaded until the
+daemon restarts or reloads its channels, so restart it to move every instance
+to the new version. A
+tool set built at the instant of the swap can miss the plugin, or, for a
+package whose manifest does not bind `wasm_sha256`, pair the previous manifest
+with the new component; the next tool set is consistent.
 
 ## Where the trust boundary actually is
 

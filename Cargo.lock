@@ -13786,6 +13786,7 @@ dependencies = [
  "rustls",
  "schemars 1.2.2",
  "scopeguard",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
