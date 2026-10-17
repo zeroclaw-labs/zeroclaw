@@ -10675,6 +10675,9 @@ impl RpcDispatcher {
                 AgentStatusEntry {
                     alias: alias.clone(),
                     enabled: agent_cfg.enabled,
+                    runtime_profile: config
+                        .runtime_profile_for_agent(alias)
+                        .map(|_| agent_cfg.runtime_profile.trim().to_string()),
                     live_sessions: rpc,
                     persisted_sessions: persisted,
                     channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
@@ -28702,6 +28705,39 @@ mod tests {
             risk_profiles,
             ..zeroclaw_config::schema::Config::default()
         }
+    }
+
+    #[tokio::test]
+    async fn agents_status_runtime_profile_resolves_config_and_omits_unresolved_profiles() {
+        use zeroclaw_config::schema::RuntimeProfileConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .runtime_profiles
+            .insert("coding".into(), RuntimeProfileConfig::default());
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = " coding ".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config.clone());
+
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert_eq!(agent["runtime_profile"], "coding");
+
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = "missing".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config);
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert!(agent.get("runtime_profile").is_none());
     }
 
     fn make_acp_test_dispatcher(

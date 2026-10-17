@@ -980,6 +980,10 @@ rpc_type! {
     pub struct AgentStatusEntry {
         pub alias: String,
         pub enabled: bool,
+        /// Current configured profile, not a running session's retained generation.
+        /// Absent when no configured runtime profile resolves for this agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub runtime_profile: Option<String>,
         #[serde(default)]
         pub live_sessions: usize,
         #[serde(default)]

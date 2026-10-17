@@ -1434,9 +1434,8 @@ impl ChromeStatus {
                 if let Some(status) = snapshot.status {
                     self.status = Some(status);
                 }
-                if let Some(health) = snapshot.health {
-                    self.health = Some(health);
-                }
+                // A failed poll must not keep an old healthy result visible.
+                self.health = snapshot.health;
                 self.refresh_in_flight = false;
                 self.refresh_rx = None;
             }
@@ -2028,6 +2027,9 @@ pub async fn run(
                             chrome_status.health.as_ref(),
                             acp_pane.current_cwd(),
                             chat_pane.current_cwd(),
+                            acp_pane.focused_runtime_context(),
+                            chat_pane.focused_runtime_context(),
+                            &terminal_candidates,
                         ),
                         Mode::Config => config_app.draw_into(frame, content_area),
                         Mode::Doctor => doctor_pane.draw(frame, content_area),
@@ -5088,6 +5090,32 @@ mod tests {
             .expect("request channel should stay open");
         let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(request["method"], crate::client::method::STATUS);
+    }
+
+    #[test]
+    fn chrome_status_failed_health_refresh_clears_previous_snapshot() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut chrome_status = ChromeStatus {
+            health: Some(serde_json::json!({
+                "components": {"daemon": {"status": "ok"}}
+            })),
+            refresh_in_flight: true,
+            refresh_rx: Some(rx),
+            ..Default::default()
+        };
+        assert!(
+            tx.send(ChromeStatusSnapshot {
+                status: None,
+                health: None,
+            })
+            .is_ok()
+        );
+
+        chrome_status.drain_completed_refresh();
+
+        assert!(chrome_status.health.is_none());
+        assert!(!chrome_status.refresh_in_flight);
+        assert!(chrome_status.refresh_rx.is_none());
     }
 
     #[tokio::test]

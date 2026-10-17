@@ -4614,6 +4614,9 @@ pub struct SessionListResult {
 pub struct AgentStatusEntry {
     pub alias: String,
     pub enabled: bool,
+    /// Daemon-configured profile, not in-flight session telemetry.
+    #[serde(default)]
+    pub runtime_profile: Option<String>,
     #[serde(default)]
     pub live_sessions: usize,
     #[serde(default)]
@@ -4626,6 +4629,26 @@ pub struct AgentStatusEntry {
 #[serde(rename_all = "snake_case")]
 pub struct AgentsStatusResult {
     pub agents: Vec<AgentStatusEntry>,
+}
+
+#[cfg(test)]
+mod runtime_profile_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_profile_accepts_legacy_and_current_agent_status() {
+        let legacy: AgentStatusEntry = serde_json::from_value(serde_json::json!({
+            "alias": "coder", "enabled": true
+        }))
+        .unwrap();
+        assert!(legacy.runtime_profile.is_none());
+
+        let current: AgentStatusEntry = serde_json::from_value(serde_json::json!({
+            "alias": "coder", "enabled": true, "runtime_profile": "coding"
+        }))
+        .unwrap();
+        assert_eq!(current.runtime_profile.as_deref(), Some("coding"));
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
