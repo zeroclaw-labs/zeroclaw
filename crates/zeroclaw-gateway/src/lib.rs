@@ -373,172 +373,46 @@ impl GatewayRateLimiter {
     }
 }
 
+/// Request keys the generic `/webhook` and `/sop/*` routes have admitted.
+///
+/// It records into the gateway run's webhook store
+/// (`zeroclaw_api::webhook::WebhookReservationStore`), the same store plugin
+/// webhook deliveries reserve in, so both kinds share one committed-key
+/// budget (`[gateway] idempotency_max_keys`) and evict each other's oldest
+/// keys under pressure.
 #[derive(Debug)]
 pub struct IdempotencyStore {
-    ttl: Duration,
-    max_keys: usize,
-    entries: Mutex<IdempotencyEntries>,
-    #[cfg(feature = "plugins-wasm")]
-    next_generation: std::sync::atomic::AtomicU64,
-}
-
-#[derive(Debug, Default)]
-struct IdempotencyEntries {
-    committed: HashMap<String, Instant>,
-    /// Temporary plugin-delivery owners, bounded independently by `max_keys`.
-    /// Keeping this separate prevents one slow plugin request from making the
-    /// legacy boolean `record_if_new` path misclassify store pressure as a
-    /// committed duplicate.
-    #[cfg(feature = "plugins-wasm")]
-    pending: HashMap<String, PendingIdempotencyReservation>,
-}
-
-#[cfg(feature = "plugins-wasm")]
-#[derive(Debug)]
-struct PendingIdempotencyReservation {
-    generation: u64,
-    status: tokio::sync::watch::Sender<zeroclaw_api::webhook::WebhookReservationStatus>,
+    store: Arc<zeroclaw_api::webhook::WebhookReservationStore>,
 }
 
 impl IdempotencyStore {
+    /// A store of its own, for callers with no plugin webhook ingress.
     pub fn new(ttl: Duration, max_keys: usize) -> Self {
-        Self {
-            ttl,
-            max_keys: max_keys.max(1),
-            entries: Mutex::new(IdempotencyEntries::default()),
-            #[cfg(feature = "plugins-wasm")]
-            next_generation: std::sync::atomic::AtomicU64::new(1),
-        }
+        Self::shared(Arc::new(
+            zeroclaw_api::webhook::WebhookReservationStore::new(ttl, max_keys),
+        ))
+    }
+
+    /// Record into `store`, shared with the run's plugin webhook deliveries.
+    pub fn shared(store: Arc<zeroclaw_api::webhook::WebhookReservationStore>) -> Self {
+        Self { store }
     }
 
     /// Returns true if this key is new and is now recorded.
     fn record_if_new(&self, key: &str) -> bool {
-        let now = Instant::now();
-        let mut entries = self.entries.lock();
-
-        entries
-            .committed
-            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-
-        let pending_contains = {
-            #[cfg(feature = "plugins-wasm")]
-            {
-                entries.pending.contains_key(key)
-            }
-            #[cfg(not(feature = "plugins-wasm"))]
-            {
-                false
-            }
-        };
-        if entries.committed.contains_key(key) || pending_contains {
-            return false;
-        }
-
-        if entries.committed.len() >= self.max_keys {
-            let evict_key = entries
-                .committed
-                .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
-                .map(|(k, _)| k.clone());
-            if let Some(evict_key) = evict_key {
-                entries.committed.remove(&evict_key);
-            } else {
-                return false;
-            }
-        }
-
-        entries.committed.insert(key.to_owned(), now);
-        true
+        self.store.record_if_new(key)
     }
+}
 
-    #[cfg(feature = "plugins-wasm")]
-    fn begin_reservation(&self, key: &str) -> zeroclaw_api::webhook::WebhookReservation {
-        use zeroclaw_api::webhook::{
-            WebhookReservation, WebhookReservationStatus, WebhookReservationToken,
-            WebhookReservationWaiter,
-        };
-
-        let now = Instant::now();
-        let mut entries = self.entries.lock();
-        entries
-            .committed
-            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-        if entries.committed.contains_key(key) {
-            return WebhookReservation::Committed;
-        }
-        if let Some(pending) = entries.pending.get(key) {
-            return WebhookReservation::InFlight(WebhookReservationWaiter::new(
-                pending.status.subscribe(),
-            ));
-        }
-
-        if entries.pending.len() >= self.max_keys {
-            return WebhookReservation::Unavailable;
-        }
-
-        let generation = self
-            .next_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (status, _) = tokio::sync::watch::channel(WebhookReservationStatus::InFlight);
-        entries.pending.insert(
-            key.to_string(),
-            PendingIdempotencyReservation { generation, status },
-        );
-        WebhookReservation::Owner(WebhookReservationToken::new(key.to_string(), generation))
-    }
-
-    #[cfg(feature = "plugins-wasm")]
-    fn commit_reservation(&self, token: &zeroclaw_api::webhook::WebhookReservationToken) -> bool {
-        let mut entries = self.entries.lock();
-        if entries
-            .pending
-            .get(token.key())
-            .is_none_or(|pending| pending.generation != token.generation())
-        {
-            return false;
-        }
-        let Some(pending) = entries.pending.remove(token.key()) else {
-            return false;
-        };
-        pending
-            .status
-            .send_replace(zeroclaw_api::webhook::WebhookReservationStatus::Committed);
-        let now = Instant::now();
-        entries
-            .committed
-            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-        if entries.committed.len() >= self.max_keys {
-            let evict_key = entries
-                .committed
-                .iter()
-                .min_by_key(|(_, seen_at)| *seen_at)
-                .map(|(key, _)| key.clone());
-            if let Some(evict_key) = evict_key {
-                entries.committed.remove(&evict_key);
-            }
-        }
-        entries.committed.insert(token.key().to_string(), now);
-        true
-    }
-
-    #[cfg(feature = "plugins-wasm")]
-    fn rollback_reservation(&self, token: &zeroclaw_api::webhook::WebhookReservationToken) -> bool {
-        let mut entries = self.entries.lock();
-        if entries
-            .pending
-            .get(token.key())
-            .is_none_or(|pending| pending.generation != token.generation())
-        {
-            return false;
-        }
-        let Some(pending) = entries.pending.remove(token.key()) else {
-            return false;
-        };
-        pending
-            .status
-            .send_replace(zeroclaw_api::webhook::WebhookReservationStatus::RolledBack);
-        true
-    }
+/// The generic webhook routes' key store for one gateway run. It records into
+/// the run's plugin webhook store, so `/webhook`, `/sop/*` and plugin
+/// deliveries keep sharing one committed-key budget.
+fn generic_webhook_idempotency(
+    plugin_webhook_reservations: &Arc<zeroclaw_api::webhook::WebhookReservationStore>,
+) -> Arc<IdempotencyStore> {
+    Arc::new(IdempotencyStore::shared(Arc::clone(
+        plugin_webhook_reservations,
+    )))
 }
 
 fn parse_client_ip(value: &str) -> Option<IpAddr> {
@@ -821,6 +695,10 @@ impl AppState {
 pub struct GatewaySupervision {
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    /// Deduplication for plugin webhook deliveries. The daemon creates a fresh
+    /// store for every gateway run, so it is emptied whenever the gateway
+    /// restarts or the daemon reloads, exactly as when the gateway built it.
+    plugin_webhook_reservations: Arc<zeroclaw_api::webhook::WebhookReservationStore>,
     authority: zeroclaw_runtime::LiveConfigAuthority,
     /// The daemon generation's driver supervisor set. Approval surfaces
     /// register resumed headless drivers here so a reload drains them with the
@@ -834,16 +712,42 @@ impl GatewaySupervision {
     pub fn new(
         readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
         plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+        plugin_webhook_reservations: Arc<zeroclaw_api::webhook::WebhookReservationStore>,
         authority: zeroclaw_runtime::LiveConfigAuthority,
         sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     ) -> Self {
         Self {
             readiness,
             plugin_webhooks,
+            plugin_webhook_reservations,
             authority,
             sop_driver_handles,
         }
     }
+}
+
+/// The deduplication window and bound for webhook keys, from `[gateway]`
+/// `idempotency_ttl_secs` and `idempotency_max_keys`.
+fn idempotency_limits(config: &Config) -> (Duration, usize) {
+    (
+        Duration::from_secs(config.gateway.idempotency_ttl_secs.max(1)),
+        normalize_max_keys(
+            config.gateway.idempotency_max_keys,
+            IDEMPOTENCY_MAX_KEYS_DEFAULT,
+        ),
+    )
+}
+
+/// A fresh plugin webhook reservation store for one gateway run, with the
+/// same window and bound as the gateway's own webhook keys.
+#[must_use]
+pub fn plugin_webhook_reservations(
+    config: &Config,
+) -> Arc<zeroclaw_api::webhook::WebhookReservationStore> {
+    let (ttl, max_keys) = idempotency_limits(config);
+    Arc::new(zeroclaw_api::webhook::WebhookReservationStore::new(
+        ttl, max_keys,
+    ))
 }
 
 /// The config/onboarding route group. Authentication is enforced
@@ -1012,6 +916,7 @@ pub async fn run_gateway_with_authority(
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     authority: zeroclaw_runtime::LiveConfigAuthority,
 ) -> Result<()> {
+    let plugin_webhook_reservations = plugin_webhook_reservations(&config);
     Box::pin(run_gateway_with_plugin_webhooks(
         host,
         port,
@@ -1026,6 +931,7 @@ pub async fn run_gateway_with_authority(
         GatewaySupervision::new(
             readiness,
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            plugin_webhook_reservations,
             authority,
             sop_driver_handles,
         ),
@@ -1057,6 +963,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     let GatewaySupervision {
         readiness,
         plugin_webhooks,
+        plugin_webhook_reservations,
         authority,
         sop_driver_handles,
     } = supervision;
@@ -1763,14 +1670,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         config.gateway.webhook_rate_limit_per_minute,
         rate_limit_max_keys,
     ));
-    let idempotency_max_keys = normalize_max_keys(
-        config.gateway.idempotency_max_keys,
-        IDEMPOTENCY_MAX_KEYS_DEFAULT,
-    );
-    let idempotency_store = Arc::new(IdempotencyStore::new(
-        Duration::from_secs(config.gateway.idempotency_ttl_secs.max(1)),
-        idempotency_max_keys,
-    ));
+    let idempotency_store = generic_webhook_idempotency(&plugin_webhook_reservations);
 
     // Resolve optional path prefix for reverse-proxy deployments.
     let path_prefix: Option<&str> = config
@@ -2393,9 +2293,12 @@ pub async fn run_gateway_with_plugin_webhooks(
         );
 
     #[cfg(feature = "plugins-wasm")]
-    let inner = inner.merge(plugin_webhook::routes(plugin_webhooks));
+    let inner = inner.merge(plugin_webhook::routes(
+        plugin_webhooks,
+        plugin_webhook_reservations,
+    ));
     #[cfg(not(feature = "plugins-wasm"))]
-    let _ = plugin_webhooks;
+    let _ = (plugin_webhooks, plugin_webhook_reservations);
 
     #[cfg(feature = "a2a")]
     let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
@@ -7454,11 +7357,10 @@ path = "{trigger_path}"
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("k3"));
 
-        let entries = store.entries.lock();
-        assert_eq!(entries.committed.len(), 2);
-        assert!(!entries.committed.contains_key("k1"));
-        assert!(entries.committed.contains_key("k2"));
-        assert!(entries.committed.contains_key("k3"));
+        assert_eq!(store.store.committed_len(), 2);
+        assert!(!store.record_if_new("k3"), "k3 is still held");
+        assert!(!store.record_if_new("k2"), "k2 is still held");
+        assert!(store.record_if_new("k1"), "k1 was evicted");
     }
 
     #[test]
@@ -11949,10 +11851,9 @@ data: [DONE]\n\n";
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("new-key"));
 
-        let entries = store.entries.lock();
-        assert_eq!(entries.committed.len(), 1);
-        assert!(!entries.committed.contains_key("old-key"));
-        assert!(entries.committed.contains_key("new-key"));
+        assert_eq!(store.store.committed_len(), 1);
+        assert!(!store.record_if_new("new-key"), "the newest key is kept");
+        assert!(store.record_if_new("old-key"), "the oldest key was evicted");
     }
 
     #[test]
@@ -12080,8 +11981,10 @@ data: [DONE]\n\n";
             handle.join().unwrap();
         }
 
-        let entries = store.entries.lock();
-        assert!(entries.committed.len() <= 1000, "should respect max_keys");
+        assert!(
+            store.store.committed_len() <= 1000,
+            "should respect max_keys"
+        );
     }
 
     #[test]
