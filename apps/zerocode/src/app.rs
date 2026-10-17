@@ -1652,6 +1652,8 @@ pub async fn run(
     initial_leg: crate::ActiveLeg,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
+    let max_tracked_sessions_per_pane =
+        crate::config::resolve_max_tracked_sessions_per_pane_checked(config_dir)?;
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
     let mut help_overlay: Option<HelpOverlayState> = None;
     let mut reload_confirm = false;
@@ -1690,14 +1692,21 @@ pub async fn run(
                 let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
                 let doctor_pane = doctor::Doctor::new(rpc.clone());
-                let mut acp_pane = acp::Acp::new(rpc.clone());
+                let mut acp_pane = acp::Acp::new_with_max_tracked_sessions(
+                    rpc.clone(),
+                    max_tracked_sessions_per_pane,
+                );
                 // Carry the pre-disconnect sessions across a reconnect rebuild
                 // so the rebuilt pane reattaches every daemon-retained session
                 // (focused + sidebar backgrounds) instead of minting a fresh
                 // one. Empty on first build.
                 acp_pane.set_resume_sessions($resume_acp);
                 acp_pane.init().await?;
-                let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+                let mut chat_pane = chat::Chat::new_with_max_tracked_sessions(
+                    rpc.clone(),
+                    chat::PaneKind::Chat,
+                    max_tracked_sessions_per_pane,
+                );
                 chat_pane.set_resume_sessions($resume_chat);
                 chat_pane.init().await?;
                 let pending_start_chat = take_pending_quickstart_chat(

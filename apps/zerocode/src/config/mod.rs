@@ -395,6 +395,39 @@ impl Default for SidebarSection {
     }
 }
 
+// ── Tracked sessions ────────────────────────────────────────────────────────
+
+pub(crate) const DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
+pub(crate) const MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE: usize = 32;
+
+/// The `[sessions]` section: client-side tracked-session capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionsSection {
+    /// Maximum focused, background, and retained resume sessions tracked by
+    /// each chat-like pane.
+    #[serde(default = "default_max_tracked_sessions_per_pane")]
+    pub max_tracked_per_pane: usize,
+}
+
+impl Default for SessionsSection {
+    fn default() -> Self {
+        Self {
+            max_tracked_per_pane: default_max_tracked_sessions_per_pane(),
+        }
+    }
+}
+
+impl SessionsSection {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !(1..=MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE).contains(&self.max_tracked_per_pane) {
+            anyhow::bail!(
+                "max_tracked_per_pane must be between 1 and {MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE}"
+            );
+        }
+        Ok(())
+    }
+}
+
 // ── Todo tracker ──────────────────────────────────────────────────────────────
 
 /// Where the todo tracker renders inside the Code pane.
@@ -448,6 +481,10 @@ fn default_sidebar_sessions_percent() -> u16 {
 
 fn default_sidebar_queue_percent() -> u16 {
     50
+}
+
+const fn default_max_tracked_sessions_per_pane() -> usize {
+    DEFAULT_MAX_TRACKED_SESSIONS_PER_PANE
 }
 
 impl TodoTrackerSection {
@@ -528,6 +565,8 @@ pub(crate) struct ZerocodeConfig {
     pub connection: ConnectionSection,
     #[serde(default)]
     pub sidebar: SidebarSection,
+    #[serde(default)]
+    pub sessions: SessionsSection,
     /// Sparse keybinding overrides keyed `"<tag>.<variant>"`. Absent
     /// entries fall back to compile-time defaults.
     #[serde(default)]
@@ -543,6 +582,7 @@ impl Default for ZerocodeConfig {
             theme: ThemeSection::default(),
             connection: ConnectionSection::default(),
             sidebar: SidebarSection::default(),
+            sessions: SessionsSection::default(),
             keybindings: HashMap::new(),
             todotracker: TodoTrackerSection::default(),
         }
@@ -648,6 +688,11 @@ impl ZerocodeConfig {
             .clamp(SIDEBAR_QUEUE_PERCENT_MIN, SIDEBAR_QUEUE_PERCENT_MAX)
     }
 
+    pub(crate) fn resolve_max_tracked_sessions_per_pane(&self) -> Result<usize> {
+        self.sessions.validate()?;
+        Ok(self.sessions.max_tracked_per_pane)
+    }
+
     /// Convert the `[todotracker]` section into the runtime settings type
     /// used by [`TodoTracker`](crate::todo_tracker::TodoTracker).
     pub fn resolve_todo_tracker(&self) -> TodoTrackerSettings {
@@ -670,6 +715,26 @@ pub(crate) fn ensure_and_load(config_dir: &Path) -> Result<ZerocodeConfig> {
     let mut config = load_persisted(config_dir)?;
     apply_env_overrides(&mut config)?;
     Ok(config)
+}
+
+/// Resolve the effective client-side tracked-session limit, rejecting a
+/// malformed section or an out-of-range file/environment value rather than
+/// silently falling back to the default.
+pub(crate) fn resolve_max_tracked_sessions_per_pane_checked(config_dir: &Path) -> Result<usize> {
+    let path = config_path(config_dir);
+    if path.exists() {
+        let doc = load_document(&path)?;
+        if let Some(value) = doc.get("sessions") {
+            value
+                .clone()
+                .try_into::<SessionsSection>()
+                .with_context(|| format!("[sessions] in {} is malformed", path.display()))?;
+        }
+    }
+    let config = ensure_and_load(config_dir)?;
+    config
+        .resolve_max_tracked_sessions_per_pane()
+        .map_err(|error| anyhow::Error::msg(format!("[sessions] is invalid: {error}")))
 }
 
 /// Resolve the effective `[todotracker]` settings for a session boundary,
@@ -784,6 +849,15 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
             Ok(section) => config.sidebar = section,
             Err(e) => eprintln!(
                 "zerocode: ignoring [sidebar] in {} ({e}); using default",
+                path.display()
+            ),
+        }
+    }
+    if let Some(v) = doc.get("sessions") {
+        match v.clone().try_into::<SessionsSection>() {
+            Ok(section) => config.sessions = section,
+            Err(e) => eprintln!(
+                "zerocode: ignoring [sessions] in {} ({e}); using default",
                 path.display()
             ),
         }
@@ -2150,6 +2224,57 @@ mod tests {
         assert!(
             body.contains("[sidebar]") && body.contains("visible = true"),
             "the default document must materialize [sidebar] so schema-mirror env overrides resolve; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn tracked_session_limit_defaults_and_round_trips() {
+        let default = ZerocodeConfig::default();
+        assert_eq!(default.resolve_max_tracked_sessions_per_pane().unwrap(), 8);
+        let default_body = toml::to_string_pretty(&default).unwrap();
+        assert!(
+            default_body.contains("[sessions]")
+                && default_body.contains("max_tracked_per_pane = 8"),
+            "default config must materialize [sessions] for schema-mirror overrides; got:\n{default_body}"
+        );
+
+        let config: ZerocodeConfig =
+            toml::from_str("[sessions]\nmax_tracked_per_pane = 12\n").unwrap();
+        assert_eq!(config.resolve_max_tracked_sessions_per_pane().unwrap(), 12);
+    }
+
+    #[test]
+    fn checked_tracked_session_limit_rejects_invalid_values() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+
+        for value in [0, MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE + 1] {
+            seed(
+                dir.path(),
+                &format!("[sessions]\nmax_tracked_per_pane = {value}\n"),
+            );
+            let error = resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("max_tracked_per_pane must be between 1 and 32"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+
+        seed(dir.path(), "[sessions]\nmax_tracked_per_pane = \"many\"\n");
+        let error = resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("[sessions]"));
+    }
+
+    #[test]
+    fn canonical_env_spelling_overrides_tracked_session_limit() {
+        let _guard = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[sessions]\nmax_tracked_per_pane = 10\n");
+        let _value = EnvVarGuard::set("ZEROCODE_sessions__max_tracked_per_pane", "14");
+
+        assert_eq!(
+            resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap(),
+            14
         );
     }
 

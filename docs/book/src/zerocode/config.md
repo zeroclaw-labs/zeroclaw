@@ -64,6 +64,17 @@ narrow terminal widths. Selecting an existing agent from the sidebar starts a
 new Chat or Code session without replacing the other sessions already tracked
 by that pane.
 
+Each Chat or Code pane tracks at most eight sessions by default, including its focused session, background sessions, and retained reconnect entries. Headless and scripted setups can raise or lower that client-side bound in `zerocode-config.toml`; this field is not yet exposed as a Config-pane control:
+
+```toml
+[sessions]
+max_tracked_per_pane = 8 # valid range: 1 through 32
+```
+
+This is a ZeroCode memory and background-work bound, not daemon capacity. The daemon's ACP and WSS session limits are enforced independently, so increasing this value cannot exceed a lower server-side limit.
+
+ZeroCode resolves this setting at startup, so file changes take effect after restarting ZeroCode; reconnects within the same run keep the original value.
+
 TodoWrite values are re-read at every session boundary, so an edit made in the
 Config pane applies to the next session you start, restart, or switch to, with
 no zerocode restart needed.
@@ -78,6 +89,7 @@ as `__`:
 ZEROCODE_todotracker__enabled=false zerocode
 ZEROCODE_todotracker__location=bottom zerocode
 ZEROCODE_sidebar__visible=false zerocode
+ZEROCODE_sessions__max_tracked_per_pane=12 zerocode
 ```
 
 These overrides are process-transient: they affect the running instance only and
