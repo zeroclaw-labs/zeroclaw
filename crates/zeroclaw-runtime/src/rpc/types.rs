@@ -1807,6 +1807,15 @@ pub enum SessionUpdateEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Box<TurnUsageTotals>>,
     },
+    /// Recorded spend reached `cost.warn_at_percent` of a shared daily or
+    /// monthly limit. Non-blocking and at most once per turn; the turn
+    /// continues. `period` is `"day"` or `"month"`.
+    BudgetWarning {
+        session_id: String,
+        current_usd: f64,
+        limit_usd: f64,
+        period: zeroclaw_api::agent::BudgetWarningPeriod,
+    },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
     /// was cut here" marker so trimming is never silent. `dropped_messages` is

@@ -9814,6 +9814,9 @@ pub struct ChatState {
     /// Model's full context window; when present, the bar denominator so the
     /// trim budget shows as a marker rather than the 100% point.
     pub context_model_window: Option<u64>,
+    /// `(period, limit bits)` of every budget warning shown in this session,
+    /// so the per-turn daemon notice appears once per period and limit.
+    budget_warnings_shown: std::collections::HashSet<(String, u64)>,
     /// Outbound message queue; the front dispatches when the session is free.
     message_queue: MessageQueue,
     cancel_started_at: Option<Instant>,
@@ -9915,6 +9918,7 @@ impl ChatState {
             context_input_tokens_source: None,
             context_max_tokens: None,
             context_model_window: None,
+            budget_warnings_shown: std::collections::HashSet::new(),
             message_queue: MessageQueue::default(),
             cancel_started_at: None,
             queue_item_rects: Vec::new(),
@@ -11372,7 +11376,8 @@ impl ChatState {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::BudgetWarning { session_id, .. } => session_id.as_str(),
         };
         if update_sid != self.session_id {
             return;
@@ -11594,6 +11599,43 @@ impl ChatState {
                         ),
                     }
                 };
+                self.entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+                self.mark_dirty_append();
+            }
+            SessionUpdate::BudgetWarning {
+                current_usd,
+                limit_usd,
+                period,
+                ..
+            } => {
+                // The daemon sends one per turn while spend is over the
+                // threshold; show it once per period and limit per session.
+                if !self
+                    .budget_warnings_shown
+                    .insert((period.clone(), limit_usd.to_bits()))
+                {
+                    return;
+                }
+                let percent = if limit_usd > 0.0 {
+                    (current_usd / limit_usd * 100.0).floor().min(999.0) as u64
+                } else {
+                    100
+                };
+                let msg_key = if period == "month" {
+                    "zc-chat-budget-warning-month"
+                } else {
+                    "zc-chat-budget-warning-day"
+                };
+                let notice = crate::i18n::t_args(
+                    msg_key,
+                    &[
+                        ("spent", &format!("{current_usd:.2}")),
+                        ("limit", &format!("{limit_usd:.2}")),
+                        ("percent", &percent.to_string()),
+                    ],
+                );
+                self.freeze_prompt_settled_stream();
                 self.entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
@@ -12459,6 +12501,9 @@ impl ChatState {
         self.context_input_tokens_source = None;
         self.context_max_tokens = None;
         self.context_model_window = None;
+        // Budget warnings shown are per-session too: a new session gets its
+        // own first notice.
+        self.budget_warnings_shown.clear();
         // The TodoWrite plan is per-session; drop it (and its show/hide state)
         // so a switched-to session doesn't inherit the previous plan's tasks.
         // Rebuilding from freshly resolved settings also applies any Config-pane
@@ -25664,6 +25709,82 @@ mod tests {
             text: " world".to_string(),
         });
         assert_eq!(s.current_agent_text(), "Hello world");
+    }
+
+    fn budget_warning(current_usd: f64, limit_usd: f64, period: &str) -> SessionUpdate {
+        SessionUpdate::BudgetWarning {
+            session_id: "sess-1".to_string(),
+            current_usd,
+            limit_usd,
+            period: period.to_string(),
+        }
+    }
+
+    fn system_messages(s: &ChatState) -> Vec<String> {
+        s.entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::SystemMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn budget_warning_shows_one_notice_per_period_and_limit() {
+        let mut s = state();
+        s.apply_update(budget_warning(8.25, 10.0, "day"));
+        // The daemon repeats it every turn while spend stays over the line.
+        s.apply_update(budget_warning(9.10, 10.0, "day"));
+        let notices = system_messages(&s);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("8.25"), "{}", notices[0]);
+        assert!(notices[0].contains("10.00"), "{}", notices[0]);
+        assert!(notices[0].contains("82%"), "{}", notices[0]);
+        assert!(notices[0].contains("daily"), "{}", notices[0]);
+
+        // A raised limit or the other period is news again.
+        s.apply_update(budget_warning(16.5, 20.0, "day"));
+        s.apply_update(budget_warning(850.0, 1000.0, "month"));
+        let notices = system_messages(&s);
+        assert_eq!(notices.len(), 3, "{notices:?}");
+        assert!(notices[2].contains("monthly"), "{}", notices[2]);
+
+        // Coming back to a pair already shown stays quiet, even after others.
+        s.apply_update(budget_warning(8.75, 10.0, "day"));
+        assert_eq!(system_messages(&s).len(), 3);
+    }
+
+    #[test]
+    fn a_new_session_shows_its_own_budget_warning() {
+        let mut s = state();
+        s.apply_update(budget_warning(8.25, 10.0, "day"));
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.apply_update(SessionUpdate::BudgetWarning {
+            session_id: "sess-2".to_string(),
+            current_usd: 8.5,
+            limit_usd: 10.0,
+            period: "day".to_string(),
+        });
+        let notices = system_messages(&s);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("8.50"), "{}", notices[0]);
+    }
+
+    #[test]
+    fn budget_warning_for_another_session_is_ignored() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::BudgetWarning {
+            session_id: "other".to_string(),
+            current_usd: 8.25,
+            limit_usd: 10.0,
+            period: "day".to_string(),
+        });
+        assert!(system_messages(&s).is_empty());
     }
 
     #[test]

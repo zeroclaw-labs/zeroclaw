@@ -13792,6 +13792,16 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => SessionUpdateEvent::BudgetWarning {
+            session_id: session_id.to_string(),
+            current_usd: *current_usd,
+            limit_usd: *limit_usd,
+            period: *period,
+        },
         _ => return None,
     };
 
@@ -27406,6 +27416,23 @@ mod tests {
         assert_eq!(v["params"]["request_id"], "ar_1");
         assert_eq!(v["params"]["tool_name"], "bash");
         assert_eq!(v["params"]["timeout_secs"], 30);
+    }
+
+    #[test]
+    fn budget_warning_notification() {
+        let event = TurnEvent::BudgetWarning {
+            current_usd: 8.25,
+            limit_usd: 10.0,
+            period: zeroclaw_api::agent::BudgetWarningPeriod::Day,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "budget_warning");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["current_usd"], 8.25);
+        assert_eq!(v["params"]["limit_usd"], 10.0);
+        assert_eq!(v["params"]["period"], "day");
     }
 
     #[test]

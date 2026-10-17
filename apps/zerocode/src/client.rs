@@ -326,6 +326,15 @@ pub enum SessionUpdate {
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
     },
+    /// Recorded spend reached `cost.warn_at_percent` of the daily or monthly
+    /// limit. The turn continues; this is a heads-up only.
+    BudgetWarning {
+        session_id: String,
+        current_usd: f64,
+        limit_usd: f64,
+        /// `"day"` or `"month"`.
+        period: String,
+    },
     /// The agent published or updated its execution plan (TodoWrite).
     /// Whole-list replacement; `entries` is the complete authoritative
     /// list. An empty vec clears the tracker.
@@ -348,7 +357,8 @@ impl SessionUpdate {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id,
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::BudgetWarning { session_id, .. } => session_id,
         }
     }
 }
@@ -430,6 +440,12 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             unsatisfiable_floor: params.get("unsatisfiable_floor").and_then(|v| v.as_bool()),
+        }),
+        "budget_warning" => Some(SessionUpdate::BudgetWarning {
+            session_id: sid,
+            current_usd: params.get("current_usd")?.as_f64()?,
+            limit_usd: params.get("limit_usd")?.as_f64()?,
+            period: params.get("period")?.as_str()?.to_string(),
         }),
         "turn_complete" => Some(SessionUpdate::TurnComplete {
             session_id: sid,
@@ -6651,6 +6667,31 @@ mod plan_parse_tests {
         match parse_session_update(&params).expect("empty plan parses") {
             SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
             _ => panic!("expected SessionUpdate::Plan"),
+        }
+    }
+
+    #[test]
+    fn parses_budget_warning_update() {
+        let params = serde_json::json!({
+            "type": "budget_warning",
+            "session_id": "s1",
+            "current_usd": 8.25,
+            "limit_usd": 10.0,
+            "period": "day",
+        });
+        match parse_session_update(&params) {
+            Some(SessionUpdate::BudgetWarning {
+                session_id,
+                current_usd,
+                limit_usd,
+                period,
+            }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(current_usd, 8.25);
+                assert_eq!(limit_usd, 10.0);
+                assert_eq!(period, "day");
+            }
+            other => panic!("expected BudgetWarning, got {other:?}"),
         }
     }
 

@@ -480,6 +480,8 @@ zc-chat-history-trimmed-tokens-turns = Earlier conversation history was trimmed 
    *[other] turns
 } kept.
 zc-chat-history-trimmed-floor = The conversation history could not be trimmed below the configured token budget: { $reason }; the most recent turn still needs approximately { $after } tokens (configured budget: { $budget }).
+zc-chat-budget-warning-day = Cost warning: ${ $spent } of the ${ $limit } daily limit spent ({ $percent }%). Turns stop at the limit.
+zc-chat-budget-warning-month = Cost warning: ${ $spent } of the ${ $limit } monthly limit spent ({ $percent }%). Turns stop at the limit.
 zc-chat-history-trimmed-token-budget-clause = (configured token budget: { $budget })
 zc-chat-history-trimmed-token-source-provider = provider-reported
 zc-chat-history-trimmed-token-source-estimate = estimated
