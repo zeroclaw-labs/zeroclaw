@@ -193,6 +193,8 @@ tool-proxy-config = Manage ZeroClaw proxy settings (scope: environment | zerocla
 
 tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.
 
+tool-read-skill = Read the full source file for an available skill by name. Use this when its prompt entry says the instructions load on demand.
+
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
 tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
