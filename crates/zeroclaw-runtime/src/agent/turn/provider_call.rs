@@ -264,6 +264,7 @@ pub(crate) async fn call_provider(
     policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     iteration: usize,
     guard_tools: Option<&[ToolSpec]>,
+    known_tool_names: &std::collections::HashSet<String>,
 ) -> Result<ProviderCallOutcome> {
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
@@ -291,6 +292,7 @@ pub(crate) async fn call_provider(
                         ctx.draft_reasoning,
                         policy,
                         guard_tools,
+                        known_tool_names,
                     )
                     .await
                     {
@@ -1276,6 +1278,7 @@ mod streaming_fallback_tests {
             ctx.cancellation_token = Some(&token);
             let original = [ChatMessage::user("[IMAGE:data:image/png;base64,aGVsbG8=]")];
             let recovery = [ChatMessage::user("image omitted")];
+            let known_tool_names = std::collections::HashSet::new();
             let call = call_provider(
                 &ctx,
                 &provider,
@@ -1295,6 +1298,7 @@ mod streaming_fallback_tests {
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
+                &known_tool_names,
             );
             let cancel = async {
                 provider.recovery_started.notified().await;
@@ -1348,6 +1352,7 @@ mod streaming_fallback_tests {
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
+                &std::collections::HashSet::new(),
             ),
         )
         .await
@@ -1919,6 +1924,7 @@ mod streaming_fallback_tests {
                         policy,
                         0,
                         None,
+                        &std::collections::HashSet::new(),
                     ),
                 ),
             )
@@ -2030,6 +2036,7 @@ mod streaming_fallback_tests {
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("stream fallback remains a provider-call outcome");
@@ -2093,6 +2100,7 @@ mod streaming_fallback_tests {
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("stream interruption remains a provider-call outcome")
@@ -2237,6 +2245,7 @@ mod streaming_fallback_tests {
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
+                &std::collections::HashSet::new(),
             )
             .await
             .expect("stream failure is returned as a provider-call outcome");
@@ -2368,6 +2377,7 @@ mod streaming_fallback_tests {
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("provider call returns its outcome");
@@ -2458,6 +2468,7 @@ mod streaming_fallback_tests {
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
+                &std::collections::HashSet::new(),
             )
             .await
             .expect("pre-output refusal is recovered by the next candidate");
@@ -2570,6 +2581,7 @@ mod streaming_fallback_tests {
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("dispatch returns the provider outcome")
@@ -2649,6 +2661,7 @@ mod streaming_fallback_tests {
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("cancellation remains a provider-call outcome");
@@ -2729,6 +2742,7 @@ mod streaming_fallback_tests {
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("timeout remains a provider-call outcome");
@@ -2863,6 +2877,7 @@ mod streaming_fallback_tests {
                     policy,
                     0,
                     None,
+                    &std::collections::HashSet::new(),
                 )
                 .await
                 .unwrap();
@@ -3049,6 +3064,7 @@ mod streaming_fallback_tests {
         let original = [ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")];
         let recovery = [ChatMessage::user("[image removed]")];
 
+        let known_tool_names = std::collections::HashSet::new();
         let call = call_provider(
             &ctx,
             &provider,
@@ -3068,6 +3084,7 @@ mod streaming_fallback_tests {
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
+            &known_tool_names,
         );
         let cancel = async {
             provider.recovery_started.notified().await;
@@ -3127,6 +3144,7 @@ mod streaming_fallback_tests {
             zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
             0,
             None,
+            &std::collections::HashSet::new(),
         )
         .await
         .expect("provider call completes");
@@ -3181,6 +3199,7 @@ mod streaming_fallback_tests {
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
+                &std::collections::HashSet::new(),
             )
             .await
             .expect("provider call completes");
@@ -3302,6 +3321,7 @@ mod streaming_fallback_tests {
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
+                &std::collections::HashSet::new(),
             )
             .await
             .expect("provider call completes");
@@ -3360,6 +3380,7 @@ mod streaming_fallback_tests {
                 zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                 0,
                 None,
+                &std::collections::HashSet::new(),
             )
             .await
             .expect("provider call completes");
@@ -3525,6 +3546,7 @@ mod streaming_fallback_tests {
                         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                         None,
+                        &std::collections::HashSet::new(),
                     ),
                 ),
             )
@@ -3639,6 +3661,7 @@ mod streaming_fallback_tests {
                         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                         None,
+                        &std::collections::HashSet::new(),
                     ),
                 ),
             )
@@ -3906,6 +3929,7 @@ mod streaming_fallback_tests {
                         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                         None,
+                        &std::collections::HashSet::new(),
                     ),
                 ),
             )
@@ -3991,6 +4015,7 @@ mod streaming_fallback_tests {
                         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
                         0,
                         None,
+                        &std::collections::HashSet::new(),
                     ),
                 ),
             )
