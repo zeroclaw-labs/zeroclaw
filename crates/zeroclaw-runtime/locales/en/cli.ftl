@@ -1111,6 +1111,7 @@ cli-config-legend = Legend: 💉 env-overridden  🔒 secret
 cli-config-secret-set = {$path} is set (encrypted secret — value not displayed)
 cli-config-secret-unset = {$path} is not set (encrypted secret)
 cli-config-updated = {$path} updated.
+cli-config-pre-existing-validation-warning = warning: config still has a pre-existing validation error: {$error}
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
 cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
 model-switch-catalog-failed = Could not load catalog for configured provider profile {$provider}: {$error}

@@ -1000,6 +1000,7 @@ cli-config-legend = 凡例: 💉 env で上書き  🔒 シークレット
 cli-config-secret-set = {$path} は設定されています(暗号化されたシークレット — 値は表示されません)
 cli-config-secret-unset = {$path} は設定されていません(暗号化されたシークレット)
 cli-config-updated = {$path} を更新しました。
+cli-config-pre-existing-validation-warning = 警告: 設定には既存の検証エラーが残っています: {$error}
 cli-config-review-hint = `zeroclaw config list` を実行して確認し、必須フィールドを設定してください。
 cli-config-catalog-unavailable-manual = {"  "}⚠ {$provider} のカタログを利用できません（{$error}）。モデル ID を手動で入力してください。
 model-switch-catalog-failed = 設定済みプロバイダープロファイル {$provider} のカタログを読み込めませんでした: {$error}

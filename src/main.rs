@@ -11760,8 +11760,18 @@ Add pricing to the active provider profile or supply a catalog entry."
                         config.prop_fields().into_iter().map(|f| f.name).collect();
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
-                config.set_prop_persistent(&path, &selected_value)?;
+                let pre_existing = config.set_prop_persistent_validated(&path, &selected_value)?;
                 Box::pin(config.save_dirty()).await?;
+                if let Some(warning) = pre_existing {
+                    eprintln!(
+                        "{}",
+                        ta(
+                            "cli-config-pre-existing-validation-warning",
+                            &[("error", &warning.to_string())],
+                            "warning: config still has a pre-existing validation error: {$error}",
+                        )
+                    );
+                }
                 if let Some(c) = comment.as_ref()
                     && !c.is_empty()
                 {
@@ -11922,9 +11932,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                         let strict_error = std::fs::read_to_string(&config.config_path)
                             .ok()
                             .and_then(|raw| {
-                                crate::config::migration::migrate_to_current(&raw)
-                                    .err()
-                                    .map(|e| format!("{e:#}"))
+                                crate::config::migration::validate_migrated_at_path(
+                                    &raw,
+                                    &config.config_path,
+                                )
+                                .err()
+                                .map(|e| format!("{e:#}"))
                             });
                         if json {
                             let envelope = serde_json::json!({
