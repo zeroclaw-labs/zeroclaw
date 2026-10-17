@@ -17474,7 +17474,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
         assert_eq!(body["chat_id"], "456");
         let text = body["text"].as_str().unwrap();
-        assert!(text.contains("5s limit"), "notice names the limit: {text}");
+        assert_eq!(text, VoiceDropReason::TooLong { limit_secs: 5 }.notice());
     }
 
     #[tokio::test]
@@ -17586,30 +17586,19 @@ mod tests {
 
     #[tokio::test]
     async fn voice_drop_notices_name_the_reason_without_internals() {
+        // Notices follow the process locale, so only check what every
+        // translation shares; the English wording is pinned in
+        // `zeroclaw-runtime`'s `telegram_voice_drop_en_wording_fits_audio_uploads`.
         let too_long = VoiceDropReason::TooLong { limit_secs: 900 }.notice();
-        assert!(too_long.contains("900s limit"));
-
-        // The parser accepts audio uploads as well as voice notes, and a
-        // permanent retrieval failure includes files that are too big — the
-        // advice must fit both, not steer a music-file sender to a microphone
-        // or tell them to resend a file Telegram just refused.
-        let unavailable = VoiceDropReason::FileUnavailable.notice();
-        assert!(
-            unavailable.contains("smaller or shorter"),
-            "retrieval-failure advice must cover the too-big case: {unavailable}"
-        );
+        assert!(too_long.contains("900"), "{too_long}");
 
         for notice in [
             too_long,
-            unavailable,
+            VoiceDropReason::FileUnavailable.notice(),
             VoiceDropReason::EmptyTranscript.notice(),
         ] {
             assert!(
-                !notice.contains("microphone") && !notice.contains("voice"),
-                "wording must fit audio uploads, not just voice notes: {notice}"
-            );
-            assert!(
-                notice.starts_with("⚠️ Audio message skipped:"),
+                notice.starts_with("⚠️ "),
                 "every notice says what happened up front: {notice}"
             );
             assert!(

@@ -3462,6 +3462,43 @@ mod tests {
     }
 
     #[test]
+    fn telegram_voice_drop_en_wording_fits_audio_uploads() {
+        // The parser accepts audio uploads as well as voice notes, and a
+        // permanent retrieval failure includes files that are too big — the
+        // advice must fit both, not steer a music-file sender to a microphone
+        // or tell them to resend a file Telegram just refused.
+        let en = include_str!("../locales/en/cli.ftl");
+        let notice = |key, args| {
+            format_ftl_message(en, "en", key, args)
+                .unwrap_or_else(|| panic!("en: {key} should format"))
+        };
+        let too_long = notice(
+            "channel-telegram-voice-drop-too-long",
+            &[("limit_secs", "900")],
+        );
+        assert!(too_long.contains("900s limit"), "{too_long}");
+        let unavailable = notice("channel-telegram-voice-drop-file-unavailable", &[]);
+        assert!(
+            unavailable.contains("smaller or shorter"),
+            "retrieval-failure advice must cover the too-big case: {unavailable}"
+        );
+        for notice in [
+            too_long,
+            unavailable,
+            notice("channel-telegram-voice-drop-empty-transcript", &[]),
+        ] {
+            assert!(
+                notice.starts_with("⚠️ Audio message skipped:"),
+                "every notice says what happened up front: {notice}"
+            );
+            assert!(
+                !notice.contains("microphone") && !notice.contains("voice"),
+                "wording must fit audio uploads, not just voice notes: {notice}"
+            );
+        }
+    }
+
+    #[test]
     fn channel_approval_en_catalogue_matches_expected_literals() {
         // Byte-exact regression guard: the `en` values are the
         // source of truth the button/text-reply adapters compose their
