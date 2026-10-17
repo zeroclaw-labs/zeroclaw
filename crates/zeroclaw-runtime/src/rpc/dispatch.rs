@@ -113,6 +113,7 @@ pub enum Method {
     SessionConfigure,
     SessionCancel,
     SessionGitBranch,
+    SessionReloadContext,
     SessionList,
     SessionListAcp,
     SessionMessages,
@@ -252,6 +253,7 @@ impl Method {
         (Method::SessionConfigure, "session/configure"),
         (Method::SessionCancel, "session/cancel"),
         (Method::SessionGitBranch, "session/git_branch"),
+        (Method::SessionReloadContext, "session/reload_context"),
         (Method::SessionList, "session/list"),
         (Method::SessionListAcp, "session/list-acp"),
         (Method::SessionMessages, "session/messages"),
@@ -412,9 +414,11 @@ impl Method {
             M::SessionPrompt | M::SessionSteer | M::SessionRunOnce => {
                 (Resource::Sessions, Verb::Execute)
             }
-            M::SessionConfigure | M::SessionApprove | M::SessionAppend | M::SessionRename => {
-                (Resource::Sessions, Verb::Update)
-            }
+            M::SessionConfigure
+            | M::SessionApprove
+            | M::SessionAppend
+            | M::SessionRename
+            | M::SessionReloadContext => (Resource::Sessions, Verb::Update),
             M::SessionList
             | M::SessionListAcp
             | M::SessionMessages
@@ -2872,6 +2876,7 @@ impl RpcDispatcher {
                 | Method::SessionConfigure
                 | Method::SessionCancel
                 | Method::SessionGitBranch
+                | Method::SessionReloadContext
                 | Method::SessionMessages
                 | Method::SessionState
                 | Method::SessionDelete
@@ -3561,6 +3566,7 @@ impl RpcDispatcher {
             Method::SessionConfigure => self.handle_session_configure(params).await,
             Method::SessionCancel => self.handle_session_cancel(params).await,
             Method::SessionGitBranch => self.handle_session_git_branch(params).await,
+            Method::SessionReloadContext => self.handle_session_reload_context(params).await,
             Method::SessionList => self.handle_session_list(params).await,
             Method::SessionListAcp => self.handle_session_list_acp(params).await,
             Method::SessionMessages => self.handle_session_messages(params).await,
@@ -8202,6 +8208,54 @@ impl RpcDispatcher {
             stop_reason: result.stop_reason,
             content: result.content,
             usage,
+        })
+    }
+
+    /// Re-read the session agent's personality files and rebuild its system
+    /// prompt. Refused while a turn holds the agent, so the turn's
+    /// cached prefix is never swapped out from under it.
+    async fn handle_session_reload_context(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        let authorized = self
+            .authorize_session_owner(&req.session_id, Method::SessionReloadContext)
+            .await?;
+        let expected_generation = self.capture_session_access(&req.session_id).await?;
+        // Fence on the incarnation that was authorized, as `session/configure`
+        // does: a same-ID replacement installed between the ownership check
+        // and the capture above must not be reloaded on this caller's behalf.
+        if authorized
+            .as_ref()
+            .and_then(|record| record.live_generation)
+            .is_some_and(|generation| Some(generation) != expected_generation)
+        {
+            return Err(self.stale_session_incarnation_error());
+        }
+        let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await else {
+            return to_result(SessionReloadContextResult {
+                session_id: req.session_id,
+                live: false,
+                changed: false,
+            });
+        };
+        self.ensure_session_incarnation(&req.session_id, expected_generation)
+            .await?;
+        self.revalidate_admitted_session(&req.session_id, authorized.as_ref())
+            .await?;
+        let changed = {
+            let mut agent = agent.try_lock().map_err(|_| {
+                rpc_err(
+                    SESSION_BUSY,
+                    "a turn is running; reload the context after it finishes",
+                )
+            })?;
+            agent
+                .reload_personality()
+                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to reload context: {e}")))?
+        };
+        to_result(SessionReloadContextResult {
+            session_id: req.session_id,
+            live: true,
+            changed,
         })
     }
 
@@ -40078,6 +40132,7 @@ mod tests {
             "session/configure",
             "session/cancel",
             "session/git_branch",
+            "session/reload_context",
             "session/messages",
             "session/state",
             "session/delete",
@@ -45070,6 +45125,41 @@ mod tests {
         assert_eq!(steer["error"]["code"], json!(SESSION_NOT_FOUND), "{steer}");
     }
 
+    /// `session/reload_context` reaches the live agent, re-reads its
+    /// personality files, and reports whether the text changed.
+    #[tokio::test]
+    async fn session_reload_context_rereads_personality_for_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let workspace = config.agent_workspace_dir("test-agent");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let created = dispatcher
+            .handle_session_new_for_test(&json!({"agent_alias": "test-agent"}))
+            .await
+            .expect("session/new");
+        let sid = created["session_id"].as_str().unwrap().to_string();
+        let agent = sessions.get_agent(&sid).await.expect("live agent");
+        let agents_md = workspace.join("AGENTS.md");
+        std::fs::write(&agents_md, "RELOAD_V1_11696").unwrap();
+        // Prime the snapshot the way a first turn does.
+        assert!(!agent.lock().await.reload_personality().unwrap());
+        std::fs::write(&agents_md, "RELOAD_V2_11696").unwrap();
+
+        let result = dispatcher
+            .handle_session_reload_context(&json!({"session_id": sid}))
+            .await
+            .expect("session/reload_context");
+        assert_eq!(result["live"], json!(true), "{result}");
+        assert_eq!(result["changed"], json!(true), "{result}");
+
+        let again = dispatcher
+            .handle_session_reload_context(&json!({"session_id": sid}))
+            .await
+            .expect("second reload");
+        assert_eq!(again["changed"], json!(false), "{again}");
+    }
+
     #[test]
     fn new_session_methods_are_classified() {
         use zeroclaw_api::grants::{Resource, Verb};
@@ -45078,6 +45168,7 @@ mod tests {
             ("session/run-once", Verb::Execute),
             ("session/append", Verb::Update),
             ("session/rename", Verb::Update),
+            ("session/reload_context", Verb::Update),
             ("session/abort", Verb::Delete),
         ] {
             let method = Method::from_wire(wire).unwrap_or_else(|| panic!("{wire} is registered"));
