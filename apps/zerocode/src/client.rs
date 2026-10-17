@@ -333,6 +333,12 @@ pub enum SessionUpdate {
         session_id: String,
         entries: Vec<crate::wire::PlanEntry>,
     },
+    /// A tool call by a foreground delegate, attributed to the parent's
+    /// `delegate` call. Live only; restored history has none.
+    DelegateActivity {
+        session_id: String,
+        activity: zeroclaw_api::agent::DelegateActivity,
+    },
 }
 
 impl SessionUpdate {
@@ -348,7 +354,8 @@ impl SessionUpdate {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id,
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::DelegateActivity { session_id, .. } => session_id,
         }
     }
 }
@@ -455,6 +462,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 entries,
             })
         }
+        "delegate_activity" => Some(SessionUpdate::DelegateActivity {
+            session_id: sid,
+            activity: serde_json::from_value(params.clone()).ok()?,
+        }),
         _ => None,
     }
 }
@@ -6639,6 +6650,34 @@ mod plan_parse_tests {
             }
             _ => panic!("expected SessionUpdate::Plan"),
         }
+    }
+
+    #[test]
+    fn parses_delegate_activity_update() {
+        let params = serde_json::json!({
+            "type": "delegate_activity",
+            "session_id": "sess-1",
+            "parent_tool_call_id": "parent",
+            "agent": "researcher",
+            "depth": 0,
+            "tool_call_id": "c1",
+            "tool_name": "shell",
+            "phase": "started",
+            "arguments_summary": "command: ls"
+        });
+        let Some(SessionUpdate::DelegateActivity {
+            session_id,
+            activity,
+        }) = parse_session_update(&params)
+        else {
+            panic!("delegate activity parses");
+        };
+        assert_eq!(session_id, "sess-1");
+        assert_eq!(activity.parent_tool_call_id, "parent");
+        assert!(matches!(
+            activity.phase,
+            zeroclaw_api::agent::DelegateActivityPhase::Started { .. }
+        ));
     }
 
     #[test]

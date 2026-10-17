@@ -1780,6 +1780,13 @@ pub enum SessionUpdateEvent {
         session_id: String,
         entries: Vec<zeroclaw_api::plan::PlanEntry>,
     },
+    /// A foreground delegate's tool call starting or finishing, attributed
+    /// to the parent's `delegate` call. Live only: not in session history.
+    DelegateActivity {
+        session_id: String,
+        #[serde(flatten)]
+        activity: zeroclaw_api::agent::DelegateActivity,
+    },
     /// Terminal event for a turn. Replaces the response of `session/prompt`.
     /// `outcome` distinguishes a clean finish from a user-initiated cancel.
     TurnComplete {

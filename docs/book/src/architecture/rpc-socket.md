@@ -174,6 +174,18 @@ events:
 Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
 `tool_result`, `approval_request`.
 
+While a foreground agentic delegate runs, each of its tool calls also arrives
+as a `delegate_activity` event against the parent's `delegate` call:
+
+```json
+{"jsonrpc":"2.0","method":"session/update","params":{"session_id":"...","type":"delegate_activity","parent_tool_call_id":"tc_2","agent":"researcher","depth":0,"tool_call_id":"call_1","tool_name":"web_fetch","phase":"started","arguments_summary":"url: https://example.com"}}
+```
+
+`phase` is `started` (with `arguments_summary`, secret-redacted) or `finished`
+(with `success` and a bounded `output_preview`). `depth` counts nested
+delegates below the parent's call. These events are live only: session history
+does not record them, and background delegates do not send them.
+
 ### ACP durable lifecycle
 
 Native RPC keeps the original visible transcript separate from the retained provider context. Automatic trimming does not delete or renumber original transcript rows. A trim notification is sent only after its retained-context snapshot and covered checkpoint boundary have committed together; a failed write suppresses that notification. The snapshot excludes runtime system prompts, recalled-memory injection, and hidden reasoning. On interruption, recovery appends visible checkpoint progress once while restoring the model from the latest retained snapshot plus later checkpoint events. An explicitly empty retained snapshot remains authoritative. Sessions without a snapshot keep the legacy provider-safe replay path.
