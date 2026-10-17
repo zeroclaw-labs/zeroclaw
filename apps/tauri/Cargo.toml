@@ -23,13 +23,20 @@ base64 = "0.22"
 [dev-dependencies]
 tauri-utils = { version = "2.0", features = ["build-2"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+process-wrap = { version = "=9.0.0", default-features = false, features = ["std"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSRunningApplication"] }
 objc2-foundation = { version = "0.3", features = ["NSData"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
-process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
+process-wrap = { version = "=9.0.0", default-features = false, features = ["creation-flags", "job-object", "kill-on-drop", "std", "tokio1"] }
+windows = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [features]
 default = ["custom-protocol"]
