@@ -2671,6 +2671,39 @@ X-Tenant = "tenant-42"
 }
 
 #[test]
+fn encryption_covers_roster_password_hash() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SecretStore::new(tmp.path(), true);
+    let hash = "$scrypt$ln=15,r=8,p=3$BwcHBwcHBwcHBwcHBwcHBw$\
+                CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk";
+
+    let raw_toml = format!(
+        r#"
+schema_version = 3
+
+[users.zeroclaw_user]
+password_hash = "{hash}"
+permission_profiles = ["reader"]
+"#
+    );
+
+    let mut value: toml::Value = toml::from_str(&raw_toml).expect("toml parses");
+    encrypt_secret_strings(&mut value, &store).expect("encrypt walker succeeds");
+
+    let stored = value
+        .get("users")
+        .and_then(|v| v.get("zeroclaw_user"))
+        .and_then(|v| v.get("password_hash"))
+        .and_then(toml::Value::as_str)
+        .expect("users.zeroclaw_user.password_hash");
+    assert!(
+        stored.starts_with("enc2:"),
+        "the roster password hash must be encrypted at rest; got: {stored}"
+    );
+    assert_eq!(store.decrypt(stored).expect("decrypt hash"), hash);
+}
+
+#[test]
 fn encryption_preserves_onepassword_secret_references() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = SecretStore::new(tmp.path(), true);

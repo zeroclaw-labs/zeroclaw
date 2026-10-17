@@ -38,8 +38,8 @@ use zeroclaw_config::schema::Config;
 
 use super::transport::TransportKind;
 use crate::security::auth_provider::{
-    Credential, NativeAuthProvider, OidcAuthProvider, PeercredAuthProvider, ProviderRegistry,
-    UidRoster,
+    Credential, NativeAuthProvider, OidcAuthProvider, PasswordAuthProvider, PeercredAuthProvider,
+    ProviderRegistry, UidRoster,
 };
 use crate::security::principal_resolver::{PrincipalResolver, ResolvedPrincipal, ResolverPolicy};
 
@@ -159,15 +159,39 @@ pub struct AcceptedAuthState {
 }
 
 /// The parts of a configuration an accepted authorization state is compiled
-/// from: the OIDC, roster, and permission-profile sections and the daemon-uid
-/// trust posture. The pairing authority is shared live state, not config.
-fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
+/// from: the OIDC, roster, and permission-profile sections, the daemon-uid
+/// trust posture, and the password provider's settings. The pairing
+/// authority is shared live state, not config.
+///
+/// Public so a surface that edits configuration outside the daemon can tell
+/// whether its edit changes the policy a running daemon enforces, by the same
+/// comparison [`RpcInboundAuth::publish_accepted`] makes.
+pub fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::Value::Array(vec![
         serde_json::to_value(&config.oidc)?,
         serde_json::to_value(&config.users)?,
         serde_json::to_value(&config.permission_profiles)?,
         serde_json::Value::Bool(config.security.trust_daemon_uid),
+        serde_json::to_value(&config.security.password_auth)?,
     ]))
+}
+
+/// Whether the dotted property `path` writes one of the [`auth_inputs`]: the
+/// `oidc`, `users` or `permission_profiles` section or anything under it,
+/// `security.trust_daemon_uid`, or `security.password_auth` or anything under
+/// it.
+///
+/// A surface that edits configuration outside the daemon uses this where
+/// comparing [`auth_inputs`] before and after the edit is not enough: a write
+/// that re-asserts the value already in the file changes nothing there, yet
+/// the running daemon may still enforce another one.
+pub fn is_auth_input_path(path: &str) -> bool {
+    let section = path.split_once('.').map_or(path, |(section, _)| section);
+    matches!(section, "oidc" | "users" | "permission_profiles")
+        || path == "security.trust_daemon_uid"
+        || path
+            .strip_prefix("security.password_auth")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 impl AcceptedAuthState {
@@ -186,6 +210,14 @@ impl AcceptedAuthState {
             Arc::clone(&trust_daemon_uid),
             Arc::clone(&uid_roster),
         )))?;
+        // With pairing off the gateway serves requests that carry no
+        // credential, so a password would guard nothing; config validation
+        // reports the combination, and the provider stays unregistered
+        // whichever write path let it through. The guard's flag is fixed for
+        // this daemon generation, so it is not an authorization input.
+        if config.security.password_auth.enabled && pairing.require_pairing() {
+            registry.register(Arc::new(PasswordAuthProvider::from_config(config)))?;
+        }
         let mut aliases: Vec<&String> = config.oidc.keys().collect();
         aliases.sort();
         for alias in aliases {
@@ -820,6 +852,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(uid),
+                password_hash: None,
                 permission_profiles: vec!["operator".into()],
             },
         );
@@ -1181,6 +1214,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["not-configured".into()],
             },
         );
@@ -1209,6 +1243,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["not-configured".into()],
             },
         );
@@ -1511,7 +1546,7 @@ mod tests {
     #[test]
     fn publish_accepted_moves_the_generation_for_every_authorization_input() {
         type Mutation = fn(&mut Config);
-        let mutations: [(&str, Mutation); 6] = [
+        let mutations: [(&str, Mutation); 8] = [
             ("an OIDC field", |config| {
                 config.oidc.get_mut("corp").unwrap().audience = "zeroclaw-next".into();
             }),
@@ -1529,6 +1564,7 @@ mod tests {
                     UserConfig {
                         principal_id: None,
                         uid: Some(4344),
+                        password_hash: None,
                         permission_profiles: vec!["operator".into()],
                     },
                 );
@@ -1544,6 +1580,13 @@ mod tests {
             ("the daemon uid trust posture", |config| {
                 config.security.trust_daemon_uid = !config.security.trust_daemon_uid;
             }),
+            ("the password provider switch", |config| {
+                config.security.password_auth.enabled = !config.security.password_auth.enabled;
+            }),
+            ("a roster password hash", |config| {
+                config.users.get_mut("alice").unwrap().password_hash =
+                    Some(POLICY_SHAPED_HASH.into());
+            }),
         ];
         for (input, mutate) in mutations {
             let config = oidc_config();
@@ -1558,6 +1601,332 @@ mod tests {
         }
     }
 
+    /// A PHC string inside the password policy, with filler salt and output.
+    /// Compiling a policy never hashes, so no real password is needed.
+    const POLICY_SHAPED_HASH: &str = "$scrypt$ln=15,r=8,p=3$BwcHBwcHBwcHBwcHBwcHBw$\
+                                      CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk";
+
+    #[test]
+    fn password_provider_is_registered_only_while_enabled() {
+        let mut config = config_with_roster(4242);
+        config.users.get_mut("alice").unwrap().password_hash = Some(POLICY_SHAPED_HASH.into());
+        assert_eq!(
+            auth_for(&config, &[]).provider_names(),
+            vec!["native", "peercred"],
+            "a stored hash alone registers nothing"
+        );
+
+        config.security.password_auth.enabled = true;
+        assert_eq!(
+            auth_for(&config, &[]).provider_names(),
+            vec!["native", "peercred", "password"]
+        );
+    }
+
+    #[test]
+    fn password_provider_needs_pairing_to_register() {
+        let mut config = config_with_roster(4242);
+        config.users.get_mut("alice").unwrap().password_hash = Some(POLICY_SHAPED_HASH.into());
+        config.security.password_auth.enabled = true;
+        let unpaired = RpcInboundAuth::from_config(
+            &config,
+            Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+        )
+        .expect("valid");
+        assert_eq!(
+            unpaired.provider_names(),
+            vec!["native", "peercred"],
+            "with pairing off the provider must stay unregistered"
+        );
+    }
+
+    #[test]
+    fn deny_all_state_never_registers_the_password_provider() {
+        let mut config = config_with_roster(4242);
+        config.security.password_auth.enabled = true;
+        config.users.get_mut("alice").unwrap().permission_profiles = vec!["not-configured".into()];
+        let auth = auth_for(&config, &[]);
+        assert_eq!(auth.provider_names(), vec!["native", "peercred"]);
+    }
+
+    #[tokio::test]
+    async fn a_bearer_selecting_the_password_provider_is_refused() {
+        // A password is never read out of `auth_token`. The stored hash is
+        // of the very token sent, so if the bearer were checked as a
+        // password it would verify; it must be refused as the mis-kinded
+        // credential it is, by the provider that is registered.
+        let password = "zeroclaw-test-passphrase";
+        let mut config = config_with_roster(4242);
+        config.users.get_mut("alice").unwrap().password_hash = Some(
+            zeroclaw_config::password_hash::hash_password(password).expect("hash a test password"),
+        );
+        config.security.password_auth.enabled = true;
+        let auth = auth_for(&config, &[]);
+        assert!(auth.provider_names().iter().any(|name| name == "password"));
+        let denied = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some(password),
+                Some("password"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied,
+            AuthDenied::from_deny_reason(DenyReason::BadCredential)
+        );
+    }
+
+    #[tokio::test]
+    async fn password_and_peer_credential_on_one_entry_are_one_principal() {
+        let password = "zeroclaw-test-passphrase";
+        let mut config = config_with_roster(4242);
+        config.users.get_mut("alice").unwrap().password_hash = Some(
+            zeroclaw_config::password_hash::hash_password(password).expect("hash a test password"),
+        );
+        config.security.password_auth.enabled = true;
+        let auth = auth_for(&config, &[]);
+
+        let by_uid = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: 4242 },
+                None,
+                None,
+            )
+            .await
+            .expect("roster uid authenticates");
+        let verified = auth
+            .state()
+            .registry
+            .resolve_named(
+                "password",
+                &Credential::Password {
+                    username: "alice".into(),
+                    password: zeroize::Zeroizing::new(password.into()),
+                },
+            )
+            .await;
+        let identity = verified.identity().expect("the password verifies");
+        let by_password = auth.resolve(identity).expect("the identity resolves");
+
+        assert_eq!(by_password.principal.id, by_uid.principal.id);
+        assert_eq!(by_password.principal.auth_method, AuthMethod::Password);
+        assert!(by_password.grants.permits(Resource::Sessions, Verb::Read));
+        assert!(!by_password.grants.admin);
+    }
+
+    /// `auth_inputs` is what a client compares to decide whether an edit must
+    /// reach the running daemon, and `is_auth_input_path` is how it tells a
+    /// write to those inputs by its path, so both have to cover every
+    /// authorization section and nothing else.
+    #[test]
+    fn auth_inputs_change_only_with_the_authorization_sections() {
+        let base = base_config();
+        let inputs = auth_inputs(&base).expect("the default config encodes");
+
+        let mut unrelated = base.clone();
+        unrelated.gateway.host = "0.0.0.0".into();
+        assert_eq!(
+            auth_inputs(&unrelated).expect("the edited config encodes"),
+            inputs,
+            "a gateway edit is not an authorization input"
+        );
+        assert!(!is_auth_input_path("gateway.host"));
+
+        type Mutation = fn(&mut Config);
+        let mutations: [(&str, Mutation); 5] = [
+            ("security.trust_daemon_uid", |config| {
+                config.security.trust_daemon_uid = !config.security.trust_daemon_uid;
+            }),
+            ("security.password_auth.enabled", |config| {
+                config.security.password_auth.enabled = !config.security.password_auth.enabled;
+            }),
+            ("users.alice.uid", |config| {
+                config.users.insert(
+                    "alice".into(),
+                    UserConfig {
+                        principal_id: None,
+                        uid: Some(4242),
+                        password_hash: None,
+                        permission_profiles: vec!["operator".into()],
+                    },
+                );
+            }),
+            ("permission_profiles.operator", |config| {
+                config
+                    .permission_profiles
+                    .insert("operator".into(), PermissionProfileConfig::default());
+            }),
+            ("oidc.corp", |config| {
+                config.oidc.insert("corp".into(), OidcConfig::default());
+            }),
+        ];
+        for (path, mutate) in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                auth_inputs(&changed).expect("the edited config encodes"),
+                inputs,
+                "a write to {path} must change the authorization inputs"
+            );
+            assert!(
+                is_auth_input_path(path),
+                "{path} must name an authorization input"
+            );
+        }
+    }
+
+    /// Every path that writes a section `auth_inputs` reads is an
+    /// authorization input path, and nothing else is, however close its name.
+    #[test]
+    fn is_auth_input_path_names_exactly_the_authorization_sections() {
+        for path in [
+            "oidc",
+            "oidc.corp",
+            "oidc.corp.client_secret",
+            "users",
+            "users.me.uid",
+            "users.me.permission_profiles",
+            "permission_profiles",
+            "permission_profiles.admin.admin",
+            "security.trust_daemon_uid",
+            "security.password_auth",
+            "security.password_auth.enabled",
+        ] {
+            assert!(is_auth_input_path(path), "{path} is an authorization input");
+        }
+        for path in [
+            "",
+            "gateway.host",
+            "security",
+            "security.trust_daemon_uid_extra",
+            "security.password_auth_extra",
+            "security.password_authenticator.enabled",
+            "security.sandbox.enabled",
+            "usersx.me.uid",
+            "oidc_providers.corp",
+            "permission_profiles_extra",
+            "agents.users.model",
+            "trust_daemon_uid",
+        ] {
+            assert!(
+                !is_auth_input_path(path),
+                "{path} is not an authorization input"
+            );
+        }
+    }
+
+    /// A value for `field` that differs from its current one, derived from
+    /// its kind, or `None` where `set_prop` takes no plain value for it.
+    fn changed_value(field: &zeroclaw_config::traits::PropFieldInfo) -> Option<String> {
+        use zeroclaw_config::traits::{PropKind, UNSET_DISPLAY};
+        let current = field.display_value.as_str();
+        let unset = current == UNSET_DISPLAY;
+        match field.kind {
+            PropKind::Bool => Some((current != "true").to_string()),
+            PropKind::Integer if unset => Some("1".to_owned()),
+            PropKind::Integer => Some(current.parse::<i64>().ok()?.checked_add(1)?.to_string()),
+            PropKind::Float if unset => Some("1.0".to_owned()),
+            PropKind::Float => Some((current.parse::<f64>().ok()? + 1.0).to_string()),
+            PropKind::String | PropKind::AliasRef if unset => Some("drift-guard".to_owned()),
+            PropKind::String | PropKind::AliasRef => Some(format!("{current}-drift-guard")),
+            PropKind::Enum => (field.enum_variants?)()
+                .into_iter()
+                .find(|variant| variant != current),
+            PropKind::StringArray => {
+                let mut items: Vec<String> = if unset {
+                    Vec::new()
+                } else {
+                    serde_json::from_str(current).ok()?
+                };
+                items.push("drift-guard".to_owned());
+                serde_json::to_string(&items).ok()
+            }
+            PropKind::Object | PropKind::ObjectArray => None,
+        }
+    }
+
+    /// The drift guard for `is_auth_input_path`: a property whose write
+    /// changes the authorization inputs but which the predicate does not
+    /// name would let an edit bypass the running daemon's policy. Every
+    /// property the configuration exposes, with one entry in each
+    /// authorization section so their fields are exposed too, is changed on
+    /// its own and the inputs compared before and after.
+    #[test]
+    fn is_auth_input_path_names_every_property_that_changes_the_authorization_inputs() {
+        let mut config = base_config();
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                password_hash: None,
+                permission_profiles: vec!["operator".into()],
+            },
+        );
+        config
+            .permission_profiles
+            .insert("operator".into(), PermissionProfileConfig::default());
+        config.oidc.insert("corp".into(), OidcConfig::default());
+        let inputs = auth_inputs(&config).expect("the fixture encodes");
+        let serialized = |config: &Config| toml::to_string(config).expect("the config encodes");
+        let unedited = serialized(&config);
+
+        let mut exercised: Vec<String> = Vec::new();
+        for field in config.prop_fields() {
+            let Some(value) = changed_value(&field) else {
+                continue;
+            };
+            let mut staged = config.clone();
+            if staged.set_prop(&field.name, &value).is_err() {
+                continue;
+            }
+            // `get_prop` masks a secret whatever its value, so a write to one
+            // is seen in the serialized configuration instead.
+            let took_effect = staged.get_prop(&field.name).ok()
+                != config.get_prop(&field.name).ok()
+                || (field.is_secret && serialized(&staged) != unedited);
+            if !took_effect {
+                continue;
+            }
+            let changed = auth_inputs(&staged).expect("the edited config encodes") != inputs;
+            if changed {
+                assert!(
+                    is_auth_input_path(&field.name),
+                    "a write to {} changes the authorization inputs, but is_auth_input_path does not name it",
+                    field.name
+                );
+            } else {
+                // No property under the authorization sections takes a write
+                // that serialization does not show, so none is exempt here.
+                assert!(
+                    !is_auth_input_path(&field.name),
+                    "is_auth_input_path names {}, but a write to it leaves the authorization inputs unchanged",
+                    field.name
+                );
+            }
+            exercised.push(field.name);
+        }
+
+        for section in ["users.", "permission_profiles.", "oidc."] {
+            assert!(
+                exercised.iter().any(|name| name.starts_with(section)),
+                "no property under {section} was exercised: {exercised:?}"
+            );
+        }
+        for input in [
+            "security.trust_daemon_uid",
+            "security.password_auth.enabled",
+        ] {
+            assert!(
+                exercised.iter().any(|name| name == input),
+                "{input} was not exercised: {exercised:?}"
+            );
+        }
+    }
+
     #[test]
     fn publish_accepted_replaces_a_deny_all_state_with_the_repaired_policy() {
         let mut dangling = base_config();
@@ -1566,6 +1935,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["not-configured".into()],
             },
         );
