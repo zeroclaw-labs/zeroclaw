@@ -10,6 +10,7 @@ pub mod hook;
 pub mod ingress;
 pub mod jsonrpc;
 pub mod lifecycle;
+pub mod local_file_diff;
 pub mod media;
 pub mod memory_traits;
 pub mod model_provider;
