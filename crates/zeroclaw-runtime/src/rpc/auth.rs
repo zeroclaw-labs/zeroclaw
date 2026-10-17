@@ -38,8 +38,8 @@ use zeroclaw_config::schema::Config;
 
 use super::transport::TransportKind;
 use crate::security::auth_provider::{
-    Credential, NativeAuthProvider, OidcAuthProvider, PeercredAuthProvider, ProviderRegistry,
-    UidRoster,
+    Credential, NativeAuthProvider, OidcAuthProvider, PasswordAuthProvider, PeercredAuthProvider,
+    ProviderRegistry, UidRoster,
 };
 use crate::security::principal_resolver::{PrincipalResolver, ResolvedPrincipal, ResolverPolicy};
 
@@ -159,14 +159,16 @@ pub struct AcceptedAuthState {
 }
 
 /// The parts of a configuration an accepted authorization state is compiled
-/// from: the OIDC, roster, and permission-profile sections and the daemon-uid
-/// trust posture. The pairing authority is shared live state, not config.
+/// from: the OIDC, roster, and permission-profile sections, the daemon-uid
+/// trust posture, and the password provider's settings. The pairing
+/// authority is shared live state, not config.
 fn auth_inputs(config: &Config) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::Value::Array(vec![
         serde_json::to_value(&config.oidc)?,
         serde_json::to_value(&config.users)?,
         serde_json::to_value(&config.permission_profiles)?,
         serde_json::Value::Bool(config.security.trust_daemon_uid),
+        serde_json::to_value(&config.security.password_auth)?,
     ]))
 }
 
@@ -186,6 +188,14 @@ impl AcceptedAuthState {
             Arc::clone(&trust_daemon_uid),
             Arc::clone(&uid_roster),
         )))?;
+        // With pairing off the gateway serves requests that carry no
+        // credential, so a password would guard nothing; config validation
+        // reports the combination, and the provider stays unregistered
+        // whichever write path let it through. The guard's flag is fixed for
+        // this daemon generation, so it is not an authorization input.
+        if config.security.password_auth.enabled && pairing.require_pairing() {
+            registry.register(Arc::new(PasswordAuthProvider::from_config(config)))?;
+        }
         let mut aliases: Vec<&String> = config.oidc.keys().collect();
         aliases.sort();
         for alias in aliases {
@@ -820,6 +830,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(uid),
+                password_hash: None,
                 permission_profiles: vec!["operator".into()],
             },
         );
@@ -1181,6 +1192,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["not-configured".into()],
             },
         );
@@ -1209,6 +1221,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["not-configured".into()],
             },
         );
@@ -1511,7 +1524,7 @@ mod tests {
     #[test]
     fn publish_accepted_moves_the_generation_for_every_authorization_input() {
         type Mutation = fn(&mut Config);
-        let mutations: [(&str, Mutation); 6] = [
+        let mutations: [(&str, Mutation); 8] = [
             ("an OIDC field", |config| {
                 config.oidc.get_mut("corp").unwrap().audience = "zeroclaw-next".into();
             }),
@@ -1529,6 +1542,7 @@ mod tests {
                     UserConfig {
                         principal_id: None,
                         uid: Some(4344),
+                        password_hash: None,
                         permission_profiles: vec!["operator".into()],
                     },
                 );
@@ -1544,6 +1558,13 @@ mod tests {
             ("the daemon uid trust posture", |config| {
                 config.security.trust_daemon_uid = !config.security.trust_daemon_uid;
             }),
+            ("the password provider switch", |config| {
+                config.security.password_auth.enabled = !config.security.password_auth.enabled;
+            }),
+            ("a roster password hash", |config| {
+                config.users.get_mut("alice").unwrap().password_hash =
+                    Some(POLICY_SHAPED_HASH.into());
+            }),
         ];
         for (input, mutate) in mutations {
             let config = oidc_config();
@@ -1558,6 +1579,122 @@ mod tests {
         }
     }
 
+    /// A PHC string inside the password policy, with filler salt and output.
+    /// Compiling a policy never hashes, so no real password is needed.
+    const POLICY_SHAPED_HASH: &str = "$scrypt$ln=15,r=8,p=3$BwcHBwcHBwcHBwcHBwcHBw$\
+                                      CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk";
+
+    #[test]
+    fn password_provider_is_registered_only_while_enabled() {
+        let mut config = config_with_roster(4242);
+        config.users.get_mut("alice").unwrap().password_hash = Some(POLICY_SHAPED_HASH.into());
+        assert_eq!(
+            auth_for(&config, &[]).provider_names(),
+            vec!["native", "peercred"],
+            "a stored hash alone registers nothing"
+        );
+
+        config.security.password_auth.enabled = true;
+        assert_eq!(
+            auth_for(&config, &[]).provider_names(),
+            vec!["native", "peercred", "password"]
+        );
+    }
+
+    #[test]
+    fn password_provider_needs_pairing_to_register() {
+        let mut config = config_with_roster(4242);
+        config.users.get_mut("alice").unwrap().password_hash = Some(POLICY_SHAPED_HASH.into());
+        config.security.password_auth.enabled = true;
+        let unpaired = RpcInboundAuth::from_config(
+            &config,
+            Arc::new(PairingGuard::new(false, &[], PairingCodePolicy::default())),
+        )
+        .expect("valid");
+        assert_eq!(
+            unpaired.provider_names(),
+            vec!["native", "peercred"],
+            "with pairing off the provider must stay unregistered"
+        );
+    }
+
+    #[test]
+    fn deny_all_state_never_registers_the_password_provider() {
+        let mut config = config_with_roster(4242);
+        config.security.password_auth.enabled = true;
+        config.users.get_mut("alice").unwrap().permission_profiles = vec!["not-configured".into()];
+        let auth = auth_for(&config, &[]);
+        assert_eq!(auth.provider_names(), vec!["native", "peercred"]);
+    }
+
+    #[tokio::test]
+    async fn a_bearer_selecting_the_password_provider_is_refused() {
+        // A password is never read out of `auth_token`. The stored hash is
+        // of the very token sent, so if the bearer were checked as a
+        // password it would verify; it must be refused as the mis-kinded
+        // credential it is, by the provider that is registered.
+        let password = "zeroclaw-test-passphrase";
+        let mut config = config_with_roster(4242);
+        config.users.get_mut("alice").unwrap().password_hash = Some(
+            zeroclaw_config::password_hash::hash_password(password).expect("hash a test password"),
+        );
+        config.security.password_auth.enabled = true;
+        let auth = auth_for(&config, &[]);
+        assert!(auth.provider_names().iter().any(|name| name == "password"));
+        let denied = auth
+            .authenticate(
+                TransportKind::Wss,
+                Credential::None,
+                Some(password),
+                Some("password"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denied,
+            AuthDenied::from_deny_reason(DenyReason::BadCredential)
+        );
+    }
+
+    #[tokio::test]
+    async fn password_and_peer_credential_on_one_entry_are_one_principal() {
+        let password = "zeroclaw-test-passphrase";
+        let mut config = config_with_roster(4242);
+        config.users.get_mut("alice").unwrap().password_hash = Some(
+            zeroclaw_config::password_hash::hash_password(password).expect("hash a test password"),
+        );
+        config.security.password_auth.enabled = true;
+        let auth = auth_for(&config, &[]);
+
+        let by_uid = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: 4242 },
+                None,
+                None,
+            )
+            .await
+            .expect("roster uid authenticates");
+        let verified = auth
+            .state()
+            .registry
+            .resolve_named(
+                "password",
+                &Credential::Password {
+                    username: "alice".into(),
+                    password: zeroize::Zeroizing::new(password.into()),
+                },
+            )
+            .await;
+        let identity = verified.identity().expect("the password verifies");
+        let by_password = auth.resolve(identity).expect("the identity resolves");
+
+        assert_eq!(by_password.principal.id, by_uid.principal.id);
+        assert_eq!(by_password.principal.auth_method, AuthMethod::Password);
+        assert!(by_password.grants.permits(Resource::Sessions, Verb::Read));
+        assert!(!by_password.grants.admin);
+    }
+
     #[test]
     fn publish_accepted_replaces_a_deny_all_state_with_the_repaired_policy() {
         let mut dangling = base_config();
@@ -1566,6 +1703,7 @@ mod tests {
             UserConfig {
                 principal_id: None,
                 uid: Some(4242),
+                password_hash: None,
                 permission_profiles: vec!["not-configured".into()],
             },
         );

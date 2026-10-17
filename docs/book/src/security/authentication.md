@@ -64,10 +64,11 @@ importantly, what changes for existing remote connections.
 
 Authorization is **live** for edits made through the daemon's RPC config
 methods, which is what zerocode's config editor uses: editing
-`[permission_profiles]`, `[users]`, `[oidc]`, or `security.trust_daemon_uid`
-that way re-compiles the policy at save time. Established native-token and
-local connections re-resolve at their next operation, with no reconnect or
-restart, and an OIDC connection must initialize again. Edits made
+`[permission_profiles]`, `[users]`, `[oidc]`, `security.trust_daemon_uid`, or
+`[security.password_auth]` that way re-compiles the policy at save time.
+Established native-token and local connections re-resolve at their next
+operation, with no reconnect or restart, and an OIDC connection must
+initialize again. Edits made
 outside the daemon, directly in `config.toml`, through the web dashboard, or
 with `zeroclaw config set`, apply at the next daemon reload or restart.
 Revoking a gateway pairing token through the gateway's pairing controls
@@ -85,6 +86,7 @@ tokens through the pairing controls.
 |---|---|---|
 | `native` | Gateway pairing bearer token | Gateway pairing (`/pair`); the daemon and gateway share one live token authority |
 | `peercred` | Unix peer uid on the local socket | Always on; `[users.<name>].uid` maps a uid to a named principal |
+| `password` | Roster name and password | `[security.password_auth]` and `[users.<name>].password_hash`; no surface presents a password yet (see [Passwords](#passwords)) |
 | `oidc.<alias>` | JWT or opaque bearer from your IdP | `[oidc.<alias>]` |
 
 ### Local connections
@@ -185,6 +187,55 @@ and approvals are not keyed on it yet (see
 [What this layer does not do (yet)](#what-this-layer-does-not-do-yet)), but
 they will be, so to rename an entry without orphaning its data later, set
 `principal_id` to the original id in the same edit.
+
+Each entry needs at least one credential: a `uid`, a `password_hash`, or
+both. Every credential on one entry resolves to that entry's principal, so
+a peer credential and a password on the same entry carry the same grants.
+An entry without a `uid` still makes a roster: once any entry exists, a
+local connection that presents no credential is refused, as described under
+[Local connections](#local-connections).
+
+### Passwords
+
+`[users.<name>].password_hash` holds a scrypt hash in PHC form, never a
+password: `$scrypt$ln=<log2 N>,r=8,p=<p>$<salt>$<hash>`, with all three
+parameters written out. Validation refuses any other value, including a
+hash that costs less than N times p of 81920 (the lowest cost OWASP lists
+for scrypt), one that uses less than 16 MiB or more than 128 MiB of memory
+(`ln` outside 14 to 17) or more than 16 passes, a salt shorter than 16
+bytes, or an output other than 32 bytes. The field is a secret: it is
+encrypted at rest when `[secrets] encrypt` is on and masked on every config
+read.
+
+Stored hashes are checked only while the provider is enabled:
+
+```toml
+[security.password_auth]
+enabled = true
+```
+
+The provider also needs `gateway.require_pairing = true`, the default. With
+pairing off the gateway accepts requests that carry no credential, so a
+password would protect nothing: full config validation reports the
+combination as an error, and the provider stays unregistered while the
+running daemon has pairing off. The RPC config methods do not run that full
+validation, so they save the combination without an error; the provider
+still stays unregistered. The daemon reads the pairing setting when it
+starts or reloads, so turning pairing on takes effect at the next reload.
+A change to the switch or to any `password_hash` publishes a new
+authorization policy, like any other roster edit.
+
+The login name is the `[users.<name>]` key, matched exactly. A wrong
+password, an unknown name, and an entry without a hash get the same denial.
+When there is no hash to check, the password is checked against a stand-in
+hash with the parameters most of the roster's hashes use, so the attempt
+takes as long as checking one of them. A hash with other parameters takes a
+different time to check, which can reveal that its user exists; keep every
+hash at the same parameters.
+
+No command writes these hashes yet, and no client surface presents a
+password to the provider. In particular an RPC `auth_token` sent with
+`auth_provider = "password"` is refused, never checked as a password.
 
 ### OIDC
 
@@ -522,8 +573,9 @@ layer in follow-ups.
   every delivery and ends at the first one after its credential expires,
   its pairing is revoked, or its principal loses `Logs:Read`.
 - **Policy changes**: a config save that leaves `[oidc]`, `[users]`,
-  `[permission_profiles]`, and `security.trust_daemon_uid` unchanged keeps
-  every binding as it is. A change to any of them publishes a new policy.
+  `[permission_profiles]`, `security.trust_daemon_uid`, and
+  `[security.password_auth]` unchanged keeps every binding as it is. A
+  change to any of them publishes a new policy.
   Native-token and local connections re-resolve against it in place, but
   the daemon does not keep an OIDC bearer, so the next operation on an OIDC
   connection is refused until the client re-initializes.
