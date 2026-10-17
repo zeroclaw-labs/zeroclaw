@@ -29503,6 +29503,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_new_restore_time_trim_keeps_created_at_of_retained_chat_rows() {
+        // The restore-time trim replaces the stored transcript. With the
+        // SQLite chat backend the retained rows must keep the time they were
+        // first persisted, and only the new breadcrumb gets the time of the
+        // write.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = "default".into();
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                max_history_messages: Some(2),
+                ..Default::default()
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "session-new-restore-trim-times";
+        let session_key = format!("rpc_{sid}");
+        let over_cap = [
+            ChatMessage::user("turn one request"),
+            ChatMessage::assistant("turn one answer"),
+            ChatMessage::user("turn two request"),
+            ChatMessage::assistant("turn two answer"),
+            ChatMessage::user("turn three request"),
+            ChatMessage::assistant("turn three answer"),
+        ];
+        // One prefix at a time, so that every row gets a time of its own.
+        for len in 1..=over_cap.len() {
+            chat_backend
+                .replace_conversation_state(&session_key, &over_cap[..len], false)
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        let seeded: std::collections::HashMap<_, _> = chat_backend
+            .load_with_timestamps(&session_key)
+            .into_iter()
+            .map(|row| (row.message.content, row.created_at.expect("seeded time")))
+            .collect();
+        assert_eq!(seeded.len(), over_cap.len());
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "chat",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new must succeed");
+
+        let stored = chat_backend.load_with_timestamps(&session_key);
+        assert!(
+            stored.len() < over_cap.len(),
+            "the restore-time trim must persist a capped transcript: {stored:?}"
+        );
+        let retained: Vec<_> = stored
+            .iter()
+            .filter(|row| seeded.contains_key(&row.message.content))
+            .collect();
+        assert!(
+            !retained.is_empty(),
+            "some seeded rows must survive the trim"
+        );
+        for row in retained {
+            assert_eq!(
+                row.created_at.expect("retained time"),
+                seeded[&row.message.content],
+                "retained row {:?} must keep the time it was first persisted",
+                row.message.content
+            );
+        }
+        let newest_seeded = seeded.values().max().unwrap();
+        let breadcrumb = &stored[0];
+        assert!(
+            !seeded.contains_key(&breadcrumb.message.content),
+            "the first row is the new breadcrumb: {breadcrumb:?}"
+        );
+        assert!(
+            breadcrumb.created_at.expect("breadcrumb time") > *newest_seeded,
+            "the new breadcrumb takes the time of the write"
+        );
+    }
+
+    #[tokio::test]
     async fn rpc_acp_agents_receive_owned_session_tools_on_create_and_rehydrate() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);

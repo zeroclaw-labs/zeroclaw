@@ -26,3 +26,8 @@ url = "2.5"
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+criterion = "0.8"
+
+[[bench]]
+name = "session_sqlite"
+harness = false
