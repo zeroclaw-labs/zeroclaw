@@ -630,6 +630,7 @@ pub(crate) fn parse_responses_usage(usage: Option<&Value>) -> Option<TokenUsage>
             output_tokens,
             cached_input_tokens,
             cache_creation_input_tokens: None,
+            ..Default::default()
         },
     )
 }
@@ -1986,6 +1987,7 @@ mod tests {
                 cached_input_tokens: Some(45),
                 cache_creation_input_tokens: None,
                 output_tokens: Some(30),
+                ..
             })]
         ));
         assert_eq!(

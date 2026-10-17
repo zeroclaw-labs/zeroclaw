@@ -6443,6 +6443,7 @@ mod tests {
                         output_tokens: Some(3),
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     }),
                 }) as Box<dyn ModelProvider>,
             )],
@@ -6584,6 +6585,7 @@ mod tests {
                             output_tokens: Some(7),
                             cached_input_tokens: None,
                             cache_creation_input_tokens: None,
+                            ..Default::default()
                         },
                     )),
                     Ok(zeroclaw_providers::traits::StreamEvent::Final),
@@ -10289,6 +10291,7 @@ mod tests {
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
                     output_tokens: Some(20),
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             }]),
@@ -10867,6 +10870,7 @@ mod tests {
             output_tokens: Some(1_000_000),
             cached_input_tokens: Some(0),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
 
         let (_, cost_usd) = TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -13305,6 +13309,7 @@ mod tests {
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
                         output_tokens: Some(200),
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 })
@@ -16630,6 +16635,7 @@ mod tests {
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
                         output_tokens: Some(5),
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 }]),
@@ -16717,6 +16723,7 @@ mod tests {
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
                         output_tokens: Some(5),
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 }]),
@@ -16822,6 +16829,7 @@ mod tests {
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
                         output_tokens: Some(200),
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 }]),
@@ -16924,6 +16932,7 @@ mod tests {
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
                         output_tokens: Some(200),
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 }]),
@@ -17279,6 +17288,7 @@ mod tests {
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
                         output_tokens: Some(20),
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 },
@@ -17454,6 +17464,7 @@ vision_model_provider = "custom.vision"
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
                         output_tokens: Some(20),
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 })

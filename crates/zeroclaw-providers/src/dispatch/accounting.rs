@@ -531,12 +531,6 @@ pub(crate) fn current_billable_usage() -> Option<TokenUsage> {
                     let output = usage.output_tokens?;
                     let cached = usage.cached_input_tokens.unwrap_or(0);
                     let creation = usage.cache_creation_input_tokens.unwrap_or(0);
-                    let next = TokenUsage {
-                        input_tokens: Some(input),
-                        output_tokens: Some(output),
-                        cached_input_tokens: Some(cached),
-                        cache_creation_input_tokens: Some(creation),
-                    };
                     match &mut total {
                         Some(total) => {
                             total.input_tokens = total.input_tokens?.checked_add(input);
@@ -545,8 +539,22 @@ pub(crate) fn current_billable_usage() -> Option<TokenUsage> {
                                 total.cached_input_tokens?.checked_add(cached);
                             total.cache_creation_input_tokens =
                                 total.cache_creation_input_tokens?.checked_add(creation);
+                            // Same absent-vs-reported-zero rule as `accumulate_usage`.
+                            crate::reliable::merge_reported_usage_carriers(total, usage);
                         }
-                        None => total = Some(next),
+                        None => {
+                            total = Some(TokenUsage {
+                                input_tokens: Some(input),
+                                output_tokens: Some(output),
+                                cached_input_tokens: Some(cached),
+                                cache_creation_input_tokens: Some(creation),
+                                reasoning_tokens: usage.reasoning_tokens,
+                                provider_total_tokens: usage.provider_total_tokens,
+                                provider_cost_usd: usage
+                                    .provider_cost_usd
+                                    .filter(|cost| cost.is_finite()),
+                            });
+                        }
                     }
                 }
             }
@@ -609,6 +617,7 @@ mod tests {
                 output_tokens: None,
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             })),
             AttemptUsageOutcome::Missing
         ));
@@ -618,6 +627,7 @@ mod tests {
                 output_tokens: Some(0),
                 cached_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                ..Default::default()
             })),
             AttemptUsageOutcome::Complete(_)
         ));
@@ -627,6 +637,7 @@ mod tests {
                 output_tokens: Some(1),
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             })),
             AttemptUsageOutcome::Invalid {
                 reason: InvalidUsageReason::MissingInput,
@@ -639,6 +650,7 @@ mod tests {
                 output_tokens: Some(1),
                 cached_input_tokens: Some(2),
                 cache_creation_input_tokens: None,
+                ..Default::default()
             })),
             AttemptUsageOutcome::Invalid {
                 reason: InvalidUsageReason::CachedInputExceedsInput,
@@ -651,6 +663,7 @@ mod tests {
                 output_tokens: Some(1),
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             })),
             AttemptUsageOutcome::Invalid {
                 reason: InvalidUsageReason::TotalOverflow,
@@ -681,6 +694,7 @@ mod tests {
             output_tokens: Some(2),
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
+            ..Default::default()
         });
         assert!(collector.close().0.is_empty());
     }
@@ -699,6 +713,7 @@ mod tests {
             output_tokens: Some(2),
             cached_input_tokens: Some(1),
             cache_creation_input_tokens: None,
+            ..Default::default()
         });
 
         let (report, _) = collector.close();
@@ -710,6 +725,7 @@ mod tests {
                     output_tokens: Some(2),
                     cached_input_tokens: Some(1),
                     cache_creation_input_tokens: None,
+                    ..
                 })
             }
         ));
@@ -729,6 +745,7 @@ mod tests {
             output_tokens: Some(2),
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
+            ..Default::default()
         });
 
         let (report, _) = collector.close();
@@ -751,6 +768,7 @@ mod tests {
                     output_tokens: Some(2),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 };
                 lease.observe_stream_usage(invalid.clone());
                 lease.set_unknown();
@@ -804,6 +822,7 @@ mod tests {
             output_tokens: Some(2),
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
+            ..Default::default()
         });
 
         let (report, _) = collector.close();
@@ -825,12 +844,14 @@ mod tests {
             output_tokens: Some(2),
             cached_input_tokens: Some(1),
             cache_creation_input_tokens: None,
+            ..Default::default()
         });
         lease.observe_stream_usage(TokenUsage {
             input_tokens: Some(15),
             output_tokens: Some(3),
             cached_input_tokens: Some(2),
             cache_creation_input_tokens: None,
+            ..Default::default()
         });
 
         let (report, _) = collector.close();
@@ -842,6 +863,7 @@ mod tests {
                     output_tokens: Some(3),
                     cached_input_tokens: Some(2),
                     cache_creation_input_tokens: None,
+                    ..
                 })
             }
         ));
@@ -863,6 +885,7 @@ mod tests {
             output_tokens: Some(1),
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
+            ..Default::default()
         });
 
         assert!(matches!(
@@ -917,6 +940,7 @@ mod tests {
                 output_tokens: Some(1),
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             });
         });
 
@@ -934,5 +958,64 @@ mod tests {
             collector.close().0.is_empty(),
             "closed collector cannot reopen"
         );
+    }
+
+    #[tokio::test]
+    async fn current_billable_usage_preserves_optional_carriers_and_mixed_reporting() {
+        let collector = CallAccountingCollector::default();
+        collector
+            .scope(async {
+                let first =
+                    AttemptLease::begin("configured.provider".to_string(), "model".to_string())
+                        .expect("first lease");
+                first.finish_error_with_usage(Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    cached_input_tokens: Some(0),
+                    cache_creation_input_tokens: None,
+                    reasoning_tokens: Some(30),
+                    provider_total_tokens: Some(50),
+                    provider_cost_usd: Some(0.01),
+                }));
+
+                let second =
+                    AttemptLease::begin("configured.provider".to_string(), "model".to_string())
+                        .expect("second lease");
+                second.finish_error_with_usage(Some(TokenUsage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(1),
+                    cached_input_tokens: Some(0),
+                    cache_creation_input_tokens: None,
+                    reasoning_tokens: Some(0),
+                    provider_total_tokens: Some(12),
+                    provider_cost_usd: Some(0.0),
+                }));
+
+                let unanimous = current_billable_usage().expect("billable aggregate");
+                assert_eq!(unanimous.input_tokens, Some(15));
+                assert_eq!(unanimous.reasoning_tokens, Some(30));
+                assert_eq!(unanimous.provider_total_tokens, Some(62));
+                assert_eq!(unanimous.provider_cost_usd, Some(0.01));
+
+                let third =
+                    AttemptLease::begin("configured.provider".to_string(), "model".to_string())
+                        .expect("third lease");
+                third.finish_error_with_usage(Some(TokenUsage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    cached_input_tokens: Some(0),
+                    cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
+                    provider_total_tokens: None,
+                    provider_cost_usd: None,
+                }));
+
+                let mixed = current_billable_usage().expect("mixed aggregate");
+                assert_eq!(mixed.input_tokens, Some(16));
+                assert_eq!(mixed.reasoning_tokens, None);
+                assert_eq!(mixed.provider_total_tokens, None);
+                assert_eq!(mixed.provider_cost_usd, None);
+            })
+            .await;
     }
 }

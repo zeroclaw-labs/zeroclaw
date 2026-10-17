@@ -952,6 +952,7 @@ mod cost_usd_regression_tests {
                 output_tokens: Some(output_tokens),
                 cached_input_tokens: Some(0),
                 cache_creation_input_tokens: None,
+                ..Default::default()
             }),
             reasoning_content: None,
         };
@@ -1097,6 +1098,7 @@ mod cost_usd_regression_tests {
             output_tokens: Some(5),
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
         let interpreted = interpret_chat_response(
             &ctx,
@@ -1250,6 +1252,7 @@ mod cost_usd_regression_tests {
             output_tokens: Some(7),
             cached_input_tokens: Some(80_000),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
 
         record_accepted_chat_response(
@@ -1307,6 +1310,7 @@ mod cost_usd_regression_tests {
             output_tokens: Some(7),
             cached_input_tokens: Some(3),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
         assert!(raw_estimate > 3, "fixture must exceed the cached subset");
 
@@ -1352,6 +1356,7 @@ mod cost_usd_regression_tests {
             output_tokens: Some(56),
             cached_input_tokens: Some(10),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
 
         record_accepted_chat_response(

@@ -173,6 +173,19 @@ pub struct TokenUsage {
     /// `prompt_tokens_details.cache_creation_input_tokens`). Providers
     /// bill these at a premium over the plain input rate.
     pub cache_creation_input_tokens: Option<u64>,
+    /// Provider-reported reasoning / thinking tokens when the wire exposes
+    /// them separately (for example OpenAI-compatible
+    /// `completion_tokens_details.reasoning_tokens`). Not folded into
+    /// `output_tokens` and not priced by the ledger's rate sheet.
+    pub reasoning_tokens: Option<u64>,
+    /// Provider-reported `total_tokens` when present. May exceed
+    /// `input_tokens + output_tokens` when the provider hides reasoning
+    /// tokens outside the prompt/completion fields. Distinct from the
+    /// ledger's recomputed `total_tokens`.
+    pub provider_total_tokens: Option<u64>,
+    /// Provider-reported spend in USD when the wire exposes it (for example
+    /// OpenRouter `usage.cost`). Distinct from rate-sheet `cost_usd`.
+    pub provider_cost_usd: Option<f64>,
 }
 
 /// An LLM response that may contain text, tool calls, or both.

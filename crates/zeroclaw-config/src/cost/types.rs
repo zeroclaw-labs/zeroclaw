@@ -23,6 +23,20 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: u64,
     /// Total tokens (input + output, ignoring the cached subset).
     pub total_tokens: u64,
+    /// Provider-reported reasoning / thinking tokens when captured from the
+    /// wire. Optional so older ledger rows remain readable; never folded into
+    /// `output_tokens` or re-priced here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// Provider-reported `total_tokens` when captured from the wire. May
+    /// exceed `input_tokens + output_tokens` for hidden reasoning. Distinct
+    /// from recomputed `total_tokens` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_total_tokens: Option<u64>,
+    /// Provider-reported spend in USD when captured from the wire. Distinct
+    /// from rate-sheet `cost_usd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_cost_usd: Option<f64>,
     /// Calculated cost in USD
     pub cost_usd: f64,
     /// Token-bearing dimensions that had no valid resolved price when this
@@ -166,6 +180,9 @@ impl TokenUsage {
             cached_input_tokens,
             cache_creation_input_tokens,
             total_tokens,
+            reasoning_tokens: None,
+            provider_total_tokens: None,
+            provider_cost_usd: None,
             cost_usd,
             unpriced_tokens: 0,
             pricing_available: true,

@@ -1952,8 +1952,20 @@ struct UsageInfo {
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    /// Provider-reported total. Some models (e.g. Gemini via an OpenAI-
+    /// compatible gateway) put hidden reasoning tokens only in this field.
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    total_tokens: Option<u64>,
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Wrong-shaped details (string / array / scalar) degrade to absent
+    /// metadata instead of failing the whole usage object — matching the
+    /// pre-carrier behavior where this field was ignored.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_completion_tokens_details"
+    )]
+    completion_tokens_details: Option<CompletionTokensDetails>,
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     prompt_cache_hit_tokens: Option<u64>,
     /// Anthropic-shaped cache counters, forwarded by translating gateways
@@ -1978,6 +1990,12 @@ struct PromptTokensDetails {
     /// Anthropic usage (`prompt_tokens_details.cache_creation_input_tokens`).
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     cache_creation_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct CompletionTokensDetails {
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    reasoning_tokens: Option<u64>,
 }
 
 impl UsageInfo {
@@ -2016,11 +2034,18 @@ impl UsageInfo {
         }
         let cached_input_tokens = self.cached_input_tokens();
         let cache_creation_input_tokens = self.cache_creation_input_tokens();
+        let reasoning_tokens = self
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens);
         zeroclaw_api::model_provider::TokenUsage {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
             cached_input_tokens,
             cache_creation_input_tokens,
+            reasoning_tokens,
+            provider_total_tokens: self.total_tokens,
+            provider_cost_usd: None,
         }
     }
 }
@@ -2031,6 +2056,16 @@ where
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     Ok(value.and_then(normalize_token_count_value))
+}
+
+fn deserialize_optional_completion_tokens_details<'de, D>(
+    deserializer: D,
+) -> Result<Option<CompletionTokensDetails>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 fn normalize_token_count_value(value: serde_json::Value) -> Option<u64> {
@@ -13652,6 +13687,50 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(13313));
         assert_eq!(usage.output_tokens, Some(175));
         assert_eq!(usage.cached_input_tokens, Some(384));
+        assert_eq!(usage.provider_total_tokens, Some(13488));
+        assert_eq!(usage.reasoning_tokens, Some(100));
+    }
+
+    #[test]
+    fn usage_info_keeps_provider_total_when_reasoning_is_only_in_total() {
+        // Gemini-via-compat shape: thinking tokens appear only in total_tokens.
+        let json = r#"{
+            "choices": [{"message": {"content": "OK"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 27
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(2));
+        assert_eq!(usage.provider_total_tokens, Some(27));
+        assert_eq!(usage.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn usage_info_ignores_malformed_completion_tokens_details() {
+        for details in [r#""n/a""#, "[]", "7"] {
+            let json = format!(
+                r#"{{
+                    "choices": [{{"message": {{"content": "OK"}}}}],
+                    "usage": {{
+                        "prompt_tokens": 10,
+                        "completion_tokens": 2,
+                        "total_tokens": 27,
+                        "completion_tokens_details": {details}
+                    }}
+                }}"#
+            );
+            let resp: ApiChatResponse = serde_json::from_str(&json).unwrap();
+            let usage = resp.usage.unwrap().into_provider_usage();
+            assert_eq!(usage.input_tokens, Some(10));
+            assert_eq!(usage.output_tokens, Some(2));
+            assert_eq!(usage.provider_total_tokens, Some(27));
+            assert_eq!(usage.reasoning_tokens, None);
+        }
     }
 
     #[test]

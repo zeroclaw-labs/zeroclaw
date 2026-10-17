@@ -1783,6 +1783,7 @@ mod tests {
                     output_tokens: Some(7),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: Some(r#"{"thinking":"t","signature":"sig"}"#.to_string()),
             })

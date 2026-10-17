@@ -1394,6 +1394,7 @@ mod tests {
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
             output_tokens: Some(200),
+            ..Default::default()
         };
 
         // Vacuity control: outside of any scope (as the detached spawn body

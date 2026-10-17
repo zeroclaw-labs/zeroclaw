@@ -760,6 +760,7 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(output),
             cache_creation_input_tokens: None,
+            ..Default::default()
         }
     }
 
@@ -1241,6 +1242,7 @@ mod tests {
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
                         output_tokens: Some(200),
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 })
@@ -1397,6 +1399,7 @@ mod tests {
                         cached_input_tokens: None,
                         output_tokens: Some(100),
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 })

@@ -374,6 +374,7 @@ mod run_model_query_tests {
                     output_tokens: Some(20),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -422,6 +423,7 @@ mod run_model_query_tests {
                     output_tokens: Some(if rejected { 5 } else { 7 }),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -698,6 +700,7 @@ mod run_model_query_tests {
                     output_tokens: Some(200),
                     cached_input_tokens: Some(4_000),
                     cache_creation_input_tokens: Some(1_000),
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             },
@@ -764,6 +767,7 @@ mod run_model_query_tests {
                         output_tokens: Some(5),
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 },
@@ -814,6 +818,7 @@ mod run_model_query_tests {
                     output_tokens: Some(5),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             },

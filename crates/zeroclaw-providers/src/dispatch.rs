@@ -1541,6 +1541,7 @@ mod tests {
                     output_tokens: Some(2),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 "complete",
             ),
@@ -1550,6 +1551,7 @@ mod tests {
                     output_tokens: Some(0),
                     cached_input_tokens: Some(0),
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 "zero",
             ),
@@ -1559,6 +1561,7 @@ mod tests {
                     output_tokens: Some(2),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 "invalid",
             ),

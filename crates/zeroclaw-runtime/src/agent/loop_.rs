@@ -18223,6 +18223,7 @@ Let me check the result."#;
                     output_tokens: Some(200),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             }]))),
@@ -18334,6 +18335,7 @@ Let me check the result."#;
                 output_tokens: Some(5),
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             }),
             reasoning_content: None,
         };
@@ -18345,6 +18347,7 @@ Let me check the result."#;
                 output_tokens: Some(7),
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             }),
             reasoning_content: None,
         };
@@ -18549,6 +18552,7 @@ Let me check the result."#;
                 output_tokens: Some(4),
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             }),
             reasoning_content: None,
         };
@@ -18560,6 +18564,7 @@ Let me check the result."#;
                 output_tokens: Some(7),
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             }),
             reasoning_content: None,
         };
@@ -18920,6 +18925,7 @@ Let me check the result."#;
                     output_tokens: Some(100),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             }]))),
@@ -19162,6 +19168,7 @@ Let me check the result."#;
                     output_tokens: Some(120),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             }]))),
@@ -19234,6 +19241,7 @@ Let me check the result."#;
                     output_tokens: Some(120),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             }]))),
@@ -19356,6 +19364,7 @@ Let me check the result."#;
                         output_tokens: Some(10),
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 },
@@ -19426,6 +19435,7 @@ Let me check the result."#;
                     output_tokens: Some(120),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             }]))),
@@ -21089,6 +21099,7 @@ Let me check the result."#;
                         output_tokens: Some(10),
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 })
@@ -21689,6 +21700,7 @@ Let me check the result."#;
                         output_tokens: Some(10),
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 })

@@ -944,6 +944,7 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
             output_tokens: Some(5),
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
+            ..Default::default()
         }),
         reasoning_content: None,
     }]));

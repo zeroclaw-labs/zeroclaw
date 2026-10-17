@@ -1517,6 +1517,7 @@ mod streaming_fallback_tests {
                     output_tokens: Some(7),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -1542,6 +1543,7 @@ mod streaming_fallback_tests {
                         output_tokens: Some(5),
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     })),
                     Ok(StreamEvent::TextDelta(
                         zeroclaw_api::model_provider::StreamChunk::reasoning("private reasoning"),
@@ -1638,6 +1640,7 @@ mod streaming_fallback_tests {
                         output_tokens: Some(5),
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     }),
                     reasoning_content: None,
                 });
@@ -1695,6 +1698,7 @@ mod streaming_fallback_tests {
                         output_tokens: Some(3),
                         cached_input_tokens: Some(1),
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     })),
                     attempted_candidate: None,
                     attempted_candidate_index: None,
@@ -1730,6 +1734,7 @@ mod streaming_fallback_tests {
                     output_tokens: Some(4),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -3728,6 +3733,7 @@ mod streaming_fallback_tests {
                     output_tokens: Some(2),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -3818,6 +3824,7 @@ mod streaming_fallback_tests {
                     output_tokens: Some(1),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 })),
                 Err(zeroclaw_providers::traits::StreamError::ModelProvider(
                     "503 Service Unavailable".to_string(),

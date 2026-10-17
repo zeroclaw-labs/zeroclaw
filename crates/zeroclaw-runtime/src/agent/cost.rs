@@ -433,7 +433,7 @@ fn price_usage(
         cache_creation_input_tokens,
         output_tokens,
     );
-    let cost_usage = CostTokenUsage::new_with_cache_write(
+    let mut cost_usage = CostTokenUsage::new_with_cache_write(
         model,
         input_tokens,
         cached_input_tokens,
@@ -444,6 +444,11 @@ fn price_usage(
         rates.cache_write_per_mtok.unwrap_or(0.0),
         rates.output_per_mtok.unwrap_or(0.0),
     );
+    // Preserve provider-reported totals without changing rate-sheet pricing or
+    // the recomputed `total_tokens = input + output` contract.
+    cost_usage.reasoning_tokens = usage.reasoning_tokens;
+    cost_usage.provider_total_tokens = usage.provider_total_tokens;
+    cost_usage.provider_cost_usd = usage.provider_cost_usd;
     Some((cost_usage, unpriced))
 }
 
@@ -793,6 +798,7 @@ mod tests {
             output_tokens: Some(20),
             cached_input_tokens: Some(0),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
 
         let (_, cost_usd) = tokio::runtime::Runtime::new()
@@ -1033,6 +1039,7 @@ mod tests {
                     output_tokens: Some(0),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -1079,6 +1086,7 @@ mod tests {
                     output_tokens: Some(0),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -1634,6 +1642,7 @@ mod tests {
             output_tokens: Some(200),
             cached_input_tokens: Some(4_000),
             cache_creation_input_tokens: Some(1_000),
+            ..Default::default()
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1658,6 +1667,65 @@ mod tests {
     }
 
     #[test]
+    fn record_tool_loop_cost_usage_preserves_provider_optional_carriers() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "deepseek".to_string(),
+                pricing_with_cache("deepseek-chat", 0.27, 0.027, 1.10),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(4_000),
+            cache_creation_input_tokens: Some(1_000),
+            reasoning_tokens: Some(0),
+            provider_total_tokens: Some(5_350),
+            provider_cost_usd: Some(0.0123),
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (total_tokens, cost_usd) = runtime
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+            }))
+            .expect("cost usage");
+
+        let expected = (1_000.0 * 0.27 / 1_000_000.0)
+            + (4_000.0 * 0.027 / 1_000_000.0)
+            + (200.0 * 1.10 / 1_000_000.0);
+        assert_eq!(total_tokens, 5_200);
+        assert!((cost_usd - expected).abs() < 1e-12);
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let record: zeroclaw_config::cost::types::CostRecord =
+            serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
+        assert_eq!(record.usage.total_tokens, 5_200);
+        assert!((record.usage.cost_usd - expected).abs() < 1e-12);
+        assert_eq!(record.usage.reasoning_tokens, Some(0));
+        assert_eq!(record.usage.provider_total_tokens, Some(5_350));
+        assert_eq!(record.usage.provider_cost_usd, Some(0.0123));
+
+        // Older ledger rows without the new optional fields remain readable.
+        let legacy = r#"{"id":"legacy","usage":{"model":"deepseek-chat","input_tokens":10,"output_tokens":2,"total_tokens":12,"cost_usd":0.0,"timestamp":"2024-01-01T00:00:00Z"},"session_id":"s"}"#;
+        let legacy_record: zeroclaw_config::cost::types::CostRecord =
+            serde_json::from_str(legacy).unwrap();
+        assert_eq!(legacy_record.usage.reasoning_tokens, None);
+        assert_eq!(legacy_record.usage.provider_total_tokens, None);
+        assert_eq!(legacy_record.usage.provider_cost_usd, None);
+    }
+
+    #[test]
     fn record_tool_loop_cost_usage_attributes_records_to_the_chat_session() {
         let workspace = tempfile::TempDir::new().unwrap();
         let tracker = Arc::new(
@@ -1679,6 +1747,7 @@ mod tests {
             output_tokens: Some(200),
             cached_input_tokens: Some(4_000),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1734,6 +1803,7 @@ mod tests {
             output_tokens: Some(200),
             cached_input_tokens: Some(4_000),
             cache_creation_input_tokens: Some(1_000),
+            ..Default::default()
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1780,6 +1850,7 @@ mod tests {
             output_tokens: Some(200),
             cached_input_tokens: Some(4_000),
             cache_creation_input_tokens: Some(1_000),
+            ..Default::default()
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1850,6 +1921,7 @@ mod tests {
             output_tokens: Some(500),
             cached_input_tokens: Some(200),
             cache_creation_input_tokens: Some(300),
+            ..Default::default()
         };
 
         let (_, cost_usd) = tokio::runtime::Runtime::new()
@@ -1893,6 +1965,7 @@ mod tests {
             output_tokens: Some(500),
             cached_input_tokens: Some(200),
             cache_creation_input_tokens: Some(300),
+            ..Default::default()
         };
         let live = ModelRates {
             cache_write_per_mtok: Some(12.5),
@@ -1944,6 +2017,7 @@ mod tests {
             output_tokens: Some(50),
             cached_input_tokens: Some(0),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2020,6 +2094,7 @@ mod tests {
             output_tokens: Some(20),
             cached_input_tokens: Some(0),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -2074,6 +2149,7 @@ mod tests {
             output_tokens: Some(0),
             cached_input_tokens: Some(0),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -2124,6 +2200,7 @@ mod tests {
             output_tokens: Some(200),
             cached_input_tokens: Some(4_000),
             cache_creation_input_tokens: Some(1_000),
+            ..Default::default()
         };
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -2156,12 +2233,14 @@ mod tests {
             output_tokens: Some(5),
             cached_input_tokens: Some(0),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
         let accepted = zeroclaw_providers::traits::TokenUsage {
             input_tokens: Some(80),
             output_tokens: Some(7),
             cached_input_tokens: Some(0),
             cache_creation_input_tokens: None,
+            ..Default::default()
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(TOOL_LOOP_TURN_USAGE.scope(

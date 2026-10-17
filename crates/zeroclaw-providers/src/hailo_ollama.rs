@@ -1215,6 +1215,7 @@ impl HailoOllamaModelProvider {
                 output_tokens: response.eval_count,
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             })
         } else {
             None

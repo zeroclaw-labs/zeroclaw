@@ -845,6 +845,7 @@ impl ModelProvider for OpenRouterModelProvider {
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
             cache_creation_input_tokens: None,
+            ..Default::default()
         });
         let message = native_response
             .choices
@@ -1082,6 +1083,7 @@ impl ModelProvider for OpenRouterModelProvider {
             output_tokens: u.completion_tokens,
             cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
             cache_creation_input_tokens: None,
+            ..Default::default()
         });
         let message = native_response
             .choices
@@ -2005,6 +2007,7 @@ data: [DONE]
                 output_tokens: u.completion_tokens,
                 cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
                 cache_creation_input_tokens: None,
+                ..Default::default()
             })
             .expect("usage should be Some");
         assert_eq!(usage.input_tokens, Some(25000));
@@ -2026,6 +2029,7 @@ data: [DONE]
                 output_tokens: u.completion_tokens,
                 cached_input_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
                 cache_creation_input_tokens: None,
+                ..Default::default()
             })
             .expect("usage should be Some");
         assert!(

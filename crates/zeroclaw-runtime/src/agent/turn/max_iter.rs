@@ -595,6 +595,7 @@ mod graceful_summary_metering_tests {
                     output_tokens: Some(20),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -867,6 +868,7 @@ mod graceful_summary_metering_tests {
                     output_tokens: Some(20),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: Some("internal reasoning".to_string()),
             })

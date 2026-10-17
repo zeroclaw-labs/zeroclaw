@@ -1865,21 +1865,67 @@ fn reliable_terminal_error_with_cause(
     )
 }
 
+/// Optional wire carriers stay `Some` only when every contributing attempt
+/// reported them. Mixed absences collapse to `None`; overflow / non-finite
+/// sums also become `None`. Reported zero is preserved when unanimous.
+pub(crate) fn merge_reported_usage_carriers(target: &mut TokenUsage, source: &TokenUsage) {
+    target.reasoning_tokens =
+        sum_unanimous_reported_u64(target.reasoning_tokens, source.reasoning_tokens);
+    target.provider_total_tokens =
+        sum_unanimous_reported_u64(target.provider_total_tokens, source.provider_total_tokens);
+    target.provider_cost_usd =
+        sum_unanimous_reported_f64(target.provider_cost_usd, source.provider_cost_usd);
+}
+
+fn sum_unanimous_reported_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(a), Some(b)) => a.checked_add(b),
+        _ => None,
+    }
+}
+
+fn sum_unanimous_reported_f64(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(a), Some(b)) => {
+            let sum = a + b;
+            sum.is_finite().then_some(sum)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn accumulate_usage(total: &mut Option<TokenUsage>, usage: Option<&TokenUsage>) {
     let Some(usage) = usage else {
         return;
     };
-    let accumulated = total.get_or_insert_with(TokenUsage::default);
-    for (target, value) in [
-        (&mut accumulated.input_tokens, usage.input_tokens),
-        (&mut accumulated.output_tokens, usage.output_tokens),
-        (
-            &mut accumulated.cached_input_tokens,
-            usage.cached_input_tokens,
-        ),
-    ] {
-        if let Some(value) = value {
-            *target = Some(target.unwrap_or(0).saturating_add(value));
+    match total {
+        None => {
+            *total = Some(TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                provider_total_tokens: usage.provider_total_tokens,
+                provider_cost_usd: usage.provider_cost_usd.filter(|cost| cost.is_finite()),
+            });
+        }
+        Some(accumulated) => {
+            for (target, value) in [
+                (&mut accumulated.input_tokens, usage.input_tokens),
+                (&mut accumulated.output_tokens, usage.output_tokens),
+                (
+                    &mut accumulated.cached_input_tokens,
+                    usage.cached_input_tokens,
+                ),
+            ] {
+                if let Some(value) = value {
+                    // Preserve reported-zero: only missing (`None`) stays absent until
+                    // a concrete count arrives.
+                    *target = Some(target.unwrap_or(0).saturating_add(value));
+                }
+            }
+            merge_reported_usage_carriers(accumulated, usage);
         }
     }
 }
@@ -4214,6 +4260,58 @@ mod tests {
     use std::sync::Arc;
     use zeroclaw_api::tool::ToolSpec;
 
+    #[test]
+    fn accumulate_usage_keeps_optional_carriers_only_when_every_attempt_reports() {
+        let mut total = None;
+        accumulate_usage(
+            &mut total,
+            Some(&TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(2),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+                reasoning_tokens: Some(30),
+                provider_total_tokens: Some(50),
+                provider_cost_usd: Some(0.01),
+            }),
+        );
+        accumulate_usage(
+            &mut total,
+            Some(&TokenUsage {
+                input_tokens: Some(5),
+                output_tokens: Some(1),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+                reasoning_tokens: Some(0),
+                provider_total_tokens: Some(12),
+                provider_cost_usd: Some(0.0),
+            }),
+        );
+        let combined = total.as_ref().expect("combined usage");
+        assert_eq!(combined.input_tokens, Some(15));
+        assert_eq!(combined.reasoning_tokens, Some(30));
+        assert_eq!(combined.provider_total_tokens, Some(62));
+        assert_eq!(combined.provider_cost_usd, Some(0.01));
+
+        accumulate_usage(
+            &mut total,
+            Some(&TokenUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+                reasoning_tokens: None,
+                provider_total_tokens: None,
+                provider_cost_usd: None,
+            }),
+        );
+        let combined = total.expect("combined usage after mixed report");
+        assert_eq!(combined.input_tokens, Some(16));
+        assert_eq!(combined.reasoning_tokens, None);
+        assert_eq!(combined.provider_total_tokens, None);
+        assert_eq!(combined.provider_cost_usd, None);
+    }
+
     fn drain_captured_events(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
     ) -> Vec<serde_json::Value> {
@@ -4339,6 +4437,7 @@ mod tests {
                         output_tokens: Some(3),
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     })),
                     attempted_candidate: None,
                     attempted_candidate_index: None,
@@ -5444,6 +5543,7 @@ mod tests {
                 output_tokens: Some(5),
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             },
             FailureEvents::default(),
             anyhow::Error::new(TerminalProviderTypedError),
@@ -5511,6 +5611,7 @@ mod tests {
                     output_tokens: Some(5),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -5532,6 +5633,7 @@ mod tests {
                     output_tokens: Some(5),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -5579,6 +5681,7 @@ mod tests {
                     output_tokens: Some(5),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -5600,6 +5703,7 @@ mod tests {
                     output_tokens: Some(5),
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
+                    ..Default::default()
                 }),
                 reasoning_content: None,
             })
@@ -8150,6 +8254,7 @@ mod tests {
                 output_tokens: Some(5),
                 cached_input_tokens: None,
                 cache_creation_input_tokens: None,
+                ..Default::default()
             }),
             false,
             Some(anyhow::Error::msg(
@@ -10905,6 +11010,7 @@ mod tests {
                         output_tokens: Some(5),
                         cached_input_tokens: None,
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     })),
                     Err(Self::stream_error()),
                 ])
@@ -11194,6 +11300,7 @@ mod tests {
                         output_tokens: Some(3),
                         cached_input_tokens: Some(1),
                         cache_creation_input_tokens: None,
+                        ..Default::default()
                     })),
                     attempted_candidate: None,
                     attempted_candidate_index: None,
@@ -12470,6 +12577,7 @@ mod tests {
                     output_tokens: Some(3),
                     cached_input_tokens: Some(1),
                     cache_creation_input_tokens: None,
+                    ..
                 })
             }
         ));
@@ -12560,6 +12668,7 @@ mod tests {
                 output_tokens: Some(3),
                 cached_input_tokens: Some(1),
                 cache_creation_input_tokens: None,
+                ..
             })
         ));
         let rejected = error

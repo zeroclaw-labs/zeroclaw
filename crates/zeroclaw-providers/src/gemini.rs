@@ -1167,6 +1167,7 @@ impl GeminiModelProvider {
             output_tokens: usage.candidates_token_count,
             cached_input_tokens: None,
             cache_creation_input_tokens: None,
+            ..Default::default()
         })
     }
 
