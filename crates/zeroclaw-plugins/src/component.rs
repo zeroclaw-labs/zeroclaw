@@ -891,7 +891,8 @@ pub(crate) use call_tool_execute;
 /// `$body` returns the export's own Wasmtime result. `Err` means the call
 /// failed inside Wasmtime: a guest trap, exhausted fuel, a failed host import,
 /// or a result that could not be lifted. Wasmtime refuses every later call
-/// into such a store, so the instance is discarded, as it is after a missed
+/// into a store after the first three, and the last skips the export's
+/// post-return cleanup, so the instance is discarded, as it is after a missed
 /// deadline, and the error is reported with `$context`. An error the export
 /// itself returns arrives inside `Ok`, and the instance goes back to its slot.
 ///
