@@ -1,6 +1,5 @@
 //! The `native` provider: authenticates the existing gateway pairing
-//! bearer token as the shared operator, over the ONE live pairing
-//! authority.
+//! bearer token over the ONE live pairing authority.
 //!
 //! The wrapped [`PairingGuard`] is the same instance the gateway uses for
 //! `/pair`, rotation, and revocation (its token set is shared interior
@@ -10,14 +9,34 @@
 //! set denies everything regardless of the gateway's `require_pairing`
 //! convenience setting.
 //!
-//! A pairing token attests "trusted operator", not a distinct per-user
-//! identity, so success maps to the shared-operator sentinel.
+//! An unbound pairing token attests "trusted operator", not a distinct
+//! per-user identity, so it maps to the shared-operator sentinel. A token
+//! the operator bound to a `[users.<name>]` entry when minting its code
+//! maps to that roster principal instead, and the shared resolver grants it
+//! only that user's permission profiles.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use zeroclaw_api::principal::{AuthMethod, AuthOutcome, AuthenticatedIdentity, DenyReason};
-use zeroclaw_config::pairing::PairingGuard;
+use zeroclaw_api::principal::{
+    AuthMethod, AuthOutcome, AuthenticatedIdentity, DenyReason, IdentitySubject,
+};
+use zeroclaw_config::pairing::{PairedTokenSubject, PairingGuard};
+
+/// The identity a paired token attests. The provider, connection
+/// revalidation and the gateway's pairing responses all derive native
+/// identities here, so none of them can disagree with the handshake.
+#[must_use]
+pub fn identity_for_subject(subject: PairedTokenSubject) -> AuthenticatedIdentity {
+    match subject {
+        PairedTokenSubject::SharedOperator => {
+            AuthenticatedIdentity::shared_operator(AuthMethod::Native)
+        }
+        PairedTokenSubject::RosterUser { principal_id } => {
+            AuthenticatedIdentity::new(IdentitySubject::Roster { principal_id }, AuthMethod::Native)
+        }
+    }
+}
 
 use super::{AuthProvider, Credential};
 
@@ -60,9 +79,12 @@ impl AuthProvider for NativeAuthProvider {
 
     async fn verify(&self, credential: &Credential) -> AuthOutcome {
         match credential {
-            Credential::Bearer(token) if self.guard.token_is_paired(token) => {
-                AuthOutcome::Verified(AuthenticatedIdentity::shared_operator(AuthMethod::Native))
-            }
+            Credential::Bearer(token) => match self.guard.subject_for_token(token) {
+                Some(subject) => AuthOutcome::Verified(identity_for_subject(subject)),
+                None => AuthOutcome::Denied {
+                    reason: DenyReason::BadCredential,
+                },
+            },
             _ => AuthOutcome::Denied {
                 reason: DenyReason::BadCredential,
             },
@@ -98,6 +120,62 @@ mod tests {
             identity.subject.principal_id().as_str(),
             PrincipalId::SHARED_OPERATOR,
             "a pairing token attests the shared operator, not a distinct user"
+        );
+    }
+
+    fn bound_provider() -> (Arc<PairingGuard>, NativeAuthProvider) {
+        let guard = Arc::new(PairingGuard::from_gateway_config(
+            &zeroclaw_config::schema::GatewayConfig {
+                paired_tokens: vec!["zc_shared".into()],
+                paired_token_users: std::collections::HashMap::from([(
+                    PairingGuard::token_hash("zc_bound"),
+                    "alice".to_string(),
+                )]),
+                ..zeroclaw_config::schema::GatewayConfig::default()
+            },
+        ));
+        (Arc::clone(&guard), NativeAuthProvider::new(guard))
+    }
+
+    #[tokio::test]
+    async fn bound_token_verifies_as_its_roster_principal() {
+        let (_, provider) = bound_provider();
+        let out = provider
+            .verify(&Credential::Bearer("zc_bound".into()))
+            .await;
+        let identity = out.identity().expect("verified");
+        assert_eq!(
+            identity.subject,
+            IdentitySubject::Roster {
+                principal_id: "alice".into()
+            }
+        );
+        assert_eq!(identity.method, AuthMethod::Native);
+        assert_eq!(identity.subject.principal_id().as_str(), "user:alice");
+    }
+
+    #[tokio::test]
+    async fn unbound_token_beside_a_bound_one_stays_the_shared_operator() {
+        let (_, provider) = bound_provider();
+        let out = provider
+            .verify(&Credential::Bearer("zc_shared".into()))
+            .await;
+        assert_eq!(
+            out.identity().expect("verified").subject,
+            IdentitySubject::SharedOperator
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_a_bound_token_applies_live() {
+        let (guard, provider) = bound_provider();
+        assert!(guard.revoke_token("zc_bound"));
+        assert!(
+            !provider
+                .verify(&Credential::Bearer("zc_bound".into()))
+                .await
+                .is_allowed(),
+            "a revoked bound token must not verify as anything"
         );
     }
 
