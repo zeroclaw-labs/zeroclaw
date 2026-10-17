@@ -4294,7 +4294,7 @@ permissions = ["http_client"]
         std::fs::write(&cfg.config_path, "[web_search]\n").unwrap();
 
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -4360,7 +4360,7 @@ permissions = ["http_client"]
         let cfg = test_config(&tmp);
 
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -4422,7 +4422,7 @@ permissions = ["http_client"]
         let cfg = test_config(&tmp);
 
         let tools = all_tools_with_runtime(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -4484,7 +4484,7 @@ permissions = ["http_client"]
         )));
 
         let tools = all_tools_with_runtime(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -4786,7 +4786,7 @@ permissions = ["http_client"]
         )));
 
         let tools = all_tools_with_runtime(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -4844,7 +4844,7 @@ permissions = ["http_client"]
         // pattern the daemon uses when wiring gateway, channels, MQTT, and
         // RPC sessions from one engine pair.
         let session_a = all_tools_with_runtime(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &risk,
             "session-a",
@@ -4868,7 +4868,7 @@ permissions = ["http_client"]
         )
         .expect("first tool registry builds");
         let session_b = all_tools_with_runtime(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &risk,
             "session-b",
@@ -4996,7 +4996,7 @@ permissions = ["http_client"]
 
         let build = |agent_alias: &str, memory: Arc<dyn Memory>| {
             all_tools_with_runtime(
-                Arc::new(Config::default()),
+                Arc::new(test_config(&tmp)),
                 &security,
                 &risk,
                 agent_alias,
@@ -5490,7 +5490,7 @@ permissions = ["http_client"]
         let cfg = test_config(&tmp);
 
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -5546,7 +5546,7 @@ permissions = ["http_client"]
             .to_string();
 
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -5594,7 +5594,7 @@ permissions = ["http_client"]
         let cfg = test_config(&tmp);
 
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -5651,7 +5651,7 @@ permissions = ["http_client"]
         let cfg = test_config(&tmp);
 
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -5701,7 +5701,7 @@ permissions = ["http_client"]
         let cfg = test_config(&tmp);
 
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -5760,7 +5760,7 @@ permissions = ["http_client"]
             let sop_engine = Arc::new(std::sync::Mutex::new(engine));
             let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(mem.clone()));
             all_tools_with_runtime(
-                Arc::new(Config::default()),
+                Arc::new(test_config(&tmp)),
                 &security,
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
                 "test-agent",
@@ -5923,7 +5923,7 @@ permissions = ["http_client"]
         );
 
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
@@ -5963,7 +5963,7 @@ permissions = ["http_client"]
         let cfg = test_config(&tmp);
 
         let tools = all_tools(
-            Arc::new(Config::default()),
+            Arc::new(test_config(&tmp)),
             &security,
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             "test-agent",
