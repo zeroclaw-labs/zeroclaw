@@ -525,6 +525,9 @@ pub(crate) struct Chat {
     git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
     /// In-flight git_branch refresh; gates repeat fetches until result arrives.
     git_branch_inflight: bool,
+    /// Last `path_open::path_links_generation` seen; a change means a path's
+    /// link status resolved in the background and the transcript must restyle.
+    path_links_generation: u64,
     /// Background model-catalog fetch result, routed back so the Loading
     /// picker can swap to the populated list without blocking the draw loop.
     model_fetch_tx: mpsc::Sender<ModelFetchResult>,
@@ -909,6 +912,7 @@ impl Chat {
             git_branch_tx,
             git_branch_rx,
             git_branch_inflight: false,
+            path_links_generation: crate::path_open::path_links_generation(),
             model_fetch_tx,
             model_fetch_rx,
             session_reattach_tx,
@@ -3500,7 +3504,8 @@ impl Chat {
                 let ChatPhase::Active(ref mut state) = self.phase else {
                     return;
                 };
-                if state.input_bar.append_text_at_end(&format!("`{path}`")) {
+                let span = crate::path_open::markdown_code_span(&path);
+                if state.input_bar.append_text_at_end(&span) {
                     state.mark_dirty_full();
                 }
             }
@@ -3877,6 +3882,18 @@ impl Chat {
         self.drain_session_reattach_results();
         self.answer_withdrawn_elicitations();
         self.maybe_refresh_git_branch();
+        self.refresh_resolved_path_links();
+    }
+
+    fn refresh_resolved_path_links(&mut self) {
+        let generation = crate::path_open::path_links_generation();
+        if generation == self.path_links_generation {
+            return;
+        }
+        self.path_links_generation = generation;
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            state.mark_dirty_full();
+        }
     }
 
     /// Send the `cancel` every withdrawn elicitation still owes the daemon,
@@ -13452,6 +13469,9 @@ mod tests {
 
         let lines = vec![Line::from(format!("Image: {path}. It's committed."))];
         let width = 24;
+        // Existence is checked off the draw path; the first render schedules it.
+        let _ = url_line_regions_for_lines(&lines, width);
+        crate::path_open::wait_for_path_checks();
         let regions = url_line_regions_for_lines(&lines, width);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].urls.len(), 1);
@@ -13528,6 +13548,16 @@ mod tests {
             panic!("active");
         };
         assert_eq!(state.input_bar.input(), "`/Volumes/Work SSD/a.png`");
+
+        let mut chat = active_chat();
+        chat.execute_context_menu_request(ChatContextMenuRequest::AddPathToChat(
+            "/tmp/a`b.txt".to_string(),
+        ))
+        .await;
+        let ChatPhase::Active(ref state) = chat.phase else {
+            panic!("active");
+        };
+        assert_eq!(state.input_bar.input(), "``/tmp/a`b.txt``");
     }
 
     #[test]

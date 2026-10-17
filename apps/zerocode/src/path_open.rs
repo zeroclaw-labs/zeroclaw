@@ -6,10 +6,11 @@
 //! platform launcher, which would also *run* executables, app bundles and
 //! scripts, so those are revealed in the file manager instead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// A path candidate may span at most this many whitespace-separated words.
@@ -17,6 +18,9 @@ const MAX_PATH_WORDS: usize = 8;
 const MAX_PATH_BYTES: usize = 1024;
 const EXISTS_CACHE_TTL: Duration = Duration::from_secs(5);
 const EXISTS_CACHE_CAP: usize = 4096;
+/// Existence checks running at once. A hung network mount parks one thread
+/// per distinct path, so this bounds the damage.
+const MAX_PENDING_CHECKS: usize = 32;
 
 /// Extensions the platform launcher executes or installs instead of
 /// displaying. Compared case-insensitively.
@@ -86,7 +90,32 @@ pub(crate) fn recognized_path_ranges(
     text: &str,
     taken: &[(usize, usize, String)],
 ) -> Vec<(usize, usize, String)> {
-    recognized_path_ranges_with(text, taken, home_dir().as_deref(), &cached_exists)
+    recognized_path_ranges_with(text, taken, home_dir().as_deref(), &|path| {
+        EXISTS_PROBE.lookup(path)
+    })
+}
+
+/// Bumped whenever a background existence check changes whether a path is a
+/// link. Panes compare it each tick and rebuild the transcript when it moves.
+pub(crate) fn path_links_generation() -> u64 {
+    EXISTS_PROBE.generation.load(Ordering::Acquire)
+}
+
+/// Wrap `path` in a Markdown code span that survives backticks inside it.
+pub(crate) fn markdown_code_span(path: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for ch in path.chars() {
+        run = if ch == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest + 1);
+    let pad = if path.starts_with('`') || path.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{path}{pad}{fence}")
 }
 
 fn recognized_path_ranges_with(
@@ -132,15 +161,22 @@ fn recognized_path_ranges_with(
             if taken.iter().any(|(s, _, _)| *s > start && *s < word_end) {
                 break;
             }
-            let end = trim_trailing_punctuation(text, start, word_end);
-            let candidate = &text[start..end];
-            if candidate.len() < 2 || candidate.contains('\u{2026}') {
-                continue;
-            }
             let expand = |shown: &str| match (tilde, home) {
                 (true, Some(home)) => format!("{}{}", home.trim_end_matches('/'), &shown[1..]),
                 _ => shown.to_string(),
             };
+            let end = trim_trailing_punctuation(text, start, word_end);
+            // A real name may end in punctuation (`report!`), so the exact
+            // word wins over its sentence-trimmed form.
+            let exact = &text[start..word_end];
+            if end < word_end && !exact.contains('\u{2026}') && exists(&expand(exact)) {
+                best = Some((word_end, expand(exact)));
+                continue;
+            }
+            let candidate = &text[start..end];
+            if candidate.len() < 2 || candidate.contains('\u{2026}') {
+                continue;
+            }
             if exists(&expand(candidate)) {
                 best = Some((end, expand(candidate)));
             } else if let Some(stripped) = strip_line_suffix(candidate)
@@ -222,26 +258,98 @@ fn home_dir() -> Option<String> {
         .filter(|home| home.starts_with('/'))
 }
 
-/// Existence checks run on render paths (including streaming frames), so
-/// results are cached briefly to keep repeated frames off the filesystem.
-fn cached_exists(path: &str) -> bool {
-    static CACHE: Mutex<Option<HashMap<String, (bool, Instant)>>> = Mutex::new(None);
-    let now = Instant::now();
-    if let Ok(mut guard) = CACHE.lock() {
-        let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some((exists, at)) = cache.get(path)
-            && now.duration_since(*at) < EXISTS_CACHE_TTL
-        {
-            return *exists;
+static EXISTS_PROBE: LazyLock<ExistsProbe> =
+    LazyLock::new(|| ExistsProbe::new(Box::new(|path| std::fs::metadata(path).is_ok())));
+
+/// Existence checks for the draw path. Detection runs while rendering, and a
+/// `metadata` call on a slow or disconnected mount can block for seconds, so
+/// lookups never touch the filesystem: they answer from the cache (stale
+/// entries included) and hand misses to a background thread. A finished check
+/// that changes the answer bumps `generation` so the UI redraws.
+struct ExistsProbe {
+    state: Mutex<ExistsState>,
+    generation: AtomicU64,
+    check: Box<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+#[derive(Default)]
+struct ExistsState {
+    entries: HashMap<String, (bool, Instant)>,
+    pending: HashSet<String>,
+}
+
+impl ExistsProbe {
+    fn new(check: Box<dyn Fn(&str) -> bool + Send + Sync>) -> Self {
+        Self {
+            state: Mutex::new(ExistsState::default()),
+            generation: AtomicU64::new(0),
+            check,
         }
-        let exists = std::fs::metadata(path).is_ok();
-        if cache.len() >= EXISTS_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(path.to_string(), (exists, now));
-        return exists;
     }
-    std::fs::metadata(path).is_ok()
+
+    fn lookup(&'static self, path: &str) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let cached = state.entries.get(path).copied();
+        if let Some((exists, at)) = cached
+            && at.elapsed() < EXISTS_CACHE_TTL
+        {
+            return exists;
+        }
+        if !state.pending.contains(path) && state.pending.len() < MAX_PENDING_CHECKS {
+            state.pending.insert(path.to_string());
+            let owned = path.to_string();
+            let spawned = std::thread::Builder::new()
+                .name("zc-path-exists".to_string())
+                .spawn(move || {
+                    let exists = (self.check)(&owned);
+                    self.finish(owned, exists);
+                });
+            if spawned.is_err() {
+                state.pending.remove(path);
+            }
+        }
+        cached.is_some_and(|(exists, _)| exists)
+    }
+
+    fn finish(&self, path: String, exists: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.pending.remove(&path);
+        let shown = state.entries.get(&path).is_some_and(|(shown, _)| *shown);
+        if state.entries.len() >= EXISTS_CACHE_CAP {
+            state.entries.clear();
+        }
+        state.entries.insert(path, (exists, Instant::now()));
+        if shown != exists {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_idle(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self
+            .state
+            .lock()
+            .is_ok_and(|state| !state.pending.is_empty())
+        {
+            assert!(
+                Instant::now() < deadline,
+                "path existence checks never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// Block until background existence checks settle, so tests can render twice
+/// and see real files linked.
+#[cfg(test)]
+pub(crate) fn wait_for_path_checks() {
+    EXISTS_PROBE.wait_idle();
 }
 
 /// True when handing `path` to the platform launcher could execute code:
@@ -390,6 +498,45 @@ mod tests {
         let text = format!("Image: {path}. It's committed.");
         let found = ranges(&text, &[path, "/Volumes/Work SSD"]);
         assert_eq!(found, vec![(7, 7 + path.len(), path.to_string())]);
+    }
+
+    #[test]
+    fn exact_name_ending_in_punctuation_beats_the_trimmed_one() {
+        let found = ranges("open /tmp/report! now", &["/tmp/report!", "/tmp/report"]);
+        assert_eq!(found, vec![(5, 17, "/tmp/report!".to_string())]);
+        let found = ranges("open /tmp/report! now", &["/tmp/report"]);
+        assert_eq!(found, vec![(5, 16, "/tmp/report".to_string())]);
+    }
+
+    #[test]
+    fn existence_lookup_never_waits_on_the_filesystem() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let probe: &'static ExistsProbe =
+            Box::leak(Box::new(ExistsProbe::new(Box::new(move |_| {
+                let _ = release_rx.lock().unwrap().recv();
+                true
+            }))));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done_tx.send(probe.lookup("/slow/mount/file")));
+        let first = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("lookup blocked on a hung filesystem check");
+        assert!(!first, "unknown paths are not links until checked");
+        assert_eq!(probe.generation.load(Ordering::Acquire), 0);
+
+        release_tx.send(()).unwrap();
+        probe.wait_idle();
+        assert_eq!(probe.generation.load(Ordering::Acquire), 1);
+        assert!(probe.lookup("/slow/mount/file"));
+    }
+
+    #[test]
+    fn code_span_outgrows_backticks_in_the_path() {
+        assert_eq!(markdown_code_span("/tmp/a.txt"), "`/tmp/a.txt`");
+        assert_eq!(markdown_code_span("/tmp/a`b.txt"), "``/tmp/a`b.txt``");
+        assert_eq!(markdown_code_span("/tmp/a``"), "``` /tmp/a`` ```");
     }
 
     #[test]
