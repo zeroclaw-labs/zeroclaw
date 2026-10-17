@@ -6,6 +6,7 @@
 use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
 use zeroclaw_api::tool_attribution;
 
+use crate::agy_cli::AgyCliTool;
 use crate::ask_user::AskUserTool;
 use crate::backup_tool::BackupTool;
 use crate::browser::BrowserTool;
@@ -73,6 +74,7 @@ use crate::weather_tool::WeatherTool;
 use crate::web_fetch::WebFetchTool;
 use crate::web_search_tool::WebSearchTool;
 
+tool_attribution!(AgyCliTool, ToolKind::Plugin);
 tool_attribution!(AskUserTool, ToolKind::Wait);
 tool_attribution!(BackupTool, ToolKind::Plugin);
 tool_attribution!(BrowserTool, ToolKind::Plugin);

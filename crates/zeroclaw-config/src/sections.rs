@@ -901,6 +901,7 @@ mod tests {
             ("claude_code", SectionGroup::Integrations),
             ("codex_cli", SectionGroup::Integrations),
             ("gemini_cli", SectionGroup::Integrations),
+            ("agy_cli", SectionGroup::Integrations),
             ("opencode_cli", SectionGroup::Integrations),
             ("sop", SectionGroup::Agent),
             ("verifiable_intent", SectionGroup::Agent),

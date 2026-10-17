@@ -274,6 +274,10 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         tier: ToolTier::Host,
     },
     BuiltinToolSpec {
+        name: "agy_cli",
+        tier: ToolTier::Host,
+    },
+    BuiltinToolSpec {
         name: "opencode_cli",
         tier: ToolTier::Host,
     },
