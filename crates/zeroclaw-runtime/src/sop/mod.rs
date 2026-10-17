@@ -17,6 +17,8 @@ pub mod schema;
 pub mod scope;
 pub mod step_contract;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod trigger_registry;
 pub mod trigger_source;
 pub mod types;

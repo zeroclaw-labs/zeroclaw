@@ -1614,3 +1614,22 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 skill-http-request-timeout = HTTP request timed out
+
+# Refusals a tool returns when it runs under a bounded-delegation caller ceiling.
+# The model and the operator reading the run both see them. The wording is pinned by
+# `bounded_ceiling_refusals_come_from_the_english_catalog_with_their_wording_pinned`.
+bounded-ceiling-unsealed = {$tool}: refused — this tool was registered under bounded delegation but the caller's tool ceiling was never sealed, so the job's tool set cannot be bounded
+bounded-ceiling-no-tool-survives = {$tool}: refused — no requested tool survives the calling agent's bounded tool ceiling, and an empty allowed_tools is stored as unrestricted
+bounded-ceiling-deferred-shell = {$tool}: refused — this agent job would keep '{$shell}', and a deferred agent later runs it under the owning agent's command policy alone, without the calling agent's; list the tools the job needs without '{$shell}'
+bounded-ceiling-job-unrestricted = {$tool}: refused — this job stores no allowed_tools, so it would run with the owning agent's full registry, outside the calling agent's bounded tool ceiling
+bounded-ceiling-job-beyond = {$tool}: refused — this job's stored allowed_tools reach beyond the calling agent's bounded tool ceiling ({$outside})
+bounded-ceiling-shell-job = {$tool}: refused — this stores or re-arms a shell job, whose command the scheduler later runs under the owning agent's policy, and 'shell' is outside the calling agent's bounded tool ceiling
+bounded-ceiling-refused-reason = {$tool}: refused — {$reason}
+bounded-ceiling-sop-workshop-action = sop_workshop `{$action}` is not available under a caller tool ceiling: it persists a proposal or SOP definition that runs later, outside that ceiling. `list` and `inspect` remain available.
+bounded-ceiling-sop-execute-uncancelled = sop_execute: refused — SOP '{$sop}' left outside this turn (parked or pending on a dependency), which a bounded caller's tool ceiling cannot follow past this turn; run {$run} could NOT be cancelled ({$error}) and may still be active - treat it as unresolved, not closed
+bounded-ceiling-sop-execute-cancelled = sop_execute: refused — SOP '{$sop}' left outside this turn (parked or pending on a dependency), which a bounded caller's tool ceiling cannot follow past this turn; run {$run} has been cancelled
+bounded-ceiling-sop-advance-uncancelled = sop_advance: refused — run {$run} left outside this turn (parked or pending on a dependency), which a bounded caller's tool ceiling cannot follow past this turn; the run could NOT be cancelled ({$error}) and may still be active - treat it as unresolved, not closed
+bounded-ceiling-sop-advance-cancelled = sop_advance: refused — run {$run} left outside this turn (parked or pending on a dependency), which a bounded caller's tool ceiling cannot follow past this turn; the run has been cancelled
+bounded-ceiling-sop-approve-denied = sop_approve is not available to a bounded delegate target: approval authority belongs to the calling agent's identity, not the target's.
+bounded-ceiling-peer-unpublished = send_message_to_peer: refused — a delegated caller ceiling was declared but never published, so the recipient's turn cannot be bounded
+bounded-ceiling-spawn-unpublished = spawn_subagent: refused — a delegated caller ceiling was declared but never published, so the child cannot be bounded

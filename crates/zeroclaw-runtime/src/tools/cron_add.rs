@@ -19,6 +19,20 @@ pub struct CronAddTool {
     /// this tool instance. Cron jobs created here are validated against
     /// this agent's risk profile and run as this agent.
     agent_alias: String,
+    /// The bounded-delegation tool ceiling in force for the loop that
+    /// registered this instance, or `None` for an unbounded registration.
+    ///
+    /// A cron job outlives the turn that created it: the scheduler rebuilds
+    /// the owning agent's policy from config and passes the job's stored
+    /// `allowed_tools` to `agent::run`, so a job saved without a ceiling runs
+    /// with the owning agent's full registry. Capping the STORED list is
+    /// therefore the only place the bound can survive — an in-turn check
+    /// would be gone by the time the job fires.
+    ///
+    /// `OnceLock` because the sealed set does not exist yet when this tool is
+    /// built; the bounded assembly fills the same handle it hands to
+    /// `spawn_subagent`, so both descend from one ceiling.
+    caller_ceiling: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
 }
 
 impl CronAddTool {
@@ -27,13 +41,29 @@ impl CronAddTool {
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
+        caller_ceiling: Option<Arc<std::sync::OnceLock<Vec<String>>>>,
     ) -> Self {
         Self {
             config,
             security,
             runtime,
             agent_alias: agent_alias.into(),
+            caller_ceiling,
         }
+    }
+
+    /// Cap a job's `allowed_tools` by the caller ceiling before it is stored.
+    /// See [`crate::tools::caller_ceiling`] for why a scheduler tool has to
+    /// bound the STORED list rather than the turn.
+    fn cap_allowed_tools(
+        &self,
+        requested: Option<Vec<String>>,
+    ) -> Result<Option<Vec<String>>, String> {
+        crate::tools::caller_ceiling::cap_stored_allowed_tools(
+            "cron_add",
+            self.caller_ceiling.as_ref(),
+            requested,
+        )
     }
 
     #[cfg(test)]
@@ -46,7 +76,7 @@ impl CronAddTool {
             crate::platform::create_runtime(&config.runtime)
                 .expect("test config must construct its runtime"),
         );
-        Self::new_with_runtime(config, security, agent_alias, runtime)
+        Self::new_with_runtime(config, security, agent_alias, runtime, None)
     }
 
     fn plain_string_schedule_error(raw: &str) -> Option<String> {
@@ -448,6 +478,22 @@ impl Tool for CronAddTool {
                     });
                 }
 
+                // The command above was validated against THIS agent's risk
+                // profile, which under bounded delegation is the target's, not
+                // the caller's. A shell job stores no `allowed_tools` to cap,
+                // so the caller's bound has to be applied as a refusal here:
+                // see `caller_ceiling::require_shell_within_ceiling`.
+                if let Err(error) = crate::tools::caller_ceiling::require_shell_within_ceiling(
+                    "cron_add",
+                    self.caller_ceiling.as_ref(),
+                ) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error),
+                    });
+                }
+
                 if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
                     return Ok(blocked);
                 }
@@ -517,6 +563,18 @@ impl Tool for CronAddTool {
                         }
                     },
                     None => None,
+                };
+                // Cap by the caller ceiling BEFORE the job is stored: the
+                // stored list is the only carrier that survives to the run.
+                let allowed_tools = match self.cap_allowed_tools(allowed_tools) {
+                    Ok(list) => list,
+                    Err(error) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(error),
+                        });
+                    }
                 };
                 let uses_memory = args
                     .get("uses_memory")
