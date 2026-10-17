@@ -1012,7 +1012,7 @@ impl WhatsAppWebChannel {
                     is_group,
                     &context.dm_mention_patterns,
                     &context.group_mention_patterns,
-                    msg.text_content().unwrap_or(""),
+                    Self::inbound_text(msg),
                 )
             {
                 ::zeroclaw_log::record!(
@@ -1074,7 +1074,7 @@ impl WhatsAppWebChannel {
         let normalized = normalized.unwrap_or_else(|| sender.clone());
         let conversation_scope = Self::group_context_scope(context.passive_group_context, is_group);
         let mut passive_context = false;
-        let text_content = msg.text_content().unwrap_or("").trim().to_string();
+        let text_content = Self::inbound_text(msg).trim().to_string();
         let mut content = Self::media_fallback_content(text_content, msg);
 
         ::zeroclaw_log::record!(
@@ -1719,6 +1719,20 @@ impl WhatsAppWebChannel {
             )
             .await;
         }
+    }
+
+    /// The text the sender typed: the message body, or the caption of an
+    /// image, video or document when there is no body. wacore's
+    /// `text_content()` reads only `conversation` and `extended_text_message`,
+    /// so without the caption fallback a captioned photo would reach the
+    /// agent, and the mention gate, as a bare `[Image]`.
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_text(msg: &waproto::whatsapp::Message) -> &str {
+        use wacore::proto_helpers::MessageExt;
+        msg.text_content()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| msg.get_caption())
+            .unwrap_or("")
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -7067,6 +7081,120 @@ mod tests {
             WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
             ""
         );
+    }
+
+    /// The content the inbound handler builds before mention gating.
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content(msg: &waproto::whatsapp::Message) -> String {
+        WhatsAppWebChannel::media_fallback_content(
+            WhatsAppWebChannel::inbound_text(msg).trim().to_string(),
+            msg,
+        )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn captioned_media(kind: &str, caption: Option<&str>) -> waproto::whatsapp::Message {
+        let caption = caption.map(str::to_string);
+        let mut msg = waproto::whatsapp::Message::default();
+        match kind {
+            "image" => {
+                msg.image_message = waproto::whatsapp::message::ImageMessage {
+                    caption,
+                    ..Default::default()
+                }
+                .into();
+            }
+            "video" => {
+                msg.video_message = waproto::whatsapp::message::VideoMessage {
+                    caption,
+                    ..Default::default()
+                }
+                .into();
+            }
+            "document" => {
+                msg.document_message = waproto::whatsapp::message::DocumentMessage {
+                    caption,
+                    ..Default::default()
+                }
+                .into();
+            }
+            other => panic!("unknown media kind {other}"),
+        }
+        msg
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content_uses_media_captions() {
+        for kind in ["image", "video", "document"] {
+            let msg = captioned_media(kind, Some("  what is this?  "));
+            assert_eq!(inbound_content(&msg), "what is this?", "{kind}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content_keeps_placeholders_for_media_without_caption() {
+        for (kind, placeholder) in [
+            ("image", "[Image]"),
+            ("video", "[Video]"),
+            ("document", "[Document]"),
+        ] {
+            assert_eq!(inbound_content(&captioned_media(kind, None)), placeholder);
+            assert_eq!(
+                inbound_content(&captioned_media(kind, Some("   "))),
+                placeholder
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content_reads_captions_inside_wrappers() {
+        let document_with_caption = waproto::whatsapp::Message {
+            document_with_caption_message: waproto::whatsapp::message::FutureProofMessage {
+                message: captioned_media("document", Some("invoice")).into(),
+            }
+            .into(),
+            ..Default::default()
+        };
+        assert_eq!(inbound_content(&document_with_caption), "invoice");
+
+        let ephemeral = waproto::whatsapp::Message {
+            ephemeral_message: waproto::whatsapp::message::FutureProofMessage {
+                message: captioned_media("image", Some("receipt")).into(),
+            }
+            .into(),
+            ..Default::default()
+        };
+        assert_eq!(inbound_content(&ephemeral), "receipt");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content_leaves_text_messages_unchanged() {
+        let conversation = waproto::whatsapp::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(inbound_content(&conversation), "hello");
+        assert_eq!(
+            inbound_content(&extended_text_reply("200@lid", &[])),
+            "expand the previous response"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn captioned_media_text_mention_addresses_the_bot() {
+        let msg = captioned_media("image", Some("@15550001234 what is this?"));
+        let content = inbound_content(&msg);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            &content,
+            "15550001234",
+            None
+        ));
     }
 
     #[test]
