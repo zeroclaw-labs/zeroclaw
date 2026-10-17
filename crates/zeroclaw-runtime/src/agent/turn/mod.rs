@@ -1061,6 +1061,30 @@ struct PreDispatchTrimResult {
     kept_turns: usize,
 }
 
+fn record_tool_context_collapse(
+    collapsed: &crate::agent::history_trim::CollapsedToolContext,
+    keep_prior_turns: usize,
+    turn_id: &str,
+) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_attrs(::serde_json::json!({
+                "dropped_messages": collapsed.dropped_messages,
+                "collapsed_turns": collapsed.collapsed_turns,
+                "keep_tool_context_turns": keep_prior_turns,
+                "turn_id": turn_id,
+            })),
+        format!(
+            "Tool context collapsed for this request: {} older turn(s) sent without {} tool row(s); the newest {} turn(s) sent whole",
+            collapsed.collapsed_turns,
+            collapsed.dropped_messages,
+            keep_prior_turns.saturating_add(1)
+        )
+    );
+}
+
 fn record_dispatch_trim(
     (provider_name, model): (&str, &str),
     trim: &PreDispatchTrimResult,
@@ -1670,6 +1694,7 @@ async fn run_tool_call_loop_impl<'a>(
         strict_tool_parsing,
         parallel_tools,
         max_tool_result_chars,
+        keep_tool_context_turns,
         context_limits,
         context_limits_resolver,
         receipt_generator,
@@ -1861,6 +1886,14 @@ async fn run_tool_call_loop_impl<'a>(
     // hook-selected model, schemas, or prepared messages.
     let mut pending_reported_usage: Option<ReportedRequestUsage> = seed_reported_usage;
 
+    // The tools this loop can execute tell a call row apart from an ordinary
+    // reply whose JSON merely contains a `tool_calls` array when a request is
+    // collapsed: the registry, not an iteration's offered subset, since a
+    // carrier in an older turn may name a tool excluded since.
+    let known_tool_names: std::collections::HashSet<String> = tools_registry
+        .iter()
+        .map(|tool| tool.name().to_ascii_lowercase())
+        .collect();
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
         // Re-resolved every iteration, against the tools callable *right now*.
@@ -2094,14 +2127,32 @@ async fn run_tool_call_loop_impl<'a>(
             activated_tools,
         )?;
 
-        let (prepared_messages, mut prepared_source_rows) =
+        // The request is built from a population in which turns older than
+        // the newest `keep_tool_context_turns + 1` have lost their tool rows.
+        // The working history itself is untouched, so owners that persist it
+        // (channel cache, ACP transcript, CLI session file) keep every row.
+        let collapsed = crate::agent::history_trim::collapse_tool_context_older_than(
+            turn_state.history,
+            keep_tool_context_turns,
+            turn_state.crumb_present,
+            &known_tool_names,
+        );
+        if iteration == 0 && collapsed.dropped_messages > 0 {
+            record_tool_context_collapse(&collapsed, keep_tool_context_turns, turn_id);
+        }
+        let (prepared_messages, prepared_source_rows) =
             vision_route::prepare_messages_with_source_rows(
-                turn_state.history,
+                &collapsed.messages,
                 multimodal_config,
                 degrade_strip_images,
                 image_cache.as_mut().map(|state| &mut *state.cache),
             )
             .await?;
+        // Source rows must index the working history, not the collapsed copy.
+        let mut prepared_source_rows: Vec<usize> = prepared_source_rows
+            .iter()
+            .map(|&row| collapsed.source_rows[row])
+            .collect();
         let mut provider_request_messages = prepared_messages.messages;
         let newest_user_image_ids = prepared_messages.newest_user_image_ids;
         let pre_hook_messages = provider_request_messages.clone();
@@ -3006,13 +3057,13 @@ async fn run_tool_call_loop_impl<'a>(
             if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
                 // This is model feedback, not a tool result: malformed protocol
                 // output has no valid tool_call_id to attach a role=tool message to.
-                let msg = ChatMessage::user(
-                    "[Tool call parse error]\n\
+                let msg = ChatMessage::user(format!(
+                    "{}\n\
                      Your previous response looked like an internal tool-call protocol payload, \
                      but ZeroClaw could not parse it into a valid tool call. Use the supported \
-                     tool-call schema, or answer in natural language if no tool is needed."
-                        .to_string(),
-                );
+                     tool-call schema, or answer in natural language if no tool is needed.",
+                    crate::agent::history_trim::RUNTIME_FEEDBACK_PREFIXES[0]
+                ));
                 turn_state.push_dual(msg);
                 continue;
             }
@@ -4484,6 +4535,14 @@ async fn drive_live_sop_actions(
                                             strict_tool_parsing: eff_strict_tool_parsing,
                                             parallel_tools: eff_parallel_tools,
                                             max_tool_result_chars: eff_max_tool_result_chars,
+                                            // A live SOP step runs on the caller's
+                                            // history as part of the caller's turn;
+                                            // the caller's turn is never collapsed,
+                                            // so this nested loop must not collapse
+                                            // it either (each step prompt is a user
+                                            // row, so the outer turn would look
+                                            // "older" from in here).
+                                            keep_tool_context_turns: usize::MAX,
                                             context_limits: eff_context_limits,
                                             context_limits_resolver: None,
                                             knobs,
@@ -6723,6 +6782,7 @@ vision_model_provider = "custom.vision"
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 100_000,
+                    keep_tool_context_turns: 2,
                     context_limits: text_limits,
                     context_limits_resolver: None,
                     knobs: &knobs,
@@ -7779,6 +7839,7 @@ mod sop_step_reassembly_tests {
             budget,
             cancellation_token,
             max_tool_iterations,
+            2,
             None,
             None,
             None,
@@ -7786,6 +7847,7 @@ mod sop_step_reassembly_tests {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_budgeted_test_loop_with_hooks(
         provider: &dyn ModelProvider,
         history: &mut Vec<ChatMessage>,
@@ -7793,6 +7855,7 @@ mod sop_step_reassembly_tests {
         budget: ExecutionTreeBudget,
         cancellation_token: CancellationToken,
         max_tool_iterations: usize,
+        keep_tool_context_turns: usize,
         security: Option<&crate::security::SecurityPolicy>,
         hooks: Option<&crate::hooks::HookRunner>,
         image_cache: Option<ToolLoopImageState<'_>>,
@@ -7840,6 +7903,7 @@ mod sop_step_reassembly_tests {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 30_000,
+                    keep_tool_context_turns,
                     context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
                         100_000,
                     ),
@@ -7869,6 +7933,93 @@ mod sop_step_reassembly_tests {
             turn_id: &turn_id,
         })
         .await
+    }
+
+    /// The first parent request after a live SOP step: the step's prompt
+    /// rows sit on the parent's history, retention is at its smallest and
+    /// trimming is off. The tool round that opened the parent's turn must
+    /// still be in the request, and a plain user row in the same place must
+    /// still age it, so the step prompt's marker is what keeps the turn whole.
+    #[tokio::test]
+    async fn resumed_parent_request_keeps_its_tool_round_across_sop_step_prompts() {
+        struct NamedEchoTool;
+        impl zeroclaw_api::attribution::Attributable for NamedEchoTool {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str {
+                "echo"
+            }
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for NamedEchoTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echoes its arguments"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(
+                &self,
+                args: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: args.to_string().into(),
+                    error: None,
+                })
+            }
+        }
+        let carrier = r#"{"content":null,"tool_calls":[{"id":"call_parent","name":"echo","arguments":"{\"text\":\"hi\"}"}]}"#;
+        let result = r#"{"tool_call_id":"call_parent","content":"echo: hi"}"#;
+        let step_prompt = "[SOP: Deploy (run r1) — Step 1 of 1]\n\nCurrent step: **report**\nWhen done, report your result.\n";
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            NamedEchoTool,
+        )]);
+        for (interrupting_row, must_keep) in [(step_prompt, true), ("another user message", false)]
+        {
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CaptureProvider {
+                requests: Arc::clone(&requests),
+            };
+            let mut history = vec![
+                ChatMessage::user("parent request"),
+                ChatMessage::assistant(carrier),
+                ChatMessage::tool(result),
+                ChatMessage::user(interrupting_row),
+                ChatMessage::assistant("step done"),
+                ChatMessage::user("[Tool call parse error]\nresume"),
+            ];
+            run_budgeted_test_loop_with_hooks(
+                &provider,
+                &mut history,
+                &tools,
+                ExecutionTreeBudget::root(8),
+                CancellationToken::new(),
+                3,
+                0,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the resumed parent completes");
+            let captured = requests.lock().expect("capture lock");
+            let sent = &captured[0].0;
+            let has_call = sent.iter().any(|m| m.content == carrier);
+            let has_result = sent.iter().any(|m| m.role == "tool" && m.content == result);
+            assert_eq!(
+                (has_call, has_result),
+                (must_keep, must_keep),
+                "after {interrupting_row:?} the request was: {:?}",
+                sent.iter()
+                    .map(|m| (&m.role, &m.content))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[tokio::test]
@@ -8025,6 +8176,7 @@ mod sop_step_reassembly_tests {
                 budget.clone(),
                 CancellationToken::new(),
                 10,
+                2,
                 None,
                 Some(&hooks),
                 Some(image_state),
@@ -8061,6 +8213,7 @@ mod sop_step_reassembly_tests {
             ExecutionTreeBudget::root(1),
             CancellationToken::new(),
             10,
+            2,
             Some(&security),
             None,
             None,
@@ -9673,6 +9826,7 @@ mod tool_lifecycle_abandonment_tests {
                 strict_tool_parsing: false,
                 parallel_tools,
                 max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits {
                     context_token_budget,
                     ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
