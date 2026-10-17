@@ -4898,6 +4898,13 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_tool_elicitation(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.tool_elicitation)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn effective_tool_dispatcher(&self, agent_alias: &str) -> String {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.tool_dispatcher.as_ref())
@@ -14791,6 +14798,9 @@ pub struct RuntimeProfileConfig {
     pub parallel_tools: Option<bool>,
     /// Request one native tool call per provider response when supported. Default off.
     pub single_tool_rounds: Option<bool>,
+    /// Enable pre-turn tool-elicitation hints (prefilter + ephemeral hint).
+    /// `None` inherits (default off).
+    pub tool_elicitation: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
@@ -14853,6 +14863,7 @@ impl Default for RuntimeProfileConfig {
             compact_context: None,
             parallel_tools: None,
             single_tool_rounds: None,
+            tool_elicitation: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             deferred_builtin_tools: false,
@@ -34469,6 +34480,30 @@ runtime_profile = "missing"
         assert!(!parsed.effective_single_tool_rounds("enabled"));
         let serialized = toml::to_string(&parsed.runtime_profiles["batch"]).unwrap();
         assert!(serialized.contains("single_tool_rounds = false"));
+    }
+
+    #[test]
+    async fn runtime_profile_tool_elicitation_is_honored() {
+        let raw = r#"
+[runtime_profiles.hinted]
+tool_elicitation = true
+
+[agents.default]
+runtime_profile = "hinted"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.effective_tool_elicitation("default"));
+    }
+
+    #[test]
+    async fn tool_elicitation_defaults_off() {
+        let parsed = parse_test_config(
+            r#"
+[agents.default]
+runtime_profile = "default"
+"#,
+        );
+        assert!(!parsed.effective_tool_elicitation("default"));
     }
 
     #[test]
