@@ -1033,6 +1033,140 @@ pub async fn run_gateway_with_authority(
     .await
 }
 
+/// Select the install-wide gateway seed. Entries without a model cannot serve
+/// as a seed, so this keeps the provider and its matching model coherent.
+fn gateway_boot_provider_inputs(
+    config: &Config,
+) -> Option<(
+    &'static str,
+    &str,
+    &zeroclaw_config::schema::ModelProviderConfig,
+)> {
+    config.providers.models.first_entry_with_model()
+}
+
+/// Construct the selected gateway seed through the alias-aware, non-resilient
+/// factory. The seed establishes gateway readiness; per-agent routed calls own
+/// fallback behavior. A broken fallback on the chosen seed must not put every
+/// unrelated agent into needs-Quickstart mode.
+async fn build_gateway_boot_provider(
+    config: &Config,
+    family: &str,
+    alias: &str,
+) -> anyhow::Result<zeroclaw_providers::ResolvedModelProviderRef> {
+    let provider_ref = format!("{family}.{alias}");
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        zeroclaw_providers::create_model_provider_from_ref_with_model(&config, &provider_ref)
+    })
+    .await
+    .context("gateway seed construction task failed")?
+}
+
+/// Gateway-local state derived from the configured boot seed.
+///
+/// A missing model is ordinary first-run state. Keep that case explicit here
+/// so the gateway never fabricates a provider reference before Quickstart can
+/// configure one.
+struct GatewayBootState<'a> {
+    model_provider: Arc<dyn ModelProvider>,
+    fallback: Option<&'a zeroclaw_config::schema::ModelProviderConfig>,
+    model: String,
+}
+
+async fn initialize_gateway_boot_state<'a>(
+    config: &'a Config,
+    display_addr: &str,
+) -> GatewayBootState<'a> {
+    match gateway_boot_provider_inputs(config) {
+        Some((boot_family, boot_alias, boot_entry)) => {
+            match build_gateway_boot_provider(config, boot_family, boot_alias).await {
+                Ok(resolved) => GatewayBootState {
+                    model_provider: Arc::from(resolved.provider),
+                    fallback: Some(boot_entry),
+                    model: resolved.model.unwrap_or_default(),
+                },
+                Err(e) => {
+                    let model_provider_ref = format!("{boot_family}.{boot_alias}");
+                    match e.downcast::<zeroclaw_providers::auth::ProviderCredentialRefreshError>() {
+                        Ok(error) => {
+                            // Vendor error bodies may contain credentials; keep boot logs generic.
+                            // The original error remains available to direct provider consumers.
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "model_provider": model_provider_ref,
+                                    "error_key": "seed_credential_refresh_failed",
+                                })),
+                                "Gateway seed credential refresh failed; retaining configured \
+                         readiness. Requests construct their own configured agent provider."
+                            );
+                            GatewayBootState {
+                                model_provider: Arc::new(FailedBootModelProvider {
+                                    alias: boot_alias.to_string(),
+                                    error,
+                                }),
+                                fallback: Some(boot_entry),
+                                model: boot_entry
+                                    .model
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .to_string(),
+                            }
+                        }
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "model_provider": model_provider_ref,
+                                    "alias": boot_alias,
+                                    "error": format!("{e}"),
+                                })),
+                                "Gateway: seed model_provider failed to construct; booting in \
+                         needs_quickstart mode so /quickstart and /admin/reload stay \
+                         reachable. Fix the [providers.models.<type>.<alias>] entry \
+                         and POST /admin/reload."
+                            );
+                            GatewayBootState {
+                                model_provider: Arc::new(UnconfiguredModelProvider),
+                                fallback: Some(boot_entry),
+                                model: String::new(),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
+                &format!(
+                    "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
+                )
+            );
+            GatewayBootState {
+                model_provider: Arc::new(UnconfiguredModelProvider),
+                fallback: None,
+                model: String::new(),
+            }
+        }
+    }
+}
+
 /// Run the supervised gateway with the daemon generation's channel-plugin
 /// webhook registry and live-config authority.
 #[allow(clippy::too_many_lines)]
@@ -1117,73 +1251,17 @@ pub async fn run_gateway_with_plugin_webhooks(
     // model coherent — the previous "first entry, whatever it is" pick could
     // build the provider from one entry while `resolve_default_model` sourced
     // the model from another.
-    let (boot_family, boot_alias, boot_entry) = config
-        .providers
-        .models
-        .first_entry_with_model()
-        .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
-        .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
-    let fallback = boot_entry;
-    let model_provider_name = boot_family.as_str();
-    let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
-        match zeroclaw_providers::create_resilient_model_provider_from_ref(
-            &config,
-            model_provider_name,
-            fallback.and_then(|e| e.api_key.as_deref()),
-            fallback.and_then(|e| e.uri.as_deref()),
-            &config.reliability,
-            &zeroclaw_providers::provider_runtime_options_for_alias(
-                &config,
-                &boot_family,
-                &boot_alias,
-            ),
-        ) {
-            Ok(p) => (Arc::from(p), false),
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "model_provider": model_provider_name,
-                            "alias": boot_alias,
-                            "error": format!("{e}"),
-                        })),
-                    "Gateway: seed model_provider failed to construct; booting in \
-                     needs_quickstart mode so /quickstart and /admin/reload stay \
-                     reachable. Fix the [providers.models.<type>.<alias>] entry \
-                     and POST /admin/reload."
-                );
-                (
-                    Arc::new(UnconfiguredModelProvider) as Arc<dyn ModelProvider>,
-                    true,
-                )
-            }
-        };
-    let model = if boot_provider_failed {
-        String::new()
-    } else {
-        // `first_entry_with_model` guarantees a non-empty model for the boot
-        // entry, so reaching the empty fallback means no entry declares a
-        // model at all — the needs_quickstart onboarding path.
-        let model = fallback
-            .and_then(|e| e.model.as_deref())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(ToString::to_string);
-        if model.is_none() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
-                &format!(
-                    "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
-                )
-            );
-        }
-        model.unwrap_or_default()
-    };
+    // The same selected entry also provides the install-wide temperature and
+    // memory API key below; retaining it keeps those boot defaults coherent
+    // with the alias passed to the provider factory. When no entry has a
+    // model, do not invent a provider reference: that is ordinary first-run
+    // state, not a broken alias, and must reach the established Quickstart
+    // admission path.
+    let GatewayBootState {
+        model_provider,
+        fallback,
+        model,
+    } = initialize_gateway_boot_state(&config, &display_addr).await;
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
     // here would clobber the "let the provider decide" intent for models
     // (e.g. claude-opus-4-7) that reject `temperature`.
@@ -3002,6 +3080,41 @@ struct GatewayChatOutcome {
 }
 
 struct UnconfiguredModelProvider;
+
+/// Retain a seed failure without confusing credential health with onboarding.
+/// Production chat constructs a provider from the selected agent's live config;
+/// direct consumers of this seed still receive the original typed failure.
+struct FailedBootModelProvider {
+    alias: String,
+    error: zeroclaw_providers::auth::ProviderCredentialRefreshError,
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for FailedBootModelProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        Err(self.error.clone().into())
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for FailedBootModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
 
 #[async_trait::async_trait]
 impl ModelProvider for UnconfiguredModelProvider {
@@ -5316,6 +5429,243 @@ mod tests {
         assert_eq!(dotted, "gw_team.alpha");
         assert_eq!(underscored, "gw_team_alpha");
         assert_ne!(dotted, underscored);
+    }
+
+    #[tokio::test]
+    async fn gateway_boot_keeps_the_configured_anthropic_oauth_alias() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let (family, alias, _) = gateway_boot_provider_inputs(&config)
+            .expect("the configured OAuth alias must be selected for gateway boot");
+        let provider = build_gateway_boot_provider(&config, family, alias)
+            .await
+            .expect("the gateway boot path must build the configured OAuth alias")
+            .provider;
+
+        assert_eq!(family, "anthropic");
+        assert_eq!(alias, "subscription");
+        assert_eq!(
+            provider.alias(),
+            "subscription",
+            "gateway boot must enter the typed alias factory rather than the bare family factory"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_boot_rejects_a_noncanonical_anthropic_oauth_alias() {
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "team:subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let (family, alias, _) = gateway_boot_provider_inputs(&config)
+            .expect("the configured OAuth alias must be selected for gateway boot");
+        let error = match build_gateway_boot_provider(&config, family, alias).await {
+            Ok(_) => panic!("gateway boot must reject an OAuth alias that cannot name a profile"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("requires a canonical alias"),
+            "unexpected gateway construction error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_boot_with_a_broken_oauth_seed_stays_unconfigured() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::{AnthropicAuthMode, AnthropicModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "team:subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let state = initialize_gateway_boot_state(&config, "127.0.0.1:42617").await;
+        assert_eq!(state.model_provider.alias(), "unconfigured");
+        assert!(state.model.is_empty());
+        assert_eq!(
+            state
+                .fallback
+                .expect("the rejected seed remains available for reload diagnostics")
+                .model
+                .as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_boot_ignores_a_seed_fallback_that_is_not_auth_ready() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::providers::ModelProviderRef;
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "main".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    fallback: vec![ModelProviderRef::new("openai.backup")],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig::default(),
+            },
+        );
+
+        let (family, alias, _) = gateway_boot_provider_inputs(&config)
+            .expect("the configured Anthropic alias must be selected for gateway boot");
+        let provider = build_gateway_boot_provider(&config, family, alias)
+            .await
+            .expect("gateway seed must not construct its routed fallback chain")
+            .provider;
+        assert_eq!(provider.alias(), "main");
+    }
+
+    #[tokio::test]
+    async fn gateway_boot_without_a_model_does_not_invent_a_provider_alias() {
+        use zeroclaw_api::attribution::Attributable;
+
+        let config = Config::default();
+
+        assert!(
+            gateway_boot_provider_inputs(&config).is_none(),
+            "a first-run config must use needs_quickstart rather than construct a synthetic provider"
+        );
+
+        let state = initialize_gateway_boot_state(&config, "127.0.0.1:42617").await;
+        assert_eq!(state.model_provider.alias(), "unconfigured");
+        assert!(state.fallback.is_none());
+        assert!(state.model.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gateway_boot_refresh_failure_preserves_configured_readiness() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::{ModelProviderConfig, QwenModelProviderConfig};
+
+        struct EndpointReset;
+        impl Drop for EndpointReset {
+            fn drop(&mut self) {
+                zeroclaw_providers::set_qwen_oauth_endpoint_for_test(None);
+            }
+        }
+
+        let server = MockServer::start().await;
+        zeroclaw_providers::set_qwen_oauth_endpoint_for_test(Some(format!(
+            "{}/token",
+            server.uri()
+        )));
+        let _reset = EndpointReset;
+        let mut config = Config::default();
+        config.providers.models.qwen.insert(
+            "seed".into(),
+            QwenModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("qwen-fixture".into()),
+                    ..Default::default()
+                },
+                oauth_refresh_token: Some("synthetic-refresh-token".into()),
+                ..Default::default()
+            },
+        );
+
+        let chat_fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
+        for status in [200, 503, 401] {
+            let tmp = tempfile::tempdir().expect("gateway refresh fixture");
+            let (mut state, _) = production_sse_state(&tmp, &chat_fixture.base_url(), 1.0, false);
+            let mut live_config = state.config.read().clone();
+            live_config
+                .providers
+                .models
+                .qwen
+                .clone_from(&config.providers.models.qwen);
+            state.publish_test_config(|next| *next = live_config.clone());
+            let mock = Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "access_token": "synthetic-access-token",
+                        "resource_url": format!("{}/v1", server.uri()),
+                        "expires_in": 3600,
+                    })),
+                )
+                .expect(1)
+                .mount_as_scoped(&server)
+                .await;
+            let boot = initialize_gateway_boot_state(&live_config, "127.0.0.1:42617").await;
+            assert_eq!(boot.model_provider.alias(), "seed");
+            assert_eq!(boot.model, "qwen-fixture");
+            assert!(needs_quickstart_for(&boot.model).is_none());
+            assert!(boot.fallback.is_some());
+            if status != 200 {
+                let error = boot
+                    .model_provider
+                    .chat_with_system(None, "fixture", &boot.model, None)
+                    .await
+                    .expect_err("failed seed must not report successful chat");
+                assert!(error.is::<zeroclaw_providers::auth::ProviderCredentialRefreshError>());
+                assert!(error.to_string().contains(&status.to_string()));
+                assert!(!error.to_string().contains("needs_quickstart"));
+            }
+            state.model = boot.model;
+            state.model_provider = boot.model_provider;
+            let text = tokio::time::timeout(
+                Duration::from_secs(10),
+                collect_production_sse(
+                    &state,
+                    "unrelated configured agent",
+                    &format!("refresh-{status}"),
+                ),
+            )
+            .await
+            .expect("unrelated gateway agent finishes");
+            assert!(text.contains("fixture answer"), "gateway output: {text}");
+            assert!(text.contains("event: done"), "gateway output: {text}");
+            assert!(!text.contains("event: error"), "gateway output: {text}");
+            assert_eq!(mock.received_requests().await.len(), 1);
+        }
+        assert_eq!(chat_fixture.requests.load(Ordering::SeqCst), 3);
     }
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.

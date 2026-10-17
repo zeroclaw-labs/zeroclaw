@@ -86,6 +86,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 libc = "0.2"
 
 [dev-dependencies]
+zeroclaw-providers = { workspace = true, features = ["test-helpers"] }
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }
 rand = "0.10"
 rcgen = "0.13"
