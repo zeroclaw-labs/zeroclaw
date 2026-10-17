@@ -777,6 +777,9 @@ pub struct LocalWhisperProvider {
     alias: String,
     url: String,
     bearer_token: Option<String>,
+    /// Optional `model` selector sent as a multipart form field; `None` keeps
+    /// the legacy wire shape for servers that choose their model at startup.
+    model: Option<String>,
     max_audio_bytes: usize,
     timeout_secs: u64,
 }
@@ -840,6 +843,12 @@ impl LocalWhisperProvider {
             alias: alias.to_string(),
             url,
             bearer_token,
+            model: config
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string),
             max_audio_bytes: config.max_audio_bytes,
             timeout_secs: config.timeout_secs,
         })
@@ -855,6 +864,7 @@ impl LocalWhisperProvider {
         let bridge = zeroclaw_config::schema::LocalWhisperConfig {
             url: cfg.uri.clone(),
             bearer_token: cfg.bearer_token.clone(),
+            model: cfg.model.clone(),
             max_audio_bytes: cfg.max_audio_bytes,
             timeout_secs: cfg.timeout_secs,
         };
@@ -897,8 +907,20 @@ impl TranscriptionProvider for LocalWhisperProvider {
             req = req.bearer_auth(token);
         }
 
+        let mut form = Form::new().part("file", file_part);
+        // Only send `model` when configured. `whisper.cpp`'s server selects
+        // its model at startup and takes no selector field, so the legacy
+        // wire shape omits it; strict OpenAI-compatible servers (e.g.
+        // oMLX) reject uploads without it (`422 body -> model: Field
+        // required`) and rarely host a model literally named "whisper", so
+        // self-hosted deployments set it explicitly in
+        // `[providers.transcription.local_whisper.<alias>]`.
+        if let Some(model) = self.model.as_deref() {
+            form = form.text("model", model.to_string());
+        }
+
         let resp = req
-            .multipart(Form::new().part("file", file_part))
+            .multipart(form)
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .send()
             .await
@@ -2099,6 +2121,7 @@ mod tests {
 
     fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
         zeroclaw_config::schema::LocalWhisperConfig {
+            model: None,
             url: url.to_string(),
             bearer_token: Some("test-token".to_string()),
             max_audio_bytes: 10 * 1024 * 1024,
@@ -2326,6 +2349,173 @@ mod tests {
         assert_eq!(provider.timeout_secs, 300);
         assert_eq!(provider.url, "http://127.0.0.1:9999/v1/transcribe");
         assert_eq!(provider.bearer_token.as_deref(), Some("test-token"));
+    }
+
+    /// Wire-contract regression for `[providers.transcription.local_whisper.<alias>]`:
+    /// when `model` is configured it MUST appear as a multipart form field.
+    /// Strict OpenAI-compatible local servers (e.g. oMLX hosting
+    /// `Qwen3-ASR-1.7B-6bit`) reject uploads that omit it with
+    /// `422 body -> model: Field required`, and the failure previously fell
+    /// through as silent no-transcription (raw voice notes landing as
+    /// documents with no operator-visible error).
+    #[tokio::test]
+    async fn local_whisper_sends_configured_model_on_the_wire() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello from qwen asr"
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = LocalWhisperProvider::from_typed_config(
+            "local_whisper",
+            &zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/audio/transcriptions", server.uri()),
+                bearer_token: None,
+                model: Some("Qwen3-ASR-1.7B-6bit".to_string()),
+                ..zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig::default()
+            },
+        )
+        .expect("typed local_whisper config with model must load");
+
+        let text = provider
+            .transcribe(b"fake-ogg-bytes", "voice.ogg")
+            .await
+            .expect("transcription request must succeed");
+        assert_eq!(text, "hello from qwen asr");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let multipart = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            multipart.contains("name=\"model\""),
+            "multipart body must carry a model field;\ngot:\n{multipart}"
+        );
+        assert!(
+            multipart.contains("\r\n\r\nQwen3-ASR-1.7B-6bit\r\n"),
+            "model field value must be the configured model id;\ngot:\n{multipart}"
+        );
+    }
+
+    /// The flip side of the wire contract: when `model` is unset the field
+    /// MUST NOT be sent — `whisper.cpp`'s own server takes no model
+    /// selector, and the legacy wire shape is a compatibility contract
+    /// existing self-hosted deployments rely on.
+    #[tokio::test]
+    async fn local_whisper_omits_model_when_unset() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "legacy ok"
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = LocalWhisperProvider::from_typed_config(
+            "local_whisper",
+            &zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", server.uri()),
+                bearer_token: None,
+                ..zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig::default()
+            },
+        )
+        .expect("default local_whisper config must load");
+
+        let text = provider
+            .transcribe(b"fake-ogg-bytes", "voice.ogg")
+            .await
+            .expect("legacy wire shape must still succeed");
+        assert_eq!(text, "legacy ok");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let multipart = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            !multipart.contains("name=\"model\""),
+            "unset model must not appear on the wire;\ngot:\n{multipart}"
+        );
+    }
+
+    /// `model` normalization mirrors `bearer_token`: a blank value means "not
+    /// configured" rather than a literal empty selector, so clearing the key in
+    /// TOML cannot produce a `model=""` field that a strict server rejects.
+    #[test]
+    fn local_whisper_treats_blank_model_as_unset() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.model = Some("   ".to_string());
+        let provider = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .expect("blank model must be accepted as 'not configured'");
+        assert!(
+            provider.model.is_none(),
+            "whitespace-only model must normalize to None"
+        );
+    }
+
+    /// Surrounding whitespace is trimmed rather than forwarded verbatim — a
+    /// padded `model = " Qwen3-ASR-1.7B-6bit "` in TOML must reach the wire (and
+    /// the server's model registry lookup) unpadded.
+    #[test]
+    fn local_whisper_trims_configured_model() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.model = Some("  Qwen3-ASR-1.7B-6bit  ".to_string());
+        let provider = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .expect("padded model must load");
+        assert_eq!(provider.model.as_deref(), Some("Qwen3-ASR-1.7B-6bit"));
+    }
+
+    /// Operator-path regression for the surface operators actually write:
+    /// `model` in a `[providers.transcription.local_whisper.<alias>]` block
+    /// must survive TOML deserialization and reach the wire. Without the
+    /// struct field, serde drops the unknown key silently — config load
+    /// succeeds, and the omission only shows up as a 422 from a strict
+    /// OpenAI-compatible server at request time.
+    #[tokio::test]
+    async fn typed_local_whisper_model_survives_toml_and_reaches_the_wire() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "toml model ok"
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg: zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig =
+            toml::from_str(&format!(
+                "uri = \"{}/v1/audio/transcriptions\"\nmodel = \"Qwen3-ASR-1.7B-6bit\"\n",
+                server.uri()
+            ))
+            .expect("typed local_whisper TOML carrying `model` must deserialize");
+        assert_eq!(
+            cfg.model.as_deref(),
+            Some("Qwen3-ASR-1.7B-6bit"),
+            "`model` must not be dropped as an unknown key"
+        );
+
+        let provider = LocalWhisperProvider::from_typed_config("local_whisper", &cfg)
+            .expect("TOML-configured typed provider must load");
+        let text = provider
+            .transcribe(b"fake-ogg-bytes", "voice.ogg")
+            .await
+            .expect("transcription request must succeed");
+        assert_eq!(text, "toml model ok");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let multipart = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            multipart.contains("\r\n\r\nQwen3-ASR-1.7B-6bit\r\n"),
+            "TOML-configured model must reach the multipart body;\ngot:\n{multipart}"
+        );
     }
 
     /// Child-struct serde round-trip: TOML serialize + deserialize on a

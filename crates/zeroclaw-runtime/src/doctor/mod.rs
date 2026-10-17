@@ -2356,6 +2356,7 @@ mod tests {
         config.providers.transcription.local_whisper.insert(
             "default".to_string(),
             zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+                model: None,
                 uri: "http://localhost:8001/inference".to_string(),
                 bearer_token: None,
                 language: None,
