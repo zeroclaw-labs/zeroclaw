@@ -375,9 +375,24 @@ fn locale_from_table(table: Option<toml::Table>) -> Option<String> {
     Some(normalize_locale(&locale))
 }
 
-/// Normalize "zh_CN.UTF-8" → "zh-CN".
+/// Normalize "zh_CN.UTF-8" → "zh-CN". A regional tag the registry has no
+/// catalogue for falls back to its language ("fr_FR.UTF-8" → "fr"), as an OS
+/// usually reports the region and the catalogues are per language.
 pub fn normalize_locale(raw: &str) -> String {
-    raw.split('.').next().unwrap_or(raw).replace('_', "-")
+    let tag = raw
+        .split(['.', '@'])
+        .next()
+        .unwrap_or(raw)
+        .replace('_', "-");
+    let known = |code: &str| {
+        available_locales()
+            .iter()
+            .find(|l| l.code.eq_ignore_ascii_case(code))
+            .map(|l| l.code.clone())
+    };
+    known(&tag)
+        .or_else(|| tag.split('-').next().and_then(known))
+        .unwrap_or(tag)
 }
 
 #[cfg(test)]
@@ -2909,7 +2924,22 @@ mod tests {
 
     #[test]
     fn normalize_locale_strips_encoding() {
-        assert_eq!(normalize_locale("en_US.UTF-8"), "en-US");
+        assert_eq!(normalize_locale("en_US.UTF-8"), "en");
+        assert_eq!(normalize_locale("fr"), "fr");
+    }
+
+    #[test]
+    fn normalize_locale_falls_back_from_region_to_language_catalogue() {
+        assert_eq!(normalize_locale("fr_FR.UTF-8"), "fr");
+        assert_eq!(normalize_locale("es_AR.UTF-8"), "es");
+        assert_eq!(normalize_locale("ja_JP.eucJP"), "ja");
+        assert_eq!(normalize_locale("fr_FR@euro"), "fr");
+        assert_eq!(normalize_locale("es-MX"), "es");
+        // A region with its own catalogue keeps it, in its registry spelling.
+        assert_eq!(normalize_locale("zh_cn.utf8"), "zh-CN");
+        // No catalogue for the language either: left as is (English is used).
+        assert_eq!(normalize_locale("zh_TW.UTF-8"), "zh-TW");
+        assert_eq!(normalize_locale("de_DE.UTF-8"), "de-DE");
         assert_eq!(normalize_locale("zh_CN.utf8"), "zh-CN");
         assert_eq!(normalize_locale("fr"), "fr");
     }
@@ -2930,7 +2960,7 @@ mod tests {
             normalized_env_locale("zh_CN.UTF-8"),
             Some("zh-CN".to_string())
         );
-        assert_eq!(normalized_env_locale("fr_FR"), Some("fr-FR".to_string()));
+        assert_eq!(normalized_env_locale("fr_FR"), Some("fr".to_string()));
         assert_eq!(normalized_env_locale(" ja "), Some("ja".to_string()));
     }
 

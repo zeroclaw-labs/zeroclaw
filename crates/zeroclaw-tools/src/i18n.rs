@@ -141,11 +141,24 @@ fn format_ftl_message(
     }
 }
 
+/// The catalogue for `locale`, or for its language when the region has none
+/// ("fr-FR" → "fr"), as an OS usually reports the region and the catalogues
+/// are per language.
 fn load_ftl_from_disk(locale: &str) -> Option<String> {
-    let path = zeroclaw_config::schema::ftl_locale_dir(locale)
-        .ok()
-        .map(|d| d.join("tools.ftl"))?;
-    std::fs::read_to_string(path).ok()
+    catalogue_candidates(locale).into_iter().find_map(|code| {
+        let path = zeroclaw_config::schema::ftl_locale_dir(code)
+            .ok()?
+            .join("tools.ftl");
+        std::fs::read_to_string(path).ok()
+    })
+}
+
+fn catalogue_candidates(locale: &str) -> Vec<&str> {
+    let mut candidates = vec![locale];
+    if let Some((language, _)) = locale.split_once('-') {
+        candidates.push(language);
+    }
+    candidates
 }
 
 fn missing_tool_string(key: &str) -> String {
@@ -228,7 +241,10 @@ fn locale_from_table(table: toml::Table) -> Option<String> {
 }
 
 fn normalize_locale(raw: &str) -> String {
-    raw.split('.').next().unwrap_or(raw).replace('_', "-")
+    raw.split(['.', '@'])
+        .next()
+        .unwrap_or(raw)
+        .replace('_', "-")
 }
 
 #[cfg(test)]
@@ -259,6 +275,13 @@ mod tests {
             pick_locale(candidates.into_iter()),
             Some("zh-CN".to_string())
         );
+    }
+
+    #[test]
+    fn catalogue_candidates_fall_back_from_region_to_language() {
+        assert_eq!(catalogue_candidates("fr-FR"), ["fr-FR", "fr"]);
+        assert_eq!(catalogue_candidates("zh-CN"), ["zh-CN", "zh"]);
+        assert_eq!(catalogue_candidates("ja"), ["ja"]);
     }
 
     #[test]
