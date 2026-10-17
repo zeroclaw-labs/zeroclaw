@@ -316,6 +316,7 @@ matrix-sdk = { version = "0.19", default-features = false, features = [
 matrix-sdk-base = { version = "0.19", default-features = false, features = ["e2e-encryption"] }
 matrix-sdk-test = "0.19"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rcgen = "0.13"
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"
