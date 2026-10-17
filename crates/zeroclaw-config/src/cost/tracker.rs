@@ -420,10 +420,6 @@ impl CostTracker {
         self.session_totals.lock()
     }
 
-    fn storage_path(&self) -> PathBuf {
-        self.lock_storage().path.clone()
-    }
-
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
         self.check_budget_at_period(estimated_cost_usd, ReportingPeriod::current())
@@ -913,24 +909,27 @@ impl CostTracker {
     }
 }
 
-// ── Process-global singleton ────────────────────────────────────────
+// ── Process-global trackers ─────────────────────────────────────────
 // Both the gateway and the channels supervisor share a single CostTracker
-// so that budget enforcement is consistent across all paths.
+// per ledger so that budget enforcement is consistent across all paths.
+// Trackers are keyed by ledger path: resolving one ledger never replaces or
+// reconfigures the tracker that owns another.
 
-static GLOBAL_COST_TRACKER: OnceLock<RwLock<Option<Arc<CostTracker>>>> = OnceLock::new();
+static GLOBAL_COST_TRACKERS: OnceLock<RwLock<HashMap<PathBuf, Arc<CostTracker>>>> = OnceLock::new();
 
 impl CostTracker {
-    /// Return the process-global `CostTracker`, applying `config` to the
-    /// existing tracker on later calls and reusing the same `Arc`. Returns
-    /// `None` while cost tracking is disabled and no tracker exists yet; a
-    /// later reload flipping `enabled` to `true` constructs it on demand.
+    /// Return the process-global `CostTracker` for the ledger under
+    /// `workspace_dir`, applying `config` to the existing tracker on later
+    /// calls and reusing the same `Arc`. Returns `None` while cost tracking is
+    /// disabled and no tracker exists for that ledger yet; a later reload
+    /// flipping `enabled` to `true` constructs it on demand.
     pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
-        let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
-        Self::resolve_global(slot, config, workspace_dir)
+        let trackers = GLOBAL_COST_TRACKERS.get_or_init(|| RwLock::new(HashMap::new()));
+        Self::resolve_global(trackers, config, workspace_dir)
     }
 
     fn resolve_global(
-        slot: &RwLock<Option<Arc<CostTracker>>>,
+        trackers: &RwLock<HashMap<PathBuf, Arc<CostTracker>>>,
         config: CostConfig,
         workspace_dir: &Path,
     ) -> Option<Arc<Self>> {
@@ -948,9 +947,7 @@ impl CostTracker {
             }
         };
 
-        if let Some(ct) = slot.read().as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
-        {
+        if let Some(ct) = trackers.read().get(&storage_path).cloned() {
             ct.update_config(config);
             return Some(ct);
         }
@@ -959,10 +956,8 @@ impl CostTracker {
             return None;
         }
 
-        let mut guard = slot.write();
-        if let Some(ct) = guard.as_ref().cloned()
-            && (ct.storage_path() == storage_path || !config.enabled)
-        {
+        let mut guard = trackers.write();
+        if let Some(ct) = guard.get(&storage_path).cloned() {
             ct.update_config(config);
             return Some(ct);
         }
@@ -970,7 +965,7 @@ impl CostTracker {
         match Self::new(config, workspace_dir) {
             Ok(ct) => {
                 let ct = Arc::new(ct);
-                *guard = Some(ct.clone());
+                guard.insert(storage_path, ct.clone());
                 Some(ct)
             }
             Err(e) => {
@@ -2417,14 +2412,14 @@ mod tests {
     #[test]
     fn get_or_init_global_applies_reloaded_config_to_existing_tracker() {
         let tmp = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
 
         let boot = CostConfig {
             enabled: true,
             daily_limit_usd: 10.0,
             ..Default::default()
         };
-        let first = CostTracker::resolve_global(&slot, boot, tmp.path())
+        let first = CostTracker::resolve_global(&trackers, boot, tmp.path())
             .expect("first init yields a tracker");
 
         let reloaded = CostConfig {
@@ -2432,7 +2427,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&slot, reloaded, tmp.path())
+        let after = CostTracker::resolve_global(&trackers, reloaded, tmp.path())
             .expect("reload yields a tracker");
 
         assert_eq!(
@@ -2450,11 +2445,11 @@ mod tests {
     fn get_or_init_global_replaces_tracker_when_data_dir_changes() {
         let first_tmp = TempDir::new().unwrap();
         let second_tmp = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
 
-        let first = CostTracker::resolve_global(&slot, enabled_config(), first_tmp.path())
+        let first = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
             .expect("first init yields a tracker");
-        let after = CostTracker::resolve_global(&slot, enabled_config(), second_tmp.path())
+        let after = CostTracker::resolve_global(&trackers, enabled_config(), second_tmp.path())
             .expect("data-dir change yields a tracker");
 
         assert!(
@@ -2474,7 +2469,7 @@ mod tests {
     #[test]
     fn get_or_init_global_constructs_tracker_when_enabled_after_disabled_boot() {
         let tmp = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
 
         let disabled_boot = CostConfig {
             enabled: false,
@@ -2482,7 +2477,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            CostTracker::resolve_global(&slot, disabled_boot, tmp.path()).is_none(),
+            CostTracker::resolve_global(&trackers, disabled_boot, tmp.path()).is_none(),
             "disabled boot must not construct a tracker"
         );
 
@@ -2491,7 +2486,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let constructed = CostTracker::resolve_global(&slot, enable, tmp.path())
+        let constructed = CostTracker::resolve_global(&trackers, enable, tmp.path())
             .expect("reload enabling cost tracking must construct the tracker");
         assert_eq!(
             constructed.config().daily_limit_usd,
@@ -2500,7 +2495,7 @@ mod tests {
         );
 
         let again = CostTracker::resolve_global(
-            &slot,
+            &trackers,
             CostConfig {
                 enabled: true,
                 daily_limit_usd: 14000.0,
@@ -2518,14 +2513,14 @@ mod tests {
     #[test]
     fn get_or_init_global_leaves_tracker_resident_when_disabled_on_reload() {
         let tmp = TempDir::new().unwrap();
-        let slot = RwLock::new(None);
+        let trackers = RwLock::new(HashMap::new());
 
         let enabled_boot = CostConfig {
             enabled: true,
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let tracker = CostTracker::resolve_global(&slot, enabled_boot, tmp.path())
+        let tracker = CostTracker::resolve_global(&trackers, enabled_boot, tmp.path())
             .expect("enabled boot yields a tracker");
 
         let disable = CostConfig {
@@ -2533,7 +2528,7 @@ mod tests {
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after = CostTracker::resolve_global(&slot, disable, tmp.path())
+        let after = CostTracker::resolve_global(&trackers, disable, tmp.path())
             .expect("disable reload leaves the tracker resident");
         assert!(
             Arc::ptr_eq(&tracker, &after),
@@ -2546,6 +2541,68 @@ mod tests {
         assert!(
             matches!(after.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
             "a disabled resident tracker must short-circuit enforcement"
+        );
+    }
+
+    /// One process can resolve several ledgers. Resolving another ledger must
+    /// not evict this ledger's tracker: the next resolution would build a
+    /// second tracker over the same ledger, whose session totals never see
+    /// what the first one recorded.
+    #[test]
+    fn get_or_init_global_keeps_each_ledgers_tracker_when_another_resolves() {
+        let first_tmp = TempDir::new().unwrap();
+        let second_tmp = TempDir::new().unwrap();
+        let trackers = RwLock::new(HashMap::new());
+
+        let first = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
+            .expect("first ledger yields a tracker");
+        first
+            .record_usage(TokenUsage::new("test/model", 10, 5, 0, 1.0, 2.0, 0.0))
+            .unwrap();
+        CostTracker::resolve_global(&trackers, enabled_config(), second_tmp.path())
+            .expect("second ledger yields a tracker");
+
+        let again = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
+            .expect("first ledger still yields a tracker");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "resolving another ledger must not replace this ledger's tracker"
+        );
+        assert_eq!(
+            again.get_summary().unwrap().request_count,
+            1,
+            "the tracker resolved again must still carry this ledger's session totals"
+        );
+    }
+
+    /// A disabled resolution reconfigures only its own ledger's tracker.
+    #[test]
+    fn get_or_init_global_disabled_resolution_leaves_other_ledgers_enabled() {
+        let first_tmp = TempDir::new().unwrap();
+        let second_tmp = TempDir::new().unwrap();
+        let trackers = RwLock::new(HashMap::new());
+
+        let first = CostTracker::resolve_global(&trackers, enabled_config(), first_tmp.path())
+            .expect("first ledger yields a tracker");
+        let disabled = CostConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(
+            CostTracker::resolve_global(&trackers, disabled, second_tmp.path()).is_none(),
+            "a disabled ledger without a tracker must not construct one or borrow another's"
+        );
+        assert!(
+            first.config().enabled,
+            "a disabled resolution for another ledger must not disable this one"
+        );
+        first
+            .record_usage(TokenUsage::new("test/model", 10, 5, 0, 1.0, 2.0, 0.0))
+            .unwrap();
+        assert_eq!(
+            first.get_summary().unwrap().request_count,
+            1,
+            "this ledger's tracker must keep recording"
         );
     }
 
