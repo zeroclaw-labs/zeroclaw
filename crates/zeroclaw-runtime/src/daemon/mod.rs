@@ -1015,10 +1015,12 @@ pub async fn run_with_authority(
         } else {
             match zeroclaw_memory::create_memory_from_config(&config, None) {
                 Ok(mem) => Some(std::sync::Arc::from(mem)),
-                Err(_e) => {
+                Err(e) => {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                         "RPC memory subsystem unavailable"
                     );
                     None

@@ -18,6 +18,7 @@ pub mod consolidation;
 pub mod decay;
 pub mod dedup;
 pub mod embeddings;
+pub mod failed;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
@@ -56,6 +57,7 @@ pub use backend::{
 };
 #[allow(unused_imports)]
 pub use embeddings::EmbeddingIdentity;
+pub use failed::FailedMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -197,13 +199,15 @@ where
             audit_enabled,
         ),
         MemoryBackendKind::Unknown => {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"backend_name": backend_name, "unknown_context": unknown_context})), "Unknown memory backend '', falling back to markdown");
-            wrap_scanned_and_audit(
-                MarkdownMemory::new("markdown", workspace_dir),
-                policy,
-                workspace_dir,
-                audit_enabled,
-            )
+            let valid = selectable_memory_backends()
+                .iter()
+                .map(|profile| profile.key)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "unknown memory backend {backend_name:?}{unknown_context}; set memory.backend to \
+                 one of: {valid}"
+            );
         }
     }
 }
@@ -216,6 +220,25 @@ pub fn backend_kind_from_dotted(memory_backend: &str) -> String {
         .split_once('.')
         .map_or(memory_backend.trim(), |(kind, _)| kind)
         .to_ascii_lowercase()
+}
+
+/// Reject a non-empty `memory.backend` reference whose dotted kind is empty
+/// (`.default`, `.`, `..sqlite`): classification of the extracted kind would
+/// collapse it into the documented blank-disables path and silently disable
+/// persistence. Blank values and explicit `none` keep disabling memory.
+fn validate_memory_backend_reference(backend: &str) -> anyhow::Result<()> {
+    if !backend.trim().is_empty() && backend_kind_from_dotted(backend).is_empty() {
+        let valid = selectable_memory_backends()
+            .iter()
+            .map(|profile| profile.key)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "malformed memory backend reference {backend:?}: no backend name before '.'; \
+             set memory.backend to one of: {valid}"
+        );
+    }
+    Ok(())
 }
 
 /// Legacy auto-save key used for model-authored assistant summaries.
@@ -568,6 +591,7 @@ pub fn create_memory_with_storage_and_routes(
 ) -> anyhow::Result<Box<dyn Memory>> {
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
+    validate_memory_backend_reference(&config.backend)?;
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key, providers);
 
     // Best-effort memory hygiene/retention pass (throttled by state file).
@@ -641,6 +665,7 @@ pub fn create_memory_with_storage_and_routes(
         active_storage,
         workspace_dir,
         Some(&resolved_embedding),
+        "",
     )
 }
 
@@ -653,7 +678,9 @@ fn build_memory_with_storage(
     active_storage: ActiveStorage<'_>,
     workspace_dir: &Path,
     resolved_embedding: Option<&ResolvedEmbeddingConfig>,
+    unknown_context: &str,
 ) -> anyhow::Result<Box<dyn Memory>> {
+    validate_memory_backend_reference(&config.backend)?;
     let backend_name = backend_kind_from_dotted(&config.backend);
     let backend_kind = classify_memory_backend(&backend_name);
 
@@ -796,7 +823,7 @@ fn build_memory_with_storage(
                 resolved_embedding,
             )
         },
-        "",
+        unknown_context,
         &config.policy,
         config.audit_enabled,
     )
@@ -931,6 +958,9 @@ fn spawn_auto_reindex(mem: &SqliteMemory) {
 }
 
 pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Memory>> {
+    // Validate before the None-classification below: a malformed reference
+    // (`.default`) must be reported as malformed, not as a 'none' disable.
+    validate_memory_backend_reference(&config.memory.backend)?;
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         anyhow::bail!(
@@ -977,6 +1007,7 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
         config.resolve_active_storage(),
         &config.data_dir,
         qdrant_embedding.as_ref(),
+        " during migration",
     )
 }
 
@@ -2318,14 +2349,165 @@ url = "http://localhost:6333"
     }
 
     #[test]
-    fn factory_unknown_falls_back_to_markdown() {
+    fn factory_unknown_backend_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
             backend: "redis".into(),
             ..MemoryConfig::default()
         };
+        let msg = match create_memory(&cfg, tmp.path(), None) {
+            Ok(_) => panic!("an unrecognised backend must not silently select another store"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains("redis"),
+            "error must name the rejected backend: {msg}"
+        );
+        assert!(
+            selectable_memory_backends()
+                .iter()
+                .all(|p| p.key != "redis"),
+            "test is only meaningful while redis is not a selectable backend"
+        );
+        for profile in selectable_memory_backends() {
+            assert!(
+                msg.contains(profile.key),
+                "error must list every selectable backend, missing {:?}: {msg}",
+                profile.key
+            );
+        }
+    }
+
+    #[test]
+    fn factory_malformed_dotted_reference_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        for raw in [".default", ".", "..", ".sqlite"] {
+            let cfg = zeroclaw_config::schema::Config {
+                memory: MemoryConfig {
+                    backend: raw.into(),
+                    ..MemoryConfig::default()
+                },
+                data_dir: tmp.path().to_path_buf(),
+                ..zeroclaw_config::schema::Config::default()
+            };
+            let msg = match create_memory_from_config(&cfg, None) {
+                Ok(_) => panic!("malformed reference {raw:?} must not silently disable memory"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                msg.contains(raw) && msg.contains("malformed"),
+                "error must name the malformed reference {raw:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_factory_malformed_reference_names_the_value_not_none() {
+        // The migration path fails closed on `.default` via the None
+        // classification, but that error claims the value was 'none' —
+        // the malformed-reference validation must fire first.
+        let tmp = TempDir::new().unwrap();
+        let cfg = zeroclaw_config::schema::Config {
+            memory: MemoryConfig {
+                backend: ".default".into(),
+                ..MemoryConfig::default()
+            },
+            data_dir: tmp.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let msg = match create_memory_for_migration(&cfg) {
+            Ok(_) => panic!("malformed reference must not be reported as 'none'"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains(".default") && msg.contains("malformed"),
+            "error must name the malformed reference, not claim 'none': {msg}"
+        );
+    }
+
+    #[test]
+    fn factory_blank_and_none_backends_still_disable_memory() {
+        // Control for the malformed-reference fix: the documented blank
+        // disables path and the explicit "none" backend must keep working.
+        let tmp = TempDir::new().unwrap();
+        for raw in ["", "   ", "none"] {
+            let cfg = zeroclaw_config::schema::Config {
+                memory: MemoryConfig {
+                    backend: raw.into(),
+                    ..MemoryConfig::default()
+                },
+                data_dir: tmp.path().to_path_buf(),
+                ..zeroclaw_config::schema::Config::default()
+            };
+            let mem =
+                create_memory_from_config(&cfg, None).expect("blank/none must still construct");
+            assert_eq!(mem.name(), "none", "backend {raw:?} must disable memory");
+        }
+    }
+
+    #[test]
+    fn factory_markdown_remains_selectable() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "markdown");
+    }
+
+    #[test]
+    fn factory_empty_backend_is_disabled_memory_not_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: String::new(),
+            ..MemoryConfig::default()
+        };
+        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
+        assert_eq!(mem.name(), "none");
+    }
+
+    #[test]
+    fn factory_bare_qdrant_reports_its_own_storage_defect() {
+        // Quickstart offers Qdrant although it is deliberately outside
+        // `selectable_memory_backends()`; a bare `qdrant` value must report its missing
+        // storage entry rather than the unknown-backend hint, which names no Qdrant form.
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "qdrant".into(),
+            ..MemoryConfig::default()
+        };
+        let err = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("qdrant without storage config must not construct a store");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires a `[storage.qdrant."),
+            "must name the missing storage table: {msg}"
+        );
+        assert!(
+            !msg.contains("set memory.backend to one of"),
+            "the selectable-backend hint must not be attached to a deliberately \
+             non-selectable backend: {msg}"
+        );
+    }
+
+    #[test]
+    fn migration_factory_unknown_backend_names_its_context() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.memory.backend = "redis".into();
+        let msg = match create_memory_for_migration(&config) {
+            Ok(_) => panic!("migration must not import into a store the config did not name"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains("during migration"),
+            "error must carry the call-site context: {msg}"
+        );
     }
 
     #[test]

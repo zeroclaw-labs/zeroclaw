@@ -6204,6 +6204,69 @@ pub(crate) mod tests {
         );
     }
 
+    mod failed_memory_endpoint {
+        //! A failed-to-build backend must surface as an error on the write
+        //! endpoints, never as a no-op success that acknowledges unpersisted
+        //! data.
+
+        use super::*;
+        use zeroclaw_memory::FailedMemory;
+
+        fn state_with_failed_memory() -> AppState {
+            let mut state = test_state(zeroclaw_config::schema::Config::default());
+            state.mem = Arc::new(FailedMemory::new(
+                "sqilte",
+                &anyhow::Error::msg("unknown memory backend \"sqilte\""),
+            ));
+            state
+        }
+
+        async fn store_status_and_body(
+            state: AppState,
+        ) -> (axum::http::StatusCode, serde_json::Value) {
+            let response = handle_api_memory_store(
+                State(state),
+                HeaderMap::new(),
+                Json(MemoryStoreBody {
+                    key: "upgrade-check".into(),
+                    content: "must survive restart".into(),
+                    category: None,
+                    agent: None,
+                }),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let body = response_json(response).await;
+            (status, body)
+        }
+
+        #[tokio::test]
+        async fn store_returns_error_not_ok_when_backend_failed() {
+            let (status, body) = store_status_and_body(state_with_failed_memory()).await;
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                body["error"]
+                    .as_str()
+                    .map(|m| m.contains("sqilte") && m.contains("failed to construct"))
+                    .unwrap_or(false),
+                "error must name the failed backend: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn store_returns_ok_when_backend_is_healthy() {
+            // Control: healthy backends keep the 200-ok contract.
+            let (status, body) = store_status_and_body(test_state_with_memory(
+                zeroclaw_config::schema::Config::default(),
+                Vec::new(),
+            ))
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK);
+            assert_eq!(body["status"], "ok");
+        }
+    }
+
     #[cfg(feature = "a2a")]
     mod a2a_auth {
         use super::*;
