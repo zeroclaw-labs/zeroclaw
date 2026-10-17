@@ -178,6 +178,10 @@ impl BubblewrapSandbox {
             }
         }
         bwrap_cmd.args(invocation);
+        // Rebuilding the launcher must retain the caller's workspace.
+        if let Some(dir) = cmd.get_current_dir() {
+            bwrap_cmd.current_dir(dir);
+        }
 
         *cmd = bwrap_cmd;
         Ok(())
@@ -425,10 +429,15 @@ mod tests {
         let mut cmd = Command::new("ls");
         cmd.arg("-la");
         cmd.arg("/tmp");
+        cmd.current_dir("/tmp/eval-workspace");
         sandbox
             .wrap_command_with_support(&mut cmd, BubblewrapHardeningSupport::default())
             .unwrap();
 
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(Path::new("/tmp/eval-workspace"))
+        );
         let args = args(&cmd);
 
         assert!(
