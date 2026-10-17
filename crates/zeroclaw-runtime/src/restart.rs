@@ -225,6 +225,63 @@ pub fn respawn_if_requested() -> Option<u32> {
     }
 }
 
+/// Build-time marker `scripts/desktop/prepare-kernel.sh` sets when it builds
+/// the kernel a ZeroClaw Desktop package ships as its sidecar. A kernel built
+/// any other way (Homebrew, cargo, `install.sh`, the release archives, a
+/// workspace build) does not carry it.
+pub const DESKTOP_SIDECAR_BUILD_ENV: &str = "ZEROCLAW_DESKTOP_SIDECAR";
+
+/// Whether this kernel was built as a desktop package's sidecar.
+pub fn desktop_sidecar_build() -> bool {
+    option_env!("ZEROCLAW_DESKTOP_SIDECAR") == Some("1")
+}
+
+/// The ZeroClaw Desktop app executable, which every desktop package installs
+/// in the same directory as its kernel sidecar.
+const DESKTOP_APP_EXECUTABLE: &str = if cfg!(windows) {
+    "zeroclaw-desktop.exe"
+} else {
+    "zeroclaw-desktop"
+};
+
+/// Whether the kernel at `exe` still sits in its desktop package: the
+/// directory the kernel really lives in (symlinks to it resolved) holds the
+/// desktop app executable as a regular file. A symlink named like the app,
+/// such as a launcher in a shared `bin` directory, does not count.
+fn in_desktop_package_layout(exe: &std::path::Path) -> bool {
+    let Ok(kernel) = std::fs::canonicalize(exe) else {
+        return false;
+    };
+    kernel.parent().is_some_and(|dir| {
+        std::fs::symlink_metadata(dir.join(DESKTOP_APP_EXECUTABLE))
+            .is_ok_and(|entry| entry.file_type().is_file())
+    })
+}
+
+/// Whether a kernel at `exe`, built with or without the sidecar marker,
+/// belongs to a desktop package. Both are required: the marker proves the
+/// binary was built as a sidecar, and the layout proves it has not been
+/// copied out of its package.
+fn desktop_package_owns(exe: &std::path::Path, sidecar_build: bool) -> bool {
+    sidecar_build && in_desktop_package_layout(exe)
+}
+
+/// Whether the running kernel is a desktop package's sidecar. The desktop app
+/// installer owns such a kernel's upgrades: swapping it in place would leave
+/// the app and its kernel on different versions (and, on macOS, modify a
+/// signed bundle). A kernel installed separately keeps its own upgrade path
+/// even when the desktop app launches and supervises it. Cached: neither the
+/// build nor the executable's location changes for the process lifetime.
+pub fn desktop_bundled_kernel() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        recorded_launch_executable()
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_exe().ok())
+            .is_some_and(|exe| desktop_package_owns(&exe, desktop_sidecar_build()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +315,126 @@ mod tests {
         assert!(!respawn_requested());
         request_respawn();
         assert!(respawn_requested());
+    }
+
+    /// An install directory holding a kernel and, when `app` is set, the
+    /// desktop app executable beside it as a regular file.
+    fn install_dir(app: bool) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create install dir");
+        let kernel = dir.path().join(if cfg!(windows) {
+            "zeroclaw.exe"
+        } else {
+            "zeroclaw"
+        });
+        std::fs::write(&kernel, b"kernel").expect("write kernel");
+        if app {
+            std::fs::write(dir.path().join(DESKTOP_APP_EXECUTABLE), b"app")
+                .expect("write desktop app");
+        }
+        (dir, kernel)
+    }
+
+    #[test]
+    fn sidecar_beside_its_desktop_app_is_package_owned() {
+        let (_dir, kernel) = install_dir(true);
+        assert!(desktop_package_owns(&kernel, true));
+    }
+
+    #[test]
+    fn kernel_not_built_as_a_sidecar_is_never_package_owned() {
+        // A workspace build leaves `zeroclaw` and `zeroclaw-desktop` side by
+        // side too; without the marker that is not a package.
+        let (_dir, kernel) = install_dir(true);
+        assert!(!desktop_package_owns(&kernel, false));
+    }
+
+    #[test]
+    fn sidecar_copied_out_of_its_package_is_not_package_owned() {
+        let (_dir, kernel) = install_dir(false);
+        assert!(!desktop_package_owns(&kernel, true));
+    }
+
+    #[test]
+    fn desktop_app_name_must_be_a_regular_file() {
+        let (dir, kernel) = install_dir(false);
+        std::fs::create_dir(dir.path().join(DESKTOP_APP_EXECUTABLE))
+            .expect("create look-alike directory");
+        assert!(!desktop_package_owns(&kernel, true));
+    }
+
+    /// The independently installed PATH kernel sits in a shared prefix next
+    /// to a `zeroclaw-desktop` launcher symlink that points at a desktop app
+    /// installed elsewhere, and the desktop app supervises it. It is not
+    /// package-owned: not without the sidecar marker it lacks, and not even
+    /// with it, because a launcher symlink is not the packaged app.
+    #[cfg(unix)]
+    #[test]
+    fn path_kernel_beside_a_desktop_launcher_symlink_is_not_package_owned() {
+        let (app_bundle, _) = install_dir(true);
+        let app_executable = app_bundle.path().join(DESKTOP_APP_EXECUTABLE);
+        let (prefix_bin, path_kernel) = install_dir(false);
+        std::os::unix::fs::symlink(
+            &app_executable,
+            prefix_bin.path().join(DESKTOP_APP_EXECUTABLE),
+        )
+        .expect("add the launcher symlink");
+
+        assert!(!desktop_package_owns(&path_kernel, false));
+        assert!(!desktop_package_owns(&path_kernel, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_symlink_to_a_packaged_sidecar_is_package_owned() {
+        let (_bundle, sidecar) = install_dir(true);
+        let bin = tempfile::tempdir().expect("create bin dir");
+        let link = bin.path().join("zeroclaw");
+        std::os::unix::fs::symlink(&sidecar, &link).expect("link the sidecar onto PATH");
+        assert!(desktop_package_owns(&link, true));
+    }
+
+    #[test]
+    fn test_builds_are_not_desktop_sidecars() {
+        assert!(!desktop_sidecar_build());
+        assert!(!desktop_bundled_kernel());
+    }
+
+    #[test]
+    fn the_desktop_packaging_step_builds_sidecars_with_the_marker() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let prepare = std::fs::read_to_string(root.join("scripts/desktop/prepare-kernel.sh"))
+            .expect("desktop kernel preparation script should be readable");
+        let builds: Vec<&str> = prepare
+            .lines()
+            .filter(|line| line.contains("cargo build"))
+            .filter(|line| !line.trim_start().starts_with('#') && !line.contains("echo"))
+            .collect();
+        assert!(
+            !builds.is_empty(),
+            "prepare-kernel.sh must build the sidecar"
+        );
+        for build in builds {
+            assert!(
+                build.contains(&format!("{DESKTOP_SIDECAR_BUILD_ENV}=1 cargo build")),
+                "every sidecar build in prepare-kernel.sh must set {DESKTOP_SIDECAR_BUILD_ENV}=1: {build}"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_app_executable_matches_the_tauri_package() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(root.join("apps/tauri/Cargo.toml"))
+            .expect("desktop app manifest should be readable");
+        assert!(
+            manifest.contains("name = \"zeroclaw-desktop\""),
+            "desktop packages install the app as `zeroclaw-desktop`; update DESKTOP_APP_EXECUTABLE if the package is renamed"
+        );
+        let config = std::fs::read_to_string(root.join("apps/tauri/tauri.conf.json"))
+            .expect("desktop app config should be readable");
+        assert!(
+            !config.contains("mainBinaryName"),
+            "a Tauri `mainBinaryName` renames the installed app executable; update DESKTOP_APP_EXECUTABLE to match"
+        );
     }
 }

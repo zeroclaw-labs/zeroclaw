@@ -11,6 +11,7 @@ import {
 } from '@/lib/api';
 import {
   canAutoRestart,
+  upgradeBlockedMessageKey,
   type UpgradeRestartMode,
 } from './UpgradeDialog.logic';
 
@@ -29,6 +30,9 @@ export interface UpgradeDialogProps {
   checkUpdatesEnabled: boolean;
   /** `gateway.allow_self_upgrade` — gates the Upgrade button. */
   allowSelfUpgrade: boolean;
+  /** The kernel was installed by ZeroClaw Desktop; the desktop app's own
+   *  update upgrades it, so the Upgrade button is withheld. */
+  desktopBundled?: boolean;
   /** How a restart is achieved here; desktop/system supervisors and
    *  `self_respawn` can auto-restart, `manual` cannot. */
   restartMode?: UpgradeRestartMode;
@@ -75,6 +79,7 @@ export function UpgradeDialog({
   loading,
   checkUpdatesEnabled,
   allowSelfUpgrade,
+  desktopBundled = false,
   restartMode,
   restartHint,
   onRefetch,
@@ -101,6 +106,8 @@ export function UpgradeDialog({
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [, setRestartTick] = useState(0);
   const autoRestartAvailable = canAutoRestart(restartMode);
+  const upgradeBlockedKey = upgradeBlockedMessageKey(allowSelfUpgrade, desktopBundled);
+  const canUpgrade = upgradeBlockedKey === null;
   const [autoRestart, setAutoRestart] = useState(true);
   /** Version that was running when the upgrade started (or when we re-attached
    *  to an in-progress restart). Kept as both a ref (stable closure capture in
@@ -374,10 +381,10 @@ export function UpgradeDialog({
                     </div>
                   </div>
                 )}
-                {isNewer && !allowSelfUpgrade && (
-                  <div className="text-xs text-pc-text-muted">{t('upgrade.disabled')}</div>
+                {isNewer && upgradeBlockedKey !== null && (
+                  <div className="text-xs text-pc-text-muted">{t(upgradeBlockedKey)}</div>
                 )}
-                {isNewer && allowSelfUpgrade && autoRestartAvailable && view === 'info' && (
+                {isNewer && canUpgrade && autoRestartAvailable && view === 'info' && (
                   <div className="flex flex-col gap-1">
                     <label className="flex items-center gap-2 text-xs text-pc-text-muted">
                       <input
@@ -394,7 +401,7 @@ export function UpgradeDialog({
                     )}
                   </div>
                 )}
-                {isNewer && allowSelfUpgrade && !autoRestartAvailable && view === 'info' && (
+                {isNewer && canUpgrade && !autoRestartAvailable && view === 'info' && (
                   <div className="text-xs text-pc-text-muted">
                     {t('upgrade.manual_note')}
                     {restartHint && (
@@ -595,7 +602,7 @@ export function UpgradeDialog({
             </a>
           )}
 
-          {view === 'info' && isNewer && allowSelfUpgrade && (
+          {view === 'info' && isNewer && canUpgrade && (
             <Button variant="primary" onClick={() => setView('confirm')}>
               {t('upgrade.do_upgrade')}
             </Button>

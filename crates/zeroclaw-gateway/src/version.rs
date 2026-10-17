@@ -155,6 +155,31 @@ fn detect_restart_uncached() -> RestartInfo {
     }
 }
 
+// ── Desktop package ownership ────────────────────────────────────
+
+/// Whether the running kernel is a ZeroClaw Desktop package's sidecar, whose
+/// upgrades belong to the desktop app's installer. See
+/// [`zeroclaw_runtime::restart::desktop_bundled_kernel`].
+pub fn desktop_bundled() -> bool {
+    zeroclaw_runtime::restart::desktop_bundled_kernel()
+}
+
+const SELF_UPGRADE_DISABLED: &str =
+    "self-upgrade is disabled; set gateway.allow_self_upgrade = true to enable it";
+const SELF_UPGRADE_DESKTOP_BUNDLED: &str =
+    "this ZeroClaw was installed by ZeroClaw Desktop; update the desktop app to upgrade it";
+
+/// Why `POST /api/version/upgrade` must refuse to swap the binary, if it must.
+fn self_upgrade_refusal(allow_self_upgrade: bool, desktop_bundled: bool) -> Option<&'static str> {
+    if !allow_self_upgrade {
+        Some(SELF_UPGRADE_DISABLED)
+    } else if desktop_bundled {
+        Some(SELF_UPGRADE_DESKTOP_BUNDLED)
+    } else {
+        None
+    }
+}
+
 // ── Version check ────────────────────────────────────────────────
 
 /// Parsed output of `zeroclaw update --check --json`. Field names must match
@@ -412,11 +437,9 @@ pub async fn handle_version_upgrade(
         }
     };
 
-    if !state.config.read().gateway.allow_self_upgrade {
-        return json_error(
-            StatusCode::FORBIDDEN,
-            "self-upgrade is disabled; set gateway.allow_self_upgrade = true to enable it",
-        );
+    let allow_self_upgrade = state.config.read().gateway.allow_self_upgrade;
+    if let Some(refusal) = self_upgrade_refusal(allow_self_upgrade, desktop_bundled()) {
+        return json_error(StatusCode::FORBIDDEN, refusal);
     }
 
     let restart = detect_restart();
@@ -979,5 +1002,36 @@ mod tests {
             } => assert!(standalone_shutdown_tx.is_none()),
             _ => panic!("expected SelfRespawn"),
         }
+    }
+
+    #[test]
+    fn self_upgrade_refusal_keeps_the_config_gate_first() {
+        assert_eq!(
+            self_upgrade_refusal(false, false),
+            Some(SELF_UPGRADE_DISABLED)
+        );
+        assert_eq!(
+            self_upgrade_refusal(false, true),
+            Some(SELF_UPGRADE_DISABLED)
+        );
+    }
+
+    #[test]
+    fn self_upgrade_refusal_blocks_only_desktop_package_kernels() {
+        assert_eq!(
+            self_upgrade_refusal(true, true),
+            Some(SELF_UPGRADE_DESKTOP_BUNDLED)
+        );
+        // Enabled and not package-owned: the swap proceeds, whether or not a
+        // desktop supervisor restarts the process afterwards.
+        assert_eq!(self_upgrade_refusal(true, false), None);
+    }
+
+    #[test]
+    fn a_kernel_not_built_as_a_desktop_sidecar_keeps_its_self_upgrade() {
+        // This test binary is built like any separately installed kernel, so
+        // wherever it runs and whoever supervises it, it is not bundled.
+        assert!(!desktop_bundled());
+        assert_eq!(self_upgrade_refusal(true, desktop_bundled()), None);
     }
 }
