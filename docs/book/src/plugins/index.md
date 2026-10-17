@@ -167,6 +167,28 @@ still holds the name. `zeroclaw plugin install` never overwrites anything
 already at a package name: it refuses and names
 `zeroclaw plugin remove <name>` as the recovery.
 
+For a package the host has loaded, `plugin remove` deletes the directory the
+package was loaded from, which need not carry the package's name, for example
+after a manual move. It claims that directory in a hidden recovery transaction,
+checks that it still holds the manifest and component the host loaded, and
+deletes it through the claim. A directory that only sits at the package's name
+is not touched. A package replaced on disk since the host loaded it is put back
+and the remove is refused. Like recovery, this needs the atomic no-replace move
+described above, and refuses where the platform or filesystem cannot provide
+one.
+
+A remove that stops after claiming the directory but before deleting it, or
+that cannot put back a directory that changed since it was loaded (it reports
+the retained files), leaves what it claimed in a hidden recovery transaction
+that records only the package name. The next `plugin remove <name>` puts that
+back at `<plugins_dir>/<name>`, not in the directory it was loaded from, and
+refuses for as long as something else occupies `<name>`. To finish, move
+whatever is at `<name>` aside and run `zeroclaw plugin remove <name>` twice:
+the first run puts the package back at `<name>` and leaves it there, because
+the host did not load it from there, and the second run removes it. Then move
+the other directory back if you still need it. A delete that had already begun
+is finished by the next remove instead.
+
 For a name the host has not loaded, `plugin remove` claims the selected
 directory generation in a hidden recovery transaction and applies the same
 admission checks to those held contents. It deletes that generation in two
