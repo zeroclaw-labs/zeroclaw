@@ -156,6 +156,8 @@ impl TranscriptionError {
         }
     }
 
+    /// Build a classified error from an HTTP status (see
+    /// [`classify_transcription_http_status`]).
     fn from_status(status: reqwest::StatusCode, message: impl Into<String>) -> Self {
         #[cfg(not(any(feature = "channel-telegram", test)))]
         let _ = status;
@@ -165,6 +167,44 @@ impl TranscriptionError {
             message: message.into(),
         }
     }
+
+    /// Explicitly retryable error for steps that do NOT carry the raw audio
+    /// payload. A 413/415 on an AssemblyAI `create`/`poll` JSON request is a
+    /// metadata-level failure, not a payload rejection: classifying it as
+    /// permanent would acknowledge and drop the audio on a transient fault.
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            #[cfg(any(feature = "channel-telegram", test))]
+            kind: TranscriptionFailure::Transient,
+            message: message.into(),
+        }
+    }
+}
+
+/// Extract an operator-readable detail string from a failed transcription
+/// HTTP response WITHOUT assuming the body is JSON.
+///
+/// Upstream proxies, CDNs, and gateways answer 413/415 with plain-text or
+/// HTML error pages; attempting `resp.json()` first would fail with an
+/// untyped parse error and misclassify a permanent payload rejection as a
+/// retryable transient one. When the body happens to be JSON, pull the
+/// vendor error message out of it; otherwise keep the raw body text.
+async fn error_body_detail(resp: reqwest::Response) -> String {
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let trimmed = body.trim();
+    let message = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|value| {
+            value["err_msg"]
+                .as_str()
+                .or_else(|| value["error"].as_str())
+                .or_else(|| value["error"]["message"].as_str())
+                .map(str::to_string)
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| trimmed.to_string());
+    format!("{status}: {message}")
 }
 
 impl std::fmt::Display for TranscriptionError {
@@ -553,22 +593,18 @@ impl TranscriptionProvider for DeepgramProvider {
             .context("Failed to send transcription request to Deepgram")?;
 
         let status = resp.status();
+        if !status.is_success() {
+            return Err(TranscriptionError::from_status(
+                status,
+                format!("Deepgram API error ({})", error_body_detail(resp).await),
+            )
+            .into());
+        }
+
         let body: serde_json::Value = resp
             .json()
             .await
             .context("Failed to parse Deepgram response")?;
-
-        if !status.is_success() {
-            let error_msg = body["err_msg"]
-                .as_str()
-                .or_else(|| body["error"].as_str())
-                .unwrap_or("unknown error");
-            return Err(TranscriptionError::from_status(
-                status,
-                format!("Deepgram API error ({}): {}", status, error_msg),
-            )
-            .into());
-        }
 
         let text = body["results"]["channels"][0]["alternatives"][0]["transcript"]
             .as_str()
@@ -585,6 +621,10 @@ impl TranscriptionProvider for DeepgramProvider {
 pub struct AssemblyAiProvider {
     alias: String,
     api_key: String,
+    /// Base URL for the AssemblyAI v2 API. Production constructors pin the
+    /// public endpoint; the field exists so tests can point the provider at a
+    /// local mock server.
+    api_base: String,
 }
 
 impl AssemblyAiProvider {
@@ -603,6 +643,7 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            api_base: "https://api.assemblyai.com/v2".to_string(),
         })
     }
 
@@ -626,6 +667,7 @@ impl AssemblyAiProvider {
         Ok(Self {
             alias: alias.to_string(),
             api_key,
+            api_base: "https://api.assemblyai.com/v2".to_string(),
         })
     }
 }
@@ -644,7 +686,7 @@ impl TranscriptionProvider for AssemblyAiProvider {
 
         // Step 1: Upload the audio file.
         let upload_resp = client
-            .post("https://api.assemblyai.com/v2/upload")
+            .post(format!("{}/upload", self.api_base))
             .header("Authorization", &self.api_key)
             .header("Content-Type", "application/octet-stream")
             .body(audio_data.to_vec())
@@ -654,19 +696,21 @@ impl TranscriptionProvider for AssemblyAiProvider {
             .context("Failed to upload audio to AssemblyAI")?;
 
         let upload_status = upload_resp.status();
+        if !upload_status.is_success() {
+            return Err(TranscriptionError::from_status(
+                upload_status,
+                format!(
+                    "AssemblyAI upload error ({})",
+                    error_body_detail(upload_resp).await
+                ),
+            )
+            .into());
+        }
+
         let upload_body: serde_json::Value = upload_resp
             .json()
             .await
             .context("Failed to parse AssemblyAI upload response")?;
-
-        if !upload_status.is_success() {
-            let error_msg = upload_body["error"].as_str().unwrap_or("unknown error");
-            return Err(TranscriptionError::from_status(
-                upload_status,
-                format!("AssemblyAI upload error ({}): {}", upload_status, error_msg),
-            )
-            .into());
-        }
 
         let upload_url = upload_body["upload_url"]
             .as_str()
@@ -678,7 +722,7 @@ impl TranscriptionProvider for AssemblyAiProvider {
         });
 
         let create_resp = client
-            .post("https://api.assemblyai.com/v2/transcript")
+            .post(format!("{}/transcript", self.api_base))
             .header("Authorization", &self.api_key)
             .json(&transcript_req)
             .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
@@ -687,29 +731,27 @@ impl TranscriptionProvider for AssemblyAiProvider {
             .context("Failed to create AssemblyAI transcription")?;
 
         let create_status = create_resp.status();
+        if !create_status.is_success() {
+            // Step 2 exchanges JSON metadata (no raw audio bytes): a 413/415
+            // here is NOT a payload rejection and must stay retryable.
+            return Err(TranscriptionError::transient(format!(
+                "AssemblyAI transcription error ({})",
+                error_body_detail(create_resp).await
+            ))
+            .into());
+        }
+
         let create_body: serde_json::Value = create_resp
             .json()
             .await
             .context("Failed to parse AssemblyAI create response")?;
-
-        if !create_status.is_success() {
-            let error_msg = create_body["error"].as_str().unwrap_or("unknown error");
-            return Err(TranscriptionError::from_status(
-                create_status,
-                format!(
-                    "AssemblyAI transcription error ({}): {}",
-                    create_status, error_msg
-                ),
-            )
-            .into());
-        }
 
         let transcript_id = create_body["id"]
             .as_str()
             .context("AssemblyAI response missing 'id'")?;
 
         // Step 3: Poll for completion.
-        let poll_url = format!("https://api.assemblyai.com/v2/transcript/{transcript_id}");
+        let poll_url = format!("{}/transcript/{transcript_id}", self.api_base);
         let poll_interval = std::time::Duration::from_secs(3);
         let poll_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
 
@@ -725,19 +767,20 @@ impl TranscriptionProvider for AssemblyAiProvider {
                 .context("Failed to poll AssemblyAI transcription")?;
 
             let poll_status = poll_resp.status();
+            if !poll_status.is_success() {
+                // Same as the create step: JSON polling carries no audio
+                // payload, so even 413/415 stays a retryable failure.
+                return Err(TranscriptionError::transient(format!(
+                    "AssemblyAI poll error ({})",
+                    error_body_detail(poll_resp).await
+                ))
+                .into());
+            }
+
             let poll_body: serde_json::Value = poll_resp
                 .json()
                 .await
                 .context("Failed to parse AssemblyAI poll response")?;
-
-            if !poll_status.is_success() {
-                let error_msg = poll_body["error"].as_str().unwrap_or("unknown poll error");
-                return Err(TranscriptionError::from_status(
-                    poll_status,
-                    format!("AssemblyAI poll error ({}): {}", poll_status, error_msg),
-                )
-                .into());
-            }
 
             let status_str = poll_body["status"].as_str().unwrap_or("unknown");
 
@@ -770,6 +813,9 @@ pub struct GoogleSttProvider {
     alias: String,
     api_key: String,
     language_code: String,
+    /// Recognize endpoint. Production constructors pin the public endpoint;
+    /// the field exists so tests can point the provider at a local mock server.
+    endpoint: String,
 }
 
 impl GoogleSttProvider {
@@ -789,6 +835,7 @@ impl GoogleSttProvider {
             alias: alias.to_string(),
             api_key,
             language_code: config.language_code.clone(),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
         })
     }
 
@@ -818,6 +865,7 @@ impl GoogleSttProvider {
                 .clone()
                 .filter(|language| !language.trim().is_empty())
                 .unwrap_or_else(|| "en-US".to_string()),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
         })
     }
 
@@ -832,7 +880,7 @@ impl GoogleSttProvider {
     fn build_request(&self, request_body: &serde_json::Value) -> Result<reqwest::RequestBuilder> {
         Ok(
             zeroclaw_config::schema::build_runtime_proxy_client("transcription.google")
-                .post(GOOGLE_STT_ENDPOINT)
+                .post(&self.endpoint)
                 .header(GOOGLE_API_KEY_HEADER, self.sensitive_api_key_header()?)
                 .json(request_body)
                 .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS)),
@@ -901,19 +949,18 @@ impl TranscriptionProvider for GoogleSttProvider {
             .context("Failed to send transcription request to Google STT")?;
 
         let status = resp.status();
+        if !status.is_success() {
+            return Err(TranscriptionError::from_status(
+                status,
+                format!("Google STT API error ({})", error_body_detail(resp).await),
+            )
+            .into());
+        }
+
         let body: serde_json::Value = resp
             .json()
             .await
             .context("Failed to parse Google STT response")?;
-
-        if !status.is_success() {
-            let error_msg = body["error"]["message"].as_str().unwrap_or("unknown error");
-            return Err(TranscriptionError::from_status(
-                status,
-                format!("Google STT API error ({}): {}", status, error_msg),
-            )
-            .into());
-        }
 
         let text = body["results"][0]["alternatives"][0]["transcript"]
             .as_str()
@@ -2179,6 +2226,7 @@ mod tests {
             alias: "default".to_string(),
             api_key: "api-key-123".to_string(),
             language_code: "en-US".to_string(),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
         };
         let body = serde_json::json!({
             "config": { "languageCode": "en-US" },
@@ -2215,6 +2263,7 @@ mod tests {
             alias: "default".to_string(),
             api_key: api_key.to_string(),
             language_code: "en-US".to_string(),
+            endpoint: GOOGLE_STT_ENDPOINT.to_string(),
         };
 
         let err = match provider.build_request(&serde_json::json!({})) {
@@ -3245,5 +3294,142 @@ mod channel_builder_tests {
             .await
             .unwrap_err();
         assert_eq!(failure_kind(&err), TranscriptionFailure::Transient);
+    }
+
+    #[tokio::test]
+    async fn deepgram_non_json_413_is_classified_permanent() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A proxy/CDN in front of Deepgram answers 413 with an HTML page.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(413)
+                    .set_body_string("<html>413 Request Entity Too Large</html>"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // A native Deepgram JSON error body keeps the vendor message readable.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(413)
+                    .set_body_json(serde_json::json!({"err_msg": "payload too large"})),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = DeepgramProvider {
+            alias: "deepgram".to_string(),
+            api_url: server.uri(),
+            api_key: "test-key".to_string(),
+            model: "nova-2".to_string(),
+            language: None,
+        };
+
+        // Non-JSON 413: must NOT fall into the JSON-parse failure path (that
+        // untyped error would classify as Transient and retry the same bytes).
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Permanent);
+        assert!(err.to_string().contains("413"));
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Permanent);
+        assert!(err.to_string().contains("payload too large"));
+    }
+
+    #[tokio::test]
+    async fn assemblyai_upload_413_is_permanent_but_metadata_413_stays_transient() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Case 1: the upload step carries raw audio bytes - a 413 there IS a
+        // payload rejection and must classify permanent.
+        Mock::given(method("POST"))
+            .and(path("/v2/upload"))
+            .respond_with(
+                ResponseTemplate::new(413).set_body_string("nginx: 413 Request Entity Too Large"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Case 2: upload succeeds, then the JSON metadata request is answered
+        // with a non-JSON 413 - no audio bytes are involved, so this stays
+        // retryable instead of acknowledging and dropping the audio.
+        Mock::given(method("POST"))
+            .and(path("/v2/upload"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"upload_url": "https://cdn.example/voice.ogg"}),
+                ),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/transcript"))
+            .respond_with(ResponseTemplate::new(413).set_body_string("<html>413</html>"))
+            .mount(&server)
+            .await;
+
+        let provider = AssemblyAiProvider {
+            alias: "assemblyai".to_string(),
+            api_key: "test-key".to_string(),
+            api_base: format!("{}/v2", server.uri()),
+        };
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure_kind(&err),
+            TranscriptionFailure::Permanent,
+            "upload-step 413 rejects the payload itself"
+        );
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure_kind(&err),
+            TranscriptionFailure::Transient,
+            "metadata-step 413 carries no audio and must stay retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_stt_non_json_413_is_classified_permanent() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(413).set_body_string("request too large"))
+            .mount(&server)
+            .await;
+
+        let provider = GoogleSttProvider {
+            alias: "google".to_string(),
+            api_key: "test-key".to_string(),
+            language_code: "en-US".to_string(),
+            endpoint: server.uri(),
+        };
+
+        let err = provider
+            .transcribe(&[0u8; 16], "voice.ogg")
+            .await
+            .unwrap_err();
+        assert_eq!(failure_kind(&err), TranscriptionFailure::Permanent);
+        assert!(err.to_string().contains("413"));
     }
 }
