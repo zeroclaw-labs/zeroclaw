@@ -525,6 +525,18 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.inner.health_check().await
     }
 
+    async fn recall_for_supersession(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self
+            .inner
+            .recall_for_supersession(query, Self::read_fetch_limit(limit))
+            .await?;
+        self.filter_recalled_limited(entries, limit)
+    }
+
     async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
         self.inner.supersede(superseded_ids, new_id).await
     }

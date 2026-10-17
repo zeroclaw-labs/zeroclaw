@@ -556,6 +556,24 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Health check
     async fn health_check(&self) -> bool;
 
+    /// Recall candidates for automatic supersession using absolute cosine similarity.
+    ///
+    /// Each returned `score` must be the raw cosine of the query and stored
+    /// embeddings, never a normalized keyword, hybrid, reranked, or fallback
+    /// score. Missing vector evidence must yield no candidates. This does not
+    /// prove a contradiction; the caller still applies its conflict policy.
+    /// Implementations must retain their ordinary shared-read visibility rules.
+    /// Scoped wrappers must not delegate outside their scope.
+    ///
+    /// Default: no candidates, so backends without this evidence fail closed.
+    async fn recall_for_supersession(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+
     /// Mark entries as superseded by a newer row.
     ///
     /// Default: no-op. SQL backends can override this with reversible

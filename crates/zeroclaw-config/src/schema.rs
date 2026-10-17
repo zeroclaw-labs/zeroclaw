@@ -12841,9 +12841,12 @@ pub struct MemoryConfig {
 
     // ── Conflict Resolution ─────────────────────────────────────
     /// Cosine similarity threshold for conflict detection (0.0–1.0).
+    /// Automatic supersession requires raw vector evidence; keyword-only
+    /// recall leaves existing Core facts visible regardless of search rank.
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
     /// Enable reversible supersede soft-hide machinery when wired.
+    /// Disabling this does not restore previously superseded rows.
     #[serde(default = "default_conflict_supersede_enabled")]
     pub conflict_supersede_enabled: bool,
     /// Enable write-time near-duplicate detection.
