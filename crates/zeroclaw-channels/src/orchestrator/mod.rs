@@ -129,8 +129,8 @@ use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
-    scope_session_key, scope_thread_id, scrub_credentials,
+    build_tool_instructions_for_names, is_model_switch_requested, is_thinking_status_text,
+    run_tool_call_loop, scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::agent::system_prompt::build_skills_prompt_with_effective_tools;
 use zeroclaw_runtime::approval::ApprovalManager;
@@ -6130,6 +6130,38 @@ pub(crate) fn remap_confirmed_offset(confirmed_prefix: &str, frame: &str) -> usi
         .map_or(0, |i| i + 2)
 }
 
+/// Edit a streaming draft with the current answer plus the model's reasoning.
+///
+/// A failed edit is logged, never propagated: the draft is best-effort chrome
+/// and the final reply is delivered by `finalize_draft` regardless.
+///
+/// The reasoning is scanned with the configured outbound detector here, on the
+/// joined buffer rather than per delta: a credential split across deltas
+/// matches nothing on its own and only reconstructs once concatenated, so the
+/// complete text must cross the detector before it is rendered.
+async fn edit_draft_with_reasoning(
+    channel: &Arc<dyn Channel>,
+    reply_target: &str,
+    draft_id: &str,
+    answer: &str,
+    reasoning: &str,
+    leak_detection: &zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
+) {
+    let reasoning = redact_channel_outbound_leaks(reasoning, leak_detection, content_format);
+    if let Err(e) = channel
+        .update_draft_with_reasoning(reply_target, draft_id, answer, &reasoning)
+        .await
+    {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "Draft update failed"
+        );
+    }
+}
+
 /// Pump draft deltas to the channel transport, sanitizing every partial on the
 /// way out.
 ///
@@ -6170,6 +6202,7 @@ async fn run_draft_updater(
         turn_flush_narration,
         outbound_hooks,
         outbound_channel,
+        zeroclaw_config::schema::StreamReasoningMode::Off,
         rx,
     )
     .await;
@@ -6189,6 +6222,7 @@ async fn run_draft_updater_with_leak_detection(
     turn_flush_narration: bool,
     outbound_hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     outbound_channel: String,
+    reasoning_mode: zeroclaw_config::schema::StreamReasoningMode,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
@@ -6202,6 +6236,9 @@ async fn run_draft_updater_with_leak_detection(
     // the raw accumulation) so a later turn cannot re-guard or rewrite an earlier
     // one.
     let mut owned_guarded = String::new();
+    // Model reasoning surfaced in the draft when the channel opted in. It is
+    // display-only and never enters the finalized reply.
+    let mut reasoning_buf = String::new();
     while let Some(event) = rx.recv().await {
         match event {
             // A lifecycle event is a typed signal, not assistant text, so it
@@ -6218,6 +6255,31 @@ async fn run_draft_updater_with_leak_detection(
                         "Draft lifecycle update failed"
                     );
                 }
+            }
+            // Reasoning-derived liveness tick. When the channel opted into
+            // reasoning it is rendered in the draft's reasoning slot instead of
+            // the generic legacy tool-status path.
+            StreamDelta::Status(text)
+                if reasoning_mode != zeroclaw_config::schema::StreamReasoningMode::Off
+                    && is_thinking_status_text(&text) =>
+            {
+                reasoning_buf.clear();
+                reasoning_buf.push_str(&text);
+                let visible = redact_channel_outbound_leaks(
+                    &sanitize_streaming_draft_text(&accumulated, &known_tool_names),
+                    &leak_detection,
+                    content_format,
+                );
+                edit_draft_with_reasoning(
+                    &channel,
+                    &reply_target,
+                    &draft_id,
+                    &visible,
+                    &reasoning_buf,
+                    &leak_detection,
+                    content_format,
+                )
+                .await;
             }
             StreamDelta::Status(text) => {
                 // Publish the completed narration turn through outbound policy
@@ -6278,10 +6340,33 @@ async fn run_draft_updater_with_leak_detection(
                     }
                 }
             }
-            // Provider reasoning is opt-in at each channel surface. The
-            // generic draft path has no such presentation policy, so it must
-            // not disclose it merely because the runtime now carries it.
-            StreamDelta::Reasoning(_) => {}
+            // Provider reasoning is opt-in at each channel surface. When the
+            // channel resolved a non-`off` mode the runtime only emits these
+            // deltas for it, and the channel renders them via
+            // `update_draft_with_reasoning`; the default implementation drops
+            // them and re-edits the plain answer.
+            StreamDelta::Reasoning(text) => {
+                if reasoning_mode != zeroclaw_config::schema::StreamReasoningMode::Off {
+                    reasoning_buf.push_str(&scrub_credentials(&zeroclaw_runtime::security::scrub(
+                        &text,
+                    )));
+                    let visible = redact_channel_outbound_leaks(
+                        &sanitize_streaming_draft_text(&accumulated, &known_tool_names),
+                        &leak_detection,
+                        content_format,
+                    );
+                    edit_draft_with_reasoning(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        &visible,
+                        &reasoning_buf,
+                        &leak_detection,
+                        content_format,
+                    )
+                    .await;
+                }
+            }
             StreamDelta::Text(text) => {
                 accumulated.push_str(&text);
                 let visible = redact_channel_outbound_leaks(
@@ -6293,7 +6378,20 @@ async fn run_draft_updater_with_leak_detection(
                 // retaining the raw accumulation here could reintroduce a
                 // protocol payload during finalization.
                 *streamed_text.lock().unwrap_or_else(|e| e.into_inner()) = visible.clone();
-                if let Err(e) = channel
+                if reasoning_mode != zeroclaw_config::schema::StreamReasoningMode::Off
+                    && !reasoning_buf.is_empty()
+                {
+                    edit_draft_with_reasoning(
+                        &channel,
+                        &reply_target,
+                        &draft_id,
+                        &visible,
+                        &reasoning_buf,
+                        &leak_detection,
+                        content_format,
+                    )
+                    .await;
+                } else if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &visible)
                     .await
                 {
@@ -8075,6 +8173,48 @@ fn matrix_single_message_streaming_enabled(
     matrix_single_message_streaming_enabled_for_config(ctx.prompt_config.as_ref(), msg)
 }
 
+/// Effective reasoning visibility for a message's channel.
+///
+/// Matrix keeps its historical `single_message` gate, which the caller applies.
+/// Telegram and Slack opt in through their per-alias `stream_reasoning` field,
+/// which is only effective while that alias actually streams an editable draft
+/// (`stream_mode = "partial"` / `stream_drafts = true`); with any other mode the
+/// setting is inert. Every other channel is `Off`.
+fn stream_reasoning_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_config::schema::StreamReasoningMode {
+    use zeroclaw_config::schema::{StreamMode, StreamReasoningMode};
+    let Some(alias) = msg.channel_alias.as_deref() else {
+        return StreamReasoningMode::Off;
+    };
+    match msg.channel.as_str() {
+        "telegram" => config
+            .channels
+            .telegram
+            .get(alias)
+            .map_or(StreamReasoningMode::Off, |cfg| {
+                if cfg.stream_mode == StreamMode::Partial {
+                    cfg.stream_reasoning
+                } else {
+                    StreamReasoningMode::Off
+                }
+            }),
+        "slack" => config
+            .channels
+            .slack
+            .get(alias)
+            .map_or(StreamReasoningMode::Off, |cfg| {
+                if cfg.stream_drafts {
+                    cfg.stream_reasoning
+                } else {
+                    StreamReasoningMode::Off
+                }
+            }),
+        _ => StreamReasoningMode::Off,
+    }
+}
+
 fn matrix_stream_reasoning_for_config(
     config: &zeroclaw_config::schema::Config,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -9601,6 +9741,11 @@ async fn process_channel_message_body(
 
     let matrix_single_message_streaming =
         matrix_single_message_streaming_enabled(ctx.as_ref(), &msg);
+    // Resolve reasoning visibility from the canonical live config, not the
+    // startup snapshot, so a published change reaches the next message without
+    // rebuilding the channels. The channels resolve it live as well; this read
+    // only decides whether the runtime emits reasoning deltas for the turn.
+    let stream_reasoning = stream_reasoning_for_config(&ctx.live_config.read(), &msg);
     let mut matrix_single_message_typing_scope = if matrix_single_message_streaming {
         target_channel.as_ref().map(|channel| {
             start_matrix_single_message_typing_scope(Arc::clone(channel), msg.reply_target.clone())
@@ -9989,6 +10134,7 @@ async fn process_channel_message_body(
                         turn_flush_narration,
                         outbound_hooks,
                         outbound_channel,
+                        stream_reasoning,
                         rx,
                     )
                     .await;
@@ -10146,6 +10292,11 @@ async fn process_channel_message_body(
     let mut loop_knobs = LoopKnobs::default();
     if matrix_single_message_streaming {
         loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
+    } else if stream_reasoning != zeroclaw_config::schema::StreamReasoningMode::Off {
+        // `full` needs the runtime to emit raw reasoning deltas; `status`
+        // already rides the default liveness tick, and `off` is enforced by
+        // the channel's own render gate.
+        loop_knobs.draft_reasoning = stream_reasoning;
     }
     let turn_id = uuid::Uuid::new_v4().to_string();
     // Bracket the channel turn so lifecycle events
@@ -12819,6 +12970,24 @@ fn slack_thread_context_max_messages_resolver(
     })
 }
 
+#[cfg(feature = "channel-slack")]
+fn slack_stream_reasoning_resolver(
+    config_arc: &zeroclaw_config::live::LiveConfigHandle,
+    alias: &str,
+) -> Arc<dyn Fn() -> zeroclaw_config::schema::StreamReasoningMode + Send + Sync> {
+    let cfg_arc = config_arc.clone();
+    let alias = alias.to_string();
+    Arc::new(move || {
+        cfg_arc
+            .read()
+            .channels
+            .slack
+            .get(&alias)
+            .map(|sl| sl.stream_reasoning)
+            .unwrap_or(zeroclaw_config::schema::StreamReasoningMode::Off)
+    })
+}
+
 /// Returned by [`build_channel_by_id`] when no arm claims `channel_id`.
 ///
 /// One-off callers match on this sentinel instead of the error text so the
@@ -12992,6 +13161,7 @@ fn build_channel_by_id(
                     resolved_transcription_manager(&config, &format!("slack.{alias}")),
                 )
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
+                .with_stream_reasoning_resolver(slack_stream_reasoning_resolver(config_arc, &alias))
                 .with_cancel_reaction(sl.cancel_reaction.clone())
                 .with_approval_timeout_secs(sl.approval_timeout_secs),
             ))
@@ -14615,6 +14785,9 @@ fn collect_configured_channels_with_authority(
                         resolved_transcription_manager(&config, &format!("slack.{alias}")),
                     )
                     .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
+                    .with_stream_reasoning_resolver(slack_stream_reasoning_resolver(
+                        config_arc, alias,
+                    ))
                     .with_cancel_reaction(sl.cancel_reaction.clone())
                     .with_approval_timeout_secs(sl.approval_timeout_secs),
                 ),
@@ -19977,6 +20150,74 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stream_reasoning_resolves_per_channel_and_respects_the_streaming_gate() {
+        use zeroclaw_config::schema::{
+            SlackConfig, StreamMode, StreamReasoningMode, TelegramConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        let mut telegram = TelegramConfig {
+            stream_mode: StreamMode::Partial,
+            stream_reasoning: StreamReasoningMode::Full,
+            ..Default::default()
+        };
+        config
+            .channels
+            .telegram
+            .insert("streaming".to_string(), telegram.clone());
+        telegram.stream_mode = StreamMode::Off;
+        config
+            .channels
+            .telegram
+            .insert("silent".to_string(), telegram);
+
+        let mut slack = SlackConfig {
+            stream_drafts: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            ..Default::default()
+        };
+        config
+            .channels
+            .slack
+            .insert("streaming".to_string(), slack.clone());
+        slack.stream_drafts = false;
+        config.channels.slack.insert("silent".to_string(), slack);
+
+        let msg = |channel: &str, alias: &str| zeroclaw_api::channel::ChannelMessage {
+            channel: channel.to_string(),
+            channel_alias: Some(alias.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            stream_reasoning_for_config(&config, &msg("telegram", "streaming")),
+            StreamReasoningMode::Full
+        );
+        // Without an editable draft the setting is inert.
+        assert_eq!(
+            stream_reasoning_for_config(&config, &msg("telegram", "silent")),
+            StreamReasoningMode::Off
+        );
+        assert_eq!(
+            stream_reasoning_for_config(&config, &msg("slack", "streaming")),
+            StreamReasoningMode::Status
+        );
+        assert_eq!(
+            stream_reasoning_for_config(&config, &msg("slack", "silent")),
+            StreamReasoningMode::Off
+        );
+        // Matrix keeps its own `single_message` gate, applied by the caller.
+        assert_eq!(
+            stream_reasoning_for_config(&config, &msg("matrix", "single")),
+            StreamReasoningMode::Off
+        );
+        assert_eq!(
+            stream_reasoning_for_config(&config, &msg("discord", "default")),
+            StreamReasoningMode::Off
+        );
+    }
+
+    #[test]
     fn matrix_single_message_streaming_resolves_from_matrix_alias_only() {
         let mut config = zeroclaw_config::schema::Config::default();
         config.channels.matrix.insert(
@@ -24623,6 +24864,9 @@ api_key = "anthropic-key"
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
         draft_updates: tokio::sync::Mutex<Vec<String>>,
+        /// `(answer, reasoning)` pairs handed to
+        /// `update_draft_with_reasoning`, in order.
+        reasoning_updates: tokio::sync::Mutex<Vec<(String, String)>>,
         /// When set, `update_draft`/`finalize_draft` faithfully model the real
         /// Discord/Matrix MultiMessage confirmed-prefix bookkeeping: each
         /// `\n\n`-bounded paragraph is emitted as its own message, a frame that
@@ -24675,6 +24919,7 @@ api_key = "anthropic-key"
                 stall_start_typing: false,
                 stall_stop_typing: false,
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
+                reasoning_updates: tokio::sync::Mutex::new(Vec::new()),
                 cumulative_offset: false,
                 multi_confirmed_prefix: std::sync::Mutex::new(String::new()),
                 emitted_paragraphs: tokio::sync::Mutex::new(Vec::new()),
@@ -25166,6 +25411,21 @@ api_key = "anthropic-key"
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .len()
+        }
+
+        async fn update_draft_with_reasoning(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            answer: &str,
+            reasoning: &str,
+        ) -> anyhow::Result<()> {
+            self.reasoning_updates
+                .lock()
+                .await
+                .push((answer.to_string(), reasoning.to_string()));
+            self.draft_updates.lock().await.push(answer.to_string());
+            Ok(())
         }
 
         async fn update_draft(
@@ -51134,6 +51394,35 @@ This is an example JSON object for profile settings."#;
         assert_eq!(resolver(), 8);
     }
 
+    #[cfg(feature = "channel-slack")]
+    #[test]
+    fn slack_stream_reasoning_resolver_tracks_live_alias_config() {
+        use zeroclaw_config::schema::StreamReasoningMode;
+
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SlackConfig {
+                stream_reasoning: StreamReasoningMode::Status,
+                ..Default::default()
+            },
+        );
+        let live = zeroclaw_config::live::LiveConfig::new(config);
+        let resolver = slack_stream_reasoning_resolver(&live.handle(), "default");
+
+        assert_eq!(resolver(), StreamReasoningMode::Status);
+        let mut updated = live.snapshot();
+        updated
+            .channels
+            .slack
+            .get_mut("default")
+            .unwrap()
+            .stream_reasoning = StreamReasoningMode::Full;
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
+        assert_eq!(resolver(), StreamReasoningMode::Full);
+    }
+
     // ── Query classification in channel message processing ─────────
 
     #[tokio::test]
@@ -51832,6 +52121,7 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Off,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
@@ -51864,6 +52154,7 @@ This is an example JSON object for profile settings."#;
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
+                stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Off,
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
@@ -54130,6 +54421,7 @@ Done."#;
             false,
             None,
             String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Off,
             rx,
         )
         .await;
@@ -54210,6 +54502,7 @@ Done."#;
             false,
             None,
             String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Off,
             rx,
         )
         .await;
@@ -54300,6 +54593,7 @@ Done."#;
             false,
             None,
             String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Off,
             rx,
         )
         .await;
@@ -54371,6 +54665,7 @@ Done."#;
             false,
             None,
             String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Off,
             rx,
         )
         .await;
@@ -54442,6 +54737,7 @@ Done."#;
                 false,
                 None,
                 String::new(),
+                zeroclaw_config::schema::StreamReasoningMode::Off,
                 rx,
             )
             .await;
@@ -54554,6 +54850,7 @@ Done."#;
                 false,
                 None,
                 String::new(),
+                zeroclaw_config::schema::StreamReasoningMode::Off,
                 rx,
             )
             .await;
@@ -54670,6 +54967,7 @@ Done."#;
             false,
             None,
             String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Off,
             rx,
         )
         .await;
@@ -54821,6 +55119,7 @@ Done."#;
             false,
             None,
             String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Off,
             rx,
         )
         .await;
@@ -54908,6 +55207,7 @@ Done."#;
             false,
             None,
             String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Off,
             rx,
         )
         .await;
@@ -55003,6 +55303,159 @@ Done."#;
             channel_impl.progress_messages.lock().await.as_slice(),
             ["⏳ shell: pwd".to_string(), "✅ shell (2s)".to_string()],
             "ordinary draft channels preserve the established structured-tool presentation"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_renders_reasoning_only_when_the_channel_opted_in() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(StreamDelta::Text("partial answer".to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Reasoning("step one".to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Reasoning(" step two".to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::new(Mutex::new(String::new())),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Full,
+            rx,
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.reasoning_updates.lock().await.as_slice(),
+            [
+                ("partial answer".to_string(), "step one".to_string()),
+                (
+                    "partial answer".to_string(),
+                    "step one step two".to_string()
+                ),
+            ],
+            "reasoning accumulates in the draft without rewriting the answer"
+        );
+        // The frame the answer is finalized from never carries reasoning.
+        assert!(
+            channel_impl
+                .draft_updates
+                .lock()
+                .await
+                .iter()
+                .all(|frame| !frame.contains("step one")),
+            "reasoning must never enter the answer frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_keeps_reasoning_private_without_an_opt_in() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(StreamDelta::Text("partial answer".to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Reasoning("private".to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::new(Mutex::new(String::new())),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Off,
+            rx,
+        )
+        .await;
+
+        assert!(
+            channel_impl.reasoning_updates.lock().await.is_empty(),
+            "reasoning stays private until the channel opts in"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_redacts_a_secret_split_across_reasoning_deltas() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(StreamDelta::Text("partial answer".to_string()))
+            .await
+            .unwrap();
+        // An AWS key split so that no single delta matches the detector: each
+        // fragment passes the per-delta scrub and only the joined buffer
+        // reconstructs `AKIA` + 16 characters.
+        tx.send(StreamDelta::Reasoning("AKIA".to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Reasoning("12345678".to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Reasoning("90123456".to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        run_draft_updater_with_leak_detection(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::new(Mutex::new(String::new())),
+            zeroclaw_config::schema::LeakDetectionConfig::default(),
+            OutboundContentFormat::Markdown,
+            false,
+            None,
+            String::new(),
+            zeroclaw_config::schema::StreamReasoningMode::Full,
+            rx,
+        )
+        .await;
+
+        let updates = channel_impl.reasoning_updates.lock().await.clone();
+        assert!(
+            !updates.is_empty(),
+            "reasoning edits must reach the channel"
+        );
+        assert!(
+            updates
+                .iter()
+                .all(|(_, reasoning)| !reasoning.contains("AKIA1234567890123456")),
+            "a credential split across reasoning deltas must not reach the draft intact: {updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|(_, reasoning)| reasoning.contains("[REDACTED_AWS_CREDENTIAL]")),
+            "the joined reasoning buffer must be scanned by the outbound detector: {updates:?}"
         );
     }
 
