@@ -24,6 +24,12 @@ Keybindings use canonical modifier names: `control` is literal Control, `primary
   from the backend registry, so the options you see are exactly the ones this
   build supports.
 
+## Field labels and full details
+
+Config field rows use readable labels and keep long values to a one-line preview. Open Help while a field is selected to read its exact configuration path, complete description, and current value. The help view scrolls, including long array values and paths. Filtering continues to match the configuration path.
+
+An unset field is shown as `<unset>`, secret values remain hidden, and environment overrides are marked. Unit and default explanations come from the field description. A current value does not establish whether you explicitly configured it or inherited a default.
+
 ## Saved and applied changes
 
 After a daemon Config edit succeeds, the application summary keeps the saved property and its revision separate from the running targets' outcomes. Press `s` outside an editor or search field to open application status. Use Up/Down or Page Up/Page Down to scroll and Escape to return. The configured `application_status` action can replace the default shortcut.
