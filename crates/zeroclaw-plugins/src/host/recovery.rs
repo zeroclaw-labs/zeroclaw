@@ -54,6 +54,26 @@ fn identity(dir: &Dir) -> std::io::Result<same_file::Handle> {
     same_file::Handle::from_file(dir.try_clone()?.into_std_file())
 }
 
+/// On Unix, create the file readable and writable by its owner only. Any
+/// account that can open the package lock or a lease can hold it, and the
+/// plugins directory is one account's state. Other platforms keep their
+/// default.
+fn owner_only(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    cap_std::fs::OpenOptionsExt::mode(options, 0o600);
+    options
+}
+
+/// Opening the package lock failed. Names the lock file, such as one another
+/// account created that this one cannot open, and keeps the original error as
+/// its source, so its kind and OS error survive.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot open the package lock {}: {source}", path.display())]
+struct LockOpenError {
+    path: PathBuf,
+    source: std::io::Error,
+}
+
 impl Root {
     pub fn open(path: &Path) -> Result<Self, PluginError> {
         #[cfg(windows)]
@@ -107,9 +127,13 @@ impl Root {
     fn lock_within(&self, wait: std::time::Duration) -> Result<Guard<'_>, PluginError> {
         self.check()?;
         if self.lock.get().is_none() {
+            let named = |source: std::io::Error| {
+                let path = self.path.join(LOCK);
+                std::io::Error::new(source.kind(), LockOpenError { path, source })
+            };
             let lock = match self.dir.open_with(
                 LOCK,
-                OpenOptions::new().read(true).write(true).create_new(true),
+                owner_only(OpenOptions::new().read(true).write(true).create_new(true)),
             ) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -134,12 +158,14 @@ impl Root {
                                     | std::io::ErrorKind::ReadOnlyFilesystem
                             ) =>
                         {
-                            self.dir.open_with(LOCK, OpenOptions::new().read(true))?
+                            self.dir
+                                .open_with(LOCK, OpenOptions::new().read(true))
+                                .map_err(named)?
                         }
-                        Err(error) => return Err(error.into()),
+                        Err(error) => return Err(named(error).into()),
                     }
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(named(error).into()),
             }
             .into_std();
             // Concurrent initialization retains the winner's handle; never a
@@ -215,7 +241,7 @@ impl Root {
         let lease = dir
             .open_with(
                 LEASE,
-                OpenOptions::new().read(true).write(true).create_new(true),
+                owner_only(OpenOptions::new().read(true).write(true).create_new(true)),
             )?
             .into_std();
         lease.lock()?;
@@ -614,6 +640,126 @@ mod lock_descriptor_tests {
         let _guard = root.lock().unwrap();
         let flags = rustix::fs::fcntl_getfl(root.lock.get().unwrap()).unwrap();
         assert!(flags.contains(rustix::fs::OFlags::RDWR), "{flags:?}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod owner_only_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Runs only as the child of the test below, under the umask it sets:
+    /// creates the package lock and a transaction lease, then reopens both
+    /// through a second root.
+    #[test]
+    #[ignore = "subprocess helper for package_lock_and_lease_are_created_owner_only"]
+    fn create_lock_and_lease_child() {
+        let Ok(path) = std::env::var("ZC_OWNER_ONLY_ROOT") else {
+            return;
+        };
+        let root = Root::open(Path::new(&path)).unwrap();
+        drop(root.lock().unwrap());
+        let entry = root.transaction("modes", "installing").unwrap().entry;
+        let again = Root::open(Path::new(&path)).unwrap();
+        drop(again.lock().unwrap());
+        drop(again.reopen_transaction(entry).unwrap().unwrap());
+    }
+
+    /// Any account that can open the package lock or a lease can hold it, so
+    /// both are created owner-only whatever the umask, and reopening them
+    /// leaves that mode. The umask is process wide, so each one is set in a
+    /// child rather than in this test runner.
+    #[test]
+    fn package_lock_and_lease_are_created_owner_only() {
+        let mode = |path: &Path| {
+            format!(
+                "{:03o}",
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+            )
+        };
+        let mut modes = Vec::new();
+        for umask in ["002", "022"] {
+            let temp = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new("sh")
+                .args(["-c", &format!("umask {umask} && exec \"$0\" \"$@\"")])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host::recovery::owner_only_tests::create_lock_and_lease_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("ZC_OWNER_ONLY_ROOT", temp.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "umask {umask}: the child must run: {output:?}"
+            );
+            let entry = std::fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.join(LEASE).is_file())
+                .unwrap();
+            // The transaction directory takes the umask, which shows the child
+            // ran under it.
+            modes.push([
+                umask.to_string(),
+                mode(&entry),
+                mode(&temp.path().join(LOCK)),
+                mode(&entry.join(LEASE)),
+            ]);
+        }
+        assert_eq!(
+            modes,
+            [["002", "775", "600", "600"], ["022", "755", "600", "600"]],
+            "[umask, transaction directory, lock, lease]"
+        );
+    }
+
+    /// A lock this account cannot open, as when another account created it
+    /// owner-only, fails at once and names the lock file. The original error
+    /// stays its source, so its kind and OS error survive. Creating the lock
+    /// where this account cannot write names it too.
+    #[test]
+    fn a_lock_this_account_cannot_open_fails_at_once_and_is_named() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(Root::open(temp.path()).unwrap().lock().unwrap());
+        let lock = temp.path().join(LOCK);
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The superuser opens it regardless, so there is nothing to check.
+        let denied = match std::fs::File::open(&lock) {
+            Ok(_) => return,
+            Err(error) => error,
+        };
+        let root = Root::open(temp.path()).unwrap();
+        let started = std::time::Instant::now();
+        let Err(error) = root.lock().map(drop) else {
+            panic!("a lock this account cannot open was taken");
+        };
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let message = error.to_string();
+        assert!(message.contains(&lock.display().to_string()), "{message}");
+        let PluginError::Io(io) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+        let source = std::error::Error::source(io)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("the original error is the source");
+        assert_eq!(source.raw_os_error(), denied.raw_os_error());
+
+        let unwritable = tempfile::tempdir().unwrap();
+        let path = unwritable.path();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = Root::open(path).unwrap().lock().map(drop);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let message = error
+            .expect_err("created a lock where this account cannot write")
+            .to_string();
+        let lock = path.join(LOCK);
+        assert!(message.contains(&lock.display().to_string()), "{message}");
     }
 }
 
