@@ -82,7 +82,7 @@ jobs:
 
       - name: Upload Trivy SARIF artifact
         if: always() && hashFiles('trivy-results.sarif') != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: trivy-results-${{ matrix.stem }}
           path: trivy-results.sarif
@@ -91,7 +91,7 @@ jobs:
 
       - name: Upload Trivy SARIF to GitHub Security tab
         if: always() && hashFiles('trivy-results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
         with:
           sarif_file: trivy-results.sarif
           category: trivy-${{ matrix.stem }}
