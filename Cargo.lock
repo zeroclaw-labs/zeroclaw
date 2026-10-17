@@ -14275,7 +14275,7 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "webpki-roots 1.0.9",
- "windows 0.61.3",
+ "windows",
  "winx",
  "zeroclaw-api",
  "zeroclaw-config",

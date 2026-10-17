@@ -190,8 +190,10 @@ async fn connect_client(path: &std::path::Path) -> std::io::Result<tokio::net::U
     tokio::net::UnixStream::connect(path).await
 }
 
+/// Open the client end of the named pipe at `path`, waiting out a server
+/// that is between instances. A pipe nobody serves fails with `NotFound`.
 #[cfg(windows)]
-async fn connect_client(
+pub async fn connect_client(
     path: &std::path::Path,
 ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     use tokio::net::windows::named_pipe::ClientOptions;
