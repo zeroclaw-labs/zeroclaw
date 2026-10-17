@@ -81,11 +81,10 @@ OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
 on their terminal response event, and Anthropic streams finish on
 `message_stop`. Servers may keep the HTTP connection open after those events.
 
-Streaming clients use byte-idle timeouts: 300 seconds for OpenAI Responses and
-OpenAI-compatible providers, and 90 seconds for Anthropic. On OpenAI Responses
-and OpenAI-compatible providers, setting `timeout_secs` above 300 on the
-provider raises the idle bound to match; the bound is never lowered below the
-default. Each received body read resets the relevant timeout, so active
+Streaming clients use a byte-idle timeout of 300 seconds on OpenAI Responses,
+OpenAI-compatible and Anthropic providers. Setting `timeout_secs` above 300 on
+the provider raises the idle bound to match; the bound is never lowered below
+the default. Each received body read resets the relevant timeout, so active
 generations are not constrained by the whole-request timeout used for
 non-streaming calls. Connection setup, response headers, and buffered error
 bodies remain bounded.
