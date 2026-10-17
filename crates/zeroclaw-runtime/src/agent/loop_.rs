@@ -21291,13 +21291,32 @@ Let me check the result."#;
         assert_correlations(&broadcast_records, &traces);
 
         zeroclaw_log::flush_for_test().expect("flush runtime trace");
-        let persisted = std::fs::read_to_string(
-            zeroclaw_log::runtime_trace_path().expect("runtime trace path"),
+        let trace_path = zeroclaw_log::runtime_trace_path().expect("runtime trace path");
+
+        // The trace file is process-wide: tests running alongside this one keep
+        // appending to it after the flush, so the tail can be a record another
+        // test is still writing, cut anywhere, even inside a multi-byte
+        // character. Leave such a record behind the flushed ones so every run
+        // exercises the tolerance below.
+        let mut partial =
+            br#"{"trace_id":"in-flight","message":"llm_request","content":""#.to_vec();
+        partial.push(0xE2);
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&trace_path)
+                .expect("open runtime trace for append"),
+            &partial,
         )
-        .expect("read runtime trace");
+        .expect("append a partial record");
+
+        // The flush drained this test's own records, so none of them can be
+        // partial. Keep the lines that parse; `assert_correlations` then
+        // selects this test's records by trace id, as the broadcast check does.
+        let persisted = std::fs::read(&trace_path).expect("read runtime trace");
         let persisted_records: Vec<serde_json::Value> = persisted
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice(line).ok())
             .collect();
         assert_correlations(&persisted_records, &traces);
     }
