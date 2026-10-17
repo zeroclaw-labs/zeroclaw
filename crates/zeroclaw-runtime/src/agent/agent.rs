@@ -606,19 +606,9 @@ pub struct Agent {
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
     turn_entry_pause: Option<TestTurnEntryPause>,
-    /// The `DelegateTool` this Agent's registry registered, in its concrete
-    /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
-    /// otherwise cannot drive the *constructed* delegate's nested-registry
-    /// build and can only re-derive the wiring by hand - which is precisely
-    /// what must not be trusted for live-config threading. `None` when the
-    /// agent has no configured delegation targets.
-    ///
-    /// `allow(dead_code)`: its only reader is the delegated live-config
-    /// regression, which additionally needs `plugins-wasm-cranelift` to have a
-    /// plugin tool to execute at all. Under a narrower test feature set the
-    /// field is written and never read.
-    #[cfg(test)]
-    #[allow(dead_code)]
+    /// The exact delegate instance registered in `tools`. Retained to bind its
+    /// child builders to the RPC caller's live admission resolver without
+    /// reconstructing a second tool or copying authorization policy.
     pub(crate) delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -799,7 +789,6 @@ pub struct AgentBuilder {
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
     turn_entry_pause: Option<TestTurnEntryPause>,
-    #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
@@ -864,7 +853,6 @@ impl AgentBuilder {
             turn_datetime: None,
             #[cfg(test)]
             turn_entry_pause: None,
-            #[cfg(test)]
             delegate_tool: None,
         }
     }
@@ -1165,9 +1153,7 @@ impl AgentBuilder {
         self
     }
 
-    /// Retain the concrete `DelegateTool` the registry built, for regressions
-    /// that must drive the *constructed* delegate rather than a hand-rolled one.
-    #[cfg(test)]
+    /// Retain the concrete delegate registered by the tool factory.
     fn delegate_tool(mut self, delegate_tool: Option<Arc<crate::tools::DelegateTool>>) -> Self {
         self.delegate_tool = delegate_tool;
         self
@@ -1372,7 +1358,6 @@ impl AgentBuilder {
             turn_datetime: self.turn_datetime,
             #[cfg(test)]
             turn_entry_pause: self.turn_entry_pause,
-            #[cfg(test)]
             delegate_tool: self.delegate_tool,
         })
     }
@@ -2197,6 +2182,34 @@ impl Agent {
         self.refresh_system_prompt();
     }
 
+    /// SOP tools cannot enforce a principal ceiling. Withhold them and their
+    /// wrappers for non-admins, including nested builders that would restore
+    /// them. The retained delegate resolves the original caller's current
+    /// authority whenever it builds a child registry.
+    pub(crate) fn apply_sop_tool_admission(
+        &mut self,
+        admin: bool,
+        admission: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) {
+        let carries_admission = if let Some(delegate) = &self.delegate_tool {
+            delegate.set_sop_tool_admission(admission);
+            true
+        } else {
+            false
+        };
+        if admin {
+            return;
+        }
+        let held = self.tools.len();
+        self.tools.retain(|tool| {
+            (carries_admission && tool.name() == crate::tools::DelegateTool::NAME)
+                || !tool.requires_unrestricted_principal()
+        });
+        if self.tools.len() != held {
+            self.refresh_system_prompt();
+        }
+    }
+
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
@@ -2979,9 +2992,8 @@ impl Agent {
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
         // Captured before `assemble` consumes the result: the concrete delegate
-        // instance this registry built, so live-config regressions can drive its
-        // nested-registry construction instead of re-deriving the wiring.
-        #[cfg(test)]
+        // instance this registry built, so RPC admission also binds its child
+        // registries to the originating credential's live authority.
         let built_delegate_tool = all_tools_result.delegate_tool.clone();
         // Capture before `runtime` is moved into `ScopedAssembly`.
         let shell_profile = runtime.shell_profile();
@@ -3148,7 +3160,6 @@ impl Agent {
             };
 
         let builder = Agent::builder();
-        #[cfg(test)]
         let builder = builder.delegate_tool(built_delegate_tool);
         let mut builder = builder
             .model_provider(model_provider)

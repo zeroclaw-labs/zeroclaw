@@ -1185,6 +1185,92 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    fn with_session_owner(
+        &self,
+        session_key: &str,
+        effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        effect(owner.as_deref())
+    }
+
+    fn delete_session_authorized(
+        &self,
+        session_key: &str,
+        expected_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<Option<String>> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        let _authority = authorize(owner.as_ref().and_then(|owner| owner.as_deref()))?;
+        if owner
+            .as_ref()
+            .is_none_or(|owner| owner.as_deref() != expected_owner)
+        {
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.execute(
+            "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id IS ?2",
+            params![session_key, expected_owner],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(true)
+    }
+
+    fn set_session_state_authorized(
+        &self,
+        session_key: &str,
+        state: &str,
+        turn_id: Option<&str>,
+        _live_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?
+            .flatten();
+        let _authority = authorize(owner.as_deref())?;
+        let now = Utc::now().to_rfc3339();
+        let started_at = (state == "running").then_some(now.as_str());
+        tx.execute("UPDATE session_metadata SET state = ?1, turn_id = ?2, turn_started_at = ?3 WHERE session_key = ?4", params![state, turn_id, started_at, session_key]).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
     fn delete_session_owned(
         &self,
         session_key: &str,
@@ -1643,6 +1729,76 @@ impl SessionBackend for SqliteSessionBackend {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guarded_state_and_delete_recheck_owner_and_authority_after_connection_wait() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        for delete in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let backend = Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+            backend.set_session_agent_alias("s", "test").unwrap();
+            backend.set_session_principal("s", "user:bob").unwrap();
+            backend.append("s", &ChatMessage::user("private")).unwrap();
+            let before = backend.get_session_state("s").unwrap();
+            let allowed = Arc::new(AtomicBool::new(true));
+            let lock = backend.conn.lock();
+            let (started, waiting) = std::sync::mpsc::channel();
+            let worker_backend = Arc::clone(&backend);
+            let worker_allowed = Arc::clone(&allowed);
+            let worker = std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let authorize = |owner: Option<&str>| -> std::io::Result<
+                    Box<dyn crate::session_backend::SessionEffectGuard>,
+                > {
+                    assert_eq!(owner, Some("user:bob"));
+                    if !worker_allowed.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "revoked",
+                        ));
+                    }
+                    Ok(Box::new(()))
+                };
+                if delete {
+                    worker_backend
+                        .delete_session_authorized("s", Some("user:bob"), &authorize)
+                        .map(|_| ())
+                } else {
+                    worker_backend.set_session_state_authorized(
+                        "s",
+                        "running",
+                        Some("turn"),
+                        Some("user:alice"),
+                        &authorize,
+                    )
+                }
+            });
+            waiting.recv().unwrap();
+            allowed.store(false, Ordering::SeqCst);
+            drop(lock);
+            assert!(worker.join().unwrap().is_err());
+            assert_eq!(
+                backend.get_session_state("s").unwrap().map(|s| (
+                    s.state,
+                    s.turn_id,
+                    s.turn_started_at
+                )),
+                before.map(|s| (s.state, s.turn_id, s.turn_started_at))
+            );
+            assert_eq!(backend.load("s").len(), 1);
+            assert_eq!(
+                backend
+                    .get_session_metadata("s")
+                    .unwrap()
+                    .principal_id
+                    .as_deref(),
+                Some("user:bob")
+            );
+        }
+    }
+
     use super::*;
     use crate::session_store::SessionStore;
     use std::sync::{Arc, mpsc};

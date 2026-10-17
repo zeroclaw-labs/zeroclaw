@@ -306,11 +306,9 @@ impl ScopedToolRegistry {
             escalate_handle,
             channel_room_handle,
             unfiltered_tool_arcs,
-            // Test-only capture of the concrete delegate instance; `assemble`
-            // has no use for it and must keep destructuring exhaustively so a
-            // new field cannot be silently dropped here.
-            #[cfg(test)]
-                delegate_tool: _,
+            // The Agent captures the concrete delegate before assembly so it
+            // can bind descendant registries to live RPC authority.
+            delegate_tool: _,
         } = built;
 
         let mut builtin_names: HashSet<String> = tools_registry

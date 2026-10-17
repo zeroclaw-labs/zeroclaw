@@ -602,12 +602,8 @@ pub struct AllToolsResult {
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
-    /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
-    /// `dyn Tool`, so a regression cannot otherwise drive the *production*
-    /// delegate instance's nested-registry construction - it can only
-    /// re-derive the wiring by hand, which is exactly the thing that must not
-    /// be trusted. `None` when no agents are configured.
-    #[cfg(test)]
+    /// The same concrete delegate registered in `tools`, retained so callers
+    /// can bind its child registries to their live RPC authority resolver.
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
@@ -634,7 +630,6 @@ impl AllToolsResult {
             poll_handle: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
-            #[cfg(test)]
             delegate_tool: None,
         }
     }
@@ -2374,7 +2369,6 @@ fn all_tools_with_runtime_on_thread(
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
-                    #[cfg(test)]
                     delegate_tool: None,
                     ask_user_handle,
                     channel_room_handle,
@@ -2452,7 +2446,6 @@ fn all_tools_with_runtime_on_thread(
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
-    #[cfg(test)]
     let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
@@ -2499,10 +2492,7 @@ fn all_tools_with_runtime_on_thread(
         .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
         let delegate_tool = Arc::new(delegate_tool);
-        #[cfg(test)]
-        {
-            built_delegate_tool = Some(Arc::clone(&delegate_tool));
-        }
+        built_delegate_tool = Some(Arc::clone(&delegate_tool));
         tool_arcs.push(delegate_tool as Arc<dyn Tool>);
         Some(parent_tools)
     };
@@ -2597,7 +2587,6 @@ fn all_tools_with_runtime_on_thread(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
-        #[cfg(test)]
         delegate_tool: built_delegate_tool,
     })
 }

@@ -341,6 +341,10 @@ impl SessionStore {
     /// the same key.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
+        self.delete_session_unlocked(session_key)
+    }
+
+    fn delete_session_unlocked(&self, session_key: &str) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
         let crumb_path = self.trim_breadcrumb_path(session_key);
         if !is_regular_jsonl_session_file(&path) {
@@ -578,6 +582,29 @@ impl SessionBackend for SessionStore {
         self.clear_messages(session_key)
     }
 
+    fn with_session_owner(
+        &self,
+        _session_key: &str,
+        effect: &mut dyn FnMut(Option<&str>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let _guard = self.mutation_guard()?;
+        effect(None)
+    }
+
+    fn delete_session_authorized(
+        &self,
+        session_key: &str,
+        expected_owner: Option<&str>,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        let _guard = self.mutation_guard()?;
+        let _authority = authorize(None)?;
+        if expected_owner.is_some() {
+            return Ok(false);
+        }
+        self.delete_session_unlocked(session_key)
+    }
+
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         self.delete_session(session_key)
     }
@@ -591,6 +618,46 @@ impl SessionBackend for SessionStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_state_backend_admits_locked_live_owner_without_persisting_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        // Named admin creators may keep a live owner even though JSONL cannot
+        // persist attribution; scoped creation already refuses this backend.
+        assert!(backend.set_session_principal("s", "user:alice").is_err());
+        let calls = std::cell::Cell::new(0);
+        backend
+            .set_session_state_authorized(
+                "s",
+                "running",
+                Some("turn"),
+                Some("user:alice"),
+                &|owner| {
+                    assert_eq!(owner, Some("user:alice"));
+                    calls.set(calls.get() + 1);
+                    Ok(Box::new(()))
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(backend.get_session_state("s").unwrap().is_none());
+        assert!(
+            backend
+                .set_session_state_authorized(
+                    "s",
+                    "running",
+                    Some("turn"),
+                    Some("user:alice"),
+                    &|_| Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "revoked"
+                    ))
+                )
+                .is_err()
+        );
+    }
+
     use super::*;
     use std::path::Path;
     use std::sync::{Arc, mpsc};

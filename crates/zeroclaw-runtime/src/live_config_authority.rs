@@ -344,8 +344,9 @@ impl AgentExecutionSelection {
 
 impl AgentExecutionCapability {
     pub fn capture_selection(&self) -> AgentExecutionSelection {
-        // Never nest the lifecycle mutex and config lock. A mutation between
-        // these reads changes the generation and is rejected at admission.
+        // Release the lifecycle mutex before acquiring config here. SOP RPC
+        // effects may already hold a config read guard; lifecycle operations
+        // never acquire config while retaining this mutex.
         let (generations, closing) = {
             let state = self.agent_lifecycle.state.lock();
             let generations: HashMap<_, _> = state
@@ -366,7 +367,9 @@ impl AgentExecutionCapability {
         };
         let generations = self
             .config
-            .read()
+            // A queued writer must not block this nested read behind the
+            // outer SOP effect guard that the writer itself is waiting on.
+            .read_recursive()
             .agents
             .keys()
             .map(|alias| {
