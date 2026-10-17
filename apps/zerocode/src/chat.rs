@@ -44,8 +44,8 @@ use crate::turn_status::TurnStatus;
 mod context_menu;
 #[cfg(test)]
 use context_menu::{
-    CHARACTER_SELECTION_CONTEXT_ACTIONS, QUEUE_CONTEXT_ACTIONS, TRANSCRIPT_CONTEXT_ACTIONS,
-    URL_WITH_COPY_CONTEXT_ACTIONS,
+    CHARACTER_SELECTION_CONTEXT_ACTIONS, PATH_CONTEXT_ACTIONS, QUEUE_CONTEXT_ACTIONS,
+    TRANSCRIPT_CONTEXT_ACTIONS, URL_WITH_COPY_CONTEXT_ACTIONS,
 };
 use context_menu::{
     ChatContextMenu, ChatContextMenuAction, ChatContextMenuRequest, ChatContextMenuTarget,
@@ -495,6 +495,9 @@ pub(crate) struct Chat {
     git_branch_rx: mpsc::Receiver<GitStatusUpdate>,
     /// In-flight git_branch refresh; gates repeat fetches until result arrives.
     git_branch_inflight: bool,
+    /// Last `path_open::path_links_generation` seen; a change means a path's
+    /// link status resolved in the background and the transcript must restyle.
+    path_links_generation: u64,
     /// Background model-catalog fetch result, routed back so the Loading
     /// picker can swap to the populated list without blocking the draw loop.
     model_fetch_tx: mpsc::Sender<ModelFetchResult>,
@@ -876,6 +879,7 @@ impl Chat {
             git_branch_tx,
             git_branch_rx,
             git_branch_inflight: false,
+            path_links_generation: crate::path_open::path_links_generation(),
             model_fetch_tx,
             model_fetch_rx,
             session_reattach_tx,
@@ -3410,14 +3414,31 @@ impl Chat {
                 }
             }
             ChatContextMenuRequest::OpenUrl(url) => {
-                let result = crate::url_open::open(&url).await;
+                let notice = open_link_target(&url).await;
+                if let ChatPhase::Active(ref mut state) = self.phase
+                    && let Some(notice) = notice
+                {
+                    state.set_info_notice(notice);
+                }
+            }
+            ChatContextMenuRequest::RevealPath(path) => {
+                let result = crate::path_open::reveal(&path).await;
                 if let ChatPhase::Active(ref mut state) = self.phase
                     && let Err(error) = result
                 {
                     state.set_info_notice(crate::i18n::t_args(
-                        "zc-chat-open-link-failed",
+                        "zc-chat-open-path-failed",
                         &[("error", &error.to_string())],
                     ));
+                }
+            }
+            ChatContextMenuRequest::AddPathToChat(path) => {
+                let ChatPhase::Active(ref mut state) = self.phase else {
+                    return;
+                };
+                let span = crate::path_open::markdown_code_span(&path);
+                if state.input_bar.append_text_at_end(&span) {
+                    state.mark_dirty_full();
                 }
             }
             ChatContextMenuRequest::CopyUrl(url) => {
@@ -3471,7 +3492,12 @@ impl Chat {
                         state.delete_queued_by_id(id);
                     }
                 }
-                ChatContextMenuAction::OpenLink | ChatContextMenuAction::CopyLink => {}
+                ChatContextMenuAction::OpenLink
+                | ChatContextMenuAction::CopyLink
+                | ChatContextMenuAction::OpenPath
+                | ChatContextMenuAction::RevealPath
+                | ChatContextMenuAction::CopyPath
+                | ChatContextMenuAction::AddPathToChat => {}
             },
         }
     }
@@ -3787,6 +3813,18 @@ impl Chat {
         self.drain_model_fetch_results();
         self.drain_session_reattach_results();
         self.maybe_refresh_git_branch();
+        self.refresh_resolved_path_links();
+    }
+
+    fn refresh_resolved_path_links(&mut self) {
+        let generation = crate::path_open::path_links_generation();
+        if generation == self.path_links_generation {
+            return;
+        }
+        self.path_links_generation = generation;
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            state.mark_dirty_full();
+        }
     }
 
     #[cfg(test)]
@@ -5486,12 +5524,8 @@ impl Chat {
             if state.in_browse_mode() {
                 match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
                     UrlPointerAction::Open(url) => {
-                        match crate::url_open::open(&url).await {
-                            Ok(()) => {}
-                            Err(error) => state.set_info_notice(crate::i18n::t_args(
-                                "zc-chat-open-link-failed",
-                                &[("error", &error.to_string())],
-                            )),
+                        if let Some(notice) = open_link_target(&url).await {
+                            state.set_info_notice(notice);
                         }
                         return;
                     }
@@ -5570,12 +5604,8 @@ impl Chat {
                     MouseEventKind::Up(MouseButton::Left) => {
                         match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
                             UrlPointerAction::Open(url) => {
-                                match crate::url_open::open(&url).await {
-                                    Ok(()) => {}
-                                    Err(error) => state.set_info_notice(crate::i18n::t_args(
-                                        "zc-chat-open-link-failed",
-                                        &[("error", &error.to_string())],
-                                    )),
+                                if let Some(notice) = open_link_target(&url).await {
+                                    state.set_info_notice(notice);
                                 }
                             }
                             UrlPointerAction::Consumed => {}
@@ -7386,6 +7416,13 @@ fn context_menu_action_label(
         ChatContextMenuAction::AddToChat => "zc-chat-context-menu-add-to-chat",
         ChatContextMenuAction::OpenLink => "zc-chat-context-menu-open-link",
         ChatContextMenuAction::CopyLink => "zc-chat-context-menu-copy-link",
+        ChatContextMenuAction::OpenPath => "zc-chat-context-menu-open-path",
+        ChatContextMenuAction::RevealPath if cfg!(target_os = "macos") => {
+            "zc-chat-context-menu-reveal-path-finder"
+        }
+        ChatContextMenuAction::RevealPath => "zc-chat-context-menu-reveal-path",
+        ChatContextMenuAction::CopyPath => "zc-chat-context-menu-copy-path",
+        ChatContextMenuAction::AddPathToChat => "zc-chat-context-menu-add-path-to-chat",
         ChatContextMenuAction::Edit => "zc-chat-context-menu-edit",
         ChatContextMenuAction::Delete => "zc-chat-context-menu-delete",
     };
@@ -9023,6 +9060,42 @@ fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
     ranges
 }
 
+/// Open a transcript link target and return the notice to show, if any.
+/// Paths that could run code when opened are revealed instead.
+async fn open_link_target(target: &str) -> Option<String> {
+    if crate::path_open::is_path_target(target) {
+        match crate::path_open::open(target).await {
+            Ok(crate::path_open::OpenOutcome::Opened) => None,
+            Ok(crate::path_open::OpenOutcome::Revealed) => {
+                Some(crate::i18n::t("zc-chat-path-revealed-instead"))
+            }
+            Err(error) => Some(crate::i18n::t_args(
+                "zc-chat-open-path-failed",
+                &[("error", &error.to_string())],
+            )),
+        }
+    } else {
+        crate::url_open::open(target).await.err().map(|error| {
+            crate::i18n::t_args("zc-chat-open-link-failed", &[("error", &error.to_string())])
+        })
+    }
+}
+
+/// HTTP(S) URLs plus existing local file paths, ordered by start. Both kinds
+/// share one hit map; path targets are absolute and start with `/`, URL
+/// targets carry their scheme, so consumers can tell them apart.
+fn recognized_link_ranges(text: &str) -> Vec<(usize, usize, String)> {
+    let mut ranges = recognized_url_ranges(text);
+    if text.contains('/') {
+        let paths = crate::path_open::recognized_path_ranges(text, &ranges);
+        if !paths.is_empty() {
+            ranges.extend(paths);
+            ranges.sort_by_key(|(start, _, _)| *start);
+        }
+    }
+    ranges
+}
+
 fn style_recognized_urls(lines: &mut [Line<'static>]) {
     for line in lines {
         let (_, ranges) = actionable_url_ranges(line);
@@ -9096,7 +9169,7 @@ fn actionable_url_ranges(line: &Line<'static>) -> (String, Vec<(usize, usize, St
         }
         offset = end;
     }
-    let urls = recognized_url_ranges(&text)
+    let urls = recognized_link_ranges(&text)
         .into_iter()
         .filter(|(start, end, _)| {
             !disabled_ranges
@@ -9622,6 +9695,7 @@ struct UrlLineRegion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UrlHitRegion {
     rect: Rect,
+    /// An HTTP(S) URL, or an absolute local path (see `path_open`).
     url: String,
     occurrence: UrlOccurrenceId,
 }
@@ -12813,6 +12887,108 @@ mod tests {
                 assert_eq!(incremental, full);
             }
         }
+    }
+
+    #[test]
+    fn wrapped_path_with_space_is_one_link_on_every_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let folder = dir.path().join("Work SSD").join("worktree");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        let file = folder.join("pr-11622-01-transcript-times.png");
+        std::fs::write(&file, b"png").expect("write");
+        let path = file.to_str().expect("utf8 path").to_string();
+
+        let lines = vec![Line::from(format!("Image: {path}. It's committed."))];
+        let width = 24;
+        // Existence is checked off the draw path; the first render schedules it.
+        let _ = url_line_regions_for_lines(&lines, width);
+        crate::path_open::wait_for_path_checks();
+        let regions = url_line_regions_for_lines(&lines, width);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].urls.len(), 1);
+        assert_eq!(regions[0].urls[0].2, path, "the full path, space included");
+
+        let rows = wrapped_rows(&lines[0], width);
+        let body = Rect::new(0, 0, width, rows);
+        let hits = project_url_hit_regions(&regions, 0, body);
+        let hit_rows: std::collections::BTreeSet<u16> = hits.iter().map(|hit| hit.rect.y).collect();
+        assert!(
+            hit_rows.len() >= 3,
+            "path wraps over several rows: {hits:?}"
+        );
+        assert!(hits.iter().all(|hit| hit.url == path));
+        let occurrence = hits[0].occurrence;
+        assert!(hits.iter().all(|hit| hit.occurrence == occurrence));
+
+        let mut state = state();
+        state.url_hit_regions = hits.clone();
+        let last = hits.last().expect("hit");
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Down(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                last.rect.x,
+                last.rect.y,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Up(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                last.rect.x,
+                last.rect.y,
+            ),
+            UrlPointerAction::Open(path.clone()),
+            "a click on the continuation row opens the whole path"
+        );
+
+        let target = ChatContextMenuTarget::Url(last.clone());
+        assert_eq!(target.actions(), PATH_CONTEXT_ACTIONS);
+        for (step, expected) in [
+            (0, ChatContextMenuRequest::OpenUrl(path.clone())),
+            (1, ChatContextMenuRequest::RevealPath(path.clone())),
+            (2, ChatContextMenuRequest::CopyUrl(path.clone())),
+            (3, ChatContextMenuRequest::AddPathToChat(path.clone())),
+        ] {
+            let menu = ChatContextMenu {
+                rect: Rect::new(0, 0, 30, 6),
+                target: target.clone(),
+                selected: step,
+            };
+            assert_eq!(menu.into_request(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn missing_paths_stay_plain_text() {
+        let lines = vec![Line::from(
+            "See /definitely/not/a/real/zc-path and and/or prose.",
+        )];
+        assert!(url_line_regions_for_lines(&lines, 80).is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_path_to_chat_appends_a_code_span() {
+        let mut chat = active_chat();
+        chat.execute_context_menu_request(ChatContextMenuRequest::AddPathToChat(
+            "/Volumes/Work SSD/a.png".to_string(),
+        ))
+        .await;
+        let ChatPhase::Active(ref state) = chat.phase else {
+            panic!("active");
+        };
+        assert_eq!(state.input_bar.input(), "`/Volumes/Work SSD/a.png`");
+
+        let mut chat = active_chat();
+        chat.execute_context_menu_request(ChatContextMenuRequest::AddPathToChat(
+            "/tmp/a`b.txt".to_string(),
+        ))
+        .await;
+        let ChatPhase::Active(ref state) = chat.phase else {
+            panic!("active");
+        };
+        assert_eq!(state.input_bar.input(), "``/tmp/a`b.txt``");
     }
 
     #[test]
