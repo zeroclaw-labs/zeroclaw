@@ -133,7 +133,9 @@ Call sites use `spawn!` instead of `tokio::spawn` directly.
 ### `zeroclaw-infra`
 
 Process-level support: debouncers, watchdogs, the SQLite session
-backend. Not a tracing/metrics layer, that's `zeroclaw-log`. See
+backend, and the plugin webhook ingress service (route admission, the request
+deadline, and message dedup). Not a tracing/metrics layer, that's
+`zeroclaw-log`. See
 [Runtime state and persistence](./runtime-state-and-persistence.md) for the
 state ownership and durability boundaries across config, sessions, memory,
 logs, costs, cron, and gateway metadata.

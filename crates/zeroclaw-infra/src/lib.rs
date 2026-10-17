@@ -1,9 +1,11 @@
-//! Channel infrastructure: session backends, debouncing, and stall watchdog.
+//! Channel infrastructure: session backends, debouncing, stall watchdog, and
+//! the plugin webhook ingress.
 //! These are cross-cutting utilities used by multiple channel implementations.
 
 pub mod acp_session_store;
 pub mod debounce;
 pub mod net_guard;
+pub mod plugin_webhook;
 pub mod session_backend;
 pub mod session_queue;
 pub mod session_sqlite;
@@ -13,6 +15,7 @@ pub mod stall_watchdog;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::session_backend::SessionBackend;
 
@@ -30,6 +33,26 @@ pub fn parse_gateway_bind_socket_addr(
 
 pub fn fallback_gateway_bind_socket_addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// Fallback for `gateway.idempotency_max_keys = 0`, shared by the gateway's
+/// replay store and the plugin webhook ingress.
+pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
+
+/// A configured key bound where zero selects `fallback`; never below one.
+#[must_use]
+pub fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
+    if configured == 0 {
+        fallback.max(1)
+    } else {
+        configured
+    }
+}
+
+/// `gateway.idempotency_ttl_secs`, never below one second.
+#[must_use]
+pub fn effective_idempotency_ttl(ttl_secs: u64) -> Duration {
+    Duration::from_secs(ttl_secs.max(1))
 }
 
 pub fn make_session_backend(
@@ -87,6 +110,28 @@ mod tests {
 
     fn user_msg(content: &str) -> ChatMessage {
         ChatMessage::user(content)
+    }
+
+    #[test]
+    fn normalize_max_keys_uses_fallback_for_zero() {
+        assert_eq!(normalize_max_keys(0, 10_000), 10_000);
+        assert_eq!(normalize_max_keys(0, 0), 1);
+    }
+
+    #[test]
+    fn normalize_max_keys_preserves_nonzero_values() {
+        assert_eq!(normalize_max_keys(2_048, 10_000), 2_048);
+        assert_eq!(normalize_max_keys(1, 10_000), 1);
+    }
+
+    #[test]
+    fn effective_idempotency_limits_apply_the_documented_floors() {
+        assert_eq!(effective_idempotency_ttl(0), Duration::from_secs(1));
+        assert_eq!(effective_idempotency_ttl(7), Duration::from_secs(7));
+        assert_eq!(
+            normalize_max_keys(0, IDEMPOTENCY_MAX_KEYS_DEFAULT),
+            IDEMPOTENCY_MAX_KEYS_DEFAULT
+        );
     }
 
     #[test]
