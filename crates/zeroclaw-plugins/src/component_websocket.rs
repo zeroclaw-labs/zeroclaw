@@ -33,6 +33,7 @@ use crate::component::{PluginState, bindings};
 use crate::egress::{
     AuthorizedEgress, EGRESS_CONNECT_DEADLINE, EgressError, EgressRequest, EgressTransport,
 };
+use crate::egress_report::{record_no_egress_service, record_refusal};
 
 const MAX_URL_BYTES: usize = 4 * 1024;
 const MAX_HEADER_COUNT: usize = 32;
@@ -208,27 +209,37 @@ impl PluginState {
             return Err(WebSocketError::Unavailable);
         }
         let prepared = prepare_connection(options)?;
-        let mut request = EgressRequest::new(
-            self.scope().clone(),
-            EgressTransport::WebSocket {
-                encrypted: prepared.encrypted,
-            },
-            &prepared.host,
-            prepared.port,
-        )
-        .map_err(map_egress_error)?;
+        // Every refusal at the egress boundary below is recorded for the operator,
+        // who otherwise sees nothing: the guest gets only its WebSocket error.
+        let scope = self.scope().clone();
+        let transport = EgressTransport::WebSocket {
+            encrypted: prepared.encrypted,
+        };
+        let mut request =
+            EgressRequest::new(scope.clone(), transport, &prepared.host, prepared.port)
+                .inspect_err(|error| record_refusal(&scope, None, transport, &prepared.host, error))
+                .map_err(map_egress_error)?;
+        let destination = request.host().to_string();
         if let Some(profile) = prepared.tls_profile.as_deref() {
             request = request
                 .with_tls_profile(profile)
+                .inspect_err(|error| record_refusal(&scope, None, transport, &destination, error))
                 .map_err(map_egress_error)?;
         }
         // No egress authority attached means no reach, as for `wasi:http`.
-        let egress = self
-            .egress_service()
-            .ok_or(WebSocketError::DestinationDenied)?;
+        let Some(egress) = self.egress_service() else {
+            record_no_egress_service(&scope, transport, &destination);
+            return Err(WebSocketError::DestinationDenied);
+        };
 
         let connected = tokio::time::timeout(EGRESS_CONNECT_DEADLINE, async {
-            let authorized = egress.authorize(request).await.map_err(map_egress_error)?;
+            let authorized = egress
+                .authorize(request)
+                .await
+                .inspect_err(|error| {
+                    record_refusal(&scope, Some(&egress), transport, &destination, error);
+                })
+                .map_err(map_egress_error)?;
             let tls_config = if prepared.encrypted {
                 Some(
                     self.tls_client_config(&authorized)

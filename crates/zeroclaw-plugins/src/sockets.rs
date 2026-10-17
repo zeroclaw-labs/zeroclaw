@@ -27,6 +27,7 @@ use crate::egress::{
     AuthorizedEgress, EGRESS_CONNECT_DEADLINE, EgressError, EgressRequest, EgressTransport,
     StartTlsState,
 };
+use crate::egress_report::{record_no_egress_service, record_refusal};
 use zeroclaw_infra::net_guard::NetworkGuardError;
 
 /// Maximum bytes accepted from one guest send or retained in one read chunk.
@@ -549,21 +550,33 @@ async fn connect(
     if !state.charge_host_call() || !state.instance_services_enabled() {
         return Err(SocketFailure::HostUnavailable);
     }
-    let mut request =
-        EgressRequest::new(state.scope().clone(), mode.egress_transport(), &host, port)
-            .map_err(|error| map_egress_error(&error))?;
+    // Every refusal at the egress boundary below is recorded for the operator,
+    // who otherwise sees nothing: the guest gets only its socket error.
+    let scope = state.scope().clone();
+    let transport = mode.egress_transport();
+    let mut request = EgressRequest::new(scope.clone(), transport, &host, port)
+        .inspect_err(|error| record_refusal(&scope, None, transport, &host, error))
+        .map_err(|error| map_egress_error(&error))?;
+    let destination = request.host().to_string();
     if let Some(profile) = tls_profile.as_deref() {
         request = request
             .with_tls_profile(profile)
+            .inspect_err(|error| record_refusal(&scope, None, transport, &destination, error))
             .map_err(|error| map_egress_error(&error))?;
     }
     // No egress authority attached means no reach, the same deny-by-default
     // `wasi:http` applies.
-    let service = state.egress_service().ok_or(SocketFailure::AccessDenied)?;
+    let Some(service) = state.egress_service() else {
+        record_no_egress_service(&scope, transport, &destination);
+        return Err(SocketFailure::AccessDenied);
+    };
     let authorization = Arc::new(
         service
             .authorize(request)
             .await
+            .inspect_err(|error| {
+                record_refusal(&scope, Some(&service), transport, &destination, error);
+            })
             .map_err(|error| map_egress_error(&error))?,
     );
     // STARTTLS resolves its TLS configuration before dialing, like direct TLS,
