@@ -1,0 +1,146 @@
+name: Quickstart affected CLI evidence (manual)
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/quickstart-cli-evidence-manual.yml
+      - scripts/ci/quickstart_cli_evidence.py
+      - scripts/ci/quickstart_cli_evidence_test.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harness-controls:
+    name: Quickstart capture harness unit controls
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Run authored harness unit controls
+        run: python scripts/ci/quickstart_cli_evidence_test.py -v
+  evidence:
+    # #7432 / #11309: observe the changed list and completion through the CLI.
+    # Advisory only; retire after the affected terminal evidence is accepted.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    needs: harness-controls
+    if: github.event_name == 'workflow_dispatch' && needs.harness-controls.result == 'success'
+    steps:
+      - name: Initialize private receipt directory
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, time
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / ('quickstart-cli-evidence-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'])
+          root.mkdir(mode=0o700)
+          state = {'started': False, 'started_monotonic': time.monotonic(), 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'job': os.environ['GITHUB_JOB']}
+          fd = os.open(root / 'state.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, 'w') as out:
+              json.dump(state, out)
+          PY
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: auxiliary
+          persist-credentials: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: zeroclaw-labs/zeroclaw
+          ref: a441e0cb755ebb3e1656eeee04e694c070d79214
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - name: Build and capture only affected states
+        id: capture
+        timeout-minutes: 39
+        shell: bash
+        run: |
+          python auxiliary/scripts/ci/quickstart_cli_evidence.py \
+            --source "$GITHUB_WORKSPACE/product" \
+            --auxiliary "$GITHUB_WORKSPACE/auxiliary" \
+            --root "$RUNNER_TEMP/quickstart-cli-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Finalize cleanup and export contract
+        id: finalize
+        if: always()
+        timeout-minutes: 1
+        env:
+          EVIDENCE_CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+        shell: bash
+        run: |
+          if test -f auxiliary/scripts/ci/quickstart_cli_evidence.py; then
+            python3 auxiliary/scripts/ci/quickstart_cli_evidence.py \
+              --finalize "$RUNNER_TEMP/quickstart-cli-evidence-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          else
+            python3 - <<'PY'
+          import hashlib, json, os, pathlib, re
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / ('quickstart-cli-evidence-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'])
+          assert root.is_dir() and not root.is_symlink() and root.stat().st_uid == os.getuid()
+          values = [os.environ[k] for k in ('GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_JOB', 'GITHUB_WORKFLOW_SHA')]
+          assert re.fullmatch(r'[1-9][0-9]*', values[0]) and re.fullmatch(r'[1-9][0-9]*', values[1])
+          assert re.fullmatch(r'[A-Za-z0-9_-]+', values[2]) and re.fullmatch(r'[0-9a-f]{40}', values[3])
+          binding = dict(zip(('run_id', 'attempt', 'job', 'auxiliary_sha'), values))
+          binding.update(source_sha='a441e0cb755ebb3e1656eeee04e694c070d79214', source_tree='5c4290c8ba4b62309f8311fa38cf628f120720c0')
+          (root / 'export-decision.json').unlink(missing_ok=True)
+          (root / 'failure').mkdir(mode=0o700)
+          receipt = {'schema': 1, 'kind': 'failure', 'binding': binding, 'code': 'setup_failed_before_harness', 'cleanup_complete': False, 'execution_proof': False}
+          data = (json.dumps(receipt, sort_keys=True) + '\n').encode()
+          assert len(data) <= 4096
+          target = root / 'failure' / 'receipt.json'
+          fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(fd, 'wb') as out:
+              out.write(data)
+          decision = {'schema': 1, 'kind': 'failure', 'safe': True, 'binding': binding, 'receipt_sha256': hashlib.sha256(data).hexdigest()}
+          fd = os.open(root / 'failure-decision.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(fd, 'w') as out:
+              json.dump(decision, out)
+          assert json.loads(target.read_text()) == receipt
+          assert hashlib.sha256(target.read_bytes()).hexdigest() == decision['receipt_sha256']
+          assert json.loads((root / 'failure-decision.json').read_text()) == decision
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('success_export=false\nfailure_export=true\n')
+          PY
+            exit 1
+          fi
+      - name: Upload explicit affected evidence files
+        if: ${{ !cancelled() && steps.capture.outcome == 'success' && steps.finalize.outcome == 'success' && steps.finalize.outputs.success_export == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quickstart-affected-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/provenance.json
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/context.json
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/cases.json
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/actions.json
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/affected-output.txt
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/checksums.json
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/cleanup.json
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/screens/A-list.png
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/screens/A-completion-0.png
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/screens/A-completion-1.png
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/screens/A-completion-2.png
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/screens/B-completion-0.png
+            ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/export/screens/B-completion-1.png
+      - name: Upload minimum safe failure receipt
+        if: ${{ always() && steps.finalize.outputs.failure_export == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quickstart-safe-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 1
+          if-no-files-found: error
+          path: ${{ runner.temp }}/quickstart-cli-evidence-${{ github.run_id }}-${{ github.run_attempt }}/failure/receipt.json
