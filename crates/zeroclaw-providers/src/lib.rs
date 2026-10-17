@@ -2349,6 +2349,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
             ("atlascloud", "Atlas Cloud", false),
+            ("standardcompute", "Standard Compute", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2617,6 +2618,24 @@ mod tests {
         assert!(
             create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
             "Atlas Cloud should construct through the OpenAI-compatible family factory"
+        );
+    }
+
+    #[test]
+    fn standardcompute_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let standardcompute = providers
+            .iter()
+            .find(|provider| provider.name == "standardcompute")
+            .expect("Standard Compute provider should be listed");
+        assert_eq!(standardcompute.display_name, "Standard Compute");
+        assert_eq!(
+            canonicalize_v2_model_provider_name("standardcompute"),
+            "standardcompute"
+        );
+        assert!(
+            create_model_provider("standardcompute", Some("provider-test-credential")).is_ok(),
+            "Standard Compute should construct through the OpenAI-compatible family factory"
         );
     }
 
