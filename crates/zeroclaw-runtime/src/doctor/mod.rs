@@ -536,19 +536,40 @@ pub fn persist_model_cache(
     // let two concurrent refreshes collide on the same inode, or let a
     // pre-existing symlink at that predictable path get followed and
     // truncated; `tempfile` picks a fresh random name each call and removes
-    // the file automatically if we return before `persist`.
+    // the file automatically if we return before the rename.
     let mut tmp = tempfile::Builder::new()
         .prefix(MODEL_CACHE_FILE)
         .suffix(".tmp")
-        .tempfile_in(&cache_dir)
+        .make_in(&cache_dir, create_staging_file)
         .context("Failed to create model cache temp file")?;
     tmp.write_all(json.as_bytes())
         .context("Failed to write model cache temp file")?;
-    tmp.persist(&cache_path)
-        .map_err(|e| e.error)
-        .context("Failed to rename model cache temp file")?;
+    let mut staged = tmp.into_temp_path();
+    // `std::fs::rename`, not `persist`: the channel reader behind `/model`
+    // opens this cache without the refresh lock, and on Windows `persist` is
+    // a bare `MoveFileExW`, which cannot replace a file that any reader holds
+    // open. `rename` retries that refusal with POSIX semantics, which swap the
+    // name while open readers keep the old contents, as long as they opened it
+    // with delete sharing (std's own opens do). On Unix both are rename(2).
+    std::fs::rename(&staged, &cache_path).context("Failed to rename model cache temp file")?;
+    // The staging name no longer exists, so there is nothing left to clean up.
+    staged.disable_cleanup(true);
 
     Ok(())
+}
+
+/// Create a staging file the way `NamedTempFile::new_in` does (exclusively,
+/// owner-only on Unix) but without the Windows temporary attribute: `persist`
+/// would clear that attribute, and the plain rename that publishes the file
+/// would carry it onto the cache.
+fn create_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
 }
 
 pub async fn run_models(
@@ -2743,6 +2764,31 @@ mod tests {
         );
         let raw = std::fs::read_to_string(state_dir.join(MODEL_CACHE_FILE)).unwrap();
         assert!(raw.contains("openrouter"));
+    }
+
+    /// The channel reader behind `/model` opens the cache without the refresh
+    /// lock, so it can hold the file open while a refresh replaces it. That
+    /// must not stop the refresh, and the reader keeps the catalog it opened.
+    /// Windows refuses a plain replace of an open file, so this pins the
+    /// replace itself rather than leaving it to a race.
+    #[test]
+    fn persist_model_cache_replaces_a_cache_a_reader_holds_open() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+        persist_model_cache(&config, "openrouter", &["old-model".to_string()]).unwrap();
+        let cache_path = tmp.path().join("state").join(MODEL_CACHE_FILE);
+        let mut held = std::fs::File::open(&cache_path).unwrap();
+
+        persist_model_cache(&config, "openrouter", &["new-model".to_string()])
+            .expect("an open reader must not stop the refresh");
+
+        let held_cache = std::io::read_to_string(&mut held).unwrap();
+        assert!(held_cache.contains("old-model"), "{held_cache}");
+        let raw = std::fs::read_to_string(&cache_path).unwrap();
+        assert!(
+            raw.contains("new-model") && !raw.contains("old-model"),
+            "{raw}"
+        );
     }
 
     #[tokio::test]
