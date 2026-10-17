@@ -37,6 +37,7 @@ struct PendingApproval {
     /// Mattermost channel ID the prompt was posted into.
     channel_id: String,
     sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+    strict_session_prompt_approval: bool,
 }
 
 /// How many retired tokens to remember. A token only needs to outlive the
@@ -1263,6 +1264,10 @@ impl Channel for MattermostChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        // Post rendering does not guarantee an inert exact-content preview.
+        if zeroclaw_api::is_strict_session_prompt_approval(request) {
+            return Ok(None);
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         // Allocation and registration are one critical section, and the token is
         // drawn so it collides with neither a live prompt nor one still inside
@@ -1284,16 +1289,20 @@ impl Channel for MattermostChannel {
                     generation,
                     channel_id: recipient_channel_id(recipient).to_string(),
                     sender: tx,
+                    strict_session_prompt_approval: zeroclaw_api::is_strict_session_prompt_approval(
+                        request,
+                    ),
                 },
             );
             (token, generation)
         };
 
-        let text = crate::util::build_yesno_approval_prompt(
+        let text = crate::util::build_yesno_approval_prompt_with_policy(
             &token,
             &request.tool_name,
             &request.arguments_summary,
             request.position_counter(),
+            zeroclaw_api::is_strict_session_prompt_approval(request),
         );
         // Armed from here on: every exit below — including a dropped future —
         // retires this registration and any post bound to it. Cleanup is keyed
@@ -1937,9 +1946,18 @@ impl MattermostChannel {
         // registration; if a later request has since drawn the same token, a tap
         // on this older, still-visible prompt must not resolve it. Retiring also
         // drops the post binding, so a second tap finds nothing.
-        let Some(pending) = self.approvals.lock().retire_generation(&token, generation) else {
+        let mut state = self.approvals.lock();
+        if state.pending.get(&token).is_some_and(|pending| {
+            pending.generation == generation
+                && pending.strict_session_prompt_approval
+                && matches!(response, ChannelApprovalResponse::AlwaysApprove)
+        }) {
+            return false;
+        }
+        let Some(pending) = state.retire_generation(&token, generation) else {
             return false;
         };
+        drop(state);
         // A closed receiver means the waiter already timed out; the decision is
         // simply dropped.
         let _ = pending.sender.send(response);
@@ -2110,6 +2128,15 @@ impl MattermostChannel {
                 );
                 // Leaves the prompt pending so an authorized operator can still
                 // answer, but never forwards the attempt to the model.
+                return ApprovalReplyOutcome::Consumed;
+            }
+
+            if pending.strict_session_prompt_approval
+                && matches!(response, ChannelApprovalResponse::AlwaysApprove)
+            {
+                // Stale clients may still send the legacy persistent action;
+                // consume the approval-shaped message but keep the one-shot
+                // parked for a valid approve/deny reply.
                 return ApprovalReplyOutcome::Consumed;
             }
 
@@ -2446,6 +2473,50 @@ fn normalize_mattermost_content(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn strict_approval_is_denied_before_registration() {
+        let server = wiremock::MockServer::start().await;
+        let channel = MattermostChannel::new(
+            server.uri(),
+            Some("test-token".into()),
+            None,
+            None,
+            vec![],
+            "strict-test",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "session_prompt_set".into(),
+            arguments_summary: "[FILE:report.txt]".into(),
+            raw_arguments: None,
+            position: None,
+            strict_session_prompt_approval: true,
+        };
+        assert!(
+            channel
+                .request_approval_attributed("chat", &request)
+                .await
+                .expect("strict denial")
+                .is_none()
+        );
+        {
+            let state = channel.approvals.lock();
+            assert!(state.pending.is_empty());
+            assert!(state.posts.is_empty());
+            assert!(state.retired.is_empty());
+            assert_eq!(state.next_generation, 0);
+        }
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("HTTP requests")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn mattermost_url_trimming() {
@@ -4536,6 +4607,7 @@ mod approval_tests {
                 generation: 0,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
+                strict_session_prompt_approval: false,
             },
         );
         rx
@@ -4880,6 +4952,7 @@ mod approval_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         }
     }
 
@@ -5084,6 +5157,7 @@ mod approval_tests {
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
             position: None,
+            strict_session_prompt_approval: false,
         };
 
         // `send` fails against the unreachable test host, which surfaces as an
@@ -5148,6 +5222,7 @@ mod approval_lifecycle_tests {
                 generation: 0,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
+                strict_session_prompt_approval: false,
             },
         );
         rx
@@ -5414,6 +5489,7 @@ mod approval_identity_tests {
                 generation: 0,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
+                strict_session_prompt_approval: false,
             },
         );
         rx
@@ -5608,6 +5684,7 @@ mod approval_generation_tests {
                 generation,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
+                strict_session_prompt_approval: false,
             },
         );
         state
@@ -5814,6 +5891,7 @@ mod approval_registration_identity_tests {
                 generation,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
+                strict_session_prompt_approval: false,
             },
         );
         if let Some(post_id) = post_id {
@@ -5901,6 +5979,7 @@ mod approval_registration_identity_tests {
                         generation,
                         channel_id: ORIGIN_CHANNEL.to_string(),
                         sender,
+                        strict_session_prompt_approval: false,
                     },
                 );
                 ResponseTemplate::new(200)

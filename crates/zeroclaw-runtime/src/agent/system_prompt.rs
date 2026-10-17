@@ -26,7 +26,9 @@ pub const BOOTSTRAP_FILES: &[&str] =
 /// lists.
 pub const CONDITIONAL_BOOTSTRAP_FILES: &[&str] = &["BOOTSTRAP.md", "MEMORY.md"];
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
-pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
+// Keep this byte-identical in length to `NO_TOOLS_TASK_FRAMING`: the turn
+// loop may swap the framing after the final system-prompt budget is enforced.
+pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when this request needs it";
 
 /// Model-facing `always_ask` exception under Full autonomy.
 fn full_autonomy_always_ask_prompt_lines(always_ask: &[String]) -> String {
@@ -794,6 +796,7 @@ fn inject_workspace_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::prompt::TIMESTAMP_ORIENTATION;
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
 
     #[test]

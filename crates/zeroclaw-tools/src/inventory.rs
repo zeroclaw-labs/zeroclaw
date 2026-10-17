@@ -199,6 +199,18 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
     },
     // Sessions.
     BuiltinToolSpec {
+        name: "session_prompt_list",
+        tier: ToolTier::Host,
+    },
+    BuiltinToolSpec {
+        name: "session_prompt_set",
+        tier: ToolTier::Host,
+    },
+    BuiltinToolSpec {
+        name: "session_prompt_delete",
+        tier: ToolTier::Host,
+    },
+    BuiltinToolSpec {
         name: "sessions_current",
         tier: ToolTier::Host,
     },
