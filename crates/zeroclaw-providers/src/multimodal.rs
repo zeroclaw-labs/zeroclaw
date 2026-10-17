@@ -3151,6 +3151,15 @@ struct JpegFrameHeader {
     components: Vec<JpegComponentSampling>,
 }
 
+/// Bytes zune-jpeg 0.5.15 reads past a segment's declared end. Its APP0 parser
+/// reads a 5-byte probe whenever the length exceeds 5 and then skips the
+/// saturating remainder, so a declared length of exactly 6 consumes one byte
+/// more than declared. Every other segment it accepts consumes exactly the
+/// declared length.
+fn zune_jpeg_segment_overread(marker: u8, declared: usize) -> usize {
+    usize::from(marker == 0xe0 && declared == 6)
+}
+
 fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
     if bytes.get(..2) != Some(&[0xff, 0xd8]) {
         return None;
@@ -3223,20 +3232,121 @@ fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
             });
         }
 
-        offset = payload_end;
+        // Match zune-jpeg's APP0 length-6 over-read so a fake SOF placed
+        // immediately after that segment cannot become the projected frame.
+        offset = payload_end + zune_jpeg_segment_overread(marker, segment_len);
     }
 
     None
+}
+
+/// Allowance per metadata segment for the record zune-jpeg keeps for it, such
+/// as an `ExtendedXmpSegment` (56 bytes plus a 32-byte GUID allocation) or an
+/// `ICCChunk` (32 bytes), in a `Vec` whose capacity may have doubled.
+const JPEG_METADATA_SEGMENT_OVERHEAD_BYTES: u64 = 192;
+
+/// The marker context [`jpeg_retained_metadata_allocation`] is in, following
+/// zune-jpeg 0.5.15. Which markers carry a length differs between them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JpegWalkContext {
+    /// Before the first SOS (`decode_headers_internal`): every marker other
+    /// than SOS and EOI is read with its length, including RST, SOI, and TEM,
+    /// which reach the length-skipping default arm of `parse_marker_inner`.
+    Headers,
+    /// Entropy-coded data after an SOS, where restart markers carry no length.
+    Scan,
+    /// Markers after a scan. Baseline frames read every marker other than SOS
+    /// and EOI with its length (`advance_to_next_sos`); progressive frames
+    /// handle RST without one and the rest through `parse_marker_inner`.
+    BetweenScans,
+}
+
+/// Upper bound on the metadata zune-jpeg 0.5.15 copies out of the stream and
+/// keeps for the whole decode: EXIF, XMP, extended XMP, IPTC, ICC, MPF, and
+/// gain-map payloads, all carried in APPn segments, wherever they appear
+/// (zune-jpeg also parses markers between and after scans). Twice each payload
+/// covers the retained copy and the buffer extended XMP is reassembled into
+/// while its chunks are still held.
+///
+/// The walk follows zune-jpeg's marker handling in each [`JpegWalkContext`],
+/// skipping each segment by the length zune-jpeg consumes: the declared length,
+/// plus [`zune_jpeg_segment_overread`]. Stuffed zeros and fill bytes are never
+/// markers, and nothing after EOI is parsed. Where zune-jpeg stops early, on an
+/// error or a marker that ends a baseline decode, the walk carries on, which
+/// can only over-count.
+fn jpeg_retained_metadata_allocation(bytes: &[u8]) -> u64 {
+    let mut total = 0u64;
+    let mut offset = 2usize;
+    let mut context = JpegWalkContext::Headers;
+    let mut progressive = false;
+    while let Some(found) = bytes
+        .get(offset..)
+        .and_then(|rest| rest.iter().position(|&byte| byte == 0xff))
+    {
+        let at = offset + found;
+        let Some(&marker) = bytes.get(at + 1) else {
+            break;
+        };
+        match marker {
+            // A fill byte: any marker follows the last 0xFF.
+            0xff => {
+                offset = at + 1;
+                continue;
+            }
+            // A stuffed zero is data in every context.
+            0x00 => {
+                offset = at + 2;
+                continue;
+            }
+            // zune-jpeg stops at EOI after a scan and rejects one before it.
+            0xd9 => break,
+            _ => {}
+        }
+        let restart = (0xd0..=0xd7).contains(&marker);
+        let lengthless = restart
+            && match context {
+                JpegWalkContext::Headers => false,
+                JpegWalkContext::Scan => true,
+                JpegWalkContext::BetweenScans => progressive,
+            };
+        if lengthless {
+            offset = at + 2;
+            continue;
+        }
+        let Some(length) = bytes.get(at + 2..at + 4) else {
+            break;
+        };
+        let declared = usize::from(u16::from_be_bytes([length[0], length[1]]));
+        if matches!(marker, 0xe0..=0xef | 0xfe) {
+            let available = bytes.len().saturating_sub(at + 4);
+            let payload = declared.saturating_sub(2).min(available) as u64;
+            total = total
+                .saturating_add(payload.saturating_mul(2))
+                .saturating_add(JPEG_METADATA_SEGMENT_OVERHEAD_BYTES);
+        }
+        if context == JpegWalkContext::Headers && marker == 0xc2 {
+            progressive = true;
+        }
+        // zune-jpeg skips `declared - 2` bytes after the length field, plus
+        // its APP0 over-read. A length below 2 is rejected in headers and read
+        // without a skip between baseline scans.
+        offset = at + 4 + declared.saturating_sub(2) + zune_jpeg_segment_overread(marker, declared);
+        context = match (marker, context) {
+            (0xda, _) => JpegWalkContext::Scan,
+            (_, JpegWalkContext::Headers) => JpegWalkContext::Headers,
+            _ => JpegWalkContext::BetweenScans,
+        };
+    }
+    total
 }
 
 /// Conservative JPEG auxiliary allocation (coefficients plus row scratch),
 /// derived from the SOF dimensions and sampling factors. Returns `None` for a
 /// malformed/unprojectable header; callers then use a worst-case fallback so
 /// malformed input is refused rather than admitted cheaply.
-fn jpeg_auxiliary_allocation(bytes: &[u8], width: u32, height: u32) -> Option<u64> {
-    let header = jpeg_frame_header(bytes)?;
-    let width = u64::from(width.max(header.width));
-    let height = u64::from(height.max(header.height));
+fn jpeg_auxiliary_allocation(header: &JpegFrameHeader) -> Option<u64> {
+    let width = u64::from(header.width);
+    let height = u64::from(header.height);
     let h_max = u64::from(header.components.iter().map(|c| c.horizontal).max()?);
     let v_max = u64::from(header.components.iter().map(|c| c.vertical).max()?);
     if h_max == 0 || v_max == 0 {
@@ -3359,6 +3469,14 @@ const WEBP_ANIMATED_SCRATCH_MODEL: AnimationScratchModel = AnimationScratchModel
 fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<u64> {
     let format = image_format_for_mime(source, mime)?;
 
+    // JPEG's `into_decoder()` copies the encoded input and walks retained
+    // metadata before `Limits` apply. Project from the SOF on the borrowed
+    // bytes instead so admission can refuse oversized images without that
+    // proportional allocation.
+    if format == image::ImageFormat::Jpeg {
+        return projected_jpeg_allocation(source, mime, bytes);
+    }
+
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DECODED_IMAGE_DIMENSION);
     limits.max_image_height = Some(MAX_DECODED_IMAGE_DIMENSION);
@@ -3374,8 +3492,8 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
         reason: error.to_string(),
     };
 
-    // Header-only: this parses IHDR / RIFF chunk headers / the GIF screen
-    // descriptor, it does not decode pixels.
+    // Header-only for PNG / GIF / WebP: this parses IHDR / RIFF chunk headers /
+    // the GIF screen descriptor, it does not decode pixels.
     let decoder = reader.into_decoder().map_err(corrupt)?;
     let (width, height) = image::ImageDecoder::dimensions(&decoder);
     let output = image::ImageDecoder::total_bytes(&decoder);
@@ -3437,23 +3555,62 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
                 0
             }
         }
-        image::ImageFormat::Jpeg => {
-            // zune-jpeg's full-image coefficient planes are not visible via
-            // `ImageDecoder::total_bytes`. Use the SOF-derived bound, falling
-            // back to a deliberately expensive estimate when a malformed
-            // header cannot be projected. The latter is only reached for
-            // input that will fail full decode anyway, and ensures it cannot
-            // sneak past the pre-decode per-image cap.
-            jpeg_auxiliary_allocation(bytes, width, height).unwrap_or_else(|| {
-                pixels
-                    .saturating_mul(8)
-                    .saturating_add(u64::from(width).saturating_mul(64).saturating_mul(8))
-            })
-        }
+        // JPEG returns earlier via `projected_jpeg_allocation`.
         _ => 0,
     };
 
     Ok(output.saturating_add(scratch))
+}
+
+/// Project JPEG decode peak from the SOF without constructing `JpegDecoder`.
+///
+/// `image` 0.25.10's JPEG decoder copies the whole encoded input during
+/// `into_decoder()` (before `Limits`), so admission must not call that path
+/// just to learn dimensions. Output follows the colour type zune/image yield
+/// here: one SOF component → Luma8 (1 B/px), otherwise Rgb8 (3 B/px). Decode
+/// still constructs `JpegDecoder` later, so the projection also charges the
+/// input-proportional copies and retained APPn metadata that path keeps.
+fn projected_jpeg_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Result<u64> {
+    let Some(header) = jpeg_frame_header(bytes) else {
+        return Err(MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.to_string(),
+            reason: "JPEG frame header could not be read for admission".into(),
+        }
+        .into());
+    };
+    if header.width == 0
+        || header.height == 0
+        || header.width > MAX_DECODED_IMAGE_DIMENSION
+        || header.height > MAX_DECODED_IMAGE_DIMENSION
+    {
+        return Err(MultimodalError::CorruptImage {
+            input: source.to_string(),
+            mime: mime.to_string(),
+            reason: format!(
+                "JPEG dimensions {}x{} are outside the admission range",
+                header.width, header.height
+            ),
+        }
+        .into());
+    }
+
+    let bytes_per_pixel = if header.components.len() == 1 { 1 } else { 3 };
+    let pixels = u64::from(header.width).saturating_mul(u64::from(header.height));
+    let output = pixels.saturating_mul(bytes_per_pixel);
+    let scratch = jpeg_auxiliary_allocation(&header).unwrap_or_else(|| {
+        pixels
+            .saturating_mul(8)
+            .saturating_add(u64::from(header.width).saturating_mul(64).saturating_mul(8))
+    });
+    // Still paid on the decode path: `JpegDecoder::new` copies the input, and
+    // zune keeps a second live view plus retained APPn payloads.
+    let decode_time_copies = (bytes.len() as u64)
+        .saturating_mul(2)
+        .saturating_add(jpeg_retained_metadata_allocation(bytes));
+    Ok(output
+        .saturating_add(scratch)
+        .saturating_add(decode_time_copies))
 }
 
 /// `dispose_op` value in an APNG `fcTL` chunk meaning "clear the frame's region
@@ -5770,7 +5927,8 @@ mod tests {
         // each chroma plane uses 2x1. Every coefficient is an i16 in zune-
         // jpeg's progressive/full-image path.
         let bytes = jpeg_sof_header(17, 9, &[(2, 2), (1, 1), (1, 1)]);
-        let auxiliary = jpeg_auxiliary_allocation(&bytes, 17, 9)
+        let header = jpeg_frame_header(&bytes).expect("synthetic SOF parses");
+        let auxiliary = jpeg_auxiliary_allocation(&header)
             .expect("synthetic SOF should yield a conservative projection");
         let coefficient_bytes = (8 + 2 + 2) * 64 * JPEG_COEFFICIENT_BYTES_PER_SAMPLE;
         let row_scratch =
@@ -5784,7 +5942,8 @@ mod tests {
         // coefficients before its 36 MB output buffer, so it must fail the
         // 64 MiB per-image admission check without entering the decoder.
         let bytes = jpeg_sof_header(6000, 6000, &[(1, 1)]);
-        let auxiliary = jpeg_auxiliary_allocation(&bytes, 6000, 6000).unwrap();
+        let header = jpeg_frame_header(&bytes).expect("synthetic SOF parses");
+        let auxiliary = jpeg_auxiliary_allocation(&header).unwrap();
         let projected = 6000u64 * 6000 + auxiliary;
         assert!(projected > MAX_DECODED_IMAGE_ALLOC_BYTES);
         assert!(per_image_cap_refusal("large.jpg", "image/jpeg", projected).is_some());
@@ -5888,7 +6047,7 @@ mod tests {
         let header = jpeg_frame_header(&bytes).expect("the real frame header must be found");
         assert_eq!(header.components.len(), 3);
         let projected = 3000u64 * 3000 * 3
-            + jpeg_auxiliary_allocation(&bytes, 3000, 3000)
+            + jpeg_auxiliary_allocation(&header)
                 .expect("the real frame must have a conservative projection");
         assert!(projected > MAX_DECODED_IMAGE_ALLOC_BYTES);
 
@@ -5913,6 +6072,60 @@ mod tests {
         validate_within_budget("sibling.png", "image/png", &valid_png(), &mut budget)
             .await
             .expect("a valid sibling must remain admissible");
+    }
+
+    #[tokio::test]
+    async fn app0_length_six_cannot_hide_a_larger_jpeg_frame_from_admission() {
+        // zune-jpeg's APP0 length-6 arm reads one byte past the declared
+        // payload, eating the FF of the next marker. A fake small SOF right
+        // after that segment must not control admission while a later large
+        // progressive frame is the one that would actually decode.
+        let fake = jpeg_sof_header(16, 16, &[(1, 1)]);
+        let mut real = jpeg_sof_header(6000, 6000, &[(1, 1)]);
+        real[3] = 0xc2; // progressive SOF2
+
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x06, b'A', b'B', b'C', b'D'];
+        bytes.extend_from_slice(&fake[2..]);
+        bytes.extend_from_slice(&real[2..]);
+
+        assert!(
+            jpeg_frame_header(&bytes).is_none(),
+            "APP0 length-6 over-read must desync the fake SOF the same way zune does"
+        );
+
+        let mut budget = AGGREGATE_DECODE_BUDGET_BYTES;
+        let initial_budget = budget;
+        let (error, decodes) = counting_decodes(async {
+            validate_within_budget("hidden-frame.jpg", "image/jpeg", &bytes, &mut budget)
+                .await
+                .expect_err("hidden large frame must be refused before decode")
+        })
+        .await;
+        assert_eq!(multimodal_error_kind(&error), "corrupt_image");
+        assert_eq!(decodes, 0, "refusal must happen before pixel decoding");
+        assert_eq!(
+            budget, initial_budget,
+            "a per-image refusal must preserve budget for valid siblings"
+        );
+
+        validate_within_budget("sibling.png", "image/png", &valid_png(), &mut budget)
+            .await
+            .expect("a valid sibling must remain admissible");
+    }
+
+    #[test]
+    fn grayscale_jpeg_near_cap_keeps_one_byte_output_charge() {
+        // A 4000x4000 one-component JPEG projects ~50 MiB on master (1 B/px
+        // output + coefficient planes). Charging 3 B/px would push it over the
+        // 64 MiB cap and shrink support as a side effect of the no-copy path.
+        let bytes = jpeg_sof_header(4000, 4000, &[(1, 1)]);
+        let projected = projected_allocation("gray.jpg", "image/jpeg", &bytes)
+            .expect("ordinary grayscale SOF must project");
+        assert!(
+            projected <= MAX_DECODED_IMAGE_ALLOC_BYTES,
+            "grayscale near-cap JPEG must stay under the per-image ceiling, got {projected}"
+        );
+        assert!(per_image_cap_refusal("gray.jpg", "image/jpeg", projected).is_none());
     }
 
     #[tokio::test]
