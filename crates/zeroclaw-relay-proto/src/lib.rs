@@ -429,6 +429,15 @@ mod tests {
     }
 
     #[test]
+    fn from_json_accepts_line_terminated_control_frames() {
+        let frame = Control::Opened { conn_id: 9 }.to_json();
+        assert_eq!(
+            Control::from_json(&format!("{frame}\r\n")).unwrap(),
+            Control::Opened { conn_id: 9 }
+        );
+    }
+
+    #[test]
     fn data_round_trips() {
         let payload = b"the inner mTLS ciphertext bytes";
         let framed = encode_data(0x0102_0304_0506_0708, payload);
