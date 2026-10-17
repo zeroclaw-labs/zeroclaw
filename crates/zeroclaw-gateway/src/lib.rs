@@ -1234,7 +1234,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         config.memory.clone(),
         config.data_dir.clone(),
     ));
-    let canvas_store = canvas_store.unwrap_or_default();
+    let canvas_store = canvas_store.unwrap_or_else(|| CanvasStore::for_data_dir(&config.data_dir));
     let agent_alias_opt = default_agent_alias(&config);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
