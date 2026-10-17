@@ -6377,13 +6377,7 @@ fn render_with_plan_placement(
     let input_area = area;
 
     let queue_paused_hint = if state.queue_paused() && state.queue_len() > 0 {
-        Some(crate::i18n::t_args(
-            match state.message_queue.pause_reason() {
-                Some(QueuePauseReason::MissingCompletion) => "zc-queue-missing-completion-ghost",
-                _ => "zc-queue-paused-ghost",
-            },
-            &[("key", &resume_queue_chord_label())],
-        ))
+        Some(paused_queue_hint(state.message_queue.pause_reason()))
     } else {
         None
     };
@@ -6528,12 +6522,48 @@ fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> O
     }
 }
 
+/// Read the same live binding table used by input dispatch.
+fn send_chord_label() -> String {
+    use crate::keymap::InputBarAction;
+    InputBarAction::resolved_bindings()
+        .into_iter()
+        .find_map(|(chord, action)| (action == InputBarAction::Submit).then(|| chord.display()))
+        .unwrap_or_default()
+}
+
 fn resume_queue_chord_label() -> String {
-    crate::keymap::ChatTabAction::PauseResumeQueue
-        .default_chords()
-        .first()
-        .map(|c| c.display())
-        .unwrap_or_else(|| "Alt+P".to_string())
+    use crate::keymap::ChatTabAction;
+    ChatTabAction::resolved_bindings()
+        .into_iter()
+        .find_map(|(chord, action)| {
+            (action == ChatTabAction::PauseResumeQueue).then(|| chord.display())
+        })
+        .unwrap_or_default()
+}
+
+fn paused_queue_hint(reason: Option<QueuePauseReason>) -> String {
+    let send = send_chord_label();
+    let resume = resume_queue_chord_label();
+    let missing_completion = reason == Some(QueuePauseReason::MissingCompletion);
+    match (send.is_empty(), resume.is_empty()) {
+        (true, true) => crate::i18n::t("zc-queue-paused-no-key-ghost"),
+        (true, false) | (false, true) => crate::i18n::t_args(
+            if missing_completion {
+                "zc-queue-missing-completion-single-key-ghost"
+            } else {
+                "zc-queue-paused-single-key-ghost"
+            },
+            &[("key", if send.is_empty() { &resume } else { &send })],
+        ),
+        (false, false) => crate::i18n::t_args(
+            if missing_completion {
+                "zc-queue-missing-completion-ghost"
+            } else {
+                "zc-queue-paused-ghost"
+            },
+            &[("key", &resume), ("send", &send)],
+        ),
+    }
 }
 
 /// Queue-management help entries shown whenever the queue sidebar is open —
@@ -27304,6 +27334,180 @@ mod tests {
             .join("\n")
     }
 
+    // Keep process-global overrides stable across rendering and async dispatch.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn paused_queue_hints_follow_resolved_bindings_in_rendered_input_bar() {
+        use crate::keymap::{ChatTabAction, Chord, InputBarAction as KeymapInputAction, overrides};
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        const CHILD_ENV: &str = "ZEROCODE_QUEUE_HINT_TEST_CHILD";
+        const CHILD_SUCCESS: &str = "queue hint rendering and dispatch matrix passed";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "chat::tests::paused_queue_hints_follow_resolved_bindings_in_rendered_input_bar",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "queue hint subprocess failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_SUCCESS),
+                "queue hint subprocess did not execute the full matrix",
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        overrides::reset();
+        struct ResetBindings;
+        impl Drop for ResetBindings {
+            fn drop(&mut self) {
+                overrides::reset();
+            }
+        }
+        let _reset = ResetBindings;
+        let enter = Chord::key(KeyCode::Enter);
+        let alt_p = Chord::with(KeyCode::Char('p'), KeyModifiers::ALT);
+        let f5 = Chord::key(KeyCode::F(5));
+        let f6 = Chord::key(KeyCode::F(6));
+
+        for (send, resume) in [
+            (Some(enter), Some(alt_p)),
+            (Some(f5.clone()), Some(f6.clone())),
+            (None, Some(f6)),
+            (Some(f5), None),
+            (None, None),
+        ] {
+            overrides::set_row(
+                KeymapInputAction::TAG,
+                &KeymapInputAction::Submit.variant_name(),
+                send.clone().into_iter().collect(),
+            );
+            overrides::set_row(
+                ChatTabAction::TAG,
+                &ChatTabAction::PauseResumeQueue.variant_name(),
+                resume.clone().into_iter().collect(),
+            );
+            assert_eq!(
+                send_chord_label(),
+                send.as_ref().map(Chord::display).unwrap_or_default()
+            );
+            assert_eq!(
+                resume_queue_chord_label(),
+                resume.as_ref().map(Chord::display).unwrap_or_default()
+            );
+
+            for missing_completion in [false, true] {
+                // Exercise each advertised key independently against both pause reasons.
+                let keys: Vec<_> = send
+                    .iter()
+                    .chain(resume.iter())
+                    .cloned()
+                    .map(Some)
+                    .collect();
+                let keys = if keys.is_empty() { vec![None] } else { keys };
+                for key in keys {
+                    let (mut chat, _writer_rx) = test_chat();
+                    let mut paused = state();
+                    paused.turn_in_flight = true;
+                    paused
+                        .enqueue_message("queued".to_string(), Vec::new())
+                        .unwrap();
+                    paused.commit_turn(String::new(), false);
+                    if missing_completion {
+                        paused
+                            .message_queue
+                            .settle_turn(false, QueuePauseReason::MissingCompletion);
+                    }
+                    assert!(paused.queue_paused());
+                    let hint = paused_queue_hint(paused.message_queue.pause_reason());
+                    match send.as_ref().or(resume.as_ref()) {
+                        Some(primary) => assert!(hint.contains(&primary.display()), "{hint}"),
+                        None => assert_eq!(hint, crate::i18n::t("zc-queue-paused-no-key-ghost")),
+                    }
+                    if send
+                        .as_ref()
+                        .is_none_or(|chord| chord.code != KeyCode::Enter)
+                    {
+                        assert!(!hint.contains("Enter"), "{hint}");
+                    }
+                    if !missing_completion && let Some(resume) = &resume {
+                        assert!(hint.contains(&resume.display()), "{hint}");
+                    }
+                    chat.phase = ChatPhase::Active(Box::new(paused));
+
+                    let width = if missing_completion { 80 } else { 120 };
+                    let dock_width = crate::config::SidebarSection::default().width;
+                    let area = Rect::new(0, 0, width, 24);
+                    let conversation = Rect::new(0, 0, width - dock_width, area.height);
+                    let queue = Rect::new(conversation.width, 0, dock_width, 3);
+                    let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+                    terminal
+                        .draw(|frame| chat.draw_with_dock(frame, conversation, Some(queue), None))
+                        .unwrap();
+                    let rendered = overlay_text(&terminal, area);
+                    let row = rendered
+                        .lines()
+                        .find(|row| row.contains(&hint))
+                        .unwrap_or_else(|| panic!("paused hint not rendered: {rendered}"));
+                    println!("{width}x24 terminal cells: {}", row.trim_end());
+
+                    let mut term: crate::config_manager::Term = Terminal::with_options(
+                        crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                        ratatui::TerminalOptions {
+                            viewport: ratatui::Viewport::Fixed(area),
+                        },
+                    )
+                    .unwrap();
+                    if send
+                        .as_ref()
+                        .is_none_or(|chord| chord.code != KeyCode::Enter)
+                    {
+                        chat.handle_key(
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                            &mut term,
+                        )
+                        .await;
+                        assert!(
+                            active_state(&mut chat).queue_paused(),
+                            "unbound Enter must not resume"
+                        );
+                    }
+                    if let Some(key) = key {
+                        chat.handle_key(
+                            KeyEvent::new(key.code, key.effective_modifiers()),
+                            &mut term,
+                        )
+                        .await;
+                        assert!(
+                            !active_state(&mut chat).queue_paused(),
+                            "{} must resume",
+                            key.display()
+                        );
+                        assert!(
+                            active_state(&mut chat).turn_in_flight,
+                            "resume must dispatch the queued message"
+                        );
+                    }
+                }
+            }
+        }
+        println!("{CHILD_SUCCESS}");
+    }
+
     #[test]
     fn session_list_overlay_renders_memory_isolation_note() {
         use ratatui::{Terminal, backend::TestBackend};
@@ -30868,7 +31072,10 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         let hint = crate::i18n::t_args(
             "zc-queue-missing-completion-ghost",
-            &[("key", &resume_queue_chord_label())],
+            &[
+                ("key", &resume_queue_chord_label()),
+                ("send", &send_chord_label()),
+            ],
         );
         let dock_width = crate::config::SidebarSection::default().width;
         for width in [80, 120] {
