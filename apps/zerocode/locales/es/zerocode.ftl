@@ -163,6 +163,7 @@ zc-queue-paused-ghost = Cola en pausa — presiona { $key } o envía un mensaje 
 zc-queue-missing-completion-ghost = Fin sin confirmar. { $key } o envía para reanudar.
 zc-queue-item-injected = (inyectado)
 zc-queue-resumed = Cola reanudada.
+zc-steer-unconfirmed = No se pudo confirmar que el turno en curso recibiera tu mensaje; vuelve a estar en la entrada. Puede que ya haya llegado: compruébalo antes de reenviarlo.
 zc-queue-clear-empty = La cola ya está vacía.
 zc-queue-cleared-all = Se eliminaron { $count } mensaje(s) de la cola.
 zc-queue-cleared-one = Se eliminó el mensaje en cola { $index }.
