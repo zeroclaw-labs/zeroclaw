@@ -1142,7 +1142,7 @@ jobs:
           - name: WeChat
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-wechat --lib wechat::"
           - name: Lark
-            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark::"
           - name: Matrix
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-matrix --lib matrix::"
           - name: QQ
