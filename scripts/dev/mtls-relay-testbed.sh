@@ -36,7 +36,7 @@
 #   ZC_NODE_ID        relay node-id         (default: testbed-daemon)
 #   ZC_PROFILE        cargo profile         (release|debug, default: release)
 #   CARGO_TARGET_DIR  cargo output/cache dir (default: /opt/cargo-build)
-#   ZC_CARGO_TOOLCHAIN cargo toolchain flag  (default: +1.96.1 when installed)
+#   ZC_CARGO_TOOLCHAIN cargo toolchain flag  (default: +1.99.0 when installed)
 #
 # Flags:
 #   --check-only      run both self-checks, tear everything down, exit (CI smoke)
@@ -78,8 +78,8 @@ CARGO_TOOLCHAIN="${ZC_CARGO_TOOLCHAIN:-}"
 CARGO_CMD=(cargo)
 if [ -n "$CARGO_TOOLCHAIN" ]; then
   CARGO_CMD=(cargo "$CARGO_TOOLCHAIN")
-elif command -v rustup >/dev/null 2>&1 && rustup toolchain list | grep -q '^1\.96\.1-'; then
-  CARGO_CMD=(cargo +1.96.1)
+elif command -v rustup >/dev/null 2>&1 && rustup toolchain list | grep -q '^1\.99\.0-'; then
+  CARGO_CMD=(cargo +1.99.0)
 fi
 
 case "$PROFILE" in

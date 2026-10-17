@@ -39,13 +39,13 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.0
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.99.0
       - name: Record tested revision
         shell: bash
         run: git rev-parse HEAD >> "$GITHUB_STEP_SUMMARY"
@@ -107,7 +107,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.99.0
       - name: Install plugin fixture target
         if: needs.windows-test-scope.outputs.needs_plugin_host == 'true'
         run: rustup target add wasm32-wasip2

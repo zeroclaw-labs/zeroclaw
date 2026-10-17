@@ -1158,7 +1158,7 @@ mod tests {
         assert_eq!(retained_memory.count().await.unwrap(), 1);
 
         apply_delete(&mut config, &AliasKind::Agent, "victim").unwrap();
-        assert!(config.agents.is_empty());
+        assert_eq!(config.agents.len(), 0);
         agent_delete_owned_state(&config, "victim", &workspace, handles)
             .await
             .unwrap();
