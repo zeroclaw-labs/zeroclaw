@@ -3519,15 +3519,19 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
     format!("{base_prompt}\n\n{refreshed_skills}")
 }
 
-fn rendered_skills_prompt_mode(
-    prompt: &str,
-) -> Option<zeroclaw_config::schema::SkillsPromptInjectionMode> {
+fn rendered_skills_section(prompt: &str) -> Option<&str> {
     const SKILLS_HEADER: &str = "## Available Skills\n\n";
     const SKILLS_END: &str = "</available_skills>";
 
     let start = prompt.find(SKILLS_HEADER)?;
     let rel_end = prompt[start..].find(SKILLS_END)?;
-    let section = &prompt[start..start + rel_end + SKILLS_END.len()];
+    Some(&prompt[start..start + rel_end + SKILLS_END.len()])
+}
+
+fn rendered_skills_prompt_mode(
+    prompt: &str,
+) -> Option<zeroclaw_config::schema::SkillsPromptInjectionMode> {
+    let section = rendered_skills_section(prompt)?;
     let preamble = section.split_once("<available_skills>")?.0;
 
     if preamble.contains("Skill summaries are preloaded below") {
@@ -3714,8 +3718,15 @@ fn system_prompt_for_channel_turn(
     );
     let cached_mode_changed = rendered_skills_prompt_mode(base_prompt)
         .is_some_and(|cached_mode| cached_mode != desired_mode);
+    // Full mode can also load built-ins on demand. Its mode stays Full when
+    // the loader disappears or returns, but the cached instructions must change.
+    let cached_builtin_loading_changed =
+        rendered_skills_section(base_prompt).is_some_and(|section| {
+            section.contains("<location>builtin://")
+                && section.contains("<loading>on-demand</loading>") != read_skill_available
+        });
 
-    let prompt = if refresh_skills || cached_mode_changed {
+    let prompt = if refresh_skills || cached_mode_changed || cached_builtin_loading_changed {
         refreshed_skills_system_prompt(ctx, base_prompt, callable_protocol_exposed, excluded_tools)
     } else {
         base_prompt.to_string()
@@ -16928,13 +16939,15 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             ),
         ];
 
-        if matches!(
+        if zeroclaw_runtime::skills::skills_require_read_tool(
+            &skills,
             config.effective_skills_prompt_mode(agent_alias),
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
         ) {
             tool_descs.push((
                 "read_skill",
-                "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
+                zeroclaw_runtime::i18n::get_tool_description("read_skill").unwrap_or(
+                    "Load the full source for an available skill by name. Use when: its prompt entry marks the instructions as on-demand.",
+                ),
             ));
         }
         if config.browser.enabled {
@@ -45502,6 +45515,31 @@ BTC is currently around $65,000 based on latest tool output."#
             "an established session must inline instructions when its active provider loses the loader protocol"
         );
         assert!(!provider_transition_prompt.contains("read_skill(name)"));
+        assert!(provider_transition_prompt.contains("# ZeroClaw self-knowledge and operation"));
+
+        let mut full_config = config.clone();
+        full_config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let full_ctx = ChannelRuntimeContext {
+            prompt_config: Arc::new(full_config),
+            ..runtime_ctx.as_ref().clone()
+        };
+        let cached_full = refreshed_skills_system_prompt(&full_ctx, "", true, &[]);
+        assert_eq!(
+            rendered_skills_prompt_mode(&cached_full),
+            Some(zeroclaw_config::schema::SkillsPromptInjectionMode::Full),
+        );
+        assert!(!cached_full.contains("# ZeroClaw self-knowledge and operation"));
+        let full_fallback =
+            system_prompt_for_channel_turn(&full_ctx, &cached_full, false, false, &[], None);
+        assert!(!full_fallback.contains("read_skill(name)"));
+        assert!(full_fallback.contains("# ZeroClaw self-knowledge and operation"));
+        assert!(full_fallback.contains("Expose this skill on fresh sessions."));
+        let full_restored =
+            system_prompt_for_channel_turn(&full_ctx, &full_fallback, false, true, &[], None);
+        assert!(full_restored.contains("<loading>on-demand</loading>"));
+        assert!(!full_restored.contains("# ZeroClaw self-knowledge and operation"));
+        assert!(full_restored.contains("Expose this skill on fresh sessions."));
 
         let full_callable_skills = build_skills_prompt_with_effective_tools(
             &refreshed_skills,
@@ -45841,6 +45879,27 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_impl: Arc<HistoryCaptureModelProvider>,
         memory: Arc<dyn Memory>,
     ) -> Arc<ChannelRuntimeContext> {
+        let agent_alias = "test-agent";
+        let workspace_dir = std::env::temp_dir().join(format!(
+            "zeroclaw-cache-stability-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let prompt_config = Arc::new(zeroclaw_config::schema::Config::default());
+        let skills_prompt = zeroclaw_runtime::skills::skills_to_prompt(
+            &zeroclaw_runtime::skills::load_skills_for_agent(
+                &workspace_dir,
+                prompt_config.as_ref(),
+                agent_alias,
+            ),
+            &workspace_dir,
+        );
+        // Production contexts already contain the effective skills section.
+        // Keep this fixture faithful so a new-session refresh remains byte
+        // identical to subsequent turns.
+        let system_prompt = replace_available_skills_section(
+            "test-system-prompt\n\n## Workspace\n\nTest workspace.",
+            &skills_prompt,
+        );
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
@@ -45850,7 +45909,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl,
             model_provider_ref: Arc::new("test-provider".to_string()),
-            agent_alias: Arc::new("test-agent".to_string()),
+            agent_alias: Arc::new(agent_alias.to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: memory.clone(),
             memory_strategy: Arc::new(
@@ -45864,7 +45923,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new()),
             ),
             observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
+            system_prompt: Arc::new(system_prompt),
             model: Arc::new("test-model".to_string()),
             temperature: Some(0.0),
             auto_save_memory: false,
@@ -45884,8 +45943,8 @@ BTC is currently around $65,000 based on latest tool output."#
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            workspace_dir: Arc::new(workspace_dir),
+            prompt_config,
             live_config: zeroclaw_config::live::LiveConfig::new(
                 zeroclaw_config::schema::Config::default(),
             )
