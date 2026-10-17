@@ -269,6 +269,7 @@ pub fn make_prop_field(
         tab,
         alias_source,
         multiline,
+        setup: None,
     }
 }
 

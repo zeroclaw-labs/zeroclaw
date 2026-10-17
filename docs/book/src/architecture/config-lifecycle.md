@@ -30,6 +30,14 @@ Do not hand-edit the generated config reference. If a field, enum, alias
 section, secret marker, or description is wrong there, fix the schema or the
 generator and regenerate the reference.
 
+## Setup guidance
+
+The `config/list` RPC exposes optional per-field setup metadata from the current typed `Config`. A present `setup` entry identifies a required field under a covered contract; `missing` reports whether that contract considers its value empty. An absent entry means unknown requiredness, not optionality or readiness. The metadata is derived during introspection and is never persisted.
+
+Route guidance shares the required-value checks used by `Config::validate`. Cloud TTS key guidance shares the trimmed-key accessor used by its constructors. Missing secret values are checked against typed values before display masking. Model-provider authentication remains conditional on the provider and authentication mode; setup metadata does not check external logins, executables, connectivity, or provider readiness.
+
+In ZeroCode Config, confirming an alias name saves the entry before opening its fields. Cancelling the name form does not create an entry. Leaving the field editor afterward keeps the saved entry, and field edits retain their existing persistence behavior.
+
 ## Load order
 
 Config load has a few distinct phases:

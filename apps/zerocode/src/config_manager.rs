@@ -18,7 +18,7 @@ use ratatui::{
     Frame, Terminal,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -2858,6 +2858,25 @@ impl App {
         Ok(())
     }
 
+    /// Focus setup only after creation; ordinary opens and refreshes preserve navigation.
+    fn focus_missing_setup_field(&mut self) {
+        let Some(index) = self
+            .fields
+            .iter()
+            .position(|field| field.setup.as_ref().is_some_and(|setup| setup.missing))
+        else {
+            return;
+        };
+        self.field_cursor = index;
+        if let Some(tab) = self
+            .tab_names
+            .iter()
+            .position(|tab| *tab == self.fields[index].tab)
+        {
+            self.active_tab = tab;
+        }
+    }
+
     // ── Alias creation ───────────────────────────────────────────
 
     async fn handle_alias_create(&mut self, key: KeyEvent) -> Result<()> {
@@ -2900,6 +2919,7 @@ impl App {
                             let mut bc = breadcrumb;
                             bc.push(name);
                             self.load_fields(&prefix).await?;
+                            self.focus_missing_setup_field();
                             self.screen = Screen::FieldList {
                                 section_idx,
                                 prefix,
@@ -4691,8 +4711,36 @@ impl App {
         section_idx: usize,
         breadcrumb: &[String],
     ) {
-        let mut r = regions(area);
         let section = &self.sections[section_idx];
+        let guidance =
+            if self.aliases.is_empty() && self.detail_filter().is_none() && self.alias_tab == 0 {
+                setup_section_key(&section.key).map(|key| {
+                    format!(
+                        "{}\n{}\n{}",
+                        crate::i18n::t("zc-config-setup-empty"),
+                        crate::i18n::t(key),
+                        crate::i18n::t_args(
+                            "zc-config-setup-add",
+                            &[("keys", &tab_key(crate::keymap::ConfigTabAction::Enter))],
+                        ),
+                    )
+                })
+            } else {
+                None
+            };
+        let mut r = guidance.as_ref().map_or_else(
+            || {
+                if self.detail_filter().is_some()
+                    && self.filtered_indices(&self.aliases).is_empty()
+                    && self.alias_list_has_tabs()
+                {
+                    regions_with_help(area, 3)
+                } else {
+                    regions(area)
+                }
+            },
+            |text| guidance_regions(area, text, self.alias_list_has_tabs()),
+        );
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
@@ -4705,7 +4753,7 @@ impl App {
             use ratatui::layout::{Constraint, Direction, Layout};
             let split = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
                 .split(r.help);
             r.help = split[1];
             Some(split[0])
@@ -4740,13 +4788,23 @@ impl App {
             render_filter_bar(frame, r.help, buf, &crate::i18n::t("zc-config-filter-list"));
         } else {
             frame.render_widget(
-                Paragraph::new(Span::styled(&section.help, theme::dim_style()))
-                    .wrap(Wrap { trim: false }),
+                Paragraph::new(Text::styled(
+                    guidance.as_deref().unwrap_or(&section.help),
+                    theme::dim_style(),
+                ))
+                .wrap(Wrap { trim: false }),
                 r.help,
             );
         }
 
         let visible = self.filtered_indices(&self.aliases);
+        if self.detail_filter().is_some() && visible.is_empty() && r.help.height > 1 {
+            frame.render_widget(
+                Paragraph::new(crate::i18n::t("zc-config-setup-no-filter-matches"))
+                    .style(theme::dim_style()),
+                Rect::new(r.help.x, r.help.y + 1, r.help.width, r.help.height - 1),
+            );
+        }
 
         let mut items: Vec<ListItem> = visible
             .iter()
@@ -4846,7 +4904,41 @@ impl App {
     }
 
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
-        let r = regions(area);
+        let setup_section = match &self.screen {
+            // Rate sheets created from the Costs tab are not aliases.
+            Screen::AliasCreate {
+                section_idx,
+                map_path,
+                ..
+            } if !map_path.starts_with("cost.") => self
+                .sections
+                .get(*section_idx)
+                .and_then(|section| setup_section_key(&section.key)),
+            _ => None,
+        };
+        // One paragraph: the narrow create pane has no row to spare for a break.
+        let hint = if let Some(key) = setup_section {
+            format!(
+                "{} {}",
+                crate::i18n::t(key),
+                crate::i18n::t_args(
+                    "zc-config-setup-create",
+                    &[
+                        (
+                            "confirm",
+                            &editor_key(crate::keymap::ConfigEditorAction::Confirm)
+                        ),
+                        (
+                            "cancel",
+                            &editor_key(crate::keymap::ConfigEditorAction::Cancel)
+                        ),
+                    ],
+                ),
+            )
+        } else {
+            crate::i18n::t("zc-config-alias-create-hint")
+        };
+        let r = guidance_regions(area, &hint, false);
 
         let mut bc: Vec<String> = Vec::new();
         bc.extend(breadcrumb.iter().cloned());
@@ -4854,10 +4946,7 @@ impl App {
         self.last_breadcrumb_areas = render_breadcrumb(frame, r.breadcrumb, &bc);
 
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                crate::i18n::t("zc-config-alias-create-hint"),
-                theme::dim_style(),
-            )),
+            Paragraph::new(Span::styled(hint, theme::dim_style())).wrap(Wrap { trim: false }),
             r.help,
         );
 
@@ -5037,6 +5126,18 @@ impl App {
                         .unwrap_or_else(|| "<unset>".to_string())
                 };
 
+                let setup_marker = f
+                    .setup
+                    .as_ref()
+                    .map(|setup| {
+                        let key = if setup.missing {
+                            "zc-config-setup-required-missing"
+                        } else {
+                            "zc-config-setup-required"
+                        };
+                        format!(" [{}]", crate::i18n::t(key))
+                    })
+                    .unwrap_or_default();
                 let env_marker = if f.is_env_overridden { " [env]" } else { "" };
                 let press_hint = if Some(i) == selected_field {
                     let enter_key = tab_key(crate::keymap::ConfigTabAction::Enter);
@@ -5047,7 +5148,8 @@ impl App {
                 } else {
                     String::new()
                 };
-                let line = format!("{short_name} = {val_display}{env_marker}{press_hint}");
+                let line =
+                    format!("{short_name}{setup_marker} = {val_display}{env_marker}{press_hint}");
 
                 let style = if f.populated {
                     theme::body_style()
@@ -5957,14 +6059,40 @@ struct Regions {
     status: Rect,
 }
 
+fn setup_section_key(section: &str) -> Option<&'static str> {
+    match section {
+        "providers.models" => Some("zc-config-setup-model-providers"),
+        "providers.tts" => Some("zc-config-setup-tts-providers"),
+        "model_routes" | "embedding_routes" => Some("zc-config-setup-routes"),
+        _ => None,
+    }
+}
+
+fn guidance_regions(area: Rect, text: &str, has_tabs: bool) -> Regions {
+    let height = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(area.width.max(1))
+        .saturating_add(usize::from(has_tabs));
+    regions_with_help(
+        area,
+        height
+            .min(usize::from(area.height.saturating_sub(6)))
+            .max(2) as u16,
+    )
+}
+
 fn regions(area: Rect) -> Regions {
+    regions_with_help(area, 2)
+}
+
+fn regions_with_help(area: Rect, help_height: u16) -> Regions {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // breadcrumb
-            Constraint::Length(2), // help
-            Constraint::Min(4),    // main
-            Constraint::Length(1), // status
+            Constraint::Length(1),           // breadcrumb
+            Constraint::Length(help_height), // help
+            Constraint::Min(4),              // main
+            Constraint::Length(1),           // status
         ])
         .split(area);
 
@@ -6934,6 +7062,281 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manager.section_cursor, 1);
+    }
+
+    fn set_detail_filter(manager: &mut App, query: String) {
+        manager.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Detail,
+            section_cursor: manager.section_cursor,
+            active_tab: manager.active_tab,
+            detail: None,
+        });
+        manager.filter = Some(query);
+    }
+
+    fn draw_setup_test_frame(frame: &mut Frame, manager: &mut App) {
+        manager.loaded_section = Some(manager.section_cursor);
+        let mut chat = crate::chat::Chat::new(manager.rpc.clone(), crate::chat::PaneKind::Chat);
+        let mut acp = crate::acp::Acp::new(manager.rpc.clone());
+        crate::app::draw_app_frame(
+            frame,
+            crate::app::Mode::Config,
+            &mut chat,
+            &mut acp,
+            |frame, chunks, _, _| manager.draw_into(frame, chunks[1]),
+        );
+    }
+
+    #[test]
+    fn older_daemon_setup_metadata_stays_unknown() {
+        let value = serde_json::to_value(field("model_routes.fast.model")).unwrap();
+        let mut value = value.as_object().unwrap().clone();
+        value.remove("setup");
+        let decoded: ConfigFieldEntry = serde_json::from_value(value.into()).unwrap();
+        assert!(decoded.setup.is_none());
+    }
+
+    #[tokio::test]
+    async fn alias_creation_uses_typed_missing_metadata_and_selects_its_tab() {
+        use crate::jsonrpc::RpcOutbound;
+        use crate::wire::ConfigFieldSetup;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut manager = App::new(rpc, Path::new("/tmp"));
+        manager.sections = vec![typed_section("providers.tts")];
+        manager.screen = Screen::AliasCreate {
+            section_idx: 0,
+            map_path: "providers.tts.openai".to_string(),
+            breadcrumb: vec!["TTS".to_string(), "openai".to_string()],
+        };
+        manager.edit_buf = "sample".to_string();
+        let mut optional = field("providers.tts.openai.sample.voice");
+        optional.tab = ConfigTab::Model;
+        let mut required = field("providers.tts.openai.sample.api_key");
+        required.tab = ConfigTab::Connection;
+        required.is_secret = true;
+        required.populated = true; // Masked display population must not control setup.
+        required.setup = Some(ConfigFieldSetup { missing: true });
+        let responder = tokio::spawn(async move {
+            let create: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(
+                create["method"],
+                crate::client::method::CONFIG_MAP_KEY_CREATE
+            );
+            assert_eq!(create["params"]["key"], "sample");
+            outbound.dispatch_response(
+                create["id"].as_str().unwrap(),
+                Some(serde_json::json!({})),
+                None,
+            );
+            let list: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(list["method"], crate::client::method::CONFIG_LIST);
+            outbound.dispatch_response(
+                list["id"].as_str().unwrap(),
+                Some(serde_json::json!({"entries": [optional, required]})),
+                None,
+            );
+        });
+        manager
+            .handle_alias_create(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        responder.await.unwrap();
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.field_cursor, 1);
+        assert_eq!(manager.tab_names[manager.active_tab], ConfigTab::Connection);
+    }
+
+    #[tokio::test]
+    async fn cancelling_alias_name_only_reads_the_alias_list() {
+        use crate::jsonrpc::RpcOutbound;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let mut manager = App::new(
+            Arc::new(RpcClient::with_rpc(outbound.clone())),
+            Path::new("/tmp"),
+        );
+        manager.sections = vec![typed_section("model_routes")];
+        manager.screen = Screen::AliasCreate {
+            section_idx: 0,
+            map_path: "model_routes".to_string(),
+            breadcrumb: vec!["Routes".to_string()],
+        };
+        manager.edit_buf = "discarded".to_string();
+        let responder = tokio::spawn(async move {
+            let request: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(request["method"], crate::client::method::CONFIG_MAP_KEYS);
+            outbound.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!({"keys": []})),
+                None,
+            );
+            rx
+        });
+        manager
+            .handle_alias_create(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let mut rx = responder.await.unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+    }
+
+    fn render_setup_text(manager: &mut App) -> String {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| draw_setup_test_frame(frame, manager))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn section_search_keeps_setup_guidance_in_the_detail_preview() {
+        let mut manager = test_manager();
+        manager.sections = vec![typed_section("providers.tts")];
+        manager.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: "providers.tts.edge".to_string(),
+            breadcrumb: vec![],
+        };
+        manager.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Sections,
+            section_cursor: 0,
+            active_tab: manager.active_tab,
+            detail: None,
+        });
+        manager.filter = Some("tts".to_string());
+        let text = render_setup_text(&mut manager);
+        assert!(text.contains("No aliases are configured"), "{text}");
+        assert!(!text.contains("No matches. Clear filter."));
+    }
+
+    #[tokio::test]
+    async fn cost_rate_creation_keeps_the_generic_name_hint() {
+        let mut manager = test_manager();
+        manager.sections = vec![typed_section("providers.tts")];
+        manager.screen = Screen::AliasCreate {
+            section_idx: 0,
+            map_path: "cost.rates.providers.tts.openai".to_string(),
+            breadcrumb: vec![],
+        };
+        let text = render_setup_text(&mut manager);
+        assert!(!text.contains("Text-to-speech is optional"), "{text}");
+        assert!(!text.contains("[missing]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn setup_explanation_is_visible_without_adding_selectable_rows() {
+        use ratatui::backend::TestBackend;
+        for (width, height) in [(120, 40), (60, 24)] {
+            let mut manager = test_manager();
+            manager.sections = vec![typed_section("providers.tts")];
+            manager.screen = Screen::AliasList {
+                section_idx: 0,
+                map_path: "providers.tts.edge".to_string(),
+                breadcrumb: vec!["TTS".to_string(), "edge".to_string()],
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_setup_test_frame(frame, &mut manager))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("optional"));
+            assert!(text.contains("[+ Add]"));
+            assert!(!text.contains("list.Text"), "guidance lines ran together");
+            assert_eq!(manager.alias_cursor, 0);
+            assert!(manager.last_main_area.height >= 4);
+            manager.aliases = vec!["present".to_string()];
+            set_detail_filter(&mut manager, "nomatch".to_string());
+            terminal
+                .draw(|frame| draw_setup_test_frame(frame, &mut manager))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("No matches."));
+            assert!(!text.contains("No aliases are configured"));
+            assert!(!text.contains("[+ Add]"));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_field_and_creation_guidance_survive_narrow_detail_pane() {
+        use crate::wire::ConfigFieldSetup;
+        use ratatui::backend::TestBackend;
+        for (width, height) in [(120, 40), (60, 24)] {
+            for path in [
+                "providers.tts.openai.sample.api_key",
+                "model_routes.fast.model_provider",
+            ] {
+                let mut manager = test_manager();
+                manager.sections = vec![typed_section("providers.tts")];
+                manager.zeroclaw_pane = ZeroclawPane::Detail;
+                let prefix = path.rsplit_once('.').unwrap().0.to_string();
+                manager.screen = Screen::FieldList {
+                    section_idx: 0,
+                    prefix,
+                    breadcrumb: vec![],
+                };
+                let mut required = field(path);
+                required.setup = Some(ConfigFieldSetup { missing: true });
+                manager.fields = vec![required];
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| draw_setup_test_frame(frame, &mut manager))
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                let name = path.rsplit_once('.').unwrap().1;
+                assert!(
+                    text.contains(&format!("{name} [missing]")),
+                    "{width} columns: {name}"
+                );
+                manager.screen = Screen::AliasCreate {
+                    section_idx: 0,
+                    map_path: "providers.tts.openai".into(),
+                    breadcrumb: vec![],
+                };
+                terminal
+                    .draw(|frame| draw_setup_test_frame(frame, &mut manager))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let mut detail = String::new();
+                for y in 0..height {
+                    for x in 30..width {
+                        detail.push_str(buffer[(x, y)].symbol());
+                    }
+                    detail.push(' ');
+                }
+                let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert!(detail.contains("cancels without saving"), "{detail}");
+                assert!(detail.contains("keeps the saved entry"), "{detail}");
+            }
+        }
     }
 
     fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
@@ -8151,6 +8554,7 @@ mod tests {
             section: None,
             tab: ConfigTab::None,
             alias_source: None,
+            setup: None,
         }
     }
 
@@ -8409,6 +8813,7 @@ mod tests {
             section: None,
             tab: ConfigTab::None,
             alias_source: None,
+            setup: None,
         }
     }
 

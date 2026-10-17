@@ -78,6 +78,8 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
 /// - `#[application = "model_provider_refresh"]` on a struct classifies all
 ///   emitted children, or on a scalar field classifies only that property.
 ///   Unannotated properties require reload.
+/// - `#[field_metadata = "path::to::annotator"]` on a struct enriches its
+///   property fields after nested paths have been resolved.
 /// - `#[multiline]` on a string field hints surfaces to render a multi-line
 ///   text area (e.g. a PEM key body) instead of a single-line input.
 ///
@@ -153,7 +155,8 @@ fn attrs_have_serde_meta(attrs: &[syn::Attribute], ident: &str) -> bool {
         natural_key,
         tab,
         group,
-        multiline
+        multiline,
+        field_metadata
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -168,6 +171,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 field.application = #application;
             }
         },
+        Ok(None) => quote! {},
+        Err(err) => return err.to_compile_error().into(),
+    };
+    let field_metadata_hook = match extract_field_metadata_hook(&input.attrs) {
+        Ok(Some(path)) => quote! { #path(self, &mut fields); },
         Ok(None) => quote! {},
         Err(err) => return err.to_compile_error().into(),
     };
@@ -404,6 +412,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         tab: #tab_token,
                         alias_source: None,
                         multiline: false,
+                        setup: None,
                     });
                     if let Some(map) = #map_expr {
                         let mut entries: Vec<(&String, &String)> = map.iter().collect();
@@ -428,6 +437,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 tab: #tab_token,
                                 alias_source: None,
                                 multiline: false,
+                                setup: None,
                             });
                         }
                     }
@@ -2130,6 +2140,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         tab: #tab_token,
                         alias_source: #alias_source_expr,
                         multiline: #is_multiline,
+                        setup: None,
                     }
                 }
             });
@@ -2256,6 +2267,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 #(#nested_prop_fields)*
                 #(#dynamic_secret_map_prop_fields)*
                 #struct_application
+                #field_metadata_hook
                 fields
             }
 
@@ -2707,6 +2719,35 @@ fn extract_prefix(input: &DeriveInput) -> String {
     String::new()
 }
 
+fn extract_field_metadata_hook(attrs: &[syn::Attribute]) -> syn::Result<Option<syn::Path>> {
+    let mut hook = None;
+    for attr in attrs {
+        if !attr.path().is_ident("field_metadata") {
+            continue;
+        }
+        if hook.is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "duplicate field_metadata hook",
+            ));
+        }
+        let Meta::NameValue(nv) = &attr.meta else {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected field_metadata = \"path\"",
+            ));
+        };
+        let syn::Expr::Lit(expr_lit) = &nv.value else {
+            return Err(syn::Error::new_spanned(&nv.value, "expected a path string"));
+        };
+        let Lit::Str(path) = &expr_lit.lit else {
+            return Err(syn::Error::new_spanned(&nv.value, "expected a path string"));
+        };
+        hook = Some(path.parse::<syn::Path>()?);
+    }
+    Ok(hook)
+}
+
 fn has_attr(field: &syn::Field, name: &str) -> bool {
     field.attrs.iter().any(|attr| attr.path().is_ident(name))
 }
@@ -3070,6 +3111,24 @@ mod tests {
 
     use super::*;
     use syn::parse_quote;
+
+    #[test]
+    fn field_metadata_hook_requires_a_valid_path() {
+        let valid: DeriveInput = parse_quote! {
+            #[field_metadata = "crate::setup::annotate_fields"]
+            struct RenamedConfig { value: String }
+        };
+        let path = extract_field_metadata_hook(&valid.attrs).unwrap().unwrap();
+        assert_eq!(
+            path.to_token_stream().to_string(),
+            "crate :: setup :: annotate_fields"
+        );
+        let invalid: DeriveInput = parse_quote! {
+            #[field_metadata = "crate::setup::annotate_fields()"]
+            struct RenamedConfig { value: String }
+        };
+        assert!(extract_field_metadata_hook(&invalid.attrs).is_err());
+    }
 
     #[test]
     fn snake_to_kebab_is_identity_passthrough() {

@@ -844,3 +844,14 @@ zc-config-application-awaiting = Awaiting acknowledgement
 zc-config-application-scope-unavailable = Change scope unavailable
 zc-config-application-retired = Target retired
 zc-config-application-whole-config = Whole configuration; individual changed paths are unavailable
+
+# Config setup guidance. Requirements arrive from the daemon's typed schema.
+zc-config-setup-model-providers = A model profile stores connection and model settings. Authentication may use an API key, an external login, or a local server.
+zc-config-setup-tts-providers = Text-to-speech is optional. Add an alias to use spoken output. Cloud backends require credentials; local backends need their executable or server.
+zc-config-setup-routes = Routes are optional. Add a named hint to select a configured provider and a model for that hint.
+zc-config-setup-empty = No aliases are configured in this list.
+zc-config-setup-add = Select [+ Add] and press { $keys } to create an entry.
+zc-config-setup-create = Enter a name. { $confirm } saves it and opens fields. { $cancel } cancels without saving. Fill required fields marked [missing] and check their descriptions. Leaving those fields keeps the saved entry.
+zc-config-setup-required = required
+zc-config-setup-required-missing = missing
+zc-config-setup-no-filter-matches = No matches. Clear filter.
