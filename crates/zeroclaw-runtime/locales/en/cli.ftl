@@ -1127,6 +1127,9 @@ cli-plugin-info-load-failed =
     Rebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it.
 cli-plugin-info-load-not-applicable = Loads: not applicable. This is a skill-only plugin, so there is no component to instantiate.
 cli-plugin-info-load-failed-exit = plugin '{$name}' does not load against this host
+cli-plugin-info-load-config-refused =
+    Loads: no. The component instantiates against this host's WIT world, but the runtime refuses its configuration: {$error}
+    The configuration is the `config` map of the [[plugins.entries]] row named '{$key}'. Make it match the installed package's config_schema, or remove its values if the package declares none.
 cli-estop-domains-none = {"  "}domain_blocks:  (none)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (none)

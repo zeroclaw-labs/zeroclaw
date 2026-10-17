@@ -133,6 +133,14 @@ because verifying compiles and instantiates every component. A skill bundle
 ships no component, so it is reported as not applicable rather than as a
 failure.
 
+For a tool plugin whose component instantiates, both commands also apply the
+check the runtime makes on the tool's configuration before it registers the
+tool. `plugin remove` keeps the package's `[[plugins.entries]]` row and its
+values, so a reinstall can meet values its manifest does not accept: any value
+at all when the new package declares no `config_schema`. The runtime skips such
+a tool, so the verdict is that it does not load, with the runtime's reason and
+the row that holds the values.
+
 ### Recovering an incomplete installation
 
 `zeroclaw plugin install` builds a package in a unique hidden transaction
