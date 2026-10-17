@@ -1465,6 +1465,29 @@ pub fn register_delivery_fn(f: DeliveryFn) {
     let _ = DELIVERY_FN.set(f);
 }
 
+/// A notification receipt must never treat a skipped dispatch as delivery.
+/// Unlike legacy cron announcements, a watchdog requires an installed handler.
+/// This is still an adapter acknowledgement, not a destination readback.
+pub(crate) async fn deliver_required_announcement(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    thread_id: Option<&str>,
+    output: &str,
+) -> Result<()> {
+    let deliver = DELIVERY_FN
+        .get()
+        .context("Required announcement delivery handler is unavailable")?;
+    deliver(
+        config.clone(),
+        channel.to_string(),
+        target.to_string(),
+        thread_id.map(str::to_string),
+        output.to_string(),
+    )
+    .await
+}
+
 pub async fn deliver_announcement(
     config: &Config,
     channel: &str,
@@ -4070,6 +4093,62 @@ mod tests {
         deliver_announcement(&config, "telegram", "chat-id", None, "payload")
             .await
             .expect("missing delivery handler should be Ok with a warn log");
+    }
+
+    #[tokio::test]
+    async fn required_announcement_rejects_absent_handler_in_fresh_process() {
+        // The delivery registry is process-global and other tests install one.
+        // A subprocess proves the actual absent-handler boundary independently
+        // of test order, without resetting or replacing the production registry.
+        if std::env::var_os("ZEROCLAW_TEST_REQUIRED_DELIVERY_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cron::scheduler::tests::required_announcement_rejects_absent_handler_in_fresh_process", "--nocapture"])
+                .env("ZEROCLAW_TEST_REQUIRED_DELIVERY_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let config = Config::default();
+        assert!(DELIVERY_FN.get().is_none());
+        let result =
+            deliver_required_announcement(&config, "fixture", "recipient", None, "alert").await;
+        assert!(
+            result.is_err(),
+            "a skipped dispatch cannot confirm delivery"
+        );
+        // Ordinary cron still treats a missing handler as a logged no-op.
+        deliver_announcement(&config, "fixture", "recipient", None, "alert")
+            .await
+            .unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        register_delivery_fn(Box::new(
+            move |_config, channel, _target, _thread, _output| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    if channel == "fixture-failure" {
+                        anyhow::bail!("synthetic delivery error");
+                    }
+                    Ok(())
+                })
+            },
+        ));
+        deliver_required_announcement(&config, "fixture", "recipient", None, "alert")
+            .await
+            .unwrap();
+        assert!(
+            deliver_required_announcement(&config, "fixture-failure", "recipient", None, "alert")
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
