@@ -787,7 +787,7 @@ async fn execute_job_now_with_runtime(
         Err(e) => return (false, format!("agent {agent_alias} risk profile: {e}")),
     };
     let span = zeroclaw_log::attribution_span!(job);
-    Box::pin(execute_job_with_retry(
+    let (success, output) = Box::pin(execute_job_with_retry(
         config,
         &security,
         &agent_alias,
@@ -796,8 +796,44 @@ async fn execute_job_now_with_runtime(
         approved,
         execution_admission,
     ))
-    .instrument(span)
-    .await
+    .instrument(span.clone())
+    .await;
+    let rendered = span.in_scope(|| render_job_output(job, success, output));
+    (success, rendered)
+}
+
+/// Render a job's result for the channel. Shell jobs never expose raw
+/// diagnostics: a successful run returns bare stdout (or a localized
+/// no-output message), and a failed run logs the sanitized failure and
+/// returns a localized user-safe message. Non-shell jobs pass through.
+fn render_job_output(job: &CronJob, success: bool, output: String) -> String {
+    if !matches!(job.job_type, JobType::Shell) {
+        return output;
+    }
+
+    if success {
+        let output = output.trim();
+        return if output.is_empty() {
+            crate::i18n::get_required_cli_string("cron-shell-command-succeeded-no-output")
+        } else {
+            output.to_string()
+        };
+    }
+
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "job_id": job.id,
+                "agent_alias": job.agent_alias,
+                "error_key": "cron.shell.command_failed",
+                "diagnostic": zeroclaw_providers::sanitize_api_error(&crate::security::scrub(&output)),
+            })),
+        "Cron shell command failed"
+    );
+
+    crate::i18n::get_required_cli_string("cron-shell-command-failed")
 }
 
 fn cron_agent_run_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
@@ -1046,8 +1082,9 @@ async fn execute_and_persist_job(
         false,
         execution_admission.clone(),
     ))
-    .instrument(span)
+    .instrument(span.clone())
     .await;
+    let output = span.in_scope(|| render_job_output(job, success, output));
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         &effective_config,
@@ -1558,15 +1595,6 @@ async fn run_job_command_with_runtime_and_timeout(
         );
     }
 
-    // `job.shell_output_format` is already the canonical value by the time
-    // it reaches here: due_jobs()/all_overdue_jobs() resolve declarative jobs
-    // from config and leave imperative jobs on their stored field (see
-    // resolve_declarative_shell_output_format in store.rs). Re-deriving it
-    // here from `config.cron.get(&job.id)` without checking `job.source`
-    // would let an unrelated same-ID declarative config entry silently
-    // override an imperative job's stored format.
-    let output_format = &job.shell_output_format;
-
     let mut command = match runtime.build_shell_command(&job.command, &config.data_dir) {
         Ok(command) => command,
         Err(error) => return (false, format!("shell setup error: {error}")),
@@ -1586,22 +1614,34 @@ async fn run_job_command_with_runtime_and_timeout(
         Ok(Ok(output)) => {
             let stdout = crate::tools::shell_output::decode_shell_output(&output.stdout);
             let stderr = crate::tools::shell_output::decode_shell_output(&output.stderr);
-            let combined = match output_format {
-                // Raw mode on success returns bare stdout, by design — the
-                // point is to hand back exactly what a direct shell run
-                // would print on stdout, with no wrapper. stderr on a
-                // successful exit is intentionally dropped, not lost by
-                // accident; a failing exit still gets the full wrapped
-                // status/stdout/stderr envelope below for diagnosis.
-                CronShellOutputFormat::Raw if output.status.success() => stdout.trim().to_string(),
-                _ => format!(
-                    "status={}\nstdout:\n{}\nstderr:\n{}",
-                    output.status,
-                    stdout.trim(),
-                    stderr.trim()
-                ),
-            };
-            (output.status.success(), combined)
+            if output.status.success() {
+                // A successful shell run returns bare stdout; stderr may carry
+                // diagnostics the channel must not expose, so it is logged
+                // internally instead.
+                let stderr = stderr.trim();
+                if !stderr.is_empty() {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "job_id": job.id,
+                                "agent_alias": job.agent_alias,
+                                "error_key": "cron.shell.command_warning",
+                                "diagnostic": zeroclaw_providers::sanitize_api_error(&crate::security::scrub(stderr)),
+                            })),
+                        "Cron shell command completed with stderr output"
+                    );
+                }
+                return (true, stdout.trim().to_string());
+            }
+            let combined = format!(
+                "status={}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            );
+            (false, combined)
         }
         Ok(Err(e)) => (false, format!("spawn error: {e}")),
         Err(_) => (
@@ -2046,8 +2086,7 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(success);
-        assert!(output.contains("scheduler-ok"));
-        assert!(output.contains("status=exit status: 0"));
+        assert_eq!(output, "scheduler-ok");
     }
 
     #[tokio::test]
@@ -2130,9 +2169,9 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(success);
-        assert!(
-            output.contains("status="),
-            "imperative job's own Wrapped format must win over a same-ID declarative config entry: {output}"
+        assert_eq!(
+            output, "collision-ok",
+            "a successful shell run always returns bare stdout; diagnostics are logged, never exposed"
         );
     }
 
@@ -2215,6 +2254,144 @@ mod tests {
         assert!(!success);
         assert!(output.contains("definitely_missing_file_for_scheduler_test"));
         assert!(output.contains("status=exit status:"));
+    }
+
+    #[tokio::test]
+    async fn execute_job_now_hides_shell_failure_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.reliability.scheduler_retries = 0;
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = crate::security::AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["sh".into()];
+        let job = test_job("sh skills/wecom-leak-repro/scripts/missing.sh");
+
+        let (success, output) = execute_job_now(&config, &job).await;
+
+        assert!(!success);
+        assert_eq!(
+            output,
+            crate::i18n::get_required_cli_string("cron-shell-command-failed")
+        );
+        assert!(!output.contains("wecom-leak-repro"));
+        assert!(!output.contains("status="));
+        assert!(!output.contains("stderr:"));
+    }
+
+    #[tokio::test]
+    async fn execute_job_now_shell_success_returns_only_stdout() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = test_job("echo public-output");
+
+        let (success, output) = execute_job_now(&config, &job).await;
+
+        assert!(success);
+        assert_eq!(output, "public-output");
+        assert!(!output.contains("status="));
+        assert!(!output.contains("stderr:"));
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn shell_success_logs_credential_scrubbed_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = crate::security::AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["sh".into()];
+        let security = test_security(&config);
+
+        // A short credential and a secret that straddles the sanitizer's
+        // 500-byte truncation bound. Redaction must run before truncation or
+        // the straddling secret escapes as a truncated remnant.
+        let long_prefix = "x".repeat(480);
+        let straddle_secret = "0123456789abcdef0123456789abcdef"; // nosemgrep: generic.secrets.security.detected-generic-secret.detected-generic-secret (synthetic test value)
+        let cases: Vec<(String, String)> = vec![
+            (
+                "password=opaque-example-1234".to_string(),
+                "opaque-example-1234".to_string(),
+            ),
+            (
+                format!("{long_prefix} secret={straddle_secret}"),
+                straddle_secret.to_string(),
+            ),
+        ];
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut logs = zeroclaw_log::subscribe_or_install();
+        while logs.try_recv().is_ok() {}
+
+        for (idx, (stderr_value, secret)) in cases.into_iter().enumerate() {
+            let job_id = unique_component("credential-job");
+            let script = format!("credential-{idx}.sh");
+            tokio::fs::write(
+                config.data_dir.join(&script),
+                format!("printf 'public-output'\nprintf '{stderr_value}' >&2\n"),
+            )
+            .await
+            .unwrap();
+            // Raw output format: the successful stderr was previously
+            // discarded entirely; this path must never retain it now.
+            let job = CronJob {
+                id: job_id.clone(),
+                command: format!("sh {script}"),
+                shell_output_format: CronShellOutputFormat::Raw,
+                ..test_job("")
+            };
+
+            let (success, output) = run_job_command(&config, &security, &job).await;
+            assert!(success);
+            assert_eq!(output, "public-output");
+            assert!(!output.contains(secret.as_str()));
+
+            // The stderr warning must be logged for THIS job with the
+            // credential scrubbed from the diagnostic.
+            let warning = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    match logs.recv().await {
+                        Ok(event)
+                            if event
+                                .pointer("/attributes/error_key")
+                                .and_then(|v| v.as_str())
+                                == Some("cron.shell.command_warning")
+                                && event.pointer("/attributes/job_id").and_then(|v| v.as_str())
+                                    == Some(job_id.as_str()) =>
+                        {
+                            break event;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            panic!("log stream closed before command warning was recorded");
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("command warning should be recorded");
+            let diagnostic = warning
+                .pointer("/attributes/diagnostic")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    panic!("command warning must carry a diagnostic attribute for job {job_id}")
+                });
+            // The redaction marker must be present, and no leading slice of
+            // the secret may survive. The old truncate-then-scrub order left
+            // a 12-character prefix (`0123456789ab`) behind, which a
+            // full-secret-only check would not catch, so reject the first 12
+            // characters explicitly.
+            let probe_len = secret.len().min(12);
+            assert!(
+                diagnostic.contains("[REDACTED"),
+                "credential must be redacted in the logged diagnostic: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&secret[..probe_len]),
+                "no leading slice of the credential may survive truncation: {diagnostic}"
+            );
+        }
     }
 
     #[tokio::test]
