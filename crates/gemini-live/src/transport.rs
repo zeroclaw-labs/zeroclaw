@@ -311,6 +311,13 @@ pub struct FakeTransport {
     /// cover a failed write needs a transport that can actually fail one, and
     /// the count is what lets setup succeed before the writes under test fail.
     pub fail_writes_after: Option<usize>,
+    /// Park writes on `stall` once this many have been accepted: the frame
+    /// is recorded in `sent`, then the write waits for a permit the test
+    /// grants with `stall.add_permits(1)`. A write that can hang is what a
+    /// test needs to show a caller the difference between a control that
+    /// never started and one whose outcome is unknown.
+    pub stall_writes_after: Option<usize>,
+    pub stall: Arc<tokio::sync::Semaphore>,
 }
 
 impl FakeTransport {
@@ -322,6 +329,17 @@ impl FakeTransport {
             sent: Arc::new(Mutex::new(Vec::new())),
             pending_when_empty,
             fail_writes_after: None,
+            stall_writes_after: None,
+            stall: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    /// The same transport, but every write after `accepted` of them parks
+    /// until the test releases it through `stall`, one permit per write.
+    pub fn stalling_writes_after(accepted: usize, pending_when_empty: bool) -> Self {
+        Self {
+            stall_writes_after: Some(accepted),
+            ..Self::new(pending_when_empty)
         }
     }
 
@@ -363,7 +381,16 @@ impl Transport for FakeTransport {
         let fail = self
             .fail_writes_after
             .is_some_and(|accepted| attempt > accepted);
+        let stall = self
+            .stall_writes_after
+            .is_some_and(|accepted| attempt > accepted)
+            .then(|| Arc::clone(&self.stall));
         async move {
+            if let Some(stall) = stall {
+                if let Ok(permit) = stall.acquire().await {
+                    permit.forget();
+                }
+            }
             if fail {
                 Err(TransportError::Send("fake: write refused".into()))
             } else {

@@ -34,6 +34,8 @@
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -170,19 +172,80 @@ pub enum ControlOutcome {
     Failed(String),
 }
 
+/// What [`ControlReceipt::expire`] found when the caller stopped waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expiry {
+    /// The driver had not started the write and now never will: the control
+    /// is definitely undelivered, and a later reconnect cannot revive it.
+    Unwritten,
+    /// The transport write had already begun. Whether it lands is up to the
+    /// socket and no longer observable through this receipt: the outcome is
+    /// unknown, not a confirmed loss.
+    InFlight,
+    /// The driver decided between the caller's last look and this call.
+    Decided(ControlOutcome),
+}
+
+/// Who reached an enqueued control first: the driver (it started the write)
+/// or the caller (it stopped waiting). Shared between the queued [`Command`]
+/// and its [`ControlReceipt`], so a receipt the caller expires is never
+/// written afterwards and a write the driver started is never reported as
+/// skipped.
+const CONTROL_PENDING: u8 = 0;
+const CONTROL_WRITING: u8 = 1;
+const CONTROL_EXPIRED: u8 = 2;
+
+/// The driver's half of one control's receipt: where the verdict goes, and
+/// the claim it must win before writing.
+struct Ack {
+    verdict: oneshot::Sender<ControlOutcome>,
+    state: Arc<AtomicU8>,
+}
+
+impl Ack {
+    /// Claim the control for writing. `false` means the caller expired it
+    /// first; the driver must not write it.
+    fn begin_write(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CONTROL_PENDING,
+                CONTROL_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
 /// The outcome channel for one enqueued control.
 ///
 /// Enqueue and outcome are separate so an event loop can keep pumping while a
-/// control is in flight: block on [`Self::outcome`] where blocking is safe, or
-/// poll [`Self::try_outcome`] from inside a `select!` loop and sweep what is
-/// still open at teardown.
-pub struct ControlReceipt(oneshot::Receiver<ControlOutcome>);
+/// control is in flight: block on [`Self::outcome`] where blocking is safe,
+/// poll [`Self::try_outcome`] from inside a `select!` loop, and
+/// [`Self::expire`] what the caller will no longer wait for, so a control
+/// given up on is never written behind the caller's back.
+pub struct ControlReceipt {
+    verdict: oneshot::Receiver<ControlOutcome>,
+    state: Arc<AtomicU8>,
+}
 
 impl ControlReceipt {
+    fn pair() -> (Ack, Self) {
+        let (tx, rx) = oneshot::channel();
+        let state = Arc::new(AtomicU8::new(CONTROL_PENDING));
+        (
+            Ack {
+                verdict: tx,
+                state: Arc::clone(&state),
+            },
+            Self { verdict: rx, state },
+        )
+    }
+
     /// Wait for the driver's verdict. [`SessionError::Closed`] means the
     /// driver died without reporting one — treat it as undelivered.
     pub async fn outcome(self) -> Result<ControlOutcome, SessionError> {
-        self.0.await.map_err(|_| SessionError::Closed)
+        self.verdict.await.map_err(|_| SessionError::Closed)
     }
 
     /// Wait for the verdict without consuming the receipt, for a loop that
@@ -190,16 +253,40 @@ impl ControlReceipt {
     /// is delivered once: after this resolves, [`Self::try_outcome`] reports
     /// the receiver as closed.
     pub async fn wait(&mut self) -> Result<ControlOutcome, SessionError> {
-        (&mut self.0).await.map_err(|_| SessionError::Closed)
+        (&mut self.verdict).await.map_err(|_| SessionError::Closed)
     }
 
     /// Non-blocking peek for callers that cannot await here. `None` means the
     /// driver has not decided yet.
     pub fn try_outcome(&mut self) -> Option<Result<ControlOutcome, SessionError>> {
-        match self.0.try_recv() {
+        match self.verdict.try_recv() {
             Ok(outcome) => Some(Ok(outcome)),
             Err(oneshot::error::TryRecvError::Empty) => None,
             Err(oneshot::error::TryRecvError::Closed) => Some(Err(SessionError::Closed)),
+        }
+    }
+
+    /// Stop waiting. A control the driver has not started writing is
+    /// withdrawn: it stays in the queue but the driver skips it, so a reply
+    /// the caller has already replaced cannot be delivered later. A write
+    /// already in flight cannot be withdrawn; the caller learns that it is
+    /// in flight rather than being told it failed.
+    pub fn expire(mut self) -> Expiry {
+        if self
+            .state
+            .compare_exchange(
+                CONTROL_PENDING,
+                CONTROL_EXPIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Expiry::Unwritten;
+        }
+        match self.verdict.try_recv() {
+            Ok(outcome) => Expiry::Decided(outcome),
+            Err(_) => Expiry::InFlight,
         }
     }
 }
@@ -221,14 +308,14 @@ enum Command {
     /// Non-audio controls carry the channel the driver reports their
     /// [`ControlOutcome`] on, so "accepted into the queue" never passes for
     /// "written to the wire".
-    ClientText(String, oneshot::Sender<ControlOutcome>),
-    ToolResponse(String, oneshot::Sender<ControlOutcome>),
+    ClientText(String, Ack),
+    ToolResponse(String, Ack),
 }
 
 /// Tell the enqueuing caller what became of one control. A dropped receiver
 /// (caller gone) is not an error here.
-fn report(outcome: ControlOutcome, ack: oneshot::Sender<ControlOutcome>) {
-    let _ = ack.send(outcome);
+fn report(outcome: ControlOutcome, ack: Ack) {
+    let _ = ack.verdict.send(outcome);
 }
 
 /// Report a control the driver is about to drop without writing it. Silence
@@ -370,24 +457,24 @@ impl Session {
     /// says whether the driver later wrote, dropped, or failed it. An error
     /// here means the queue itself is gone (the driver has ended).
     pub async fn send_client_text(&self, text: &str) -> Result<ControlReceipt, SessionError> {
-        let (ack, receipt) = oneshot::channel();
+        let (ack, receipt) = ControlReceipt::pair();
         self.cmd_tx
             .send(Command::ClientText(text.to_string(), ack))
             .await
             .map_err(|_| SessionError::Closed)?;
-        Ok(ControlReceipt(receipt))
+        Ok(receipt)
     }
 
     /// Acknowledge a tool call by id (kutsu owns the tool's semantics).
     /// Carries the same delivery receipt as [`Self::send_client_text`]: an
     /// acknowledgement the driver never writes is a model turn left waiting.
     pub async fn send_tool_response(&self, call_id: &str) -> Result<ControlReceipt, SessionError> {
-        let (ack, receipt) = oneshot::channel();
+        let (ack, receipt) = ControlReceipt::pair();
         self.cmd_tx
             .send(Command::ToolResponse(call_id.to_string(), ack))
             .await
             .map_err(|_| SessionError::Closed)?;
-        Ok(ControlReceipt(receipt))
+        Ok(receipt)
     }
 
     /// A cloneable, `&self`-only handle for enqueuing client-text turns,
@@ -417,12 +504,12 @@ impl ClientTextSender {
     /// Send a client text turn. Identical wire effect to
     /// [`Session::send_client_text`], including its delivery receipt.
     pub async fn send_client_text(&self, text: &str) -> Result<ControlReceipt, SessionError> {
-        let (ack, receipt) = oneshot::channel();
+        let (ack, receipt) = ControlReceipt::pair();
         self.cmd_tx
             .send(Command::ClientText(text.to_string(), ack))
             .await
             .map_err(|_| SessionError::Closed)?;
-        Ok(ControlReceipt(receipt))
+        Ok(receipt)
     }
 }
 
@@ -659,12 +746,20 @@ async fn write_cmd<T: Transport>(transport: &mut T, cmd: Command) -> Result<(), 
             }
             r
         }
+        // A control the caller has expired is skipped, not written: the
+        // caller was told it is undelivered and may already have replaced it.
         Command::ClientText(t, ack) => {
+            if !ack.begin_write() {
+                return Ok(());
+            }
             let r = transport.send_text(wire::build_client_content(&t)).await;
             report(outcome_of(&r), ack);
             r
         }
         Command::ToolResponse(id, ack) => {
+            if !ack.begin_write() {
+                return Ok(());
+            }
             let r = transport.send_text(wire::build_tool_response(&id)).await;
             report(outcome_of(&r), ack);
             r
@@ -1213,6 +1308,54 @@ mod tests {
             !bad_sent.lock().unwrap().is_empty(),
             "the failing transport must still record the attempted write"
         );
+    }
+
+    #[tokio::test]
+    async fn an_expired_control_is_never_written_and_an_in_flight_one_says_so() {
+        // Setup is accepted; the next write parks on the stall, so the first
+        // text is in flight on the transport and the second is queued behind
+        // it. Expiring them must tell the two apart, and the expired queued
+        // one must be skipped when the driver gets to it.
+        let mut fake = FakeTransport::stalling_writes_after(1, true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        let sent = fake.sent.clone();
+        let stall = Arc::clone(&fake.stall);
+        let s = Session::connect_with_transport(cfg(), fake, no_reconnect())
+            .await
+            .unwrap();
+
+        let first = s.send_client_text("first").await.unwrap();
+        let second = s.send_client_text("second").await.unwrap();
+        // The stalled write has been handed to the transport (setup + first).
+        wait_for_sent(&sent, 2).await;
+
+        assert_eq!(
+            second.expire(),
+            Expiry::Unwritten,
+            "a control the driver has not reached is withdrawn outright"
+        );
+        assert_eq!(
+            first.expire(),
+            Expiry::InFlight,
+            "a control already on the transport cannot be withdrawn"
+        );
+
+        // Release the stalled write; the driver then reaches the expired
+        // control and must skip it, so the next live one lands right after.
+        // Every write past setup parks, so the next one needs its permit too.
+        stall.add_permits(2);
+        s.send_client_text("third")
+            .await
+            .unwrap()
+            .outcome()
+            .await
+            .unwrap();
+        let sent = sent.lock().unwrap();
+        assert!(
+            !sent.iter().any(|f| f.contains("second")),
+            "an expired control must never be written, got {sent:?}"
+        );
+        assert!(sent.last().unwrap().contains("third"));
     }
 
     #[tokio::test]

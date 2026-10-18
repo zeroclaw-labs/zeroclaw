@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tokio::sync::{Notify, mpsc};
 
 use gemini_live::session::{
-    ClientTextSender, ControlOutcome, ControlReceipt, Event, Session, SessionError,
+    ClientTextSender, ControlOutcome, ControlReceipt, Event, Expiry, Session, SessionError,
 };
 use gemini_live::types::{FunctionDecl, Model, SetupConfig};
 use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
@@ -258,11 +258,13 @@ struct ActiveSession {
     lost_tool_acks: Vec<String>,
 }
 
-/// How long [`Channel::send`] waits for the driver's verdict on one reply.
+/// How long [`Channel::send`] waits for the driver's verdict on one reply,
+/// and how long teardown waits for the acknowledgements still in flight.
 /// The driver always answers eventually (written, discarded, or failed), but
 /// "eventually" spans a reconnect budget that can be long; a spoken reply
 /// older than this is stale anyway, and the orchestrator must not be pinned
-/// to a dead socket waiting for it.
+/// to a dead socket waiting for it. A reply that runs out of time is
+/// withdrawn, never written late: the caller was told it failed.
 const CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The driver's verdict on the oldest acknowledgement in flight. Pends forever
@@ -417,6 +419,38 @@ impl SpeechToSpeechChannel {
                 self.note_lost_ack(id, &format!("write failed: {reason}"));
             }
             Err(e) => self.note_lost_ack(id, &e.to_string()),
+        }
+    }
+
+    /// Turn the driver's verdict on one reply into what [`Channel::send`]
+    /// tells its caller.
+    fn reply_verdict(&self, outcome: Result<ControlOutcome, SessionError>) -> Result<()> {
+        match outcome {
+            Ok(ControlOutcome::Written) => Ok(()),
+            Ok(ControlOutcome::Discarded) => Err(anyhow::Error::msg(format!(
+                "speech_to_speech.{}: the reply was not delivered — the connection \
+                 dropped before it was written",
+                self.alias
+            ))),
+            Ok(ControlOutcome::Failed(reason)) => Err(anyhow::Error::msg(format!(
+                "speech_to_speech.{}: the provider refused the reply: {reason}",
+                self.alias
+            ))),
+            // The driver ended without deciding: a reply arriving after
+            // hangup is a race, not a failure.
+            Err(SessionError::Closed) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"alias": self.alias})),
+                    "speech_to_speech: session ended before the reply was written"
+                );
+                Ok(())
+            }
+            Err(e) => Err(anyhow::Error::msg(format!(
+                "speech_to_speech.{}: failed to relay reply into live session: {e}",
+                self.alias
+            ))),
         }
     }
 
@@ -652,13 +686,43 @@ impl SpeechToSpeechChannel {
             // only thing that must not wait for it.
             self.settle_acks(&mut acks);
         }
-        // Acknowledgements still in flight when the call ends never reached
-        // the model: the connection is going away with them. Settle what the
-        // driver already decided, then count the rest as lost — an undecided
-        // write at teardown is not a delivered one.
-        self.settle_acks(&mut acks);
-        for (id, _) in acks {
-            self.note_lost_ack(&id, "call ended before the write was confirmed");
+        // Acknowledgements still undecided when the call ends are not lost
+        // yet: the driver keeps draining its queue after the session handle
+        // goes, and the model's last turn (the `end_session` acknowledgement)
+        // is normally written right here. Release the session so the driver
+        // can finish, wait for the verdicts within the same budget a reply
+        // gets, and only then withdraw what the driver never started. A write
+        // already in progress is of unknown outcome, not a confirmed loss.
+        drop(session);
+        let deadline = tokio::time::Instant::now() + CONTROL_ACK_TIMEOUT;
+        while !acks.is_empty() {
+            match tokio::time::timeout_at(deadline, oldest_ack(&mut acks)).await {
+                Ok(outcome) => {
+                    let (id, _) = acks.remove(0);
+                    self.settle_ack(&id, outcome);
+                }
+                Err(_) => break,
+            }
+        }
+        for (id, receipt) in acks {
+            match receipt.expire() {
+                Expiry::Decided(outcome) => self.settle_ack(&id, Ok(outcome)),
+                Expiry::Unwritten => {
+                    self.note_lost_ack(&id, "call ended before the write started");
+                }
+                Expiry::InFlight => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "tool_call": id,
+                            })),
+                        "speech_to_speech: call ended with an acknowledgement write still in \
+                         progress; its outcome is unknown"
+                    );
+                }
+            }
         }
         // Per the single-active-session assumption (see `active_session`'s
         // doc) this alias never has two sessions attached at once, so an
@@ -769,7 +833,7 @@ impl Channel for SpeechToSpeechChannel {
         };
         match sender {
             Some(sender) => {
-                let receipt = match sender.send_client_text(&message.content).await {
+                let mut receipt = match sender.send_client_text(&message.content).await {
                     Ok(receipt) => receipt,
                     // The driver ended between attach and this call: a reply
                     // arriving after hangup is a race, not a failure.
@@ -792,40 +856,28 @@ impl Channel for SpeechToSpeechChannel {
                         )));
                     }
                 };
-                match tokio::time::timeout(CONTROL_ACK_TIMEOUT, receipt.outcome()).await {
-                    Ok(Ok(ControlOutcome::Written)) => Ok(()),
-                    Ok(Ok(ControlOutcome::Discarded)) => Err(anyhow::Error::msg(format!(
-                        "speech_to_speech.{}: the reply was not delivered — the connection \
-                         dropped before it was written",
-                        self.alias
-                    ))),
-                    Ok(Ok(ControlOutcome::Failed(reason))) => Err(anyhow::Error::msg(format!(
-                        "speech_to_speech.{}: the provider refused the reply: {reason}",
-                        self.alias
-                    ))),
-                    // The driver ended without deciding; same race as above.
-                    Ok(Err(SessionError::Closed)) => {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"alias": self.alias})),
-                            "speech_to_speech: session ended before the reply was written"
-                        );
-                        Ok(())
-                    }
-                    Ok(Err(e)) => Err(anyhow::Error::msg(format!(
-                        "speech_to_speech.{}: failed to relay reply into live session: {e}",
-                        self.alias
-                    ))),
-                    Err(_) => Err(anyhow::Error::msg(format!(
-                        "speech_to_speech.{}: the reply was still unwritten after {}s — \
-                         the provider connection is not delivering",
-                        self.alias,
-                        CONTROL_ACK_TIMEOUT.as_secs()
-                    ))),
+                match tokio::time::timeout(CONTROL_ACK_TIMEOUT, receipt.wait()).await {
+                    Ok(outcome) => self.reply_verdict(outcome),
+                    // Out of time. A reply the driver has not started writing
+                    // is withdrawn, so it cannot be spoken later once the
+                    // caller has been told it failed and answered again. A
+                    // write already in progress cannot be withdrawn; its
+                    // outcome is unknown, which is not the same as lost.
+                    Err(_) => match receipt.expire() {
+                        Expiry::Decided(outcome) => self.reply_verdict(Ok(outcome)),
+                        Expiry::Unwritten => Err(anyhow::Error::msg(format!(
+                            "speech_to_speech.{}: the reply expired after {}s before the \
+                             provider connection could write it; it will not be delivered",
+                            self.alias,
+                            CONTROL_ACK_TIMEOUT.as_secs()
+                        ))),
+                        Expiry::InFlight => Err(anyhow::Error::msg(format!(
+                            "speech_to_speech.{}: the reply's write to the provider was \
+                             still in progress after {}s; whether it was delivered is unknown",
+                            self.alias,
+                            CONTROL_ACK_TIMEOUT.as_secs()
+                        ))),
+                    },
                 }
             }
             None => {
@@ -978,38 +1030,11 @@ mod tests {
         // driver is inside the reconnect, so nothing is draining the queue. It
         // must be written exactly once when the connection comes back — not
         // dropped, and not written plus replayed.
-        let mut first = FakeTransport::new(false);
-        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
-        first.push_close(1011, "server restart");
-        let second = FakeTransport::new(true);
-        let second_sent = second.sent.clone();
-
         // A reconnector parked until the test releases it: that is the window
         // in which the reply is enqueued. It announces when the driver is
         // inside it, because before that the driver is still in its backoff
         // sleep, where a queued control is discarded by design.
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut slot = Some((second, release_rx, entered_tx));
-        let gated: Reconnector<FakeTransport> = Box::new(move || {
-            let taken = slot.take();
-            Box::pin(async move {
-                match taken {
-                    Some((transport, release, entered)) => {
-                        let _ = entered.send(());
-                        let _ = release.await;
-                        Ok(transport)
-                    }
-                    None => Err(SessionError::Transport(TransportError::Connect(
-                        "drained".into(),
-                    ))),
-                }
-            })
-        });
-
-        let session = Session::connect_with_transport(client_config(&cfg()), first, gated)
-            .await
-            .unwrap();
+        let (session, second_sent, release_tx, entered_rx) = gated_reconnect_session().await;
         let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string()));
         let (tx, _rx) = mpsc::channel(8);
         let (driver, target) = drive(&ch, session, tx).await;
@@ -1052,6 +1077,118 @@ mod tests {
 
         ch.stop().await;
         driver.await.unwrap().unwrap();
+    }
+
+    /// The gated-reconnect scaffolding of the test above: a session whose
+    /// reconnector parks until `release` fires and announces on `entered`
+    /// when the driver is inside it, plus the reopened transport's `sent`.
+    async fn gated_reconnect_session() -> (
+        Session,
+        Arc<Mutex<Vec<String>>>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let mut first = FakeTransport::new(false);
+        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        first.push_close(1011, "server restart");
+        let second = FakeTransport::new(true);
+        let second_sent = second.sent.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut slot = Some((second, release_rx, entered_tx));
+        let gated: Reconnector<FakeTransport> = Box::new(move || {
+            let taken = slot.take();
+            Box::pin(async move {
+                match taken {
+                    Some((transport, release, entered)) => {
+                        let _ = entered.send(());
+                        let _ = release.await;
+                        Ok(transport)
+                    }
+                    None => Err(SessionError::Transport(TransportError::Connect(
+                        "drained".into(),
+                    ))),
+                }
+            })
+        });
+        let session = Session::connect_with_transport(client_config(&cfg()), first, gated)
+            .await
+            .unwrap();
+        (session, second_sent, release_tx, entered_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_that_expires_during_the_reconnect_is_never_written_after_the_reopen() {
+        // The reconnect outlasts the reply's budget. `send()` reports the
+        // reply undelivered, and that report has to be final: when the
+        // connection comes back the driver must skip the reply, not speak an
+        // answer the agent has already been told was lost.
+        let (session, second_sent, release_tx, entered_rx) = gated_reconnect_session().await;
+        let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string()));
+        let (tx, _rx) = mpsc::channel(8);
+        let (driver, target) = drive(&ch, session, tx).await;
+
+        entered_rx
+            .await
+            .expect("the driver must enter the reconnect");
+        let err = ch
+            .send(&SendMessage::new("it is three o'clock", &target))
+            .await
+            .expect_err("a reply the driver never wrote within the budget is a failure");
+        assert!(
+            err.to_string().contains("will not be delivered"),
+            "the failure must be a definite one: {err}"
+        );
+
+        let _ = release_tx.send(());
+        assert!(
+            wait_for_sent(&second_sent, "\"setup\"").await,
+            "the reopen must complete so the skipped write is actually exercised"
+        );
+        // Let the driver work through the queue behind the setup.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !second_sent
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|frame| frame.contains("it is three o'clock")),
+            "an expired reply must never reach the reopened connection, got {:?}",
+            second_sent.lock().unwrap()
+        );
+
+        ch.stop().await;
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_whose_write_is_still_in_progress_is_reported_as_unknown_not_lost() {
+        // The transport takes the reply and then hangs. The caller cannot be
+        // told the reply failed — it may well land — only that its outcome is
+        // not known, so it does not answer again on a false loss.
+        let mut fake = FakeTransport::stalling_writes_after(1, true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        let stall = Arc::clone(&fake.stall);
+        let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
+            .await
+            .unwrap();
+        let ch = SpeechToSpeechChannel::new("desk".to_string());
+        ch.attach_session(&session);
+        let target = ch.reply_target_for(&ch.session_id().expect("session attached"));
+
+        let err = ch
+            .send(&SendMessage::new("it is three o'clock", &target))
+            .await
+            .expect_err("a write that has not completed within the budget is not a success");
+        assert!(
+            err.to_string().contains("unknown"),
+            "an in-flight write must be reported as undecided, not lost: {err}"
+        );
+        assert!(
+            !err.to_string().contains("will not be delivered"),
+            "an in-flight write must not be reported as withdrawn: {err}"
+        );
+        stall.add_permits(1);
     }
 
     #[tokio::test]
@@ -1283,23 +1420,14 @@ mod tests {
             "session must be detached once run_session closes it"
         );
 
-        // The ack write happens on the driver task, asynchronously from the
-        // enqueue in `run_session` (mirrors `send_relays_reply_into_live_
-        // session_as_text`'s poll below) — the mpsc channel drains already-
-        // queued commands even after `Session` (and so `cmd_tx`) is dropped
-        // at the end of `run_session`, but that drain isn't necessarily
-        // done by the time this assertion runs.
-        let mut acked = false;
-        for _ in 0..1000 {
-            if sent.lock().unwrap().iter().any(|t| t.contains("e1")) {
-                acked = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
+        // The ack write happens on the driver task, after `run_session`
+        // enqueued it on its way out; teardown waits for the driver's verdict
+        // instead of calling an undecided acknowledgement lost, so the write
+        // has landed by the time `run_session` returns. No polling here: a
+        // return before the verdict is the regression.
         assert!(
-            acked,
-            "end_session call must still be acked before closing, got {:?}",
+            sent.lock().unwrap().iter().any(|t| t.contains("e1")),
+            "end_session call must be acked before run_session returns, got {:?}",
             sent.lock().unwrap()
         );
     }
