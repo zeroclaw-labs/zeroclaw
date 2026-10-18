@@ -1130,13 +1130,18 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub live_pricing: bool,
-    /// Override the provider's default for native tool calling.
-    /// `None` (default) honors the provider's built-in choice. `Some(true)`
-    /// forces native tool calls on, `Some(false)` forces text-fallback.
-    /// Currently consulted only by the Groq factory, which defaults to
-    /// text-fallback because llama-family Groq models reject native tool
-    /// calls with HTTP 400. Setting `native_tools = true` re-enables native
-    /// tool calling for Groq models that support it.
+    /// Override the provider's default for native tool calling. `None`
+    /// (default) honors the provider's built-in choice; `Some(true)` forces
+    /// native tool calls on, `Some(false)` forces text-fallback. Only three
+    /// factories in `zeroclaw-providers/src/factory.rs` consult the field:
+    /// `groq` and `custom` default to text-fallback and enable native tool
+    /// calling only on `Some(true)`, while `hailo_ollama` has no native tool
+    /// calling and rejects `Some(true)`. Every other family ignores it. For
+    /// `custom` the field gates only the chat-completions path: an alias with
+    /// `wire_api = "responses"` is served by the Responses provider, which is
+    /// selected before this field is consulted, ignores it, and supports
+    /// native tool calls regardless. A chat-completions `custom` gateway that
+    /// accepts OpenAI `tools` payloads needs `native_tools = true`.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
@@ -14799,7 +14804,14 @@ pub struct RuntimeProfileConfig {
     pub parallel_tools: Option<bool>,
     /// Request one native tool call per provider response when supported. Default off.
     pub single_tool_rounds: Option<bool>,
-    /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
+    /// Tool dispatch strategy: `"auto"` (default), `"native"`, or `"xml"`.
+    /// `"auto"` selects the native dispatcher only when the provider reports
+    /// native tool calling, while `"native"` and `"xml"` force one strategy
+    /// regardless of provider capability. Forcing `"native"` on a provider
+    /// whose factory disabled native tool calling (for example a
+    /// chat-completions `custom` alias without `native_tools = true`) sends no
+    /// `tools` in the request, so the model cannot emit native tool calls.
+    /// `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
     pub tool_call_dedup_exempt: Vec<String>,
