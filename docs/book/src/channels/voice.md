@@ -80,10 +80,15 @@ function acknowledgement carries a receipt, and the broker waits for what the
 connection actually did with it: wrote it, dropped it with the dying socket, or
 refused it. A reply that was written reaches the model once. A reply that was
 lost comes back to the agent as a delivery failure rather than a silent
-success, so the next turn can take it into account. Nothing is re-sent behind
-the caller's back, which is what keeps the same sentence from being spoken
-twice. A function acknowledgement has no caller to answer, so its loss is
-logged with the call id and listed again when the call ends.
+success, so the next turn can take it into account. A reply the connection
+has not taken within its budget is withdrawn and reported undelivered; it is
+never spoken later, once the agent has already moved on. A write that is
+already under way when the budget runs out is reported as undecided, not as
+lost. Nothing is re-sent behind the caller's back, which is what keeps the
+same sentence from being spoken twice. A function acknowledgement has no
+caller to answer, so its loss is logged with the call id and listed again when
+the call ends; one still undecided when the call ends is given the same budget
+before it is counted.
 
 **Privacy & cost.** A live session streams caller audio, and the transcripts
 and prompts derived from it, to the speech backend provider (Google Gemini
