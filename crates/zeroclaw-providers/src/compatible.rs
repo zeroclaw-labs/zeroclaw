@@ -1529,7 +1529,7 @@ impl OpenAiCompatibleModelProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: self.message_content_for_role(&m.role, &m.content, !merge),
+                content: self.message_content_for_role(&m.role, &m.content, self.supports_vision),
                 thinking_blocks: self.fallback_thinking_replay(m),
             })
             .collect();
@@ -3231,7 +3231,6 @@ impl OpenAiCompatibleModelProvider {
         tools: Option<Vec<NativeToolSpec>>,
         temperature: Option<f64>,
         options_enabled: bool,
-        merge: bool,
         system_merged: bool,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
     ) -> NativeChatRequest {
@@ -3243,7 +3242,8 @@ impl OpenAiCompatibleModelProvider {
         let tool_choice = tools
             .as_ref()
             .and_then(|t| (!t.is_empty()).then(|| "auto".to_string()));
-        let mut messages = self.convert_messages_for_native(effective_messages, !merge);
+        let mut messages =
+            self.convert_messages_for_native(effective_messages, self.supports_vision);
         let carrier = Self::merged_system_carrier_index(&messages, system_merged);
         self.apply_cache_breakpoints(&mut messages, carrier);
         // Streamed requests are thinking-off under passthrough (see
@@ -4203,7 +4203,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             };
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &content, !merge),
+                content: Self::to_message_content("user", &content, self.supports_vision),
                 thinking_blocks: None,
             });
         } else {
@@ -4216,7 +4216,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
             messages.push(Message {
                 role: "user".to_string(),
-                content: Self::to_message_content("user", &normalized_message, true),
+                content: Self::to_message_content(
+                    "user",
+                    &normalized_message,
+                    self.supports_vision,
+                ),
                 thinking_blocks: None,
             });
         }
@@ -4331,7 +4335,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             (!tools.is_empty()).then_some(tools),
             model,
             temperature,
-            !merge,
+            self.supports_vision,
             system_merged,
             // Legacy entry point: carries no `ChatRequest`, so no runtime
             // thinking params are available to forward.
@@ -4454,7 +4458,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             tools,
             model,
             temperature,
-            !merge,
+            self.supports_vision,
             system_merged,
             request.thinking,
         );
@@ -4663,7 +4667,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools,
                     temperature,
                     options_enabled,
-                    merge,
                     system_merged,
                     thinking_owned,
                 ))
@@ -4675,7 +4678,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         content: provider.message_content_for_role(
                             &message.role,
                             &message.content,
-                            !merge,
+                            provider.supports_vision,
                             // Streamed requests are thinking-off under
                             // passthrough (see streaming_thinking_params):
                             // history replay blocks require the request
@@ -4909,7 +4912,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 };
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: Self::to_message_content("user", &content, !merge),
+                    content: Self::to_message_content("user", &content, provider.supports_vision),
                     thinking_blocks: None,
                 });
             } else {
@@ -4922,7 +4925,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: Self::to_message_content("user", &normalized_message_content, !merge),
+                    content: Self::to_message_content(
+                        "user",
+                        &normalized_message_content,
+                        provider.supports_vision,
+                    ),
                     thinking_blocks: None,
                 });
             }
@@ -5076,7 +5083,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .iter()
                 .map(|m| Message {
                     role: m.role.clone(),
-                    content: provider.message_content_for_role(&m.role, &m.content, !merge),
+                    content: provider.message_content_for_role(
+                        &m.role,
+                        &m.content,
+                        provider.supports_vision,
+                    ),
                     thinking_blocks: None,
                 })
                 .collect();
@@ -5557,7 +5568,8 @@ mod tests {
         let mut builder = OpenAiCompatibleModelProvider::builder("test")
             .display_name("custom")
             .base_url(&format!("http://{addr}"))
-            .auth_style(AuthStyle::Bearer);
+            .auth_style(AuthStyle::Bearer)
+            .vision(true);
         if cache_passthrough {
             builder = builder.with_cache_passthrough();
         }
@@ -5755,7 +5767,8 @@ mod tests {
         let mut builder = OpenAiCompatibleModelProvider::builder("test")
             .display_name("custom")
             .base_url(&format!("http://{addr}"))
-            .auth_style(AuthStyle::Bearer);
+            .auth_style(AuthStyle::Bearer)
+            .vision(true);
         if cache_passthrough {
             builder = builder.with_cache_passthrough();
         }
@@ -6506,7 +6519,6 @@ mod tests {
             Some(0.5),
             true,
             false,
-            false,
             None,
         ))
         .unwrap();
@@ -6538,7 +6550,6 @@ mod tests {
             Some(vec![]),
             None,
             true,
-            false,
             false,
             None,
         ))
@@ -6697,7 +6708,6 @@ mod tests {
             None,
             true,
             false,
-            false,
             Some(params),
         ))
         .unwrap();
@@ -6731,7 +6741,6 @@ mod tests {
             None,
             true,
             false,
-            false,
             Some(params),
         ))
         .unwrap();
@@ -6744,7 +6753,6 @@ mod tests {
             Some(vec![]),
             None,
             true,
-            false,
             false,
             Some(params),
         ))
@@ -7647,7 +7655,6 @@ mod tests {
             Some(0.75),
             true,
             false,
-            false,
             Some(params),
         ))
         .unwrap();
@@ -7668,7 +7675,6 @@ mod tests {
             Some(vec![]),
             Some(0.75),
             true,
-            false,
             false,
             Some(params),
         ))
@@ -8062,7 +8068,6 @@ mod tests {
             Some(0.75),
             true,
             false,
-            false,
             Some(params),
         ))
         .unwrap();
@@ -8089,7 +8094,6 @@ mod tests {
             Some(vec![]),
             Some(0.75),
             true,
-            false,
             false,
             Some(params),
         ))

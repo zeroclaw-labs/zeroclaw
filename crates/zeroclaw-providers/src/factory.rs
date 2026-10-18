@@ -295,6 +295,9 @@ pub fn apply_compat_options(
     mut b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
 ) -> Box<dyn ModelProvider> {
+    if let Some(v) = opts.vision {
+        b = b.vision(v);
+    }
     if let Some(t) = opts.provider_timeout_secs {
         b = b.timeout_secs(t);
     }
