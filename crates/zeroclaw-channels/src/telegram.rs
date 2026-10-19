@@ -44,6 +44,10 @@ static ORPHAN_THINK_TAG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyL
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+/// `sendRichMessage` text limit, in UTF-8 characters.
+const TELEGRAM_RICH_MAX_MESSAGE_LENGTH: usize = 32_768;
+/// Bot API rich tables accept at most this many columns.
+const TELEGRAM_RICH_MAX_TABLE_COLUMNS: usize = 20;
 
 /// Prefix for synthetic draft ids returned by `send_draft` in MultiMessage mode.
 const TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
@@ -482,6 +486,668 @@ fn fit_telegram_bot_commands_to_body_budget(commands: &mut Vec<serde_json::Value
         dropped += 1;
     }
     dropped
+}
+
+struct MarkdownTableSpan {
+    start: usize,
+    end: usize,
+    columns: usize,
+}
+
+fn is_fence_delimiter(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+fn table_cells(line: &str) -> Option<Vec<&str>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let mut body = trimmed;
+    if let Some(rest) = body.strip_prefix('|') {
+        body = rest;
+    }
+    if let Some(rest) = body.strip_suffix('|') {
+        body = rest;
+    }
+    let cells: Vec<&str> = body.split('|').collect();
+    if cells.is_empty() { None } else { Some(cells) }
+}
+
+fn is_separator_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let core = trimmed.trim_matches(':');
+    core.len() >= 3 && core.chars().all(|ch| ch == '-')
+}
+
+fn separator_column_count(line: &str) -> Option<usize> {
+    let cells = table_cells(line)?;
+    if cells.iter().all(|cell| is_separator_cell(cell)) {
+        Some(cells.len())
+    } else {
+        None
+    }
+}
+
+fn looks_like_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.contains('|') && separator_column_count(trimmed).is_none()
+}
+
+fn markdown_lines(text: &str) -> Vec<(usize, usize, &str)> {
+    let mut offset = 0usize;
+    let mut lines = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        let end = offset + line.len();
+        offset = end;
+        lines.push((start, end, line.trim_end_matches(['\r', '\n'])));
+    }
+    lines
+}
+
+/// GitHub-flavored tables that are not inside a fence.
+fn markdown_table_spans(text: &str) -> Vec<MarkdownTableSpan> {
+    let lines = markdown_lines(text);
+    let mut spans = Vec::new();
+    let mut in_fence = false;
+    let mut index = 0usize;
+    while index < lines.len() {
+        let (_, _, content) = lines[index];
+        if is_fence_delimiter(content) {
+            in_fence = !in_fence;
+            index += 1;
+            continue;
+        }
+        if !in_fence
+            && index + 1 < lines.len()
+            && looks_like_table_row(content)
+            && let Some(columns) = separator_column_count(lines[index + 1].2)
+        {
+            let start = lines[index].0;
+            let mut end = lines[index + 1].1;
+            let mut next = index + 2;
+            while next < lines.len() {
+                let row = lines[next].2;
+                if is_fence_delimiter(row) || !looks_like_table_row(row) {
+                    break;
+                }
+                end = lines[next].1;
+                next += 1;
+            }
+            spans.push(MarkdownTableSpan {
+                start,
+                end,
+                columns,
+            });
+            index = next;
+            continue;
+        }
+        index += 1;
+    }
+    spans
+}
+
+/// Fenced regions whose body contains a table separator.
+fn fenced_table_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let lines = markdown_lines(text);
+    let mut ranges = Vec::new();
+    let mut fence_start: Option<usize> = None;
+    let mut fence_has_separator = false;
+    for (start, end, content) in lines {
+        if is_fence_delimiter(content) {
+            if let Some(open) = fence_start.take() {
+                if fence_has_separator {
+                    ranges.push(open..end);
+                }
+                fence_has_separator = false;
+            } else {
+                fence_start = Some(start);
+            }
+            continue;
+        }
+        if fence_start.is_some() && separator_column_count(content).is_some() {
+            fence_has_separator = true;
+        }
+    }
+    ranges
+}
+
+fn protected_markdown_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges: Vec<std::ops::Range<usize>> = markdown_table_spans(text)
+        .into_iter()
+        .map(|span| span.start..span.end)
+        .collect();
+    ranges.extend(fenced_table_ranges(text));
+    ranges.sort_by_key(|range| range.start);
+    ranges.retain(|range| range.start < range.end);
+    ranges
+}
+
+/// Wrap tables wider than `max_columns` in a fence so they render as code.
+/// `max_columns == 0` wraps every table.
+fn wrap_markdown_tables(text: &str, max_columns: usize) -> String {
+    let spans = markdown_table_spans(text);
+    if spans
+        .iter()
+        .all(|span| max_columns > 0 && span.columns <= max_columns)
+    {
+        return text.to_string();
+    }
+
+    let mut out = String::with_capacity(text.len() + spans.len() * 8);
+    let mut cursor = 0usize;
+    for span in spans {
+        out.push_str(&text[cursor..span.start]);
+        if max_columns > 0 && span.columns <= max_columns {
+            out.push_str(&text[span.start..span.end]);
+        } else {
+            let raw = &text[span.start..span.end];
+            let body = raw.trim_end_matches(['\n', '\r']);
+            let trailing = &raw[body.len()..];
+            out.push_str("```\n");
+            out.push_str(body);
+            out.push('\n');
+            out.push_str("```");
+            out.push_str(trailing);
+        }
+        cursor = span.end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn split_plain_for_limit(text: &str, limit: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let limit = limit.max(1);
+    let mut chunks = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.chars().count() <= limit {
+            chunks.push(rest.to_string());
+            break;
+        }
+        let hard = byte_index_after_chars(rest, limit);
+        let mut end = hard;
+        if let Some(pos) = rest[..hard].rfind('\n') {
+            let candidate = pos + '\n'.len_utf8();
+            if rest[..pos].chars().count() >= limit / 2 && candidate > 0 {
+                end = candidate;
+            }
+        }
+        if end == 0 {
+            end = rest.chars().next().map_or(1, char::len_utf8);
+        }
+        chunks.push(rest[..end].to_string());
+        rest = &rest[end..];
+    }
+    chunks
+}
+
+fn merge_into_last(chunks: &mut [String], parts: &mut Vec<String>, limit: usize) {
+    if parts.is_empty() {
+        return;
+    }
+    if let Some(last) = chunks.last_mut()
+        && !last.is_empty()
+        && last.chars().count() + parts[0].chars().count() <= limit
+    {
+        last.push_str(&parts.remove(0));
+    }
+}
+
+/// Split `message`, keeping `protected` byte ranges intact even when they
+/// exceed `limit`. Ranges must be char boundaries and non-overlapping.
+fn split_message_protecting(
+    message: &str,
+    limit: usize,
+    protected: &[std::ops::Range<usize>],
+) -> Vec<String> {
+    if protected.is_empty() {
+        let parts = split_plain_for_limit(message, limit);
+        return if parts.is_empty() {
+            vec![String::new()]
+        } else {
+            parts
+        };
+    }
+
+    let mut chunks = Vec::new();
+    let mut cursor = 0usize;
+    for range in protected {
+        if range.start < cursor || range.end > message.len() || range.start > range.end {
+            continue;
+        }
+        if range.start > cursor {
+            let mut parts = split_plain_for_limit(&message[cursor..range.start], limit);
+            merge_into_last(&mut chunks, &mut parts, limit);
+            chunks.extend(parts);
+        }
+        let piece = &message[range.start..range.end];
+        if !piece.is_empty() {
+            if let Some(last) = chunks.last_mut() {
+                if !last.is_empty() && last.chars().count() + piece.chars().count() <= limit {
+                    last.push_str(piece);
+                } else {
+                    chunks.push(piece.to_string());
+                }
+            } else {
+                chunks.push(piece.to_string());
+            }
+        }
+        cursor = range.end;
+    }
+    if cursor < message.len() {
+        let mut parts = split_plain_for_limit(&message[cursor..], limit);
+        merge_into_last(&mut chunks, &mut parts, limit);
+        chunks.extend(parts);
+    }
+    if chunks.is_empty() {
+        vec![String::new()]
+    } else {
+        chunks
+    }
+}
+
+fn append_plain_telegram_chunks(chunks: &mut Vec<String>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let mut parts = split_message_for_telegram(text);
+    let limit = TELEGRAM_MAX_MESSAGE_LENGTH
+        .saturating_sub(telegram_chunk_marker_len(true, true))
+        .max(1);
+    if let (Some(last), Some(first)) = (chunks.last(), parts.first()) {
+        let open_fence = code_block_state_after(last, false);
+        if !open_fence && !last.is_empty() && last.chars().count() + first.chars().count() <= limit
+        {
+            merge_into_last(chunks, &mut parts, limit);
+        }
+    }
+    chunks.extend(parts);
+}
+
+fn append_protected_piece(chunks: &mut Vec<String>, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
+    let limit = TELEGRAM_MAX_MESSAGE_LENGTH
+        .saturating_sub(telegram_chunk_marker_len(true, true))
+        .max(1);
+    if let Some(last) = chunks.last_mut() {
+        let open_fence = code_block_state_after(last, false);
+        if !open_fence && !last.is_empty() && last.chars().count() + piece.chars().count() <= limit
+        {
+            last.push_str(piece);
+            return;
+        }
+    }
+    chunks.push(piece.to_string());
+}
+
+/// Like [`split_message_for_telegram`], but a markdown table stays in one chunk
+/// even when that chunk then exceeds Telegram's text limit.
+fn split_message_for_telegram_keeping_tables(message: &str) -> Vec<String> {
+    let spans = markdown_table_spans(message);
+    if spans.is_empty() {
+        return split_message_for_telegram(message);
+    }
+    let mut chunks = Vec::new();
+    let mut cursor = 0usize;
+    for span in spans {
+        if span.start > cursor {
+            append_plain_telegram_chunks(&mut chunks, &message[cursor..span.start]);
+        }
+        append_protected_piece(&mut chunks, &message[span.start..span.end]);
+        cursor = span.end;
+    }
+    if cursor < message.len() {
+        append_plain_telegram_chunks(&mut chunks, &message[cursor..]);
+    }
+    if chunks.is_empty() {
+        vec![String::new()]
+    } else {
+        chunks
+    }
+}
+
+fn neutralize_rich_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    let mut math_block: Option<String> = None;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let newline = &line[content.len()..];
+        if math_block.is_some() {
+            if content.trim() == "$$" {
+                let rendered = math_block.take().unwrap_or_default();
+                out.push_str(rendered.trim_end_matches(['\n', '\r']));
+                out.push_str(newline);
+            } else if let Some(body) = math_block.as_mut() {
+                body.push_str(line);
+            }
+            continue;
+        }
+        if is_fence_delimiter(content) {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            continue;
+        }
+        if content.trim() == "$$" {
+            math_block = Some(String::new());
+            continue;
+        }
+        out.push_str(&neutralize_rich_line(content));
+        out.push_str(newline);
+    }
+    if let Some(body) = math_block {
+        out.push_str("$$");
+        out.push('\n');
+        out.push_str(&body);
+    }
+    out
+}
+
+fn neutralize_rich_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    while index < line.len() {
+        if bytes[index] == b'\\' {
+            let ch = line[index..].chars().next().unwrap_or('\\');
+            out.push(ch);
+            index += ch.len_utf8();
+            if index < line.len() {
+                let next = line[index..].chars().next().unwrap_or('\0');
+                out.push(next);
+                index += next.len_utf8();
+            }
+            continue;
+        }
+        if bytes[index] == b'`'
+            && let Some(end) = line[index + 1..].find('`')
+        {
+            let close = index + 1 + end + 1;
+            out.push_str(&line[index..close]);
+            index = close;
+            continue;
+        }
+        if bytes[index] == b'!'
+            && let Some((len, replacement)) = rewrite_markdown_image(&line[index..])
+        {
+            out.push_str(&replacement);
+            index += len;
+            continue;
+        }
+        if bytes[index] == b'$'
+            && let Some((len, inner)) = take_math_span(&line[index..])
+        {
+            out.push_str(inner);
+            index += len;
+            continue;
+        }
+        let Some(ch) = line[index..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn take_math_span(line: &str) -> Option<(usize, &str)> {
+    if let Some(rest) = line.strip_prefix("$$") {
+        let end = rest.find("$$")?;
+        if end == 0 {
+            return None;
+        }
+        Some((end + 4, &rest[..end]))
+    } else if let Some(rest) = line.strip_prefix('$') {
+        let end = rest.find('$')?;
+        if end == 0 {
+            return None;
+        }
+        let inner = &rest[..end];
+        // `$400 and $x^2$` must not become one span. A real inline span does not
+        // start or end with whitespace, and it does not close in front of a digit.
+        if inner.starts_with(char::is_whitespace) || inner.ends_with(char::is_whitespace) {
+            return None;
+        }
+        if rest[end + 1..].starts_with(|ch: char| ch.is_ascii_digit()) {
+            return None;
+        }
+        Some((end + 2, inner))
+    } else {
+        None
+    }
+}
+
+fn rewrite_markdown_image(text: &str) -> Option<(usize, String)> {
+    let rest = text.strip_prefix("![")?;
+    let bracket_end = rest.find(']')?;
+    let alt = &rest[..bracket_end];
+    let after_bracket = rest.get(bracket_end + 1..)?;
+    let url_body = after_bracket.strip_prefix('(')?;
+    let paren_end = url_body.find(')')?;
+    let url = &url_body[..paren_end];
+    if url.is_empty() {
+        return None;
+    }
+    let replacement = if alt.is_empty() {
+        url.to_string()
+    } else {
+        format!("[{alt}]({url})")
+    };
+    let len = 2 + bracket_end + 1 + 1 + paren_end + 1;
+    Some((len, replacement))
+}
+
+/// Markdown passed to `sendRichMessage`. Strips math delimiters and image
+/// embeds, and fences tables that exceed the 20-column limit.
+fn prepare_rich_markdown(text: &str) -> String {
+    let neutralized = neutralize_rich_markdown(text);
+    wrap_markdown_tables(&neutralized, TELEGRAM_RICH_MAX_TABLE_COLUMNS)
+}
+
+fn project_rich_message(value: &serde_json::Value) -> Option<String> {
+    let blocks = value.get("blocks")?.as_array()?;
+    let text = project_blocks(blocks);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn incoming_message_text(message: &serde_json::Value) -> Option<String> {
+    if let Some(text) = message.get("text").and_then(serde_json::Value::as_str)
+        && !text.is_empty()
+    {
+        return Some(text.to_string());
+    }
+    message.get("rich_message").and_then(project_rich_message)
+}
+
+fn project_blocks(blocks: &[serde_json::Value]) -> String {
+    blocks
+        .iter()
+        .map(project_block)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn project_block(block: &serde_json::Value) -> String {
+    let kind = block
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match kind {
+        "table" => project_table(block),
+        "list" => project_list(block),
+        "heading" => {
+            let size = block
+                .get("size")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1);
+            let level = usize::try_from(size).unwrap_or(1).clamp(1, 6);
+            let text = block.get("text").map(project_rich_text).unwrap_or_default();
+            format!("{} {text}", "#".repeat(level))
+        }
+        "pre" => {
+            let lang = block
+                .get("language")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let text = block.get("text").map(project_rich_text).unwrap_or_default();
+            format!("```{lang}\n{text}\n```")
+        }
+        "divider" => "---".to_string(),
+        "block_quotation" | "expandable_block_quotation" | "pull_quotation" => {
+            project_nested_content(block)
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => project_nested_content(block),
+    }
+}
+
+fn project_nested_content(block: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = block.get("text") {
+        let rendered = project_rich_text(text);
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
+    }
+    if let Some(summary) = block.get("summary") {
+        let rendered = project_rich_text(summary);
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
+    }
+    if let Some(blocks) = block.get("blocks").and_then(serde_json::Value::as_array) {
+        let nested = project_blocks(blocks);
+        if !nested.is_empty() {
+            parts.push(nested);
+        }
+    }
+    parts.join("\n")
+}
+
+fn project_rich_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items.iter().map(project_rich_text).collect(),
+        serde_json::Value::Object(map) => {
+            if let Some(text) = map.get("text") {
+                let rendered = project_rich_text(text);
+                if !rendered.is_empty() {
+                    return rendered;
+                }
+            }
+            for key in ["source", "expression", "latex", "value"] {
+                if let Some(text) = map.get(key).and_then(serde_json::Value::as_str)
+                    && !text.is_empty()
+                {
+                    return text.to_string();
+                }
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+fn project_list(block: &serde_json::Value) -> String {
+    let Some(items) = block.get("items").and_then(serde_json::Value::as_array) else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for item in items {
+        let has_checkbox = item
+            .get("has_checkbox")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let checked = item
+            .get("is_checked")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let label = item
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let marker = if has_checkbox {
+            if checked { "- [x]" } else { "- [ ]" }
+        } else if label.is_empty() {
+            "-"
+        } else {
+            label
+        };
+        let body = item
+            .get("blocks")
+            .and_then(serde_json::Value::as_array)
+            .map(|blocks| project_blocks(blocks))
+            .unwrap_or_default();
+        if body.is_empty() {
+            lines.push(marker.to_string());
+            continue;
+        }
+        let mut body_lines = body.lines();
+        if let Some(first) = body_lines.next() {
+            lines.push(format!("{marker} {first}"));
+            for extra in body_lines {
+                lines.push(format!("  {extra}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn project_table(block: &serde_json::Value) -> String {
+    let Some(rows) = block.get("cells").and_then(serde_json::Value::as_array) else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let Some(cells) = row.as_array() else {
+            continue;
+        };
+        let rendered: Vec<String> = cells
+            .iter()
+            .map(|cell| {
+                cell.get("text")
+                    .map(project_rich_text)
+                    .unwrap_or_default()
+                    .replace('\n', " ")
+            })
+            .collect();
+        lines.push(format!("| {} |", rendered.join(" | ")));
+        if row_index == 0 {
+            let separator = vec!["---"; rendered.len()].join(" | ");
+            lines.push(format!("| {separator} |"));
+        }
+    }
+    if let Some(caption) = block.get("caption") {
+        let caption = project_rich_text(caption);
+        if !caption.is_empty() {
+            lines.push(caption);
+        }
+    }
+    lines.join("\n")
 }
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
@@ -984,6 +1650,8 @@ pub struct TelegramChannel {
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
     mention_only: bool,
+    /// When true, final replies use Bot API `sendRichMessage`.
+    rich_messages: bool,
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
@@ -2608,6 +3276,7 @@ impl TelegramChannel {
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            rich_messages: false,
             per_user_session: true,
             passive_group_context: false,
             bot_username: Mutex::new(None),
@@ -2675,6 +3344,16 @@ impl TelegramChannel {
     /// Configure whether Telegram-native acknowledgement reactions are sent.
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
+        self
+    }
+
+    /// Send final replies with Bot API rich messages when `enabled`.
+    ///
+    /// Headings, lists, quotes, and tables then render natively. Some clients
+    /// still show those messages as unsupported, so callers leave this off
+    /// unless every client in use can render them.
+    pub fn with_rich_messages(mut self, enabled: bool) -> Self {
+        self.rich_messages = enabled;
         self
     }
 
@@ -5868,7 +6547,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let message = update.get("message")?;
 
-        let text = message.get("text").and_then(serde_json::Value::as_str)?;
+        let text_owned = incoming_message_text(message)?;
+        let text = text_owned.as_str();
 
         let (_, sender_id, sender_identity) = Self::extract_sender_info(message);
 
@@ -5988,6 +6668,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">
     /// This mirrors OpenClaw's markdownToTelegramHtml approach.
     fn markdown_to_telegram_html(text: &str) -> String {
+        let text = wrap_markdown_tables(text, 0);
         let lines: Vec<&str> = text.split('\n').collect();
         let mut result_lines: Vec<String> = Vec::new();
 
@@ -6161,14 +6842,35 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         thread_id: Option<&str>,
         skip_chunks: usize,
     ) -> Result<usize, SendChunksError> {
-        let chunks = split_message_for_telegram(message);
+        if self.rich_messages {
+            return self
+                .send_rich_text_chunks(message, chat_id, thread_id, skip_chunks)
+                .await;
+        }
+        self.send_html_text_chunks(message, chat_id, thread_id, skip_chunks)
+            .await
+    }
+
+    async fn send_html_text_chunks(
+        &self,
+        message: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        skip_chunks: usize,
+    ) -> Result<usize, SendChunksError> {
+        let chunks = split_message_for_telegram_keeping_tables(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
             if index < skip_chunks {
                 continue;
             }
 
-            let text = format_telegram_text_chunk(chunk, index, chunks.len());
+            let marked = format_telegram_text_chunk(chunk, index, chunks.len());
+            let text = if marked.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
+                marked
+            } else {
+                chunk.to_string()
+            };
 
             let mut markdown_body = serde_json::json!({
                 "chat_id": chat_id,
@@ -6266,6 +6968,92 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(chunks.len())
     }
 
+    async fn send_rich_text_chunks(
+        &self,
+        message: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        skip_chunks: usize,
+    ) -> Result<usize, SendChunksError> {
+        let prepared = prepare_rich_markdown(message);
+        let ranges = protected_markdown_ranges(&prepared);
+        let budget = TELEGRAM_RICH_MAX_MESSAGE_LENGTH
+            .saturating_sub(telegram_chunk_marker_len(true, true))
+            .max(1);
+        let chunks = split_message_protecting(&prepared, budget, &ranges);
+        for (index, chunk) in chunks.iter().enumerate() {
+            if index < skip_chunks {
+                continue;
+            }
+            let marked = format_telegram_text_chunk(chunk, index, chunks.len());
+            let text = if marked.chars().count() <= TELEGRAM_RICH_MAX_MESSAGE_LENGTH {
+                marked
+            } else {
+                chunk.to_string()
+            };
+            match self
+                .send_rich_message_honoring_rate_limit(chat_id, thread_id, &text)
+                .await
+                .map_err(|error| SendChunksError {
+                    delivered: index,
+                    rate_limited: false,
+                    source: error.into(),
+                })? {
+                SendMessageAttempt::Sent => {}
+                SendMessageAttempt::RateLimited { status, body } => {
+                    return Err(SendChunksError {
+                        delivered: index,
+                        rate_limited: true,
+                        source: anyhow::Error::msg(format!(
+                            "Telegram sendRichMessage rate limited ({status}): {body}"
+                        )),
+                    });
+                }
+                SendMessageAttempt::Failed { status, .. } => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                        "Telegram sendRichMessage failed; falling back to HTML"
+                    );
+                    self.send_html_text_chunks(&text, chat_id, thread_id, 0)
+                        .await
+                        .map_err(|error| SendChunksError {
+                            delivered: if error.delivered > 0 {
+                                index + 1
+                            } else {
+                                index
+                            },
+                            rate_limited: error.rate_limited,
+                            source: error.source,
+                        })?;
+                }
+            }
+            if index + 1 < chunks.len() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Ok(chunks.len())
+    }
+
+    async fn send_rich_message_honoring_rate_limit(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        markdown: &str,
+    ) -> Result<SendMessageAttempt, reqwest::Error> {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "rich_message": { "markdown": markdown },
+        });
+        if let Some(tid) = thread_id {
+            body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+        }
+        self.post_bot_method_honoring_rate_limit("sendRichMessage", &body)
+            .await
+    }
+
     /// Posts one `sendMessage` request. On HTTP 429 it waits the server's
     /// `retry_after` (up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`]) and resends the
     /// same body, at most [`TELEGRAM_RATE_LIMIT_RETRIES`] times, so a flood
@@ -6274,11 +7062,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         &self,
         body: &serde_json::Value,
     ) -> Result<SendMessageAttempt, reqwest::Error> {
+        self.post_bot_method_honoring_rate_limit("sendMessage", body)
+            .await
+    }
+
+    async fn post_bot_method_honoring_rate_limit(
+        &self,
+        method: &str,
+        body: &serde_json::Value,
+    ) -> Result<SendMessageAttempt, reqwest::Error> {
         let mut retries = 0;
         loop {
             let resp = self
                 .http_client()
-                .post(self.api_url("sendMessage"))
+                .post(self.api_url(method))
                 .json(body)
                 .send()
                 .await?;
@@ -6296,6 +7093,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
+                            "method": method,
                             "retry_after_secs": wait.as_secs(),
                             "retries": retries,
                         })),
@@ -6309,6 +7107,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
+                        "method": method,
                         "retry_after_secs": wait.as_secs(),
                         "attempt": retries,
                     })),
@@ -8126,6 +8925,43 @@ impl Channel for TelegramChannel {
             }
 
             return Ok(());
+        }
+
+        if self.rich_messages
+            && let Some(id) = msg_id
+        {
+            let prepared = prepare_rich_markdown(text);
+            if prepared.chars().count() <= TELEGRAM_RICH_MAX_MESSAGE_LENGTH {
+                let body = serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": id,
+                    "rich_message": { "markdown": prepared },
+                });
+                if let Ok(resp) = self
+                    .http_client()
+                    .post(self.api_url("editMessageText"))
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    match Self::classify_edit_message_response(resp).await {
+                        EditMessageResult::Success | EditMessageResult::NotModified => {
+                            return Ok(());
+                        }
+                        EditMessageResult::Failed(status) => {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                                "Telegram finalize_draft rich edit failed; falling back to HTML"
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // If text exceeds limit, delete draft and send as chunked messages
@@ -12644,6 +13480,135 @@ mod tests {
         assert_eq!(rendered, "<pre><code>let x = 1;</code></pre>");
         assert!(!rendered.contains("language-"));
         assert!(!rendered.contains("onclick"));
+    }
+
+    #[test]
+    fn telegram_markdown_to_html_wraps_table_in_pre() {
+        let rendered =
+            TelegramChannel::markdown_to_telegram_html("| A | B |\n| --- | --- |\n| 1 | 2 |\n");
+        assert!(rendered.contains("<pre><code>"));
+        assert!(rendered.contains("| A | B |"));
+        assert!(rendered.contains("| 1 | 2 |"));
+        assert!(!rendered.contains("<table"));
+    }
+
+    #[test]
+    fn prepare_rich_markdown_keeps_currency_and_rewrites_images() {
+        let prepared = prepare_rich_markdown(
+            "Cost is $400 and $x^2$.\n\n![shot](https://example.com/a.png)\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n",
+        );
+        assert!(prepared.contains("$400"));
+        assert!(prepared.contains("x^2"));
+        assert!(!prepared.contains("$x^2$"));
+        assert!(prepared.contains("[shot](https://example.com/a.png)"));
+        assert!(!prepared.contains("![shot]"));
+        assert!(prepared.contains("| A | B |"));
+        assert!(!prepared.contains("```\n| A | B |"));
+    }
+
+    #[test]
+    fn prepare_rich_markdown_leaves_math_and_images_inside_code() {
+        let prepared =
+            prepare_rich_markdown("```\n$x^2$\n![a](https://example.com/a.png)\n```\n`$y$`");
+        assert!(prepared.contains("$x^2$"));
+        assert!(prepared.contains("![a](https://example.com/a.png)"));
+        assert!(prepared.contains("`$y$`"));
+    }
+
+    #[test]
+    fn prepare_rich_markdown_fences_tables_wider_than_20_columns() {
+        let header = (0..21)
+            .map(|index| format!("c{index}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let separator = (0..21).map(|_| "---").collect::<Vec<_>>().join(" | ");
+        let row = (0..21)
+            .map(|index| index.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let prepared =
+            prepare_rich_markdown(&format!("| {header} |\n| {separator} |\n| {row} |\n"));
+        assert!(prepared.starts_with("```\n"));
+        assert!(prepared.contains("| c0 |"));
+        assert!(prepared.trim_end().ends_with("```"));
+    }
+
+    #[test]
+    fn split_keeps_markdown_table_intact() {
+        let mut message = "a".repeat(4080);
+        message.push_str("\n| A | B |\n| --- | --- |\n| 1 | 2 |\n");
+        let chunks = split_message_for_telegram_keeping_tables(&message);
+        assert!(
+            chunks.len() >= 2,
+            "table must stay in its own chunk once the prefix fills the limit"
+        );
+        let table = chunks
+            .iter()
+            .find(|chunk| chunk.contains("| --- |"))
+            .expect("table chunk");
+        assert!(table.contains("| A | B |"));
+        assert!(table.contains("| 1 | 2 |"));
+        assert!(!table.contains(&"a".repeat(100)));
+    }
+
+    #[test]
+    fn project_rich_message_reads_heading_list_and_table() {
+        let rich = serde_json::json!({
+            "blocks": [
+                { "type": "heading", "size": 2, "text": "Status" },
+                {
+                    "type": "list",
+                    "items": [
+                        {
+                            "label": "-",
+                            "has_checkbox": true,
+                            "is_checked": false,
+                            "blocks": [{ "type": "paragraph", "text": "open" }]
+                        }
+                    ]
+                },
+                {
+                    "type": "table",
+                    "cells": [
+                        [{ "text": "A" }, { "text": "B" }],
+                        [{ "text": "1" }, { "text": "2" }]
+                    ]
+                }
+            ]
+        });
+        let projected = project_rich_message(&rich).unwrap();
+        assert!(projected.contains("## Status"));
+        assert!(projected.contains("- [ ] open"));
+        assert!(projected.contains("| A | B |"));
+        assert!(projected.contains("| 1 | 2 |"));
+    }
+
+    #[test]
+    fn parse_update_message_projects_rich_message_without_text() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let update = serde_json::json!({
+            "update_id": 9,
+            "message": {
+                "message_id": 4,
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 42 },
+                "rich_message": {
+                    "blocks": [
+                        { "type": "paragraph", "text": "hello from rich" }
+                    ]
+                }
+            }
+        });
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("rich-only message should parse");
+        assert_eq!(msg.content, "hello from rich");
+        assert_eq!(msg.sender, "alice");
     }
 
     #[test]

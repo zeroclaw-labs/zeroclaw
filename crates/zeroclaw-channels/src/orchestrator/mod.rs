@@ -13231,7 +13231,8 @@ fn build_channel_by_id(
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
                 .with_per_user_session(tg.per_user_session)
-                .with_approval_timeout_secs(tg.approval_timeout_secs),
+                .with_approval_timeout_secs(tg.approval_timeout_secs)
+                .with_rich_messages(tg.rich_messages),
             ))
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -14814,7 +14815,8 @@ fn collect_configured_channels_with_authority(
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
                     .with_per_user_session(tg.per_user_session)
-                    .with_approval_timeout_secs(tg.approval_timeout_secs),
+                    .with_approval_timeout_secs(tg.approval_timeout_secs)
+                    .with_rich_messages(tg.rich_messages),
                 ),
                 tg,
             ),
@@ -17946,7 +17948,8 @@ pub async fn deliver_announcement(
                 Arc::new(move || peers.clone());
             let ch =
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
-                    .with_api_base(tg.api_base_url.clone());
+                    .with_api_base(tg.api_base_url.clone())
+                    .with_rich_messages(tg.rich_messages);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -53540,6 +53543,8 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+
+                rich_messages: false,
             },
         );
         let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
@@ -53573,6 +53578,8 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+
+                rich_messages: false,
             },
         );
         config

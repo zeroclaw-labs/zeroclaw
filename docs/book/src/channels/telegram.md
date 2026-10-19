@@ -83,6 +83,25 @@ started and served by the resolved default enabled agent. Declare explicit
 bindings as shown above so an unlisted bot is genuinely inactive rather than
 silently running under the default agent.
 
+### Tables and rich messages
+
+Telegram HTML has no table tag. Markdown tables are sent as preformatted text
+so the grid stays in one piece instead of being split or read as inline HTML.
+
+Set `rich_messages = true` on the channel alias to send final replies with Bot
+API `sendRichMessage`. Headings, lists, quotes, and tables then render
+natively. Some clients still show those messages as unsupported, so leave the
+flag off unless every client in use can render them.
+
+```toml
+[channels.telegram.home]
+rich_messages = true
+```
+
+Tables wider than 20 columns stay fenced as code, which is the Bot API column
+limit. If `sendRichMessage` fails, the reply is sent as HTML. Draft updates
+while a reply is still being written stay plain text.
+
 ## 3. Choose how the first users are authorized
 
 Choose one of the following paths before starting the bot.
