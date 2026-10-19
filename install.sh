@@ -409,6 +409,9 @@ Options:
   --full               Install everything: the 'full' feature preset plus every
                        installable app (implies --source)
   --minimal            Alias for --preset minimal
+  --cli-only           CLI-only build for servers: the standard features without
+                       the dashboard and web gateway (alias for --preset cli-only;
+                       builds from source)
   --features X,Y       Select specific features — source only (comma-separated)
   --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
   --with-gateway       Force the gateway feature on (overrides preset/feature default)
@@ -433,6 +436,7 @@ Examples:
   $0 --source --features agent-runtime,channel-discord  # custom feature set
   $0 --source --preset full                   # every channel plus heavyweight extras
   $0 --full                                    # everything: full preset + every app
+  $0 --cli-only                                # CLI-only server build (no dashboard)
   $0 --skip-quickstart                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
@@ -768,7 +772,7 @@ DRY_RUN=false
 MODIFY_PATH=true # append PATH export to the shell profile; --no-modify-path opts out
 PREFIX="$HOME"
 INSTALL_MODE="" # ""=ask, "prebuilt"=force prebuilt, "source"=force source
-PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-features
+PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-features, "cli-only"=--cli-only
 WITH_GATEWAY="" # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 WITHOUT_TUI=""  # ""=unset (default: install TUI), "true"=skip TUI
 USER_APPS=""    # ""=unset (default apps), "none"=skip all, or comma list (e.g. "zerocode")
@@ -784,7 +788,7 @@ while [ $# -gt 0 ]; do
   --minimal) MINIMAL=true ;;
   --preset)
     if [ $# -lt 2 ]; then
-      die "Missing value for --preset. Expected: --preset minimal|full"
+      die "Missing value for --preset. Expected: --preset minimal|full|cli-only"
     fi
     shift
     case "$1" in
@@ -793,7 +797,8 @@ while [ $# -gt 0 ]; do
       MINIMAL=true
       ;;
     full) PRESET="full" ;;
-    *) die "Unknown preset '$1'. Expected: minimal or full" ;;
+    cli-only) PRESET="cli-only" ;;
+    *) die "Unknown preset '$1'. Expected: minimal, full or cli-only" ;;
     esac
     ;;
   --full)
@@ -801,6 +806,7 @@ while [ $# -gt 0 ]; do
     PRESET="full"
     FULL_APPS=true
     ;;
+  --cli-only) PRESET="cli-only" ;;
   --features)
     if [ $# -lt 2 ]; then
       die "Missing value for --features. Expected: --features X,Y"
@@ -879,11 +885,12 @@ fi
 # ── Decide: pre-built or source ───────────────────────────────────
 
   # >>> generated:route-decision by `cargo generate installers` - do not edit <<<
-# --minimal, --features, --apps, --without-gateway, or --preset full imply
-# source. Prebuilt archives have fixed feature and app contents, so any flag
-# that changes the feature set or selects apps must force a source build.
+# --minimal, --features, --apps, --without-gateway, --cli-only, or --preset
+# full imply source. Prebuilt archives have fixed feature and app contents, so
+# any flag that changes the feature set or selects apps must force a source
+# build.
 if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ] || [ -n "$USER_APPS" ] ||
-  [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ]; then
+  [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ] || [ "$PRESET" = "cli-only" ]; then
   INSTALL_MODE="source"
 fi
 
@@ -1031,6 +1038,14 @@ See all available features:
     CARGO_FLAGS="--no-default-features"
   fi
 
+  # `--cli-only` is its own complete feature set (resolved below), so the
+  # gateway toggles and `--minimal` cannot be combined with it.
+  if [ "$PRESET" = "cli-only" ]; then
+    [ "$WITH_GATEWAY" = "true" ] && die "--cli-only builds have no gateway; drop --with-gateway"
+    [ "$MINIMAL" = true ] && die "--cli-only and --minimal are different feature sets; pick one"
+    WITH_GATEWAY=""
+  fi
+
   # `--without-gateway` overrides the default-features set: switch to
   # --no-default-features and re-add everything in `default` except gateway.
   if [ "$WITH_GATEWAY" = "false" ] && [ "$MINIMAL" != true ]; then
@@ -1061,6 +1076,21 @@ See all available features:
     else
       warn "Could not resolve --preset full from the feature registry; falling back to default features."
     fi
+  fi
+
+  # `--cli-only` builds the standard distribution without the dashboard, the
+  # web gateway and the ACP bridge that dials it. Resolve it from the canonical
+  # registry (`cargo generate features --selection cli-only`) for this host's
+  # target, as the release workflow resolves `dist`. Fail instead of falling
+  # back: Cargo's defaults would install the dashboard build.
+  if [ "$PRESET" = "cli-only" ]; then
+    cli_only_target=$(detect_target_triple)
+    cli_only_features=$(cargo run --quiet -p xtask --bin generate -- features --selection cli-only ${cli_only_target:+--target "$cli_only_target"} 2>/dev/null || true)
+    if [ -z "$cli_only_features" ]; then
+      die "Could not resolve the CLI-only feature set from the feature registry (cargo generate features --selection cli-only)."
+    fi
+    CARGO_FLAGS="--no-default-features"
+    USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$cli_only_features"
   fi
 
   # Interactive picker — only when the operator did not pin features or
@@ -1360,6 +1390,21 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
   if ! quickstart_needed; then
     info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping setup prompt."
     info "Run '$QUICKSTART_COMMAND' to reconfigure."
+  elif [ "$GUIDED_QUICKSTART_MODE" = "offer" ] && [ -t 0 ] && [ "$PRESET" = "cli-only" ]; then
+    # A CLI-only build has no dashboard to finish setup in, so it offers the
+    # CLI quickstart alone. Bare Enter accepts it.
+    echo
+    printf "%s" "$(bold "ZeroClaw installed. Run the CLI quickstart ($QUICKSTART_COMMAND) now? [Y/n] ")"
+    read -r quickstart_choice
+    case "${quickstart_choice:-y}" in
+    [Nn]*)
+      info "Skipped setup. Run '$QUICKSTART_COMMAND' when ready."
+      ;;
+    *)
+      echo
+      "$BIN" "$QUICKSTART_SUBCOMMAND" || warn "Quickstart exited with an error — run '$QUICKSTART_COMMAND' manually"
+      ;;
+    esac
   elif [ "$GUIDED_QUICKSTART_MODE" = "offer" ] && [ -t 0 ]; then
     # 3-way setup choice. Bare Enter accepts the [1] CLI quickstart default;
     # option [2] foregrounds the daemon so the operator can finish in the
@@ -1403,6 +1448,9 @@ echo
 # fall back to a one-off CLI agent run.
 if [ -f "$CARGO_HOME/bin/$TUI_BIN_NAME" ]; then
   info "Done. Run $(bold "$TUI_BIN_NAME") to launch the terminal UI and start working."
+elif [ "$PRESET" = "cli-only" ] && [ -f "$CARGO_HOME/bin/zeroclaw" ]; then
+  info "Done. Run $(bold "zeroclaw daemon") for the always-on daemon (this build has no dashboard),"
+  info "or $(bold "zeroclaw agent") for a one-off CLI chat."
 elif [ -f "$CARGO_HOME/bin/zeroclaw" ] && "$CARGO_HOME/bin/zeroclaw" --help 2>/dev/null | grep -q '\bdaemon\b'; then
   info "Done. Run $(bold "zeroclaw daemon") for the always-on daemon + web dashboard,"
   info "or $(bold "zeroclaw agent") for a one-off CLI chat."
