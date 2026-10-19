@@ -4,7 +4,9 @@
 use process_wrap::tokio::{ChildWrapper, CommandWrap, CommandWrapper, JobObject, KillOnDrop};
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 #[cfg(any(unix, windows))]
@@ -14,6 +16,11 @@ use std::time::Instant;
 // in zeroclaw-runtime's service module.
 const READINESS_FRAME_MAX_BYTES: usize = 4096;
 const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a supervisor that failed startup gets to exit before it is forced.
+pub(crate) const STARTUP_CLEANUP_GRACE: Duration = Duration::from_millis(250);
+/// How long to wait for a terminated job's supervisor to report its exit.
+#[cfg(windows)]
+const WINDOWS_JOB_EXIT_WAIT: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 const SIGTERM: i32 = 15;
@@ -28,6 +35,16 @@ const EPERM: i32 = 1;
 unsafe extern "C" {
     fn kill(pid: i32, signal: i32) -> i32;
 }
+
+/// The handle of a launched desktop supervisor, and the only thing that makes
+/// the tree under it owned. On Unix it is the supervisor's `Child`, which
+/// leads its own process group. On Windows it also holds the Job Object the
+/// supervisor was created in, suspended, before it could start a descendant;
+/// the tree is stopped through that job, never by process ID.
+#[cfg(not(windows))]
+pub type Supervisor = Child;
+#[cfg(windows)]
+pub type Supervisor = Box<dyn process_wrap::std::ChildWrapper>;
 
 /// Filename of the kernel binary on the current platform.
 fn zeroclaw_exe_name() -> &'static str {
@@ -81,81 +98,171 @@ pub fn find_zeroclaw_binary() -> Option<PathBuf> {
     None
 }
 
-/// Spawn the bounded desktop daemon supervisor, detached so it outlives the app.
-/// The child handle is returned but intentionally not reaped because the
-/// supervisor owns the daemon's background lifecycle and log capture.
-pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
-    ensure_desktop_supervisor_capability(binary)?;
+/// Spawn the bounded desktop daemon supervisor and take its readiness pipe.
+/// The returned handle is the only proof that this app instance launched the
+/// tree: the caller must hand it to its owner (see [`crate::ownership`]) before
+/// waiting for readiness, so Quit can stop the tree at any point. The
+/// supervisor owns the daemon's lifecycle and log capture.
+pub(crate) fn spawn_supervisor(
+    binary: &Path,
+    port: u16,
+) -> std::io::Result<(Supervisor, std::process::ChildStdout)> {
     let mut cmd = desktop_daemon_command(binary, port);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    // Detach so signals to the app's process group (e.g. Ctrl-C on a dev
-    // `cargo run`) don't also stop the supervisor, and so it survives app exit.
+    // Its own process group, so signals aimed at the app's group (e.g. Ctrl-C
+    // on a dev `cargo run`) don't reach it and cleanup can signal exactly this
+    // tree. It keeps running when windows close or the app crashes; only an
+    // app exit through the retained handle stops it.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    #[cfg(not(windows))]
+    let mut child: Supervisor = cmd.spawn()?;
+    // Created suspended and assigned to a job this handle owns before it
+    // runs, so every descendant starts inside the job. The job does not kill
+    // on close: an app crash leaves the tree running, as on Unix. If the job
+    // cannot be set up after the process exists, the guard kills it.
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
-    }
-
-    let mut child = cmd.spawn()?;
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
+    let mut child: Supervisor = {
+        use process_wrap::std::{CommandWrap as StdCommandWrap, CreationFlags, JobObject};
+        use windows::Win32::System::Threading::{
+            CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
+        };
+        let guard = SetupFailureGuard::armed();
+        let mut wrapped = StdCommandWrap::from(cmd);
+        wrapped
+            .wrap(CreationFlags(
+                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            ))
+            .wrap(guard.clone())
+            .wrap(JobObject);
+        let child = wrapped.spawn()?;
+        guard.disarm();
+        child
+    };
+    #[cfg(not(windows))]
+    let stdout = child.stdout.take();
+    #[cfg(windows)]
+    let stdout = child.stdout().take();
+    match stdout {
+        Some(stdout) => Ok((child, stdout)),
         None => {
             let startup_error = std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "desktop supervisor stdout unavailable",
             );
-            return Err(attach_cleanup_error(
+            Err(attach_cleanup_error(
                 startup_error,
-                terminate_supervisor_tree(&mut child),
-            ));
+                terminate_supervisor_tree(&mut child, STARTUP_CLEANUP_GRACE),
+            ))
         }
-    };
+    }
+}
+
+/// Wait for the supervisor's one readiness frame.
+pub(crate) fn read_readiness(stdout: std::process::ChildStdout) -> std::io::Result<Option<String>> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(read_readiness_frame(stdout));
     });
-    let frame = match receiver.recv_timeout(Duration::from_secs(10)) {
+    match receiver.recv_timeout(Duration::from_secs(10)) {
         Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            let startup_error = std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "desktop supervisor readiness timed out",
-            );
-            return Err(attach_cleanup_error(
-                startup_error,
-                terminate_supervisor_tree(&mut child),
-            ));
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let startup_error = std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "desktop supervisor readiness reader exited unexpectedly",
-            );
-            return Err(attach_cleanup_error(
-                startup_error,
-                terminate_supervisor_tree(&mut child),
-            ));
-        }
-    };
-    match validate_readiness_frame(frame, || child.try_wait()) {
-        Ok(()) => Ok(child),
-        Err(startup_error) => Err(attach_cleanup_error(
-            startup_error,
-            terminate_supervisor_tree(&mut child),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "desktop supervisor readiness timed out",
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "desktop supervisor readiness reader exited unexpectedly",
         )),
     }
 }
 
-fn validate_readiness_frame<F>(
+/// Kills and reaps a spawned process if the rest of its setup fails after the
+/// process exists: on Windows, creating its job, assigning the suspended
+/// process to it, or resuming it. Disarmed once the whole spawn succeeds, so a
+/// supervisor that started keeps the job's no-kill-on-close crash policy.
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug)]
+struct SetupFailureGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(any(windows, test))]
+impl SetupFailureGuard {
+    fn armed() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )))
+    }
+
+    fn disarm(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(windows, test))]
+impl process_wrap::std::CommandWrapper for SetupFailureGuard {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn process_wrap::std::ChildWrapper>,
+        _core: &process_wrap::std::CommandWrap,
+    ) -> std::io::Result<Box<dyn process_wrap::std::ChildWrapper>> {
+        Ok(Box::new(SetupFailureChild {
+            child: Some(child),
+            armed: std::sync::Arc::clone(&self.0),
+        }))
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct SetupFailureChild {
+    child: Option<Box<dyn process_wrap::std::ChildWrapper>>,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(any(windows, test))]
+impl process_wrap::std::ChildWrapper for SetupFailureChild {
+    fn inner(&self) -> &dyn process_wrap::std::ChildWrapper {
+        self.child.as_deref().expect("guard child must be present")
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn process_wrap::std::ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("guard child must be present")
+    }
+
+    fn into_inner(mut self: Box<Self>) -> Box<dyn process_wrap::std::ChildWrapper> {
+        self.child.take().expect("guard child must be present")
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for SetupFailureChild {
+    fn drop(&mut self) {
+        if !self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(child) = self.child.as_deref_mut() else {
+            return;
+        };
+        let _ = child.start_kill();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_readiness_frame<F>(
     frame: std::io::Result<Option<String>>,
     status_probe: F,
 ) -> std::io::Result<()>
@@ -186,7 +293,7 @@ where
     parse_readiness_line(&line).map_err(std::io::Error::other)
 }
 
-fn ensure_desktop_supervisor_capability(binary: &Path) -> std::io::Result<()> {
+pub(crate) fn ensure_desktop_supervisor_capability(binary: &Path) -> std::io::Result<()> {
     ensure_desktop_supervisor_capability_with_timeout(binary, CAPABILITY_PROBE_TIMEOUT)
 }
 
@@ -234,7 +341,11 @@ fn ensure_desktop_supervisor_capability_with_timeout(
     })?;
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait() {
+        #[cfg(not(windows))]
+        let polled = peek_supervisor_exit(&mut child);
+        #[cfg(windows)]
+        let polled = child.try_wait();
+        match polled {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
@@ -278,7 +389,7 @@ fn ensure_desktop_supervisor_capability_with_timeout(
 
 #[cfg(not(windows))]
 fn terminate_capability_probe(child: &mut Child) -> std::io::Result<()> {
-    terminate_supervisor_tree(child)
+    terminate_supervisor_tree(child, STARTUP_CLEANUP_GRACE)
 }
 
 #[cfg(windows)]
@@ -399,7 +510,7 @@ fn read_readiness_frame<R: Read>(mut reader: R) -> std::io::Result<Option<String
     })
 }
 
-fn attach_cleanup_error(
+pub(crate) fn attach_cleanup_error(
     startup_error: std::io::Error,
     cleanup_result: std::io::Result<()>,
 ) -> std::io::Error {
@@ -412,130 +523,87 @@ fn attach_cleanup_error(
     }
 }
 
-fn terminate_supervisor_tree(child: &mut Child) -> std::io::Result<()> {
+/// Stop the process tree a supervisor handle leads, allowing `grace` for the
+/// supervisor to stop its daemon before the tree is forced down.
+///
+/// Only the handle is trusted, never a PID looked up later. On Unix the
+/// supervisor leads its own process group, and it is not reaped until every
+/// group signal has been sent: while it is unreaped its PID, and so the group
+/// ID, cannot be reused, so the signals reach only the tree this handle
+/// launched. On Windows the open process handle keeps the PID from being
+/// reused while it is signalled.
+pub(crate) fn terminate_supervisor_tree(
+    child: &mut Supervisor,
+    grace: Duration,
+) -> std::io::Result<()> {
     let mut utility_errors = Vec::new();
-    let mut forceful_termination_initiated = false;
 
     #[cfg(unix)]
     {
         let pid = child.id();
-        // The supervisor is started in its own process group, so a negative
-        // PID targets only that owned group and its descendant daemon.
-        if let Err(error) = signal_supervisor_group(pid, SIGTERM) {
-            utility_errors.push(error.to_string());
+        // ECHILD means the supervisor was already reaped, so its PID and group
+        // ID are no longer reserved and must not be signalled.
+        let reserved = !matches!(
+            supervisor_exit_status(pid),
+            Err(ref error) if error.raw_os_error() == Some(libc::ECHILD)
+        );
+        if reserved {
+            terminate_reserved_group(child, pid, grace, &mut utility_errors);
         } else {
-            let deadline = Instant::now() + Duration::from_millis(250);
-            while Instant::now() < deadline {
-                if let Err(error) = child.try_wait() {
-                    utility_errors.push(format!("failed to reap supervisor: {error}"));
+            utility_errors.push("supervisor was reaped before cleanup".to_string());
+        }
+        // Only checks from here on: once the group empties its ID may be
+        // reused, so nothing is signalled after the reap.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            match supervisor_group_still_running(pid) {
+                Ok(false) => break,
+                Ok(true) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(true) => {
+                    utility_errors
+                        .push("supervisor process group remained after cleanup".to_string());
                     break;
                 }
-                match supervisor_group_still_running(pid) {
-                    Ok(false) => break,
-                    Ok(true) => std::thread::sleep(Duration::from_millis(10)),
-                    Err(error) => {
-                        utility_errors.push(format!(
-                            "failed to inspect supervisor process group: {error}"
-                        ));
-                        break;
-                    }
+                Err(error) => {
+                    utility_errors.push(format!(
+                        "failed to verify supervisor process group cleanup: {error}"
+                    ));
+                    break;
                 }
             }
-        }
-        match supervisor_group_still_running(pid) {
-            Ok(true) => {
-                if let Err(error) = signal_supervisor_group(pid, SIGKILL) {
-                    utility_errors.push(error.to_string());
-                } else {
-                    forceful_termination_initiated = true;
-                    let deadline = Instant::now() + Duration::from_millis(250);
-                    while Instant::now() < deadline {
-                        if let Err(error) = child.try_wait() {
-                            utility_errors.push(format!("failed to reap supervisor: {error}"));
-                            break;
-                        }
-                        match supervisor_group_still_running(pid) {
-                            Ok(false) => break,
-                            Ok(true) => std::thread::sleep(Duration::from_millis(10)),
-                            Err(error) => {
-                                utility_errors.push(format!(
-                                    "failed to verify supervisor process group cleanup: {error}"
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(false) => {}
-            Err(error) => utility_errors.push(format!(
-                "failed to inspect supervisor process group before escalation: {error}"
-            )),
         }
     }
     #[cfg(windows)]
     {
-        let pid = child.id().to_string();
-        for force in [false, true] {
-            let mut command = Command::new("taskkill");
-            command.args(["/PID", &pid, "/T"]);
-            if force {
-                command.arg("/F");
-            }
-            match command.status() {
-                Ok(status) if status.success() => {
-                    if force {
-                        forceful_termination_initiated = true;
-                    }
-                    if !force {
-                        let deadline = Instant::now() + Duration::from_millis(250);
-                        while Instant::now() < deadline {
-                            match child.try_wait() {
-                                Ok(Some(_)) => break,
-                                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                                Err(error) => {
-                                    utility_errors
-                                        .push(format!("failed to inspect supervisor: {error}"));
-                                    break;
-                                }
-                            }
-                        }
-                    }
+        // Terminating the job reaches exactly the processes created in it; no
+        // process ID or parent relationship is consulted. There is no graceful
+        // phase on Windows: the windowless supervisor has no console to signal.
+        if let Err(error) = child.start_kill() {
+            utility_errors.push(format!("failed to terminate the supervisor's job: {error}"));
+        }
+        let deadline = Instant::now() + grace.max(WINDOWS_JOB_EXIT_WAIT);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                Ok(status) => utility_errors.push(format!("taskkill exited with status {status}")),
-                Err(error) => utility_errors.push(format!("taskkill failed: {error}")),
-            }
-            if !child_still_running(child) {
-                break;
+                Ok(None) => {
+                    utility_errors.push(
+                        "supervisor remained running after its job was terminated".to_string(),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    utility_errors.push(format!("failed to inspect supervisor: {error}"));
+                    break;
+                }
             }
         }
     }
 
-    if child_still_running(child) {
-        match child.kill() {
-            Ok(()) => forceful_termination_initiated = true,
-            Err(error) => utility_errors.push(format!("fallback child kill failed: {error}")),
-        }
-    }
-    let child_running = child_still_running(child);
-    if (!child_running || forceful_termination_initiated)
-        && let Err(error) = child.wait()
-    {
-        utility_errors.push(format!("failed to reap supervisor: {error}"));
-    }
-    if child_still_running(child) {
-        utility_errors.push("supervisor remained running after cleanup".to_string());
-    }
-    #[cfg(unix)]
-    match supervisor_group_still_running(child.id()) {
-        Ok(true) => {
-            utility_errors.push("supervisor process group remained after cleanup".to_string())
-        }
-        Ok(false) => {}
-        Err(error) => utility_errors.push(format!(
-            "failed to verify supervisor process group cleanup: {error}"
-        )),
-    }
     if utility_errors.is_empty() {
         Ok(())
     } else {
@@ -543,8 +611,47 @@ fn terminate_supervisor_tree(child: &mut Child) -> std::io::Result<()> {
     }
 }
 
-fn child_still_running(child: &mut Child) -> bool {
-    !matches!(child.try_wait(), Ok(Some(_)))
+/// Signal and reap a supervisor that has not been reaped yet, so its PID and
+/// process group are still reserved: SIGTERM to the group, up to `grace` for
+/// the supervisor to exit, SIGKILL to whatever is left of the group, then the
+/// reap.
+#[cfg(unix)]
+fn terminate_reserved_group(
+    child: &mut Child,
+    pid: u32,
+    grace: Duration,
+    utility_errors: &mut Vec<String>,
+) {
+    match signal_reserved_group(pid, SIGTERM) {
+        Ok(()) => {
+            let deadline = Instant::now() + grace;
+            loop {
+                match supervisor_exited(pid) {
+                    Ok(true) => break,
+                    Ok(false) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(false) => break,
+                    Err(error) => {
+                        utility_errors.push(format!("failed to inspect supervisor: {error}"));
+                        break;
+                    }
+                }
+            }
+        }
+        Err(error) => utility_errors.push(error.to_string()),
+    }
+    // Descendants that ignored SIGTERM or outlived the supervisor are still in
+    // its group, which the unreaped supervisor keeps reserved.
+    if let Err(error) = signal_reserved_group(pid, SIGKILL) {
+        utility_errors.push(error.to_string());
+        if let Err(error) = child.kill() {
+            utility_errors.push(format!("fallback child kill failed: {error}"));
+        }
+    }
+    if let Err(error) = child.wait() {
+        utility_errors.push(format!("failed to reap supervisor: {error}"));
+    }
 }
 
 #[cfg(unix)]
@@ -560,6 +667,17 @@ fn signal_supervisor_group(pid: u32, signal: i32) -> std::io::Result<()> {
     }
 }
 
+/// Signal a process group whose leader has not been reaped. macOS refuses to
+/// signal a group whose only member is its exited (zombie) leader with EPERM;
+/// there is nothing left to signal then, so that case is not an error.
+#[cfg(unix)]
+fn signal_reserved_group(pid: u32, signal: i32) -> std::io::Result<()> {
+    match signal_supervisor_group(pid, signal) {
+        Err(error) if error.raw_os_error() == Some(EPERM) && supervisor_exited(pid)? => Ok(()),
+        result => result,
+    }
+}
+
 #[cfg(unix)]
 fn supervisor_group_still_running(pid: u32) -> std::io::Result<bool> {
     let pid = i32::try_from(pid)
@@ -572,6 +690,70 @@ fn supervisor_group_still_running(pid: u32) -> std::io::Result<bool> {
         Ok(false)
     } else {
         Err(error)
+    }
+}
+
+/// The supervisor's exit status once it has exited, without reaping it:
+/// `WNOWAIT` leaves it a zombie, so its PID and process group stay reserved
+/// until cleanup reaps it.
+#[cfg(unix)]
+fn supervisor_exit_status(pid: u32) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let id = libc::id_t::try_from(pid)
+        .map_err(|_| std::io::Error::other("supervisor PID does not fit in id_t"))?;
+    // SAFETY: an all-zero `siginfo_t` is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid, writable `siginfo_t` for the whole call.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `waitid` succeeded, so `info` holds a child-status record (all
+    // zero when the child has not exited yet).
+    let (exited_pid, status) = unsafe { (info.si_pid(), info.si_status()) };
+    if exited_pid == 0 {
+        return Ok(None);
+    }
+    let raw = match info.si_code {
+        libc::CLD_EXITED => (status & 0xff) << 8,
+        libc::CLD_KILLED => status & 0x7f,
+        libc::CLD_DUMPED => (status & 0x7f) | 0x80,
+        code => {
+            return Err(std::io::Error::other(format!(
+                "unexpected supervisor state code {code}"
+            )));
+        }
+    };
+    Ok(Some(std::process::ExitStatus::from_raw(raw)))
+}
+
+/// Whether the supervisor has exited, without reaping it on Unix.
+#[cfg(unix)]
+pub(crate) fn supervisor_exited(pid: u32) -> std::io::Result<bool> {
+    supervisor_exit_status(pid).map(|status| status.is_some())
+}
+
+/// The supervisor's exit status once it has exited. On Unix it is left
+/// unreaped so cleanup can still signal its process group safely; on Windows
+/// the open process handle already keeps its PID from being reused.
+pub(crate) fn peek_supervisor_exit(
+    child: &mut Supervisor,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    #[cfg(unix)]
+    {
+        supervisor_exit_status(child.id())
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait()
     }
 }
 
@@ -643,6 +825,24 @@ fn desktop_daemon_command(binary: &Path, port: u16) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run a fixture's capability probe once, untimed. The first exec of a
+    /// new file can take seconds on a loaded macOS host, which the launch's
+    /// timed probe would otherwise be measuring.
+    #[cfg(unix)]
+    fn warm_probe(binary: &Path) {
+        let status = Command::new(binary)
+            .args(["service", "run-desktop-daemon", "--help"])
+            .status()
+            .expect("warm fixture");
+        assert!(status.success(), "fixture must answer the capability probe");
+    }
+
+    /// Launch `binary` the way the app does, into a fresh owned registry.
+    #[cfg(unix)]
+    fn launch(binary: &Path) -> std::io::Result<()> {
+        crate::ownership::OwnedProcesses::default().launch(binary, 0)
+    }
     #[cfg(unix)]
     use std::fs;
 
@@ -719,7 +919,7 @@ mod tests {
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make old kernel fixture executable");
 
-        let error = spawn_daemon(&binary, 0).expect_err("old kernel must be rejected");
+        let error = launch(&binary).expect_err("old kernel must be rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains(&binary.display().to_string()));
         assert!(error.to_string().contains("supports this command"));
@@ -882,8 +1082,9 @@ mod tests {
         fs::write(&binary, fixture).expect("write supervisor fixture");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make supervisor fixture executable");
+        warm_probe(&binary);
 
-        let error = spawn_daemon(&binary, 0).expect_err("log-open failure must reject startup");
+        let error = launch(&binary).expect_err("log-open failure must reject startup");
         let error = error.to_string();
         let detail_prefix = format!("failed to open desktop log {}: ", log_destination.display());
         let (_, detail) = error
@@ -952,8 +1153,9 @@ mod tests {
         fs::write(&binary, fixture).expect("write exiting supervisor fixture");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
             .expect("make exiting supervisor fixture executable");
+        warm_probe(&binary);
 
-        let error = spawn_daemon(&binary, 0).expect_err("invalid readiness must reject startup");
+        let error = launch(&binary).expect_err("invalid readiness must reject startup");
         assert!(error.to_string().contains("invalid readiness response"));
         assert!(!error.to_string().contains("cleanup failed"));
         let descendant_pid: i32 = fs::read_to_string(&pid_file)
@@ -970,5 +1172,73 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("descendant process {descendant_pid} remained alive after cleanup");
+    }
+
+    /// A wrapper that fails after the process exists, as job creation,
+    /// assignment or resumption can on Windows, and reports the PID it saw.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct FailAfterSpawn(std::sync::Arc<std::sync::Mutex<Option<u32>>>);
+
+    #[cfg(unix)]
+    impl process_wrap::std::CommandWrapper for FailAfterSpawn {
+        fn wrap_child(
+            &mut self,
+            child: Box<dyn process_wrap::std::ChildWrapper>,
+            _core: &process_wrap::std::CommandWrap,
+        ) -> std::io::Result<Box<dyn process_wrap::std::ChildWrapper>> {
+            *self.0.lock().expect("pid cell") = Some(child.id());
+            Err(std::io::Error::other("job setup failed"))
+        }
+    }
+
+    #[cfg(unix)]
+    fn sleeper() -> process_wrap::std::CommandWrap {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        process_wrap::std::CommandWrap::from(command)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_whose_setup_fails_after_the_process_exists_kills_it() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut wrapped = sleeper();
+        wrapped
+            .wrap(SetupFailureGuard::armed())
+            .wrap(FailAfterSpawn(std::sync::Arc::clone(&seen)));
+        let error = wrapped.spawn().expect_err("setup fails after the spawn");
+        assert!(error.to_string().contains("job setup failed"));
+        let pid = seen
+            .lock()
+            .expect("pid cell")
+            .expect("the process existed before setup failed");
+        let pid = i32::try_from(pid).expect("pid fits in pid_t");
+        // The guard killed and reaped it: the PID no longer names a process.
+        let result = unsafe { kill(pid, 0) };
+        assert_eq!(result, -1, "the half-set-up process was left running");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(ESRCH));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_disarmed_guard_leaves_a_started_process_running() {
+        let guard = SetupFailureGuard::armed();
+        let mut wrapped = sleeper();
+        wrapped.wrap(guard.clone());
+        let child = wrapped.spawn().expect("spawn succeeds");
+        guard.disarm();
+        let pid = i32::try_from(child.id()).expect("pid fits in pid_t");
+        drop(child);
+        assert_eq!(
+            unsafe { kill(pid, 0) },
+            0,
+            "a disarmed guard must not kill a started process"
+        );
+        // SAFETY: the test spawned `pid` and has not reaped it.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
     }
 }

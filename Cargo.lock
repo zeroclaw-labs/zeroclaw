@@ -14016,6 +14016,7 @@ version = "0.8.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -14029,6 +14030,7 @@ dependencies = [
  "tauri-plugin-store",
  "tauri-utils",
  "tokio",
+ "windows",
 ]
 
 [[package]]
