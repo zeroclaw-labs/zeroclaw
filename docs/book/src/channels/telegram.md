@@ -86,7 +86,9 @@ silently running under the default agent.
 ### Tables and rich messages
 
 Telegram HTML has no table tag. Markdown tables are sent as preformatted text
-so the grid stays in one piece instead of being split or read as inline HTML.
+so a grid stays together instead of being split mid-row or read as inline HTML.
+A table longer than one Telegram message continues on the next message with
+its header repeated.
 
 Set `rich_messages = true` on the channel alias to send final replies with Bot
 API `sendRichMessage`. Headings, lists, quotes, and tables then render

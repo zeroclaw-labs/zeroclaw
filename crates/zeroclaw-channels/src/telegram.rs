@@ -702,8 +702,9 @@ fn merge_into_last(chunks: &mut [String], parts: &mut Vec<String>, limit: usize)
     }
 }
 
-/// Split `message`, keeping `protected` byte ranges intact even when they
-/// exceed `limit`. Ranges must be char boundaries and non-overlapping.
+/// Split `message`, keeping `protected` byte ranges intact when they fit in
+/// `limit`. A protected table that does not fit breaks between rows and
+/// repeats its header. Ranges must be char boundaries and non-overlapping.
 fn split_message_protecting(
     message: &str,
     limit: usize,
@@ -730,17 +731,7 @@ fn split_message_protecting(
             chunks.extend(parts);
         }
         let piece = &message[range.start..range.end];
-        if !piece.is_empty() {
-            if let Some(last) = chunks.last_mut() {
-                if !last.is_empty() && last.chars().count() + piece.chars().count() <= limit {
-                    last.push_str(piece);
-                } else {
-                    chunks.push(piece.to_string());
-                }
-            } else {
-                chunks.push(piece.to_string());
-            }
-        }
+        append_limited_pieces(&mut chunks, piece, limit);
         cursor = range.end;
     }
     if cursor < message.len() {
@@ -774,25 +765,100 @@ fn append_plain_telegram_chunks(chunks: &mut Vec<String>, text: &str) {
 }
 
 fn append_protected_piece(chunks: &mut Vec<String>, piece: &str) {
-    if piece.is_empty() {
-        return;
-    }
     let limit = TELEGRAM_MAX_MESSAGE_LENGTH
         .saturating_sub(telegram_chunk_marker_len(true, true))
         .max(1);
-    if let Some(last) = chunks.last_mut() {
-        let open_fence = code_block_state_after(last, false);
-        if !open_fence && !last.is_empty() && last.chars().count() + piece.chars().count() <= limit
-        {
-            last.push_str(piece);
-            return;
-        }
-    }
-    chunks.push(piece.to_string());
+    append_limited_pieces(chunks, piece, limit);
 }
 
-/// Like [`split_message_for_telegram`], but a markdown table stays in one chunk
-/// even when that chunk then exceeds Telegram's text limit.
+fn append_limited_pieces(chunks: &mut Vec<String>, piece: &str, limit: usize) {
+    if piece.is_empty() {
+        return;
+    }
+    let parts = split_oversized_table(piece, limit);
+    for part in parts {
+        if let Some(last) = chunks.last_mut() {
+            let open_fence = code_block_state_after(last, false);
+            if !open_fence
+                && !last.is_empty()
+                && last.chars().count() + part.chars().count() <= limit
+            {
+                last.push_str(&part);
+                continue;
+            }
+        }
+        chunks.push(part);
+    }
+}
+
+/// Keep a markdown table intact when it fits in `limit`. Otherwise break it
+/// between rows and repeat the header and separator on each continuation.
+/// A single row that still does not fit is split as plain text so later rows
+/// are not dropped.
+fn split_oversized_table(table: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    if table.chars().count() <= limit {
+        return vec![table.to_string()];
+    }
+    let Some((header, separator, rows)) = table_header_and_rows(table) else {
+        return split_plain_for_limit(table, limit);
+    };
+    let prefix = format!("{header}\n{separator}\n");
+    if prefix.chars().count() >= limit {
+        return split_plain_for_limit(table, limit);
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = prefix.clone();
+    let mut has_row = false;
+    for row in rows {
+        let row_line = format!("{row}\n");
+        if current.chars().count() + row_line.chars().count() <= limit {
+            current.push_str(&row_line);
+            has_row = true;
+            continue;
+        }
+        if has_row {
+            chunks.push(std::mem::take(&mut current));
+            current = prefix.clone();
+        }
+        if current.chars().count() + row_line.chars().count() <= limit {
+            current.push_str(&row_line);
+            has_row = true;
+            continue;
+        }
+        let mut oversized = current.clone();
+        oversized.push_str(&row_line);
+        chunks.extend(split_plain_for_limit(&oversized, limit));
+        current = prefix.clone();
+        has_row = false;
+    }
+    if has_row || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn table_header_and_rows(table: &str) -> Option<(String, String, Vec<String>)> {
+    let lines: Vec<&str> = table
+        .split_inclusive('\n')
+        .map(|line| line.trim_end_matches(['\r', '\n']))
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() < 2 || !looks_like_table_row(lines[0]) {
+        return None;
+    }
+    let separator = lines[1];
+    if separator_column_count(separator).is_none() {
+        return None;
+    }
+    let rows = lines[2..].iter().map(|line| (*line).to_string()).collect();
+    Some((lines[0].to_string(), separator.to_string(), rows))
+}
+
+/// Like [`split_message_for_telegram`], but a markdown table is not broken
+/// mid-row. A table that exceeds Telegram's text limit continues on the next
+/// message with its header repeated.
 fn split_message_for_telegram_keeping_tables(message: &str) -> Vec<String> {
     let spans = markdown_table_spans(message);
     if spans.is_empty() {
@@ -875,11 +941,10 @@ fn neutralize_rich_line(line: &str) -> String {
             continue;
         }
         if bytes[index] == b'`'
-            && let Some(end) = line[index + 1..].find('`')
+            && let Some(end) = matching_backtick_span(&line[index..])
         {
-            let close = index + 1 + end + 1;
-            out.push_str(&line[index..close]);
-            index = close;
+            out.push_str(&line[index..index + end]);
+            index += end;
             continue;
         }
         if bytes[index] == b'!'
@@ -903,6 +968,32 @@ fn neutralize_rich_line(line: &str) -> String {
         index += ch.len_utf8();
     }
     out
+}
+
+/// Length of a backtick span whose closer is the same length as its opener.
+/// ``echo "$HOME$"`` is one span; a single backtick must not close it.
+fn matching_backtick_span(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    if bytes.first() != Some(&b'`') {
+        return None;
+    }
+    let open = bytes.iter().take_while(|byte| **byte == b'`').count();
+    let mut search = open;
+    while search < bytes.len() {
+        if bytes[search] != b'`' {
+            search += 1;
+            continue;
+        }
+        let close = bytes[search..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        if close == open {
+            return Some(search + close);
+        }
+        search += close;
+    }
+    None
 }
 
 fn take_math_span(line: &str) -> Option<(usize, &str)> {
@@ -13549,6 +13640,59 @@ mod tests {
         assert!(table.contains("| A | B |"));
         assert!(table.contains("| 1 | 2 |"));
         assert!(!table.contains(&"a".repeat(100)));
+    }
+
+    #[test]
+    fn split_long_table_repeats_header_within_telegram_limit() {
+        let mut message = String::from("| Name | Value |\n| --- | --- |\n");
+        for index in 0..400 {
+            message.push_str(&format!("| row{index} | value{index} |\n"));
+        }
+        assert!(message.chars().count() > TELEGRAM_MAX_MESSAGE_LENGTH);
+        let chunks = split_message_for_telegram_keeping_tables(&message);
+        let budget = TELEGRAM_MAX_MESSAGE_LENGTH
+            .saturating_sub(telegram_chunk_marker_len(true, true))
+            .max(1);
+        assert!(chunks.len() > 1, "a table past the limit must continue");
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= budget,
+                "chunk length {} exceeds {budget}",
+                chunk.chars().count()
+            );
+            assert!(chunk.contains("| Name | Value |"));
+            assert!(chunk.contains("| --- | --- |"));
+        }
+        let joined = chunks.join("");
+        for index in 0..400 {
+            assert!(joined.contains(&format!("row{index}")));
+        }
+    }
+
+    #[test]
+    fn split_huge_table_row_stays_within_telegram_limit() {
+        let cell = "x".repeat(5_000);
+        let message = format!("| A | B |\n| --- | --- |\n| 1 | {cell} |\n| 2 | ok |\n");
+        let chunks = split_message_for_telegram_keeping_tables(&message);
+        let budget = TELEGRAM_MAX_MESSAGE_LENGTH
+            .saturating_sub(telegram_chunk_marker_len(true, true))
+            .max(1);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= budget);
+        }
+        let joined = chunks.join("");
+        assert!(joined.contains(&"x".repeat(100)));
+        assert!(joined.contains("| 2 | ok |"));
+    }
+
+    #[test]
+    fn prepare_rich_markdown_keeps_dollars_inside_double_backticks() {
+        let prepared = prepare_rich_markdown("Run ``echo \"$HOME$\"`` then $x^2$.");
+        assert!(prepared.contains("$HOME$"));
+        assert!(prepared.contains("echo \"$HOME$\""));
+        assert!(prepared.contains("x^2"));
+        assert!(!prepared.contains("$x^2$"));
     }
 
     #[test]
