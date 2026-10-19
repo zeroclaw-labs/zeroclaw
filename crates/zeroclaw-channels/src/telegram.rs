@@ -65,10 +65,25 @@ struct MultiDraftKey {
 #[derive(Debug)]
 struct SendChunksError {
     delivered: usize,
+    /// HTML messages already accepted for `chunks[delivered]` after
+    /// `sendRichMessage` was rejected. A resume must continue that HTML
+    /// fallback instead of sending the rich chunk again.
+    html_fallback_skip: usize,
     /// The chunk failed because Telegram is still flood-limiting this chat.
     /// Callers must not resume or resend inside the penalty window.
     rate_limited: bool,
     source: anyhow::Error,
+}
+
+impl SendChunksError {
+    fn at(delivered: usize, rate_limited: bool, source: anyhow::Error) -> Self {
+        Self {
+            delivered,
+            html_fallback_skip: 0,
+            rate_limited,
+            source,
+        }
+    }
 }
 
 impl std::fmt::Display for SendChunksError {
@@ -661,6 +676,59 @@ fn wrap_markdown_tables(text: &str, max_columns: usize) -> String {
     out
 }
 
+/// Split plain text at `limit`, closing and reopening a code fence that
+/// crosses a chunk boundary so the next message does not leave the fence.
+fn split_plain_keeping_fences(message: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    if message.is_empty() {
+        return Vec::new();
+    }
+    if message.chars().count() <= limit {
+        return vec![message.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = message;
+    let mut in_code_block = false;
+    while !remaining.is_empty() {
+        let starts_in_code_block = in_code_block;
+        let reopen_len = if starts_in_code_block {
+            TELEGRAM_FENCE_REOPEN.chars().count()
+        } else {
+            0
+        };
+        if remaining.chars().count() + reopen_len <= limit {
+            chunks.push(build_telegram_chunk(remaining, starts_in_code_block, false));
+            break;
+        }
+        let close_reserve = TELEGRAM_FENCE_CLOSE.chars().count() + 1;
+        let room = limit
+            .saturating_sub(reopen_len)
+            .saturating_sub(close_reserve)
+            .max(1);
+        let hard = byte_index_after_chars(remaining, room.min(remaining.chars().count()));
+        let mut end = hard;
+        if let Some(pos) = remaining[..hard].rfind('\n') {
+            let candidate = pos + '\n'.len_utf8();
+            if remaining[..pos].chars().count() >= room / 2 && candidate > 0 {
+                end = candidate;
+            }
+        }
+        if end == 0 {
+            end = remaining.chars().next().map_or(1, char::len_utf8);
+        }
+        let raw = &remaining[..end];
+        in_code_block = code_block_state_after(raw, starts_in_code_block);
+        chunks.push(build_telegram_chunk(
+            raw,
+            starts_in_code_block,
+            in_code_block,
+        ));
+        remaining = &remaining[end..];
+    }
+    chunks
+}
+
 fn split_plain_for_limit(text: &str, limit: usize) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
@@ -711,7 +779,7 @@ fn split_message_protecting(
     protected: &[std::ops::Range<usize>],
 ) -> Vec<String> {
     if protected.is_empty() {
-        let parts = split_plain_for_limit(message, limit);
+        let parts = split_plain_keeping_fences(message, limit);
         return if parts.is_empty() {
             vec![String::new()]
         } else {
@@ -726,7 +794,7 @@ fn split_message_protecting(
             continue;
         }
         if range.start > cursor {
-            let mut parts = split_plain_for_limit(&message[cursor..range.start], limit);
+            let mut parts = split_plain_keeping_fences(&message[cursor..range.start], limit);
             merge_into_last(&mut chunks, &mut parts, limit);
             chunks.extend(parts);
         }
@@ -735,7 +803,7 @@ fn split_message_protecting(
         cursor = range.end;
     }
     if cursor < message.len() {
-        let mut parts = split_plain_for_limit(&message[cursor..], limit);
+        let mut parts = split_plain_keeping_fences(&message[cursor..], limit);
         merge_into_last(&mut chunks, &mut parts, limit);
         chunks.extend(parts);
     }
@@ -849,9 +917,7 @@ fn table_header_and_rows(table: &str) -> Option<(String, String, Vec<String>)> {
         return None;
     }
     let separator = lines[1];
-    if separator_column_count(separator).is_none() {
-        return None;
-    }
+    separator_column_count(separator)?;
     let rows = lines[2..].iter().map(|line| (*line).to_string()).collect();
     Some((lines[0].to_string(), separator.to_string(), rows))
 }
@@ -3443,9 +3509,29 @@ impl TelegramChannel {
     /// Headings, lists, quotes, and tables then render natively. Some clients
     /// still show those messages as unsupported, so callers leave this off
     /// unless every client in use can render them.
+    ///
+    /// This value is only the fallback for a handle with no live-config
+    /// authority. A wired authority is read at send time.
     pub fn with_rich_messages(mut self, enabled: bool) -> Self {
         self.rich_messages = enabled;
         self
+    }
+
+    /// Whether final replies use `sendRichMessage`.
+    ///
+    /// A long-lived channel reads `channels.telegram.<alias>.rich_messages`
+    /// from the live config. The constructor snapshot is used only when no
+    /// authority is wired, as with one-shot handles and tests.
+    fn rich_messages_enabled(&self) -> bool {
+        let Some(authority) = &self.persist else {
+            return self.rich_messages;
+        };
+        let config = authority.live_handle();
+        let cfg = config.read();
+        cfg.channels
+            .telegram
+            .get(&self.alias)
+            .is_some_and(|telegram| telegram.rich_messages)
     }
 
     /// Set by the orchestrator from `[channels.telegram.<alias>].per_user_session`.
@@ -5317,6 +5403,7 @@ impl TelegramChannel {
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some()
+            || incoming_message_text(message).is_some()
         {
             return true;
         }
@@ -5380,9 +5467,9 @@ impl TelegramChannel {
         // which simply finds no bind code and falls through to the
         // unauthorized-approval notice — the same outcome unauthorized
         // text senders already get.
-        let text = message
-            .get("text")
-            .and_then(serde_json::Value::as_str)
+        let rich_or_text = incoming_message_text(message);
+        let text = rich_or_text
+            .as_deref()
             .or_else(|| message.get("caption").and_then(serde_json::Value::as_str))
             .unwrap_or("");
 
@@ -6762,13 +6849,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let text = wrap_markdown_tables(text, 0);
         let lines: Vec<&str> = text.split('\n').collect();
         let mut result_lines: Vec<String> = Vec::new();
+        let mut in_fence = false;
 
         for line in &lines {
             let trimmed_line = line.trim_start();
             if trimmed_line.starts_with("```") {
                 // Preserve fence lines so the second-pass block parser can consume them
                 // without interference from inline backtick handling.
+                in_fence = !in_fence;
                 result_lines.push(trimmed_line.to_string());
+                continue;
+            }
+            if in_fence {
+                // Telegram rejects inline HTML nested inside `<pre><code>`, so a
+                // fenced table must be escaped rather than formatted.
+                result_lines.push(Self::escape_html(line));
                 continue;
             }
 
@@ -6933,9 +7028,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         thread_id: Option<&str>,
         skip_chunks: usize,
     ) -> Result<usize, SendChunksError> {
-        if self.rich_messages {
+        if self.rich_messages_enabled() {
             return self
-                .send_rich_text_chunks(message, chat_id, thread_id, skip_chunks)
+                .send_rich_text_chunks(message, chat_id, thread_id, skip_chunks, 0)
                 .await;
         }
         self.send_html_text_chunks(message, chat_id, thread_id, skip_chunks)
@@ -6977,11 +7072,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             let (markdown_status, markdown_err) = match self
                 .send_message_honoring_rate_limit(&markdown_body)
                 .await
-                .map_err(|e| SendChunksError {
-                    delivered: index,
-                    rate_limited: false,
-                    source: e.into(),
-                })? {
+                .map_err(|e| SendChunksError::at(index, false, e.into()))?
+            {
                 SendMessageAttempt::Sent => {
                     if index < chunks.len() - 1 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -6989,13 +7081,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     continue;
                 }
                 SendMessageAttempt::RateLimited { status, body } => {
-                    return Err(SendChunksError {
-                        delivered: index,
-                        rate_limited: true,
-                        source: anyhow::Error::msg(format!(
+                    return Err(SendChunksError::at(
+                        index,
+                        true,
+                        anyhow::Error::msg(format!(
                             "Telegram sendMessage rate limited ({status}): {body}"
                         )),
-                    });
+                    ));
                 }
                 SendMessageAttempt::Failed { status, body } => (status, body),
             };
@@ -7019,35 +7111,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             match self
                 .send_message_honoring_rate_limit(&plain_body)
                 .await
-                .map_err(|e| SendChunksError {
-                    delivered: index,
-                    rate_limited: false,
-                    source: e.into(),
-                })? {
+                .map_err(|e| SendChunksError::at(index, false, e.into()))?
+            {
                 SendMessageAttempt::Sent => {}
                 SendMessageAttempt::RateLimited {
                     status: plain_status,
                     body: plain_err,
                 } => {
-                    return Err(SendChunksError {
-                        delivered: index,
-                        rate_limited: true,
-                        source: anyhow::Error::msg(format!(
+                    return Err(SendChunksError::at(
+                        index,
+                        true,
+                        anyhow::Error::msg(format!(
                             "Telegram sendMessage rate limited (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
                         )),
-                    });
+                    ));
                 }
                 SendMessageAttempt::Failed {
                     status: plain_status,
                     body: plain_err,
                 } => {
-                    return Err(SendChunksError {
-                        delivered: index,
-                        rate_limited: false,
-                        source: anyhow::Error::msg(format!(
+                    return Err(SendChunksError::at(
+                        index,
+                        false,
+                        anyhow::Error::msg(format!(
                             "Telegram sendMessage failed (markdown {markdown_status}: {markdown_err}; plain {plain_status}: {plain_err})"
                         )),
-                    });
+                    ));
                 }
             }
 
@@ -7059,12 +7148,30 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(chunks.len())
     }
 
+    async fn send_text_chunks_resuming(
+        &self,
+        message: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        skip_chunks: usize,
+        html_fallback_skip: usize,
+    ) -> Result<usize, SendChunksError> {
+        if self.rich_messages_enabled() {
+            return self
+                .send_rich_text_chunks(message, chat_id, thread_id, skip_chunks, html_fallback_skip)
+                .await;
+        }
+        self.send_html_text_chunks(message, chat_id, thread_id, skip_chunks)
+            .await
+    }
+
     async fn send_rich_text_chunks(
         &self,
         message: &str,
         chat_id: &str,
         thread_id: Option<&str>,
         skip_chunks: usize,
+        html_fallback_skip: usize,
     ) -> Result<usize, SendChunksError> {
         let prepared = prepare_rich_markdown(message);
         let ranges = protected_markdown_ranges(&prepared);
@@ -7082,44 +7189,57 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             } else {
                 chunk.to_string()
             };
-            match self
-                .send_rich_message_honoring_rate_limit(chat_id, thread_id, &text)
-                .await
-                .map_err(|error| SendChunksError {
-                    delivered: index,
-                    rate_limited: false,
-                    source: error.into(),
-                })? {
-                SendMessageAttempt::Sent => {}
-                SendMessageAttempt::RateLimited { status, body } => {
-                    return Err(SendChunksError {
-                        delivered: index,
-                        rate_limited: true,
-                        source: anyhow::Error::msg(format!(
-                            "Telegram sendRichMessage rate limited ({status}): {body}"
-                        )),
-                    });
-                }
-                SendMessageAttempt::Failed { status, .. } => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            let resume_html = index == skip_chunks && html_fallback_skip > 0;
+            if !resume_html {
+                match self
+                    .send_rich_message_honoring_rate_limit(chat_id, thread_id, &text)
+                    .await
+                    .map_err(|error| SendChunksError::at(index, false, error.into()))?
+                {
+                    SendMessageAttempt::Sent => {
+                        if index + 1 < chunks.len() {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        continue;
+                    }
+                    SendMessageAttempt::RateLimited { status, body } => {
+                        return Err(SendChunksError::at(
+                            index,
+                            true,
+                            anyhow::Error::msg(format!(
+                                "Telegram sendRichMessage rate limited ({status}): {body}"
+                            )),
+                        ));
+                    }
+                    SendMessageAttempt::Failed { status, .. } => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"status": status.to_string()})),
-                        "Telegram sendRichMessage failed; falling back to HTML"
-                    );
-                    self.send_html_text_chunks(&text, chat_id, thread_id, 0)
-                        .await
-                        .map_err(|error| SendChunksError {
-                            delivered: if error.delivered > 0 {
-                                index + 1
-                            } else {
-                                index
-                            },
-                            rate_limited: error.rate_limited,
-                            source: error.source,
-                        })?;
+                            "Telegram sendRichMessage failed; falling back to HTML"
+                        );
+                    }
                 }
+            }
+            if let Err(error) = self
+                .send_html_text_chunks(
+                    &text,
+                    chat_id,
+                    thread_id,
+                    if resume_html { html_fallback_skip } else { 0 },
+                )
+                .await
+            {
+                return Err(SendChunksError {
+                    delivered: index,
+                    html_fallback_skip: error.delivered,
+                    rate_limited: error.rate_limited,
+                    source: error.source,
+                });
             }
             if index + 1 < chunks.len() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -7237,6 +7357,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             Ok(_) => Ok(()),
             Err(SendChunksError {
                 delivered: 0,
+                html_fallback_skip: 0,
                 rate_limited: true,
                 source,
             }) => Err(zeroclaw_api::channel::FinalizeUndelivered {
@@ -7245,25 +7366,41 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .into()),
             Err(SendChunksError {
                 delivered,
+                html_fallback_skip,
                 rate_limited: true,
                 ..
-            }) => Err(zeroclaw_api::channel::FinalizePartialDelivery { delivered }.into()),
+            }) => Err(zeroclaw_api::channel::FinalizePartialDelivery {
+                delivered: delivered.max(html_fallback_skip),
+            }
+            .into()),
             Err(SendChunksError {
                 delivered: 0,
+                html_fallback_skip: 0,
                 source,
                 ..
             }) => Err(source),
-            Err(SendChunksError { delivered, .. }) => {
+            Err(SendChunksError {
+                delivered,
+                html_fallback_skip,
+                ..
+            }) => {
                 // Some chunks are already posted. Resume from the first unsent
                 // chunk rather than restarting, then report the accepted prefix
-                // if it still cannot finish.
+                // if it still cannot finish. A rich chunk that already fell
+                // back to HTML resumes inside that fallback.
                 match self
-                    .send_text_chunks(text, chat_id, thread_id, delivered)
+                    .send_text_chunks_resuming(
+                        text,
+                        chat_id,
+                        thread_id,
+                        delivered,
+                        html_fallback_skip,
+                    )
                     .await
                 {
                     Ok(_) => Ok(()),
                     Err(e) => Err(zeroclaw_api::channel::FinalizePartialDelivery {
-                        delivered: e.delivered.max(delivered),
+                        delivered: e.delivered.max(delivered).max(e.html_fallback_skip),
                     }
                     .into()),
                 }
@@ -9018,7 +9155,7 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        if self.rich_messages
+        if self.rich_messages_enabled()
             && let Some(id) = msg_id
         {
             let prepared = prepare_rich_markdown(text);
@@ -11557,6 +11694,94 @@ mod tests {
         );
     }
 
+    /// A rejected `sendRichMessage` can fan out into several HTML messages.
+    /// If only some of those arrive, the resume must continue the HTML
+    /// fallback instead of skipping the rest of that rich chunk.
+    #[tokio::test]
+    async fn rich_html_fallback_resume_sends_remaining_html_chunks() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let message = "y".repeat(5_000);
+        let html_chunks = split_message_for_telegram(&message);
+        assert!(html_chunks.len() >= 2);
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "send failed"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_rich_messages(true)
+        .with_api_base(mock_server.uri());
+        let err = channel
+            .send_text_chunks(&message, "100", None, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.delivered, 0, "the rich chunk itself is not finished");
+        assert_eq!(
+            err.html_fallback_skip, 1,
+            "the first HTML piece was accepted"
+        );
+
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 2 }
+            })))
+            .mount(&resume_server)
+            .await;
+        let channel = channel.with_api_base(resume_server.uri());
+        channel
+            .send_text_chunks_resuming(&message, "100", None, err.delivered, err.html_fallback_skip)
+            .await
+            .unwrap();
+        let resume_paths: Vec<String> = resume_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(
+            resume_paths
+                .iter()
+                .all(|path| path.ends_with("/sendMessage")),
+            "resume must not retry sendRichMessage: {resume_paths:?}"
+        );
+        assert_eq!(resume_paths.len(), html_chunks.len() - 1);
+    }
+
     /// Regression: when finalization chunks a long final answer and a later
     /// chunk fails after an earlier one was accepted, `finalize_draft` must
     /// surface [`zeroclaw_api::channel::FinalizePartialDelivery`] rather than a
@@ -13581,6 +13806,91 @@ mod tests {
         assert!(rendered.contains("| A | B |"));
         assert!(rendered.contains("| 1 | 2 |"));
         assert!(!rendered.contains("<table"));
+    }
+
+    #[test]
+    fn telegram_markdown_to_html_escapes_formatted_table_cells() {
+        let rendered = TelegramChannel::markdown_to_telegram_html(
+            "| **A** | `x` |\n| --- | --- |\n| [n](https://example.com) | 1 |\n",
+        );
+        assert!(rendered.contains("<pre><code>"));
+        assert!(rendered.contains("**A**"));
+        assert!(rendered.contains("`x`"));
+        assert!(rendered.contains("[n](https://example.com)"));
+        assert!(!rendered.contains("<b>"));
+        assert!(!rendered.contains("<code>x</code>"));
+        assert!(!rendered.contains("<a "));
+    }
+
+    #[test]
+    fn split_rich_plain_reopens_code_fence_within_limit() {
+        let mut body = String::from("```\n");
+        body.push_str(&"code line\n".repeat(400));
+        body.push_str("```\nAfter the block.\n");
+        let chunks = split_plain_keeping_fences(&body, 2_000);
+        assert!(chunks.len() > 1, "the fenced block must cross the limit");
+        for chunk in &chunks {
+            assert!(
+                chunk.chars().count() <= 2_000,
+                "chunk length {}",
+                chunk.chars().count()
+            );
+        }
+        assert!(
+            chunks.iter().skip(1).any(|chunk| chunk.starts_with("```")),
+            "a continued code block must reopen its fence: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.contains("After the block."))
+        );
+    }
+
+    #[test]
+    fn rich_messages_enabled_reads_live_config_not_the_snapshot() {
+        let mut enabled = Config::default();
+        let telegram = zeroclaw_config::schema::TelegramConfig {
+            rich_messages: true,
+            ..Default::default()
+        };
+        enabled
+            .channels
+            .telegram
+            .insert("home".to_string(), telegram);
+        let from_live = TelegramChannel::new(
+            "token".into(),
+            "home".to_string(),
+            Arc::new(Vec::<String>::new),
+            false,
+        )
+        .with_rich_messages(false)
+        .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(enabled));
+        assert!(from_live.rich_messages_enabled());
+
+        let mut disabled = Config::default();
+        disabled.channels.telegram.insert(
+            "home".to_string(),
+            zeroclaw_config::schema::TelegramConfig::default(),
+        );
+        let from_live_off = TelegramChannel::new(
+            "token".into(),
+            "home".to_string(),
+            Arc::new(Vec::<String>::new),
+            false,
+        )
+        .with_rich_messages(true)
+        .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(disabled));
+        assert!(!from_live_off.rich_messages_enabled());
+
+        let snapshot = TelegramChannel::new(
+            "token".into(),
+            "home".to_string(),
+            Arc::new(Vec::<String>::new),
+            false,
+        )
+        .with_rich_messages(true);
+        assert!(snapshot.rich_messages_enabled());
     }
 
     #[test]
@@ -21620,6 +21930,92 @@ mod tests {
         assert!(
             sent_text.contains("Invalid binding code"),
             "expected the pairing branch's wrong-code reply from a captioned /bind, got: {sent_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_unauthorized_message_reads_rich_only_bind_and_text() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 1, &[r#""chat_id":"3030""#]).await;
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+        let bind_update = serde_json::json!({
+            "update_id": 9_100,
+            "message": {
+                "message_id": 70,
+                "chat": {"id": 3030, "type": "private"},
+                "from": {"id": 170_000, "username": "zeroclaw_unauthorized"},
+                "rich_message": {
+                    "blocks": [{
+                        "type": "paragraph",
+                        "text": "/bind not-a-real-code"
+                    }]
+                }
+            }
+        });
+        ch.handle_unauthorized_message(&bind_update).await;
+        let sent_text = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .find_map(|body| {
+                body.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        assert!(
+            sent_text.contains("Invalid binding code"),
+            "rich-only /bind should reach pairing, got: {sent_text}"
+        );
+
+        let notice_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&notice_server, 2, &[r#""chat_id":"3031""#]).await;
+        let notice_channel = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_mock_api_base(notice_server.uri());
+        let hello = serde_json::json!({
+            "update_id": 9_101,
+            "message": {
+                "message_id": 71,
+                "chat": {"id": 3031, "type": "private"},
+                "from": {"id": 170_001, "username": "zeroclaw_unauthorized"},
+                "rich_message": {
+                    "blocks": [{ "type": "paragraph", "text": "hello from rich" }]
+                }
+            }
+        });
+        notice_channel.handle_unauthorized_message(&hello).await;
+        let notice = notice_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .find_map(|body| {
+                body.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        assert!(
+            notice.contains("requires operator approval"),
+            "rich-only text should get the approval notice, got: {notice}"
         );
     }
 
