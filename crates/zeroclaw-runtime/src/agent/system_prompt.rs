@@ -1342,6 +1342,55 @@ mod tests {
     }
 
     #[test]
+    fn prompt_budget_cap_bootstrap_prompt_stays_within_cap() {
+        // Incident regression (2026-10-20 firstcontact flood): a non-compact
+        // profile with an oversized workspace must still hand the model a
+        // prompt inside max_system_prompt_chars — 563K system chars against a
+        // 40K-token budget is exactly the failure this gate closes.
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let oversized = "A".repeat(200_000);
+        for file in ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md"] {
+            std::fs::write(workspace.path().join(file), &oversized).expect("write workspace file");
+        }
+        let cap = 50_000;
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            cap,
+            true,
+            false,
+            None,
+        );
+        assert!(
+            prompt.chars().count() <= cap,
+            "assembled prompt ({} chars) must fit the {}-char cap",
+            prompt.chars().count(),
+            cap
+        );
+    }
+
+    #[test]
+    fn prompt_budget_cap_schema_default_is_finite() {
+        // The resolved-runtime default is what an unconfigured profile's
+        // agent.resolved carries; a zero default silently disables the cap
+        // (the incident), so it must stay a finite, generous bound.
+        let default = zeroclaw_config::schema::ResolvedRuntime::default();
+        assert!(
+            default.max_system_prompt_chars > 0,
+            "default max_system_prompt_chars must bound prompt growth, got {}",
+            default.max_system_prompt_chars
+        );
+    }
+
+    #[test]
     fn timestamp_orientation_respects_budgets_at_and_below_reserved_tail() {
         let tools = [(
             "shell",
