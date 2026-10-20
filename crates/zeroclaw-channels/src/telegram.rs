@@ -1179,6 +1179,11 @@ pub struct TelegramChannel {
     /// outlives the settle bound the task keeps the clear, ordered after the
     /// add response - see [`AckReactionState`].
     ack_reactions_in_flight: InFlightAckReactions,
+    /// Delay between polls while one update is retrying a transient failure.
+    /// Always [`Self::TRANSIENT_RETRY_DELAY_SECS`] in production; tests
+    /// shrink it so a retry-budget regression does not wait out the real
+    /// backoff.
+    transient_retry_delay: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2786,7 +2791,17 @@ impl TelegramChannel {
             voice_drop_notice_timeout: VOICE_DROP_NOTICE_TIMEOUT,
             reaction_clear_timeout: REACTION_CLEAR_TIMEOUT,
             ack_reactions_in_flight: Mutex::new(HashMap::new()),
+            transient_retry_delay: Duration::from_secs(Self::TRANSIENT_RETRY_DELAY_SECS),
         }
+    }
+
+    /// Shrink the transient-retry backoff so a retry-budget test does not
+    /// wait out the production delay. Test-only: the backoff is not
+    /// operator-tunable.
+    #[cfg(test)]
+    fn with_transient_retry_delay(mut self, delay: Duration) -> Self {
+        self.transient_retry_delay = delay;
+        self
     }
 
     /// Shrink the voice-drop notice bound so a stalled-notice test does not
@@ -7398,18 +7413,36 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Consecutive transient attempts after which a single update is
     /// acknowledged as undeliverable instead of retried forever.
     ///
-    /// Classification already keeps confidently permanent rejections off this
-    /// path, so what remains here is a failure the vendor calls recoverable
-    /// - yet a persistently failing endpoint (an ASR service returning 500
-    ///   for one corrupted file, a download that never completes) would
-    ///   otherwise pin the offset indefinitely and head-of-line block every
-    ///   later update for the whole bot. Ten attempts bound the
-    ///   damage: fast-failing endpoints stall the batch for ~30 seconds, and
-    ///   slow ones for at most ten attempt durations. Giving up is loud - an
-    ///   ERROR with the update id and attempt count - because acknowledging a
-    ///   recoverable failure means the message is lost; the log is the
-    ///   explicit, observable record the recovery policy requires.
+    /// The cap is deliberately narrow: it applies only to the voice /
+    /// transcription path, where it bounds the damage a persistently
+    /// failing endpoint (an ASR service returning 500 for one corrupted
+    /// file, a download that never completes) would otherwise do by pinning
+    /// the offset indefinitely and head-of-line blocking every later update
+    /// for the whole bot. Ten attempts bound the stall: fast-failing
+    /// endpoints hold the batch for ~30 seconds, and slow ones for at most
+    /// ten attempt durations. Giving up is loud - an ERROR with the update
+    /// id and attempt count - because acknowledging a recoverable failure
+    /// means the message is lost; the log is the explicit, observable
+    /// record the recovery policy requires.
+    ///
+    /// Attachment (photo / document) and media-group downloads never exhaust
+    /// this budget. Their transient failures retry on every poll for as long
+    /// as the outage lasts, so a temporary network or disk problem cannot
+    /// turn into permanent message loss the moment it outlives the cap.
     const MAX_TRANSIENT_UPDATE_ATTEMPTS: u32 = 10;
+
+    /// Whether the transient-retry budget may acknowledge `update` without
+    /// delivery once exhausted. Only voice / audio updates are eligible:
+    /// they alone route through the transcription path the cap exists to
+    /// bound. Every other payload - text, photo / document attachments,
+    /// media groups - keeps retrying transient failures indefinitely, which
+    /// is the lossless behavior this gate must not take away from them.
+    fn transient_cap_applies(update: &serde_json::Value) -> bool {
+        update
+            .get("message")
+            .and_then(Self::parse_voice_metadata)
+            .is_some()
+    }
 
     /// Whether the tracked transient attempt counter for `uid` has reached
     /// [`Self::MAX_TRANSIENT_UPDATE_ATTEMPTS`]. Updates without an id cannot
@@ -7424,6 +7457,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     async fn pause_for_transient_update(
+        &self,
         uid: Option<i64>,
         transient_retry: &mut Option<(i64, u32)>,
     ) -> UpdateOutcome {
@@ -7444,14 +7478,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .with_attrs(::serde_json::json!({
                     "update_id": uid,
                     "attempts": attempts,
-                    "retry_delay_secs": Self::TRANSIENT_RETRY_DELAY_SECS,
+                    "retry_delay_secs": self.transient_retry_delay.as_secs(),
                 })),
             "Transient failure parsing update; leaving offset unadvanced so the next poll retries it"
         );
-        tokio::time::sleep(std::time::Duration::from_secs(
-            Self::TRANSIENT_RETRY_DELAY_SECS,
-        ))
-        .await;
+        tokio::time::sleep(self.transient_retry_delay).await;
         UpdateOutcome::StopBatch
     }
 
@@ -7510,11 +7541,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // (not fall through to the next parser) so the offset stays put and
         // the next poll retries it.
         //
-        // An update that already burned through its transient budget is
+        // A voice update that already burned through its transient budget is
         // acknowledged without another attempt: spending one more
         // download/transcription round on it would defeat the bound, and the
-        // ERROR below is the explicit record that the message is lost.
-        if Self::transient_retry_exhausted(uid, transient_retry) {
+        // ERROR below is the explicit record that the message is lost. The
+        // gate is deliberately voice-only - the transcription path is what
+        // the cap exists to bound. Attachments and media groups never
+        // exhaust it: their transient failures keep retrying on every poll
+        // so a temporary outage cannot acknowledge a payload that was never
+        // delivered.
+        if Self::transient_cap_applies(update)
+            && Self::transient_retry_exhausted(uid, transient_retry)
+        {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -7549,7 +7587,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 return UpdateOutcome::Advanced;
             }
             UpdateDisposition::RetryTransient => {
-                return Self::pause_for_transient_update(uid, transient_retry).await;
+                return self.pause_for_transient_update(uid, transient_retry).await;
             }
         };
 
@@ -7797,7 +7835,7 @@ impl TelegramChannel {
                     for remaining in batches {
                         Self::restore_media_group_batch(pending_media_groups, remaining);
                     }
-                    return Self::pause_for_transient_update(uid, transient_retry).await;
+                    return self.pause_for_transient_update(uid, transient_retry).await;
                 }
                 MediaGroupDispatchOutcome::ReceiverClosed => {
                     for remaining in batches {
@@ -20069,6 +20107,93 @@ mod tests {
         handle.abort();
     }
 
+    /// Regression for the attachment-loss review finding: an attachment
+    /// whose download fails for longer than the transient-retry budget must
+    /// still be delivered once the outage ends. The voice/transcription cap
+    /// may acknowledge an exhausted voice update, but it must never
+    /// acknowledge an attachment: every retry leaves the offset behind the
+    /// update until the payload is actually delivered.
+    #[tokio::test]
+    async fn listen_attachment_recovers_after_outliving_transient_retry_budget() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        let uid = 2_100;
+        let failing = telegram_document_update(uid, 9, 666, "alice", "file987", "report.pdf");
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([failing.clone()])).await;
+        mount_telegram_get_updates(&mock_server, uid + 1, serde_json::json!([])).await;
+
+        // Eleven failures outlast the whole ten-attempt budget. The twelfth
+        // attempt succeeds, proving the budget never acknowledges an
+        // undelivered attachment.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(11)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_path": "documents/report.pdf"}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/file/bot[^/]+/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"pdf bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_mock_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_transient_retry_delay(Duration::from_millis(10)),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let recovered = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
+            .await
+            .expect("timed out waiting for the attachment that outlived the retry budget")
+            .expect("channel closed before delivering the recovered attachment");
+        assert!(
+            recovered.content.contains("report.pdf"),
+            "the attachment must deliver once the outage ends, got: {}",
+            recovered.content
+        );
+
+        let extra = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(
+            extra.is_err(),
+            "unexpected extra message delivered: {extra:?}"
+        );
+
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid + 1,
+            LISTEN_HANG_GUARD,
+            "past the recovered attachment only after it was delivered",
+        )
+        .await;
+
+        handle.abort();
+    }
+
     /// Drive `listen()` with `unauthorized_update` (sent by "zeroclaw_unauthorized",
     /// who is not on the allowlist) followed by an authorized text update
     /// in the same chat, asserting the shared unauthorized-update
@@ -20931,45 +21056,106 @@ mod tests {
         handle.abort();
     }
 
-    /// An update that already exhausted its transient budget is acknowledged
-    /// without another parse attempt, so a persistently failing endpoint can
-    /// no longer pin the offset forever. The budget gate sits ahead
-    /// of parsing: this update costs no I/O at all.
+    /// A voice update that already exhausted its transient budget is
+    /// acknowledged without another parse attempt, so a persistently failing
+    /// transcription endpoint can no longer pin the offset forever. The
+    /// budget gate sits ahead of parsing: this update costs no I/O at all.
     #[tokio::test]
-    async fn process_update_acknowledges_update_after_transient_budget_exhausted() {
+    async fn process_update_acknowledges_voice_update_after_transient_budget_exhausted() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/transcribe", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
         let ch = TelegramChannel::new(
             "test-token".into(),
             "telegram_test_alias",
             Arc::new(|| vec!["alice".to_string()]),
             false,
-        );
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_transcription(tc);
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
 
         let uid = 9_001;
-        let update = telegram_text_update(uid, 95, 666, "alice", "poisoned");
+        let update = telegram_voice_update(uid, 95, 666, "alice", "poisoned-voice");
 
         let mut exhausted = Some((uid, TelegramChannel::MAX_TRANSIENT_UPDATE_ATTEMPTS));
         let outcome = ch.process_update(&update, &tx, &mut exhausted).await;
         assert!(
             matches!(outcome, UpdateOutcome::Advanced),
-            "an exhausted update must be acknowledged so later updates proceed"
+            "an exhausted voice update must be acknowledged so later updates proceed"
         );
         assert_eq!(
             exhausted, None,
             "the counter resets once the update is given up"
         );
-
-        // Below the cap the same update routes normally (delivered, counter
-        // cleared by success).
-        let mut below_cap = Some((uid, TelegramChannel::MAX_TRANSIENT_UPDATE_ATTEMPTS - 1));
-        let outcome = ch.process_update(&update, &tx, &mut below_cap).await;
-        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        assert!(
+            mock_server
+                .received_requests()
+                .await
+                .map_or(true, |requests| requests.is_empty()),
+            "the exhausted-update gate must sit ahead of every download/transcription attempt"
+        );
 
         // A full counter tracked against a *different* update id must not
-        // condemn this one.
+        // condemn this one: with the mock silent, the voice parse fails
+        // transiently instead of acknowledging, which also proves the gate
+        // scoped the tracker to the tracked id.
         let mut other_uid = Some((uid + 1, TelegramChannel::MAX_TRANSIENT_UPDATE_ATTEMPTS));
         let outcome = ch.process_update(&update, &tx, &mut other_uid).await;
-        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        assert!(
+            matches!(outcome, UpdateOutcome::StopBatch),
+            "a counter tracked for another update id must route this one through the normal retry path"
+        );
+    }
+
+    /// The transient budget is eligibility-scoped: it may acknowledge an
+    /// exhausted *voice* update, but it must never acknowledge an attachment
+    /// update. An attachment that already burned the whole budget is parsed
+    /// again - its transient failure keeps retrying until it delivers.
+    #[tokio::test]
+    async fn process_update_never_exhausts_transient_budget_for_attachment() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["alice".to_string()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let uid = 9_101;
+        let update = telegram_document_update(uid, 96, 666, "alice", "file789", "report.pdf");
+
+        let mut exhausted = Some((uid, TelegramChannel::MAX_TRANSIENT_UPDATE_ATTEMPTS));
+        let outcome = ch.process_update(&update, &tx, &mut exhausted).await;
+        assert!(
+            matches!(outcome, UpdateOutcome::StopBatch),
+            "an attachment update must keep retrying past the voice budget, not be acknowledged"
+        );
+        assert_eq!(
+            exhausted,
+            Some((uid, TelegramChannel::MAX_TRANSIENT_UPDATE_ATTEMPTS + 1)),
+            "the attachment attempt still counts for diagnostics, but the cap must not drop it"
+        );
     }
 
     /// The terminal transcription drop is announced to the sender with the
