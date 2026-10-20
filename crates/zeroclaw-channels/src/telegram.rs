@@ -25205,7 +25205,7 @@ mod tests {
 
         let stalled = {
             let ch = Arc::clone(&ch);
-            tokio::spawn(async move {
+            zeroclaw_spawn::spawn!(async move {
                 ch.set_explicit_reaction("111", "1", "\u{1F44D}", true)
                     .await
             })
