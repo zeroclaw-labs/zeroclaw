@@ -356,7 +356,7 @@ impl InprocConnector {
     }
 
     /// Open one in-process connection and return the client's half. `None`
-    /// when the generation is cancelled before a context is bound.
+    /// when admission is sealed or the generation is cancelled.
     pub async fn connect(&self) -> Option<DuplexStream> {
         let ctx = {
             let mut rx = self.inner.ctx.subscribe();
@@ -918,17 +918,84 @@ mod tests {
     /// generation is sealed, even before its token is cancelled.
     #[tokio::test]
     async fn connect_waiting_for_bind_gives_up_when_sealed() {
-        let connector = InprocConnector::new(CancellationToken::new());
+        use std::future::{Future, poll_fn};
+
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
         let waiter = connector.clone();
-        let pending = zeroclaw_spawn::spawn!(async move { waiter.connect().await.is_some() });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!pending.is_finished(), "connect waits for a bound context");
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let pending = zeroclaw_spawn::spawn!(async move {
+            let mut connect = std::pin::pin!(waiter.connect());
+            let mut parked_tx = Some(parked_tx);
+            poll_fn(|cx| {
+                let result = connect.as_mut().poll(cx);
+                if result.is_pending()
+                    && let Some(parked_tx) = parked_tx.take()
+                {
+                    parked_tx.send(()).expect("test waits for a pending poll");
+                }
+                result
+            })
+            .await
+            .is_some()
+        });
+        // Confirm the task has registered its waker before sealing. Await its
+        // handle below so the test cannot repoll connect and hide a missed wake.
+        tokio::time::timeout(Duration::from_secs(2), parked_rx)
+            .await
+            .expect("connect reaches its bind wait")
+            .expect("connect must wait for a bound context");
         connector.close_admission();
         let connected = tokio::time::timeout(Duration::from_secs(2), pending)
             .await
             .expect("waiter ends on seal")
             .expect("waiter task did not panic");
         assert!(!connected);
+        assert!(!cancel.is_cancelled(), "sealing alone wakes the waiter");
+    }
+
+    /// Drain must release the context even when the caller has not closed
+    /// admission first and another owner retains a connector clone.
+    #[tokio::test]
+    async fn draining_alone_releases_the_bound_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ctx_for(base_config(tmp.path()));
+        let weak = Arc::downgrade(&ctx);
+        let cancel = CancellationToken::new();
+        let connector = InprocConnector::new(cancel.clone());
+        let surviving_clone = connector.clone();
+        connector.bind(ctx);
+        assert!(weak.upgrade().is_some(), "the connector holds the context");
+
+        let aborted = tokio::time::timeout(Duration::from_secs(2), connector.drain())
+            .await
+            .expect("an idle connector drains without cancellation");
+        assert_eq!(aborted, 0);
+        assert!(!surviving_clone.is_bound(), "draining unbinds every clone");
+        assert!(
+            weak.upgrade().is_none(),
+            "drain alone must release the generation's context"
+        );
+
+        let rebound = ctx_for(base_config(tmp.path()));
+        let rebound_weak = Arc::downgrade(&rebound);
+        surviving_clone.bind(rebound);
+        assert!(
+            !surviving_clone.is_bound(),
+            "a drained connector stays unbound"
+        );
+        assert!(rebound_weak.upgrade().is_none());
+        let late = tokio::time::timeout(Duration::from_secs(2), surviving_clone.connect())
+            .await
+            .expect("a drained connector answers without waiting for cancel");
+        assert!(
+            late.is_none(),
+            "a drained connector hands out no connection"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "none of this relied on cancellation"
+        );
     }
 
     /// A config with one agent, so a session can be opened over the duplex.
