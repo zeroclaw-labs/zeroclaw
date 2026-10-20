@@ -75,6 +75,21 @@ and tested.
 
 ## Runtime turn responsibilities
 
+Channel turns use the shared runtime's result-aware recovery policy. Recovery
+evidence belongs to one logical turn and survives an in-turn model switch;
+unchanged successful polling is advisory, while repeated identical completed
+failures receive a correction and one final retry. Tool approval and dispatch
+remain subject to the existing policy.
+
+On timeout or cancellation, the channel requests cooperative cancellation and
+allows at most five seconds for executor closeout. With tool-context retention
+enabled, the runtime's canonical current-turn messages are saved to the existing
+session backend before the interruption marker. Native tool pairs and paired
+prompt-mode results both survive a later session reload. This is a transcript
+checkpoint, not an automatic retry or crash-resumable job: an operation without
+a recorded result can have an uncertain outcome and must be checked before it
+is repeated. The processing deadline is not extended by a model switch.
+
 The shared lifecycle should own behavior that must be consistent across
 channels:
 

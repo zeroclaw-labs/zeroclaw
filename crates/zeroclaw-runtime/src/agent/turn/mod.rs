@@ -1648,6 +1648,19 @@ pub(crate) fn run_tool_call_loop_with_guard<'a>(
     run_tool_call_loop_impl(p, None, None, repetition_guard)
 }
 
+/// Recovery evidence owned by one logical turn, including model switches.
+/// Contains only hashed completed-dispatch evidence, never tool arguments.
+#[derive(Default)]
+pub struct ToolLoopRecovery(std::sync::Mutex<repetition::RepetitionGuard>);
+
+/// Run a channel turn with the same result-aware recovery used by Agent APIs.
+pub fn run_tool_call_loop_with_recovery<'a>(
+    p: ToolLoop<'a>,
+    recovery: &'a ToolLoopRecovery,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    run_tool_call_loop_with_guard(p, Some(&recovery.0))
+}
+
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
 ) -> impl std::future::Future<Output = Result<String>> + '_ {
