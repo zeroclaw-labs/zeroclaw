@@ -15,15 +15,282 @@ use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 
 use crate::agent::loop_::{
-    append_pinned_mcp_section, apply_policy_tool_filter, eager_mcp_tool_allowed,
-    load_peripheral_tools, mcp_allowed_tool_count, mcp_tool_access_policy,
-    preactivate_always_filter_groups, register_eager_mcp_tool_if_allowed,
+    append_pinned_mcp_section, eager_mcp_tool_allowed, load_peripheral_tools,
+    mcp_allowed_tool_count, mcp_tool_access_policy, preactivate_always_filter_groups,
+    register_eager_mcp_tool_if_allowed,
 };
 use crate::skills::Skill;
+use crate::tools::skill_tool::{PreparedSkill, PreparedSkillBuiltin, SlotId, TargetRef};
 use crate::tools::{
     self, ActivatedToolSet, AllToolsResult, DelegateParentToolsHandle, PerToolChannelHandle, Tool,
-    register_skill_tools_with_context_and_runtime_optional_nat64,
 };
+
+// Stable positions survive every filter until the one final emission. Only the
+// concrete pipeline is kept after an outer filter: skills historically resolve
+// it through a separate context even when it is not a top-level callable.
+struct BuildEntry {
+    value: Option<BuildSlot>,
+    top_level: bool,
+}
+
+enum BuildSlot {
+    Ready(Arc<dyn Tool>),
+    Pipeline(tools::PipelineTool),
+    Elevated {
+        prepared: PreparedSkillBuiltin,
+        target: TargetRef,
+    },
+}
+
+impl BuildSlot {
+    fn name(&self) -> &str {
+        match self {
+            Self::Ready(tool) => tool.name(),
+            Self::Pipeline(tool) => tool.name(),
+            Self::Elevated { prepared, .. } => &prepared.tool_name,
+        }
+    }
+
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        match self {
+            Self::Ready(tool) => tool.spec(),
+            Self::Pipeline(tool) => tool.spec(),
+            Self::Elevated { prepared, .. } => prepared.spec(),
+        }
+    }
+}
+
+fn is_guest(tool: &dyn Tool) -> bool {
+    matches!(
+        tool.role(),
+        zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::WasmPlugin)
+    )
+}
+
+fn is_search_guest(tool: &dyn Tool) -> bool {
+    is_guest(tool) && tool.name() == tools::ToolSearchTool::NAME
+}
+
+struct BuildRegistry {
+    entries: Vec<BuildEntry>,
+}
+
+impl BuildRegistry {
+    fn push(&mut self, value: BuildSlot) -> SlotId {
+        let id = SlotId(self.entries.len());
+        self.entries.push(BuildEntry {
+            value: Some(value),
+            top_level: true,
+        });
+        id
+    }
+
+    fn push_ready(&mut self, tool: Box<dyn Tool>) {
+        self.push(BuildSlot::Ready(Arc::from(tool)));
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (SlotId, &BuildSlot)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                entry
+                    .value
+                    .as_ref()
+                    .filter(|_| entry.top_level)
+                    .map(|value| (SlotId(index), value))
+            })
+    }
+
+    fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&BuildSlot) -> bool) {
+        for entry in &mut self.entries {
+            if entry.top_level && entry.value.as_ref().is_some_and(|value| !keep(value)) {
+                entry.top_level = false;
+                if !matches!(entry.value.as_ref(), Some(BuildSlot::Pipeline(_))) {
+                    entry.value = None;
+                }
+            }
+        }
+    }
+
+    fn register_mcp(
+        &mut self,
+        wrapper: Arc<dyn Tool>,
+        delegate_handle: Option<&DelegateParentToolsHandle>,
+        policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
+    ) -> bool {
+        let mut added = Vec::new();
+        let registered =
+            register_eager_mcp_tool_if_allowed(wrapper, &mut added, delegate_handle, policy);
+        for tool in added {
+            self.push_ready(tool);
+        }
+        registered
+    }
+
+    /// Called only after an actual native creator succeeds. No native helper
+    /// is inserted into the nested views that never originally contained it.
+    fn claim_search(
+        &mut self,
+        unfiltered: &mut Vec<Arc<dyn Tool>>,
+        context: &mut Vec<Arc<dyn Tool>>,
+        delegate_handle: Option<&DelegateParentToolsHandle>,
+    ) {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        tools::late_tool_search_observer::record(
+            "claim",
+            "tool_search",
+            unfiltered.len(),
+            context.len(),
+        );
+        for entry in &mut self.entries {
+            let retired = match entry.value.as_ref() {
+                Some(BuildSlot::Ready(tool)) => is_search_guest(tool.as_ref()),
+                Some(BuildSlot::Elevated {
+                    target: TargetRef::Existing(tool),
+                    ..
+                }) => is_search_guest(tool.as_ref()),
+                _ => false,
+            };
+            if retired {
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                tools::late_tool_search_observer::record("claim-retire", "slot", 0, 0);
+                entry.value = None;
+                entry.top_level = false;
+            } else if matches!(entry.value.as_ref(), Some(BuildSlot::Pipeline(_)))
+                && let Some(BuildSlot::Pipeline(tool)) = entry.value.take()
+            {
+                entry.value = Some(BuildSlot::Pipeline(tool.retain_context_tools(|child| {
+                    let retired = is_search_guest(child);
+                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                    tools::late_tool_search_observer::record(
+                        "pipeline-child",
+                        if retired { "retire" } else { "keep" },
+                        tools::late_tool_search_observer::borrowed_id(child),
+                        0,
+                    );
+                    !retired
+                })));
+            }
+        }
+        unfiltered.retain(|tool| {
+            let retired = is_search_guest(tool.as_ref());
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            tools::late_tool_search_observer::record(
+                "unfiltered-child",
+                if retired { "retire" } else { "keep" },
+                tools::late_tool_search_observer::arc_id(tool),
+                0,
+            );
+            !retired
+        });
+        context.retain(|tool| {
+            let retired = is_search_guest(tool.as_ref());
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            tools::late_tool_search_observer::record(
+                "context-child",
+                if retired { "retire" } else { "keep" },
+                tools::late_tool_search_observer::arc_id(tool),
+                0,
+            );
+            !retired
+        });
+        if let Some(parent) = delegate_handle {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            tools::late_tool_search_observer::record(
+                "parent-handle",
+                "claim",
+                tools::late_tool_search_observer::arc_id(parent),
+                0,
+            );
+            parent.write().retain(|tool| {
+                let retired = is_search_guest(tool.as_ref());
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                tools::late_tool_search_observer::record(
+                    "parent-child",
+                    if retired { "retire" } else { "keep" },
+                    tools::late_tool_search_observer::arc_id(tool),
+                    0,
+                );
+                !retired
+            });
+        }
+    }
+
+    fn seal(mut self, pipeline_id: Option<SlotId>) -> Vec<Box<dyn Tool>> {
+        let pipeline_needed = pipeline_id.is_some_and(|id| {
+            self.entries[id.0].top_level
+                || self.iter().any(|(_, value)| {
+                    matches!(
+                        value,
+                        BuildSlot::Elevated {
+                            target: TargetRef::Pipeline(target),
+                            ..
+                        } if *target == id
+                    )
+                })
+        });
+        // The sole owned value becomes an Arc once, after every creator claim.
+        // An unused pipeline is dropped without publishing a replacement.
+        let pipeline = pipeline_id.and_then(|id| match self.entries[id.0].value.take() {
+            Some(BuildSlot::Pipeline(tool)) if pipeline_needed => {
+                let tool = Arc::new(tool);
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                tools::late_tool_search_observer::record(
+                    "pipeline-publish",
+                    "sole",
+                    id.0,
+                    tools::late_tool_search_observer::arc_id(&tool),
+                );
+                Some((id, tool))
+            }
+            _ => None,
+        });
+        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        for (index, entry) in self.entries.into_iter().enumerate() {
+            if !entry.top_level {
+                continue;
+            }
+            if let Some((id, tool)) = &pipeline
+                && *id == SlotId(index)
+            {
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                tools::late_tool_search_observer::record(
+                    "pipeline-top",
+                    "same-arc",
+                    tools::late_tool_search_observer::arc_id(tool),
+                    0,
+                );
+                tools.push(Box::new(tools::ArcToolRef(
+                    Arc::clone(tool) as Arc<dyn Tool>
+                )));
+                continue;
+            }
+            match entry.value {
+                Some(BuildSlot::Ready(tool)) => tools.push(Box::new(tools::ArcToolRef(tool))),
+                Some(BuildSlot::Elevated { prepared, target }) => {
+                    let target = match target {
+                        TargetRef::Existing(tool) => Some(tool),
+                        // No name fallback: this reference can only bind to the
+                        // original slot, or fail closed if that slot is absent.
+                        TargetRef::Pipeline(target) => pipeline.as_ref().and_then(|(id, tool)| {
+                            (*id == target).then(|| Arc::clone(tool) as Arc<dyn Tool>)
+                        }),
+                    };
+                    if let Some(target) = target {
+                        tools.push(Box::new(prepared.bind(target)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        tools
+    }
+}
 
 /// A per-agent tool registry that has been scoped and gated. The inner field is
 /// private and production code can only mint one through
@@ -33,7 +300,10 @@ use crate::tools::{
 /// registry is a compile error, not a review-checklist item. Read sites are
 /// unchanged: the registry [`std::ops::Deref`]s to the same `[Box<dyn Tool>]`
 /// slice the raw `Vec` used to expose.
-pub struct ScopedToolRegistry(Vec<Box<dyn Tool>>);
+pub struct ScopedToolRegistry(
+    Vec<Box<dyn Tool>>,
+    Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
+);
 
 impl std::ops::Deref for ScopedToolRegistry {
     type Target = [Box<dyn Tool>];
@@ -58,6 +328,32 @@ impl ScopedToolRegistry {
     /// [`Self::assemble`] (or the test-only constructor).
     pub(crate) fn retain(&mut self, f: impl FnMut(&Box<dyn Tool>) -> bool) {
         self.0.retain(f);
+        self.refresh_builtin_schemas();
+    }
+
+    /// Schema exposure is derived from the current scoped registry and the
+    /// selected-name state. It does not change which tools can execute.
+    pub fn hidden_builtin_names(&self) -> HashSet<String> {
+        self.1.as_ref().map_or_else(HashSet::new, |state| {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .hidden_builtin_names()
+        })
+    }
+
+    fn refresh_builtin_schemas(&self) {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        tools::late_tool_search_observer::record("phase", "post-seal-refresh", 8, 0);
+        let Some(state) = &self.1 else { return };
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.0.iter().any(|tool| tool.name() == "tool_search") {
+            state.refresh_deferred_builtin_specs(self.0.iter().map(|tool| tool.spec()).collect());
+        } else {
+            // A later caller ceiling can remove discovery itself. Keep the
+            // surviving executable tools usable through their eager schemas.
+            state.set_deferred_builtin_specs(Vec::new());
+        }
     }
 
     /// Rebind the memory-backed tools of an ALREADY-sealed registry to a new
@@ -103,6 +399,7 @@ impl ScopedToolRegistry {
                 *tool = replacement;
             }
         }
+        self.refresh_builtin_schemas();
     }
 
     /// Test-only constructor that mints a registry directly from raw tools,
@@ -114,7 +411,7 @@ impl ScopedToolRegistry {
     /// in shipped builds and the seal holds where it matters.
     #[cfg(any(test, feature = "test-util"))]
     pub fn from_raw_for_test(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self(tools)
+        Self(tools, None)
     }
 }
 
@@ -269,21 +566,50 @@ impl ScopedToolRegistry {
             mcp_registry: overrides_mcp_registry,
         } = spec;
 
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        tools::late_tool_search_observer::record("phase", "factory", 1, 0);
         let AllToolsResult {
-            tools: mut tools_registry,
+            tools: tools_registry,
+            reserved_host_names: mut host_tool_names,
             delegate_handle,
             ask_user_handle,
             reaction_handle,
             poll_handle,
             escalate_handle,
             channel_room_handle,
-            unfiltered_tool_arcs,
+            mut unfiltered_tool_arcs,
             // Test-only capture of the concrete delegate instance; `assemble`
             // has no use for it and must keep destructuring exhaustively so a
             // new field cannot be silently dropped here.
             #[cfg(test)]
                 delegate_tool: _,
         } = built;
+
+        // Builtin declarations own their names independently of whether the
+        // current selection constructed them. Prebuilt inputs also retain the
+        // canonical deferred/context-withdrawn owners.
+        let (plugin_tools, mut tools_registry): (Vec<_>, Vec<_>) = tools_registry
+            .into_iter()
+            .partition(|tool| is_guest(tool.as_ref()));
+        host_tool_names.extend(tools_registry.iter().map(|tool| tool.name().to_string()));
+        tools::reserve_deferred_host_names(config, &mut host_tool_names);
+        tools_registry.extend(
+            plugin_tools
+                .into_iter()
+                .filter(|tool| !host_tool_names.contains(tool.name())),
+        );
+        unfiltered_tool_arcs
+            .retain(|tool| !is_guest(tool.as_ref()) || !host_tool_names.contains(tool.name()));
+        if let Some(parent) = delegate_handle.as_ref() {
+            parent
+                .write()
+                .retain(|tool| !is_guest(tool.as_ref()) || !host_tool_names.contains(tool.name()));
+        }
+
+        let mut builtin_names: HashSet<String> = tools_registry
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
 
         // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
         //    real devices), so this is gated: execution surfaces pass
@@ -303,16 +629,51 @@ impl ScopedToolRegistry {
             tools_registry.extend(peripheral_tools);
         }
 
-        // Mint the pipeline only after the effective caller policy is known. The
-        // same immutable Arc is used for top-level registration and any
-        // skill-scoped builtin elevation, so no unrestricted copy can escape.
-        let context_filtered_tool_arcs: Vec<Arc<dyn Tool>> = unfiltered_tool_arcs
+        let mut tools_registry = BuildRegistry {
+            entries: tools_registry
+                .into_iter()
+                .map(|tool| BuildEntry {
+                    value: Some(BuildSlot::Ready(Arc::from(tool))),
+                    top_level: true,
+                })
+                .collect(),
+        };
+
+        // Mint once at the original point, but keep the concrete value owned
+        // until late native ownership claims have narrowed its children.
+        let mut context_filtered_tool_arcs: Vec<Arc<dyn Tool>> = unfiltered_tool_arcs
             .iter()
             .filter(|tool| tool_allowed_in_context(tool.name(), exclude_memory, acp_delivery))
             .cloned()
             .collect();
-        let pipeline_tool = config.pipeline.enabled.then(|| {
-            Arc::new(tools::PipelineTool::with_access_policy(
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        {
+            tools::late_tool_search_observer::record(
+                "phase",
+                "context",
+                2,
+                context_filtered_tool_arcs.len(),
+            );
+            for tool in &context_filtered_tool_arcs {
+                tools::late_tool_search_observer::record(
+                    "context-entry",
+                    "original",
+                    tools::late_tool_search_observer::arc_id(tool),
+                    0,
+                );
+            }
+        }
+        let pipeline_id = (config.pipeline.enabled
+            && config.tools.is_enabled(tools::PipelineTool::NAME))
+        .then(|| {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            tools::late_tool_search_observer::record(
+                "constructor-enter",
+                "pipeline",
+                context_filtered_tool_arcs.len(),
+                0,
+            );
+            let tool = tools::PipelineTool::with_access_policy(
                 config.pipeline.clone(),
                 context_filtered_tool_arcs.clone(),
                 zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
@@ -320,16 +681,22 @@ impl ScopedToolRegistry {
                     security.excluded_tools.as_deref(),
                     caller_allowed,
                 ),
-            )) as Arc<dyn Tool>
+            );
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            tools::late_tool_search_observer::record("constructor-return", "pipeline", 0, 0);
+            builtin_names.insert(tool.name().to_string());
+            tools_registry.push(BuildSlot::Pipeline(tool))
         });
-        if let Some(tool) = pipeline_tool.as_ref() {
-            tools_registry.push(Box::new(tools::ArcToolRef(Arc::clone(tool))));
-        }
 
         // 2. Built-in allow/deny filter (uniform: the gateway used to skip it entirely).
         //    `caller_allowed` narrows on top of the policy, for the `run` path only.
         let before_filter = tools_registry.len();
-        apply_policy_tool_filter(&mut tools_registry, Some(security.as_ref()), caller_allowed);
+        tools_registry.retain(|tool| {
+            let name = tool.name();
+            let policy_ok = security.is_tool_allowed(name);
+            let caller_ok = caller_allowed.is_none_or(|list| list.iter().any(|n| n == name));
+            policy_ok && caller_ok
+        });
         if emit_assembly_logs && tools_registry.len() != before_filter {
             ::zeroclaw_log::record!(
                 INFO,
@@ -368,6 +735,8 @@ impl ScopedToolRegistry {
         // the `ScopedAssembled::mcp_tool_names` field doc for the contract.
         let mut mcp_tool_names: HashSet<String> = HashSet::new();
 
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        tools::late_tool_search_observer::record("phase", "mcp", 3, 0);
         let agent_mcp_servers = if connect_mcp && config.mcp.enabled {
             config.mcp_servers_for_agent(agent_alias)
         } else {
@@ -392,8 +761,22 @@ impl ScopedToolRegistry {
             // CLI / one-shot / process_message path intact.
             let shared_registry: Option<Arc<tools::McpRegistry>> =
                 if let Some(shared) = overrides_mcp_registry.as_ref() {
+                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                    tools::late_tool_search_observer::record(
+                        "mcp-registry",
+                        "override",
+                        tools::late_tool_search_observer::arc_id(shared),
+                        0,
+                    );
                     Some(Arc::clone(shared))
                 } else {
+                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                    tools::late_tool_search_observer::record(
+                        "mcp-connect",
+                        "actual",
+                        agent_mcp_servers.len(),
+                        0,
+                    );
                     match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                         Ok(registry) => Some(Arc::new(registry)),
                         Err(err) => {
@@ -419,6 +802,13 @@ impl ScopedToolRegistry {
                     }
                 };
             if let Some(registry) = shared_registry {
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                tools::late_tool_search_observer::record(
+                    "mcp-registry",
+                    "used",
+                    tools::late_tool_search_observer::arc_id(&registry),
+                    registry.server_count(),
+                );
                 // Origin set: every `<server>__<tool>` name the registry knows.
                 // Deferred stubs derive from the same `tool_names()` call, so
                 // one extension covers eager, deferred, and later activations.
@@ -435,9 +825,8 @@ impl ScopedToolRegistry {
                 // deferred-loading and eager modes) - parity with run/process_message.
                 for tool in tools::build_mcp_capability_tools(&registry, mcp_policy.as_ref()) {
                     let capability_name = tool.name().to_string();
-                    if register_eager_mcp_tool_if_allowed(
+                    if tools_registry.register_mcp(
                         tool,
-                        &mut tools_registry,
                         delegate_handle.as_ref(),
                         mcp_policy.as_ref(),
                     ) {
@@ -485,9 +874,8 @@ impl ScopedToolRegistry {
                             let wrapper: Arc<dyn Tool> = Arc::new(
                                 stub.activate(Arc::clone(&registry), Arc::clone(security)),
                             );
-                            register_eager_mcp_tool_if_allowed(
+                            tools_registry.register_mcp(
                                 wrapper,
-                                &mut tools_registry,
                                 delegate_handle.as_ref(),
                                 mcp_policy.as_ref(),
                             );
@@ -565,8 +953,27 @@ impl ScopedToolRegistry {
                             mcp_policy.as_ref(),
                             &preactivated_names,
                         );
+                        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                        tools::late_tool_search_observer::record(
+                            "constructor-enter",
+                            "mcp-search",
+                            allowed_stub_count,
+                            0,
+                        );
                         let mut tool_search =
                             tools::ToolSearchTool::new(filtered_deferred, activated);
+                        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                        tools::late_tool_search_observer::record(
+                            "constructor-return",
+                            "mcp-search",
+                            0,
+                            0,
+                        );
+                        tools_registry.claim_search(
+                            &mut unfiltered_tool_arcs,
+                            &mut context_filtered_tool_arcs,
+                            delegate_handle.as_ref(),
+                        );
                         if let Some(mut policy) = mcp_policy {
                             // The caller ceiling already materialized the stub
                             // registry above. Do not retain a second, stale
@@ -589,7 +996,7 @@ impl ScopedToolRegistry {
                         }
                         let tool_search = Arc::new(tool_search);
                         tool_search_handle = Some(Arc::clone(&tool_search));
-                        tools_registry.push(Box::new(tools::ArcToolRef(tool_search)));
+                        tools_registry.push(BuildSlot::Ready(tool_search));
                     }
                 } else {
                     let names = registry.tool_names();
@@ -607,9 +1014,8 @@ impl ScopedToolRegistry {
                                 Arc::clone(&registry),
                                 Arc::clone(security),
                             ));
-                            if register_eager_mcp_tool_if_allowed(
+                            if tools_registry.register_mcp(
                                 wrapper,
-                                &mut tools_registry,
                                 delegate_handle.as_ref(),
                                 mcp_policy.as_ref(),
                             ) {
@@ -639,12 +1045,8 @@ impl ScopedToolRegistry {
 
         // 5. Skills (uniform: the gateway used to skip them). Registered under the same
         //    `SecurityPolicy`, resolving builtin elevation against context-filtered arcs.
-        let resolution_registry: Vec<Arc<dyn Tool>> = context_filtered_tool_arcs
-            .iter()
-            .cloned()
-            .chain(mcp_elevation_arcs.iter().cloned())
-            .chain(pipeline_tool.iter().cloned())
-            .collect();
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        tools::late_tool_search_observer::record("phase", "skills", 4, 0);
         let nat64_prefixes = match zeroclaw_infra::net_guard::parse_nat64_prefixes(
             &config.security.nat64_prefixes,
             "security.nat64_prefixes",
@@ -662,14 +1064,100 @@ impl ScopedToolRegistry {
                 None
             }
         };
-        register_skill_tools_with_context_and_runtime_optional_nat64(
-            &mut tools_registry,
-            skills,
-            Arc::clone(security),
-            &resolution_registry,
-            runtime,
-            nat64_prefixes.as_deref(),
-        );
+        if !skills.is_empty() {
+            let skill_tools = crate::skills::prepare_skill_tools_with_runtime(
+                skills,
+                Arc::clone(security),
+                runtime,
+                nat64_prefixes.as_deref(),
+                PreparedSkill::Ready,
+                |skill_name, tool, kind_label| {
+                    crate::skills::resolve_skill_elevation(
+                        skill_name,
+                        tool,
+                        kind_label,
+                        |target_name| {
+                            if let Some(target) = context_filtered_tool_arcs
+                                .iter()
+                                .chain(mcp_elevation_arcs.iter())
+                                .find(|target| target.name() == target_name)
+                            {
+                                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                                tools::late_tool_search_observer::record(
+                                    "skill-target",
+                                    "existing",
+                                    tools::late_tool_search_observer::arc_id(target),
+                                    0,
+                                );
+                                let target = Arc::clone(target);
+                                return Some(PreparedSkill::Elevated {
+                                    prepared: PreparedSkillBuiltin::prepare(
+                                        skill_name,
+                                        tool,
+                                        tool.locked_args.clone(),
+                                        target.as_ref(),
+                                    ),
+                                    target: TargetRef::Existing(target),
+                                });
+                            }
+                            pipeline_id.and_then(|id| {
+                                match tools_registry.entries[id.0].value.as_ref() {
+                                    Some(BuildSlot::Pipeline(target))
+                                        if target.name() == target_name =>
+                                    {
+                                        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                                        tools::late_tool_search_observer::record(
+                                            "skill-target",
+                                            "pipeline",
+                                            id.0,
+                                            0,
+                                        );
+                                        Some(PreparedSkill::Elevated {
+                                            prepared: PreparedSkillBuiltin::prepare(
+                                                skill_name,
+                                                tool,
+                                                tool.locked_args.clone(),
+                                                target,
+                                            ),
+                                            target: TargetRef::Pipeline(id),
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            })
+                        },
+                    )
+                },
+            );
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            tools::late_tool_search_observer::record(
+                "phase",
+                "skills-prepared",
+                5,
+                skill_tools.len(),
+            );
+            // The complete batch is prepared before the one fixed snapshot.
+            let existing_names = tools_registry
+                .iter()
+                .map(|(_, tool)| tool.name().to_string())
+                .collect();
+            tools::register_prepared_skill_tools(
+                skill_tools,
+                &existing_names,
+                skills,
+                security,
+                |tool| match tool {
+                    PreparedSkill::Ready(tool) => tool.name(),
+                    PreparedSkill::Elevated { prepared, .. } => &prepared.tool_name,
+                },
+                |tool| match tool {
+                    PreparedSkill::Ready(tool) => tools_registry.push_ready(tool),
+                    PreparedSkill::Elevated { prepared, target } => {
+                        tools_registry.push(BuildSlot::Elevated { prepared, target });
+                    }
+                },
+            );
+        }
 
         // Skills and deferred MCP helpers are registered after the built-in filter,
         // so the explicit denylist must subtract once more at the final boundary.
@@ -689,8 +1177,128 @@ impl ScopedToolRegistry {
             deferred_section.clear();
         }
 
+        // This is prompt visibility, not ownership or admission. The basic
+        // workspace/memory actions stay directly usable; other built-ins keep
+        // their executable instances in this same scoped registry.
+        const EAGER_BUILTINS: &[&str] = &[
+            "shell",
+            "file_read",
+            "file_write",
+            "file_edit",
+            "memory_recall",
+            "memory_store",
+        ];
+        let builtin_deferral = !list_deferred_mcp_specs
+            && config
+                .runtime_profile_for_agent(agent_alias)
+                .is_some_and(|profile| profile.deferred_builtin_tools);
+        let mut search_policy = zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+            security.allowed_tools.as_deref(),
+            security.excluded_tools.as_deref(),
+            caller_allowed,
+        );
+        let search_admitted = search_policy
+            .as_ref()
+            .is_none_or(|policy| policy.is_tool_allowed("tool_search"));
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        tools::late_tool_search_observer::record("phase", "specs", 6, 0);
+        let mut builtin_schema_handle = None;
+        if builtin_deferral && search_admitted {
+            let captured_specs: Vec<_> = tools_registry
+                .iter()
+                .filter(|(_, tool)| {
+                    builtin_names.contains(tool.name())
+                        && !EAGER_BUILTINS.contains(&tool.name())
+                        && tool.name() != "tool_search"
+                })
+                .map(|(id, tool)| {
+                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                    tools::late_tool_search_observer::record("spec-acquire", "assembly", id.0, 0);
+                    (id, tool.spec())
+                })
+                .collect();
+            if !captured_specs.is_empty() {
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                for (id, spec) in &captured_specs {
+                    tools::late_tool_search_observer::record(
+                        "captured-spec",
+                        &spec.name,
+                        id.0,
+                        tools::late_tool_search_observer::arc_id(&spec.parameters),
+                    );
+                }
+                // The original HashMap collection chooses the last duplicate.
+                // Retiring that origin must not promote an earlier loser.
+                let last_origins: std::collections::HashMap<_, _> = captured_specs
+                    .iter()
+                    .map(|(id, spec)| (spec.name.clone(), *id))
+                    .collect();
+                let activated = activated_handle.get_or_insert_with(|| {
+                    Arc::new(std::sync::Mutex::new(ActivatedToolSet::new()))
+                });
+                activated
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_deferred_builtin_specs(
+                        captured_specs
+                            .iter()
+                            .map(|(_, spec)| spec.clone())
+                            .collect(),
+                    );
+                builtin_schema_handle = Some(Arc::clone(activated));
+                if tool_search_handle.is_none() {
+                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                    tools::late_tool_search_observer::record(
+                        "constructor-enter",
+                        "builtin-search",
+                        captured_specs.len(),
+                        0,
+                    );
+                    let mut search =
+                        tools::ToolSearchTool::for_builtin_schemas(Arc::clone(activated));
+                    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                    tools::late_tool_search_observer::record(
+                        "constructor-return",
+                        "builtin-search",
+                        0,
+                        0,
+                    );
+                    tools_registry.claim_search(
+                        &mut unfiltered_tool_arcs,
+                        &mut context_filtered_tool_arcs,
+                        delegate_handle.as_ref(),
+                    );
+                    if let Some(mut policy) = search_policy.take() {
+                        // The registry already applied this ceiling. Later
+                        // narrowing removes catalog entries at the same seam.
+                        policy.caller_allowed = None;
+                        search = search.with_access_policy(policy);
+                    }
+                    let search = Arc::new(search);
+                    tools_registry.push(BuildSlot::Ready(Arc::clone(&search) as Arc<dyn Tool>));
+                    tool_search_handle = Some(search);
+                }
+                activated
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .refresh_deferred_builtin_specs(
+                        captured_specs
+                            .into_iter()
+                            .filter(|(id, spec)| {
+                                last_origins.get(&spec.name) == Some(id)
+                                    && tools_registry.entries[id.0].top_level
+                                    && tools_registry.entries[id.0].value.is_some()
+                            })
+                            .map(|(_, spec)| spec)
+                            .collect(),
+                    );
+            }
+        }
+
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        tools::late_tool_search_observer::record("phase", "seal", 7, 0);
         ScopedAssembled {
-            registry: ScopedToolRegistry(tools_registry),
+            registry: ScopedToolRegistry(tools_registry.seal(pipeline_id), builtin_schema_handle),
             delegate_handle,
             ask_user_handle,
             reaction_handle,
@@ -780,6 +1388,7 @@ mod tests {
     fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
         AllToolsResult {
             tools,
+            reserved_host_names: HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
@@ -811,6 +1420,7 @@ mod tests {
             .collect();
         AllToolsResult {
             tools,
+            reserved_host_names: HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
@@ -834,6 +1444,10 @@ mod tests {
     ) -> ScopedAssembled {
         let mut config = Config::default();
         config.pipeline.enabled = true;
+        config
+            .tools
+            .optional
+            .push(tools::PipelineTool::NAME.to_string());
         config.pipeline.max_steps = 20;
         config.pipeline.allowed_tools = vec!["shell".to_string(), "file_write".to_string()];
         ScopedToolRegistry::assemble(ScopedAssembly {
@@ -1030,6 +1644,10 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut config = Config::default();
         config.pipeline.enabled = true;
+        config
+            .tools
+            .optional
+            .push(tools::PipelineTool::NAME.to_string());
         config.pipeline.allowed_tools = vec!["shell".to_string(), child_name.to_string()];
         let security = Arc::new(SecurityPolicy {
             allowed_tools: Some(vec![
@@ -1201,6 +1819,365 @@ mod tests {
         })
         .await;
         out.registry.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    fn builtin_deferral_config(enabled: bool) -> Config {
+        use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            "catalog".into(),
+            RuntimeProfileConfig {
+                deferred_builtin_tools: enabled,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "default".into(),
+            AliasedAgentConfig {
+                runtime_profile: "catalog".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    async fn assemble_builtin_catalog(
+        config: &Config,
+        security: &Arc<SecurityPolicy>,
+        built: AllToolsResult,
+        caller_allowed: Option<&[String]>,
+        listing: bool,
+    ) -> ScopedAssembled {
+        ScopedToolRegistry::assemble(ScopedAssembly {
+            config,
+            agent_alias: "default",
+            security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: listing,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await
+    }
+
+    fn search_schemas(result: &ToolResult) -> Vec<serde_json::Value> {
+        result
+            .output
+            .lines()
+            .filter_map(|line| line.strip_prefix("<function>")?.strip_suffix("</function>"))
+            .map(|schema| serde_json::from_str(schema).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn builtin_deferral_preserves_core_schemas_and_executable_registry() {
+        let config = builtin_deferral_config(true);
+        let security = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["denied".into()]),
+            ..SecurityPolicy::default()
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let assembled = assemble_builtin_catalog(
+            &config,
+            &security,
+            built_with_counting_tools(
+                Arc::clone(&calls),
+                &[
+                    "shell",
+                    "file_read",
+                    "file_write",
+                    "file_edit",
+                    "memory_recall",
+                    "memory_store",
+                    "memory_export",
+                    "calendar",
+                    "denied",
+                ],
+            ),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            assembled.registry.hidden_builtin_names(),
+            HashSet::from(["memory_export".to_string(), "calendar".to_string()])
+        );
+        assert_eq!(assembled.registry.len(), 9);
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .all(|tool| tool.name() != "denied")
+        );
+        let calendar = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "calendar")
+            .unwrap();
+        assert!(
+            calendar
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        let expected_schema = serde_json::to_value(calendar.spec()).unwrap();
+        let search = assembled.tool_search_handle.as_ref().unwrap();
+        let denied = search
+            .execute(serde_json::json!({"query": "select:denied"}))
+            .await
+            .unwrap();
+        assert!(search_schemas(&denied).is_empty());
+        let selected = search
+            .execute(serde_json::json!({"query": "select:calendar"}))
+            .await
+            .unwrap();
+        assert_eq!(search_schemas(&selected), vec![expected_schema]);
+        assert_eq!(
+            assembled.registry.hidden_builtin_names(),
+            HashSet::from(["memory_export".to_string()])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let activated = assembled.activated_handle.as_ref().unwrap().lock().unwrap();
+        assert!(activated.get("calendar").is_none());
+        assert!(activated.tool_specs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn builtin_schemas_stay_eager_without_opt_in_or_discovery() {
+        let cases = [
+            (false, SecurityPolicy::default(), None),
+            (
+                true,
+                SecurityPolicy {
+                    excluded_tools: Some(vec!["tool_search".into()]),
+                    ..SecurityPolicy::default()
+                },
+                None,
+            ),
+            (
+                true,
+                SecurityPolicy {
+                    allowed_tools: Some(vec!["shell".into(), "calendar".into()]),
+                    ..SecurityPolicy::default()
+                },
+                None,
+            ),
+            (
+                true,
+                SecurityPolicy::default(),
+                Some(vec!["shell".to_string(), "calendar".to_string()]),
+            ),
+        ];
+        for (enabled, policy, caller_allowed) in cases {
+            let config = builtin_deferral_config(enabled);
+            let assembled = assemble_builtin_catalog(
+                &config,
+                &Arc::new(policy),
+                built_with(vec![
+                    Box::new(MockTool("shell")),
+                    Box::new(MockTool("calendar")),
+                ]),
+                caller_allowed.as_deref(),
+                false,
+            )
+            .await;
+            assert!(assembled.registry.hidden_builtin_names().is_empty());
+            assert_eq!(assembled.registry.len(), 2);
+            assert!(assembled.tool_search_handle.is_none());
+            assert!(assembled.activated_handle.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_assembly_keeps_builtin_schemas_eager() {
+        let config = builtin_deferral_config(true);
+        let assembled = assemble_builtin_catalog(
+            &config,
+            &Arc::new(SecurityPolicy::default()),
+            built_with(vec![
+                Box::new(MockTool("shell")),
+                Box::new(MockTool("calendar")),
+            ]),
+            None,
+            true,
+        )
+        .await;
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert_eq!(assembled.registry.len(), 2);
+        assert!(assembled.tool_search_handle.is_none());
+        assert!(assembled.activated_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn builtin_deferral_prunes_removed_metadata_and_selection() {
+        let config = builtin_deferral_config(true);
+        let mut assembled = assemble_builtin_catalog(
+            &config,
+            &Arc::new(SecurityPolicy::default()),
+            built_with(vec![
+                Box::new(MockTool("shell")),
+                Box::new(MockTool("calendar")),
+                Box::new(MockTool("weather")),
+            ]),
+            None,
+            false,
+        )
+        .await;
+        let search = Arc::clone(assembled.tool_search_handle.as_ref().unwrap());
+        search
+            .execute(serde_json::json!({"query": "select:calendar"}))
+            .await
+            .unwrap();
+        assembled.registry.retain(|tool| tool.name() != "calendar");
+        assert_eq!(
+            assembled.registry.hidden_builtin_names(),
+            HashSet::from(["weather".to_string()])
+        );
+        assert!(!search.deferred_prompt_section().contains("calendar"));
+        let removed = search
+            .execute(serde_json::json!({"query": "select:calendar"}))
+            .await
+            .unwrap();
+        assert!(search_schemas(&removed).is_empty());
+
+        search
+            .execute(serde_json::json!({"query": "select:weather"}))
+            .await
+            .unwrap();
+        let principal_allowed = vec!["shell".to_string(), "tool_search".to_string()];
+        search.narrow_to_caller(&principal_allowed);
+        assert!(search.deferred_prompt_section().is_empty());
+        let removed = search
+            .execute(serde_json::json!({"query": "select:weather"}))
+            .await
+            .unwrap();
+        assert!(search_schemas(&removed).is_empty());
+        assembled
+            .registry
+            .retain(|tool| principal_allowed.iter().any(|name| name == tool.name()));
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert!(
+            !assembled
+                .activated_handle
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .has_deferred_builtin_schemas()
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_builtin_search_restores_surviving_eager_schemas() {
+        let config = builtin_deferral_config(true);
+        let mut assembled = assemble_builtin_catalog(
+            &config,
+            &Arc::new(SecurityPolicy::default()),
+            built_with(vec![
+                Box::new(MockTool("shell")),
+                Box::new(MockTool("calendar")),
+            ]),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            assembled
+                .registry
+                .hidden_builtin_names()
+                .contains("calendar")
+        );
+        assembled
+            .registry
+            .retain(|tool| tool.name() != "tool_search");
+        assert_eq!(assembled.registry.len(), 2);
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert!(
+            assembled
+                .tool_search_handle
+                .as_ref()
+                .unwrap()
+                .deferred_prompt_section()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_memory_selection_uses_rebound_backend() {
+        use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
+        use zeroclaw_tools::memory_export::MemoryExportTool;
+
+        let original_dir = tempfile::TempDir::new().unwrap();
+        let current_dir = tempfile::TempDir::new().unwrap();
+        let original: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new("original", original_dir.path()).unwrap());
+        let current: Arc<dyn Memory> =
+            Arc::new(SqliteMemory::new("current", current_dir.path()).unwrap());
+        original
+            .store("shared", "original-backend", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        current
+            .store("private", "current-backend", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let config = builtin_deferral_config(true);
+        let security = Arc::new(SecurityPolicy::default());
+        let mut assembled = assemble_builtin_catalog(
+            &config,
+            &security,
+            built_with(vec![Box::new(MemoryExportTool::new(Arc::clone(&original)))]),
+            None,
+            false,
+        )
+        .await;
+        assert!(
+            assembled
+                .registry
+                .hidden_builtin_names()
+                .contains("memory_export")
+        );
+        let selected = assembled
+            .tool_search_handle
+            .as_ref()
+            .unwrap()
+            .execute(serde_json::json!({"query": "select:memory_export"}))
+            .await
+            .unwrap();
+        assert_eq!(search_schemas(&selected)[0]["name"], "memory_export");
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assembled
+            .registry
+            .rebind_memory_tools(Arc::clone(&current), Arc::clone(&security));
+        assert!(assembled.registry.hidden_builtin_names().is_empty());
+        assert!(
+            assembled
+                .activated_handle
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get("memory_export")
+                .is_none()
+        );
+        let result = assembled.registry[0]
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let entries: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(entries.as_array().unwrap().len(), 1);
+        assert_eq!(entries[0]["content"], "current-backend");
+        assert!(!result.output.contains("original-backend"));
     }
 
     #[tokio::test]
@@ -1613,7 +2590,7 @@ mod tests {
 
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
         ScopedAssembled {
-            registry: ScopedToolRegistry(Vec::new()),
+            registry: ScopedToolRegistry(Vec::new(), None),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),

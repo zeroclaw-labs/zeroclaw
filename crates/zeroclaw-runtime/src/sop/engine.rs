@@ -122,7 +122,7 @@ pub struct SopEngine {
     /// leaves the run `Running` and claimed with nobody to write the terminal
     /// state again; maintenance consumes this map until the write lands. The
     /// durable run row stays the source of truth for status.
-    pending_orphan_settlements: std::collections::HashMap<String, OrphanedRunSettlement>,
+    pending_orphan_settlements: OrphanedRunSettlementQueue,
     /// Decision models by alias, consulted by dispatch for SOPs with a
     /// `[decision]` table. An SOP whose alias is absent resolves fail-closed.
     decision_models: HashMap<String, Arc<dyn super::decision::DecisionModel>>,
@@ -178,7 +178,7 @@ impl MaintenanceSummary {
 
 /// Why a run is waiting on a terminal write that no driver will ever make.
 ///
-/// Both cases are runs the engine still holds as active, with an execution
+/// These are runs the engine still holds as active, with an execution
 /// claim, but that nothing is left to advance. Each settles through the normal
 /// claim-releasing terminal path; the kind only decides the terminal status and
 /// the durable event that explains it.
@@ -190,6 +190,33 @@ pub enum OrphanedRunSettlement {
     /// A reload aborted the run's driver mid-drive. Settled `Failed`: the step
     /// was underway and did not finish.
     DriverAborted,
+    /// Execution authority rejected the next step before its target ran.
+    /// Settled `Cancelled`: the driver stopped without executing that step.
+    ExecutionRejected,
+}
+
+/// Canonical pending terminal writes, retained across daemon generations.
+/// Handles may be handed off, but only an engine mutates or retries entries.
+#[derive(Clone, Default)]
+pub struct OrphanedRunSettlementQueue {
+    pending: Arc<parking_lot::Mutex<std::collections::HashMap<String, OrphanedRunSettlement>>>,
+    settlement: Arc<parking_lot::Mutex<()>>,
+}
+
+impl OrphanedRunSettlementQueue {
+    /// Observe the shared gate while a test pauses an engine's durable read.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn settlement_in_progress_for_test(&self) -> bool {
+        self.settlement.is_locked()
+    }
+
+    fn snapshot(&self) -> Vec<(String, OrphanedRunSettlement)> {
+        self.pending
+            .lock()
+            .iter()
+            .map(|(run_id, kind)| (run_id.clone(), *kind))
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -401,7 +428,7 @@ impl SopEngine {
             step_budget_finalization_ready: std::collections::HashSet::new(),
             execution_capability: None,
             headless_drivers: std::collections::HashSet::new(),
-            pending_orphan_settlements: std::collections::HashMap::new(),
+            pending_orphan_settlements: OrphanedRunSettlementQueue::default(),
             decision_models: HashMap::new(),
         }
     }
@@ -3420,6 +3447,36 @@ impl SopEngine {
         Ok(Some(prior))
     }
 
+    fn settle_run_for_rejected_execution(&mut self, run_id: &str) -> Result<Option<SopRunStatus>> {
+        let Some((prior, current_step)) = self
+            .active_runs
+            .get(run_id)
+            .map(|run| (run.status, run.current_step))
+        else {
+            return Ok(None);
+        };
+        if !matches!(prior, SopRunStatus::Running | SopRunStatus::CancelRequested) {
+            return Ok(None);
+        }
+        let reason = "execution authority rejected this step before target execution, so the \
+                      driver stopped and nothing will advance the run"
+            .to_string();
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "run_execution_rejected".to_string(),
+            actor: None,
+            reason: Some(reason.clone()),
+            payload: ::serde_json::json!({
+                "step": current_step,
+                "prior_status": prior.to_string(),
+            }),
+        };
+        self.finish_run_with_gate_event(run_id, SopRunStatus::Cancelled, Some(reason), &event)?;
+        Ok(Some(prior))
+    }
+
     /// Settle a run no driver will advance, keeping ownership of the retry.
     ///
     /// On success any pending retry for the run is cleared. On failure the run
@@ -3432,28 +3489,94 @@ impl SopEngine {
         run_id: &str,
         kind: OrphanedRunSettlement,
     ) -> Result<Option<SopRunStatus>> {
-        let result = match kind {
-            OrphanedRunSettlement::DrainedBeforeAdmission => {
-                self.settle_run_for_drained_generation(run_id)
-            }
-            OrphanedRunSettlement::DriverAborted => self.settle_run_for_aborted_driver(run_id),
-        };
+        // Old drivers can outlive reload. Serialize the durable read and write
+        // across engines, without holding the pending map through persistence.
+        let queue = self.pending_orphan_settlements.clone();
+        let _settlement = queue.settlement.lock();
+        let kind = self
+            .pending_orphan_settlements
+            .pending
+            .lock()
+            .get(run_id)
+            .copied()
+            .unwrap_or(kind);
+        let result = self
+            .load_orphaned_run_for_settlement(run_id, kind)
+            .and_then(|needs_settlement| match (needs_settlement, kind) {
+                (false, _) => Ok(None),
+                (true, OrphanedRunSettlement::DrainedBeforeAdmission) => {
+                    self.settle_run_for_drained_generation(run_id)
+                }
+                (true, OrphanedRunSettlement::DriverAborted) => {
+                    self.settle_run_for_aborted_driver(run_id)
+                }
+                (true, OrphanedRunSettlement::ExecutionRejected) => {
+                    self.settle_run_for_rejected_execution(run_id)
+                }
+            });
         match &result {
             Ok(_) => {
-                self.pending_orphan_settlements.remove(run_id);
+                self.pending_orphan_settlements
+                    .pending
+                    .lock()
+                    .remove(run_id);
             }
             Err(_) => {
                 self.pending_orphan_settlements
+                    .pending
+                    .lock()
                     .insert(run_id.to_string(), kind);
             }
         }
         result
     }
 
+    fn load_orphaned_run_for_settlement(
+        &mut self,
+        run_id: &str,
+        kind: OrphanedRunSettlement,
+    ) -> Result<bool> {
+        // A restored cache can be stale even when populated: another generation
+        // may already have settled this run through the shared queue.
+        if let Some(stored) = self.store.load_run(run_id)? {
+            if matches!(
+                stored.run.status,
+                SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
+            ) {
+                self.claims_pending_persist.remove(run_id);
+                self.claims_retained_after_terminal_rollback.remove(run_id);
+                self.cancellation_finalization_ready.remove(run_id);
+                self.step_budget_finalization_ready.remove(run_id);
+                self.active_runs.remove(run_id);
+                // This is view reconciliation, not another completion.
+                self.finished_runs.retain(|run| run.run_id != run_id);
+                self.finished_runs.push(stored.run);
+                let max = self.config.max_finished_runs;
+                if max > 0 && self.finished_runs.len() > max {
+                    let excess = self.finished_runs.len() - max;
+                    self.finished_runs.drain(..excess);
+                }
+                return Ok(false);
+            } else {
+                let needs_settlement = matches!(
+                    stored.run.status,
+                    SopRunStatus::Running | SopRunStatus::CancelRequested
+                ) || (kind == OrphanedRunSettlement::DrainedBeforeAdmission
+                    && stored.run.status == SopRunStatus::Pending);
+                if needs_settlement || self.active_runs.contains_key(run_id) {
+                    self.active_runs.insert(run_id.to_string(), stored.run);
+                }
+                return Ok(needs_settlement);
+            }
+        }
+        Ok(self.active_runs.contains_key(run_id))
+    }
+
     /// Hand this engine the retry for runs a previous engine could not settle.
     ///
-    /// A reload tears down the old generation before this engine exists. If
-    /// settling an aborted driver's run failed there, the durable row is still
+    /// A reload retires the old generation, but its stragglers may still be
+    /// settling through the shared queue. If their terminal write failed, the
+    /// durable row is still
     /// `Running`, and restoring it here would renew its claim with no driver
     /// to advance it. Recording the runs here makes this engine's maintenance
     /// the owner of that terminal write.
@@ -3461,22 +3584,37 @@ impl SopEngine {
         &mut self,
         runs: impl IntoIterator<Item = (String, OrphanedRunSettlement)>,
     ) {
-        self.pending_orphan_settlements.extend(runs);
+        let mut pending = self.pending_orphan_settlements.pending.lock();
+        for (run_id, kind) in runs {
+            pending.entry(run_id).or_insert(kind);
+        }
+    }
+
+    /// Retain the canonical retry queue even after its drivers were pruned.
+    #[must_use]
+    pub fn orphaned_run_settlement_queue(&self) -> OrphanedRunSettlementQueue {
+        self.pending_orphan_settlements.clone()
+    }
+
+    /// Transfer retry ownership without losing writes from late old producers.
+    pub fn adopt_orphaned_run_settlement_queue(&mut self, queue: OrphanedRunSettlementQueue) {
+        let pending = self.pending_orphan_settlements.snapshot();
+        self.pending_orphan_settlements = queue;
+        self.adopt_orphaned_run_settlements(pending);
     }
 
     /// Runs awaiting a retried terminal write, for callers and tests that need
     /// to see whether maintenance still owns one.
     #[must_use]
     pub fn has_pending_orphan_settlement(&self, run_id: &str) -> bool {
-        self.pending_orphan_settlements.contains_key(run_id)
+        self.pending_orphan_settlements
+            .pending
+            .lock()
+            .contains_key(run_id)
     }
 
     fn retry_pending_orphan_settlements(&mut self) -> usize {
-        let pending: Vec<(String, OrphanedRunSettlement)> = self
-            .pending_orphan_settlements
-            .iter()
-            .map(|(run_id, kind)| (run_id.clone(), *kind))
-            .collect();
+        let pending = self.pending_orphan_settlements.snapshot();
         let mut settled = 0;
         for (run_id, kind) in pending {
             match self.settle_orphaned_run(&run_id, kind) {
@@ -5863,7 +6001,10 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
         self.step_budget_finalization_ready.remove(run_id);
-        self.pending_orphan_settlements.remove(run_id);
+        self.pending_orphan_settlements
+            .pending
+            .lock()
+            .remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         // The park snapshot is purely a rehydration artifact: a terminal run must
@@ -5919,7 +6060,10 @@ impl SopEngine {
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.cancellation_finalization_ready.remove(run_id);
         self.step_budget_finalization_ready.remove(run_id);
-        self.pending_orphan_settlements.remove(run_id);
+        self.pending_orphan_settlements
+            .pending
+            .lock()
+            .remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         self.remove_deterministic_state_file(&run);
@@ -6463,14 +6607,27 @@ fn amqp_match_from(pat: &[&str], words: &[&str]) -> bool {
 /// Glob match a filesystem trigger `pattern` against a normalized `path`,
 /// supporting `*` (single segment) and `**` (recursive) wildcards via the
 /// `glob` crate. A bare directory pattern also matches paths nested beneath it.
+///
+/// Both sides are compared with every platform separator spelled `/`. Watchers
+/// report Windows paths with `\`, which the nested-path check would otherwise
+/// never see as a separator; on Unix `\` is an ordinary filename character and
+/// is left alone.
 pub(crate) fn filesystem_path_matches(pattern: &str, path: &str) -> bool {
-    if let Ok(compiled) = glob::Pattern::new(pattern)
-        && compiled.matches(path)
+    let pattern = with_forward_separators(pattern);
+    let path = with_forward_separators(path);
+    if let Ok(compiled) = glob::Pattern::new(&pattern)
+        && compiled.matches(&path)
     {
         return true;
     }
     let prefix = pattern.trim_end_matches('/');
     path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn with_forward_separators(path: &str) -> String {
+    path.chars()
+        .map(|c| if std::path::is_separator(c) { '/' } else { c })
+        .collect()
 }
 
 /// Whether the payload's `event` field names one of the trigger's listed kinds.
@@ -7276,6 +7433,40 @@ mod tests {
         assert!(mqtt_topic_matches("#", "a/b/c"));
         assert!(mqtt_topic_matches("a/#", "a/b/c"));
         assert!(!mqtt_topic_matches("b/#", "a/b/c"));
+    }
+
+    #[test]
+    fn filesystem_path_matching_directories_and_globs() {
+        assert!(filesystem_path_matches("/w/in", "/w/in"));
+        assert!(filesystem_path_matches("/w/in", "/w/in/a.pdf"));
+        assert!(filesystem_path_matches("/w/in/", "/w/in/sub/a.pdf"));
+        assert!(!filesystem_path_matches("/w/in", "/w/inbox/a.pdf"));
+        assert!(filesystem_path_matches("/w/in/*.pdf", "/w/in/a.pdf"));
+        assert!(filesystem_path_matches("/w/in/**/*.pdf", "/w/in/sub/a.pdf"));
+        assert!(!filesystem_path_matches("/w/in/*.pdf", "/w/in/a.txt"));
+    }
+
+    /// Watchers report Windows paths with `\`, so a directory trigger must
+    /// treat it as a separator there, whichever separator the trigger uses.
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_path_matching_accepts_windows_separators() {
+        assert!(filesystem_path_matches(r"C:\w\in", r"C:\w\in\a.pdf"));
+        assert!(filesystem_path_matches(r"C:\w\in\", r"C:\w\in\sub\a.pdf"));
+        assert!(filesystem_path_matches("C:/w/in", r"C:\w\in\a.pdf"));
+        assert!(filesystem_path_matches(
+            r"\\?\C:\w\in",
+            r"\\?\C:\w\in\a.pdf"
+        ));
+        assert!(filesystem_path_matches(r"C:\w\in\*.pdf", r"C:\w\in\a.pdf"));
+        assert!(!filesystem_path_matches(r"C:\w\in", r"C:\w\inbox\a.pdf"));
+    }
+
+    /// On Unix `\` is an ordinary filename character, not a separator.
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_path_matching_keeps_backslash_literal_on_unix() {
+        assert!(!filesystem_path_matches("/w/in", r"/w/in\a.pdf"));
     }
 
     // ── Calendar trigger matching ─────────────────────
@@ -10021,7 +10212,11 @@ mod tests {
             "only the failed first park still holds an exec claim"
         );
 
-        engine.config.approval_timeout_secs = 1;
+        // Use a large timeout so the second run (parked at whole-second
+        // `waiting_since`) cannot become overdue if the wall clock crosses a
+        // second boundary between park and this tick. The first run is still a
+        // timeout candidate because its waiting_since is back-dated below.
+        engine.config.approval_timeout_secs = 3600;
         engine.active_runs.get_mut(&first_id).unwrap().waiting_since =
             Some("2000-01-01T00:00:00Z".to_string());
         let summary = engine.run_maintenance_tick();

@@ -16,19 +16,23 @@ repository. You never need a ZeroClaw checkout to build one, only the `wit/`
 contract files (fetched in step 1) and an installed `zeroclaw` binary with
 the plugin host compiled in to run it.
 
-> **The release binary is not that binary.** The prebuilt binaries the
-> installer ships do not include the plugin host (`zeroclaw plugin …` is an
-> unrecognized subcommand), and `plugins-wasm` is not in the crate's default
-> feature set. Build the host side from source with an execution backend;
-> every backend feature carries the `plugins-wasm` umbrella itself, so one
-> flag is enough:
+> **Check which binary you have.** The release archives for the 64-bit
+> desktop and server targets carry the plugin host and the compiler that
+> loads `.wasm` components, and every release executes a plugin from each of
+> them before it publishes. The 32-bit ARM archives and the experimental Android archive do
+> not (`zeroclaw plugin ...` is an unrecognized subcommand there), and
+> `plugins-wasm` is not in the crate's default feature set, so a source build
+> with Cargo defaults has no host either. For those, build the host side from
+> source with an execution backend; every backend feature carries the
+> `plugins-wasm` umbrella itself, so one flag is enough:
 >
 > ```bash
 > cargo build --release --features plugins-wasm-cranelift
 > ```
 >
 > The [protocol page](../developing/plugin-protocol.md#build-features)
-> documents the backend choices.
+> documents the backend choices and
+> [lists plugin support per artifact](../developing/plugin-protocol.md#plugin-support-per-release-artifact).
 
 ## How a tool call flows
 
@@ -467,6 +471,9 @@ Two operational constraints worth repeating from the
   host logs a `WARN` event with `error_key` `plugin_package_name_conflict` in
   its `attributes`. If the name your `name` export returns matches one, the
   tool is not registered, and the `error_key` is `plugin_tool_name_conflict`.
+  A `name` export that contains `__` is never registered either: MCP tools use
+  that separator (`<server>__<tool>`), and the `error_key` is
+  `plugin_tool_name_reserved`.
   The names checked are the tools that registry build has already registered,
   including plugin tools accepted before yours, plus `execute_pipeline` when
   `[pipeline] enabled = true`. That is not a fixed list of every built-in
@@ -485,7 +492,7 @@ Two operational constraints worth repeating from the
 | `zeroclaw plugin install` fails with `does not load against this host` | The component was built against a WIT that differs from this host's `wit/v0` (a stale `configure` signature, a capability flag the host does not share), or for the wrong target (a core module or `wasm32-wasip1`). The install-time load check is the same instantiation the daemon runs at startup, so nothing was installed. Rebuild against the shipped WIT and reinstall; `--no-verify` installs it anyway, and the daemon will then skip it at startup with the same diagnostic. |
 | Plugin missing from `zeroclaw plugin list` | Plugin system disabled; malformed manifest; `wasm_path` file missing; signature policy rejected it. The startup log carries the specific skip warning. |
 | Present in `zeroclaw plugin list` but the tool never loads | `plugins.auto_discover` is `false` (the default). Auto-discovered tool and skill capabilities load only when `plugins.auto_discover = true`; `plugins.enabled = true` alone activates only explicitly-declared channels. Run `zeroclaw config set plugins.auto_discover true`. |
-| Tool rejected during registration | Config validation or the metadata probe failed, or the package or tool name conflicts with an already registered tool. Check the log for the specific error: a name conflict carries `error_key` `plugin_package_name_conflict` or `plugin_tool_name_conflict`, and a probe failure usually means the component was built against mismatched WIT. |
+| Tool rejected during registration | Config validation or the metadata probe failed, the package or tool name conflicts with an already registered tool, or the tool name contains the MCP separator `__`. Check the log for the specific error: a name conflict carries `error_key` `plugin_package_name_conflict` or `plugin_tool_name_conflict`, a name containing `__` carries `plugin_tool_name_reserved`, and a probe failure usually means the component was built against mismatched WIT. |
 | Tool never selected by the model | The description/schema do not tell the model when the tool applies. A tool that is missing from the model's catalog entirely is a loading problem instead; start with the rows above. |
 | `__config` absent despite configured section | The effective scope denied `config_read`, the entry does not use the installation-printed full-instance key, the validated object is empty, or every validated property is marked secret. A `config_schema`/permission mismatch rejects the plugin instead. |
 | `secrets.get` returns `not-found` | The property is missing or is not a direct top-level string marked `x-secret = true` in the admitted schema. |

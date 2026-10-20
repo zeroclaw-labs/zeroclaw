@@ -366,6 +366,12 @@ impl ZerocodePane {
         self.conn_edit.is_some()
     }
 
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        self.capture.is_some()
+            || self.conn_edit.is_some()
+            || crate::keymap::ConfigTabAction::from_chord(key).is_some()
+    }
+
     // ── Draw ─────────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -1918,10 +1924,23 @@ fn rows_from<A: crate::keymap::RebindableActions>(out: &mut Vec<BindingRow>) {
     for v in A::all() {
         out.push(BindingRow {
             action_key: v.key(),
-            label: v.human_label().to_string(),
+            label: localized_action_label(&v.key(), v.human_label()),
             chords: v.resolved(),
         });
     }
+}
+
+/// Keybindings-page label for an action. Actions with a Fluent label use it;
+/// the rest keep their built-in English label.
+fn localized_action_label(action_key: &str, fallback: &str) -> String {
+    if let Some(n) = action_key
+        .strip_prefix("global.focus_session")
+        .filter(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+    {
+        return crate::i18n::t_args("zc-keybinding-focus-session", &[("n", n)]);
+    }
+    let label_key = format!("zc-keybinding-{}", action_key.replace(['.', '_'], "-"));
+    crate::i18n::try_t(&label_key).unwrap_or_else(|| fallback.to_string())
 }
 
 /// Resolve the compile-time default chords for a single `"tag.variant"`
@@ -1969,6 +1988,47 @@ mod tests {
     use crate::keymap::InputBarAction;
     use crossterm::event::{KeyCode, KeyEvent};
 
+    #[test]
+    fn provider_alias_rename_binding_label_uses_locale() {
+        const CHILD: &str = "ZEROCODE_RENAME_LABEL_TEST_CHILD";
+        // i18n is process-global; isolate this locale from other pane tests.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "zerocode_pane::tests::provider_alias_rename_binding_label_uses_locale",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let locale_dir = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&locale_dir).unwrap();
+        std::fs::write(
+            locale_dir.join("zerocode.ftl"),
+            "zc-keybinding-config-tab-rename-alias = Renommer le fournisseur\n",
+        )
+        .unwrap();
+        crate::i18n::init("fr", dir.path());
+        let pane = ZerocodePane::new(dir.path());
+        let row = pane
+            .rows
+            .iter()
+            .find(|row| row.action_key == "config_tab.rename_alias")
+            .unwrap();
+        assert_eq!(row.label, "Renommer le fournisseur");
+        assert!(!row.chords.is_empty());
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -1999,6 +2059,19 @@ mod tests {
     fn given_explicit_row(action_key: &str, chords: Vec<Chord>) {
         let (tag, variant) = action_key.split_once('.').expect("dotted action key");
         overrides::set_row(tag, variant, chords);
+    }
+
+    #[test]
+    fn session_shortcut_is_captured_by_the_binding_modal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let row = focus_binding(&mut pane, "input_bar.clear_input");
+        pane.capture = Some(Capture { row, error: None });
+
+        assert!(pane.claims_session_shortcut(&KeyEvent::new(
+            KeyCode::Char('1'),
+            Chord::with_primary(KeyCode::Char('1'), KeyModifiers::CONTROL).effective_modifiers(),
+        )));
     }
 
     /// The bot's round-2 finding, at both call sites. An operator already owning

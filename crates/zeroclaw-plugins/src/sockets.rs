@@ -519,9 +519,9 @@ fn map_egress_error(error: &EgressError) -> SocketFailure {
         EgressError::Network(_) => SocketFailure::AccessDenied,
         EgressError::DnsFailed { .. } => SocketFailure::ResolutionFailed,
         EgressError::ConnectionLimitReached { .. } => SocketFailure::ConnectionLimit,
-        EgressError::InvalidTlsMaterial { .. } | EgressError::TlsSecretUnavailable { .. } => {
-            SocketFailure::TlsConfigurationFailed
-        }
+        EgressError::InvalidTlsMaterial { .. }
+        | EgressError::TlsSecretUnavailable { .. }
+        | EgressError::TlsConfigMismatch => SocketFailure::TlsConfigurationFailed,
         EgressError::PolicyUnavailable(_)
         | EgressError::InvalidHostPattern(_)
         | EgressError::InvalidNat64Prefix(_)

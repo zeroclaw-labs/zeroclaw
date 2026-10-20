@@ -20,15 +20,17 @@ Composite job with multiple matrix legs:
 - **build**: unconditional matrix for `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`; a separate **windows-build** job checks `x86_64-pc-windows-msvc` when package ownership selects either of its commands
 - **check**: two warnings-fatal passes over the workspace (excluding `zeroclaw-desktop`): no default features; and default features with `--all-targets`, which is the only leg that compiles test targets on the default feature surface. The all-features surface is compiled and type-checked by **lint**, whose clippy pass runs `--features ci-all --all-targets` on the same workspace; a separate all-features `cargo check` leg would duplicate that compilation without adding coverage
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
+- **check-plugin-backends**: selected by `scripts/ci/plugin_backend_change_filter.sh`. Compiles `zeroclaw-plugins` under each execution backend and runs the component, runtime admission, and root CLI plugin tests under `plugins-wasm-cranelift`. A separate `plugin artifact smoke` leg builds the `zeroclaw` binary with the same feature and runs `scripts/ci/plugin_artifact_smoke.sh` against it, with packages from `scripts/ci/build_plugin_smoke_packages.sh`. The smoke takes any `zeroclaw` binary, uses a throwaway configuration directory and the scripted local provider in `scripts/ci/plugin_smoke_provider.py`, and drives the operator's own commands: `plugin install`, `config set`, and an agent turn that executes the tool. It checks that an installed plugin stays unused until the operator enables the plugin system, turns discovery on, and approves the tool; that values configured for a package that does not request them are not delivered; that a payload with the wrong digest, a payload that is not a component, and a component for another WIT world are refused; and that strict signature mode refuses an unsigned, untrusted, or edited package while it runs a trusted one. The leg's last step runs the smoke with the opposite expectation and requires the exit status reserved for a failed check. The agent turn also depends on crates the path filter does not select, such as `zeroclaw-providers`, `zeroclaw-tools`, `zeroclaw-memory`, and `zeroclaw-api`, so a break there first shows on merge-queue and `master` runs, where the job always runs
 - **bench**: benchmarks compile check; runs on `master` pushes, merge-queue runs, and manual dispatch only. PRs skip it (the gate treats the skip as non-fatal), so benchmark bitrot is still caught before a release without spending the compile on every PR
 - **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux, including the config-write isolation and Fluent coverage (no bare user-facing strings) architecture guards. A final informational step replays the gateway golden-frame scenarios (`crates/zeroclaw-gateway/tests/golden_frames.rs`: WebSocket chat, webhook JSON and SSE, `/api/events`, and ACP) against their recorded fixtures with `--run-ignored only`. It reuses the job's build, writes any drift to the step summary with a warning, and never fails the job; it stays informational until the gateway reaches the core over RPC
+- **test-tool-features**: the tests of the opt-in SaaS, coding-CLI and external adapters, which Cargo `default` no longer builds: `cargo nextest run` over the root, config, tools, runtime, channels and gateway library tests plus the root report-template integration tests, with `--features tools-compat`. `lint` compiles the same code under `ci-all` but runs no test
 - **memory-postgres-test**: `cargo nextest run --locked -p zeroclaw-memory --features memory-postgres`, followed by the crate's serial ignored acceptance tests against an ephemeral PostgreSQL 17 service
 - **parallel-runtime-test**: repeated same-process runtime/channel tests from `scripts/ci/parallel_runtime_test_gate.sh`, run in parallel with the main test job for relevant PR paths and unconditionally on `master` pushes and merge queue runs
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
 - **docs-style**: markdown lint, em-dash prose check, and changed-line link gate via `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`
 
-Linux jobs in the required gate run on Blacksmith except for the kernel-dependent Landlock check: the compile-heavy fleet on `blacksmith-8vcpu-ubuntu-2404`, and the housekeeping set (`fmt`, the change detectors, repository guards, docs and policy gates, the Nix checks, the container smoke, `security`, `web-permission-tests`, and the `gate` aggregator itself) on `blacksmith-4vcpu-ubuntu-2404`. The one deliberate exception is `test-landlock`, which stays on GitHub-hosted `ubuntu-latest` because the Landlock LSM check depends on the hosted kernel; macOS and Windows legs keep their platform runners. This split exists because GitHub's hosted-runner assignment stalled org-wide on 2026-09-14 while Blacksmith kept serving: with the housekeeping jobs moved, a hosted outage costs only the platform-specific checks instead of the whole required gate. All jobs name their runner labels and cache-provider inputs directly; `tests/architecture/ci_runner_labels.rs` keeps three inventories honest (compile fleet, housekeeping fleet, and the hosted-Linux allowlist), so a job cannot drift to another runner class, or onto `ubuntu-latest`, without editing the reviewed inventory in the same commit. Work jobs do not wait on `fmt`; the deliberate trade-off is extra runner work on PRs that fail formatting. `CI Required Gate` still needs `fmt` directly and aggregates required results, so formatting errors still block merge. The separately label-gated advisory Windows workflow remains outside that gate. Its Linux selector also runs on the Blacksmith 4vcpu class. Branch protection pins the composite gate job. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
+Linux jobs in the required gate run on Blacksmith except for the kernel-dependent Landlock check: the compile-heavy fleet on `blacksmith-8vcpu-ubuntu-2404`, and the housekeeping set (`fmt`, the change detectors, repository guards, docs and policy gates, the Nix checks, the container smoke, `security`, `web-permission-tests`, and the `gate` aggregator itself) on `blacksmith-4vcpu-ubuntu-2404`. The one deliberate Linux exception is `test-landlock`, which stays on GitHub-hosted `ubuntu-latest` because the Landlock LSM check depends on the hosted kernel. Windows task-owner recovery uses `blacksmith-8vcpu-windows-2025`; macOS and the other Windows jobs keep their GitHub-hosted platform runners. This split exists because GitHub's hosted-runner assignment stalled org-wide on 2026-09-14 while Blacksmith kept serving: with the housekeeping jobs moved, a hosted outage costs only the platform-specific checks instead of the whole required gate. All jobs name their runner labels and cache-provider inputs directly; `tests/architecture/ci_runner_labels.rs` checks the Linux inventories (compile fleet, housekeeping fleet, and the hosted-Linux allowlist) plus the recovery-only Windows runner and cache-writer contract. Work jobs do not wait on `fmt`; the deliberate trade-off is extra runner work on PRs that fail formatting. `CI Required Gate` still needs `fmt` directly and aggregates required results, so formatting errors still block merge. The separately label-gated advisory Windows workflow remains outside that gate. Its Linux selector also runs on the Blacksmith 4vcpu class. Branch protection pins the composite gate job. The `master` push run keeps the same quality signal while seeding trusted Rust caches for later PR runs.
 
 Pull requests and merge-queue entries that change `[workspace.package] version` to a stable `X.Y.Z` also run `crates-preflight`, which calls `pub-crates.yml` with `stage: preflight`, no secret, and the compile fleet's runner label. `crates-preflight-changes` decides this with `scripts/ci/crates_preflight_trigger.sh`; every other change skips both, and a skipped job does not fail the gate. Because the job is a reusable-workflow call with no `runs-on`, `tests/architecture/ci_runner_labels.rs` inventories it separately and requires it to pass the fleet label.
 
@@ -52,7 +54,9 @@ Required Windows compilation stays automatic without a label, but it checks only
 
 The service smoke builds `windows_service_smoke_fixture`, which owns its synthetic daemon and argument dispatch. Root CLI changes in `src/main.rs` do not automatically select it. Service source, runtime module wiring, the fixture and smoke script, config/spawn dependencies, and relevant manifest/build controls retain coverage. The task-owner recovery job retains direct control-plane and runtime module-wiring triggers. Package manifests and build scripts select these native jobs when their reverse dependency closure reaches runtime; unrelated gateway or standalone-app manifests do not. The recovery shell entrypoint delegates to the same package selector rather than maintaining a second ownership registry.
 
-The recovery tests run in parallel with compilation because their runtime unit-test harness cannot reuse `cargo check` output. Both jobs preserve the Windows build leg's master-seeded cache identity, and recovery never writes a cache of its own. An unselected job skips before allocating a Windows runner. `CI Required Gate` directly consumes the detector and each required Windows job, rejects missing selection outputs, and requires every selected job to succeed. A selected-but-skipped, failed or cancelled job cannot count as an intentional skip.
+The recovery tests run in their own `windows-task-owner-recovery` job on `blacksmith-8vcpu-windows-2025`, in parallel with compilation because their runtime unit-test harness cannot reuse `cargo check` output. An unselected job skips before allocating a Windows runner. `CI Required Gate` directly consumes the detector and each required Windows job, rejects missing selection outputs, and requires every selected job to succeed. A selected-but-skipped, failed or cancelled job cannot count as an intentional skip.
+
+Recovery calls the pinned `Swatinem/rust-cache` action directly with `shared-key: windows-recovery-blacksmith`, rather than assuming the GitHub build runner's cache has a compatible Rust environment hash. Only successful `push` runs on `refs/heads/master` save this dedicated dependency cache; PR and merge-queue runs only restore it. A miss builds normally and does not skip either test. Default workspace-artifact cleanup remains enabled, so the runtime harness still compiles. This adds a cache namespace that consumes repository storage; compilation and service smoke keep their existing runners and caches.
 
 ### Label-gated Advisory Windows Tests (`windows-tests.yml`)
 
@@ -70,7 +74,7 @@ The Linux selector checks formatting, compares the PR base SHA with the checked-
 
 `skip` means no changed path affects Rust compilation or tests covered by the current workspace suite. `scoped` maps Rust source, test, benchmark, example, and package-local manifest paths to package roots from Cargo metadata, closes that set over workspace reverse dependents, maps root `src/` and `tests/` to the root package, deduplicates package names, and excludes `zeroclaw-desktop` like the existing workspace suite. `full` is selected for workspace manifests or dependency resolution, `.cargo`, the Rust toolchain, CI or test infrastructure, the selector or workflow, unknown paths, ambiguous metadata, and other changes that cannot be mapped safely. Every `Cargo.lock` change selects `full` because workspace-wide dependency resolution can affect packages beyond the directly changed manifests. Direct changes to the root, gateway, or provider packages, plus changes to plugin, runtime, plugin config, WIT, root plugin activation, plugin backend filter, dependency, selector, selector-contract, `ci.yml`, or `windows-tests.yml` paths, set `needs_plugin_host=true`. The controlling-file cases make workflow revisions exercise the plugin-host path they own. Malformed or unavailable changed-path input selects baseline `full` and true. Missing or malformed Cargo metadata also selects baseline `full` with `needs_plugin_host=true` because the dependency closure cannot be established safely.
 
-For `scoped`, the Windows job passes explicit `-p` arguments to `cargo nextest`; for `full`, it runs `cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop`. When `needs_plugin_host=true`, it installs `wasm32-wasip2` and appends the feature-enabled `zeroclaw-plugins` component targets (`channel_plugin_e2e`, `tool_plugin_timeout_e2e`, `reference_plugin`, `reference_plugin_e2e`, and `tool_plugin_e2e`), plugin library tests, runtime live-config and admission regressions, gateway library tests, the root CLI plugin tests (the plugin registry client, the `plugins::` modules including the egress ceremony's Windows shell proofs, and the CLI egress ceremony tests), and the root `plugin_channel_runtime_e2e` and `channel_egress_e2e` targets. Every appended invocation runs even when an earlier one fails, and the summary preserves each phase status plus the failure inventory. The job reports separate baseline, plugin-host, and total durations. Ordinary `scoped` and `full` selections do not pay the plugin-host compilation cost. This PR workflow restores compatible `platform-test` cache entries but never saves them. It checks out the frozen PR merge SHA and does not persist checkout credentials. A skipped Windows job is intentional and visible beside the selector result.
+For `scoped`, the Windows job passes explicit `-p` arguments to `cargo nextest`; for `full`, it runs `cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop`. When `needs_plugin_host=true`, it installs `wasm32-wasip2` and appends the feature-enabled `zeroclaw-plugins` component targets (`channel_plugin_e2e`, `tool_plugin_timeout_e2e`, `reference_plugin`, `reference_plugin_e2e`, and `tool_plugin_e2e`), plugin library tests, runtime live-config and admission regressions, gateway library tests, the root CLI plugin tests (the plugin registry client, the `plugins::` modules including the egress ceremony's Windows shell proofs, the CLI egress ceremony tests, and the `plugin update` tests in the root binary), the `plugin_update_cli` and `plugin_info_cli` component tests, which run the real binary, and the root `plugin_channel_runtime_e2e` and `channel_egress_e2e` targets. Every appended invocation runs even when an earlier one fails, and the summary preserves each phase status plus the failure inventory. The job reports separate baseline, plugin-host, and total durations. Ordinary `scoped` and `full` selections do not pay the plugin-host compilation cost. This PR workflow restores compatible `platform-test` cache entries but never saves them. It checks out the frozen PR merge SHA and does not persist checkout credentials. A skipped Windows job is intentional and visible beside the selector result.
 
 ### Scheduled Platform Tests (`platform-tests.yml`)
 
@@ -199,6 +203,61 @@ Every dispatch also runs a small release-tool smoke matrix independently of the 
 
 MUSL build legs also install `cross` through `scripts/ci/install_release_tool.sh`, which downloads the exact pinned upstream release asset and verifies its SHA-256 before installing it. The required Repository Structure job tests the supported runner-to-asset mapping and the smoke workflow contract without making network calls.
 
+The default `qualification_profile: normal` retains the full matrix, the
+`dist-broad` raw-binary smoke route, the standard `dist` archive route, the
+normal cache policies, and the existing ARM64 memory lifecycle and macOS
+180-minute ceiling. Its five jobs keep `CARGO_INCREMENTAL=0` at job scope.
+The release-tool smoke validates the dispatch inputs before installing tools;
+normal product jobs retain their independent scheduling.
+
+Select `qualification_profile: stable-gnu-ubuntu22` with `distribution: dist`
+and `release_tools_only: false` for a finite, nonpublishing qualification.
+Empty, unknown, malformed, broad-distribution, or tools-only combinations are
+refused. Four GNU build rows run on Ubuntu22: x86_64, aarch64, armv7, and arm.
+They call the same local `build-release-payloads` action as Stable, with its
+existing linker and ARMv6 bindings, Rust1.98, locked release profile, explicit
+canonical features, ordinary Cargo jobs, three payloads per row, 90-minute
+ceiling, and inclusive 83,886,080-byte main-binary cap. Only the qualifier
+enables the action's features output; its manifest consumes that single
+resolution. Stable leaves the evidence switch off.
+
+Separate web and fixture producers use the existing entrypoints and Stable
+toolchain setup. These three build roles call the pinned Swatinem action
+directly with the original `web`, `plugin-smoke-packages`, and `build` shared
+keys. The fixture prefix and each Ubuntu22 target prefix match Stable, and
+default target restoration remains enabled. Every qualifier cache uses
+`save-if: false`, even on master. These roles omit the workflow/job
+`CARGO_INCREMENTAL` declaration, matching Stable. The pinned cache action
+exports `CARGO_INCREMENTAL=0` before constructing its cache configuration
+and leaves that value in subsequent steps. Producer receipts require and
+record the effective string `"0"`; completeness checks the same value.
+The action-exported value is retained. The normal web cache policy is unchanged.
+Action logs must supply the actual primary key, restore keys, hit, and cache
+source before cache parity can be accepted. These inputs guarantee neither a
+warm cache nor a later Stable build duration.
+
+The two native consumers run x86 GNU on Ubuntu22 and ARM64 GNU on Ubuntu24-arm,
+with 30-minute ceilings. Each verifies and extracts its same-run archive,
+runs the full verbose scripted-provider suite within five minutes, and
+unconditionally invokes the archive-aware plugin smoke. There is no raw
+fallback. The selected completeness job runs even after an upstream failure
+and rejects every missing, skipped, failed, or cancelled role. It checks four
+archives with the unchanged verifier, twelve input hashes and their saved
+ELF, compiler/sysroot and resource observations, and two native evidence
+carriers. Source commit, tree, run, attempt, profile, web and fixture hashes
+bind the receipts to one dispatch.
+
+Before accepting this route, retain the actual cache receipts, interpret all
+twelve ABI observations, and inspect each native carrier's named thirteen
+provider tests and eighteen archive controls. A successful job or carrier
+inventory alone does not replace those results or maintainer review. Missing
+or uninterpretable evidence holds acceptance; it does not authorize an
+automatic budget, resource, feature, or ABI-policy change. Ubuntu24 ARM64
+execution is not Ubuntu22 ARM64 runtime proof. ARM32, companion execution,
+Darwin, MUSL, Android, Windows, Stable's full matrix, and release
+readiness require their own evidence. A source change alone proves none of
+these runtime results.
+
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
 Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows x86_64 targets. It mirrors the required PR lint command with `--target` set for each platform, but intentionally does not run on PRs and is not part of `CI Required Gate`.
@@ -213,6 +272,22 @@ Downloadable assets use GitHub-hosted Build Level 2 attestations. Offline
 bundles and trusted-root material ship inside one verification archive, and
 both SBOM formats are checksummed and attested before the release is created.
 Cosign remains limited to GHCR image signing.
+
+Every 64-bit archive except the experimental Android one carries the WASM
+plugin host, and a dispatched release proves it before the GitHub Release and
+its own image pushes: `plugin-smoke-packages` builds the fixture plugin
+packages once on Linux, and `plugin-smoke` downloads each archive on a runner
+of its own platform and runs `scripts/ci/plugin_artifact_smoke.sh` against the
+packaged binary (the same script the `check-plugin-backends` smoke leg runs on
+pull requests). `publish` and `docker` wait for every leg. An xtask test keeps
+the leg list equal to the registry's per-target plugin policy, so a target
+cannot carry the host without a leg or lose its leg while it still carries the
+host. The build legs fail any binary over the 80 MiB cap set on the size
+check step. The manual Cross-Platform Build workflow rehearses the same legs
+against the binaries it builds, so a distribution change is measured and proven
+from one dispatch before a release runs. A release started by a tag push also
+triggers Docker Publish on its own `v*` tag trigger, and that run does not wait
+for the smoke.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
 
@@ -324,11 +399,11 @@ transfers, coordinate the package rename or merge in one reviewed change.
 
 ## Build cache behavior
 
-Most Rust-heavy jobs in `ci.yml` cache through the local `./.github/actions/rust-cache` composite, which receives `use-blacksmith: 'true'` from every Blacksmith job, matching the runner label those jobs name directly. Both values are checked-in constants in `ci.yml`, not an Actions variable. `vars` is unreadable in fork-origin `pull_request` runs, so the former `CI_USE_BLACKSMITH` toggle silently sent every fork PR (90% of this repo's PRs) to GitHub-hosted runners with a cold cache, because master had stopped seeding the GitHub Actions cache when it moved to Blacksmith. With the constants, fork PRs use `useblacksmith/rust-cache` (Blacksmith NVMe sticky disk) on Blacksmith runners like every other run of `ci.yml`; changing the label and the provider inputs on the compile jobs, which `tests/architecture/ci_runner_labels.rs` keeps in lockstep, moves the fleet back to `ubuntu-latest` + `Swatinem/rust-cache` in one reviewed commit. Both action references live in the composite regardless of the selection, so both must stay in the allowlist. The macOS and Windows build legs stay on `Swatinem/rust-cache` against the GitHub Actions cache, and the `fmt`, `nix-eval`, and `docs-style` jobs (none of which compile the workspace) use no Rust cache. `codeql.yml` pins the same Blacksmith label for its Rust scan, so no workflow reads the `CI_USE_BLACKSMITH` variable any more; it can be deleted from the repository settings. These behaviors are worth knowing when triaging cache-related flakes:
+Most Rust-heavy jobs in `ci.yml` cache through the local `./.github/actions/rust-cache` composite, which receives `use-blacksmith: 'true'` from its Blacksmith compile callers, matching the runner label those jobs name directly. Both values are checked-in constants in `ci.yml`, not an Actions variable. `vars` is unreadable in fork-origin `pull_request` runs, so the former `CI_USE_BLACKSMITH` toggle silently sent every fork PR (90% of this repo's PRs) to GitHub-hosted runners with a cold cache, because master had stopped seeding the GitHub Actions cache when it moved to Blacksmith. With the constants, those fork PR jobs use `useblacksmith/rust-cache` (Blacksmith NVMe sticky disk) on Blacksmith runners like the corresponding master jobs; changing the label and the provider inputs on the Linux compile jobs, which `tests/architecture/ci_runner_labels.rs` keeps in lockstep, moves that fleet back to `ubuntu-latest` + `Swatinem/rust-cache` in one reviewed commit. Both action references live in the composite regardless of the selection, so both must stay in the allowlist. Windows task-owner recovery is the direct-`Swatinem/rust-cache` exception on Blacksmith, with its own master-seeded dependency cache. The macOS and Windows build legs stay on `Swatinem/rust-cache` against the GitHub Actions cache, and the `fmt`, `nix-eval`, and `docs-style` jobs (none of which compile the workspace) use no Rust cache. `codeql.yml` pins the same Blacksmith label for its Rust scan, so no workflow reads the `CI_USE_BLACKSMITH` variable any more; it can be deleted from the repository settings. These behaviors are worth knowing when triaging cache-related flakes:
 
 - **Matrix legs need distinct cache keys.** A cache key is derived from the job id (or `shared-key`), the runner OS and architecture, the toolchain, `CARGO*`/`RUST*` environment variables, and the lockfile. Matrix legs that differ only in feature flags or cargo arguments therefore resolve to the same key; the leg that saves first owns it and every other leg restores a mismatched dependency set. Before per-leg keys, the cranelift plugin-backend leg recompiled about 620 dependency crates (roughly four minutes) on every run, master included, because it shared a key with the pulley and runtime-only legs. `check` and `check-plugin-backends` therefore give every leg a comma-free `cache-key` matrix field passed as `shared-key`; legs whose dependency sets genuinely match may share one. A new Rust matrix job should do the same.
 - **Cache writes are master-only.** `save-if` is conditioned on `github.ref == 'refs/heads/master'`, so PR runs read the master-seeded cache but never update it. PR branches can't pollute the shared cache with branch-specific artifacts. The `push` trigger on `master` is what gives the workflow a trusted cache-writing run after merges.
-- **Cache saves on failure.** `cache-on-failure: true` is set on every job, so a partial run still seeds the next attempt warm.
+- **Recovery saves only on success.** Its `cache-on-failure: 'false'` keeps failed recovery runs from seeding its cache. Other composite-cache compile jobs retain `cache-on-failure: true`, so a partial master run can still seed their next attempt warm.
 - **Windows build cache is enabled.** The Windows build leg runs the same pinned Rust cache action as Linux and macOS. If Windows cache behavior flakes or regresses, revert the workflow change and document the failing restore/save evidence in the cache issue.
 - **Incremental compilation is disabled.** `CARGO_INCREMENTAL: 0` at the workflow level. Incremental builds inflate cache size and produce non-reproducible artifacts under partial-stale conditions.
 - **`cargo-deny` and `cargo-nextest` are installed fresh each run.** The `security` job runs `cargo install cargo-deny --locked`; the Linux `test` job and both scheduled `platform-tests.yml` legs pull the appropriate `cargo-nextest` binary from `get.nexte.st`. The advisory PR Windows job instead downloads its pinned nextest release archive and verifies a hardcoded SHA-256 before extraction because it runs on a much larger set of untrusted PRs. Neither tool is cached, so each install adds a fixed cost to its job. Switching either to `taiki-e/install-action` would let them be cached, but that action is not in the allowlist today.
@@ -360,7 +435,7 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `actions/attest` (`v4.2.2`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain` (`stable`, `v1`) | `ci.yml`, `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `docs-deploy.yml`, `codeql.yml` | Install Rust toolchain |
-| `Swatinem/rust-cache` (`v2.9.2`) | `ci.yml` (GitHub-hosted path of `./.github/actions/rust-cache`), `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching on GitHub-hosted runners |
+| `Swatinem/rust-cache` (`v2.9.2`) | `ci.yml` (GitHub-hosted composite path and direct Blacksmith Windows recovery), `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docs-deploy.yml` | Cargo build/dependency caching on GitHub-hosted runners and Blacksmith Windows recovery |
 | `useblacksmith/rust-cache` (`v3.0.1`) | `ci.yml` (Blacksmith path of `./.github/actions/rust-cache`) | Cargo build/dependency caching on Blacksmith sticky disk; selected by the `use-blacksmith: 'true'` input each Blacksmith compile job passes to the composite (a checked-in constant) |
 | `docker/setup-buildx-action` (`v3.11.1`, `v4.0.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Docker Buildx setup |
 | `docker/login-action` (`v3.4.0`, `v4.1.0`) | `release-stable-manual.yml`, `docker-publish.yml`, `trivy-scheduled.yml` | GHCR authentication |

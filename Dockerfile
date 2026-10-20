@@ -53,7 +53,7 @@ FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_RUST_SLIM} AS builder
 WORKDIR /app
 ARG TARGETARCH
 # >>> generated:docker-features-arg by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
+ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,plugins-wasm-cranelift,schema-export,tool-claude-code,tool-claude-code-runner,tool-codex-cli,tool-composio,tool-gemini-cli,tool-google-workspace,tool-jira,tool-linkedin,tool-microsoft365,tool-notion,tool-opencode-cli,tool-project-intel,tools-external,whatsapp-web"
 # >>> end generated:docker-features-arg <<<
 
 # No `.git` in the build context (`.dockerignore`); the commit is passed in here.
@@ -81,6 +81,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
+# Root path patches need their genuine source during dependency prefetch.
+COPY vendor/ vendor/
 # The optional WASM plugin host generates bindings from the repository-owned
 # WIT contract during compilation. Keep this before the dependency prefetch so
 # plugin-enabled builds have the same ABI input in both builder invocations.
@@ -139,6 +141,8 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay
     && echo "fn main() {}" > xtask/src/bin/web.rs \
     && mkdir -p crates/zeroclaw-hardware/examples \
     && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
+    && mkdir -p crates/zeroclaw-plugins/examples \
+    && echo "fn main() {}" > crates/zeroclaw-plugins/examples/sign_manifest.rs \
     && for d in crates/*/; do [ "$d" = "crates/zeroclaw-macros/" ] && continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
     && for d in crates/*/tests/fixtures/*/; do [ -f "${d}Cargo.toml" ] || continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
     && printf 'fn main() {}' > crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/src/main.rs

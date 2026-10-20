@@ -156,6 +156,7 @@ jobs:
           plugin_runtime_admission_log="$RUNNER_TEMP/windows-plugin-runtime-admission-nextest.log"
           plugin_gateway_log="$RUNNER_TEMP/windows-plugin-gateway-nextest.log"
           plugin_cli_log="$RUNNER_TEMP/windows-plugin-cli-nextest.log"
+          plugin_update_cli_log="$RUNNER_TEMP/windows-plugin-update-cli-nextest.log"
           plugin_root_log="$RUNNER_TEMP/windows-plugin-root-nextest.log"
           hardware_log="$RUNNER_TEMP/windows-hardware-nextest.log"
           case "$MODE" in
@@ -204,6 +205,7 @@ jobs:
           plugin_runtime_admission_status=not-run
           plugin_gateway_status=not-run
           plugin_cli_status=not-run
+          plugin_update_cli_status=not-run
           plugin_root_status=not-run
           if [[ "$NEEDS_PLUGIN_HOST" == "true" ]]; then
             plugin_started_at=$SECONDS
@@ -247,8 +249,26 @@ jobs:
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
               --bin zeroclaw \
-              plugin_registry:: plugins:: egress 2>&1 | tee "$plugin_cli_log"
+              plugin_registry:: plugins:: egress \
+              tests::a_batch_leaves_a_package_displaced \
+              tests::a_legacy_row_refusal \
+              tests::a_package_that_goes_away \
+              tests::a_package_the_registry_does_not_list \
+              tests::a_refused_update \
+              tests::a_restored_copy_the_policy_rejects \
+              tests::an_interrupted_update \
+              tests::an_update_ \
+              tests::config_rejections_name_the_instance \
+              tests::installing_an_installed_package_points_at_plugin_update \
+              tests::rendered_update_tokens \
+              tests::the_displaced_note \
+              tests::update_ 2>&1 | tee "$plugin_cli_log"
             plugin_cli_status=${PIPESTATUS[0]}
+            cargo nextest run --locked --no-fail-fast \
+              --features plugins-wasm-cranelift \
+              --test component \
+              plugin_update_cli plugin_info_cli 2>&1 | tee "$plugin_update_cli_log"
+            plugin_update_cli_status=${PIPESTATUS[0]}
             cargo nextest run --locked --no-fail-fast \
               --features plugins-wasm-cranelift \
               --test plugin_channel_runtime_e2e \
@@ -256,7 +276,7 @@ jobs:
             plugin_root_status=${PIPESTATUS[0]}
             set -e
             plugin_host_duration=$((SECONDS - plugin_started_at))
-            if (( plugin_components_status != 0 || plugin_lib_status != 0 || plugin_runtime_config_status != 0 || plugin_runtime_admission_status != 0 || plugin_gateway_status != 0 || plugin_cli_status != 0 || plugin_root_status != 0 )); then
+            if (( plugin_components_status != 0 || plugin_lib_status != 0 || plugin_runtime_config_status != 0 || plugin_runtime_admission_status != 0 || plugin_gateway_status != 0 || plugin_cli_status != 0 || plugin_update_cli_status != 0 || plugin_root_status != 0 )); then
               plugin_host_status=1
             fi
           fi
@@ -293,6 +313,9 @@ jobs:
           if [[ "$plugin_cli_status" != "not-run" && "$plugin_cli_status" != "0" ]]; then
             failure_inventory="${failure_inventory:+$failure_inventory,}plugin-cli"
           fi
+          if [[ "$plugin_update_cli_status" != "not-run" && "$plugin_update_cli_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-update-cli"
+          fi
           if [[ "$plugin_root_status" != "not-run" && "$plugin_root_status" != "0" ]]; then
             failure_inventory="${failure_inventory:+$failure_inventory,}plugin-root"
           fi
@@ -317,6 +340,7 @@ jobs:
             printf "| Plugin-host runtime admission status | %s |\n" "$plugin_runtime_admission_status"
             printf "| Plugin-host gateway status | %s |\n" "$plugin_gateway_status"
             printf "| Plugin-host CLI status | %s |\n" "$plugin_cli_status"
+            printf "| Plugin-host update CLI status | %s |\n" "$plugin_update_cli_status"
             printf "| Plugin-host root status | %s |\n" "$plugin_root_status"
             printf "| Failure inventory | %s |\n" "$failure_inventory"
             printf "| Baseline duration | %ss |\n" "$baseline_duration"

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::{
     Arc,
@@ -51,7 +51,10 @@ use context_menu::{
     ChatContextMenu, ChatContextMenuAction, ChatContextMenuRequest, ChatContextMenuTarget,
 };
 
+mod message_queue;
 mod transcript_layout;
+use message_queue::{AdmissionError, MessageQueue, QueuePauseReason};
+pub(crate) use message_queue::{QueueItemStatus, QueuedMessage};
 use transcript_layout::{EntryLayoutInput, LinesDirty, TranscriptLayoutCache};
 
 // Height of the approval popup anchored to the bottom of the content area.
@@ -410,6 +413,19 @@ pub(crate) enum SidebarStatus {
     Errored,
 }
 
+/// Read-only projection of the session currently focused by one Code or Chat pane.
+///
+/// This stays client-local because model/provider overrides and the message queue
+/// belong to the live pane session, not to the daemon's configured agent view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FocusedRuntimeContext<'a> {
+    pub agent_alias: &'a str,
+    pub model_provider_ref: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub queued_messages: usize,
+    pub queue_paused: bool,
+}
+
 /// One sidebar row: a session this pane tracks, in stable creation order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SidebarSessionSummary {
@@ -435,13 +451,11 @@ pub(crate) struct ResumeEntry {
     queue: ReconnectQueueState,
     interrupted: bool,
     recovery_required: bool,
-}
-
-/// The queue owns both its pause and the explanation shown to the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueuePauseReason {
-    Generic,
-    MissingCompletion,
+    /// The last turn ended `Failed` (`SessionError::TurnFailed`). The rebuilt
+    /// pane reloads the transcript but not the client-side status, so the
+    /// red sidebar dot is carried here. `SessionLost` is not carried: the
+    /// rebuild re-attaches the session, which is what clears it.
+    turn_failed: bool,
 }
 
 /// Client-owned queue and composer state that cannot be reconstructed from the
@@ -450,10 +464,7 @@ enum QueuePauseReason {
 /// daemon.
 #[derive(Debug, Clone, Default)]
 struct ReconnectQueueState {
-    messages: VecDeque<QueuedMessage>,
-    next_id: u64,
-    paused: Option<QueuePauseReason>,
-    selected: Option<u64>,
+    message_queue: MessageQueue,
     composer_text: String,
     composer_attachments: Vec<PendingAttachment>,
 }
@@ -839,6 +850,9 @@ struct PromptCompletion {
     session_id: String,
     turn_generation: u64,
     error: Option<String>,
+    /// JSON-RPC code of `error`, so a refusal the daemon issued before the
+    /// turn started (`SESSION_BUSY`) can be told apart from a turn failure.
+    error_code: Option<i32>,
     transport_closed: bool,
     cancelled: bool,
 }
@@ -973,6 +987,7 @@ impl Chat {
                     || self
                         .session_resync_in_flight
                         .contains_key(&state.session_id),
+                turn_failed: state.last_error == Some(SessionError::TurnFailed),
             });
         }
 
@@ -1334,7 +1349,7 @@ impl Chat {
             .chain(self.resume_backgrounds.iter_mut())
             .filter(|entry| entry.session_id == session_id)
         {
-            for message in entry.queue.messages.drain(..) {
+            for message in entry.queue.message_queue.clear() {
                 cleanup_report.merge(cleanup_attachment_temps(&message.attachments));
             }
         }
@@ -1735,6 +1750,7 @@ impl Chat {
             queue: ReconnectQueueState::default(),
             interrupted: false,
             recovery_required: false,
+            turn_failed: false,
         });
         self.pick_or_start_session(&agent_alias).await;
     }
@@ -2334,6 +2350,7 @@ impl Chat {
                         entry.queue,
                         entry.interrupted,
                         entry.recovery_required,
+                        entry.turn_failed,
                     );
                 }
                 if !self.session_order.contains(&state.session_id) {
@@ -2540,6 +2557,7 @@ impl Chat {
             entry.queue.clone(),
             entry.interrupted,
             entry.recovery_required,
+            entry.turn_failed,
         );
         Ok(state)
     }
@@ -2795,16 +2813,31 @@ impl Chat {
                 // this turn; retain the interrupted state for reconnect.
                 continue;
             }
-            if completion.error.is_some() {
-                state.remove_optimistic_user_message(completion.turn_generation);
-            }
+            let refused_text = if completion.error.is_some() {
+                state.remove_optimistic_user_message(completion.turn_generation)
+            } else {
+                None
+            };
+            // A busy refusal never started the turn: return the message to
+            // the queue before settling, so settling neither cleans up its
+            // attachments nor loses its text. The text comes from the
+            // optimistic row just removed, the one place it is held.
+            let requeued = match refused_text {
+                Some(text)
+                    if completion.error_code == Some(crate::jsonrpc::error_codes::SESSION_BUSY) =>
+                {
+                    state.requeue_refused_dispatch(text);
+                    true
+                }
+                _ => false,
+            };
             // Keep a known pause or cancellation reason. Other successful
             // responses still cannot prove clean completion without a terminal
             // notification, so queued work stays paused conservatively.
             let pause_reason = if completion.error.is_some()
                 || completion.cancelled
                 || state.cancel_started_at.is_some()
-                || state.queue_paused == Some(QueuePauseReason::Generic)
+                || state.message_queue.pause_reason() == Some(QueuePauseReason::Generic)
             {
                 QueuePauseReason::Generic
             } else {
@@ -2813,10 +2846,12 @@ impl Chat {
             state.settle_turn_from_prompt_response(pause_reason);
             let prompt_error = completion.error.clone();
             if let Some(error) = completion.error {
-                state.set_info_notice(crate::i18n::t_args(
-                    "zc-queue-dispatch-failed",
-                    &[("error", &error)],
-                ));
+                let key = if requeued {
+                    "zc-queue-dispatch-requeued"
+                } else {
+                    "zc-queue-dispatch-failed"
+                };
+                state.set_info_notice(crate::i18n::t_args(key, &[("error", &error)]));
             }
             // The response is the one terminal signal guaranteed on this
             // connection: the daemon answers every `session/prompt` it ran,
@@ -3640,6 +3675,7 @@ impl Chat {
                     client.connection_state(),
                     crate::client::ConnectionState::Disconnected { .. }
                 );
+            let error_code = result.as_ref().err().map(|e| e.code);
             let cancelled = result
                 .as_ref()
                 .is_ok_and(|value| value["stop_reason"].as_str() == Some("cancelled"));
@@ -3649,6 +3685,7 @@ impl Chat {
                     session_id: sid,
                     turn_generation,
                     error,
+                    error_code,
                     transport_closed,
                     cancelled,
                 })
@@ -3763,6 +3800,19 @@ impl Chat {
         self.drain_model_fetch_results();
         self.drain_session_reattach_results();
         self.maybe_refresh_git_branch();
+    }
+
+    /// Whether live transport state is waiting for `tick_transport_events`.
+    ///
+    /// The app's input wait polls this between short slices so streamed
+    /// session updates render promptly instead of waiting out the idle tick,
+    /// and so the bounded notification broadcast is drained often enough not
+    /// to lag (a lag forces a durable transcript reload of every session).
+    pub(crate) fn has_pending_transport_events(&self) -> bool {
+        !self.notif_rx.is_empty()
+            || !self.prompt_completion_rx.is_empty()
+            || !self.session_resync_rx.is_empty()
+            || !self.session_reattach_rx.is_empty()
     }
 
     #[cfg(test)]
@@ -5425,45 +5475,19 @@ impl Chat {
                     if let Some(track) = state.scrollbar_track_rect
                         && mouse::in_rect(col, row, track)
                     {
-                        state.scrollbar_drag = Some(ScrollbarDrag {
-                            start_scroll: state.scroll_offset,
-                            start_row: row,
-                        });
-                        let max = state
-                            .last_total_rows
-                            .saturating_sub(state.last_inner_height);
-                        if track.height > 0 {
-                            let rel = row.saturating_sub(track.y) as u32;
-                            let new_off = (rel * max as u32 / track.height.max(1) as u32) as u16;
-                            state.scroll_offset = new_off.min(max);
-                            state.pinned_to_bottom = state.scroll_offset >= max;
-                            state.sync_transcript_selection_viewport();
-                        }
+                        state.scrollbar_drag = true;
+                        state.seek_scrollbar(row);
                         return;
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
-                    if let Some(drag) = state.scrollbar_drag {
-                        let max = state
-                            .last_total_rows
-                            .saturating_sub(state.last_inner_height);
-                        let track_h = state
-                            .scrollbar_track_rect
-                            .map(|r| r.height)
-                            .unwrap_or(0)
-                            .max(1);
-                        let dy = row as i32 - drag.start_row as i32;
-                        let scroll_delta = dy * max as i32 / track_h as i32;
-                        let new_off =
-                            (drag.start_scroll as i32 + scroll_delta).clamp(0, max as i32);
-                        state.scroll_offset = new_off as u16;
-                        state.pinned_to_bottom = state.scroll_offset >= max;
-                        state.sync_transcript_selection_viewport();
+                    if state.scrollbar_drag {
+                        state.seek_scrollbar(row);
                         return;
                     }
                 }
-                MouseEventKind::Up(MouseButton::Left) if state.scrollbar_drag.is_some() => {
-                    state.scrollbar_drag = None;
+                MouseEventKind::Up(MouseButton::Left) if state.scrollbar_drag => {
+                    state.scrollbar_drag = false;
                     return;
                 }
                 _ => {}
@@ -5700,15 +5724,17 @@ impl Chat {
         }
     }
 
-    /// Returns `(input_tokens, trim_budget, model_window)` for the context bar.
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+    /// Returns `(input_tokens, input_tokens_source, trim_budget, model_window)`
+    /// for the context bar.
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<String>, Option<u64>, Option<u64>) {
         match &self.phase {
             ChatPhase::Active(s) => (
                 s.context_input_tokens,
+                s.context_input_tokens_source.clone(),
                 s.context_max_tokens,
                 s.context_model_window,
             ),
-            _ => (None, None, None),
+            _ => (None, None, None, None),
         }
     }
 
@@ -5722,6 +5748,24 @@ impl Chat {
             | ChatPhase::PickChangeDirectory { agent_alias, .. } => Some(agent_alias.as_str()),
             _ => None,
         }
+    }
+
+    /// Runtime context for the pane's focused live session.
+    ///
+    /// Agent-picker and directory-picker phases intentionally return `None`:
+    /// they have a tentative agent choice but no live session whose overrides,
+    /// turn state, or client queue can be reported as active context.
+    pub(crate) fn focused_runtime_context(&self) -> Option<FocusedRuntimeContext<'_>> {
+        let ChatPhase::Active(state) = &self.phase else {
+            return None;
+        };
+        Some(FocusedRuntimeContext {
+            agent_alias: &state.agent_alias,
+            model_provider_ref: state.model_provider_ref.as_deref(),
+            model: state.model.as_deref(),
+            queued_messages: state.queue_len(),
+            queue_paused: state.queue_paused(),
+        })
     }
 
     /// Working directory for the active conversation, if a session is running.
@@ -5861,6 +5905,24 @@ impl Chat {
                     && state.input_bar.claims_pane_navigation(key)
             }
             _ => false,
+        }
+    }
+
+    /// Whether the active Chat surface owns a global session shortcut chord.
+    ///
+    /// Pickers and modal overlays get first refusal over every key. In the
+    /// normal composer, an explicitly rebound pane or input-bar action keeps
+    /// its chord instead of being shadowed by the global default.
+    pub(crate) fn claims_session_shortcut(&self, key: &KeyEvent) -> bool {
+        match &self.phase {
+            ChatPhase::Active(state) => {
+                // Browse mode is not a modal: an unclaimed session shortcut
+                // switches straight away instead of only leaving browse mode.
+                state.overlay_owns_keys()
+                    || crate::keymap::ChatTabAction::from_chord(key).is_some()
+                    || crate::keymap::InputBarAction::from_chord(key).is_some()
+            }
+            _ => true,
         }
     }
 }
@@ -6359,13 +6421,7 @@ fn render_with_plan_placement(
     let input_area = area;
 
     let queue_paused_hint = if state.queue_paused() && state.queue_len() > 0 {
-        Some(crate::i18n::t_args(
-            match state.queue_paused {
-                Some(QueuePauseReason::MissingCompletion) => "zc-queue-missing-completion-ghost",
-                _ => "zc-queue-paused-ghost",
-            },
-            &[("key", &resume_queue_chord_label())],
-        ))
+        Some(paused_queue_hint(state.message_queue.pause_reason()))
     } else {
         None
     };
@@ -6510,12 +6566,48 @@ fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> O
     }
 }
 
+/// Read the same live binding table used by input dispatch.
+fn send_chord_label() -> String {
+    use crate::keymap::InputBarAction;
+    InputBarAction::resolved_bindings()
+        .into_iter()
+        .find_map(|(chord, action)| (action == InputBarAction::Submit).then(|| chord.display()))
+        .unwrap_or_default()
+}
+
 fn resume_queue_chord_label() -> String {
-    crate::keymap::ChatTabAction::PauseResumeQueue
-        .default_chords()
-        .first()
-        .map(|c| c.display())
-        .unwrap_or_else(|| "Alt+P".to_string())
+    use crate::keymap::ChatTabAction;
+    ChatTabAction::resolved_bindings()
+        .into_iter()
+        .find_map(|(chord, action)| {
+            (action == ChatTabAction::PauseResumeQueue).then(|| chord.display())
+        })
+        .unwrap_or_default()
+}
+
+fn paused_queue_hint(reason: Option<QueuePauseReason>) -> String {
+    let send = send_chord_label();
+    let resume = resume_queue_chord_label();
+    let missing_completion = reason == Some(QueuePauseReason::MissingCompletion);
+    match (send.is_empty(), resume.is_empty()) {
+        (true, true) => crate::i18n::t("zc-queue-paused-no-key-ghost"),
+        (true, false) | (false, true) => crate::i18n::t_args(
+            if missing_completion {
+                "zc-queue-missing-completion-single-key-ghost"
+            } else {
+                "zc-queue-paused-single-key-ghost"
+            },
+            &[("key", if send.is_empty() { &resume } else { &send })],
+        ),
+        (false, false) => crate::i18n::t_args(
+            if missing_completion {
+                "zc-queue-missing-completion-ghost"
+            } else {
+                "zc-queue-paused-ghost"
+            },
+            &[("key", &resume), ("send", &send)],
+        ),
+    }
 }
 
 /// Queue-management help entries shown whenever the queue sidebar is open —
@@ -6623,8 +6715,8 @@ fn render_queue_sidebar(f: &mut Frame, state: &mut ChatState, area: Rect) {
         )));
         row_owner.push(None);
     } else {
-        for (idx, msg) in state.message_queue.iter().enumerate() {
-            let selected = state.queue_sel == Some(msg.id);
+        for (idx, msg) in state.message_queue.items().iter().enumerate() {
+            let selected = state.message_queue.selected() == Some(msg.id);
             let marker = if selected { "▶ " } else { "  " };
             let head_style = if selected {
                 theme::title_style()
@@ -8050,24 +8142,22 @@ fn render_conversation(
     }
     render_copy_feedback(f, state);
     render_message_copy_overlay(f, state, body_rect);
-    let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
-        .position(scroll as usize)
-        .viewport_content_length(inner_height as usize);
-    f.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None),
-        area,
-        &mut scrollbar_state,
-    );
-    // Scrollbar paints in `area.right() - 1`; mirror that.
     if area.height > 2 {
-        state.scrollbar_track_rect = Some(Rect::new(
+        let track = Rect::new(
             area.x + area.width.saturating_sub(1),
             area.y + 1,
             1,
             area.height - 2,
-        ));
+        );
+        let mut scrollbar_state = state.scrollbar_state();
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            track,
+            &mut scrollbar_state,
+        );
+        state.scrollbar_track_rect = Some(track);
     } else {
         state.scrollbar_track_rect = None;
     }
@@ -9553,13 +9643,6 @@ impl ModelPickerOverlay {
 const MAX_RENDERED_ENTRIES: usize = 1_000;
 const RENDER_WINDOW_SHIFT_ENTRIES: usize = MAX_RENDERED_ENTRIES / 2;
 
-/// Scrollbar drag captured on mouse-down on the track.
-#[derive(Debug, Clone, Copy)]
-struct ScrollbarDrag {
-    start_scroll: u16,
-    start_row: u16,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TranscriptDragEdge {
     Top,
@@ -9657,20 +9740,6 @@ enum CopyFeedbackTarget {
 struct CopyFeedback {
     target: CopyFeedbackTarget,
     shown_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum QueueItemStatus {
-    Pending,
-    Injected,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct QueuedMessage {
-    pub id: u64,
-    pub text: String,
-    pub attachments: Vec<PendingAttachment>,
-    pub status: QueueItemStatus,
 }
 
 #[derive(Debug)]
@@ -9797,8 +9866,8 @@ pub struct ChatState {
     title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
     scrollbar_track_rect: Option<ratatui::layout::Rect>,
-    /// Active scrollbar drag anchor.
-    scrollbar_drag: Option<ScrollbarDrag>,
+    /// Whether the scrollbar owns the current left-button drag.
+    scrollbar_drag: bool,
     session_overlay: SessionOverlay,
     scroll_offset: u16,
     pinned_to_bottom: bool,
@@ -9810,21 +9879,21 @@ pub struct ChatState {
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
     pub context_input_tokens: Option<u64>,
+    /// Provenance of `context_input_tokens` ("provider" or "estimate"). An
+    /// estimated count must be rendered as approximate, never as measured
+    /// usage. Always set and cleared together with the count it describes.
+    pub context_input_tokens_source: Option<String>,
     /// Preemptive-trim budget for this session (the bar fills toward this).
     pub context_max_tokens: Option<u64>,
     /// Model's full context window; when present, the bar denominator so the
     /// trim budget shows as a marker rather than the 100% point.
     pub context_model_window: Option<u64>,
+    /// `(period, limit bits)` of every budget warning shown in this session,
+    /// so the per-turn daemon notice appears once per period and limit.
+    budget_warnings_shown: std::collections::HashSet<(String, u64)>,
     /// Outbound message queue; the front dispatches when the session is free.
-    message_queue: VecDeque<QueuedMessage>,
-    /// Monotonic id source for queued messages.
-    next_queue_id: u64,
-    /// Pause reason; freezes auto-dispatch until the user resumes.
-    queue_paused: Option<QueuePauseReason>,
-    resume_override: bool,
+    message_queue: MessageQueue,
     cancel_started_at: Option<Instant>,
-    /// Selected queued message id for sidebar edit/delete.
-    queue_sel: Option<u64>,
     /// Per-item clickable rects from the last sidebar draw, mapping a queued
     /// message id to its header-row rect. Drives left-click selection.
     queue_item_rects: Vec<(u64, ratatui::layout::Rect)>,
@@ -9912,7 +9981,7 @@ impl ChatState {
             copy_feedback: None,
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
-            scrollbar_drag: None,
+            scrollbar_drag: false,
             session_overlay: SessionOverlay::None,
             scroll_offset: 0,
             pinned_to_bottom: true,
@@ -9920,14 +9989,12 @@ impl ChatState {
             last_inner_height: 0,
             transcript_layout: TranscriptLayoutCache::new(),
             context_input_tokens: None,
+            context_input_tokens_source: None,
             context_max_tokens: None,
             context_model_window: None,
-            message_queue: VecDeque::new(),
-            next_queue_id: 0,
-            queue_paused: None,
-            resume_override: false,
+            budget_warnings_shown: std::collections::HashSet::new(),
+            message_queue: MessageQueue::default(),
             cancel_started_at: None,
-            queue_sel: None,
             queue_item_rects: Vec::new(),
             queue_sidebar_rect: None,
             queue_scroll: 0,
@@ -9961,14 +10028,18 @@ impl ChatState {
     /// Whether text input currently belongs to the composer rather than a
     /// modal, picker, explorer, or transcript-browse surface.
     fn composer_owns_text_input(&self) -> bool {
-        !self.model_picker.is_open()
-            && self.pending_elicitation().is_none()
-            && self.pending_approval().is_none()
-            && matches!(self.session_overlay, SessionOverlay::None)
-            && self.context_menu.is_none()
-            && !self.input_bar.has_file_explorer()
-            && !self.input_bar.has_attachment_manager()
-            && !self.in_browse_mode()
+        !self.overlay_owns_keys() && !self.in_browse_mode()
+    }
+
+    /// A picker, modal, menu or input-bar overlay is open and owns every key.
+    fn overlay_owns_keys(&self) -> bool {
+        self.model_picker.is_open()
+            || self.pending_elicitation().is_some()
+            || self.pending_approval().is_some()
+            || !matches!(self.session_overlay, SessionOverlay::None)
+            || self.context_menu.is_some()
+            || self.input_bar.has_file_explorer()
+            || self.input_bar.has_attachment_manager()
     }
 
     /// Route a key to an input-bar-owned overlay and retain its user feedback.
@@ -11042,6 +11113,100 @@ impl ChatState {
         }
     }
 
+    fn scrollbar_state(&self) -> ScrollbarState {
+        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        if self.entries.len() <= MAX_RENDERED_ENTRIES {
+            return ScrollbarState::new(usize::from(max) + 1)
+                .position(usize::from(self.scroll_offset.min(max)))
+                .viewport_content_length(usize::from(self.last_inner_height));
+        }
+
+        // Reuse the indexed viewport lookup without laying out older entries.
+        let visible = self.visible_cached_entry_range(self.scroll_offset, self.last_inner_height);
+        let position = if self.pinned_to_bottom {
+            self.entries.len().saturating_sub(1)
+        } else {
+            match self
+                .transcript_layout
+                .view()
+                .cached_screen_ranges
+                .get(visible.start)
+            {
+                Some((idx, _, _, _)) => *idx,
+                // The viewport sits below the cached rows, inside a live reply.
+                None if !self
+                    .transcript_layout
+                    .view()
+                    .cached_screen_ranges
+                    .is_empty() =>
+                {
+                    self.render_window_end().saturating_sub(1)
+                }
+                None => self.transcript_layout.view().cached_render_start,
+            }
+        };
+        ScrollbarState::new(self.entries.len())
+            .position(position)
+            .viewport_content_length(visible.len().max(1))
+    }
+
+    fn seek_scrollbar(&mut self, row: u16) {
+        let Some(track) = self.scrollbar_track_rect.filter(|track| track.height > 0) else {
+            return;
+        };
+        let span = track.height.saturating_sub(1).max(1);
+        let position = row.saturating_sub(track.y).min(span);
+        // A stale browse cursor must not reclaim the newly sought window.
+        self.clear_browse_selection();
+        if position == 0 {
+            self.scroll_to_top();
+        } else if position == span {
+            self.scroll_to_bottom();
+        } else if self.entries.len() <= MAX_RENDERED_ENTRIES {
+            let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+            self.scroll_offset = (u32::from(position) * u32::from(max) / u32::from(span)) as u16;
+            self.pinned_to_bottom = self.scroll_offset >= max;
+            self.sync_transcript_selection_viewport();
+        } else {
+            let target =
+                self.entries.len().saturating_sub(1) * usize::from(position) / usize::from(span);
+            // Match zero-line entries in render_entry_into without full-history layout.
+            let is_visible = |idx: &usize| match &self.entries[*idx] {
+                ChatEntry::AgentThought(_) => self.show_thoughts,
+                ChatEntry::SystemMessage(text) => !text.is_empty(),
+                _ => true,
+            };
+            let target = (target..self.entries.len())
+                .find(is_visible)
+                .or_else(|| (0..target).rev().find(is_visible))
+                .unwrap_or(target);
+            self.pinned_to_bottom = false;
+            if !(self.transcript_layout.view().cached_render_start..self.render_window_end())
+                .contains(&target)
+            {
+                self.transcript_layout.set_render_start(
+                    target.min(self.entries.len().saturating_sub(MAX_RENDERED_ENTRIES)),
+                );
+                self.mark_dirty_full();
+            }
+            if self.transcript_layout.view().dirty != LinesDirty::Clean {
+                self.clear_transcript_selection_for_render_change();
+                self.transcript_snapshot = None;
+                self.rebuild_lines(self.transcript_layout.view().cached_render_width);
+            }
+            self.last_total_rows = self.transcript_layout.view().cached_total_rows;
+            let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+            self.scroll_offset = self
+                .transcript_layout
+                .view()
+                .cached_screen_ranges
+                .iter()
+                .find(|(idx, _, _, _)| *idx >= target)
+                .map_or(max, |(_, lo, _, _)| (*lo).min(max));
+            self.sync_transcript_selection_viewport();
+        }
+    }
+
     pub fn scroll_up(&mut self, lines: u16) {
         self.pinned_to_bottom = false;
         if lines > self.scroll_offset && self.transcript_layout.view().cached_render_start > 0 {
@@ -11285,7 +11450,8 @@ impl ChatState {
             | SessionUpdate::ContextUsage { session_id, .. }
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
-            | SessionUpdate::Plan { session_id, .. } => session_id.as_str(),
+            | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::BudgetWarning { session_id, .. } => session_id.as_str(),
         };
         if update_sid != self.session_id {
             return;
@@ -11355,7 +11521,7 @@ impl ChatState {
                 // Cap stored output so large tool responses (bash, file reads) don't
                 // accumulate unboundedly. The same bound is applied to restored cards.
                 let raw_output = bounded_tool_output(raw_output);
-                for entry in self.entries.iter_mut().rev() {
+                for (entry_index, entry) in self.entries.iter_mut().enumerate().rev() {
                     if let ChatEntry::Tool {
                         tool_call_id: id,
                         result,
@@ -11364,7 +11530,12 @@ impl ChatState {
                         && id.as_ref() == tool_call_id.as_str()
                     {
                         *result = Some(Arc::<str>::from(raw_output));
-                        self.mark_dirty_full(); // mutation of existing entry
+                        // Usually the tail entry: re-render only that card.
+                        // `rebuild_lines` falls back to a full rebuild when
+                        // the mutated entry is not the cached tail (parallel
+                        // tool calls), so this is never stale.
+                        self.invalidate_url_interactions();
+                        self.mark_dirty_tail(entry_index);
                         break;
                     }
                 }
@@ -11391,11 +11562,16 @@ impl ChatState {
             }
             SessionUpdate::ContextUsage {
                 input_tokens,
+                input_tokens_source,
                 max_context_tokens,
                 model_context_window,
                 ..
             } => {
                 self.context_input_tokens = input_tokens;
+                // Provenance travels with the count it describes: an absent
+                // count must not keep a stale "estimate"/"provider" label, and
+                // an estimated count must never inherit a prior measured one.
+                self.context_input_tokens_source = input_tokens.and(input_tokens_source);
                 // Budget and capacity are one authoritative per-call snapshot.
                 // In particular, `None` capacity is meaningful: compatibility
                 // fallback routes omit it and must clear a prior configured
@@ -11506,6 +11682,43 @@ impl ChatState {
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
             }
+            SessionUpdate::BudgetWarning {
+                current_usd,
+                limit_usd,
+                period,
+                ..
+            } => {
+                // The daemon sends one per turn while spend is over the
+                // threshold; show it once per period and limit per session.
+                if !self
+                    .budget_warnings_shown
+                    .insert((period.clone(), limit_usd.to_bits()))
+                {
+                    return;
+                }
+                let percent = if limit_usd > 0.0 {
+                    (current_usd / limit_usd * 100.0).floor().min(999.0) as u64
+                } else {
+                    100
+                };
+                let msg_key = if period == "month" {
+                    "zc-chat-budget-warning-month"
+                } else {
+                    "zc-chat-budget-warning-day"
+                };
+                let notice = crate::i18n::t_args(
+                    msg_key,
+                    &[
+                        ("spent", &format!("{current_usd:.2}")),
+                        ("limit", &format!("{limit_usd:.2}")),
+                        ("percent", &percent.to_string()),
+                    ],
+                );
+                self.freeze_prompt_settled_stream();
+                self.entries
+                    .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+                self.mark_dirty_append();
+            }
             SessionUpdate::TurnComplete {
                 client_turn_generation,
                 message_count,
@@ -11577,9 +11790,7 @@ impl ChatState {
         self.turn_had_tool_calls = false;
         // A terminal notification resolves the earlier uncertainty, but the
         // queued backlog still waits for the user's deliberate resume.
-        if self.queue_paused == Some(QueuePauseReason::MissingCompletion) {
-            self.queue_paused = Some(QueuePauseReason::Generic);
-        }
+        self.message_queue.acknowledge_terminal_notification();
         self.settle_turn_lifecycle(clean, QueuePauseReason::Generic);
     }
 
@@ -11614,10 +11825,7 @@ impl ChatState {
         let mut cleanup_report = self.cleanup_active_turn_attachments();
         cleanup_report.merge(self.input_bar.take_cleanup_report());
         self.surface_cleanup_report(cleanup_report);
-        if !clean && !self.resume_override && !self.message_queue.is_empty() {
-            self.queue_paused = Some(pause_reason);
-        }
-        self.resume_override = false;
+        self.message_queue.settle_turn(clean, pause_reason);
     }
 
     pub fn enter_cancelling(&mut self) {
@@ -11714,41 +11922,43 @@ impl ChatState {
         cleanup_attachment_temps(&std::mem::take(&mut self.active_turn_attachments))
     }
 
-    fn remove_optimistic_user_message(&mut self, generation: u64) {
-        let Some((marked_generation, entry_index, prior_message_count)) =
-            self.optimistic_user_message.take()
-        else {
-            return;
-        };
-        if marked_generation != generation {
-            return;
-        }
-        self.message_count = prior_message_count;
-        if matches!(
-            self.entries.get(entry_index),
-            Some(ChatEntry::UserMessage { .. })
-        ) {
-            self.entries.remove(entry_index);
-            self.first_message = self.entries.iter().find_map(|entry| {
-                let ChatEntry::UserMessage {
-                    text: Some(text), ..
-                } = entry
-                else {
-                    return None;
-                };
-                let display = strip_enrichment_prefix(text.as_ref());
-                (!display.trim().is_empty()).then(|| display.to_string())
-            });
-            self.mark_dirty_full();
-        }
+    /// Put the message a refused prompt dispatched back in the queue, with
+    /// the attachments the turn took over, before settling can delete them.
+    /// Only for refusals issued before the turn started (`SESSION_BUSY`): the
+    /// daemon never ran the message, so dropping it would lose what the user
+    /// typed. Ordering and pause rules live in `MessageQueue::requeue_refused`.
+    fn requeue_refused_dispatch(&mut self, text: String) {
+        let attachments = std::mem::take(&mut self.active_turn_attachments);
+        self.message_queue.requeue_refused(text, attachments);
     }
 
-    const QUEUE_CAP: usize = 32;
-
-    fn alloc_queue_id(&mut self) -> u64 {
-        let id = self.next_queue_id;
-        self.next_queue_id = self.next_queue_id.wrapping_add(1);
-        id
+    /// Remove the optimistic row of a turn the daemon rejected and return the
+    /// text it carried (empty for an attachment-only message), or `None` when
+    /// no row of `generation` was removed.
+    fn remove_optimistic_user_message(&mut self, generation: u64) -> Option<String> {
+        let (marked_generation, entry_index, prior_message_count) =
+            self.optimistic_user_message.take()?;
+        if marked_generation != generation {
+            return None;
+        }
+        self.message_count = prior_message_count;
+        let Some(ChatEntry::UserMessage { text, .. }) = self.entries.get(entry_index) else {
+            return None;
+        };
+        let removed = text.as_deref().unwrap_or_default().to_string();
+        self.entries.remove(entry_index);
+        self.first_message = self.entries.iter().find_map(|entry| {
+            let ChatEntry::UserMessage {
+                text: Some(text), ..
+            } = entry
+            else {
+                return None;
+            };
+            let display = strip_enrichment_prefix(text.as_ref());
+            (!display.trim().is_empty()).then(|| display.to_string())
+        });
+        self.mark_dirty_full();
+        Some(removed)
     }
 
     pub fn enqueue_message(
@@ -11756,28 +11966,8 @@ impl ChatState {
         text: String,
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
-        if text.trim().is_empty() && attachments.is_empty() {
-            let cleanup_report = cleanup_attachment_temps(&attachments);
-            self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t("zc-queue-empty"));
-        }
-        let pending = self.message_queue.len();
-        if pending >= Self::QUEUE_CAP {
-            let cleanup_report = cleanup_attachment_temps(&attachments);
-            self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t_args(
-                "zc-queue-full",
-                &[("cap", &Self::QUEUE_CAP.to_string())],
-            ));
-        }
-        let id = self.alloc_queue_id();
-        self.message_queue.push_back(QueuedMessage {
-            id,
-            text,
-            attachments,
-            status: QueueItemStatus::Pending,
-        });
-        Ok(())
+        let result = self.message_queue.enqueue(text, attachments);
+        self.queue_admission_result(result)
     }
 
     pub fn inject_message(
@@ -11785,94 +11975,53 @@ impl ChatState {
         text: String,
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
-        if text.trim().is_empty() && attachments.is_empty() {
-            let cleanup_report = cleanup_attachment_temps(&attachments);
-            self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t("zc-queue-empty"));
-        }
-        if self.message_queue.len() >= Self::QUEUE_CAP {
-            let cleanup_report = cleanup_attachment_temps(&attachments);
-            self.surface_cleanup_report(cleanup_report);
-            return Err(crate::i18n::t_args(
-                "zc-queue-full",
-                &[("cap", &Self::QUEUE_CAP.to_string())],
-            ));
-        }
-        let id = self.alloc_queue_id();
-        let insert_at = self
+        let result = self
             .message_queue
-            .iter()
-            .position(|m| m.status == QueueItemStatus::Pending)
-            .unwrap_or(self.message_queue.len());
-        self.message_queue.insert(
-            insert_at,
-            QueuedMessage {
-                id,
-                text,
-                attachments,
-                status: QueueItemStatus::Injected,
-            },
-        );
-        // An inject is the force-send-now intent: resume the queue and let it
-        // survive a cancel auto-pause, unlike a plain queued submission.
-        self.queue_paused = None;
-        if self.turn_in_flight {
-            self.resume_override = true;
-        }
-        Ok(())
+            .inject(text, attachments, self.turn_in_flight);
+        self.queue_admission_result(result)
+    }
+
+    fn queue_admission_result(
+        &mut self,
+        result: Result<(), (AdmissionError, Vec<PendingAttachment>)>,
+    ) -> Result<(), String> {
+        result.map_err(|(error, attachments)| {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
+            match error {
+                AdmissionError::Empty => crate::i18n::t("zc-queue-empty"),
+                AdmissionError::Full => crate::i18n::t_args(
+                    "zc-queue-full",
+                    &[("cap", &MessageQueue::CAPACITY.to_string())],
+                ),
+            }
+        })
     }
 
     fn next_dispatch_index(&self) -> Option<usize> {
-        if self.turn_in_flight {
-            return None;
-        }
-        if let Some(idx) = self
-            .message_queue
-            .iter()
-            .position(|m| m.status == QueueItemStatus::Injected)
-        {
-            return Some(idx);
-        }
-        if self.queue_paused() {
-            return None;
-        }
-        self.message_queue
-            .iter()
-            .position(|m| m.status == QueueItemStatus::Pending)
+        self.message_queue.next_dispatch_index(self.turn_in_flight)
     }
 
     pub fn take_next_dispatchable(&mut self) -> Option<QueuedMessage> {
-        let idx = self.next_dispatch_index()?;
-        let msg = self.message_queue.remove(idx)?;
-        self.resume_override = false;
-        if self.queue_sel == Some(msg.id) {
-            self.queue_sel = None;
-        }
-        Some(msg)
+        self.message_queue
+            .take_next_dispatchable(self.turn_in_flight)
     }
 
     /// Flip the queue pause state. Returns the new paused value so the caller
     /// can pump on resume and surface the right notice.
     pub fn toggle_queue_pause(&mut self) -> bool {
-        self.queue_paused = if self.queue_paused() {
-            None
-        } else {
-            Some(QueuePauseReason::Generic)
-        };
-        self.queue_paused()
+        self.message_queue.toggle_pause()
     }
 
     pub fn queue_paused(&self) -> bool {
-        self.queue_paused.is_some()
+        self.message_queue.paused()
     }
 
     /// Clear an explicit pause without bypassing the cancel auto-pause: a
     /// cancelled turn settles into the paused state and the backlog waits for a
     /// deliberate resume. Returns true if the queue was paused.
     pub fn resume_queue(&mut self) -> bool {
-        let was_paused = self.queue_paused();
-        self.queue_paused = None;
-        was_paused
+        self.message_queue.resume()
     }
 
     pub fn queue_len(&self) -> usize {
@@ -11881,10 +12030,7 @@ impl ChatState {
 
     fn reconnect_queue_state(&self) -> ReconnectQueueState {
         ReconnectQueueState {
-            messages: self.message_queue.clone(),
-            next_id: self.next_queue_id,
-            paused: self.queue_paused,
-            selected: self.queue_sel,
+            message_queue: self.message_queue.clone(),
             composer_text: self.input_bar.input().to_string(),
             composer_attachments: self.input_bar.reconnect_file_attachments(),
         }
@@ -11893,23 +12039,23 @@ impl ChatState {
     /// Restore the queue and composer state the client owns across a transport
     /// rebuild. Transcript, pending interactions, and terminal turn state come
     /// from (or are reconciled with) the daemon instead of being snapshotted.
+    /// The red-dot status is the exception: `load_history` never sets
+    /// `last_error`, so a failed last turn or a failed reconciliation is
+    /// carried from the old pane.
     fn restore_reconnect_state(
         &mut self,
         queue: ReconnectQueueState,
         interrupted: bool,
         recovery_required: bool,
+        turn_failed: bool,
     ) {
-        self.message_queue = queue.messages;
-        self.next_queue_id = queue.next_id;
-        self.queue_paused = queue.paused;
-        self.queue_sel = queue
-            .selected
-            .filter(|id| self.message_queue.iter().any(|message| message.id == *id));
+        self.message_queue.restore(queue.message_queue);
         self.input_bar
             .load_for_edit(queue.composer_text, queue.composer_attachments);
-        self.resume_override = false;
         if recovery_required {
             self.last_error = Some(SessionError::ResyncFailed);
+        } else if turn_failed {
+            self.last_error = Some(SessionError::TurnFailed);
         }
         if interrupted {
             self.entries
@@ -11972,18 +12118,13 @@ impl ChatState {
     /// yet (e.g. the first message just opened the sidebar). Keeps keyboard
     /// delete/edit working without a manual open step.
     pub fn ensure_queue_selection(&mut self) {
-        if self.queue_sel.is_none()
-            && let Some(front) = self.message_queue.front()
-        {
-            self.queue_sel = Some(front.id);
-        }
+        self.message_queue.ensure_selection();
     }
 
     /// Select a queued item by id (mouse left-click in the sidebar). Ignores
     /// ids no longer present. Returns true when the selection changed.
     pub fn select_queued_by_id(&mut self, id: u64) -> bool {
-        if self.message_queue.iter().any(|m| m.id == id) && self.queue_sel != Some(id) {
-            self.queue_sel = Some(id);
+        if self.message_queue.select(id) {
             self.mark_dirty_full();
             true
         } else {
@@ -12021,82 +12162,38 @@ impl ChatState {
         }
     }
 
-    fn editable_ids(&self) -> Vec<u64> {
-        self.message_queue.iter().map(|m| m.id).collect()
-    }
-
     pub fn queue_select_step(&mut self, delta: isize) {
-        let ids = self.editable_ids();
-        if ids.is_empty() {
-            self.queue_sel = None;
-            return;
+        if self.message_queue.select_step(delta) {
+            self.mark_dirty_full();
         }
-        let cur = self
-            .queue_sel
-            .and_then(|id| ids.iter().position(|&x| x == id))
-            .unwrap_or(0) as isize;
-        let next = (cur + delta).rem_euclid(ids.len() as isize) as usize;
-        self.queue_sel = Some(ids[next]);
-        self.mark_dirty_full();
     }
 
     fn selected_queue_id(&self) -> Option<u64> {
-        self.queue_sel
-            .filter(|id| self.message_queue.iter().any(|message| message.id == *id))
+        self.message_queue.selected_id()
     }
 
     fn queued_text(&self, id: u64) -> Option<String> {
         self.message_queue
-            .iter()
-            .find(|message| message.id == id)
+            .message(id)
             .map(|message| message.text.clone())
     }
 
     fn promote_queued_by_id(&mut self, id: u64) -> bool {
-        let Some(position) = self
-            .message_queue
-            .iter()
-            .position(|message| message.id == id)
-        else {
+        let Some(redraw) = self.message_queue.promote(id, self.turn_in_flight) else {
             return false;
         };
-        let pending = self.message_queue[position].status == QueueItemStatus::Pending;
-        if pending {
-            let Some(mut message) = self.message_queue.remove(position) else {
-                return false;
-            };
-            message.status = QueueItemStatus::Injected;
-            let insert_at = self
-                .message_queue
-                .iter()
-                .position(|queued| queued.status == QueueItemStatus::Pending)
-                .unwrap_or(self.message_queue.len());
-            self.message_queue.insert(insert_at, message);
-        }
-        let resumed = self.resume_queue();
-        if self.turn_in_flight {
-            self.resume_override = true;
-        }
-        if pending || resumed {
+        if redraw {
             self.mark_dirty_full();
         }
         true
     }
 
     fn delete_queued_by_id(&mut self, id: u64) -> bool {
-        let Some(position) = self
-            .message_queue
-            .iter()
-            .position(|message| message.id == id)
-        else {
+        let Some(message) = self.message_queue.delete(id) else {
             return false;
         };
-        if let Some(message) = self.message_queue.remove(position) {
-            let cleanup_report = cleanup_attachment_temps(&message.attachments);
-            self.surface_cleanup_report(cleanup_report);
-        }
-        let ids = self.editable_ids();
-        self.queue_sel = ids.get(position.min(ids.len().saturating_sub(1))).copied();
+        let cleanup_report = cleanup_attachment_temps(&message.attachments);
+        self.surface_cleanup_report(cleanup_report);
         self.mark_dirty_full();
         true
     }
@@ -12109,12 +12206,7 @@ impl ChatState {
     }
 
     fn take_queued_for_edit(&mut self, id: u64) -> Option<(String, Vec<PendingAttachment>)> {
-        let position = self
-            .message_queue
-            .iter()
-            .position(|message| message.id == id)?;
-        let message = self.message_queue.remove(position)?;
-        self.queue_sel = self.editable_ids().first().copied();
+        let message = self.message_queue.take_for_edit(id)?;
         self.mark_dirty_full();
         Some((message.text, message.attachments))
     }
@@ -12154,12 +12246,8 @@ impl ChatState {
                 }
                 let pos = n - 1;
                 let mut cleanup_report = CleanupReport::default();
-                if let Some(msg) = self.message_queue.remove(pos) {
+                if let Some(msg) = self.message_queue.remove_at(pos) {
                     cleanup_report = cleanup_attachment_temps(&msg.attachments);
-                    if self.queue_sel == Some(msg.id) {
-                        let ids = self.editable_ids();
-                        self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
-                    }
                 }
                 self.mark_dirty_full();
                 append_cleanup_notice(
@@ -12172,13 +12260,9 @@ impl ChatState {
 
     fn clear_queue(&mut self) -> CleanupReport {
         let mut cleanup_report = CleanupReport::default();
-        for msg in self.message_queue.drain(..) {
+        for msg in self.message_queue.clear() {
             cleanup_report.merge(cleanup_attachment_temps(&msg.attachments));
         }
-        self.next_queue_id = 0;
-        self.queue_paused = None;
-        self.resume_override = false;
-        self.queue_sel = None;
         cleanup_report
     }
 
@@ -12225,7 +12309,7 @@ impl ChatState {
         self.turn_had_tool_calls = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
-        self.resume_override = false;
+        self.message_queue.reset_resume_override();
         let cleanup_report = self.cleanup_active_turn_attachments();
         self.surface_cleanup_report(cleanup_report);
     }
@@ -12315,12 +12399,18 @@ impl ChatState {
         self.entries
             .push(ChatEntry::SystemMessage(Arc::<str>::from(notice_text)));
         self.info_message = None;
-        // The reload clears `last_error` unconditionally: a stale `ResyncFailed`
-        // from this very resync must not stick once the snapshot proves the
-        // transcript is readable again. The carried outcome below then
-        // re-applies `SessionLost`/`TurnFailed` if the finished turn itself
-        // failed.
-        self.last_error = None;
+        // The reload clears the connection-class errors: a stale
+        // `ResyncFailed` from this very resync must not stick once the
+        // snapshot proves the transcript is readable again. `TurnFailed`
+        // survives: a lag reload covers every tracked session, idle ones
+        // included, and reloading does not change whether the last turn
+        // failed. Every dispatch from this pane clears it in
+        // `push_user_message`, so a `TurnFailed` here belongs to the last
+        // turn this pane sent. The carried outcome below then re-applies
+        // `SessionLost`/`TurnFailed` if the finished turn itself failed.
+        if self.last_error != Some(SessionError::TurnFailed) {
+            self.last_error = None;
+        }
         // Consume the outcome captured by the terminal-frame intercept
         // (`drain_notifications`), handed over by the apply that took
         // `lag_reattach` whole. Owner: that one reload; nothing else may
@@ -12487,8 +12577,12 @@ impl ChatState {
         // from the previous session before the first LLM call fires a new
         // ContextUsage event.
         self.context_input_tokens = None;
+        self.context_input_tokens_source = None;
         self.context_max_tokens = None;
         self.context_model_window = None;
+        // Budget warnings shown are per-session too: a new session gets its
+        // own first notice.
+        self.budget_warnings_shown.clear();
         // The TodoWrite plan is per-session; drop it (and its show/hide state)
         // so a switched-to session doesn't inherit the previous plan's tasks.
         // Rebuilding from freshly resolved settings also applies any Config-pane
@@ -12651,6 +12745,28 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn focused_runtime_context_reads_live_overrides_and_client_queue_state() {
+        let (mut chat, _writer_rx) = test_chat();
+        let mut active = state();
+        active.set_model_identity(Some("openai.session"), Some("gpt-session"));
+        active.turn_status = TurnStatus::WaitingForApproval;
+        active
+            .enqueue_message("queued follow-up".to_string(), Vec::new())
+            .expect("queue has capacity");
+        assert!(active.toggle_queue_pause());
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let context = chat
+            .focused_runtime_context()
+            .expect("active session has runtime context");
+        assert_eq!(context.agent_alias, "myagent");
+        assert_eq!(context.model_provider_ref, Some("openai.session"));
+        assert_eq!(context.model, Some("gpt-session"));
+        assert_eq!(context.queued_messages, 1);
+        assert!(context.queue_paused);
     }
 
     fn url_hit(rect: Rect, url: &str, row: u16, byte_start: usize) -> UrlHitRegion {
@@ -13222,6 +13338,7 @@ mod tests {
         let mut state = state();
         state.apply_update(SessionUpdate::ContextUsage {
             session_id: "sess-1".to_string(),
+            input_tokens_source: None,
             input_tokens: Some(100_000),
             max_context_tokens: Some(180_000),
             model_context_window: Some(200_000),
@@ -13231,6 +13348,7 @@ mod tests {
 
         state.apply_update(SessionUpdate::ContextUsage {
             session_id: "sess-1".to_string(),
+            input_tokens_source: None,
             input_tokens: Some(12_000),
             max_context_tokens: Some(32_000),
             model_context_window: None,
@@ -13243,6 +13361,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn context_usage_provenance_travels_with_the_count_it_describes() {
+        let mut state = state();
+
+        // Estimated frame: provenance stored alongside the count.
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(4_200),
+            input_tokens_source: Some("estimate".to_string()),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(state.context_input_tokens, Some(4_200));
+        assert_eq!(
+            state.context_input_tokens_source.as_deref(),
+            Some("estimate")
+        );
+
+        // A later provider-reported frame must replace, never inherit, the
+        // previous estimate label.
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(100_000),
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(
+            state.context_input_tokens_source.as_deref(),
+            Some("provider")
+        );
+
+        // An absent count must clear the label too: a stale "provider" marker
+        // on no number would misdescribe the next thing rendered.
+        state.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: None,
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(180_000),
+            model_context_window: Some(200_000),
+        });
+        assert_eq!(state.context_input_tokens, None);
+        assert_eq!(
+            state.context_input_tokens_source, None,
+            "provenance must be cleared whenever the count it describes is cleared"
+        );
+    }
+
     fn resume_entry(session_id: &str, agent_alias: &str, was_focused: bool) -> ResumeEntry {
         ResumeEntry {
             session_id: session_id.to_string(),
@@ -13252,6 +13418,7 @@ mod tests {
             queue: ReconnectQueueState::default(),
             interrupted: false,
             recovery_required: false,
+            turn_failed: false,
         }
     }
 
@@ -14656,6 +14823,11 @@ mod tests {
         assert_eq!(state.transcript_selection, selection);
         assert_eq!(state.transcript_snapshot.as_ref().unwrap().scroll, 2);
 
+        state.scrollbar_track_rect = Some(Rect::new(5, 0, 1, 5));
+        state.seek_scrollbar(2);
+        assert_eq!(state.transcript_selection, selection);
+        assert_eq!(state.transcript_snapshot.as_ref().unwrap().scroll, 1);
+
         state.enter_browse_mode();
         assert_eq!(state.transcript_selection, None);
 
@@ -14722,6 +14894,12 @@ mod tests {
         assert_eq!(state.transcript_layout.view().cached_render_start, 1_200);
         assert_eq!(state.transcript_selection, selection);
         assert!(state.transcript_snapshot.is_some());
+
+        state.scrollbar_track_rect = Some(Rect::new(79, 2, 1, 10));
+        state.seek_scrollbar(6);
+        assert!(state.transcript_layout.view().cached_render_start < 1_200);
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(state.transcript_snapshot, None);
     }
 
     #[test]
@@ -15430,9 +15608,11 @@ mod tests {
         state.scrollbar_track_rect = Some(Rect::new(79, 2, 1, 10));
         chat.phase = ChatPhase::Active(Box::new(state));
 
-        for (kind, row) in [
-            (MouseEventKind::Down(MouseButton::Left), 4),
-            (MouseEventKind::Drag(MouseButton::Left), 8),
+        for (kind, row, expected) in [
+            (MouseEventKind::Down(MouseButton::Left), 4, 17),
+            (MouseEventKind::Drag(MouseButton::Left), 4, 17),
+            (MouseEventKind::Drag(MouseButton::Left), 5, 26),
+            (MouseEventKind::Drag(MouseButton::Left), 11, 80),
         ] {
             chat.handle_mouse(
                 MouseEvent {
@@ -15444,13 +15624,17 @@ mod tests {
                 Rect::new(0, 0, 80, 20),
             )
             .await;
+            let ChatPhase::Active(state) = &chat.phase else {
+                panic!("expected active chat");
+            };
+            assert_eq!(state.scroll_offset, expected);
         }
 
         {
             let ChatPhase::Active(state) = &chat.phase else {
                 panic!("expected active chat");
             };
-            assert!(state.scrollbar_drag.is_some());
+            assert!(state.scrollbar_drag);
             assert!(state.scroll_offset > 0);
             assert_eq!(state.transcript_selection, None);
         }
@@ -15469,7 +15653,220 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert!(state.scrollbar_drag.is_none());
+        assert!(!state.scrollbar_drag);
+    }
+
+    #[tokio::test]
+    async fn scrollbar_seeks_complete_history_with_a_bounded_render_window() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let draw = |chat: &mut Chat, area: Rect| {
+            let ChatPhase::Active(state) = &mut chat.phase else {
+                panic!("expected active chat");
+            };
+            let mut terminal =
+                Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+            terminal
+                .draw(|frame| {
+                    render_conversation(frame, state, area);
+                })
+                .expect("draw conversation");
+            assert!(state.transcript_layout.view().cached_entry_count <= MAX_RENDERED_ENTRIES);
+            state.scrollbar_track_rect.expect("scrollbar track")
+        };
+
+        for (browse_mode, hidden_entries) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (mut chat, _rx) = test_chat();
+            let mut active = state();
+            active.entries = (0..2_200)
+                .map(|idx| {
+                    if hidden_entries && idx > 0 && idx < 2_199 {
+                        if idx % 2 == 0 {
+                            ChatEntry::AgentThought(Arc::<str>::from("hidden thought"))
+                        } else {
+                            ChatEntry::SystemMessage(Arc::<str>::from(""))
+                        }
+                    } else {
+                        ChatEntry::AgentMessage(Arc::<str>::from(format!("entry {idx}")))
+                    }
+                })
+                .collect();
+            active.show_thoughts = !hidden_entries;
+            if browse_mode {
+                active.enter_browse_mode();
+            }
+            active.mark_dirty_full();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut area = Rect::new(0, 0, 80, 20);
+            let mut track = draw(&mut chat, area);
+
+            for (step, kind) in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let row = match step {
+                    0 => track.y + track.height / 2,
+                    1 | 3 => track.y,
+                    _ => track.bottom() - 1,
+                };
+                chat.handle_mouse(
+                    MouseEvent {
+                        kind,
+                        column: track.x,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    area,
+                )
+                .await;
+                track = draw(&mut chat, area);
+                let ChatPhase::Active(state) = &chat.phase else {
+                    panic!("expected active chat");
+                };
+                assert!(
+                    !state.in_browse_mode(),
+                    "old cursor must not reclaim the window"
+                );
+                match step {
+                    0 => {
+                        let expected = if hidden_entries {
+                            2_199
+                        } else {
+                            2_199 * usize::from(row - track.y) / usize::from(track.height - 1)
+                        };
+                        assert_eq!(state.scrollbar_state().get_position(), expected);
+                        assert!(state.entry_rects.iter().any(|(idx, _)| *idx == expected));
+                    }
+                    1 | 3 => {
+                        assert_eq!(state.transcript_layout.view().cached_render_start, 0);
+                        assert_eq!(state.scroll_offset, 0);
+                        assert!(state.entry_rects.iter().any(|(idx, _)| *idx == 0));
+                    }
+                    _ => {
+                        assert!(state.pinned_to_bottom);
+                        assert_eq!(state.render_window_end(), 2_200);
+                        assert!(state.entry_rects.iter().any(|(idx, _)| *idx == 2_199));
+                    }
+                }
+                if step == 1 && !hidden_entries {
+                    let ChatPhase::Active(state) = &mut chat.phase else {
+                        panic!("expected active chat");
+                    };
+                    let rect = state.entry_rects[0].1;
+                    assert!(state.begin_transcript_drag(rect.x, rect.y));
+                    assert!(state.update_transcript_drag(rect.x + 1, rect.y));
+                    state.finish_transcript_drag();
+                    let selection = state.transcript_selection;
+                    let selected_text = state.current_selection_text();
+                    let cached_start = state.transcript_layout.view().cached_render_start;
+                    let cached_count = state.transcript_layout.view().cached_entry_count;
+                    chat.handle_mouse(
+                        MouseEvent {
+                            kind: MouseEventKind::Drag(MouseButton::Left),
+                            column: track.x,
+                            row: track.y + 1,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        area,
+                    )
+                    .await;
+                    track = draw(&mut chat, area);
+                    let ChatPhase::Active(state) = &chat.phase else {
+                        panic!("expected active chat");
+                    };
+                    assert_eq!(
+                        state.transcript_layout.view().cached_render_start,
+                        cached_start
+                    );
+                    assert_eq!(
+                        state.transcript_layout.view().cached_entry_count,
+                        cached_count
+                    );
+                    assert_eq!(state.transcript_selection, selection);
+                    assert_eq!(state.current_selection_text(), selected_text);
+                }
+                if step == 2 {
+                    area = Rect::new(0, 0, 60, 14);
+                    track = draw(&mut chat, area);
+                }
+            }
+        }
+
+        let (mut chat, _rx) = test_chat();
+        let mut active = state();
+        active.entries = (0..2_200)
+            .map(|idx| {
+                if idx == 0 {
+                    ChatEntry::AgentMessage(Arc::<str>::from("visible entry"))
+                } else {
+                    ChatEntry::AgentThought(Arc::<str>::from("hidden suffix"))
+                }
+            })
+            .collect();
+        active.show_thoughts = false;
+        active.mark_dirty_full();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        let area = Rect::new(0, 0, 80, 20);
+        let track = draw(&mut chat, area);
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: track.x,
+                row: track.y + track.height / 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        draw(&mut chat, area);
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.scrollbar_state().get_position(), 0);
+        assert!(state.entry_rects.iter().any(|(idx, _)| *idx == 0));
+    }
+
+    #[test]
+    fn scrollbar_stays_at_the_newest_entry_when_scrolled_inside_a_live_reply() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        s.entries = (0..2_200)
+            .map(|idx| ChatEntry::AgentMessage(Arc::<str>::from(format!("entry {idx}"))))
+            .collect();
+        s.streaming_text = "overlay row ".repeat(500);
+        s.pinned_to_bottom = true;
+        s.mark_dirty_full();
+        let area = Rect::new(0, 0, 80, 20);
+        let mut terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("test terminal");
+        let mut draw = |s: &mut ChatState| {
+            terminal
+                .draw(|frame| {
+                    render_conversation(frame, s, area);
+                })
+                .expect("draw conversation");
+        };
+        draw(&mut s);
+        assert_eq!(s.render_window_end(), 2_200);
+        assert_eq!(s.scrollbar_state().get_position(), 2_199);
+
+        s.scroll_up(1);
+        draw(&mut s);
+        assert!(!s.pinned_to_bottom);
+        assert!(
+            s.scroll_offset >= s.transcript_layout.view().cached_total_rows,
+            "viewport must still be inside the live reply"
+        );
+        assert_eq!(s.scrollbar_state().get_position(), 2_199);
     }
 
     #[test]
@@ -16979,32 +17376,26 @@ mod tests {
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Chat);
         let mut focused = resume_entry("sess-focused", "alpha", true);
-        focused.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "focused queue".to_string(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
-        focused.queue.next_id = 1;
-        focused.queue.paused = Some(QueuePauseReason::Generic);
+        focused
+            .queue
+            .message_queue
+            .enqueue("focused queue".to_string(), Vec::new())
+            .unwrap();
+        focused.queue.message_queue.toggle_pause();
         let mut bad_background = resume_entry("sess-bad", "beta", false);
-        bad_background.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "bad background queue".to_string(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
-        bad_background.queue.next_id = 1;
-        bad_background.queue.paused = Some(QueuePauseReason::Generic);
+        bad_background
+            .queue
+            .message_queue
+            .enqueue("bad background queue".to_string(), Vec::new())
+            .unwrap();
+        bad_background.queue.message_queue.toggle_pause();
         let mut healthy_background = resume_entry("sess-good", "gamma", false);
-        healthy_background.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "healthy background queue".to_string(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
-        healthy_background.queue.next_id = 1;
-        healthy_background.queue.paused = Some(QueuePauseReason::Generic);
+        healthy_background
+            .queue
+            .message_queue
+            .enqueue("healthy background queue".to_string(), Vec::new())
+            .unwrap();
+        healthy_background.queue.message_queue.toggle_pause();
         chat.set_resume_sessions(vec![focused, bad_background, healthy_background]);
 
         let init = tokio::spawn(async move {
@@ -17078,13 +17469,13 @@ mod tests {
         assert_eq!(
             chat.resume_focused
                 .as_ref()
-                .map(|entry| (entry.session_id.as_str(), entry.queue.messages.len())),
+                .map(|entry| (entry.session_id.as_str(), entry.queue.message_queue.len())),
             Some(("sess-focused", 1))
         );
         assert_eq!(
             chat.resume_backgrounds
                 .iter()
-                .map(|entry| (entry.session_id.as_str(), entry.queue.messages.len()))
+                .map(|entry| (entry.session_id.as_str(), entry.queue.message_queue.len()))
                 .collect::<Vec<_>>(),
             vec![("sess-bad", 1)]
         );
@@ -17094,7 +17485,7 @@ mod tests {
                 .map(|entry| (
                     entry.session_id.as_str(),
                     entry.was_focused,
-                    entry.queue.messages.len()
+                    entry.queue.message_queue.len()
                 ))
                 .collect::<Vec<_>>(),
             vec![
@@ -17189,7 +17580,9 @@ mod tests {
         prior
             .enqueue_message("keep queued".to_string(), Vec::new())
             .expect("queue message");
-        prior.queue_paused = Some(QueuePauseReason::MissingCompletion);
+        prior
+            .message_queue
+            .settle_turn(false, QueuePauseReason::MissingCompletion);
         prior.turn_in_flight = true;
         prior.turn_status = TurnStatus::WaitingForApproval;
         prior.pending_approval = Some(PendingApproval {
@@ -17216,9 +17609,9 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let entry = entries.remove(0);
         assert!(entry.interrupted);
-        assert_eq!(entry.queue.messages.len(), 1);
+        assert_eq!(entry.queue.message_queue.len(), 1);
         assert_eq!(
-            entry.queue.paused,
+            entry.queue.message_queue.pause_reason(),
             Some(QueuePauseReason::MissingCompletion)
         );
         assert_eq!(entry.queue.composer_text, "draft survives reconnect");
@@ -17261,10 +17654,15 @@ mod tests {
             }],
             false,
         );
-        rebuilt.restore_reconnect_state(entry.queue, entry.interrupted, entry.recovery_required);
+        rebuilt.restore_reconnect_state(
+            entry.queue,
+            entry.interrupted,
+            entry.recovery_required,
+            entry.turn_failed,
+        );
         assert_eq!(rebuilt.queue_len(), 1);
         assert_eq!(
-            rebuilt.queue_paused,
+            rebuilt.message_queue.pause_reason(),
             Some(QueuePauseReason::MissingCompletion)
         );
         assert_eq!(rebuilt.input_bar.input(), "draft survives reconnect");
@@ -17306,6 +17704,30 @@ mod tests {
         }
         assert!(methods.contains(&Some(method::SESSION_APPROVE.to_string())));
         assert!(methods.contains(&None));
+
+        rebuilt.resume_queue();
+        rebuilt.turn_in_flight = true;
+        rebuilt
+            .inject_message("send after reconnect".to_string(), Vec::new())
+            .unwrap();
+        let snapshot = rebuilt.reconnect_queue_state();
+        assert!(
+            rebuilt.message_queue.resume_override(),
+            "snapshotting must preserve the old pane's armed override"
+        );
+        assert!(snapshot.message_queue.resume_override());
+        let mut adopted = state_for("sess-r", "alpha");
+        adopted.restore_reconnect_state(snapshot, true, false, false);
+        assert!(
+            !adopted.message_queue.resume_override(),
+            "adoption must discard the old turn's override"
+        );
+        adopted.turn_in_flight = true;
+        adopted.commit_turn(String::new(), false);
+        assert!(
+            adopted.queue_paused(),
+            "an adopted override must not suppress a later cancel auto-pause"
+        );
     }
 
     // ── Multi-session (agent sidebar) ────────────────────────────
@@ -17482,6 +17904,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = two_session_chat(&rpc);
+        assert!(!chat.has_pending_transport_events());
         if let Some(b) = chat.background.first_mut() {
             b.turn_in_flight = true;
         }
@@ -17493,6 +17916,10 @@ mod tests {
                 "session_id": "sess-b",
                 "text": "hi",
             }),
+        );
+        assert!(
+            chat.has_pending_transport_events(),
+            "a queued notification must wake the input wait"
         );
         chat.rpc.push_notification_for_test(
             "session/update",
@@ -17506,6 +17933,7 @@ mod tests {
             }),
         );
         chat.drain_notifications();
+        assert!(!chat.has_pending_transport_events());
 
         let b = chat.background.first().expect("background session");
         assert_eq!(b.turn_status, TurnStatus::WaitingForApproval);
@@ -17536,6 +17964,374 @@ mod tests {
         let entries = chat.resume_entries();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].recovery_required);
+    }
+
+    /// A notification-lag reload covers idle sessions too. It resolves
+    /// `ResyncFailed` but must not turn a failed last turn green.
+    #[test]
+    fn notification_resync_reload_keeps_failed_turn_and_clears_resync_failed() {
+        let history = || {
+            vec![crate::client::MessageEntry {
+                role: "assistant".to_string(),
+                content: "durable answer".to_string(),
+                ..Default::default()
+            }]
+        };
+
+        let mut failed = state();
+        failed.apply_update(turn_complete(
+            "sess-1",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        assert_eq!(failed.last_error, Some(SessionError::TurnFailed));
+        failed.replace_history_after_notification_resync(
+            history(),
+            false,
+            ResyncNotice::Idle,
+            None,
+            None,
+        );
+        assert_eq!(failed.last_error, Some(SessionError::TurnFailed));
+        assert_eq!(failed.sidebar_status(), SidebarStatus::Errored);
+
+        let mut unreconciled = state();
+        unreconciled.last_error = Some(SessionError::ResyncFailed);
+        unreconciled.replace_history_after_notification_resync(
+            history(),
+            false,
+            ResyncNotice::Idle,
+            None,
+            None,
+        );
+        assert_eq!(unreconciled.last_error, None);
+        assert_eq!(unreconciled.sidebar_status(), SidebarStatus::Ready);
+    }
+
+    /// A daemon restart rebuilds the pane, and the rebuilt `ChatState` starts
+    /// with `last_error` clear. A failed last turn must keep its red dot; a
+    /// lost session is resolved by the rebuild's own re-attach and comes back
+    /// ready.
+    #[tokio::test]
+    async fn reconnect_rebuild_keeps_failed_turn_red_and_clears_session_lost() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let ChatPhase::Active(ref mut focused) = chat.phase else {
+            panic!("focused session must be active");
+        };
+        focused.apply_update(turn_complete(
+            "sess-a",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        assert_eq!(focused.last_error, Some(SessionError::TurnFailed));
+        chat.background[0].apply_update(turn_complete(
+            "sess-b",
+            TurnEndOutcome::Failed,
+            "prompt failed: session_not_found",
+        ));
+        assert_eq!(
+            chat.background[0].last_error,
+            Some(SessionError::SessionLost)
+        );
+
+        let entries = chat.resume_entries();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let mut rebuilt = state_for(&entry.session_id, &entry.agent_alias);
+            assert_eq!(rebuilt.sidebar_status(), SidebarStatus::Ready);
+            rebuilt.restore_reconnect_state(
+                entry.queue,
+                entry.interrupted,
+                entry.recovery_required,
+                entry.turn_failed,
+            );
+            match entry.session_id.as_str() {
+                "sess-a" => {
+                    assert_eq!(rebuilt.last_error, Some(SessionError::TurnFailed));
+                    assert_eq!(rebuilt.sidebar_status(), SidebarStatus::Errored);
+                }
+                "sess-b" => {
+                    assert_eq!(rebuilt.last_error, None);
+                    assert_eq!(rebuilt.sidebar_status(), SidebarStatus::Ready);
+                }
+                other => panic!("unexpected resume entry {other}"),
+            }
+        }
+    }
+
+    /// Render the production agent sidebar (`AgentSidebar::draw`) for every
+    /// session `chat` tracks and read the status dot back from the terminal
+    /// cells: `(session_id, glyph, foreground color)` per row, in sidebar
+    /// order. The rows are the same `session_summaries()` the app hands the
+    /// sidebar each frame.
+    fn rendered_sidebar_dots(chat: &Chat) -> Vec<(String, String, ratatui::style::Color)> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let rows = chat.session_summaries();
+        let area = Rect::new(0, 0, 24, 8);
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        let ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat.pane_kind),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Session rows start inside the panel border, one per line.
+        rows.iter()
+            .enumerate()
+            .map(|(i, summary)| {
+                let x = area.x + 1;
+                let y = area.y + 1 + i as u16;
+                let text = (x..area.x + area.width - 1)
+                    .map(|col| buf[(col, y)].symbol())
+                    .collect::<String>();
+                assert!(
+                    text.contains(summary.agent_alias.as_str()),
+                    "row {i} should show {}: {text:?}",
+                    summary.agent_alias
+                );
+                (
+                    summary.session_id.clone(),
+                    buf[(x, y)].symbol().to_string(),
+                    buf[(x, y)].fg,
+                )
+            })
+            .collect()
+    }
+
+    /// Final-interface check for the reconnect transition: the real sidebar
+    /// is drawn before the rebuild and again after a fresh `Chat` re-attached
+    /// every carried session through `init()` against a fake daemon. The
+    /// failed-turn session keeps its red dot; the session-lost one (the
+    /// connection-error control, resolved by the re-attach itself) comes back
+    /// green.
+    #[tokio::test]
+    async fn reconnect_rebuild_renders_failed_turn_red_and_recovered_session_lost_green() {
+        let red = theme::status_error_style().fg.expect("error dot color");
+        let green = theme::status_ready_style().fg.expect("ready dot color");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let mut chat = two_session_chat(&rpc);
+        let ChatPhase::Active(ref mut focused) = chat.phase else {
+            panic!("focused session must be active");
+        };
+        focused.apply_update(turn_complete(
+            "sess-a",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        chat.background[0].apply_update(turn_complete(
+            "sess-b",
+            TurnEndOutcome::Failed,
+            "prompt failed: session_not_found",
+        ));
+        assert_eq!(
+            rendered_sidebar_dots(&chat),
+            vec![
+                ("sess-a".to_string(), "\u{25cf}".to_string(), red),
+                ("sess-b".to_string(), "\u{25cf}".to_string(), red),
+            ],
+            "both sessions are red before the socket drops"
+        );
+
+        // The daemon restarted: the app layer snapshots the pane and builds a
+        // fresh one on the new socket, exactly as `app.rs` does.
+        let entries = chat.resume_entries();
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel::<String>(16);
+        let reconnect_rpc = Arc::new(RpcOutbound::new(reconnect_tx));
+        let reconnect_client = Arc::new(RpcClient::with_rpc(Arc::clone(&reconnect_rpc)));
+        let mut rebuilt = Chat::new(reconnect_client, PaneKind::Chat);
+        rebuilt.set_resume_sessions(entries);
+        let mut init = tokio::spawn(async move {
+            let _ = rebuilt.init().await;
+            rebuilt
+        });
+
+        // Fake daemon: answer whatever the rebuild asks for, by method, until
+        // `init` returns.
+        let rebuilt = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    joined = &mut init => break joined.expect("rebuild init task"),
+                    line = reconnect_rx.recv() => {
+                        let frame: serde_json::Value =
+                            serde_json::from_str(&line.expect("rpc channel open"))
+                                .expect("RPC request should be JSON");
+                        match frame["method"].as_str() {
+                            Some(method::AGENTS_STATUS) => respond_ok(
+                                &reconnect_rpc,
+                                &frame,
+                                serde_json::json!({
+                                    "agents": [
+                                        {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0},
+                                        {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                                    ]
+                                }),
+                            ),
+                            Some(method::SESSION_NEW) => {
+                                let sid = frame["params"]["session_id"].clone();
+                                respond_ok(
+                                    &reconnect_rpc,
+                                    &frame,
+                                    serde_json::json!({ "session_id": sid, "workspace_dir": "/w" }),
+                                );
+                            }
+                            Some(method::CONFIG_LIST) => {
+                                respond_ok(&reconnect_rpc, &frame, serde_json::json!([]));
+                            }
+                            Some(method::SESSION_MESSAGES) => respond_ok(
+                                &reconnect_rpc,
+                                &frame,
+                                serde_json::json!({
+                                    "messages": [
+                                        { "role": "user", "content": "ask" },
+                                        { "role": "assistant", "content": "durable answer" }
+                                    ],
+                                    "total": 2
+                                }),
+                            ),
+                            other => panic!("unexpected reconnect frame: {other:?}"),
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("reconnect rebuild should finish");
+
+        assert_eq!(
+            rendered_sidebar_dots(&rebuilt),
+            vec![
+                ("sess-a".to_string(), "\u{25cf}".to_string(), red),
+                ("sess-b".to_string(), "\u{25cf}".to_string(), green),
+            ],
+            "after the rebuild the failed turn stays red; the re-attached lost session is green"
+        );
+        assert_eq!(
+            rebuilt.state_for_session("sess-a").unwrap().last_error,
+            Some(SessionError::TurnFailed)
+        );
+        assert_eq!(
+            rebuilt.state_for_session("sess-b").unwrap().last_error,
+            None
+        );
+    }
+
+    /// Final-interface check for the notification-lag transition: a channel
+    /// overflow reloads every tracked session from a fake daemon, then the
+    /// real sidebar is drawn. The failed-turn session keeps its red dot; the
+    /// session whose earlier reload had failed (the connection-error control)
+    /// recovers to green.
+    #[tokio::test]
+    async fn notification_lag_reload_renders_failed_turn_red_and_recovered_resync_failed_green() {
+        let red = theme::status_error_style().fg.expect("error dot color");
+        let green = theme::status_ready_style().fg.expect("ready dot color");
+
+        let (tx, mut writer_rx) = mpsc::channel::<String>(32);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut failed = state_for("sess-failed", "alpha");
+        failed.push_user_message(Some("ask".to_string()), Vec::new());
+        failed.apply_update(turn_complete(
+            "sess-failed",
+            TurnEndOutcome::Failed,
+            "daily cost limit exceeded",
+        ));
+        let mut unreconciled = state_for("sess-unreconciled", "beta");
+        unreconciled.last_error = Some(SessionError::ResyncFailed);
+        chat.phase = ChatPhase::Active(Box::new(failed));
+        chat.background.push(unreconciled);
+        chat.session_order = vec!["sess-failed".to_string(), "sess-unreconciled".to_string()];
+        assert_eq!(
+            rendered_sidebar_dots(&chat),
+            vec![
+                ("sess-failed".to_string(), "\u{25cf}".to_string(), red),
+                ("sess-unreconciled".to_string(), "\u{25cf}".to_string(), red),
+            ],
+            "both sessions are red before the lag"
+        );
+
+        // Overflow the 64-frame notification channel so the drain reports
+        // Lagged and reloads every tracked session.
+        for _ in 0..65 {
+            chat.rpc
+                .push_notification_for_test("session/update", serde_json::Value::Null);
+        }
+        chat.drain_notifications();
+        assert!(chat.session_resync_in_flight.contains_key("sess-failed"));
+        assert!(
+            chat.session_resync_in_flight
+                .contains_key("sess-unreconciled")
+        );
+
+        // Fake daemon: both sessions are idle with a readable transcript.
+        for _ in 0..4 {
+            let frame = next_rpc_request(&mut writer_rx, "lag recovery reloads each session").await;
+            let sid = frame["params"]["session_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            match frame["method"].as_str() {
+                Some(method::SESSION_STATE) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({ "session_id": sid, "state": "idle" }),
+                ),
+                Some(method::SESSION_MESSAGES) => respond_ok(
+                    &outbound,
+                    &frame,
+                    serde_json::json!({
+                        "messages": [
+                            { "role": "user", "content": "ask" },
+                            { "role": "assistant", "content": "durable answer" }
+                        ],
+                        "total": 2
+                    }),
+                ),
+                other => panic!("unexpected recovery frame: {other:?}"),
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both sessions should finish resync");
+        chat.tick_transport_events();
+        assert!(chat.session_resync_in_flight.is_empty());
+
+        assert_eq!(
+            rendered_sidebar_dots(&chat),
+            vec![
+                ("sess-failed".to_string(), "\u{25cf}".to_string(), red),
+                (
+                    "sess-unreconciled".to_string(),
+                    "\u{25cf}".to_string(),
+                    green
+                ),
+            ],
+            "after the lag reload the failed turn stays red; the recovered reload is green"
+        );
+        assert_eq!(
+            chat.state_for_session("sess-failed").unwrap().last_error,
+            Some(SessionError::TurnFailed)
+        );
+        assert_eq!(
+            chat.state_for_session("sess-unreconciled")
+                .unwrap()
+                .last_error,
+            None
+        );
     }
 
     #[tokio::test]
@@ -18768,7 +19564,7 @@ mod tests {
         assert!(!state.turn_in_flight);
         assert!(state.lag_reattach.is_none());
         assert_eq!(
-            state.queue_paused,
+            state.message_queue.pause_reason(),
             Some(QueuePauseReason::MissingCompletion),
             "the reload must retain why queued work paused"
         );
@@ -19716,11 +20512,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_session_swaps_states_and_preserves_transcripts() {
+    async fn session_shortcut_focus_swaps_states_and_preserves_running_transcripts() {
         let (tx, _rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let mut chat = two_session_chat(&rpc);
         if let ChatPhase::Active(a) = &mut chat.phase {
+            a.turn_in_flight = true;
             a.entries
                 .push(ChatEntry::SystemMessage(Arc::<str>::from("from-a")));
             a.rebuild_lines(40);
@@ -19761,6 +20558,11 @@ mod tests {
             .iter()
             .find(|s| s.session_id == "sess-a")
             .expect("previous session stays tracked");
+        assert!(
+            a.turn_in_flight,
+            "switching must not cancel the running session"
+        );
+        assert_eq!(a.sidebar_status(), SidebarStatus::Running);
         assert!(matches!(&a.entries[0], ChatEntry::SystemMessage(m) if m.as_ref() == "from-a"));
         assert_eq!(a.transcript_layout.view().dirty, LinesDirty::Clean);
         assert_eq!(a.transcript_layout.view().cached_lines, cached_a);
@@ -20229,13 +21031,11 @@ mod tests {
         chat.session_order.push("sess-f".to_string());
         chat.session_order.push("sess-bg".to_string());
         let mut retained = resume_entry("sess-bg", "alpha", false);
-        retained.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "queued while disconnected".to_string(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
-        retained.queue.next_id = 1;
+        retained
+            .queue
+            .message_queue
+            .enqueue("queued while disconnected".to_string(), Vec::new())
+            .unwrap();
         chat.resume_backgrounds.push(retained);
 
         let retry = tokio::spawn(async move {
@@ -23236,12 +24036,11 @@ mod tests {
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Chat);
         let mut retained = resume_entry("sess-failed", "beta", true);
-        retained.queue.messages.push_back(QueuedMessage {
-            id: 0,
-            text: "retained queue".into(),
-            attachments: Vec::new(),
-            status: QueueItemStatus::Pending,
-        });
+        retained
+            .queue
+            .message_queue
+            .enqueue("retained queue".into(), Vec::new())
+            .unwrap();
         chat.set_resume_sessions(vec![retained]);
         let add = tokio::spawn(async move {
             chat.add_agent_session("alpha").await;
@@ -23268,7 +24067,7 @@ mod tests {
         assert_eq!(chat.current_session_id(), Some("sess-new"));
         assert_eq!(chat.resume_backgrounds[0].session_id, "sess-failed");
         assert_eq!(
-            chat.resume_backgrounds[0].queue.messages[0].text,
+            chat.resume_backgrounds[0].queue.message_queue.items()[0].text,
             "retained queue"
         );
         assert_eq!(chat.tracked_session_count(), 2);
@@ -24649,7 +25448,12 @@ mod tests {
             if abandon {
                 chat.on_pane_blur();
                 assert_eq!(
-                    chat.resume_focused.as_ref().unwrap().queue.messages.len(),
+                    chat.resume_focused
+                        .as_ref()
+                        .unwrap()
+                        .queue
+                        .message_queue
+                        .len(),
                     1
                 );
             } else {
@@ -25014,6 +25818,82 @@ mod tests {
         assert_eq!(s.current_agent_text(), "Hello world");
     }
 
+    fn budget_warning(current_usd: f64, limit_usd: f64, period: &str) -> SessionUpdate {
+        SessionUpdate::BudgetWarning {
+            session_id: "sess-1".to_string(),
+            current_usd,
+            limit_usd,
+            period: period.to_string(),
+        }
+    }
+
+    fn system_messages(s: &ChatState) -> Vec<String> {
+        s.entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::SystemMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn budget_warning_shows_one_notice_per_period_and_limit() {
+        let mut s = state();
+        s.apply_update(budget_warning(8.25, 10.0, "day"));
+        // The daemon repeats it every turn while spend stays over the line.
+        s.apply_update(budget_warning(9.10, 10.0, "day"));
+        let notices = system_messages(&s);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("8.25"), "{}", notices[0]);
+        assert!(notices[0].contains("10.00"), "{}", notices[0]);
+        assert!(notices[0].contains("82%"), "{}", notices[0]);
+        assert!(notices[0].contains("daily"), "{}", notices[0]);
+
+        // A raised limit or the other period is news again.
+        s.apply_update(budget_warning(16.5, 20.0, "day"));
+        s.apply_update(budget_warning(850.0, 1000.0, "month"));
+        let notices = system_messages(&s);
+        assert_eq!(notices.len(), 3, "{notices:?}");
+        assert!(notices[2].contains("monthly"), "{}", notices[2]);
+
+        // Coming back to a pair already shown stays quiet, even after others.
+        s.apply_update(budget_warning(8.75, 10.0, "day"));
+        assert_eq!(system_messages(&s).len(), 3);
+    }
+
+    #[test]
+    fn a_new_session_shows_its_own_budget_warning() {
+        let mut s = state();
+        s.apply_update(budget_warning(8.25, 10.0, "day"));
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.apply_update(SessionUpdate::BudgetWarning {
+            session_id: "sess-2".to_string(),
+            current_usd: 8.5,
+            limit_usd: 10.0,
+            period: "day".to_string(),
+        });
+        let notices = system_messages(&s);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("8.50"), "{}", notices[0]);
+    }
+
+    #[test]
+    fn budget_warning_for_another_session_is_ignored() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::BudgetWarning {
+            session_id: "other".to_string(),
+            current_usd: 8.25,
+            limit_usd: 10.0,
+            period: "day".to_string(),
+        });
+        assert!(system_messages(&s).is_empty());
+    }
+
     #[test]
     fn history_trimmed_update_adds_visible_system_notice() {
         let mut s = state();
@@ -25353,6 +26233,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tool_result_rerenders_only_the_tail_card_and_matches_full_rebuild() {
+        let mut s = state();
+        for id in ["tc1", "tc2"] {
+            s.apply_update(SessionUpdate::ToolCall {
+                session_id: "sess-1".to_string(),
+                tool_call_id: id.to_string(),
+                name: "shell".to_string(),
+                raw_input: serde_json::json!({"command": id}),
+            });
+        }
+        let width = 60;
+        s.rebuild_lines(width);
+
+        // Tail result: incremental tail path, identical to a full rebuild.
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc2".to_string(),
+            raw_output: "tail output\n".to_string(),
+        });
+        assert_eq!(s.transcript_layout.view().dirty, LinesDirty::TailChanged(1));
+        s.rebuild_lines(width);
+        let incremental = s.transcript_layout.view().cached_lines.clone();
+        s.transcript_layout.invalidate_full();
+        s.rebuild_lines(width);
+        assert_eq!(incremental, s.transcript_layout.view().cached_lines);
+
+        // Non-tail result (parallel tool calls) still renders correctly.
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc1".to_string(),
+            raw_output: "earlier output\n".to_string(),
+        });
+        s.rebuild_lines(width);
+        let fallback = s.transcript_layout.view().cached_lines.clone();
+        s.transcript_layout.invalidate_full();
+        s.rebuild_lines(width);
+        assert_eq!(fallback, s.transcript_layout.view().cached_lines);
     }
 
     #[test]
@@ -26215,7 +27135,7 @@ mod tests {
             state
                 .enqueue_message("delete me".to_string(), Vec::new())
                 .expect("queue message");
-            state.message_queue[0].id
+            state.message_queue.items()[0].id
         };
         let old_queue = Rect::new(50, 4, 24, 8);
         let moved_queue = Rect::new(50, 12, 24, 8);
@@ -26288,7 +27208,7 @@ mod tests {
                 let state = active_state(&mut chat);
                 state.enqueue_message("first".into(), Vec::new()).unwrap();
                 state.enqueue_message("second".into(), Vec::new()).unwrap();
-                let selected = state.message_queue[1].id;
+                let selected = state.message_queue.items()[1].id;
                 state.select_queued_by_id(selected);
                 let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
                 terminal
@@ -26341,7 +27261,7 @@ mod tests {
                     chat.handle_queue_mouse(event(kind), queue).await;
                 }
                 let state = active_state(&mut chat);
-                assert_eq!(state.queue_sel, Some(selected), "{overlay}");
+                assert_eq!(state.message_queue.selected(), Some(selected), "{overlay}");
                 assert_eq!(state.queue_scroll, 0, "{overlay}");
                 assert!(state.context_menu.is_none(), "{overlay}");
 
@@ -26399,7 +27319,7 @@ mod tests {
             .enqueue_message("retained".into(), Vec::new())
             .unwrap();
         state.queue_sidebar_rect = Some(Rect::new(1, 1, 22, 8));
-        state.queue_item_rects = vec![(state.message_queue[0].id, Rect::new(1, 1, 22, 1))];
+        state.queue_item_rects = vec![(state.message_queue.items()[0].id, Rect::new(1, 1, 22, 1))];
         chat.stash_active();
         chat.handle_queue_mouse(
             MouseEvent {
@@ -26431,7 +27351,7 @@ mod tests {
             state
                 .enqueue_message("delete me".to_string(), Vec::new())
                 .expect("queue message");
-            state.message_queue[0].id
+            state.message_queue.items()[0].id
         };
         let conversation = Rect::new(0, 0, 56, 24);
         let queue = Rect::new(56, 0, 24, 3);
@@ -26650,6 +27570,180 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // Keep process-global overrides stable across rendering and async dispatch.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn paused_queue_hints_follow_resolved_bindings_in_rendered_input_bar() {
+        use crate::keymap::{ChatTabAction, Chord, InputBarAction as KeymapInputAction, overrides};
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        const CHILD_ENV: &str = "ZEROCODE_QUEUE_HINT_TEST_CHILD";
+        const CHILD_SUCCESS: &str = "queue hint rendering and dispatch matrix passed";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "chat::tests::paused_queue_hints_follow_resolved_bindings_in_rendered_input_bar",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "queue hint subprocess failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_SUCCESS),
+                "queue hint subprocess did not execute the full matrix",
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        overrides::reset();
+        struct ResetBindings;
+        impl Drop for ResetBindings {
+            fn drop(&mut self) {
+                overrides::reset();
+            }
+        }
+        let _reset = ResetBindings;
+        let enter = Chord::key(KeyCode::Enter);
+        let alt_p = Chord::with(KeyCode::Char('p'), KeyModifiers::ALT);
+        let f5 = Chord::key(KeyCode::F(5));
+        let f6 = Chord::key(KeyCode::F(6));
+
+        for (send, resume) in [
+            (Some(enter), Some(alt_p)),
+            (Some(f5.clone()), Some(f6.clone())),
+            (None, Some(f6)),
+            (Some(f5), None),
+            (None, None),
+        ] {
+            overrides::set_row(
+                KeymapInputAction::TAG,
+                &KeymapInputAction::Submit.variant_name(),
+                send.clone().into_iter().collect(),
+            );
+            overrides::set_row(
+                ChatTabAction::TAG,
+                &ChatTabAction::PauseResumeQueue.variant_name(),
+                resume.clone().into_iter().collect(),
+            );
+            assert_eq!(
+                send_chord_label(),
+                send.as_ref().map(Chord::display).unwrap_or_default()
+            );
+            assert_eq!(
+                resume_queue_chord_label(),
+                resume.as_ref().map(Chord::display).unwrap_or_default()
+            );
+
+            for missing_completion in [false, true] {
+                // Exercise each advertised key independently against both pause reasons.
+                let keys: Vec<_> = send
+                    .iter()
+                    .chain(resume.iter())
+                    .cloned()
+                    .map(Some)
+                    .collect();
+                let keys = if keys.is_empty() { vec![None] } else { keys };
+                for key in keys {
+                    let (mut chat, _writer_rx) = test_chat();
+                    let mut paused = state();
+                    paused.turn_in_flight = true;
+                    paused
+                        .enqueue_message("queued".to_string(), Vec::new())
+                        .unwrap();
+                    paused.commit_turn(String::new(), false);
+                    if missing_completion {
+                        paused
+                            .message_queue
+                            .settle_turn(false, QueuePauseReason::MissingCompletion);
+                    }
+                    assert!(paused.queue_paused());
+                    let hint = paused_queue_hint(paused.message_queue.pause_reason());
+                    match send.as_ref().or(resume.as_ref()) {
+                        Some(primary) => assert!(hint.contains(&primary.display()), "{hint}"),
+                        None => assert_eq!(hint, crate::i18n::t("zc-queue-paused-no-key-ghost")),
+                    }
+                    if send
+                        .as_ref()
+                        .is_none_or(|chord| chord.code != KeyCode::Enter)
+                    {
+                        assert!(!hint.contains("Enter"), "{hint}");
+                    }
+                    if !missing_completion && let Some(resume) = &resume {
+                        assert!(hint.contains(&resume.display()), "{hint}");
+                    }
+                    chat.phase = ChatPhase::Active(Box::new(paused));
+
+                    let width = if missing_completion { 80 } else { 120 };
+                    let dock_width = crate::config::SidebarSection::default().width;
+                    let area = Rect::new(0, 0, width, 24);
+                    let conversation = Rect::new(0, 0, width - dock_width, area.height);
+                    let queue = Rect::new(conversation.width, 0, dock_width, 3);
+                    let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+                    terminal
+                        .draw(|frame| chat.draw_with_dock(frame, conversation, Some(queue), None))
+                        .unwrap();
+                    let rendered = overlay_text(&terminal, area);
+                    let row = rendered
+                        .lines()
+                        .find(|row| row.contains(&hint))
+                        .unwrap_or_else(|| panic!("paused hint not rendered: {rendered}"));
+                    println!("{width}x24 terminal cells: {}", row.trim_end());
+
+                    let mut term: crate::config_manager::Term = Terminal::with_options(
+                        crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                        ratatui::TerminalOptions {
+                            viewport: ratatui::Viewport::Fixed(area),
+                        },
+                    )
+                    .unwrap();
+                    if send
+                        .as_ref()
+                        .is_none_or(|chord| chord.code != KeyCode::Enter)
+                    {
+                        chat.handle_key(
+                            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                            &mut term,
+                        )
+                        .await;
+                        assert!(
+                            active_state(&mut chat).queue_paused(),
+                            "unbound Enter must not resume"
+                        );
+                    }
+                    if let Some(key) = key {
+                        chat.handle_key(
+                            KeyEvent::new(key.code, key.effective_modifiers()),
+                            &mut term,
+                        )
+                        .await;
+                        assert!(
+                            !active_state(&mut chat).queue_paused(),
+                            "{} must resume",
+                            key.display()
+                        );
+                        assert!(
+                            active_state(&mut chat).turn_in_flight,
+                            "resume must dispatch the queued message"
+                        );
+                    }
+                }
+            }
+        }
+        println!("{CHILD_SUCCESS}");
     }
 
     #[test]
@@ -28849,14 +29943,14 @@ mod tests {
         s.turn_in_flight = true;
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
         s.enqueue_message("b".to_string(), Vec::new()).unwrap();
-        let second = s.message_queue[1].id;
+        let second = s.message_queue.items()[1].id;
         assert!(s.select_queued_by_id(second));
-        assert_eq!(s.queue_sel, Some(second));
+        assert_eq!(s.message_queue.selected(), Some(second));
         // Re-selecting the same id reports no change.
         assert!(!s.select_queued_by_id(second));
         // Unknown id is ignored.
         assert!(!s.select_queued_by_id(9999));
-        assert_eq!(s.queue_sel, Some(second));
+        assert_eq!(s.message_queue.selected(), Some(second));
     }
 
     #[test]
@@ -28917,14 +30011,15 @@ mod tests {
             .unwrap();
         s.enqueue_message("ordinary two".to_string(), Vec::new())
             .unwrap();
-        let promoted_id = s.message_queue[2].id;
-        s.queue_paused = Some(QueuePauseReason::Generic);
+        let promoted_id = s.message_queue.items()[2].id;
+        s.toggle_queue_pause();
 
         assert!(s.promote_queued_by_id(promoted_id));
         assert!(!s.queue_paused());
-        assert!(s.resume_override);
+        assert!(s.message_queue.resume_override());
         assert_eq!(
             s.message_queue
+                .items()
                 .iter()
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
@@ -28935,7 +30030,7 @@ mod tests {
                 "ordinary two"
             ]
         );
-        let promoted = &s.message_queue[1];
+        let promoted = &s.message_queue.items()[1];
         assert_eq!(promoted.id, promoted_id);
         assert_eq!(promoted.status, QueueItemStatus::Injected);
         assert_eq!(promoted.attachments.len(), 1);
@@ -28948,12 +30043,13 @@ mod tests {
         s.turn_in_flight = true;
         s.inject_message("first".to_string(), Vec::new()).unwrap();
         s.inject_message("second".to_string(), Vec::new()).unwrap();
-        let second_id = s.message_queue[1].id;
+        let second_id = s.message_queue.items()[1].id;
 
         assert!(s.promote_queued_by_id(second_id));
         assert!(s.promote_queued_by_id(second_id));
         assert_eq!(
             s.message_queue
+                .items()
                 .iter()
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
@@ -28967,7 +30063,7 @@ mod tests {
         s.turn_in_flight = true;
         s.enqueue_message("first".to_string(), Vec::new()).unwrap();
         s.enqueue_message("second".to_string(), Vec::new()).unwrap();
-        let second_id = s.message_queue[1].id;
+        let second_id = s.message_queue.items()[1].id;
         let transcript_bounds = Rect::new(5, 2, 30, 12);
         s.transcript_snapshot = Some(transcript_snapshot(
             transcript_bounds,
@@ -28975,12 +30071,12 @@ mod tests {
         ));
         s.queue_sidebar_rect = Some(Rect::new(40, 2, 30, 3));
         s.queue_item_rects = vec![
-            (s.message_queue[0].id, Rect::new(41, 3, 28, 1)),
+            (s.message_queue.items()[0].id, Rect::new(41, 3, 28, 1)),
             (second_id, Rect::new(41, 4, 28, 1)),
         ];
 
         assert!(s.open_queue_context_menu(45, 4));
-        assert_eq!(s.queue_sel, Some(second_id));
+        assert_eq!(s.message_queue.selected(), Some(second_id));
         let menu = s.context_menu.as_ref().expect("queue menu opens");
         assert_eq!(menu.target.actions(), QUEUE_CONTEXT_ACTIONS);
         assert!(matches!(menu.target, ChatContextMenuTarget::Queue(id) if id == second_id));
@@ -29024,14 +30120,17 @@ mod tests {
             .unwrap();
         s.ensure_queue_selection();
         let id = s.selected_queue_id().unwrap();
-        let before_selection = s.queue_sel;
+        let before_selection = s.message_queue.selected();
 
         assert_eq!(s.queued_text(id).as_deref(), Some("copy me"));
         assert_eq!(s.queue_len(), 1);
-        assert_eq!(s.queue_sel, before_selection);
-        assert_eq!(s.message_queue[0].id, id);
-        assert_eq!(s.message_queue[0].status, QueueItemStatus::Pending);
-        assert_eq!(s.message_queue[0].attachments[0].filename, "keep.txt");
+        assert_eq!(s.message_queue.selected(), before_selection);
+        assert_eq!(s.message_queue.items()[0].id, id);
+        assert_eq!(s.message_queue.items()[0].status, QueueItemStatus::Pending);
+        assert_eq!(
+            s.message_queue.items()[0].attachments[0].filename,
+            "keep.txt"
+        );
     }
 
     #[tokio::test]
@@ -29045,7 +30144,7 @@ mod tests {
         active
             .enqueue_message("send now".to_string(), Vec::new())
             .unwrap();
-        let id = active.message_queue[0].id;
+        let id = active.message_queue.items()[0].id;
         chat.phase = ChatPhase::Active(Box::new(active));
 
         let first = tokio::spawn(async move {
@@ -29077,7 +30176,10 @@ mod tests {
             panic!("expected active chat");
         };
         assert!(matches!(state.turn_status, TurnStatus::Cancelling));
-        assert_eq!(state.message_queue[0].status, QueueItemStatus::Injected);
+        assert_eq!(
+            state.message_queue.items()[0].status,
+            QueueItemStatus::Injected
+        );
 
         chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
             id,
@@ -29103,7 +30205,7 @@ mod tests {
         active
             .enqueue_message("recover me".to_string(), Vec::new())
             .unwrap();
-        let id = active.message_queue[0].id;
+        let id = active.message_queue.items()[0].id;
         chat.phase = ChatPhase::Active(Box::new(active));
 
         let action = tokio::spawn(async move {
@@ -29211,7 +30313,10 @@ mod tests {
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
         assert!(s.queue_sidebar_open(), "non-empty queue → sidebar open");
         s.ensure_queue_selection();
-        assert!(s.queue_sel.is_some(), "first enqueue seeds a selection");
+        assert!(
+            s.message_queue.selected().is_some(),
+            "first enqueue seeds a selection"
+        );
         s.delete_selected_queued();
         assert!(
             !s.queue_sidebar_open(),
@@ -29428,7 +30533,7 @@ mod tests {
         let mut s = state();
         s.turn_in_flight = true;
         s.enqueue_message("a".to_string(), Vec::new()).unwrap();
-        s.queue_paused = Some(QueuePauseReason::Generic);
+        s.toggle_queue_pause();
         s.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(1, 1, 6, 1),
             text: Arc::<str>::from("stale"),
@@ -29471,7 +30576,7 @@ mod tests {
     fn queue_cap_enforced() {
         let mut s = state();
         s.turn_in_flight = true;
-        for i in 0..ChatState::QUEUE_CAP {
+        for i in 0..MessageQueue::CAPACITY {
             s.enqueue_message(format!("m{i}"), Vec::new()).unwrap();
         }
         assert!(
@@ -30066,6 +31171,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_tool_rounds_notifications_reach_final_chat_and_code_cells_in_order() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/single-tool-rounds.json"
+        )))
+        .unwrap();
+        let notice = fixture["unsupported_notice"].as_str().unwrap();
+        for pane in [PaneKind::Chat, PaneKind::Acp] {
+            for unsupported in [false, true] {
+                for width in [120, 160] {
+                    let (mut chat, _writer_rx) = test_chat();
+                    chat.pane_kind = pane;
+                    let mut active = state();
+                    active.turn_in_flight = true;
+                    for id in ["call-one", "call-two"] {
+                        active
+                            .tool_disclosures
+                            .insert(id.into(), ToolDisclosure::Full);
+                    }
+                    chat.phase = ChatPhase::Active(Box::new(active));
+                    let mut updates = fixture["updates"].as_array().unwrap().clone();
+                    if unsupported {
+                        updates.insert(0, serde_json::json!({
+                            "method": "session/update",
+                            "params": {"type": "agent_message_chunk", "session_id": "sess-1", "text": format!("{notice}\n\n")}
+                        }));
+                    }
+                    let area = Rect::new(0, 0, width, 48);
+                    let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+                    let mut ordered = Vec::new();
+                    for update in &updates {
+                        chat.rpc.push_notification_for_test(
+                            update["method"].as_str().unwrap(),
+                            update["params"].clone(),
+                        );
+                        chat.tick_transport_events();
+                        terminal
+                            .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+                            .unwrap();
+                        let params = &update["params"];
+                        let token = match params["type"].as_str().unwrap() {
+                            "agent_message_chunk" => params["text"].as_str().unwrap(),
+                            "tool_call" => "[tool: echo]",
+                            "tool_result" => params["raw_output"].as_str().unwrap(),
+                            _ => unreachable!(),
+                        };
+                        if !token.contains(notice) {
+                            ordered.push(token);
+                        }
+                        let rendered = overlay_text(&terminal, area);
+                        let normalized = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let mut remainder = normalized.as_str();
+                        for token in &ordered {
+                            let offset = remainder.find(token).unwrap_or_else(|| {
+                                panic!(
+                                    "missing or out-of-order {token} at width {width}: {rendered}"
+                                )
+                            });
+                            remainder = &remainder[offset + token.len()..];
+                        }
+                        assert_eq!(
+                            normalized.matches(notice).count(),
+                            usize::from(unsupported),
+                            "notice count at width {width}: {rendered}"
+                        );
+                        assert_eq!(
+                            rendered.matches("[tool: echo]").count(),
+                            ordered
+                                .iter()
+                                .filter(|token| **token == "[tool: echo]")
+                                .count(),
+                            "wrong tool-card count at width {width}: {rendered}"
+                        );
+                        for token in [
+                            "before-first",
+                            "result-1",
+                            "after-first",
+                            "result-2",
+                            "done",
+                        ] {
+                            assert_eq!(
+                                rendered.matches(token).count(),
+                                usize::from(ordered.contains(&token)),
+                                "wrong count for {token}: {rendered}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn prompt_completion_settles_turn_when_terminal_update_is_missing() {
         let (mut chat, mut writer_rx) = test_chat();
         let mut active = state();
@@ -30093,7 +31293,7 @@ mod tests {
         assert!(matches!(active.turn_status, TurnStatus::Idle));
         assert!(active.queue_paused());
         assert_eq!(
-            active.queue_paused,
+            active.message_queue.pause_reason(),
             Some(QueuePauseReason::MissingCompletion)
         );
         assert_eq!(active.queue_len(), 1);
@@ -30110,7 +31310,10 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         let hint = crate::i18n::t_args(
             "zc-queue-missing-completion-ghost",
-            &[("key", &resume_queue_chord_label())],
+            &[
+                ("key", &resume_queue_chord_label()),
+                ("send", &send_chord_label()),
+            ],
         );
         let dock_width = crate::config::SidebarSection::default().width;
         for width in [80, 120] {
@@ -30193,7 +31396,7 @@ mod tests {
             let active = active_state(&mut chat);
             assert!(!active.turn_in_flight, "{scenario}");
             assert_eq!(
-                active.queue_paused,
+                active.message_queue.pause_reason(),
                 Some(QueuePauseReason::Generic),
                 "{scenario}"
             );
@@ -30304,7 +31507,10 @@ mod tests {
         chat.drain_notifications();
 
         let active = active_state(&mut chat);
-        assert_eq!(active.queue_paused, Some(QueuePauseReason::Generic));
+        assert_eq!(
+            active.message_queue.pause_reason(),
+            Some(QueuePauseReason::Generic)
+        );
         assert!(
             active.take_next_dispatchable().is_none(),
             "a late signal must not resume work"
@@ -30745,7 +31951,10 @@ mod tests {
         chat.drain_prompt_completions();
 
         let active = active_state(&mut chat);
-        assert_eq!(active.queue_paused, Some(QueuePauseReason::Generic));
+        assert_eq!(
+            active.message_queue.pause_reason(),
+            Some(QueuePauseReason::Generic)
+        );
         assert!(active.take_next_dispatchable().is_none());
         assert!(!active.turn_in_flight);
         assert!(
@@ -30762,6 +31971,164 @@ mod tests {
         assert!(
             active.info_message.is_some(),
             "the dispatch error must be surfaced"
+        );
+        let queued: Vec<_> = active
+            .message_queue
+            .items()
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(
+            queued,
+            vec!["busy prompt".to_string(), "queued follow-up".to_string()],
+            "a busy refusal never ran the message, so it returns to the queue"
+        );
+        assert!(
+            active.queue_paused(),
+            "the requeued message waits for an explicit resume, not a retry loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_session_busy_requeues_ahead_of_pending_with_attachments() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let clip = dir.path().join("shot.png");
+        std::fs::write(&clip, b"png").expect("write clipboard attachment");
+        let mut active = state();
+        active
+            .enqueue_message("first".to_string(), vec![clipboard_att(&clip, "shot.png")])
+            .unwrap();
+        active
+            .enqueue_message("second".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "first prompt should be sent").await;
+        assert_eq!(request["params"]["prompt"], "first");
+        respond_err(
+            &chat.rpc_out,
+            &request,
+            crate::jsonrpc::error_codes::SESSION_BUSY,
+            "Session busy: Timed out waiting for session sess-1",
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        let queued: Vec<_> = active
+            .message_queue
+            .items()
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(queued, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(active.message_queue.items()[0].attachments.len(), 1);
+        assert!(
+            clip.exists(),
+            "settling a refused turn must not delete the requeued clipboard temp"
+        );
+        assert!(active.queue_paused());
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "a paused queue must not redispatch into the busy session"
+        );
+    }
+
+    /// `Injected` items bypass the pause, so a refused inject that kept its
+    /// status would be retried straight back into the busy session. It must
+    /// come back as `Pending`, wait out the pause, and go out once on resume
+    /// with its text and attachment intact.
+    #[tokio::test]
+    async fn prompt_session_busy_requeues_injected_as_pending_until_resume() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let clip = dir.path().join("shot.png");
+        std::fs::write(&clip, b"png").expect("write clipboard attachment");
+        let mut active = state();
+        active
+            .inject_message("urgent".to_string(), vec![clipboard_att(&clip, "shot.png")])
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "injected prompt should be sent").await;
+        assert_eq!(request["params"]["prompt"], "urgent");
+        respond_err(
+            &chat.rpc_out,
+            &request,
+            crate::jsonrpc::error_codes::SESSION_BUSY,
+            "Session busy: Timed out waiting for session sess-1",
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        assert_eq!(active.queue_len(), 1);
+        assert_eq!(active.message_queue.items()[0].text, "urgent");
+        assert_eq!(
+            active.message_queue.items()[0].status,
+            QueueItemStatus::Pending,
+            "a refused inject must not keep the status that bypasses the pause"
+        );
+        assert_eq!(active.message_queue.items()[0].attachments.len(), 1);
+        assert!(active.queue_paused());
+        assert!(
+            !active.entries.iter().any(|entry| matches!(
+                entry,
+                ChatEntry::UserMessage { text: Some(text), .. } if text.as_ref() == "urgent"
+            )),
+            "the refused message lives in the queue, not as a transcript row"
+        );
+        chat.pump_all_queues();
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "the paused queue must not redispatch the refused inject"
+        );
+
+        active_state(&mut chat).resume_queue();
+        chat.pump_all_queues();
+        let retry = next_rpc_request(&mut writer_rx, "resume sends the refused inject").await;
+        assert_eq!(retry["method"], method::SESSION_PROMPT);
+        assert_eq!(retry["params"]["prompt"], "urgent");
+        assert_eq!(
+            retry["params"]["attachments"].as_array().map(Vec::len),
+            Some(1),
+            "the retry carries the original attachment"
+        );
+        assert!(
+            clip.exists(),
+            "the attachment temp survives until the retry runs"
+        );
+        assert_eq!(active_state(&mut chat).queue_len(), 0);
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "the refused inject is sent exactly once on resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_non_busy_error_does_not_requeue() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("bad prompt".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt should be sent").await;
+        respond_err(
+            &chat.rpc_out,
+            &request,
+            crate::jsonrpc::error_codes::INVALID_PARAMS,
+            "bad params",
+        );
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        assert_eq!(
+            active_state(&mut chat).queue_len(),
+            0,
+            "only a refusal issued before the turn started requeues"
         );
     }
 
@@ -30795,6 +32162,55 @@ mod tests {
             unreachable!();
         };
         active
+    }
+
+    // Up/Down are also chat browse chords. While the slash-command popup is
+    // open they must move its highlight, not scroll the transcript.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn arrow_keys_move_the_slash_command_highlight_in_chat_and_code() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let mut chat = chat_with_active_input(kind);
+            {
+                let state = active_state(&mut chat);
+                state.input_bar.clear_input();
+                state.input_bar.insert_text("/");
+                let (count, index, open) = state.input_bar.autocomplete_snapshot();
+                assert!(open && count >= 2);
+                assert_eq!(index, Some(0));
+            }
+            let mut term = key_term();
+
+            chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+                .await;
+            assert_eq!(
+                active_state(&mut chat).input_bar.autocomplete_snapshot().1,
+                Some(1),
+                "{kind:?}: Down must move the highlight"
+            );
+            chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut term)
+                .await;
+            assert_eq!(
+                active_state(&mut chat).input_bar.autocomplete_snapshot().1,
+                Some(0),
+                "{kind:?}: Up must move the highlight"
+            );
+
+            chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+                .await;
+            let state = active_state(&mut chat);
+            assert!(
+                !state.input_bar.autocomplete_snapshot().2,
+                "{kind:?}: Esc must close the popup"
+            );
+            assert!(!state.in_browse_mode());
+        }
     }
 
     // Keymap overrides are process-global; retain the existing test lock across
@@ -30873,6 +32289,86 @@ mod tests {
                 !chat.wants_quit_chord(&copy),
                 "browse mode must not claim input copy"
             );
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn composer_vertical_navigation_precedes_transcript_in_chat_and_code() {
+        use crate::keymap::{Chord, InputBarAction as A, overrides};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for (text, width) in [("alpha\nbravo", 30), ("alpha bravo delta", 9)] {
+                let mut chat = chat_with_active_input(kind);
+                let active = active_state(&mut chat);
+                active.input_bar.load_for_edit(text.into(), Vec::new());
+                let mut renderer =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 12)).unwrap();
+                renderer
+                    .draw(|frame| {
+                        active.input_bar.render(
+                            frame,
+                            Rect::new(0, 0, width, 12),
+                            false,
+                            true,
+                            &TurnStatus::Idle,
+                            Instant::now(),
+                            None,
+                        );
+                    })
+                    .unwrap();
+                chat.handle_key(up, &mut term).await;
+                assert!(active_state(&mut chat).input_bar.cursor() < text.len());
+                chat.handle_key(down, &mut term).await;
+                assert_eq!(active_state(&mut chat).input_bar.cursor(), text.len());
+                assert_eq!(active_state(&mut chat).input_bar.input(), text);
+
+                active_state(&mut chat).pending_elicitation = Some(single_elicitation());
+                chat.handle_key(up, &mut term).await;
+                assert_eq!(active_state(&mut chat).input_bar.cursor(), text.len());
+                active_state(&mut chat).pending_elicitation = None;
+                active_state(&mut chat).browse_cursor = Some(0);
+                chat.handle_key(up, &mut term).await;
+                assert_eq!(active_state(&mut chat).input_bar.cursor(), text.len());
+                active_state(&mut chat).browse_cursor = None;
+
+                overrides::set_row(
+                    A::TAG,
+                    "history_prev",
+                    vec![Chord::with(KeyCode::Up, KeyModifiers::ALT)],
+                );
+                chat.handle_key(up, &mut term).await;
+                assert_eq!(active_state(&mut chat).input_bar.cursor(), text.len());
+                chat.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &mut term)
+                    .await;
+                assert!(active_state(&mut chat).input_bar.cursor() < text.len());
+                overrides::reset();
+
+                let active = active_state(&mut chat);
+                active.input_bar.clear_input();
+                active.last_total_rows = 40;
+                active.last_inner_height = 10;
+                active.scroll_offset = 20;
+                active.pinned_to_bottom = false;
+                chat.handle_key(up, &mut term).await;
+                assert_eq!(active_state(&mut chat).scroll_offset, 19);
+                chat.handle_key(down, &mut term).await;
+                assert_eq!(active_state(&mut chat).scroll_offset, 20);
+            }
         }
     }
 
@@ -31091,6 +32587,64 @@ mod tests {
             agents: Vec::new(),
         };
         assert!(!chat.claims_pane_navigation(&word_left));
+    }
+
+    #[tokio::test]
+    async fn session_shortcut_respects_modal_and_explicit_input_bar_owners() {
+        use crate::keymap::{Chord, overrides};
+        use crossterm::event::KeyCode;
+
+        let shortcut = KeyEvent::new(
+            KeyCode::Char('1'),
+            Chord::with_primary(KeyCode::Char('1'), crossterm::event::KeyModifiers::CONTROL)
+                .effective_modifiers(),
+        );
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        assert!(
+            !chat.claims_session_shortcut(&shortcut),
+            "the unobstructed composer leaves the default global shortcut available"
+        );
+
+        active_state(&mut chat).pending_approval = Some(PendingApproval {
+            request_id: "session-shortcut-approval".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+        assert!(
+            chat.claims_session_shortcut(&shortcut),
+            "the approval modal must keep ownership of every key"
+        );
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        overrides::reset();
+        overrides::set_row(
+            "input_bar",
+            "clear_input",
+            vec![Chord::with_primary(
+                KeyCode::Char('1'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )],
+        );
+        let chat = chat_with_active_input(PaneKind::Chat);
+        assert!(
+            chat.claims_session_shortcut(&KeyEvent::new(
+                KeyCode::Char('1'),
+                Chord::with_primary(KeyCode::Char('1'), crossterm::event::KeyModifiers::CONTROL,)
+                    .effective_modifiers(),
+            )),
+            "an explicit input-bar override must outrank the global default"
+        );
+        overrides::reset();
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        assert!(
+            !chat.claims_session_shortcut(&shortcut),
+            "browse mode yields the shortcut so one press switches sessions"
+        );
     }
 
     #[tokio::test]

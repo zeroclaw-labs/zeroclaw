@@ -206,7 +206,7 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
   "severity_number": 9,
   "severity_text": "INFO",
   "event": { "category": "channel", "action": "inbound", "outcome": "success" },
-  "service": { "name": "zeroclaw", "version": "0.8.5" },
+  "service": { "name": "zeroclaw", "version": "0.8.6" },
   "trace_id": "<turn id>",
   "span_id": "<sub-span id>",
   "zeroclaw": {

@@ -26,7 +26,7 @@ env:
 
 # ── Runner selection: a checked-in label on each compile-heavy job ──────────
 # The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
-# check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
+# check-32bit, bench, test, test-channel-features, test-tool-features, memory-postgres-test, msrv, parallel-runtime-test,
 # installer-drift) and the Linux `build` matrix entry name their runner label
 # directly, so runner selection does not wait for fmt. The separate required
 # Windows jobs wait for windows-required-changes; the build matrix
@@ -204,6 +204,12 @@ jobs:
 
       - name: Test release announcement composer
         run: bash scripts/ci/release_post_text.test.sh
+
+      - name: Test binary size report
+        run: bash scripts/ci/binary_size_report.test.sh
+
+      - name: Test dependency footprint report
+        run: bash scripts/ci/dependency_footprint.test.sh
 
       - name: Test docs stable metadata promotion
         run: python3 scripts/docs/promote_stable_test.py
@@ -666,7 +672,7 @@ jobs:
     name: Test Windows task-owner recovery
     needs: [windows-required-changes, master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' && needs.windows-required-changes.result == 'success' && needs.windows-required-changes.outputs.windows_recovery == 'true' }}
-    runs-on: windows-latest
+    runs-on: blacksmith-8vcpu-windows-2025
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -674,14 +680,14 @@ jobs:
         with:
           toolchain: 1.98.0
           targets: x86_64-pc-windows-msvc
-      # Restore the Windows build leg's master-seeded cache (registry, git, and
-      # shared dependency artifacts) under the same key, and never write: a
-      # second Windows cache would compete for the repository's cache quota.
-      - uses: ./.github/actions/rust-cache
+      # Keep a recovery cache on this runner; do not assume the GitHub build
+      # cache's Rust environment hash matches. Only successful master pushes seed
+      # it; PRs and merge-queue runs read without competing writes.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          use-blacksmith: 'false'
-          shared-key: build
-          save-if: 'false'
+          shared-key: windows-recovery-blacksmith
+          cache-on-failure: 'false'
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -779,6 +785,14 @@ jobs:
             features: plugins-wasmtime
             suite: check
             cache-key: check-plugin-backends
+          # Own leg and key: the smoke runs the `zeroclaw` binary, built
+          # without the runtime crate's test-only features. The test legs
+          # build the runtime with them and cannot share that compile, so a
+          # separate leg keeps their duration unchanged.
+          - name: plugin artifact smoke
+            features: plugins-wasm-cranelift
+            suite: smoke
+            cache-key: plugins-artifact-smoke
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -808,14 +822,17 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
-        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime'
+        if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime' && matrix.suite != 'smoke'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
       - name: Run plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
-        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e
+        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test memory_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e --test socket_plugin_e2e --test websocket_plugin_e2e
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
+      - name: Run manifest signing command tests
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
+        run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --example sign_manifest
       - name: Run runtime live-config plugin regressions
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         # Module filter, not a single test name: agent::plugin_live_config holds
@@ -831,7 +848,446 @@ jobs:
       # `cargo test` accepts only one positional TESTNAME; the harness ORs them.
       - name: Run runtime plugin admission regressions
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
-        run: 'cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib -- plugin_runtime:: tools::tests::shared_ceiling tools::tests::repeated_loader tools::tests::auto_discover tools::tests::colliding_plugin'
+        run: |
+          set -euo pipefail
+          python3 - <<'LATE_PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import selectors
+          import signal
+          import stat
+          import subprocess
+          import sys
+          import threading
+          import tempfile
+          import time
+
+          workspace = Path.cwd().resolve(strict=True)
+          runner_temp = Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
+          root = Path(tempfile.mkdtemp(prefix='late-tool-search-', dir=runner_temp))
+          root.chmod(0o700)
+          cases = root / 'cases'
+          cases.mkdir(mode=0o700)
+
+          # One source of truth per invocation: actual checkout/fixture inputs, original
+          # command argv and actual process result. No source import or shell expansion.
+          def digest(path, limit):
+              meta = path.lstat()
+              if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid() or meta.st_size <= 0 or meta.st_size > limit:
+                  raise RuntimeError('proof input ownership/type/size refused')
+              value = hashlib.sha256()
+              count = 0
+              with path.open('rb') as reader:
+                  while data := reader.read(65536):
+                      count += len(data)
+                      if count > limit:
+                          raise RuntimeError('proof hash size refused')
+                      value.update(data)
+              if count != meta.st_size:
+                  raise RuntimeError('proof input changed during hash')
+              return {'sha256': value.hexdigest(), 'bytes': count}
+
+
+          # Process identity and retained direct-child ownership are adapted from
+          # scripts/ci/quickstart_cli_evidence.py (process_identity / OwnedChild).
+          # Selected contract: Linux, one main Python thread, default SIGCHLD, and no
+          # concurrent/direct reap outside this owner. SIGKILL/kernel/host loss cannot
+          # guarantee cleanup; uncertain ownership refuses numeric group signalling.
+          PENDING_CANCELLATION = None
+          DEFER_CANCELLATION = False
+
+          class Refusal(RuntimeError):
+              """Errors contain stable codes, never input, config, or subprocess output."""
+
+          def require(condition, code):
+              if not condition:
+                  raise Refusal(code)
+
+
+          def cancellation_checkpoint():
+              require(PENDING_CANCELLATION is None, 'interrupted')
+
+
+          def owned_run_contract():
+              require(sys.platform == 'linux' and hasattr(os, 'WNOWAIT') and hasattr(os, 'waitid')
+                      and signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
+                      and threading.current_thread() is threading.main_thread()
+                      and threading.active_count() == 1, 'process_wait_contract')
+
+
+          def process_identity(pid):
+              """Linux numeric birth fields only; never export proc comm/argv/environment."""
+              require(type(pid) is int and pid > 0, "process_identity")
+              with open("/proc/" + str(pid) + "/stat", "rb", buffering=0) as handle:
+                  raw = handle.read(4097)
+              require(len(raw) <= 4096, "process_stat_boundary")
+              left, right = raw.find(b"("), raw.rfind(b") ")
+              require(left > 0 and right > left, "process_stat_schema")
+              fields = raw[right + 2:].split()
+              require(len(fields) > 19 and raw[:left].strip() == str(pid).encode(), "process_stat_schema")
+              try:
+                  values = [int(fields[i]) for i in (1, 2, 3, 19)]
+              except ValueError:
+                  raise Refusal("process_stat_schema") from None
+              require(all(v >= 0 for v in values) and values[3] > 0, "process_stat_schema")
+              return {"pid": pid, "parent_pid": values[0], "pgid": values[1],
+                      "session": values[2], "start_ticks": values[3], "state": fields[0].decode("ascii")}
+
+          def group_exists(pgid, deadline, live_only=False):
+              """Bounded observation, not signal0 or ownership authorization."""
+              with os.scandir("/proc") as entries:
+                  for count, entry in enumerate(entries):
+                      require(count < 4096 and time.monotonic() < deadline, "group_observation_boundary")
+                      if not entry.name.isdigit():
+                          continue
+                      try:
+                          current = process_identity(int(entry.name))
+                      except (FileNotFoundError, ProcessLookupError):
+                          continue
+                      if current["pgid"] == pgid and (not live_only or current["state"] not in ("Z", "X")):
+                          return True
+              return False
+
+          class OwnedChild:
+              """Single-threaded Linux direct-child anchor, retained through group cleanup.
+
+              poll/wait below use WNOWAIT. No Popen.poll/wait, SIGCHLD reaper or concurrent
+              direct wait may retire this anchor before the last group signal.
+              """
+              def __init__(self, pid, role, proc=None):
+                  self.pid, self.role, self.proc = pid, role, proc
+                  self.stdout = proc.stdout if proc is not None else None
+                  self.parent = os.getpid()
+                  self.identity = None
+                  self.returncode = None
+                  self.retired = False
+                  self.direct_waits = 0
+                  self.direct_reaped = False
+                  self.signals = []
+                  self._evidence_cleanup = None
+
+              def bind(self, deadline):
+                  require(self.role == "command", "process_role")
+                  owned_run_contract()
+                  while True:
+                      require(time.monotonic() < deadline, "process_bind_timeout")
+                      self._observe()
+                      current = process_identity(self.pid)
+                      require(current["parent_pid"] == self.parent, "process_parent")
+                      if current["pgid"] == self.pid and current["session"] == self.pid:
+                          self.identity = {k: current[k] for k in
+                                           ("pid", "parent_pid", "pgid", "session", "start_ticks")}
+                          return self
+                      time.sleep(0.02)
+
+              def _observe(self):
+                  require(not self.retired, "process_retired")
+                  if self.proc is not None and self.proc.returncode is not None:
+                      self.retired = True
+                      raise Refusal("process_already_reaped")
+                  try:
+                      result = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                  except ChildProcessError:
+                      self.retired = True
+                      raise Refusal("process_already_reaped") from None
+                  if result is not None:
+                      require(result.si_pid == self.pid and result.si_code in
+                              (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED), "process_wait_identity")
+                      self.returncode = result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+                  return self.returncode
+
+              def poll(self):
+                  require(self.identity is not None and not self.retired, "process_unbound_or_retired")
+                  owned_run_contract()
+                  code = self._observe()
+                  current = process_identity(self.pid)
+                  require(all(current[k] == v for k, v in self.identity.items()), "process_identity_changed")
+                  return code
+
+              def wait(self, timeout):
+                  """Exit observation only. Direct reap belongs exclusively to stop()."""
+                  end = time.monotonic() + timeout
+                  while True:
+                      cancellation_checkpoint()
+                      code = self.poll()
+                      if code is not None:
+                          return code
+                      require(time.monotonic() < end, "subprocess_timeout")
+                      time.sleep(0.02)
+
+              def signal_group(self, sig):
+                  require(sig in (signal.SIGTERM, signal.SIGKILL), "process_signal")
+                  self.poll()  # Direct waitability + birth/parent/session/PGID immediately before signal.
+                  os.killpg(self.identity["pgid"], sig)
+                  self.signals.append(int(sig))
+
+              def stop(self):
+                  if self._evidence_cleanup is not None:
+                      return self._evidence_cleanup
+                  absent, verified, failure = False, False, None
+                  try:
+                      self.poll()
+                      verified = True
+                      for sig, seconds in ((signal.SIGTERM, 10), (signal.SIGKILL, 10)):
+                          try:
+                              self.signal_group(sig)
+                          except ProcessLookupError:
+                              self.poll()  # ESRCH is not a replacement ownership proof.
+                          end = time.monotonic() + seconds
+                          while time.monotonic() < end:
+                              exited = self.poll() is not None
+                              if exited:
+                                  if sig == signal.SIGKILL:
+                                      break
+                                  try:
+                                      if not group_exists(self.pid, end, live_only=True):
+                                          break
+                                  except Refusal as error:
+                                      if str(error) != "group_observation_boundary":
+                                          raise
+                                      break  # TERM budget exhausted; revalidate before KILL.
+                              time.sleep(0.02)
+                      self.poll()
+                      require(self.returncode is not None, "process_exit_unobserved")
+                      # Retire BEFORE direct wait so an interrupt/read/wait fault cannot
+                      # authorize a later numeric killpg after reap or PID retirement.
+                      self.retired = True
+                      self.direct_waits += 1
+                      # WNOWAIT already observed this exact direct child's terminal code.
+                      # Suppress Popen's destructor reaper BEFORE the sole final wait,
+                      # including if that wait faults after consuming the exit status.
+                      if self.proc is not None:
+                          self.proc.returncode = self.returncode
+                      waited, status = os.waitpid(self.pid, os.WNOHANG)
+                      require(waited == self.pid, "process_direct_wait")
+                      self.direct_reaped = True
+                      self.returncode = os.waitstatus_to_exitcode(status)
+                      if self.proc is not None:
+                          self.proc.returncode = self.returncode
+                      while group_exists(self.pid, end):
+                          require(time.monotonic() < end, "process_group_remains")
+                          time.sleep(0.02)
+                      absent = True
+                  except BaseException as error:
+                      failure = str(error) if isinstance(error, Refusal) else "process_cleanup_fault"
+                  self._evidence_cleanup = {
+                      "pid": self.pid, "role": self.role, "identity": self.identity,
+                      "identity_verified": verified, "ownership_retired": self.retired,
+                      "direct_waits": self.direct_waits, "direct_reaped": self.direct_reaped,
+                      "group_absent": absent, "returncode": self.returncode, "failure": failure,
+                      "signals": self.signals}
+                  return self._evidence_cleanup
+
+
+          def stop_owned(child):
+              require(isinstance(child, OwnedChild), 'process_owner_required')
+              return child.stop()
+
+
+          def cleanup_proved(result):
+              return (result.get("direct_reaped") is True and result.get("group_absent") is True
+                      and result.get("identity_verified") is True and result.get("ownership_retired") is True
+                      and result.get("direct_waits") == 1 and result.get("failure") is None)
+
+
+          def run(argv, cap, seconds=None, env=None):
+              global DEFER_CANCELLATION
+              cancellation_checkpoint()
+              owned_run_contract()
+              process = child = selector = None
+              output = bytearray()
+              deadline = None if seconds is None else time.monotonic() + seconds
+              after_exit = None
+              code = error = cleanup = None
+              previous_deferral = DEFER_CANCELLATION
+              DEFER_CANCELLATION = True
+              try:
+                  process = subprocess.Popen(argv, cwd=workspace, env=env, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT, start_new_session=True)
+                  child = OwnedChild(process.pid, 'command', process)
+                  # Do not honor a newly latched interruption between registration and
+                  # identity acquisition; the finally below already retains the owner.
+                  child.bind(time.monotonic() + 1)
+                  cancellation_checkpoint()
+                  selector = selectors.DefaultSelector()
+                  os.set_blocking(process.stdout.fileno(), False)
+                  selector.register(process.stdout, selectors.EVENT_READ)
+                  while selector.get_map():
+                      cancellation_checkpoint()
+                      if deadline is not None and time.monotonic() >= deadline:
+                          raise Refusal('owned proof command timeout')
+                      if child.poll() is not None:
+                          after_exit = after_exit or time.monotonic()
+                          if time.monotonic() - after_exit > 5:
+                              raise Refusal('owned proof command pipe remained open after exit')
+                      for key, _ in selector.select(0.1):
+                          data = os.read(key.fd, 4096)
+                          if not data:
+                              selector.unregister(key.fileobj)
+                              continue
+                          if len(output) + len(data) > cap:
+                              raise Refusal('owned proof command output overflow')
+                          output.extend(data)
+                  code = child.wait(timeout=10)  # WNOWAIT observation, never a direct reap.
+              except BaseException as failure:
+                  error = failure
+              finally:
+                  # No cancellation checkpoint until stop AND every owned close finish.
+                  if child is not None:
+                      try:
+                          cleanup = stop_owned(child)
+                          if not cleanup_proved(cleanup) and error is None:
+                              error = Refusal('owned proof command cleanup refused')
+                      except BaseException as failure:
+                          if error is None:
+                              error = failure
+                  if selector is not None:
+                      try:
+                          selector.close()
+                      except BaseException as failure:
+                          if error is None:
+                              error = failure
+                  if process is not None and process.stdout is not None:
+                      try:
+                          process.stdout.close()
+                          require(process.stdout.closed is True, 'process_pipe_close')
+                      except BaseException as failure:
+                          if error is None:
+                              error = failure
+                  DEFER_CANCELLATION = previous_deferral
+              if PENDING_CANCELLATION is not None and error is None:
+                  error = Refusal('interrupted')
+              if error is not None:
+                  print(bytes(output).decode('utf-8', errors='replace'), end='', flush=True)
+                  raise error
+              return code, bytes(output)
+
+
+          def checked(argv, cap=2 * 1024 * 1024, seconds=240):
+              code, data = run(argv, cap, seconds)
+              print(data.decode('utf-8', errors='replace'), end='', flush=True)
+              if code:
+                  raise SystemExit(code if code > 0 else 1)
+              return data.decode('utf-8', errors='strict').strip()
+
+
+          def exclusive_json(path, value):
+              data = json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+              if len(data) > 32768:
+                  raise RuntimeError('fixture receipt overflow')
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, 'wb') as writer:
+                  writer.write(data)
+                  writer.flush()
+
+
+          def interrupted(signum, _frame):
+              global PENDING_CANCELLATION
+              if PENDING_CANCELLATION is None:
+                  PENDING_CANCELLATION = signum
+              if not DEFER_CANCELLATION:
+                  raise Refusal('interrupted')
+
+          signal.signal(signal.SIGTERM, interrupted)
+          signal.signal(signal.SIGINT, interrupted)
+
+          expected = ['tools::r5_namespace_tests::late_tool_search_real_guest_metadata_preflight', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_registry_owner', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_delegate_retirement', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_pipeline_retirement', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_skill_direct_retirement', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_skill_pipeline_retirement', 'tools::r5_namespace_tests::late_tool_search_mcp_search_select_activation', 'tools::r5_namespace_tests::late_tool_search_builtin_only_views', 'tools::r5_namespace_tests::late_tool_search_builtin_only_schema_selection', 'tools::r5_namespace_tests::late_tool_search_no_host_disabled_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_connect_disabled_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_ungranted_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_eager_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_listing_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_empty_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_filtered_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_empty_builtin_catalog_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_helper_denied_keeps_no_guest_recovery', 'tools::r5_namespace_tests::late_tool_search_caller_principal_context', 'tools::r5_namespace_tests::late_tool_search_recovery_cannot_reintroduce_guest', 'tools::r5_namespace_tests::late_tool_search_shared_registry_no_reconnect', 'tools::r5_namespace_tests::late_tool_search_minimal_full_compiled_semantics', 'tools::r5_namespace_tests::late_tool_search_registration_order_and_hidden_specs']
+          prefix = 'tools::r5_namespace_tests::late_tool_search'
+          manifest = workspace / 'crates/zeroclaw-plugins/tests/fixtures/tool-fixture/Cargo.toml'
+          cargo_version = checked(['cargo', '+1.98.0', '-Vv'])
+          rust_version = checked(['rustc', '+1.98.0', '-vV'])
+          installed = checked(['rustup', 'target', 'list', '--installed', '--toolchain', '1.98.0'])
+          if 'wasm32-wasip2' not in installed.splitlines():
+              raise RuntimeError('required installed wasm32-wasip2 target absent')
+          head = checked(['git', 'rev-parse', 'HEAD'])
+          tree = checked(['git', 'rev-parse', 'HEAD^{tree}'])
+          parents = checked(['git', 'show', '-s', '--format=%P', 'HEAD']).split()
+          inputs = ['Cargo.toml', 'Cargo.lock', 'crates/zeroclaw-plugins/tests/fixtures/tool-fixture/Cargo.toml',
+                    'crates/zeroclaw-plugins/tests/fixtures/tool-fixture/src/lib.rs']
+          inputs += [str(path.relative_to(workspace)) for path in sorted((workspace / 'wit/v0').iterdir()) if path.is_file()]
+          if len(inputs) != 17:
+              raise RuntimeError('unexpected WIT input inventory')
+          input_rows = [{'path': path, **digest(workspace / path, 4 * 1024 * 1024)} for path in inputs]
+          components = {}
+          commands = []
+          for kind, flags in [('default', []), ('namespace', ['--features', 'namespace-tool-search'])]:
+              target = root / f'{kind}-target'
+              target.mkdir(mode=0o700)
+              argv = ['cargo', '+1.98.0', 'build', '--locked', '--manifest-path', str(manifest),
+                      '--package', 'zeroclaw-tool-plugin-fixture', '--target', 'wasm32-wasip2',
+                      '--target-dir', str(target)] + flags
+              checked(argv)
+              component = (target / 'wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm').resolve(strict=True)
+              if not component.is_relative_to(target):
+                  raise RuntimeError('component output escaped owned target')
+              components[kind] = {'path': str(component), **digest(component, 64 * 1024 * 1024)}
+              commands.append(argv)
+          for row in input_rows:
+              if digest(workspace / row['path'], 4 * 1024 * 1024) != {k: row[k] for k in ['sha256', 'bytes']}:
+                  raise RuntimeError('build altered locked source inputs')
+          receipt = {'schema': 1, 'execution_kind': 'github-actions', 'head': head, 'tree': tree,
+                     'parents': parents, 'reported_event_sha': os.environ['GITHUB_SHA'],
+                     'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                     'job_key': os.environ['GITHUB_JOB'], 'workflow_ref': os.environ['GITHUB_WORKFLOW_REF'],
+                     'workflow_sha': os.environ['GITHUB_WORKFLOW_SHA'], 'matrix': 'plugins-wasm-cranelift/runtime',
+                     'cargo_version': cargo_version, 'rust_version': rust_version,
+                     'inputs': input_rows, 'commands': commands, 'components': components}
+          for tool in ['cargo', 'rustc']:
+              path = Path(checked(['rustup', 'which', '--toolchain', '1.98.0', tool])).resolve(strict=True)
+              receipt[f'{tool}_binary'] = digest(path, 512 * 1024 * 1024)
+          receipt_path = root / 'fixture-receipt.json'
+          exclusive_json(receipt_path, receipt)
+          env = dict(os.environ)
+          env.update(ZEROCLAW_LATE_TOOL_SEARCH_DEFAULT_COMPONENT=components['default']['path'],
+                     ZEROCLAW_LATE_TOOL_SEARCH_COMPONENT=components['namespace']['path'],
+                     ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT=str(receipt_path),
+                     ZEROCLAW_LATE_TOOL_SEARCH_CASE_RECEIPTS=str(cases))
+          base = ['cargo', 'test', '--locked', '-p', 'zeroclaw-runtime', '--features', 'plugins-wasm-cranelift', '--lib', '--']
+          code, listing = run(base + [prefix, '--list'], 2 * 1024 * 1024, env=env)
+          print(listing.decode('utf-8', errors='replace'), end='', flush=True)
+          listed = re.findall(rb'^(tools::r5_namespace_tests::late_tool_search\w*): test$', listing, re.M)
+          if code or sorted(name.decode() for name in listed) != sorted(expected):
+              raise RuntimeError('exact twenty-three namespace listing refused')
+          # Keep the original larger OR selection and its order; new prefix is appended.
+          selectors_old = ['plugin_runtime::', 'tools::tests::shared_ceiling', 'tools::tests::repeated_loader',
+                           'tools::tests::auto_discover', 'tools::tests::colliding_plugin',
+                           'tools::tests::plugin_tls_coherence']
+          code, output = run(base + selectors_old + [prefix], 16 * 1024 * 1024, env=env)
+          print(output.decode('utf-8', errors='replace'), end='', flush=True)
+          passed = re.findall(rb'^test (tools::r5_namespace_tests::late_tool_search\w*) \.\.\. ok$', output, re.M)
+          if code or sorted(name.decode() for name in passed) != sorted(expected):
+              raise RuntimeError('exact twenty-three namespace execution refused')
+          if not re.search(rb'^test result: ok\.', output, re.M):
+              raise RuntimeError('successful runtime harness summary missing')
+          actual_paths = sorted(path.name for path in cases.iterdir())
+          if actual_paths != sorted(name.rsplit('::', 1)[-1] + '.json' for name in expected):
+              raise RuntimeError('unexpected case receipt inventory')
+          exported = 0
+          for name in expected:
+              path = cases / (name.rsplit('::', 1)[-1] + '.json')
+              digest(path, 512 * 1024)
+              data = path.read_bytes()
+              item = json.loads(data)
+              if set(item) != {'schema', 'name', 'passed', 'cleanup_ok', 'events', 'test_executable', 'runtime_source_sha256', 'fixture_receipt_sha256'}:
+                  raise RuntimeError('case receipt schema refused')
+              if item['name'] != name.rsplit('::', 1)[-1] or item['schema'] != 1 or item['passed'] is not True or item['cleanup_ok'] is not True:
+                  raise RuntimeError('case receipt result refused')
+              if item['fixture_receipt_sha256'] != digest(receipt_path, 32768)['sha256']:
+                  raise RuntimeError('case fixture binding refused')
+              if item['runtime_source_sha256'] != digest(workspace / 'crates/zeroclaw-runtime/src/tools/scoped.rs', 4 * 1024 * 1024)['sha256']:
+                  raise RuntimeError('case source binding refused')
+              if len(item['events']) > 4096 or not re.fullmatch('[0-9a-f]{64}', item['test_executable']['sha256']):
+                  raise RuntimeError('case trace/executable binding refused')
+              exported += len(data)
+              if exported > 9 * 1024 * 1024:
+                  raise RuntimeError('case receipt export overflow')
+              print('LATE_CASE_RECEIPT ' + data.decode('utf-8'), flush=True)
+          print('LATE_FIXTURE_RECEIPT ' + receipt_path.read_text(), flush=True)
+          print('LATE_TOOL_SEARCH_NAMED_PASS 23', flush=True)
+          LATE_PY
       # Cross-crate activation proof. This lives in the root `zeroclaw` package
       # rather than the line above because it drives `zeroclaw-runtime`, which
       # `zeroclaw-plugins` cannot depend on without inverting the crate graph.
@@ -844,8 +1300,17 @@ jobs:
       # proves a granted destination is reached and an ungranted or wrong-host
       # destination never sees a packet.
       - name: Run channel egress boundary e2e
-        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift' && matrix.suite != 'smoke'
         run: cargo test --locked --features plugins-wasm-cranelift --test channel_egress_e2e
+      # Channel WebSocket lifecycle proof. A root target for the same
+      # crate-graph reason as the two steps above: it drives the production
+      # configured-channel path against a loopback WebSocket server and asserts
+      # on what the server saw (one socket across polls, one redial after a
+      # server close, a closed socket and released lease on shutdown, and no
+      # packet at all when the destination is not granted).
+      - name: Run channel WebSocket lifecycle e2e
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
+        run: cargo test --locked --features plugins-wasm-cranelift --test channel_websocket_e2e
       # The root binary's tests with plugin support compiled in. `mod plugins`,
       # the plugin registry and the plugin CLI's tests in `main.rs` only
       # compile under `plugins-wasm`, so the default-feature Test job never sees
@@ -853,12 +1318,49 @@ jobs:
       # runs rather than a name filter: the ceremony tests in `main.rs` share no
       # common name, and a filter silently skipped most of them. The component
       # tests drive the real binary through `plugin info` and `plugin list
-      # --verify` against an installed component that does not load.
+      # --verify` against an installed component that does not load, and
+      # through `plugin update` against a local registry serving the in-tree
+      # tool fixture, built for the fixture target installed above.
       - name: Run root CLI plugin tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         run: |
           cargo test --locked --features plugins-wasm-cranelift --bin zeroclaw
-          cargo test --locked --features plugins-wasm-cranelift --test component -- plugin_info_cli
+          cargo test --locked --features plugins-wasm-cranelift --test component -- plugin_info_cli plugin_update_cli
+      # Plugin artifact smoke. The harness takes any `zeroclaw` binary, so the
+      # release workflows can point it at a packaged archive; running it here
+      # against the feature-enabled build keeps it working between releases.
+      # It installs and executes a real tool component through the operator's
+      # commands and an agent turn, which no test above reaches. Provenance is
+      # recorded in .github/workflows/README.md.
+      - name: Verify plugin artifact smoke harness
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'smoke'
+        run: |
+          bash scripts/ci/plugin_artifact_smoke.test.sh
+          python3 scripts/ci/plugin_smoke_provider_test.py
+      - name: Run plugin artifact smoke
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'smoke'
+        run: |
+          cargo build --locked --features plugins-wasm-cranelift --bin zeroclaw
+          bash scripts/ci/build_plugin_smoke_packages.sh "$RUNNER_TEMP/plugin-smoke-packages"
+          bash scripts/ci/plugin_artifact_smoke.sh \
+            --binary target/debug/zeroclaw \
+            --expect host \
+            --packages "$RUNNER_TEMP/plugin-smoke-packages" \
+            --label "debug build / x86_64-unknown-linux-gnu"
+      # The same binary under the opposite expectation has to fail its one
+      # check, with the status reserved for a failed check. This guards the
+      # host-free expectation only; the contract tests and the run above guard
+      # the rest. Its report stays out of the job summary.
+      - name: Reject a plugin-bearing binary as host-free
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'smoke'
+        run: |
+          inverted=0
+          GITHUB_STEP_SUMMARY="" bash scripts/ci/plugin_artifact_smoke.sh \
+            --binary target/debug/zeroclaw --expect no-host || inverted=$?
+          if [ "$inverted" -ne 1 ]; then
+            echo "::error::Expected the host-free expectation to fail with status 1, got $inverted."
+            exit 1
+          fi
 
   msrv:
     name: MSRV (declared floor)
@@ -1066,8 +1568,8 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-  # Feature configurations keep their original defaults and test filters.
-  # In particular, Lark runs without defaults and QQ excludes live-auth tests.
+  # Optional channel configurations run without default channels so each leg
+  # isolates its named feature. QQ still excludes live-auth tests.
   test-channel-features:
     name: Test (channel ${{ matrix.name }})
     needs: [master-debounce]
@@ -1079,13 +1581,13 @@ jobs:
       matrix:
         include:
           - name: WeChat
-            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-wechat --lib wechat::"
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-wechat --lib wechat::"
           - name: Lark
-            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark::"
           - name: Matrix
-            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-matrix --lib matrix::"
           - name: QQ
-            command: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check one_off_send_resolves_dotted_qq_alias deliver_announcement_routes_qq_to_qq_arm deliver_announcement_rejects_disabled_qq_alias compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-qq --lib qq::tests::health_check one_off_send_resolves_dotted_qq_alias deliver_announcement_routes_qq_to_qq_arm deliver_announcement_rejects_disabled_qq_alias compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
@@ -1110,6 +1612,55 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
+
+  # The SaaS and coding-CLI tools are out of Cargo `default`, so `test` no
+  # longer builds them, and `lint` compiles them under `ci-all` without running
+  # a test. This lane runs their tests with the compatibility bundle:
+  # the tool modules, the coding-CLI executor, adapter and action-budget
+  # suites, config validation with the tools compiled in, the runner's gateway
+  # hook, and the root report-template tests.
+  test-tool-features:
+    name: Test (opt-in tools)
+    needs: [master-debounce]
+    if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'true'
+          shared-key: tool-features
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install test system dependencies
+        run: bash scripts/ci/apt_install.sh mold expect python3
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      - name: Run opt-in tool tests
+        run: >-
+          cargo nextest run --locked --no-fail-fast
+          -p zeroclaw -p zeroclaw-config -p zeroclaw-tools -p zeroclaw-runtime -p zeroclaw-channels -p zeroclaw-gateway
+          --features tools-compat
+          --lib --test integration
+          -E 'not binary(integration) or test(/^report_template_tool_test::/)'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+      - name: Verify config-only feature cannot compile a concrete tool
+        run: >-
+          cargo nextest run --locked -p zeroclaw-tools --no-default-features
+          --features zeroclaw-config/tool-notion --lib --run-ignored only
+          -E 'test(/^inventory::tests::config_only_notion_feature_does_not_compile_owner$/)'
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   memory-postgres-test:
     name: Test (PostgreSQL Memory)
@@ -1588,7 +2139,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-required-changes, windows-service-smoke, build, windows-build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
+    needs: [master-debounce, fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, windows-required-changes, windows-service-smoke, build, windows-build, windows-task-owner-recovery, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, test-tool-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests, crates-preflight-changes, crates-preflight]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Check results

@@ -3074,6 +3074,9 @@ pub const V2_WORKSPACE_TOPLEVEL_DISPATCH: &[(&str, V2WorkspaceDest)] = &[
     ("memory", V2WorkspaceDest::MemorySubentryDispatch),
     ("sessions", V2WorkspaceDest::DataDir),
     ("state", V2WorkspaceDest::DataDir),
+    // Installed packages belong to host data, not the agent's writable
+    // workspace. Existing legacy discovery already searches data/plugins.
+    ("plugins", V2WorkspaceDest::DataDir),
     ("skills", V2WorkspaceDest::SharedDir),
     // Top-level instance-state file. The DeviceRegistry reader at
     // `api_pairing.rs:40` opens `<data_dir>/devices.db`, so unlike

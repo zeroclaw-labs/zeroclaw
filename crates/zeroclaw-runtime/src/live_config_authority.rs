@@ -8,6 +8,10 @@ use anyhow::{Context, Result};
 use zeroclaw_config::live::{LiveConfig, LiveConfigHandle};
 use zeroclaw_config::schema::Config;
 
+use crate::config_application::{
+    ConfigApplicationLedger, ConfigApplicationStatus, ConfigApplicationTarget,
+};
+
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -27,6 +31,7 @@ pub struct LiveConfigAuthority {
     live: LiveConfig,
     config_write_lock: Arc<tokio::sync::Mutex<()>>,
     agent_lifecycle: AgentLifecycleCoordinator,
+    application_results: Arc<parking_lot::Mutex<ConfigApplicationLedger>>,
 }
 
 impl LiveConfigAuthority {
@@ -37,6 +42,35 @@ impl LiveConfigAuthority {
             live: LiveConfig::new(config),
             config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::default(),
+            application_results: Arc::default(),
+        }
+    }
+
+    /// Test-only authority whose config write lock is private to it.
+    ///
+    /// A unit-test binary is one process, so authorities built with
+    /// [`Self::new`] share one lock across every test in it: a test holding
+    /// its context's guard stalls every other test's config writers, and
+    /// parallel runs queue timing-bounded tests behind unrelated ones.
+    /// Clones of this authority still share its lock, as they do in
+    /// production.
+    #[cfg(test)]
+    pub(crate) fn for_tests(config: Config) -> Self {
+        Self {
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ..Self::new(config)
+        }
+    }
+
+    /// Test-only authority with its own published config and lifecycle that
+    /// serializes on `writer`'s config write lock: another connection to the
+    /// daemon `writer` belongs to, for a fixture that needs a different
+    /// config than the first connection's.
+    #[cfg(test)]
+    pub(crate) fn for_tests_sharing_writer(config: Config, writer: &Self) -> Self {
+        Self {
+            config_write_lock: Arc::clone(&writer.config_write_lock),
+            ..Self::new(config)
         }
     }
 
@@ -57,6 +91,7 @@ impl LiveConfigAuthority {
             live: LiveConfig::new(config),
             config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
             agent_lifecycle: AgentLifecycleCoordinator::with_ownership(ownership),
+            application_results: Arc::default(),
         }
     }
 
@@ -75,6 +110,38 @@ impl LiveConfigAuthority {
     /// The currently published revision.
     pub fn published_revision(&self) -> zeroclaw_config::live::ConfigRevision {
         self.live.published_revision()
+    }
+
+    /// Application facts for the daemon, without exposing RPC sessions.
+    pub fn application_status(&self) -> ConfigApplicationStatus {
+        let results = self.application_results.lock();
+        results.status(self.live.published_revision(), |target| {
+            matches!(target, ConfigApplicationTarget::Daemon)
+        })
+    }
+
+    /// The caller holds the live-session map through this synchronous read.
+    /// Visibility filtering must not retire another caller's live targets.
+    pub(crate) fn application_status_for_sessions(
+        &self,
+        current: impl Fn(&ConfigApplicationTarget) -> bool,
+        visible: impl Fn(&ConfigApplicationTarget) -> bool,
+    ) -> ConfigApplicationStatus {
+        let mut results = self.application_results.lock();
+        results.retire_targets(current);
+        results.status(self.live.published_revision(), visible)
+    }
+
+    pub(crate) fn complete_application(
+        &self,
+        revision: zeroclaw_config::live::ConfigRevision,
+        target: &ConfigApplicationTarget,
+        paths: &[Vec<String>],
+        applied: bool,
+    ) {
+        self.application_results
+            .lock()
+            .complete(revision, target, paths, applied);
     }
 
     /// The epoch of this authority's publication domain. Cloned
@@ -104,7 +171,24 @@ impl LiveConfigAuthority {
             guard,
             lease,
             live: self.live.clone(),
+            application_results: Arc::clone(&self.application_results),
+            application_attempts: Vec::new(),
         })
+    }
+
+    /// Hold this authority's config writer mutex without admitting a commit.
+    /// Readers in the route-generation transaction (session construction,
+    /// `session/configure`, rehydration and its reconciliation) take it so
+    /// that no commit publishes while they build from config. It admits no
+    /// write lease, so a closing generation never drains against a reader.
+    pub async fn lock_config_writer(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.config_write_lock).lock_owned().await
+    }
+
+    /// [`Self::lock_config_writer`] without waiting: `None` while a commit or
+    /// another reader holds the mutex.
+    pub fn try_lock_config_writer(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.config_write_lock).try_lock_owned().ok()
     }
 
     /// Whether the daemon-wide config writer mutex is currently held.
@@ -1123,9 +1207,19 @@ pub struct ConfigCommit {
     guard: tokio::sync::OwnedMutexGuard<()>,
     lease: ConfigWriteLease,
     live: LiveConfig,
+    application_results: Arc<parking_lot::Mutex<ConfigApplicationLedger>>,
+    application_attempts: Vec<(ConfigApplicationTarget, Vec<Vec<String>>)>,
 }
 
 impl ConfigCommit {
+    pub(crate) fn register_application(
+        &mut self,
+        target: ConfigApplicationTarget,
+        paths: Vec<Vec<String>>,
+    ) {
+        self.application_attempts.push((target, paths));
+    }
+
     /// Clone the currently published config. Read-for-modify under this
     /// commit's serialization: no other admitted writer can interleave.
     pub fn current_config(&self) -> Config {
@@ -1155,6 +1249,8 @@ impl ConfigCommit {
         revision: zeroclaw_config::live::ConfigRevision,
         config: Config,
     ) -> Result<(), ConfigCommitError> {
+        let changed_paths = Config::semantic_changed_paths(&self.current_config(), &config).ok();
+        let mut application_results = self.application_results.lock();
         self.live.publish(revision, config).map_err(|error| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1167,6 +1263,11 @@ impl ConfigCommit {
             );
             ConfigCommitError::from(error)
         })?;
+        application_results.published(
+            revision,
+            changed_paths.as_deref(),
+            &self.application_attempts,
+        );
         Ok(())
     }
 
@@ -1392,6 +1493,52 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), drain)
             .await
             .expect("drain completes once the admitted commit finishes");
+    }
+
+    #[test]
+    fn test_authorities_get_a_private_write_lock_unless_told_to_share_one() {
+        let process = zeroclaw_config::write_lock::shared_config_write_lock();
+        let isolated = LiveConfigAuthority::for_tests(Config::default());
+        let other = LiveConfigAuthority::for_tests(Config::default());
+        assert!(!Arc::ptr_eq(&isolated.config_write_lock, &process));
+        assert!(!Arc::ptr_eq(
+            &isolated.config_write_lock,
+            &other.config_write_lock
+        ));
+        assert!(Arc::ptr_eq(
+            &isolated.config_write_lock,
+            &isolated.clone().config_write_lock
+        ));
+
+        let sharing = LiveConfigAuthority::for_tests_sharing_writer(Config::default(), &isolated);
+        assert!(Arc::ptr_eq(
+            &sharing.config_write_lock,
+            &isolated.config_write_lock
+        ));
+        assert!(!sharing.live_handle().same_storage(&isolated.live_handle()));
+    }
+
+    #[tokio::test]
+    async fn config_writer_gate_and_commits_serialize_on_one_mutex() {
+        let authority = LiveConfigAuthority::for_tests(Config::default());
+        let gate = authority.lock_config_writer().await;
+        assert!(authority.try_lock_config_writer().is_none());
+        let mut commit = std::pin::pin!(authority.begin_config_commit());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut commit)
+                .await
+                .is_err(),
+            "a commit must wait while a reader holds the writer gate"
+        );
+
+        drop(gate);
+        let commit = tokio::time::timeout(std::time::Duration::from_secs(5), commit)
+            .await
+            .expect("the commit proceeds once the reader releases the gate")
+            .expect("an open generation admits the commit");
+        assert!(authority.try_lock_config_writer().is_none());
+        drop(commit);
+        assert!(authority.try_lock_config_writer().is_some());
     }
 
     #[test]

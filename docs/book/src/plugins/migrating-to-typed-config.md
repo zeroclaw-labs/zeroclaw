@@ -175,22 +175,39 @@ sharing credentials. Fresh installs seed and print this tool key automatically.
 
 ### Channel instances
 
-A channel key includes the configured channel alias. `zeroclaw plugin install`
-and `zeroclaw plugin info` know the package but do not own that alias, so they
-cannot derive, print, or seed a channel key and must not invent a package-level
-substitute. Alias-aware channel construction and runtime config resolution
-landed in
+A channel key includes the configured channel alias. The package alone does
+not name an alias, so a channel key is derived only once an alias is bound, and
+no command invents a package-level substitute. Alias-aware channel construction
+and runtime config resolution landed in
 [zeroclaw#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146): a daemon
 constructs an explicitly declared channel instance and resolves its typed config
 from `zpi1(package, channel, alias)`, keyed off the actual configured alias.
 
-Automatic `plugin info` key display and install-time seeding for channel
-instances remain manual until the grant ceremony in
-[zeroclaw#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584). Until that
-ceremony lands, operators seed the channel key by hand with `zeroclaw config
-set` rather than having install or info print and seed it for them, so a
-channel-only package that relies on the automatic install and info key path is
-not yet complete.
+Binding the alias derives, prints, and seeds that key. To put a channel
+instance's values on it:
+
+1. Run `zeroclaw plugin bind <package> --channel-alias <alias>`. If the
+   manifest declares destinations, the package holds a transport that can
+   reach them (`http_client`, `websocket_client`, or `socket_client`), and the
+   instance has no row yet, add `--egress declared` to grant them or
+   `--egress none` to bind with no network reach; without either, the command
+   refuses and lists them. It
+   creates the `[channels.plugin.<alias>]` binding, or keeps one you already
+   wrote, and seeds the instance's `[[plugins.entries]]` row.
+   `zeroclaw plugin install <source> --channel-alias <alias>` does the same
+   while installing.
+2. Set values with
+   `zeroclaw config set plugins.entries.<instance-key>.config.<key>`. The
+   bind's readiness report lists each `required` key as set or missing, with
+   the exact command for a missing one, and `zeroclaw plugin info <package>`
+   prints the instance key and the same report again later. Values stay
+   encrypted at rest.
+
+A row that already exists under the instance key is left exactly as it is, so
+values you wrote there by hand survive the bind. No legacy name is consulted
+for a channel instance: channel construction postdates the full-instance key,
+so no runtime ever read a channel's config from a row named after its package
+or alias.
 
 ## Diagnosing a rejection
 
@@ -210,10 +227,10 @@ not yet complete.
 Every package published in `zeroclaw-labs/zeroclaw-plugins` requests
 `config_read`, and none declared `config_schema` when this landed, so all of
 them need step 1 and step 5. Migration is tracked in that repository rather
-than here, since the packages version independently of the host. Tool packages
-can complete the operator-key step now. Channel-only packages must wait for the
-alias-aware key path above before the tracker marks or publishes them as
-migrated for this contract.
+than here, since the packages version independently of the host. Both kinds
+can complete the operator-key step now: tool packages through install and
+`plugin info`, and channel-only packages through `zeroclaw plugin bind`, as
+described above.
 
 ## Memory plugins
 

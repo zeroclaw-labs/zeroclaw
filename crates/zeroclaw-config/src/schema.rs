@@ -8,7 +8,7 @@ use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
 use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
-use crate::traits::{ChannelConfig, HasPropKind, PropKind};
+use crate::traits::{ApplicationCapability, ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
 use directories::UserDirs;
@@ -24,6 +24,43 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
 use zeroclaw_macros::Configurable;
+
+/// One config snapshot's property application metadata, built once by
+/// [`Config::application_capabilities`] and queried per changed path.
+#[derive(Debug, Clone)]
+pub struct ApplicationCapabilities {
+    fields: Vec<(String, ApplicationCapability)>,
+}
+
+impl ApplicationCapabilities {
+    /// Resolve potential application for `path`, defaulting to reload.
+    pub fn capability(&self, path: &[String]) -> ApplicationCapability {
+        // Dotted metadata cannot distinguish an opaque dotted key from nesting.
+        if path.is_empty()
+            || path
+                .iter()
+                .any(|part| part.is_empty() || part.contains('.'))
+        {
+            return ApplicationCapability::ReloadRequired;
+        }
+        let name = path.join(".");
+        let subtree = format!("{name}.");
+        let mut matched = false;
+        for (field_name, application) in &self.fields {
+            if *field_name == name || field_name.starts_with(&subtree) {
+                matched = true;
+                if *application != ApplicationCapability::ModelProviderRefresh {
+                    return ApplicationCapability::ReloadRequired;
+                }
+            }
+        }
+        if matched {
+            ApplicationCapability::ModelProviderRefresh
+        } else {
+            ApplicationCapability::ReloadRequired
+        }
+    }
+}
 
 const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.anthropic",
@@ -105,6 +142,7 @@ pub enum CronJobClaim<'a> {
 /// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[field_metadata = "crate::setup::annotate_fields"]
 pub struct Config {
     /// Shared instance data directory (databases, hygiene state, cost
     /// records, daemon state files). Computed from `ZEROCLAW_CONFIG_DIR`
@@ -221,6 +259,14 @@ pub struct Config {
     #[nested]
     #[group = "Operations"]
     pub security: SecurityConfig,
+
+    /// Optional model-visible built-ins (`[tools]`). The default is full;
+    /// `optional = []` selects the eleven core tools. Selection never grants
+    /// execution permission. Reload after edits.
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub tools: crate::builtin_tools::BuiltinToolsConfig,
 
     /// Backup tool configuration (`[backup]`).
     #[serde(default)]
@@ -958,6 +1004,7 @@ pub struct ModelProviderConfig {
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub extra_headers: HashMap<String, String>,
     /// Wire protocol flavor: `responses` for OpenAI's Responses API (`POST /v1/responses`), `chat_completions` for the legacy chat wire and most OpenAI-compatible gateways. New OpenAI provider slots default to `responses`; other families default to chat-completions (or ignore the field). Only override if you're forcing an unusual combination.
@@ -1087,10 +1134,11 @@ pub struct ModelProviderConfig {
     /// Override the provider's default for native tool calling.
     /// `None` (default) honors the provider's built-in choice. `Some(true)`
     /// forces native tool calls on, `Some(false)` forces text-fallback.
-    /// Currently consulted only by the Groq factory, which defaults to
-    /// text-fallback because llama-family Groq models reject native tool
-    /// calls with HTTP 400. Setting `native_tools = true` re-enables native
-    /// tool calling for Groq models that support it.
+    /// For OpenAI-compatible chat-completions families, native calls avoid
+    /// injecting the prompt-guided tool-use protocol into the system prompt.
+    /// Set this only after confirming the configured endpoint and model
+    /// accept the native tool schema. Providers routed through
+    /// `wire_api = "responses"` are inherently native and ignore this setting.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
@@ -3834,6 +3882,7 @@ pub struct ResolvedRuntime {
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
     pub eval: crate::scattered_types::EvalConfig,
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
+    pub effort_routing: Option<crate::scattered_types::EffortRoutingConfig>,
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
@@ -4027,6 +4076,7 @@ impl Default for ResolvedRuntime {
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
+            effort_routing: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
@@ -4175,6 +4225,7 @@ pub struct AliasedAgentConfig {
     /// `Config::validate()` fails loud on dangling references.
     #[tab(Providers)]
     #[serde(default)]
+    #[application = "model_provider_refresh"]
     pub model_provider: crate::providers::ModelProviderRef,
     /// Risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
     #[tab(General)]
@@ -4628,6 +4679,13 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_single_tool_rounds(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|profile| profile.single_tool_rounds)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn effective_max_execution_tree_iterations(&self, agent_alias: &str) -> Option<usize> {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_execution_tree_iterations)
@@ -4930,6 +4988,7 @@ impl Config {
             resolved.history_pruning = profile.history_pruning.clone();
             resolved.eval = profile.eval.clone();
             resolved.auto_classify = profile.auto_classify.clone();
+            resolved.effort_routing = profile.effort_routing.clone();
             resolved.context_compression = profile.context_compression.clone();
             resolved.tool_receipts = profile.tool_receipts.clone();
             resolved.tool_filter_groups = profile.tool_filter_groups.clone();
@@ -5813,12 +5872,14 @@ pub struct McpServerConfig {
     /// Optional environment variables for stdio transport.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub env: HashMap<String, String>,
     /// Optional HTTP headers for HTTP/SSE transports. Treated as secret:
     /// the values commonly carry Bearer tokens for the upstream MCP server.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
     /// Optional per-call timeout in seconds (hard capped in validation).
@@ -7197,14 +7258,17 @@ pub struct MultimodalConfig {
     ///
     /// Caps the total number of `[IMAGE:...]` markers that survive into the
     /// provider request after multimodal preprocessing. Older images are
-    /// dropped first when the cumulative count exceeds this limit. When a
-    /// new image takes the count past the limit, the oldest surviving
-    /// image is removed from its message, which can invalidate a
-    /// provider's cached prefix from that message onward; a larger limit
-    /// delays cap eviction and reduces how many happen over a session,
-    /// but once the limit is full each further image still evicts one.
-    /// Acts as the upper bound on per-turn upload cost when tool outputs
-    /// surface local image paths.
+    /// dropped first. When a new image takes the count past the limit, the
+    /// oldest images are removed in one batch, down to half the limit
+    /// rounded up (4 -> 2, 8 -> 4, 16 -> 8); the count then grows back to the
+    /// limit before the next batch. Removing an image changes the message
+    /// that held it, which can invalidate a provider's cached prefix from
+    /// that message onward; batching means a session past the limit pays
+    /// that once every `max_images / 2 + 1` new images rather than on every
+    /// one. Right after a batch the model sees fewer older images than the
+    /// limit allows. A larger limit delays the first batch and makes each
+    /// one less frequent. Acts as the upper bound on per-turn upload cost
+    /// when tool outputs surface local image paths.
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
@@ -8184,6 +8248,10 @@ pub struct WssConfig {
     /// `["zero", "192.168.2.168"]`). `localhost` and `127.0.0.1` are always
     /// included. Each entry that parses as an IP becomes an IP SAN, else a DNS
     /// SAN. Changing this list regenerates the server leaf (the CA is untouched).
+    /// When the listeners are reached over Tailscale (`tunnel_provider =
+    /// "tailscale"`, or a `[wss]`/`[enroll]` bind on a tailnet address), the
+    /// node's MagicDNS name, short name, and tailnet IPs are added automatically
+    /// at startup; list them here only to pin names tailscaled does not report.
     /// Ignored when you bring your own server certificate via `cert_path`.
     #[serde(default)]
     pub sans: Vec<String>,
@@ -8241,6 +8309,25 @@ impl Default for WssConfig {
             max_sessions_per_client: default_wss_max_sessions_per_client(),
             incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
         }
+    }
+}
+
+impl WssClientAuthConfig {
+    /// The operator-provided (bring-your-own) CA that verifies client
+    /// certificates, when one is in effect: client auth enabled with a CA path.
+    /// In that mode the daemon holds no CA signing key, so it verifies clients
+    /// but cannot issue certificates and does not run the enrollment endpoint.
+    pub fn external_ca_path(&self) -> Option<&str> {
+        (self.enabled && !self.ca_cert_path.is_empty()).then_some(self.ca_cert_path.as_str())
+    }
+}
+
+impl WssConfig {
+    /// See [`WssClientAuthConfig::external_ca_path`].
+    pub fn external_client_ca(&self) -> Option<&str> {
+        self.client_auth
+            .as_ref()
+            .and_then(WssClientAuthConfig::external_ca_path)
     }
 }
 
@@ -9615,6 +9702,7 @@ pub struct PluginEntryConfig {
     pub name: String,
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub config: HashMap<String, String>,
     /// Destinations this plugin instance may reach. Default: empty,
@@ -10243,6 +10331,7 @@ pub struct FileUploadConfig {
     /// `[mcp.servers.*.headers]`.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
@@ -10328,6 +10417,7 @@ pub struct FileUploadBundleConfig {
     /// Static HTTP headers attached to every upload request.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
@@ -10420,6 +10510,7 @@ pub struct FileDownloadConfig {
     /// `[mcp.servers.*.headers]`.
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
@@ -12750,6 +12841,11 @@ pub struct MemoryConfig {
     /// operations; recall is a single hybrid call today, so this has no effect.
     #[serde(default = "default_fts_early_return_score")]
     pub fts_early_return_score: f64,
+    /// Prefix injected memory entries with their storage date
+    /// (`[from YYYY-MM-DD]`), so the model can tell recalled text from the
+    /// live turn it is prepended to.
+    #[serde(default = "default_true")]
+    pub recall_date_stamp: bool,
 
     // ── Namespace Isolation ─────────────────────────────────────
     /// Default namespace for memory entries.
@@ -13252,6 +13348,7 @@ impl Default for MemoryConfig {
             importance_weight: default_importance_weight(),
             recency_weight: default_recency_weight(),
             fts_early_return_score: default_fts_early_return_score(),
+            recall_date_stamp: true,
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
             conflict_supersede_enabled: default_conflict_supersede_enabled(),
@@ -13438,6 +13535,7 @@ pub struct ObservabilityConfig {
     /// ```
     #[serde(default)]
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub otel_headers: Option<std::collections::HashMap<String, String>>,
 
@@ -14701,10 +14799,17 @@ pub struct RuntimeProfileConfig {
     pub compact_context: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
     pub parallel_tools: Option<bool>,
+    /// Request one native tool call per provider response when supported. Default off.
+    pub single_tool_rounds: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
     pub tool_call_dedup_exempt: Vec<String>,
+    /// Expose only basic workspace and memory tool schemas eagerly, with other
+    /// admitted built-ins discoverable through `tool_search`. Default false
+    /// preserves eager exposure. This never changes tool permissions; if
+    /// `tool_search` is not admitted, built-in schemas remain eager.
+    pub deferred_builtin_tools: bool,
     /// Maximum characters for the assembled system prompt. `None` inherits.
     pub max_system_prompt_chars: Option<usize>,
     /// Maximum characters for a single tool result. `None` inherits.
@@ -14732,6 +14837,8 @@ pub struct RuntimeProfileConfig {
     #[nested]
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
     #[nested]
+    pub effort_routing: Option<crate::scattered_types::EffortRoutingConfig>,
+    #[nested]
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
     #[nested]
     pub tool_receipts: ToolReceiptsConfig,
@@ -14755,8 +14862,10 @@ impl Default for RuntimeProfileConfig {
             context_compact_ratio: None,
             compact_context: None,
             parallel_tools: None,
+            single_tool_rounds: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
+            deferred_builtin_tools: false,
             max_system_prompt_chars: None,
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
@@ -14767,6 +14876,7 @@ impl Default for RuntimeProfileConfig {
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
+            effort_routing: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             tool_receipts: ToolReceiptsConfig::default(),
             tool_filter_groups: Vec::new(),
@@ -15161,6 +15271,7 @@ impl Default for SchedulerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "model_routes"]
+#[application = "model_provider_refresh"]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     /// `#[serde(default)]` lets the `create_map_key` macro default-construct
@@ -17133,6 +17244,18 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub use_markdown_blocks: bool,
+    /// Accept messages posted by other Slack apps and bots
+    /// (`subtype = "bot_message"`), such as Workflow Builder steps.
+    ///
+    /// Off by default: these senders are not humans, so accepting them widens
+    /// who can drive the agent. Enabling this does **not** bypass
+    /// authorization: the posting app's bot ID still has to match the
+    /// channel's peer allowlist, so allow specific bot IDs rather than `"*"`
+    /// unless every app in the workspace is trusted. This agent's own posts
+    /// are always ignored regardless of this setting.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allow_bot_messages: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -21078,6 +21201,7 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             observability: ObservabilityConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
+            tools: crate::builtin_tools::BuiltinToolsConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -21407,31 +21531,120 @@ fn paths_equal_lexically(a: &Path, b: &Path) -> bool {
 /// visible to the runtime, which now scans [`PluginsConfig::resolved_plugins_dir`].
 ///
 /// Historically `zeroclaw plugin install` wrote to `<data_dir>/plugins` (and,
-/// before the data-dir rename, `<install_root>/workspace/plugins`). A directory
-/// is reported only when it differs from the configured plugins dir and contains
-/// at least one plugin (a subdirectory with a `manifest.toml`). Used to surface a
-/// migration hint and to drive `zeroclaw plugin migrate`.
+/// before the data-dir rename, `<install_root>/workspace/plugins`). New V2
+/// splits route packages to host data. An older split's live agent workspace
+/// is not an automatic recovery source: compatible packages there require
+/// explicit operator adoption through `zeroclaw plugin install <path>`.
+/// Supported legacy root aliases are followed, but roots overlapping a known
+/// agent workspace in either direction are excluded. Target aliases are
+/// excluded and duplicate roots occur once. This selection does not bind the
+/// packages a later mover rescans or authenticate their historical origin.
+/// Used to surface a migration hint and to drive `zeroclaw plugin migrate`.
 #[must_use]
 pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
     let target = config.plugins.resolved_plugins_dir();
+    let canonical_target = std::fs::canonicalize(&target).ok();
+    let workspaces: Vec<PathBuf> = std::iter::once(config.agent_workspace_dir("default"))
+        .chain(
+            config
+                .agents
+                .keys()
+                .map(|alias| config.agent_workspace_dir(alias)),
+        )
+        .chain(std::iter::once(
+            config.install_root_dir().join("agents/default/workspace"),
+        ))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
     [
         config.data_dir.join("plugins"),
         config.install_root_dir().join("workspace").join("plugins"),
+        v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins"),
     ]
     .into_iter()
-    .filter(|legacy| *legacy != target && dir_has_plugin(legacy))
+    .filter(|legacy| {
+        if paths_equal_lexically(legacy, &target) || !dir_has_plugin(legacy) {
+            return false;
+        }
+        let Ok(canonical) = std::fs::canonicalize(legacy) else {
+            return false;
+        };
+        if workspaces
+            .iter()
+            .any(|workspace| legacy_root_overlaps_workspace(legacy, &canonical, workspace))
+        {
+            return false;
+        }
+        canonical_target.as_ref() != Some(&canonical) && seen.insert(canonical)
+    })
     .collect()
 }
 
-/// Returns `true` if `dir` holds at least one plugin (a subdirectory containing a
-/// `manifest.toml`).
+fn legacy_root_overlaps_workspace(legacy: &Path, canonical: &Path, workspace: &Path) -> bool {
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    if let Ok(workspace) = std::fs::canonicalize(workspace) {
+        return overlaps(canonical, &workspace);
+    }
+    // An absent declared workspace is still a known role. Compare normalized
+    // lexical paths conservatively; do not create it or attest it as present.
+    let Some(lexical_workspace) = legacy_lexical_absolute_path(workspace) else {
+        return true;
+    };
+    let Some(legacy) = legacy_lexical_absolute_path(legacy) else {
+        return true;
+    };
+    if overlaps(&legacy, &lexical_workspace) || overlaps(canonical, &lexical_workspace) {
+        return true;
+    }
+    // A declared absent child may be reached through an existing parent alias.
+    // Resolve only that existing ancestor, then compare the remaining declared
+    // path lexically. This does not attest the missing workspace as present.
+    for ancestor in workspace.ancestors().skip(1) {
+        if let Ok(parent) = std::fs::canonicalize(ancestor) {
+            let Ok(suffix) = workspace.strip_prefix(ancestor) else {
+                return true;
+            };
+            let Some(projected) = legacy_lexical_absolute_path(&parent.join(suffix)) else {
+                return true;
+            };
+            return overlaps(canonical, &projected);
+        }
+    }
+    false
+}
+
+fn legacy_lexical_absolute_path(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    if !absolute.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+/// Returns `true` if `dir` holds at least one ordinary child directory containing
+/// a `manifest.toml`, matching the runtime's package-directory eligibility.
 fn dir_has_plugin(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    entries
-        .flatten()
-        .any(|entry| entry.path().join("manifest.toml").exists())
+    entries.flatten().any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && entry.path().join("manifest.toml").exists()
+    })
 }
 
 /// Detect if an executable path lives under a macOS Homebrew prefix and return
@@ -22160,6 +22373,79 @@ pub mod test_post_replace_pause_gate {
 }
 
 impl Config {
+    /// Compare unmasked semantic properties, independently of dirty-path bookkeeping.
+    /// Serialized values are temporary; only opaque path components are returned.
+    /// Serde-skipped loader diagnostics and process-local bookkeeping are excluded.
+    pub fn semantic_changed_paths(previous: &Self, candidate: &Self) -> Result<Vec<Vec<String>>> {
+        fn materialize(config: &Config) -> Result<toml::Value> {
+            let mut value =
+                toml::Value::try_from(config).context("cannot materialize config change scope")?;
+            let table = value
+                .as_table_mut()
+                .context("config change scope must be a table")?;
+            // Root serialization omits this entire section when disabled,
+            // even though its other fields still belong to the config.
+            table.insert(
+                "conversational_ai".to_string(),
+                toml::Value::try_from(&config.conversational_ai)
+                    .context("cannot materialize conversational AI change scope")?,
+            );
+            Ok(value)
+        }
+
+        fn compare(
+            previous: &toml::Value,
+            candidate: &toml::Value,
+            path: &mut Vec<String>,
+            changed: &mut Vec<Vec<String>>,
+        ) {
+            match (previous, candidate) {
+                (toml::Value::Table(before), toml::Value::Table(after)) => {
+                    let keys: std::collections::BTreeSet<_> =
+                        before.keys().chain(after.keys()).collect();
+                    for key in keys {
+                        path.push(key.clone());
+                        match (before.get(key), after.get(key)) {
+                            (Some(before), Some(after)) => compare(before, after, path, changed),
+                            _ => changed.push(path.clone()),
+                        }
+                        path.pop();
+                    }
+                }
+                // Arrays remain one semantic property, including natural-key lists.
+                _ if previous != candidate => changed.push(path.clone()),
+                _ => {}
+            }
+        }
+
+        let previous = materialize(previous)?;
+        let candidate = materialize(candidate)?;
+        let mut changed = Vec::new();
+        compare(&previous, &candidate, &mut Vec::new(), &mut changed);
+        Ok(changed)
+    }
+
+    /// Resolve potential application from generated metadata, defaulting to reload.
+    ///
+    /// Builds this snapshot's property metadata on every call. To classify
+    /// several paths against one snapshot, build
+    /// [`Config::application_capabilities`] once and query it per path.
+    pub fn application_capability(&self, path: &[String]) -> ApplicationCapability {
+        self.application_capabilities().capability(path)
+    }
+
+    /// Snapshot this config's per-property application metadata once, so
+    /// many paths can be classified without re-deriving `prop_fields()`.
+    pub fn application_capabilities(&self) -> ApplicationCapabilities {
+        ApplicationCapabilities {
+            fields: self
+                .prop_fields()
+                .into_iter()
+                .map(|field| (field.name, field.application))
+                .collect(),
+        }
+    }
+
     /// The resolved peer policy for `<channel_type>.<alias>`: every granted
     /// entry, plus every `ignore` entry as a `PEER_DENY_PREFIX` marker.
     ///
@@ -23129,6 +23415,7 @@ impl Config {
         self.collect_context_compression_ignored_warnings(&mut warnings);
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
+        self.collect_compiled_out_tool_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -23239,10 +23526,56 @@ impl Config {
         ));
     }
 
+    /// One warning per enabled section whose tool this build was compiled
+    /// without: the section has no effect, and `validate()` does not check
+    /// the tool's own settings, so this is the one place it is reported.
+    fn collect_compiled_out_tool_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !cfg!(feature = "tools-external") {
+            // Only a named adapter is reported. Full selects what this build
+            // carries, so the wildcard, and with it the default, stays quiet.
+            for name in crate::builtin_tools::EXTERNAL_TOOL_NAMES {
+                if self.tools.optional.iter().any(|entry| entry == name) {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::TOOL_COMPILED_OUT,
+                        format!(
+                            "{name} was selected in tools.optional, but this build lacks \
+                                 `tools-external`. Build from source with `tools-compat`; \
+                                 runtime config cannot add compiled-out code."
+                        ),
+                        "tools.optional".to_string(),
+                    ));
+                }
+            }
+        }
+        for tool in crate::opt_in_tools::OptInTool::ALL {
+            if tool.compiled() || !tool.enabled_in(self) {
+                continue;
+            }
+            let (section, feature) = (tool.section(), tool.feature());
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                format!(
+                    "[{section}] is enabled, but this build was compiled without the \
+                     `{feature}` feature, so the tool is unavailable and its settings are not \
+                     checked. Use a build that includes `{feature}`, or disable the section."
+                ),
+                format!("{section}.enabled"),
+            ));
+        }
+    }
+
     fn collect_codex_cli_extra_arg_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
+        // The arguments reach no process in a build without the Codex tool,
+        // which `collect_compiled_out_tool_warnings` reports instead.
+        if !crate::opt_in_tools::OptInTool::CodexCli.compiled() {
+            return;
+        }
         for risky_match in risky_codex_cli_arg_matches(&self.codex_cli.extra_args) {
             warnings.push(crate::validation_warnings::ValidationWarning::new(
                 CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING,
@@ -23912,6 +24245,47 @@ impl Config {
                     "runtime_profiles.{profile_alias}.max_execution_tree_iterations must be greater than 0"
                 );
             }
+            if let Some(policy) = &profile.effort_routing {
+                if profile.auto_classify.is_some() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("runtime_profiles.{profile_alias}.effort_routing"),
+                        "runtime_profiles.{profile_alias}.effort_routing cannot be combined with runtime_profiles.{profile_alias}.auto_classify"
+                    );
+                }
+                let local_hint = policy.local_hint.trim();
+                let cloud_hint = policy.cloud_hint.trim();
+                if local_hint.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("runtime_profiles.{profile_alias}.effort_routing.local_hint"),
+                        "runtime_profiles.{profile_alias}.effort_routing.local_hint must not be empty"
+                    );
+                }
+                if cloud_hint.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("runtime_profiles.{profile_alias}.effort_routing.cloud_hint"),
+                        "runtime_profiles.{profile_alias}.effort_routing.cloud_hint must not be empty"
+                    );
+                }
+                if local_hint.eq_ignore_ascii_case(cloud_hint) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("runtime_profiles.{profile_alias}.effort_routing.cloud_hint"),
+                        "runtime_profiles.{profile_alias}.effort_routing local_hint and cloud_hint must name distinct model_routes"
+                    );
+                }
+                for (field, hint) in [("local_hint", local_hint), ("cloud_hint", cloud_hint)] {
+                    if !self.model_routes.iter().any(|route| route.hint == hint) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("runtime_profiles.{profile_alias}.effort_routing.{field}"),
+                            "runtime_profiles.{profile_alias}.effort_routing.{field} = {hint:?} but no model_routes entry has that hint"
+                        );
+                    }
+                }
+            }
         }
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
@@ -24540,7 +24914,12 @@ impl Config {
 
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
-            if route.hint.trim().is_empty() {
+            let required = crate::setup::route_required_fields(
+                &route.hint,
+                &route.model_provider,
+                &route.model,
+            );
+            if required.hint.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].hint"),
@@ -24548,7 +24927,7 @@ impl Config {
                 );
             }
             let mp = route.model_provider.trim();
-            if mp.is_empty() {
+            if required.model_provider.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model_provider"),
@@ -24575,7 +24954,7 @@ impl Config {
                     "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
-            if route.model.trim().is_empty() {
+            if required.model.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model"),
@@ -24586,7 +24965,12 @@ impl Config {
 
         // Embedding routes
         for (i, route) in self.embedding_routes.iter().enumerate() {
-            if route.hint.trim().is_empty() {
+            let required = crate::setup::route_required_fields(
+                &route.hint,
+                &route.model_provider,
+                &route.model,
+            );
+            if required.hint.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].hint"),
@@ -24594,7 +24978,7 @@ impl Config {
                 );
             }
             let mp = route.model_provider.trim();
-            if mp.is_empty() {
+            if required.model_provider.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model_provider"),
@@ -24619,7 +25003,7 @@ impl Config {
                     "embedding_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
-            if route.model.trim().is_empty() {
+            if required.model.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model"),
@@ -24760,8 +25144,13 @@ impl Config {
             }
         }
 
+        // An opt-in tool's own settings are checked only in a build that
+        // carries the tool. Its section still parses everywhere, and
+        // `collect_warnings` reports it as compiled out instead of this
+        // demanding credentials or resources for a tool that cannot run.
+        //
         // Microsoft 365
-        if self.microsoft365.enabled {
+        if crate::opt_in_tools::OptInTool::Microsoft365.runs_in(self) {
             let tenant = self
                 .microsoft365
                 .tenant_id
@@ -24803,47 +25192,6 @@ impl Config {
             }
         }
 
-        // Microsoft 365
-        if self.microsoft365.enabled {
-            let tenant = self
-                .microsoft365
-                .tenant_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if tenant.is_none() {
-                anyhow::bail!(
-                    "microsoft365.tenant_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let client = self
-                .microsoft365
-                .client_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if client.is_none() {
-                anyhow::bail!(
-                    "microsoft365.client_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let flow = self.microsoft365.auth_flow.trim();
-            if flow != "client_credentials" && flow != "device_code" {
-                anyhow::bail!("microsoft365.auth_flow must be client_credentials or device_code");
-            }
-            if flow == "client_credentials"
-                && self
-                    .microsoft365
-                    .client_secret
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-            {
-                anyhow::bail!(
-                    "microsoft365.client_secret must not be empty when auth_flow is client_credentials"
-                );
-            }
-        }
-
         validate_plugin_entries(&self.plugins)?;
         validate_plugin_channel_instances(&self.channels)?;
 
@@ -24870,154 +25218,158 @@ impl Config {
             }
         }
 
-        // Google Workspace allowed_services validation
-        let mut seen_gws_services = std::collections::HashSet::new();
-        for (i, service) in self.google_workspace.allowed_services.iter().enumerate() {
-            let normalized = service.trim();
-            if normalized.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("google_workspace.allowed_services[{i}]"),
-                    "google_workspace.allowed_services[{i}] must not be empty"
-                );
-            }
-            if !normalized
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "google_workspace.allowed_services[{i}] contains invalid characters: {normalized}"
-                );
-            }
-            if !seen_gws_services.insert(normalized.to_string()) {
-                anyhow::bail!(
-                    "google_workspace.allowed_services contains duplicate entry: {normalized}"
-                );
-            }
-        }
-
-        // Build the effective allowed-services set for cross-validation.
-        // When the operator leaves allowed_services empty the tool falls back to
-        // DEFAULT_GWS_SERVICES; use the same constant here so validation is
-        // consistent in both cases.
-        let effective_services: std::collections::HashSet<&str> =
-            if self.google_workspace.allowed_services.is_empty() {
-                DEFAULT_GWS_SERVICES.iter().copied().collect()
-            } else {
-                self.google_workspace
-                    .allowed_services
-                    .iter()
-                    .map(|s| s.trim())
-                    .collect()
-            };
-
-        let mut seen_gws_operations = std::collections::HashSet::new();
-        for (i, operation) in self.google_workspace.allowed_operations.iter().enumerate() {
-            let service = operation.service.trim();
-            let resource = operation.resource.trim();
-
-            if service.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("google_workspace.allowed_operations[{i}].service"),
-                    "google_workspace.allowed_operations[{i}].service must not be empty"
-                );
-            }
-            if resource.is_empty() {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].resource must not be empty"
-                );
-            }
-
-            if !effective_services.contains(service) {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].service '{service}' is not in the \
-                     effective allowed_services; this entry can never match at runtime"
-                );
-            }
-            if !service
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
-                );
-            }
-            // Unlike service IDs, resource/sub_resource/method names are camelCase
-            // in the Google APIs (calendarList, quickAdd, batchUpdate), so
-            // uppercase must be accepted here and in the runtime tool check.
-            if !resource
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
-                );
-            }
-
-            if let Some(ref sub_resource) = operation.sub_resource {
-                let sub = sub_resource.trim();
-                if sub.is_empty() {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].sub_resource must not be empty when present"
-                    );
-                }
-                if !sub
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-                {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
-                    );
-                }
-            }
-
-            if operation.methods.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("google_workspace.allowed_operations[{i}].methods"),
-                    "google_workspace.allowed_operations[{i}].methods must not be empty"
-                );
-            }
-
-            let mut seen_methods = std::collections::HashSet::new();
-            for (j, method) in operation.methods.iter().enumerate() {
-                let normalized = method.trim();
+        // Google Workspace allowed_services / allowed_operations. Checked
+        // whenever the tool is compiled in, enabled or not, as before; a build
+        // without the tool does not check them, like the other opt-in tools.
+        if crate::opt_in_tools::OptInTool::GoogleWorkspace.compiled() {
+            let mut seen_gws_services = std::collections::HashSet::new();
+            for (i, service) in self.google_workspace.allowed_services.iter().enumerate() {
+                let normalized = service.trim();
                 if normalized.is_empty() {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].methods[{j}] must not be empty"
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("google_workspace.allowed_services[{i}]"),
+                        "google_workspace.allowed_services[{i}] must not be empty"
                     );
                 }
                 if !normalized
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
                 {
                     anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
+                        "google_workspace.allowed_services[{i}] contains invalid characters: {normalized}"
                     );
                 }
-                if !seen_methods.insert(normalized.to_string()) {
+                if !seen_gws_services.insert(normalized.to_string()) {
                     anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].methods contains duplicate entry: {normalized}"
+                        "google_workspace.allowed_services contains duplicate entry: {normalized}"
                     );
                 }
             }
 
-            let sub_key = operation
-                .sub_resource
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("");
-            let operation_key = format!("{service}:{resource}:{sub_key}");
-            if !seen_gws_operations.insert(operation_key.clone()) {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations contains duplicate service/resource/sub_resource entry: {operation_key}"
-                );
+            // Build the effective allowed-services set for cross-validation.
+            // When the operator leaves allowed_services empty the tool falls back to
+            // DEFAULT_GWS_SERVICES; use the same constant here so validation is
+            // consistent in both cases.
+            let effective_services: std::collections::HashSet<&str> =
+                if self.google_workspace.allowed_services.is_empty() {
+                    DEFAULT_GWS_SERVICES.iter().copied().collect()
+                } else {
+                    self.google_workspace
+                        .allowed_services
+                        .iter()
+                        .map(|s| s.trim())
+                        .collect()
+                };
+
+            let mut seen_gws_operations = std::collections::HashSet::new();
+            for (i, operation) in self.google_workspace.allowed_operations.iter().enumerate() {
+                let service = operation.service.trim();
+                let resource = operation.resource.trim();
+
+                if service.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("google_workspace.allowed_operations[{i}].service"),
+                        "google_workspace.allowed_operations[{i}].service must not be empty"
+                    );
+                }
+                if resource.is_empty() {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].resource must not be empty"
+                    );
+                }
+
+                if !effective_services.contains(service) {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].service '{service}' is not in the \
+                         effective allowed_services; this entry can never match at runtime"
+                    );
+                }
+                if !service
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
+                    );
+                }
+                // Unlike service IDs, resource/sub_resource/method names are camelCase
+                // in the Google APIs (calendarList, quickAdd, batchUpdate), so
+                // uppercase must be accepted here and in the runtime tool check.
+                if !resource
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
+                    );
+                }
+
+                if let Some(ref sub_resource) = operation.sub_resource {
+                    let sub = sub_resource.trim();
+                    if sub.is_empty() {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].sub_resource must not be empty when present"
+                        );
+                    }
+                    if !sub
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
+                        );
+                    }
+                }
+
+                if operation.methods.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("google_workspace.allowed_operations[{i}].methods"),
+                        "google_workspace.allowed_operations[{i}].methods must not be empty"
+                    );
+                }
+
+                let mut seen_methods = std::collections::HashSet::new();
+                for (j, method) in operation.methods.iter().enumerate() {
+                    let normalized = method.trim();
+                    if normalized.is_empty() {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].methods[{j}] must not be empty"
+                        );
+                    }
+                    if !normalized
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
+                        );
+                    }
+                    if !seen_methods.insert(normalized.to_string()) {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].methods contains duplicate entry: {normalized}"
+                        );
+                    }
+                }
+
+                let sub_key = operation
+                    .sub_resource
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("");
+                let operation_key = format!("{service}:{resource}:{sub_key}");
+                if !seen_gws_operations.insert(operation_key.clone()) {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations contains duplicate service/resource/sub_resource entry: {operation_key}"
+                    );
+                }
             }
         }
 
         // Project intelligence
-        if self.project_intel.enabled {
+        if crate::opt_in_tools::OptInTool::ProjectIntel.runs_in(self) {
             let lang = &self.project_intel.default_language;
             if !["en", "de", "fr", "it"].contains(&lang.as_str()) {
                 anyhow::bail!(
@@ -25086,7 +25438,7 @@ impl Config {
         }
 
         // Notion
-        if self.notion.enabled {
+        if crate::opt_in_tools::OptInTool::Notion.runs_in(self) {
             if self.notion.database_id.trim().is_empty() {
                 anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
             }
@@ -25140,7 +25492,7 @@ impl Config {
         }
 
         // Jira
-        if self.jira.enabled {
+        if crate::opt_in_tools::OptInTool::Jira.runs_in(self) {
             if self.jira.base_url.trim().is_empty() {
                 anyhow::bail!("jira.base_url must not be empty when jira.enabled = true");
             }
@@ -26171,6 +26523,17 @@ impl Config {
             .and_then(|v| v.try_into().ok())
             .unwrap_or_default();
         prune_default_values(&mut new_table, &default_table);
+        // Keep the selection even when it is the full default. Pruning it would
+        // leave an omitted section that `config migrate` then has to normalize.
+        new_table
+            .entry("tools".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("serialized tools selector is not a TOML table")?
+            .insert(
+                "optional".to_string(),
+                builtin_tool_selection_value(&config_to_save),
+            );
         let new_toml = ensure_blank_line_before_sections(
             &toml::to_string_pretty(&new_table).context("Failed to serialize pruned config")?,
         );
@@ -26269,6 +26632,27 @@ impl Config {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
         }
 
+        let selector_dirty = self
+            .dirty_paths
+            .iter()
+            .any(|path| path == "tools" || path == "tools.optional");
+        if selector_dirty || !doc.as_table().contains_key("tools") {
+            // Use the masked canonical selection, not a transient env value.
+            // An unrelated edit leaves any existing malformed tools section
+            // untouched; an explicit selector edit cannot silently fail to save.
+            if let Some(tools) = doc.as_table().get("tools") {
+                anyhow::ensure!(
+                    tools.as_table_like().is_some(),
+                    "cannot persist tools.optional through a malformed tools section"
+                );
+            }
+            set_path_in_doc(
+                doc.as_table_mut(),
+                &["tools", "optional"],
+                &builtin_tool_selection_value(&config_to_save),
+            );
+        }
+
         // Retire the inert `[security.nevis]` table from the file. The shim
         // discards its content at load and `skip_serializing` keeps it out of
         // a full save, but an incremental save reparses the original file and
@@ -26310,6 +26694,18 @@ impl Config {
         self.clear_dirty();
         Ok(())
     }
+}
+
+fn builtin_tool_selection_value(config: &Config) -> toml::Value {
+    toml::Value::Array(
+        config
+            .tools
+            .optional
+            .iter()
+            .cloned()
+            .map(toml::Value::String)
+            .collect(),
+    )
 }
 
 fn collect_onepassword_reference_snapshots(
@@ -26600,8 +26996,7 @@ fn apply_dirty_path(
     // the per-field MCP editor's edits go nowhere on disk. See the
     // regression test `save_dirty_persists_mcp_server_field_via_natural_key`.
     if let Some(section) = find_natural_key_section_for_path(dotted) {
-        apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
-        return Ok(());
+        return apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
     }
 
     // `HashMap<String, T>` sections whose key is a `#[resource_key]`
@@ -26739,6 +27134,10 @@ fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> 
 /// the existing Table-shaped `set_path_in_doc` / `delete_path_in_doc`
 /// helpers against the located entry's table.
 ///
+/// A present-value write refused by the document-shape check fails the
+/// save; the caller must not clear dirty paths or publish unsaved state.
+/// Missing-value delete/no-op paths keep their existing behavior.
+///
 /// **Order-independence invariant.** `Config::dirty_paths` is a
 /// `HashSet<String>`, so the three shapes above can apply in any
 /// interleaving within a single `save_dirty` batch — in particular,
@@ -26759,7 +27158,7 @@ fn apply_dirty_natural_key_path(
     dotted: &str,
     full_table: &toml::Table,
     _default_table: &toml::Table,
-) {
+) -> Result<()> {
     // `dotted` is known to start with `<section_path>.` thanks to
     // `find_natural_key_section_for_path`; split the alias and inner
     // suffix off the tail.
@@ -26768,14 +27167,14 @@ fn apply_dirty_natural_key_path(
         .and_then(|s| s.strip_prefix('.'))
     {
         Some(r) => r,
-        None => return,
+        None => return Ok(()),
     };
     let (alias, inner_suffix) = match rest.split_once('.') {
         Some((a, i)) => (a, Some(i)),
         None => (rest, None),
     };
     if alias.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Walk the in-memory serialized array at `section_path`. Each
@@ -26796,7 +27195,7 @@ fn apply_dirty_natural_key_path(
     // always at the deepest segment of `section_path`; the leading
     // segments are plain struct fields and therefore Tables on disk.
     let Some((array_key, parent_segs)) = section_segs.split_last() else {
-        return;
+        return Ok(());
     };
 
     // Inner-suffix path: per-field edit (case 1). Reconcile the inner
@@ -26850,10 +27249,13 @@ fn apply_dirty_natural_key_path(
                     array_key,
                     section.natural_key_field,
                     alias,
-                );
-                let Some(entry_table) = entry_table else {
-                    return;
-                };
+                )
+                .with_context(|| {
+                    format!(
+                        "Cannot persist natural-key section {}: incompatible document node",
+                        section.section_path
+                    )
+                })?;
                 let mut pruned = value.clone();
                 prune_empty_leaves(&mut pruned);
                 set_path_in_doc(entry_table, &inner_segs, &pruned);
@@ -26870,12 +27272,12 @@ fn apply_dirty_natural_key_path(
                     section.natural_key_field,
                     alias,
                 ) else {
-                    return;
+                    return Ok(());
                 };
                 delete_path_in_doc(entry_table, &inner_segs);
             }
         }
-        return;
+        return Ok(());
     }
 
     // Bare-alias path (cases 2 and 3). No inner suffix → reconcile the
@@ -26894,10 +27296,13 @@ fn apply_dirty_natural_key_path(
                 array_key,
                 section.natural_key_field,
                 alias,
-            );
-            let Some(entry_table) = entry_table else {
-                return;
-            };
+            )
+            .with_context(|| {
+                format!(
+                    "Cannot persist natural-key section {}: incompatible document node",
+                    section.section_path
+                )
+            })?;
             // Replace the table's contents wholesale so removed inner
             // fields actually disappear from disk.
             entry_table.clear();
@@ -26919,6 +27324,7 @@ fn apply_dirty_natural_key_path(
             );
         }
     }
+    Ok(())
 }
 
 /// Return the longest `MapKeyKind::Map` section whose path is a strict
@@ -27129,7 +27535,8 @@ fn warn_natural_key_doc_kind_mismatch(
 ///   * Parent Tables along `parent_segs` are auto-created if missing
 ///     (mirrors `set_path_in_doc`).
 ///   * The `array_key` slot may not yet exist; insert an
-///     `ArrayOfTables` if so.
+///     `ArrayOfTables` if so. An existing empty `[]` is also a valid
+///     empty Vec; convert it when creating the first keyed table.
 ///   * The array may not yet contain an entry whose natural-key field
 ///     matches `alias`; push a new table with `<natural_key_field> =
 ///     "<alias>"` seeded.
@@ -27175,6 +27582,31 @@ fn ensure_array_of_tables_entry<'a>(
             array_key,
             toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
         );
+    } else if let Some(array) = cursor.get(array_key).and_then(|item| item.as_array())
+        && array.is_empty()
+    {
+        // No existing rows can be lost. Carry the key's leading comments,
+        // comments inside the empty array, and its end-of-line comment onto
+        // the first table. insert() resets the key decor so later tables do
+        // not repeat those comments.
+        let leading = cursor
+            .key(array_key)
+            .and_then(|key| key.leaf_decor().prefix())
+            .and_then(|prefix| prefix.as_str())
+            .unwrap_or("");
+        let inner = array.trailing().as_str().unwrap_or("");
+        let trailing = array
+            .decor()
+            .suffix()
+            .and_then(|suffix| suffix.as_str())
+            .unwrap_or("");
+        let mut first = toml_edit::Table::new();
+        first.insert(natural_key_field, toml_edit::value(alias.to_string()));
+        first.decor_mut().set_prefix(format!("{leading}{inner}"));
+        first.decor_mut().set_suffix(trailing.to_owned());
+        let mut aot = toml_edit::ArrayOfTables::new();
+        aot.push(first);
+        cursor.insert(array_key, toml_edit::Item::ArrayOfTables(aot));
     }
     let aot = cursor
         .get_mut(array_key)
@@ -28064,6 +28496,263 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_detects_unmasked_credentials() {
+        let mut previous = Config::default();
+        previous.providers.models.openai.insert(
+            "default".into(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("old-test-secret".into()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let mut candidate = previous.clone();
+        candidate
+            .providers
+            .models
+            .openai
+            .get_mut("default")
+            .unwrap()
+            .base
+            .api_key = Some("new-test-secret".into());
+
+        let name = "providers.models.openai.default.api_key";
+        assert_eq!(
+            previous.get_prop(name).unwrap(),
+            candidate.get_prop(name).unwrap()
+        );
+        let paths = Config::semantic_changed_paths(&previous, &candidate).unwrap();
+        assert_eq!(
+            paths,
+            vec![vec!["providers", "models", "openai", "default", "api_key"]]
+        );
+        assert_eq!(
+            candidate.application_capability(&paths[0]),
+            ApplicationCapability::ModelProviderRefresh
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_ignores_dirty_set_for_full_replacement() {
+        let previous = Config::default();
+        let mut candidate = previous.clone();
+        candidate.gateway.port += 1;
+        assert!(candidate.dirty_paths.is_empty());
+        let paths = Config::semantic_changed_paths(&previous, &candidate).unwrap();
+        assert_eq!(paths, vec![vec!["gateway", "port"]]);
+        candidate.mark_dirty("unrelated.path");
+        assert_eq!(
+            Config::semantic_changed_paths(&previous, &candidate).unwrap(),
+            paths
+        );
+        candidate.dirty_paths.clear();
+        candidate.gateway.port = previous.gateway.port;
+        assert!(
+            Config::semantic_changed_paths(&previous, &candidate)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_includes_disabled_conversational_ai() {
+        let previous = Config::default();
+        let mut candidate = previous.clone();
+        candidate.conversational_ai.default_language = "de".into();
+        assert!(!candidate.conversational_ai.enabled);
+        assert!(
+            toml::Value::try_from(&candidate)
+                .unwrap()
+                .get("conversational_ai")
+                .is_none()
+        );
+        assert_eq!(
+            Config::semantic_changed_paths(&previous, &candidate).unwrap(),
+            vec![vec!["conversational_ai", "default_language"]],
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_preserves_dotted_alias_and_table_presence() {
+        let mut previous = Config::default();
+        previous
+            .agents
+            .insert("ops.team".into(), AliasedAgentConfig::default());
+        let mut candidate = previous.clone();
+        candidate.agents.get_mut("ops.team").unwrap().model_provider = "openai.default".into();
+        let paths = Config::semantic_changed_paths(&previous, &candidate).unwrap();
+        assert_eq!(paths, vec![vec!["agents", "ops.team", "model_provider"]]);
+        assert_eq!(
+            candidate.application_capability(&paths[0]),
+            ApplicationCapability::ReloadRequired
+        );
+
+        candidate.agents.remove("ops.team");
+        assert_eq!(
+            Config::semantic_changed_paths(&previous, &candidate).unwrap(),
+            vec![vec!["agents", "ops.team"]],
+        );
+        assert_eq!(
+            Config::semantic_changed_paths(&candidate, &previous).unwrap(),
+            vec![vec!["agents", "ops.team"]],
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_treats_arrays_as_whole_properties() {
+        let mut previous = Config::default();
+        previous.model_routes.push(ModelRouteConfig {
+            hint: "fast".into(),
+            model: "old-model".into(),
+            ..ModelRouteConfig::default()
+        });
+        let mut candidate = previous.clone();
+        candidate.model_routes[0].model = "new-model".into();
+        candidate.gateway.paired_tokens.push("test-token".into());
+        assert_eq!(
+            Config::semantic_changed_paths(&previous, &candidate).unwrap(),
+            vec![vec!["gateway", "paired_tokens"], vec!["model_routes"]],
+        );
+        assert_eq!(
+            candidate.application_capability(&["model_routes".into()]),
+            ApplicationCapability::ModelProviderRefresh
+        );
+        assert_eq!(
+            candidate.application_capability(&["gateway".into(), "paired_tokens".into()]),
+            ApplicationCapability::ReloadRequired
+        );
+        candidate.model_routes.clear();
+        assert_eq!(
+            candidate.application_capability(&["model_routes".into()]),
+            ApplicationCapability::ReloadRequired
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[::core::prelude::v1::test]
+    fn config_application_semantic_changed_paths_propagates_materialization_failure() {
+        let previous = Config::default();
+        let mut candidate = previous.clone();
+        // Disabled-section extraction must propagate failure too.
+        candidate.conversational_ai.max_conversation_turns = usize::MAX;
+        assert!(Config::semantic_changed_paths(&previous, &candidate).is_err());
+        assert!(Config::semantic_changed_paths(&candidate, &previous).is_err());
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_application_metadata_defaults_and_annotated_scope() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .openai
+            .insert("prod_v2".into(), OpenAIModelProviderConfig::default());
+        config
+            .providers
+            .tts
+            .openai
+            .insert("default".into(), OpenAITtsProviderConfig::default());
+        config
+            .agents
+            .insert("ops_team".into(), AliasedAgentConfig::default());
+        config.model_routes.push(ModelRouteConfig {
+            hint: "fast".into(),
+            ..ModelRouteConfig::default()
+        });
+        let fields = config.prop_fields();
+        let capabilities = config.application_capabilities();
+        let live: Vec<_> = fields
+            .iter()
+            .filter(|field| field.application == ApplicationCapability::ModelProviderRefresh)
+            .collect();
+        assert!(!live.is_empty());
+        assert!(
+            live.iter()
+                .all(|field| field.name.starts_with("providers.models.")
+                    || field.name.starts_with("model_routes.")
+                    || field.name == "agents.ops_team.model_provider")
+        );
+        for prefix in ["providers.models.", "model_routes."] {
+            let children: Vec<_> = fields
+                .iter()
+                .filter(|field| field.name.starts_with(prefix))
+                .collect();
+            assert!(!children.is_empty());
+            assert!(
+                children
+                    .iter()
+                    .all(|field| field.application == ApplicationCapability::ModelProviderRefresh)
+            );
+        }
+        for path in [
+            vec!["providers", "models"],
+            vec!["providers", "models", "openai", "prod_v2"],
+            vec!["providers", "models", "openai", "prod_v2", "api_key"],
+            vec!["agents", "ops_team", "model_provider"],
+            vec!["model_routes"],
+        ] {
+            let path: Vec<_> = path.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                config.application_capability(&path),
+                ApplicationCapability::ModelProviderRefresh
+            );
+            assert_eq!(
+                capabilities.capability(&path),
+                ApplicationCapability::ModelProviderRefresh,
+                "the reusable snapshot index must agree with the per-call lookup for {path:?}"
+            );
+        }
+        for path in [
+            vec![],
+            vec!["unknown"],
+            vec!["providers", "models", "unknown"],
+            vec!["providers", "models", "openai", "prod_v2", "unknown"],
+            vec!["providers"],
+            vec!["providers", "tts"],
+            vec!["gateway"],
+            vec!["agents", "ops_team"],
+            vec!["agents", "ops_team", "enabled"],
+            vec!["providers.models", "openai", "prod_v2", "api_key"],
+        ] {
+            let path: Vec<_> = path.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                config.application_capability(&path),
+                ApplicationCapability::ReloadRequired
+            );
+            assert_eq!(
+                capabilities.capability(&path),
+                ApplicationCapability::ReloadRequired,
+                "the reusable snapshot index must agree with the per-call lookup for {path:?}"
+            );
+        }
+        assert_eq!(
+            ApplicationCapability::default(),
+            ApplicationCapability::ReloadRequired
+        );
+        for capability in [
+            ApplicationCapability::ReloadRequired,
+            ApplicationCapability::ModelProviderRefresh,
+        ] {
+            let wire = serde_json::to_value(capability).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ApplicationCapability>(wire).unwrap(),
+                capability
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(ApplicationCapability::ModelProviderRefresh).unwrap(),
+            "model_provider_refresh"
+        );
+        #[cfg(feature = "schema-export")]
+        assert!(
+            !serde_json::to_value(schemars::schema_for!(ApplicationCapability))
+                .unwrap()
+                .is_null()
+        );
+    }
+
     #[::core::prelude::v1::test]
     fn channel_external_peers_carries_every_ignore_across_matching_groups() {
         let config: super::Config = toml::from_str(
@@ -30233,6 +30922,39 @@ zeroclaw-operators = "operator"
     }
 
     #[test]
+    async fn legacy_plugin_dirs_detects_data_destination_after_workspace_override() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let migrated = v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins");
+        assert_eq!(migrated, config.install_root_dir().join("data/plugins"));
+        assert_ne!(migrated, config.data_dir.join("plugins"));
+        write_plugin(&migrated, "resumed");
+        config
+            .agents
+            .entry("default".into())
+            .or_default()
+            .workspace
+            .path = Some(tmp.path().join("custom-workspace"));
+        assert_ne!(
+            config.agent_workspace_dir("default").join("plugins"),
+            migrated
+        );
+
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![migrated]);
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_resumed_destination_when_it_is_the_target() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let migrated = v2::workspace_toplevel_v3_path(&config.install_root_dir(), "plugins");
+        config.plugins.plugins_dir = migrated.to_string_lossy().into_owned();
+        write_plugin(&migrated, "current");
+
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
     async fn legacy_plugin_dirs_empty_when_no_legacy_plugins() {
         let tmp = TempDir::new().unwrap();
         let config = config_with_dirs(tmp.path());
@@ -30253,6 +30975,78 @@ zeroclaw-operators = "operator"
 
         // The data-dir candidate now equals the target → not a "legacy" dir.
         assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_excludes_historical_and_live_agent_workspaces() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let historical = config.agent_workspace_dir("default").join("plugins");
+        write_plugin(&historical, "historical");
+        config
+            .agents
+            .entry("default".into())
+            .or_default()
+            .workspace
+            .path = Some(tmp.path().join("custom-workspace"));
+        write_plugin(
+            &config.agent_workspace_dir("default").join("plugins"),
+            "live",
+        );
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_canonical_target_and_duplicate_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        let data = config.data_dir.join("plugins");
+        write_plugin(&data, "current");
+        config.plugins.plugins_dir = data
+            .join("..")
+            .join("plugins")
+            .to_string_lossy()
+            .into_owned();
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+
+        config.plugins.plugins_dir = tmp.path().join("managed").to_string_lossy().into_owned();
+        config.data_dir = config.install_root_dir().join("workspace");
+        let legacy = config.data_dir.join("plugins");
+        write_plugin(&legacy, "legacy");
+        assert_eq!(legacy_plugin_dirs_with_entries(&config), vec![legacy]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn legacy_plugin_dirs_follows_supported_alias_candidates() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_dirs(tmp.path());
+        let outside = tmp.path().join("outside");
+        write_plugin(&outside, "unselected");
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let data_alias = config.data_dir.join("plugins");
+        symlink(&outside, &data_alias).unwrap();
+        let legacy = config.install_root_dir().join("workspace/plugins");
+        std::fs::create_dir_all(&legacy).unwrap();
+        symlink(outside.join("unselected"), legacy.join("linked-package")).unwrap();
+        assert_eq!(
+            legacy_plugin_dirs_with_entries(&config),
+            vec![data_alias.clone()]
+        );
+        // An ordinary package directory can still use a manifest alias under
+        // the existing runtime manifest-loading contract.
+        std::fs::create_dir_all(legacy.join("linked-manifest")).unwrap();
+        symlink(
+            outside.join("unselected/manifest.toml"),
+            legacy.join("linked-manifest/manifest.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_plugin_dirs_with_entries(&config),
+            vec![data_alias, legacy]
+        );
     }
 
     // ── Defaults ─────────────────────────────────────────────
@@ -30845,6 +31639,20 @@ open_skills_enabled = false
             config.effective_skills_prompt_mode("pinned_full"),
             SkillsPromptInjectionMode::Full
         );
+    }
+
+    #[test]
+    async fn runtime_profile_deferred_builtin_tools_is_opt_in() {
+        assert!(!RuntimeProfileConfig::default().deferred_builtin_tools);
+        let omitted: RuntimeProfileConfig = toml::from_str("").unwrap();
+        assert!(!omitted.deferred_builtin_tools);
+
+        let enabled: RuntimeProfileConfig =
+            toml::from_str("deferred_builtin_tools = true").unwrap();
+        assert!(enabled.deferred_builtin_tools);
+        let round_trip: RuntimeProfileConfig =
+            toml::from_str(&toml::to_string(&enabled).unwrap()).unwrap();
+        assert!(round_trip.deferred_builtin_tools);
     }
 
     #[test]
@@ -32897,6 +33705,7 @@ auto_save = true
             },
             decision_models: HashMap::new(),
             trust: crate::scattered_types::TrustConfig::default(),
+            tools: crate::builtin_tools::BuiltinToolsConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -33746,6 +34555,40 @@ runtime_profile = "fast"
     }
 
     #[test]
+    async fn runtime_profile_single_tool_rounds_defaults_off_and_resolves_by_agent() {
+        let mut parsed = parse_test_config(
+            r#"
+[runtime_profiles.interactive]
+single_tool_rounds = true
+[runtime_profiles.batch]
+single_tool_rounds = false
+[runtime_profiles.unset]
+[agents.enabled]
+runtime_profile = "interactive"
+[agents.disabled]
+runtime_profile = "batch"
+[agents.unset]
+runtime_profile = "unset"
+[agents.missing]
+runtime_profile = "missing"
+"#,
+        );
+        assert_eq!(RuntimeProfileConfig::default().single_tool_rounds, None);
+        assert!(parsed.effective_single_tool_rounds("enabled"));
+        for alias in ["disabled", "unset", "missing", "unknown"] {
+            assert!(!parsed.effective_single_tool_rounds(alias));
+        }
+        parsed
+            .runtime_profiles
+            .get_mut("interactive")
+            .unwrap()
+            .single_tool_rounds = Some(false);
+        assert!(!parsed.effective_single_tool_rounds("enabled"));
+        let serialized = toml::to_string(&parsed.runtime_profiles["batch"]).unwrap();
+        assert!(serialized.contains("single_tool_rounds = false"));
+    }
+
+    #[test]
     async fn runtime_profile_unset_max_tool_iterations_uses_default() {
         // A profile that does not set max_tool_iterations (sentinel 0) falls
         // back to the global default rather than 0.
@@ -34048,6 +34891,214 @@ default_temperature = 0.7
         let _ = fs::remove_dir_all(&dir).await;
     }
 
+    // Upgrade compatibility and durable selector persistence.
+    #[tokio::test]
+    async fn new_install_remains_full_after_repeated_load_and_save() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
+        for _ in 0..3 {
+            let config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(config.tools.optional, ["*"]);
+            config.save().await.unwrap();
+            let raw = fs::read_to_string(dir.path().join("config.toml"))
+                .await
+                .unwrap();
+            let value: toml::Value = toml::from_str(&raw).unwrap();
+            assert_eq!(
+                value["tools"]["optional"],
+                toml::Value::Array(vec![toml::Value::String("*".into())])
+            );
+            assert!(crate::migration::migrate_file(&raw).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_load_and_dirty_save_preserve_selector_intent() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "schema_version = 3\n# operator locale comment\nlocale = \"en\"\n",
+        )
+        .await
+        .unwrap();
+        let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+        assert_eq!(config.tools.optional, ["*"]);
+        config.set_prop("observability.backend", "log").unwrap();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("# operator locale comment"));
+        assert_eq!(
+            crate::migration::migrate_to_current(&raw)
+                .unwrap()
+                .tools
+                .optional,
+            ["*"]
+        );
+        let value: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            value["tools"]["optional"],
+            toml::Value::Array(vec![toml::Value::String("*".into())])
+        );
+        config.set_prop("tools.optional", "[]").unwrap();
+        config.mark_dirty("tools.optional");
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&path).await.unwrap();
+        let value: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(value["tools"]["optional"], toml::Value::Array(Vec::new()));
+        assert!(
+            Box::pin(Config::load_or_init())
+                .await
+                .unwrap()
+                .tools
+                .optional
+                .is_empty()
+        );
+        assert!(config.dirty_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_selections_survive_full_and_incremental_saves() {
+        let _env_guard = env_override_lock().await;
+        let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
+        for selected in [
+            Vec::new(),
+            vec!["calculator".to_string()],
+            vec!["*".to_string()],
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut config = Config {
+                config_path: dir.path().join("config.toml"),
+                data_dir: dir.path().join("data"),
+                ..Config::default()
+            };
+            config.tools.optional = selected.clone();
+            config.save().await.unwrap();
+            config.set_prop("observability.backend", "log").unwrap();
+            config.mark_dirty("observability.backend");
+            config.save_dirty().await.unwrap();
+            let raw = fs::read_to_string(&config.config_path).await.unwrap();
+            assert_eq!(
+                crate::migration::migrate_to_current(&raw)
+                    .unwrap()
+                    .tools
+                    .optional,
+                selected
+            );
+            assert!(crate::migration::migrate_file(&raw).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn dirty_save_does_not_repair_an_unrelated_malformed_tools_section() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = "schema_version = 3\n[tools]\noptional = false # preserve invalid selector\n";
+        fs::write(&path, raw).await.unwrap();
+        let original: toml::Value = toml::from_str(raw).unwrap();
+        let load = crate::migration::migrate_to_current_salvaged(raw);
+        let mut config = load.config;
+        config.config_path = path.clone();
+        config.data_dir = dir.path().join("data");
+        config.degraded_sections = load.dropped;
+        config.set_prop("observability.backend", "log").unwrap();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+        let written = fs::read_to_string(path).await.unwrap();
+        let value: toml::Value = toml::from_str(&written).unwrap();
+        assert_eq!(value.get("tools"), original.get("tools"));
+        assert!(written.contains("# preserve invalid selector"));
+        assert!(crate::migration::migrate_to_current(&written).is_err());
+        assert_eq!(
+            crate::migration::migrate_to_current_resilient(&written)
+                .tools
+                .optional,
+            ["*"]
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_dirty_save_refuses_a_malformed_parent_without_clobbering() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = "schema_version = 3\ntools = false # malformed parent\n";
+        fs::write(&path, raw).await.unwrap();
+        let load = crate::migration::migrate_to_current_salvaged(raw);
+        let mut config = load.config;
+        config.config_path = path.clone();
+        config.data_dir = dir.path().join("data");
+        config.degraded_sections = load.dropped;
+        config.mark_dirty("tools.optional");
+        let error = config.save_dirty().await.unwrap_err();
+        assert!(error.to_string().contains("malformed tools section"));
+        assert_eq!(fs::read_to_string(path).await.unwrap(), raw);
+        assert!(config.dirty_paths.contains("tools.optional"));
+    }
+
+    #[tokio::test]
+    async fn selector_env_override_is_masked_for_fresh_and_legacy_saves() {
+        let _env_guard = env_override_lock().await;
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _tools_guard = EnvValueGuard::set("ZEROCLAW_tools__optional", "[\"calculator\"]");
+        for legacy in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+            let path = dir.path().join("config.toml");
+            if legacy {
+                fs::write(&path, "schema_version = 3\n").await.unwrap();
+            }
+            let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(config.tools.optional, ["calculator"]);
+            let expected = vec!["*".to_string()];
+            if legacy {
+                // The omitted selector must persist from the masked snapshot
+                // before a full save has materialized the tools section.
+                config.set_prop("observability.backend", "log").unwrap();
+                config.mark_dirty("observability.backend");
+                config.save_dirty().await.unwrap();
+                let raw = fs::read_to_string(&path).await.unwrap();
+                let value: toml::Value = toml::from_str(&raw).unwrap();
+                assert_eq!(
+                    value["tools"]["optional"],
+                    toml::Value::Array(vec![toml::Value::String("*".into())])
+                );
+                assert_eq!(config.tools.optional, ["calculator"]);
+            }
+            config.save().await.unwrap();
+            let raw = fs::read_to_string(&path).await.unwrap();
+            assert_eq!(
+                crate::migration::migrate_to_current(&raw)
+                    .unwrap()
+                    .tools
+                    .optional,
+                expected
+            );
+            config.set_prop("observability.backend", "log").unwrap();
+            config.mark_dirty("observability.backend");
+            config.save_dirty().await.unwrap();
+            let raw = fs::read_to_string(&path).await.unwrap();
+            assert_eq!(
+                crate::migration::migrate_to_current(&raw)
+                    .unwrap()
+                    .tools
+                    .optional,
+                expected
+            );
+            assert_eq!(config.tools.optional, ["calculator"]);
+        }
+    }
+
     #[tokio::test]
     async fn config_save_prunes_unchanged_default_blocks() {
         // Fresh-init config without any operator edits should write a
@@ -34170,6 +35221,7 @@ default_temperature = 0.7
             config_path: config_path.clone(),
             observability: ObservabilityConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
+            tools: crate::builtin_tools::BuiltinToolsConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -38084,6 +39136,7 @@ runtime_profile = "default"
         assert!(config.validate().is_ok());
     }
 
+    #[cfg(feature = "tool-jira")]
     #[test]
     async fn validate_rejects_unknown_jira_actions() {
         for action in ["delete_ticket", "drop_database", ""] {
@@ -38100,6 +39153,136 @@ runtime_profile = "default"
             assert!(
                 err.contains("jira.allowed_actions contains unknown action"),
                 "expected Jira allowed action error for {action:?}, got: {err}"
+            );
+        }
+    }
+
+    /// A config written for a full build validates in a build without its
+    /// opt-in tools. Each tool's own checks, which would demand credentials,
+    /// an endpoint, a database or an existing templates directory, run only
+    /// where the tool can, and each enabled section is reported once as
+    /// compiled out.
+    #[cfg(not(any(
+        feature = "tool-jira",
+        feature = "tool-notion",
+        feature = "tool-microsoft365",
+        feature = "tool-project-intel"
+    )))]
+    #[test]
+    async fn a_lean_build_validates_enabled_sections_for_tools_it_lacks() {
+        assert!(
+            !Config::default()
+                .collect_warnings()
+                .iter()
+                .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
+            "a disabled section is not reported"
+        );
+
+        let mut config = Config::default();
+        config.microsoft365.enabled = true;
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
+        config.notion.enabled = true;
+        config.jira.enabled = true;
+        config.jira.allowed_actions = vec!["drop_database".into()];
+        config
+            .validate()
+            .expect("a build without these tools does not check their settings");
+
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        assert_eq!(
+            compiled_out,
+            [
+                "jira.enabled",
+                "notion.enabled",
+                "microsoft365.enabled",
+                "project_intel.enabled"
+            ],
+            "one warning per enabled section this build lacks"
+        );
+    }
+
+    /// Google Workspace's allowlist checks run only where the tool is
+    /// compiled in. A build without it accepts an operation outside
+    /// `allowed_services` and reports the section once as compiled out; a
+    /// build with it still refuses the entry.
+    #[test]
+    async fn google_workspace_allowlist_is_checked_only_where_the_tool_is_compiled() {
+        use crate::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.google_workspace.enabled = true;
+        config.google_workspace.allowed_services = vec!["drive".into()];
+        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "calendar".into(),
+            resource: "events".into(),
+            sub_resource: None,
+            methods: vec!["list".into()],
+        }];
+
+        let result = config.validate();
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        if OptInTool::GoogleWorkspace.compiled() {
+            let err = result
+                .expect_err("a build with the tool checks its allowlist")
+                .to_string();
+            assert!(
+                err.contains("is not in the effective allowed_services"),
+                "{err}"
+            );
+            assert!(compiled_out.is_empty(), "{compiled_out:?}");
+        } else {
+            result.expect("a build without the tool does not check its allowlist");
+            assert_eq!(compiled_out, ["google_workspace.enabled"]);
+        }
+    }
+
+    /// The counterpart in a build that carries the tools: their settings are
+    /// still checked, and nothing is reported as compiled out.
+    #[cfg(all(
+        feature = "tool-jira",
+        feature = "tool-notion",
+        feature = "tool-microsoft365",
+        feature = "tool-project-intel"
+    ))]
+    #[test]
+    async fn a_build_with_the_tools_checks_their_settings() {
+        type Enable = fn(&mut Config);
+        let cases: [(&str, Enable); 4] = [
+            ("microsoft365.tenant_id", |c| c.microsoft365.enabled = true),
+            ("project_intel.templates_dir", |c| {
+                c.project_intel.enabled = true;
+                c.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
+            }),
+            ("notion.database_id", |c| c.notion.enabled = true),
+            ("jira.base_url", |c| c.jira.enabled = true),
+        ];
+        for (field, enable) in cases {
+            let mut config = Config::default();
+            enable(&mut config);
+            let err = config
+                .validate()
+                .expect_err("a build with the tool checks its settings")
+                .to_string();
+            assert!(
+                err.contains(field),
+                "expected an error on {field}, got: {err}"
+            );
+            assert!(
+                !config
+                    .collect_warnings()
+                    .iter()
+                    .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
+                "{field}: a compiled-in tool is not reported as compiled out"
             );
         }
     }
@@ -38370,6 +39553,7 @@ api_token = "tok"
         );
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn google_workspace_allowed_operations_require_methods() {
         let mut config = Config::default();
@@ -38384,6 +39568,7 @@ api_token = "tok"
         assert!(err.contains("google_workspace.allowed_operations[0].methods"));
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn google_workspace_allowed_operations_reject_duplicate_service_resource_sub_resource_entries()
      {
@@ -38428,6 +39613,7 @@ api_token = "tok"
         assert!(config.validate().is_ok());
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn google_workspace_allowed_operations_reject_duplicate_methods_within_entry() {
         let mut config = Config::default();
@@ -38495,6 +39681,7 @@ api_token = "tok"
         assert!(config.validate().is_ok());
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn google_workspace_allowed_operations_reject_invalid_sub_resource_characters() {
         let mut config = Config::default();
@@ -40064,6 +41251,301 @@ group_policy = "disabled"
         assert_eq!(gh.url.as_deref(), Some("https://mcp.example/"));
     }
 
+    #[test]
+    async fn save_dirty_persists_rows_from_loaded_empty_plugin_array() {
+        let _env_guard = env_override_lock().await;
+        let _backend_guard = EnvValueGuard::set("ZEROCLAW_observability__backend", "log");
+        for plugin_source in [
+            "[plugins]\nentries = []\n",
+            "[plugins]\n# entry list comment\nentries = [\n# empty array comment\n] # trailing entry comment\n",
+            "",
+            "[[plugins.entries]]\nname = \"existing\"\negress_hosts = [\"existing.example\"]\n",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", tmp.path());
+            let config_path = tmp.path().join("config.toml");
+            let seed = format!(
+                "schema_version = {}\n\n[observability]\n# operator comment\nbackend = \"none\"\n\n{plugin_source}",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            std::fs::write(&config_path, &seed).unwrap();
+            let strict = crate::migration::migrate_to_current(&seed).unwrap();
+            let previous_rows = strict.plugins.entries.len();
+            let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert!(config.degraded_sections.is_empty());
+            assert!(config.degraded_security.is_empty());
+            assert_eq!(config.plugins.entries.len(), previous_rows);
+            assert_eq!(config.loaded_from.as_ref(), Some(&config_path));
+            assert_eq!(config.observability.backend, ObservabilityBackend::Log);
+            let loaded_from = config.loaded_from.clone();
+            let env_paths = config.env_overridden_paths.clone();
+            let env_snapshots = config.pre_override_snapshots.clone();
+
+            assert!(config.create_map_key("plugins.entries", "first").unwrap());
+            config.plugins.entries.last_mut().unwrap().egress_hosts = vec!["first.example".into()];
+            config.mark_dirty("plugins.entries.first");
+            config.save_dirty().await.unwrap();
+            assert!(config.dirty_paths.is_empty());
+            let first_saved = std::fs::read_to_string(&config_path).unwrap();
+            let first_disk = crate::migration::migrate_to_current(&first_saved).unwrap();
+            assert_eq!(first_disk.plugins.entries.len(), previous_rows + 1);
+            assert_eq!(
+                first_disk.plugins.entry_egress("first").0,
+                vec!["first.example"]
+            );
+            assert_eq!(first_disk.observability.backend, ObservabilityBackend::None);
+            assert!(first_saved.contains("# operator comment"));
+            for comment in [
+                "# entry list comment",
+                "# empty array comment",
+                "# trailing entry comment",
+            ] {
+                if seed.contains(comment) {
+                    assert_eq!(first_saved.matches(comment).count(), 1);
+                }
+            }
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.plugins.entries.len(), previous_rows + 1);
+            assert_eq!(
+                reloaded.plugins.entry_egress("first").0,
+                vec!["first.example"]
+            );
+
+            assert!(config.create_map_key("plugins.entries", "second").unwrap());
+            config.plugins.entries.last_mut().unwrap().egress_hosts = vec!["second.example".into()];
+            config.mark_dirty("plugins.entries.second");
+            let bad_path = "cost.rates.providers.models.openai.ghost-model.input_per_mtok";
+            config.mark_dirty(bad_path);
+            let dirty_before = config.dirty_paths.clone();
+            config
+                .save_dirty()
+                .await
+                .expect_err("invalid dirty path must fail");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), first_saved);
+            assert_eq!(config.dirty_paths, dirty_before);
+            assert_eq!(config.loaded_from, loaded_from);
+            assert_eq!(config.env_overridden_paths, env_paths);
+            assert_eq!(config.pre_override_snapshots, env_snapshots);
+            assert_eq!(config.plugins.entries.len(), previous_rows + 2);
+
+            config.dirty_paths.remove(bad_path);
+            config.save_dirty().await.unwrap();
+            assert!(config.dirty_paths.is_empty());
+            assert_eq!(config.loaded_from, loaded_from);
+            assert_eq!(config.env_overridden_paths, env_paths);
+            assert_eq!(config.pre_override_snapshots, env_snapshots);
+            assert_eq!(config.observability.backend, ObservabilityBackend::Log);
+            assert!(!config.create_map_key("plugins.entries", "second").unwrap());
+            let written = std::fs::read_to_string(&config_path).unwrap();
+            let disk = crate::migration::migrate_to_current(&written).unwrap();
+            assert_eq!(disk.plugins.entries.len(), previous_rows + 2);
+            assert_eq!(disk.plugins.entry_egress("first").0, vec!["first.example"]);
+            assert_eq!(
+                disk.plugins.entry_egress("second").0,
+                vec!["second.example"]
+            );
+            if previous_rows != 0 {
+                assert_eq!(
+                    disk.plugins.entry_egress("existing").0,
+                    vec!["existing.example"]
+                );
+            }
+            assert_eq!(disk.observability.backend, ObservabilityBackend::None);
+            assert!(written.contains("# operator comment"));
+            for comment in [
+                "# entry list comment",
+                "# empty array comment",
+                "# trailing entry comment",
+            ] {
+                if seed.contains(comment) {
+                    assert_eq!(written.matches(comment).count(), 1);
+                }
+            }
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.plugins.entries.len(), previous_rows + 2);
+            assert_eq!(
+                reloaded.plugins.entry_egress("second").0,
+                vec!["second.example"]
+            );
+        }
+    }
+
+    #[test]
+    async fn save_dirty_persists_inner_fields_from_loaded_empty_mcp_array() {
+        let _env_guard = env_override_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", tmp.path());
+        let config_path = tmp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n[mcp]\nservers = []\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+        crate::migration::migrate_to_current(&seed).unwrap();
+        let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+        assert!(config.mcp.servers.is_empty());
+        assert!(config.degraded_sections.is_empty());
+        assert!(config.create_map_key("mcp.servers", "github").unwrap());
+        config
+            .set_prop_persistent("mcp.servers.github.transport", "http")
+            .unwrap();
+        config
+            .set_prop_persistent("mcp.servers.github.url", "https://mcp.example/")
+            .unwrap();
+        assert!(!config.dirty_paths.contains("mcp.servers.github"));
+        config.save_dirty().await.unwrap();
+        assert!(config.dirty_paths.is_empty());
+        let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+        assert_eq!(reloaded.mcp.servers.len(), 1);
+        assert_eq!(reloaded.mcp.servers[0].name, "github");
+        assert_eq!(reloaded.mcp.servers[0].transport, McpTransport::Http);
+        assert_eq!(
+            reloaded.mcp.servers[0].url.as_deref(),
+            Some("https://mcp.example/")
+        );
+    }
+
+    #[test]
+    async fn save_dirty_refuses_inline_plugin_writes_without_clearing_state() {
+        let _env_guard = env_override_lock().await;
+        let _backend_guard = EnvValueGuard::set("ZEROCLAW_observability__backend", "log");
+        for inner_field in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", tmp.path());
+            let config_path = tmp.path().join("config.toml");
+            let seed = format!(
+                "schema_version = {}\n\n\
+                 [observability]\n# operator comment\nbackend = \"none\"\n\n\
+                 [plugins]\n# inline entry comment\n\
+                 entries = [{{ name = \"operator_instance\", \
+                 config = {{ token = \"synthetic-private-value\" }}, \
+                 egress_hosts = [\"operator.example\"] }}] # trailing comment\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            let strict = crate::migration::migrate_to_current(&seed).unwrap();
+            assert_eq!(strict.plugins.entries.len(), 1);
+            std::fs::write(&config_path, &seed).unwrap();
+            let live = Box::pin(Config::load_or_init()).await.unwrap();
+            assert!(live.degraded_sections.is_empty());
+            assert!(live.degraded_security.is_empty());
+            assert_eq!(live.loaded_from.as_ref(), Some(&config_path));
+            assert_eq!(live.observability.backend, ObservabilityBackend::Log);
+            let live_before = toml::to_string(&live).unwrap();
+            let mut staged = live.clone();
+            if inner_field {
+                staged.plugins.entries[0].egress_hosts = vec!["replacement.example".into()];
+                staged.mark_dirty("plugins.entries.operator_instance.egress_hosts");
+            } else {
+                assert!(
+                    staged
+                        .create_map_key("plugins.entries", "new_instance")
+                        .unwrap()
+                );
+                staged.plugins.entries.last_mut().unwrap().egress_hosts =
+                    vec!["replacement.example".into()];
+                staged.mark_dirty("plugins.entries.new_instance");
+            }
+            let staged_before = toml::to_string(&staged).unwrap();
+            let dirty_before = staged.dirty_paths.clone();
+            let loaded_from = staged.loaded_from.clone();
+            let env_paths = staged.env_overridden_paths.clone();
+            let env_snapshots = staged.pre_override_snapshots.clone();
+            for _ in 0..2 {
+                let error = staged
+                    .save_dirty()
+                    .await
+                    .expect_err("a refused natural-key write must fail the save");
+                let message = format!("{error:#}");
+                assert!(message.contains("plugins.entries"));
+                for private_value in [
+                    "synthetic-private-value",
+                    "operator_instance",
+                    "new_instance",
+                    "operator.example",
+                    "replacement.example",
+                ] {
+                    assert!(!message.contains(private_value));
+                }
+                assert_eq!(std::fs::read_to_string(&config_path).unwrap(), seed);
+                assert_eq!(toml::to_string(&staged).unwrap(), staged_before);
+                assert_eq!(staged.dirty_paths, dirty_before);
+                assert_eq!(staged.loaded_from, loaded_from);
+                assert_eq!(staged.env_overridden_paths, env_paths);
+                assert_eq!(staged.pre_override_snapshots, env_snapshots);
+                assert_eq!(toml::to_string(&live).unwrap(), live_before);
+                assert!(live.dirty_paths.is_empty());
+                assert_eq!(live.loaded_from, loaded_from);
+                assert_eq!(live.env_overridden_paths, env_paths);
+                assert_eq!(live.pre_override_snapshots, env_snapshots);
+            }
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.plugins.entries.len(), 1);
+            assert_eq!(
+                reloaded.plugins.entry_egress("operator_instance").0,
+                vec!["operator.example"]
+            );
+            assert_eq!(
+                reloaded
+                    .plugins
+                    .entry_config("operator_instance")
+                    .unwrap()
+                    .unwrap()
+                    .get("token")
+                    .map(String::as_str),
+                Some("synthetic-private-value")
+            );
+        }
+    }
+
+    #[test]
+    async fn natural_key_missing_write_and_delete_noops_preserve_inline_document() {
+        let source = format!(
+            "schema_version = {}\n\n[plugins]\n\
+             entries = [{{ name = \"operator_instance\", egress_hosts = [\"operator.example\"] }}]\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        let config = crate::migration::migrate_to_current(&source).unwrap();
+        let full_table = toml::Value::try_from(&config)
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .clone();
+        let default_table = toml::Table::new();
+        for path in [
+            "plugins.entries.missing_instance",
+            "plugins.entries.operator_instance.missing_field",
+        ] {
+            let mut doc: toml_edit::DocumentMut = source.parse().unwrap();
+            let before = doc.to_string();
+            apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table).unwrap();
+            assert_eq!(doc.to_string(), before);
+        }
+    }
+
+    #[test]
+    async fn natural_key_writer_preserves_unsupported_existing_nodes() {
+        for source in [
+            "[plugins]\nentries = [{ name = \"existing\", egress_hosts = [\"existing.example\"] }] # inline comment\n",
+            "[plugins]\nentries = \"operator value\" # scalar comment\n",
+            "[plugins.entries]\nname = \"operator value\" # table comment\n",
+            "plugins = \"operator value\" # parent comment\n",
+        ] {
+            let mut doc: toml_edit::DocumentMut = source.parse().unwrap();
+            let before = doc.to_string();
+            assert!(
+                ensure_array_of_tables_entry(
+                    doc.as_table_mut(),
+                    &["plugins"],
+                    "entries",
+                    "name",
+                    "new"
+                )
+                .is_none()
+            );
+            assert_eq!(doc.to_string(), before);
+        }
+    }
+
     /// `rename_map_key("mcp.servers", "fs", "filesystem")` rewrites the
     /// in-memory entry's `name` field in place and marks BOTH aliases
     /// dirty. The incremental writer must update the matching
@@ -40499,11 +41981,17 @@ group_policy = "disabled"
         });
         config.mark_dirty("mcp.servers.fs.command");
 
-        // The save itself must succeed — bail is a no-op for the
-        // wrong-kind node, not an error.
-        config.save_dirty().await.unwrap();
+        // A refused write fails the save without clearing its pending work.
+        let dirty_before = config.dirty_paths.clone();
+        let error = config
+            .save_dirty()
+            .await
+            .expect_err("wrong-kind MCP write must fail");
+        assert!(error.to_string().contains("mcp.servers"));
+        assert_eq!(config.dirty_paths, dirty_before);
 
         let written = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(written, seed);
         // The hand-edited scalar shape survives untouched: we'd
         // rather a load-time validation error the operator sees than
         // a silent overwrite of their (possibly intentional) file
@@ -41973,6 +43461,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         cfg.validate().unwrap();
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn config_validate_rejects_duplicate_google_workspace_allowed_operations() {
         let mut cfg = Config::default();
@@ -41997,6 +43486,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         assert!(err.contains("duplicate service/resource/sub_resource entry"));
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn config_validate_rejects_operation_service_not_in_allowed_services() {
         let mut cfg = Config::default();
@@ -42033,6 +43523,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         assert!(cfg.validate().is_ok());
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn config_validate_rejects_unknown_service_when_allowed_services_empty() {
         // Even with allowed_services empty (using defaults), an operation whose
@@ -43332,7 +44823,173 @@ stream_tool_arguments = [
             "mcp.servers.acme.headers.Authorization"
         ));
         assert!(!Config::prop_is_secret("file_download.timeout_secs"));
-        assert!(!Config::prop_is_secret("file_download.headers"));
+        // The bare map path is the `PropKind::SecretMap` container row: it is
+        // secret-classified (it fronts encrypted values) even though its
+        // display carries only key names.
+        assert!(Config::prop_is_secret("file_download.headers"));
+    }
+
+    fn mcp_server_fixture(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: an empty `#[secret] HashMap<String, String>` (MCP `env`)
+    /// used to emit no property rows at all, so neither Zerocode nor the
+    /// dashboard could add the first key. The container row must exist on
+    /// an empty map and advertise itself as `SecretMap`.
+    #[test]
+    async fn empty_secret_map_emits_container_row() {
+        let mut config = Config::default();
+        config.mcp.servers.push(mcp_server_fixture("acme"));
+
+        let fields = config.prop_fields();
+        for leaf in ["env", "headers"] {
+            let path = format!("mcp.servers.acme.{leaf}");
+            let row = fields
+                .iter()
+                .find(|f| f.name == path)
+                .unwrap_or_else(|| panic!("missing container row `{path}`"));
+            assert_eq!(row.kind, crate::traits::PropKind::SecretMap);
+            assert!(row.is_secret);
+            assert_eq!(row.display_value, crate::traits::UNSET_DISPLAY);
+            assert_eq!(
+                row.credential_class,
+                Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+            );
+            assert_eq!(
+                config.get_prop(&path).unwrap(),
+                crate::traits::UNSET_DISPLAY
+            );
+            assert!(Config::prop_is_secret(&path));
+        }
+        assert!(
+            !fields
+                .iter()
+                .any(|f| f.name.starts_with("mcp.servers.acme.env.")),
+            "an empty map has no entry rows"
+        );
+    }
+
+    #[test]
+    async fn secret_map_entries_add_list_and_remove_without_leaking_values() {
+        let mut config = Config::default();
+        config.mcp.servers.push(mcp_server_fixture("acme"));
+
+        config
+            .set_prop("mcp.servers.acme.env.ZED_TOKEN", "zed-plaintext")
+            .unwrap();
+        config
+            .set_prop("mcp.servers.acme.env.API_KEY", "api-plaintext")
+            .unwrap();
+        assert_eq!(
+            config.mcp.servers[0].env.get("API_KEY").map(String::as_str),
+            Some("api-plaintext")
+        );
+
+        let fields = config.prop_fields();
+        let env_rows: Vec<&str> = fields
+            .iter()
+            .filter(|f| f.name.starts_with("mcp.servers.acme.env"))
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(
+            env_rows,
+            vec![
+                "mcp.servers.acme.env",
+                "mcp.servers.acme.env.API_KEY",
+                "mcp.servers.acme.env.ZED_TOKEN",
+            ],
+            "container first, then entries in sorted key order"
+        );
+        // Container display lists key names only.
+        assert_eq!(
+            config.get_prop("mcp.servers.acme.env").unwrap(),
+            "API_KEY, ZED_TOKEN"
+        );
+        for field in &fields {
+            assert!(
+                !field.display_value.contains("plaintext"),
+                "`{}` leaked a secret value: {}",
+                field.name,
+                field.display_value
+            );
+        }
+
+        // Writing the container itself is rejected with guidance.
+        let err = config
+            .set_prop("mcp.servers.acme.env", "{\"X\":\"y\"}")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`env` is a key/value map") && err.contains("<this path>.<KEY>"),
+            "{err}"
+        );
+
+        // An empty value (what `config delete` sends) removes the entry.
+        config
+            .set_prop("mcp.servers.acme.env.ZED_TOKEN", "")
+            .unwrap();
+        assert!(!config.mcp.servers[0].env.contains_key("ZED_TOKEN"));
+        assert_eq!(config.get_prop("mcp.servers.acme.env").unwrap(), "API_KEY");
+        config.set_prop("mcp.servers.acme.env.API_KEY", "").unwrap();
+        assert!(config.mcp.servers[0].env.is_empty());
+        assert_eq!(
+            config.get_prop("mcp.servers.acme.env").unwrap(),
+            crate::traits::UNSET_DISPLAY
+        );
+    }
+
+    /// Same call sites the dashboard / Zerocode use (`set_prop_persistent`
+    /// then `save_dirty`): an added env entry lands on disk encrypted, and
+    /// removing it drops the key from disk rather than leaving `KEY = ""`.
+    #[test]
+    async fn save_dirty_persists_secret_map_entry_add_and_remove() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(mcp_server_fixture("fs"));
+
+        config
+            .set_prop_persistent("mcp.servers.fs.env.GBR_MAILBOX_KEY", "mailbox-plaintext")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("GBR_MAILBOX_KEY"),
+            "added env key must be written; got:\n{written}"
+        );
+        assert!(
+            !written.contains("mailbox-plaintext"),
+            "env values must be encrypted at rest; got:\n{written}"
+        );
+
+        config
+            .set_prop_persistent("mcp.servers.fs.env.GBR_MAILBOX_KEY", "")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("GBR_MAILBOX_KEY"),
+            "removed env key must be dropped from disk; got:\n{written}"
+        );
+        assert!(written.contains("name = \"fs\""), "{written}");
     }
 
     #[test]
@@ -43790,6 +45447,50 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert_eq!(mcp_servers.value_type, "McpServerConfig");
     }
 
+    fn assert_map_key_sections_reuse_paths(
+        first: &[crate::traits::MapKeySection],
+        second: &[crate::traits::MapKeySection],
+    ) {
+        assert_eq!(first.len(), second.len());
+        for (first, second) in first.iter().zip(second) {
+            assert_eq!(
+                (
+                    first.path,
+                    first.kind,
+                    first.value_type,
+                    first.description,
+                    first.natural_key,
+                    first.resource_key,
+                ),
+                (
+                    second.path,
+                    second.kind,
+                    second.value_type,
+                    second.description,
+                    second.natural_key,
+                    second.resource_key,
+                ),
+            );
+            assert_eq!(
+                first.path.as_ptr(),
+                second.path.as_ptr(),
+                "schema path {} must reuse its static backing storage",
+                first.path,
+            );
+        }
+    }
+
+    #[test]
+    async fn map_key_sections_reuses_static_paths() {
+        let sections = Config::map_key_sections();
+        for path in ["agents", "model_routes", "mcp.servers", "cost.rates.tools"] {
+            assert!(sections.iter().any(|section| section.path == path));
+        }
+        for _ in 0..4 {
+            assert_map_key_sections_reuse_paths(&sections, &Config::map_key_sections());
+        }
+    }
+
     #[test]
     async fn create_map_key_inserts_default_mcp_server() {
         // Round-trip: `POST /api/config/map-key?path=mcp.servers&key=github`.
@@ -44039,6 +45740,22 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         #[nested]
         pub types: HashMap<String, HashMap<String, DoubleMapLeaf>>,
+    }
+
+    #[test]
+    async fn map_key_sections_double_map_reuses_static_paths() {
+        let sections = DoubleMapOuter::map_key_sections();
+        assert_eq!(sections.len(), 1);
+        let section = &sections[0];
+        assert_eq!(section.path, "dm.types");
+        assert_eq!(section.kind, crate::traits::MapKeyKind::Map);
+        assert_eq!(section.value_type, "DoubleMapLeaf");
+        assert_eq!(section.description, "");
+        assert_eq!(section.natural_key, None);
+        assert!(!section.resource_key);
+        for _ in 0..4 {
+            assert_map_key_sections_reuse_paths(&sections, &DoubleMapOuter::map_key_sections());
+        }
     }
 
     fn double_map_fixture() -> DoubleMapOuter {
@@ -48669,6 +50386,7 @@ group_policy = "all"
         }
     }
 
+    #[cfg(feature = "tool-codex-cli")]
     #[::core::prelude::v1::test]
     fn codex_cli_policy_config_source_warnings_are_non_blocking_and_redacted() {
         let selected_profile = "sensitive-production-profile";
@@ -48696,6 +50414,7 @@ group_policy = "all"
         );
     }
 
+    #[cfg(feature = "tool-codex-cli")]
     #[::core::prelude::v1::test]
     fn codex_cli_feature_toggle_warnings_are_non_blocking_and_redacted() {
         let selected_feature = "sensitive-future-capability";
@@ -48724,6 +50443,7 @@ group_policy = "all"
         );
     }
 
+    #[cfg(feature = "tool-codex-cli")]
     #[::core::prelude::v1::test]
     fn codex_cli_executable_integration_warnings_are_non_blocking_and_redacted() {
         let sensitive_server = "private-review-server";
@@ -48766,6 +50486,7 @@ group_policy = "all"
         );
     }
 
+    #[cfg(feature = "tool-codex-cli")]
     #[::core::prelude::v1::test]
     fn codex_cli_security_warnings_are_non_blocking_and_structured() {
         let mut config = Config::default();
@@ -48795,6 +50516,45 @@ group_policy = "all"
             .expect("unknown operator-controlled Codex arguments must remain allowed");
         assert!(
             warnings_with_code(&config, CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING,).is_empty()
+        );
+    }
+
+    /// With the Codex tool compiled out, an enabled `[codex_cli]` carrying a
+    /// risky argument yields one warning, that the tool is compiled out: the
+    /// argument reaches no process. With the tool compiled in, the argument
+    /// warning is raised and nothing else.
+    #[::core::prelude::v1::test]
+    fn codex_cli_warnings_follow_whether_the_tool_is_compiled() {
+        use crate::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.codex_cli.enabled = true;
+        config.codex_cli.extra_args = owned_codex_args(&["--sandbox", "danger-full-access"]);
+        config
+            .validate()
+            .expect("operator-controlled Codex arguments never block validation");
+
+        let codex: Vec<(String, String)> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.path.starts_with("codex_cli"))
+            .map(|warning| (warning.code, warning.path))
+            .collect();
+        let expected = if OptInTool::CodexCli.compiled() {
+            (
+                CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING,
+                "codex_cli.extra_args[0]",
+            )
+        } else {
+            (
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                "codex_cli.enabled",
+            )
+        };
+        assert_eq!(
+            codex,
+            [(expected.0.to_string(), expected.1.to_string())],
+            "one warning about [codex_cli]"
         );
     }
 
@@ -49740,7 +51500,8 @@ model_provider = \"ollama.default\"
             PropKind::AliasRef
             | PropKind::StringArray
             | PropKind::ObjectArray
-            | PropKind::Object => None,
+            | PropKind::Object
+            | PropKind::SecretMap => None,
         }
     }
 
@@ -49872,5 +51633,111 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    fn effort_routing_config() -> super::Config {
+        let mut config = super::Config::default();
+        for alias in ["local", "cloud"] {
+            let entry = config
+                .providers
+                .models
+                .ensure("custom", alias)
+                .expect("custom provider entry");
+            entry.model = Some(format!("{alias}-model"));
+        }
+        config.model_routes = vec![
+            super::ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            super::ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".into(),
+            super::RuntimeProfileConfig {
+                effort_routing: Some(crate::scattered_types::EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: crate::scattered_types::CloudEscalationPolicy::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn effort_routing_requires_two_existing_distinct_hints() {
+        let config = effort_routing_config();
+        config.validate().expect("valid effort routing config");
+
+        let mut overlapping_classifier = config.clone();
+        overlapping_classifier
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .auto_classify = Some(crate::scattered_types::AutoClassifyConfig::default());
+        let error = overlapping_classifier
+            .validate()
+            .expect_err("effort routing and auto-classify must not compete on one profile");
+        assert!(error.to_string().contains("cannot be combined"));
+
+        let mut missing = config.clone();
+        missing
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .effort_routing
+            .as_mut()
+            .unwrap()
+            .cloud_hint = "missing".into();
+        let error = missing.validate().expect_err("missing route must fail");
+        assert!(error.to_string().contains("no model_routes entry"));
+
+        let mut wrong_case = config.clone();
+        wrong_case
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .effort_routing
+            .as_mut()
+            .unwrap()
+            .local_hint = "LOCAL".into();
+        let error = wrong_case
+            .validate()
+            .expect_err("route hints are case-sensitive");
+        assert!(error.to_string().contains("no model_routes entry"));
+
+        let mut duplicate = config;
+        duplicate
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .effort_routing
+            .as_mut()
+            .unwrap()
+            .cloud_hint = "LOCAL".into();
+        let error = duplicate.validate().expect_err("duplicate hints must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must name distinct model_routes")
+        );
+
+        let mut duplicate_route = effort_routing_config();
+        let mut final_local_route = duplicate_route.model_routes[0].clone();
+        final_local_route.model_provider = "custom.cloud".into();
+        final_local_route.model = "final-local-model".into();
+        duplicate_route.model_routes.push(final_local_route);
+        duplicate_route
+            .validate()
+            .expect("legacy duplicate route hints remain valid");
     }
 }

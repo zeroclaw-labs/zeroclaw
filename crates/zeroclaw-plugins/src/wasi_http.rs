@@ -545,8 +545,14 @@ async fn plugin_trust_material(deadline: Instant) -> Result<TrustMaterial, Error
                 let anchors = build_trust_anchors();
                 record_trust_anchors(&anchors);
                 let roots = Arc::new(anchors.store);
+                // Plugin TLS's one provider decision, never the process-level
+                // default. Should it fail, publishing nothing is what waiters
+                // already read as a dead assembly.
+                let Ok(builder) = crate::egress::tls_client_builder() else {
+                    return;
+                };
                 let config = Arc::new(
-                    rustls::ClientConfig::builder()
+                    builder
                         .with_root_certificates(Arc::clone(&roots))
                         .with_no_client_auth(),
                 );
@@ -2883,6 +2889,47 @@ ok",
                 started.elapsed()
             );
         });
+    }
+
+    /// The assembly names plugin TLS's provider instead of resolving the
+    /// process-level default, so its first run cannot panic in a build that
+    /// compiles in more than one provider without installing a default, and
+    /// plugin HTTPS never adopts a default an embedder chose.
+    ///
+    /// Deliberately free of `tls_fixture`, whose server side resolves the
+    /// process default: this test must also run in such a build.
+    #[test]
+    fn the_trust_assembly_selects_ring_without_a_process_default() {
+        let _lock = env_lock();
+        // A store nobody has assembled yet: the temporary path is unique per
+        // run, so this request takes the cache's miss branch.
+        let empty = tempfile::NamedTempFile::new().expect("an empty machine store");
+        let _dir = EnvGuard::set("SSL_CERT_DIR", None);
+        let _path = EnvGuard::set("SSL_CERT_FILE", Some(empty.path()));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime");
+        let config = runtime
+            .block_on(async { plugin_tls_config(Instant::now() + Duration::from_secs(10)).await })
+            .expect("the assembly must publish a configuration");
+
+        let provider = config.crypto_provider();
+        let groups = |groups: &[&'static dyn rustls::crypto::SupportedKxGroup]| {
+            groups.iter().map(|group| group.name()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            groups(&provider.kx_groups),
+            groups(rustls::crypto::ring::DEFAULT_KX_GROUPS),
+            "ring's key-exchange groups, not another provider's"
+        );
+        if let Some(process_default) = rustls::crypto::CryptoProvider::get_default() {
+            assert!(
+                !Arc::ptr_eq(provider, process_default),
+                "the assembly must own its provider rather than share the process default"
+            );
+        }
     }
 
     /// A store that was read in part is not a store that added nothing.

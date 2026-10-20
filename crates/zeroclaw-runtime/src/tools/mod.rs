@@ -1,6 +1,12 @@
 //! Tool subsystem for agent-callable capabilities.
 
 pub mod attribution;
+#[cfg(any(
+    feature = "tool-claude-code",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+))]
 pub(crate) mod coding_cli_executor;
 pub mod cron_add;
 pub(crate) mod cron_common;
@@ -44,24 +50,33 @@ pub use zeroclaw_tools::a2a_client::{
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::browser::{BrowserTool, ComputerUseConfig};
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::browser_delegate::BrowserDelegateTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::browser_open::BrowserOpenTool;
 pub use zeroclaw_tools::calculator::CalculatorTool;
 pub use zeroclaw_tools::canvas::{ALLOWED_CONTENT_TYPES, MAX_CONTENT_SIZE};
 pub use zeroclaw_tools::canvas::{CanvasStore, CanvasTool};
 pub use zeroclaw_tools::channel_room::ChannelRoomTool;
+#[cfg(feature = "tool-claude-code")]
 pub use zeroclaw_tools::claude_code::ClaudeCodeTool;
+#[cfg(feature = "tool-claude-code-runner")]
 pub use zeroclaw_tools::claude_code_runner::ClaudeCodeRunnerTool;
 pub use zeroclaw_tools::cli_discovery::{DiscoveredCli, discover_cli_tools};
 pub use zeroclaw_tools::cloud_ops::CloudOpsTool;
 pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
+#[cfg(feature = "tool-codex-cli")]
 pub use zeroclaw_tools::codex_cli::CodexCliTool;
+#[cfg(feature = "tool-composio")]
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::email_read::EmailReadTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
 pub use zeroclaw_tools::file_download::{FileDownloadSsrfPolicy, FileDownloadTool};
@@ -69,19 +84,24 @@ pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
+#[cfg(feature = "tool-gemini-cli")]
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_forge::GitForgeTool;
 pub use zeroclaw_tools::git_operations::{GitCommandBoundary, GitOperationsTool};
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
+#[cfg(feature = "tool-google-workspace")]
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
 pub use zeroclaw_tools::hardware_memory_map::HardwareMemoryMapTool;
 pub use zeroclaw_tools::hardware_memory_read::HardwareMemoryReadTool;
 pub use zeroclaw_tools::http_request::HttpRequestTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::image_gen::ImageGenTool;
 pub use zeroclaw_tools::image_info::ImageInfoTool;
+#[cfg(feature = "tool-jira")]
 pub use zeroclaw_tools::jira_tool::JiraTool;
 pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
+#[cfg(feature = "tool-linkedin")]
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
 pub use zeroclaw_tools::mcp_client::{McpRegistry, McpServer};
@@ -98,17 +118,24 @@ pub use zeroclaw_tools::memory_forget::MemoryForgetTool;
 pub use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 pub use zeroclaw_tools::memory_recall::MemoryRecallTool;
 pub use zeroclaw_tools::memory_store::MemoryStoreTool;
+#[cfg(feature = "tool-microsoft365")]
 pub use zeroclaw_tools::microsoft365::Microsoft365Tool;
 pub use zeroclaw_tools::model_routing_config::ModelRoutingConfigTool;
+#[cfg(feature = "tool-notion")]
 pub use zeroclaw_tools::notion_tool::NotionTool;
+#[cfg(feature = "tool-opencode-cli")]
 pub use zeroclaw_tools::opencode_cli::OpenCodeCliTool;
 pub use zeroclaw_tools::pipeline::PipelineTool;
 pub use zeroclaw_tools::poll::PollTool;
+#[cfg(feature = "tool-project-intel")]
 pub use zeroclaw_tools::project_intel::ProjectIntelTool;
 pub use zeroclaw_tools::proxy_config::ProxyConfigTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::pushover::PushoverTool;
 pub use zeroclaw_tools::reaction::ReactionTool;
+#[cfg(feature = "tool-project-intel")]
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
@@ -117,10 +144,13 @@ pub use zeroclaw_tools::sessions::{
     AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
     SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::weather_tool::WeatherTool;
 pub use zeroclaw_tools::web_fetch::WebFetchTool;
+#[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
@@ -230,6 +260,14 @@ impl Tool for ArcToolRef {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        self.0.execute_with_context(args, context).await
+    }
 }
 
 /// Serply credential override state for `WebSearchTool`.
@@ -240,6 +278,7 @@ impl Tool for ArcToolRef {
 /// active, in which case the tool keeps resolving `[web_search] serply_api_key`
 /// from `config.toml` at use time so rotation and removal take effect without a
 /// restart.
+#[cfg(feature = "tools-external")]
 fn serply_api_key_override(root_config: &Config) -> Option<Option<String>> {
     root_config
         .prop_is_env_overridden("web_search.serply_api_key")
@@ -247,10 +286,53 @@ fn serply_api_key_override(root_config: &Config) -> Option<Option<String>> {
 }
 
 fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
-    root_config.claude_code.enabled
-        || root_config.codex_cli.enabled
-        || root_config.gemini_cli.enabled
-        || root_config.opencode_cli.enabled
+    (cfg!(feature = "tool-claude-code") && root_config.claude_code.enabled)
+        || (cfg!(feature = "tool-codex-cli") && root_config.codex_cli.enabled)
+        || (cfg!(feature = "tool-gemini-cli") && root_config.gemini_cli.enabled)
+        || (cfg!(feature = "tool-opencode-cli") && root_config.opencode_cli.enabled)
+}
+
+/// Whether the Composio tool is registered for `config`: compiled in and
+/// enabled. Prompt builders consult this so the model is never told about a
+/// tool this build does not carry.
+pub fn composio_tool_available(config: &Config) -> bool {
+    cfg!(feature = "tool-composio")
+        && config.tools.is_enabled("composio")
+        && config.composio.enabled
+}
+
+/// An integration enabled in config whose tool this build was compiled
+/// without. Mirrors the channel orchestrator's "compiled without" notice, and
+/// carries the code `Config::collect_warnings` reports the same section under
+/// for `config/validate`, the config API and `doctor`.
+#[cfg(not(all(
+    feature = "tool-jira",
+    feature = "tool-notion",
+    feature = "tool-linkedin",
+    feature = "tool-composio",
+    feature = "tool-google-workspace",
+    feature = "tool-microsoft365",
+    feature = "tool-project-intel",
+    feature = "tool-claude-code",
+    feature = "tool-claude-code-runner",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+)))]
+fn warn_tool_compiled_out(root_config: &Config, tool: zeroclaw_config::opt_in_tools::OptInTool) {
+    if tool.enabled_in(root_config) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "code": zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT,
+                    "section": tool.section(),
+                    "feature": tool.feature(),
+                })),
+            "a tool is enabled in config but this build was compiled without its feature; skipping it"
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -315,6 +397,56 @@ impl Tool for ArcDelegatingTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner.execute_with_context(args, context).await
+    }
+}
+
+/// Run a constructor only after explicit built-in availability is resolved.
+/// Execution authorization remains the scoped registry's responsibility.
+/// Emit namespace ownership at the same declaration that selects construction.
+/// Selection remains the canonical `[tools].optional` decision; claiming a name
+/// does not construct a tool or grant permission to execute it.
+fn select_declared_builtin_tool(
+    selection: &zeroclaw_config::builtin_tools::BuiltinToolsConfig,
+    reserved_host_names: &mut std::collections::HashSet<String>,
+    name: &str,
+) -> bool {
+    reserved_host_names.insert(name.to_string());
+    selection.is_enabled(name)
+}
+
+fn register_builtin_tool(
+    selection: &zeroclaw_config::builtin_tools::BuiltinToolsConfig,
+    registry: &mut Vec<Arc<dyn Tool>>,
+    reserved_host_names: &mut std::collections::HashSet<String>,
+    name: &str,
+    constructor: impl FnOnce() -> Arc<dyn Tool>,
+) {
+    if select_declared_builtin_tool(selection, reserved_host_names, name) {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("constructor-enter", name, 0, 0);
+        registry.push(constructor());
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("constructor-return", name, 0, 0);
+    }
+}
+
+/// These owners are declared here because their implementations are deferred
+/// or withdrawn by an execution context. Use the owning types' canonical names.
+pub(crate) fn reserve_deferred_host_names(
+    config: &Config,
+    reserved_host_names: &mut std::collections::HashSet<String>,
+) {
+    reserved_host_names.insert(ModelSwitchTool::NAME.to_string());
+    if config.pipeline.enabled {
+        reserved_host_names.insert(PipelineTool::NAME.to_string());
     }
 }
 
@@ -440,7 +572,6 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
         return;
     }
 
-    let before = tools_registry.len();
     let policy = Arc::clone(&security);
     let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime_optional_nat64(
         skills,
@@ -453,15 +584,45 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
         .iter()
         .map(|t| t.name().to_string())
         .collect();
+    register_prepared_skill_tools(
+        skill_tools,
+        &existing_names,
+        skills,
+        &policy,
+        |tool| tool.name(),
+        |tool| tools_registry.push(tool),
+    );
+}
+
+/// Apply the same fixed pre-batch snapshot to ordinary or prepared skills.
+/// This never admits a new name into the snapshot while iterating the batch.
+pub(crate) fn register_prepared_skill_tools<T>(
+    skill_tools: Vec<T>,
+    existing_names: &std::collections::HashSet<String>,
+    skills: &[crate::skills::Skill],
+    policy: &SecurityPolicy,
+    name: impl Fn(&T) -> &str,
+    mut register: impl FnMut(T),
+) {
+    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+    late_tool_search_observer::record(
+        "skill-snapshot",
+        "batch",
+        existing_names.len(),
+        skill_tools.len(),
+    );
+    let mut registered = 0;
     for tool in skill_tools {
-        if existing_names.contains(tool.name()) {
+        if existing_names.contains(name(&tool)) {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "duplicate", 0, 0);
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 &format!(
                     "Skill tool '{}' shadows built-in tool, skipping",
-                    tool.name()
+                    name(&tool)
                 )
             );
         } else if policy
@@ -469,28 +630,34 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
             .as_ref()
             .is_some_and(|list| list.is_empty())
         {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "deny-all", 0, 0);
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Skill tool '{}' denied by empty allowed_tools (deny-all), skipping",
-                    tool.name()
+                    name(&tool)
                 )
             );
-        } else if policy.is_tool_excluded(tool.name()) {
+        } else if policy.is_tool_excluded(name(&tool)) {
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "excluded", 0, 0);
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Skill tool '{}' denied by excluded_tools, skipping",
-                    tool.name()
+                    name(&tool)
                 )
             );
         } else {
-            tools_registry.push(tool);
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("skill-decision", "register", 0, 0);
+            register(tool);
+            registered += 1;
         }
     }
-    let registered = tools_registry.len() - before;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -575,6 +742,11 @@ pub struct AllToolsResult {
     /// filtered one, which has already misled readers into believing built-ins
     /// escaped `allowed_tools`.
     pub tools: Vec<Box<dyn Tool>>,
+    /// Structural namespace facts emitted by this registry's canonical builtin
+    /// declarations, including applicable tools whose constructors were omitted.
+    /// Created per registry build and consumed by binding/assembly; grants and
+    /// execution availability still resolve through their existing owners.
+    pub reserved_host_names: std::collections::HashSet<String>,
     pub delegate_handle: Option<DelegateParentToolsHandle>,
     pub ask_user_handle: Option<PerToolChannelHandle>,
     pub channel_room_handle: Option<PerToolChannelHandle>,
@@ -611,6 +783,7 @@ impl AllToolsResult {
     pub fn from_prebuilt_tools(tools: Vec<Box<dyn Tool>>) -> Self {
         Self {
             tools,
+            reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             channel_room_handle: None,
@@ -763,6 +936,47 @@ pub fn shell_tool_for_runtime(
     runtime_shell_assembly(security, runtime, risk_profile, root_config).shell_tool
 }
 
+/// The TLS coherence witness for one plugin instance, over the inputs read from
+/// the same locked config view as its policy or its frame's values. The keyed
+/// derivation lives in `zeroclaw_plugins`; this only hands over those inputs.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_tls_config_witness(
+    config: &Config,
+    instance_key: &str,
+) -> Result<zeroclaw_plugins::egress::TlsConfigWitness, zeroclaw_plugins::error::PluginError> {
+    let mut entries = config
+        .plugins
+        .entries
+        .iter()
+        .filter(|entry| entry.name == instance_key);
+    let entry = entries.next();
+    if entries.next().is_some() {
+        return Err(zeroclaw_plugins::error::PluginError::InvalidConfig(
+            "plugin TLS coherence inputs are unavailable".to_string(),
+        ));
+    }
+    // Borrow sorted values: no plaintext serialization buffer is built.
+    let values = entry.map(|entry| {
+        entry
+            .config
+            .iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+    });
+    zeroclaw_plugins::egress::TlsConfigWitness::derive(&(
+        instance_key,
+        entry.map(|entry| {
+            (
+                &entry.egress_hosts,
+                &entry.egress_allow_private,
+                &entry.tls_profiles,
+            )
+        }),
+        values,
+        &config.security.nat64_prefixes,
+        config.plugins.limits.max_connections_per_instance,
+    ))
+}
+
 /// One plugin instance's egress policy, read from canonical config at use time.
 ///
 /// `instance_key` is the instance's
@@ -780,6 +994,7 @@ pub fn shell_tool_for_runtime(
 fn plugin_egress_policy(
     config: &Config,
     instance_key: &str,
+    may_read_config: bool,
 ) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
     use zeroclaw_plugins::egress::{
         EgressError, EgressPolicy, TlsClientIdentity, TlsProfile, TlsProfileName,
@@ -839,6 +1054,16 @@ fn plugin_egress_policy(
         config.plugins.limits.max_connections_per_instance,
     )?
     .with_tls_profiles(profiles)
+    .and_then(|policy| {
+        // Permissionless transports must not inspect the material inputs merely
+        // to authorize a destination. Materialization will fail closed later.
+        if !may_read_config {
+            return Ok(policy);
+        }
+        let witness = plugin_tls_config_witness(config, instance_key)
+            .map_err(|error| EgressError::PolicyUnavailable(error.to_string()))?;
+        Ok(policy.with_tls_config_witness(witness))
+    })
 }
 
 /// The one host-owned egress authority shared by every plugin instance in a
@@ -871,9 +1096,14 @@ pub(crate) fn plugin_egress_service(
             let instance_key = scope.id().config_entry_key().map_err(|error| {
                 zeroclaw_plugins::egress::EgressError::PolicyUnavailable(error.to_string())
             })?;
+            let may_read_config = scope
+                .grants()
+                .allows(zeroclaw_plugins::PluginPermission::ConfigRead);
             match live_config.as_ref() {
-                Some(handle) => plugin_egress_policy(&handle.read(), &instance_key),
-                None => plugin_egress_policy(&config, &instance_key),
+                Some(handle) => {
+                    plugin_egress_policy(&handle.read(), &instance_key, may_read_config)
+                }
+                None => plugin_egress_policy(&config, &instance_key, may_read_config),
             }
         }),
     )
@@ -948,12 +1178,14 @@ pub(crate) fn plugin_host_services(
         // Filled from the same config view the values come from, so the
         // reserved set and the secrets it withholds share one revision.
         let mut host_only = Vec::new();
+        let mut witness = None;
         let resolved = if let Some(live_config) = &live_config {
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
                 // Transient per-call view: schema/grant checks happen before
                 // this access, and the global lock is released before guest
                 // setup.
                 let config = live_config.read();
+                witness = Some(plugin_tls_config_witness(&config, &config_entry_key)?);
                 host_only = plugin_tls_secret_properties(&config, &config_entry_key);
                 plugin_config_values(&config, &config_entry_key, package)
             })
@@ -964,11 +1196,20 @@ pub(crate) fn plugin_host_services(
                 )
             })?;
             zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                witness = Some(plugin_tls_config_witness(config, &config_entry_key)?);
                 host_only = plugin_tls_secret_properties(config, &config_entry_key);
                 plugin_config_values(config, &config_entry_key, package)
             })
         };
-        resolved.map(|resolved| resolved.reserve_for_host(host_only))
+        resolved.map(|resolved| {
+            let resolved = resolved.reserve_for_host(host_only);
+            // A schema permitted to withhold config does not invoke the source
+            // closure. Preserve that empty view; it cannot materialize TLS secrets.
+            match witness {
+                Some(witness) => resolved.with_tls_config_witness(witness),
+                None => resolved,
+            }
+        })
     });
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
@@ -1103,7 +1344,11 @@ pub(crate) fn all_tools_with_runtime_context(
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
+    #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+    let late_trace = late_tool_search_observer::capture();
     let builder = move || {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        let _late_guard = late_tool_search_observer::enter_builder(late_trace);
         // Warm the lazy regexes BEFORE the registry build and BEFORE any
         // turn can start: LazyLock runs the initializer on whichever thread
         // reaches it first, so a turn racing an un-joined warmup would
@@ -1291,7 +1536,7 @@ fn all_tools_with_runtime_on_thread(
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
     composio_entity_id: Option<&str>,
-    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    _browser_config: &zeroclaw_config::schema::BrowserConfig,
     http_config: &zeroclaw_config::schema::HttpRequestConfig,
     web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
     workspace_dir: &std::path::Path,
@@ -1307,6 +1552,8 @@ fn all_tools_with_runtime_on_thread(
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
+    #[cfg(feature = "tools-external")]
+    let browser_config = _browser_config;
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
@@ -1318,6 +1565,12 @@ fn all_tools_with_runtime_on_thread(
         let context = format!("agents.{agent_alias}: {error}");
         anyhow::Error::new(error).context(context)
     })?;
+    #[cfg(any(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -1331,7 +1584,27 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
-    let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
+    let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
+    let mut reserved_host_names = std::collections::HashSet::new();
+    reserve_deferred_host_names(root_config, &mut reserved_host_names);
+    macro_rules! select_tool {
+        ($name:expr) => {
+            select_declared_builtin_tool(&root_config.tools, &mut reserved_host_names, $name)
+        };
+    }
+    macro_rules! register_tool {
+        ($name:expr, $constructor:expr) => {
+            register_builtin_tool(
+                &root_config.tools,
+                &mut tool_arcs,
+                &mut reserved_host_names,
+                $name,
+                || $constructor,
+            );
+        };
+    }
+    register_tool!(
+        "shell",
         Arc::new(RateLimitedTool::new(
             shell_tool
                 .with_timeout_secs(if security.shell_timeout_secs > 0 {
@@ -1342,77 +1615,134 @@ fn all_tools_with_runtime_on_thread(
                 .with_shared_tui_env(tui_env)
                 .with_persistent_writes(persistent_writes),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "file_read",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "deliver_file",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "file_write",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "file_edit",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileEditTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
             ),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "glob_search",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "content_search",
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "cron_add",
         Arc::new(CronAddTool::new_with_runtime(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
-        )),
-        Arc::new(CronListTool::new(config.clone(), agent_alias)),
+        ))
+    );
+    register_tool!(
+        "cron_list",
+        Arc::new(CronListTool::new(config.clone(), agent_alias))
+    );
+    register_tool!(
+        "cron_remove",
         Arc::new(CronRemoveTool::new(
             config.clone(),
             security.clone(),
             agent_alias,
-        )),
+        ))
+    );
+    register_tool!(
+        "cron_update",
         Arc::new(CronUpdateTool::new_with_runtime(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "cron_run",
         Arc::new(CronRunTool::new_with_runtime_and_capability(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
             execution_capability.clone(),
-        )),
-        Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
-        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryExportTool::new(memory.clone())),
-        Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
+        ))
+    );
+    register_tool!(
+        "cron_runs",
+        Arc::new(CronRunsTool::new(config.clone(), agent_alias))
+    );
+    register_tool!(
+        "memory_store",
+        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone()))
+    );
+    register_tool!(
+        "memory_recall",
+        Arc::new(MemoryRecallTool::new(memory.clone()))
+    );
+    register_tool!(
+        "memory_forget",
+        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone()))
+    );
+    register_tool!(
+        "memory_export",
+        Arc::new(MemoryExportTool::new(memory.clone()))
+    );
+    register_tool!(
+        "memory_purge",
+        Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone()))
+    );
+    register_tool!(
+        "schedule",
         Arc::new(ScheduleTool::new_with_runtime(
             security.clone(),
             Arc::clone(&root_config_shared),
             agent_alias,
             runtime.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "spawn_subagent",
         Arc::new(
             SpawnSubagentTool::new(
                 Arc::clone(&root_config_shared),
@@ -1421,51 +1751,72 @@ fn all_tools_with_runtime_on_thread(
             )
             .with_subagent_caller(is_subagent_caller)
             .with_execution_capability(execution_capability.clone()),
-        ),
+        )
+    );
+    register_tool!(
+        "send_message_to_peer",
         Arc::new(SendMessageToPeerTool::new_with_live_config_and_capability(
             Arc::clone(&root_config_shared),
             agent_alias,
             live_config.clone(),
             execution_capability.clone(),
-        )),
+        ))
+    );
+    register_tool!(
+        "model_routing_config",
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
-        )),
-        Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
-        Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
+        ))
+    );
+    if !is_subagent_caller {
+        register_tool!(
+            "model_switch",
+            Arc::new(ModelSwitchTool::new(security.clone(), config.clone()))
+        );
+    }
+    register_tool!(
+        "proxy_config",
+        Arc::new(ProxyConfigTool::new(config.clone(), security.clone()))
+    );
+    register_tool!(
+        "git_operations",
         Arc::new(GitOperationsTool::new_with_command_boundary(
             security.clone(),
             Arc::new(RuntimeGitCommandBoundary {
                 sandbox: sandbox.clone(),
                 runtime_kind: root_config.runtime.kind,
             }),
-        )),
+        ))
+    );
+    #[cfg(feature = "tools-external")]
+    register_tool!(
+        "pushover",
         Arc::new(PushoverTool::new(
             security.clone(),
             workspace_dir.to_path_buf(),
-        )),
-        Arc::new(CalculatorTool::new()),
-        Arc::new(WeatherTool::new()),
-        Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
-        Arc::new(TodoWriteTool::new()),
-    ];
-
-    // A SubAgent runs as an ephemeral clone of its parent and inherits the
-    // parent's model verbatim; it must not be able to switch the active
-    // model out from under the parent (the switch signal is process-wide).
-    if is_subagent_caller {
-        tool_arcs.retain(|tool| tool.name() != ModelSwitchTool::NAME);
-    }
+        ))
+    );
+    register_tool!("calculator", Arc::new(CalculatorTool::new()));
+    #[cfg(feature = "tools-external")]
+    register_tool!("weather", Arc::new(WeatherTool::new()));
+    register_tool!(
+        "canvas",
+        Arc::new(CanvasTool::new(canvas_store.unwrap_or_default()))
+    );
+    register_tool!("TodoWrite", Arc::new(TodoWriteTool::new()));
 
     // Register discord_search if any configured Discord alias has
     // archive enabled. Multiple Discord aliases are supported (one per
     // bot/server set); the search tool reads from a shared archive DB
     // so it's enabled when at least one alias archives.
-    if root_config.channels.discord.values().any(|d| d.archive) {
+    if root_config.channels.discord.values().any(|d| d.archive) && select_tool!("discord_search") {
         match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
             Ok(discord_mem) => {
-                tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
+                register_tool!(
+                    "discord_search",
+                    Arc::new(DiscordSearchTool::new(Arc::new(discord_mem)))
+                );
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -1480,6 +1831,13 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // email_search — registered when at least one email channel is enabled
+    #[cfg(feature = "tools-external")]
+    if root_config
+        .channels
+        .email
+        .values()
+        .any(|channel| channel.enabled)
+        && (select_tool!("email_search") | select_tool!("email_read"))
     {
         let email_configs: std::collections::HashMap<
             String,
@@ -1501,14 +1859,17 @@ fn all_tools_with_runtime_on_thread(
                 None
             };
             let configs = Arc::new(email_configs);
-            tool_arcs.push(Arc::new(EmailSearchTool::new(
-                Arc::clone(&configs),
-                auth_service.clone(),
-            )));
-            tool_arcs.push(Arc::new(EmailReadTool::new(
-                Arc::clone(&configs),
-                auth_service,
-            )));
+            register_tool!(
+                "email_search",
+                Arc::new(EmailSearchTool::new(
+                    Arc::clone(&configs),
+                    auth_service.clone(),
+                ))
+            );
+            register_tool!(
+                "email_read",
+                Arc::new(EmailReadTool::new(Arc::clone(&configs), auth_service,))
+            );
         }
     }
 
@@ -1516,6 +1877,7 @@ fn all_tools_with_runtime_on_thread(
     // Preserves family + alias identity so alias-specific typed config
     // (e.g. requires_openai_auth) survives into llm_task execution.
     if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
+        && select_tool!("llm_task")
     {
         let llm_task_model = entry
             .model
@@ -1523,31 +1885,36 @@ fn all_tools_with_runtime_on_thread(
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
         let llm_task_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
-        tool_arcs.push(Arc::new(LlmTaskTool::new(
-            security.clone(),
-            config.clone(),
-            family.to_string(),
-            alias.to_string(),
-            llm_task_model,
-            entry.temperature,
-            entry.api_key.clone(),
-            llm_task_runtime_options,
-        )));
+        register_tool!(
+            "llm_task",
+            Arc::new(LlmTaskTool::new(
+                security.clone(),
+                config.clone(),
+                family.to_string(),
+                alias.to_string(),
+                llm_task_model,
+                entry.temperature,
+                entry.api_key.clone(),
+                llm_task_runtime_options,
+            ))
+        );
     }
 
     if matches!(
         root_config.effective_skills_prompt_mode(agent_alias),
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-    ) {
+    ) && select_tool!("read_skill")
+    {
         // ReadSkillTool holds full config to support workspace skills,
         // open-skills, agent-bound bundles, and plugin skills.
-        tool_arcs.push(Arc::new(ReadSkillTool::new(
-            config.clone(),
-            agent_alias.to_string(),
-        )));
+        register_tool!(
+            "read_skill",
+            Arc::new(ReadSkillTool::new(config.clone(), agent_alias.to_string(),))
+        );
     }
 
-    if browser_config.enabled {
+    #[cfg(feature = "tools-external")]
+    if browser_config.enabled && select_tool!("browser_open") {
         // Add legacy browser_open tool for simple URL opening
         match BrowserOpenTool::new_with_private_hosts(
             security.clone(),
@@ -1572,7 +1939,8 @@ fn all_tools_with_runtime_on_thread(
     // Full browser automation (pluggable backend) is a separate opt-in from
     // `browser_open`: it drives a real Chrome/Chromium session that may
     // already be logged in, so `[browser] enabled` alone must not grant it.
-    if browser_config.automation_enabled {
+    #[cfg(feature = "tools-external")]
+    if browser_config.automation_enabled && select_tool!("browser") {
         match BrowserTool::new_with_backend(
             security.clone(),
             browser_config.allowed_domains.clone(),
@@ -1609,12 +1977,16 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Browser delegation tool (conditionally registered; requires shell access)
-    if root_config.browser_delegate.enabled {
+    #[cfg(feature = "tools-external")]
+    if root_config.browser_delegate.enabled && select_tool!("browser_delegate") {
         if has_shell_access {
-            tool_arcs.push(Arc::new(BrowserDelegateTool::new(
-                security.clone(),
-                root_config.browser_delegate.clone(),
-            )));
+            register_tool!(
+                "browser_delegate",
+                Arc::new(BrowserDelegateTool::new(
+                    security.clone(),
+                    root_config.browser_delegate.clone(),
+                ))
+            );
         } else {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1625,7 +1997,7 @@ fn all_tools_with_runtime_on_thread(
         }
     }
 
-    if http_config.enabled {
+    if http_config.enabled && select_tool!("http_request") {
         match HttpRequestTool::new_with_config(
             security.clone(),
             http_config.allowed_domains.clone(),
@@ -1655,7 +2027,12 @@ fn all_tools_with_runtime_on_thread(
     // A2A outbound client (conditionally registered; opt-in via [a2a.client] enabled).
     // The four a2a_* tools share one client holding the live config handle, so
     // peer/credential/security resolution happens at call time (no stored peer Vec).
-    if root_config.a2a.client.enabled {
+    if root_config.a2a.client.enabled
+        && ["a2a_discover", "a2a_send", "a2a_get_task", "a2a_cancel"]
+            .iter()
+            .map(|name| select_tool!(name))
+            .fold(false, |selected, enabled| selected | enabled)
+    {
         let live = live_config.clone().unwrap_or_else(|| {
             zeroclaw_config::live::LiveConfig::new(root_config.clone()).handle()
         });
@@ -1689,10 +2066,10 @@ fn all_tools_with_runtime_on_thread(
                 // every successful network call (RateLimitedTool.record_action
                 // after success), and a post-I/O rate-limit failure could hide
                 // a successful remote result from the agent.
-                tool_arcs.push(Arc::new(A2aDiscoverTool::new(
-                    Arc::clone(&client),
-                    security.clone(),
-                )));
+                register_tool!(
+                    "a2a_discover",
+                    Arc::new(A2aDiscoverTool::new(Arc::clone(&client), security.clone(),))
+                );
                 // Act tools (send/cancel) are NOT wrapped in RateLimitedTool:
                 // they pre-charge the action budget via enforce_tool_operation(Act)
                 // before network I/O. RateLimitedTool would post-charge again,
@@ -1701,18 +2078,18 @@ fn all_tools_with_runtime_on_thread(
                 // which can cause the agent to retry an already-created/canceled
                 // task. The pre-charge in execute() covers both autonomy gating
                 // and rate limiting (record_action fails on budget exhaustion).
-                tool_arcs.push(Arc::new(A2aSendTool::new(
-                    Arc::clone(&client),
-                    security.clone(),
-                )));
-                tool_arcs.push(Arc::new(A2aGetTaskTool::new(
-                    Arc::clone(&client),
-                    security.clone(),
-                )));
-                tool_arcs.push(Arc::new(A2aCancelTool::new(
-                    Arc::clone(&client),
-                    security.clone(),
-                )));
+                register_tool!(
+                    "a2a_send",
+                    Arc::new(A2aSendTool::new(Arc::clone(&client), security.clone(),))
+                );
+                register_tool!(
+                    "a2a_get_task",
+                    Arc::new(A2aGetTaskTool::new(Arc::clone(&client), security.clone(),))
+                );
+                register_tool!(
+                    "a2a_cancel",
+                    Arc::new(A2aCancelTool::new(Arc::clone(&client), security.clone(),))
+                );
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -1753,7 +2130,8 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Text browser tool (headless text-based browser rendering)
-    if root_config.text_browser.enabled {
+    #[cfg(feature = "tools-external")]
+    if root_config.text_browser.enabled && select_tool!("text_browser") {
         match TextBrowserTool::new_with_private_hosts(
             security.clone(),
             root_config.text_browser.preferred_browser.clone(),
@@ -1776,15 +2154,18 @@ fn all_tools_with_runtime_on_thread(
         }
     }
 
-    // Web search tool (enabled by default for GLM and other models)
-    if root_config.web_search.enabled {
+    // Web search requires explicit selection and provider configuration
+    #[cfg(feature = "tools-external")]
+    if root_config.web_search.enabled && select_tool!("web_search_tool") {
         // Rate-limited like every other outbound-network tool (see web_fetch
         // and http_request above): without the wrapper an agent loop could
         // issue unbounded searches against the configured provider — and
         // against the default DuckDuckGo scrape path, which gets the machine
         // blocked.
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            WebSearchTool::new_with_config_and_anysearch_override(
+        register_tool!(
+            "web_search_tool",
+            Arc::new(RateLimitedTool::new(
+                WebSearchTool::new_with_config_and_anysearch_override(
                 root_config.web_search.search_provider.clone(),
                 root_config.web_search.brave_api_key.clone(),
                 root_config.web_search.tavily_api_key.clone(),
@@ -1807,12 +2188,19 @@ fn all_tools_with_runtime_on_thread(
             .with_keenable_api_key_override(WebSearchTool::keenable_api_key_override(
                 root_config,
             )),
-            security.clone(),
-        )));
+                security.clone(),
+            ))
+        );
     }
 
     // Notion API tool (conditionally registered)
-    if root_config.notion.enabled {
+    #[cfg(not(feature = "tool-notion"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::Notion,
+    );
+    #[cfg(feature = "tool-notion")]
+    if root_config.notion.enabled && select_tool!("notion") {
         let notion_api_key = if root_config.notion.api_key.trim().is_empty() {
             std::env::var("NOTION_API_KEY").unwrap_or_default()
         } else {
@@ -1826,12 +2214,18 @@ fn all_tools_with_runtime_on_thread(
                 "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
             );
         } else {
-            tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
+            register_tool!(
+                "notion",
+                Arc::new(NotionTool::new(notion_api_key, security.clone()))
+            );
         }
     }
 
     // Jira integration (config-gated)
-    if root_config.jira.enabled {
+    #[cfg(not(feature = "tool-jira"))]
+    warn_tool_compiled_out(root_config, zeroclaw_config::opt_in_tools::OptInTool::Jira);
+    #[cfg(feature = "tool-jira")]
+    if root_config.jira.enabled && select_tool!("jira") {
         let api_token = if root_config.jira.api_token.trim().is_empty() {
             std::env::var("JIRA_API_TOKEN").unwrap_or_default()
         } else {
@@ -1872,74 +2266,108 @@ fn all_tools_with_runtime_on_thread(
                     "Jira tool: Server/DC mode (API v2, Bearer auth)"
                 );
             }
-            tool_arcs.push(Arc::new(JiraTool::new(
-                root_config.jira.base_url.trim().to_string(),
-                email,
-                api_token,
-                root_config.jira.allowed_actions.clone(),
-                security.clone(),
-                root_config.jira.timeout_secs,
-            )));
+            register_tool!(
+                "jira",
+                Arc::new(JiraTool::new(
+                    root_config.jira.base_url.trim().to_string(),
+                    email,
+                    api_token,
+                    root_config.jira.allowed_actions.clone(),
+                    security.clone(),
+                    root_config.jira.timeout_secs,
+                ))
+            );
         }
     }
 
     // Project delivery intelligence
-    if root_config.project_intel.enabled {
-        tool_arcs.push(Arc::new(ProjectIntelTool::new(
-            root_config.project_intel.default_language.clone(),
-            root_config.project_intel.risk_sensitivity.clone(),
-        )));
+    #[cfg(not(feature = "tool-project-intel"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ProjectIntel,
+    );
+    #[cfg(feature = "tool-project-intel")]
+    if root_config.project_intel.enabled
+        && (select_tool!("project_intel") | select_tool!("report_template"))
+    {
+        register_tool!(
+            "project_intel",
+            Arc::new(ProjectIntelTool::new(
+                root_config.project_intel.default_language.clone(),
+                root_config.project_intel.risk_sensitivity.clone(),
+            ))
+        );
         // Report template tool — direct access to template engine
-        tool_arcs.push(Arc::new(ReportTemplateTool::new()));
+        register_tool!("report_template", Arc::new(ReportTemplateTool::new()));
     }
 
     // MCSS Security Operations
     if root_config.security_ops.enabled {
-        tool_arcs.push(Arc::new(SecurityOpsTool::new(
-            root_config.security_ops.clone(),
-        )));
+        register_tool!(
+            "security_ops",
+            Arc::new(SecurityOpsTool::new(root_config.security_ops.clone(),))
+        );
     }
 
-    // Backup tool (enabled by default)
+    // Backup service config and model-visible selection are separate
     if root_config.backup.enabled {
-        tool_arcs.push(Arc::new(BackupTool::new_with_data_root_and_security(
-            config.data_dir.clone(),
-            root_config.backup.include_dirs.clone(),
-            root_config.backup.max_keep,
-            security.clone(),
-        )));
+        register_tool!(
+            "backup",
+            Arc::new(BackupTool::new_with_data_root_and_security(
+                config.data_dir.clone(),
+                root_config.backup.include_dirs.clone(),
+                root_config.backup.max_keep,
+                security.clone(),
+            ))
+        );
     }
 
     // Data management tool (disabled by default)
     if root_config.data_retention.enabled {
-        tool_arcs.push(Arc::new(
-            DataManagementTool::new_with_data_root_and_security(
+        register_tool!(
+            "data_management",
+            Arc::new(DataManagementTool::new_with_data_root_and_security(
                 config.data_dir.clone(),
                 root_config.data_retention.retention_days,
                 security.clone(),
-            ),
-        ));
+            ),)
+        );
     }
 
     // Cloud operations advisory tools (read-only analysis)
     if root_config.cloud_ops.enabled {
-        tool_arcs.push(Arc::new(CloudOpsTool::new(root_config.cloud_ops.clone())));
-        tool_arcs.push(Arc::new(CloudPatternsTool::new()));
+        register_tool!(
+            "cloud_ops",
+            Arc::new(CloudOpsTool::new(root_config.cloud_ops.clone()))
+        );
+        register_tool!("cloud_patterns", Arc::new(CloudPatternsTool::new()));
     }
 
     // Google Workspace CLI (gws) integration — requires shell access
-    if root_config.google_workspace.enabled && has_shell_access {
-        tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
-            security.clone(),
-            root_config.google_workspace.allowed_services.clone(),
-            root_config.google_workspace.allowed_operations.clone(),
-            root_config.google_workspace.credentials_path.clone(),
-            root_config.google_workspace.default_account.clone(),
-            root_config.google_workspace.rate_limit_per_minute,
-            root_config.google_workspace.timeout_secs,
-            root_config.google_workspace.audit_log,
-        )));
-    } else if root_config.google_workspace.enabled {
+    #[cfg(not(feature = "tool-google-workspace"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::GoogleWorkspace,
+    );
+    #[cfg(feature = "tool-google-workspace")]
+    if root_config.google_workspace.enabled && has_shell_access && select_tool!("google_workspace")
+    {
+        register_tool!(
+            "google_workspace",
+            Arc::new(GoogleWorkspaceTool::new(
+                security.clone(),
+                root_config.google_workspace.allowed_services.clone(),
+                root_config.google_workspace.allowed_operations.clone(),
+                root_config.google_workspace.credentials_path.clone(),
+                root_config.google_workspace.default_account.clone(),
+                root_config.google_workspace.rate_limit_per_minute,
+                root_config.google_workspace.timeout_secs,
+                root_config.google_workspace.audit_log,
+            ))
+        );
+    } else if root_config.tools.is_enabled("google_workspace")
+        && root_config.google_workspace.enabled
+    {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1958,122 +2386,215 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Claude Code delegation tool
-    if register_coding_cli_tools && root_config.claude_code.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            ClaudeCodeTool::new_with_executor(
+    #[cfg(not(feature = "tool-claude-code"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ClaudeCode,
+    );
+    #[cfg(feature = "tool-claude-code")]
+    if root_config.claude_code.enabled && register_coding_cli_tools && select_tool!("claude_code") {
+        register_tool!(
+            "claude_code",
+            Arc::new(RateLimitedTool::new(
+                ClaudeCodeTool::new_with_executor(
+                    security.clone(),
+                    root_config.claude_code.clone(),
+                    coding_cli_executor.clone(),
+                ),
                 security.clone(),
-                root_config.claude_code.clone(),
-                coding_cli_executor.clone(),
-            ),
-            security.clone(),
-        )));
+            ))
+        );
     }
 
     // Claude Code task runner with Slack progress and SSH handoff
-    if root_config.claude_code_runner.enabled {
+    #[cfg(not(feature = "tool-claude-code-runner"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ClaudeCodeRunner,
+    );
+    #[cfg(feature = "tool-claude-code-runner")]
+    if root_config.claude_code_runner.enabled && select_tool!("claude_code_runner") {
         let gateway_url = format!(
             "http://{}:{}",
             root_config.gateway.host, root_config.gateway.port
         );
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            ClaudeCodeRunnerTool::new(
+        register_tool!(
+            "claude_code_runner",
+            Arc::new(RateLimitedTool::new(
+                ClaudeCodeRunnerTool::new(
+                    security.clone(),
+                    root_config.claude_code_runner.clone(),
+                    gateway_url,
+                ),
                 security.clone(),
-                root_config.claude_code_runner.clone(),
-                gateway_url,
-            ),
-            security.clone(),
-        )));
+            ))
+        );
     }
 
     // Codex CLI delegation tool
-    if register_coding_cli_tools && root_config.codex_cli.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            CodexCliTool::new_with_executor(
+    #[cfg(not(feature = "tool-codex-cli"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::CodexCli,
+    );
+    #[cfg(feature = "tool-codex-cli")]
+    if root_config.codex_cli.enabled && register_coding_cli_tools && select_tool!("codex_cli") {
+        register_tool!(
+            "codex_cli",
+            Arc::new(RateLimitedTool::new(
+                CodexCliTool::new_with_executor(
+                    security.clone(),
+                    root_config.codex_cli.clone(),
+                    coding_cli_executor.clone(),
+                ),
                 security.clone(),
-                root_config.codex_cli.clone(),
-                coding_cli_executor.clone(),
-            ),
-            security.clone(),
-        )));
+            ))
+        );
     }
 
     // Gemini CLI delegation tool
-    if register_coding_cli_tools && root_config.gemini_cli.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            GeminiCliTool::new_with_executor(
+    #[cfg(not(feature = "tool-gemini-cli"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::GeminiCli,
+    );
+    #[cfg(feature = "tool-gemini-cli")]
+    if root_config.gemini_cli.enabled && register_coding_cli_tools && select_tool!("gemini_cli") {
+        register_tool!(
+            "gemini_cli",
+            Arc::new(RateLimitedTool::new(
+                GeminiCliTool::new_with_executor(
+                    security.clone(),
+                    root_config.gemini_cli.clone(),
+                    coding_cli_executor.clone(),
+                ),
                 security.clone(),
-                root_config.gemini_cli.clone(),
-                coding_cli_executor.clone(),
-            ),
-            security.clone(),
-        )));
+            ))
+        );
     }
 
     // OpenCode CLI delegation tool
-    if register_coding_cli_tools && root_config.opencode_cli.enabled {
-        tool_arcs.push(Arc::new(RateLimitedTool::new(
-            OpenCodeCliTool::new_with_executor(
+    #[cfg(not(feature = "tool-opencode-cli"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::OpenCodeCli,
+    );
+    #[cfg(feature = "tool-opencode-cli")]
+    if root_config.opencode_cli.enabled && register_coding_cli_tools && select_tool!("opencode_cli")
+    {
+        register_tool!(
+            "opencode_cli",
+            Arc::new(RateLimitedTool::new(
+                OpenCodeCliTool::new_with_executor(
+                    security.clone(),
+                    root_config.opencode_cli.clone(),
+                    coding_cli_executor.clone(),
+                ),
                 security.clone(),
-                root_config.opencode_cli.clone(),
-                coding_cli_executor.clone(),
-            ),
-            security.clone(),
-        )));
+            ))
+        );
     }
 
-    // Vision tools are always available
-    tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
-    tool_arcs.push(Arc::new(RateLimitedTool::new(
-        PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
-        security.clone(),
-    )));
+    // Vision adapters require explicit selection
+    #[cfg(feature = "tools-external")]
+    register_tool!(
+        "screenshot",
+        Arc::new(ScreenshotTool::new(security.clone()))
+    );
+    register_tool!(
+        "image_info",
+        Arc::new(RateLimitedTool::new(
+            PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+            security.clone(),
+        ))
+    );
 
-    if let Ok(backend) =
-        zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
+    if [
+        "sessions_current",
+        "sessions_list",
+        "sessions_history",
+        "sessions_send",
+    ]
+    .iter()
+    .map(|name| select_tool!(name))
+    .fold(false, |selected, enabled| selected | enabled)
+        && let Ok(backend) =
+            zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
         if let Some(acp_sessions) = acp_sessions {
-            tool_arcs.push(Arc::new(SessionsCurrentTool::with_acp_sessions(
-                backend.clone(),
-                acp_sessions.clone(),
-            )));
-            tool_arcs.push(Arc::new(SessionsListTool::with_acp_sessions(
-                backend.clone(),
-                acp_sessions.clone(),
-            )));
-            tool_arcs.push(Arc::new(SessionsHistoryTool::with_acp_sessions(
-                backend.clone(),
-                security.clone(),
-                acp_sessions.clone(),
-            )));
-            tool_arcs.push(Arc::new(SessionsSendTool::with_acp_sessions(
-                backend,
-                security.clone(),
-                acp_sessions,
-            )));
+            register_tool!(
+                "sessions_current",
+                Arc::new(SessionsCurrentTool::with_acp_sessions(
+                    backend.clone(),
+                    acp_sessions.clone(),
+                ))
+            );
+            register_tool!(
+                "sessions_list",
+                Arc::new(SessionsListTool::with_acp_sessions(
+                    backend.clone(),
+                    acp_sessions.clone(),
+                ))
+            );
+            register_tool!(
+                "sessions_history",
+                Arc::new(SessionsHistoryTool::with_acp_sessions(
+                    backend.clone(),
+                    security.clone(),
+                    acp_sessions.clone(),
+                ))
+            );
+            register_tool!(
+                "sessions_send",
+                Arc::new(SessionsSendTool::with_acp_sessions(
+                    backend,
+                    security.clone(),
+                    acp_sessions,
+                ))
+            );
         } else {
-            tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
-            tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
-            tool_arcs.push(Arc::new(SessionsHistoryTool::new(
-                backend.clone(),
-                security.clone(),
-            )));
-            tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+            register_tool!(
+                "sessions_current",
+                Arc::new(SessionsCurrentTool::new(backend.clone()))
+            );
+            register_tool!(
+                "sessions_list",
+                Arc::new(SessionsListTool::new(backend.clone()))
+            );
+            register_tool!(
+                "sessions_history",
+                Arc::new(SessionsHistoryTool::new(backend.clone(), security.clone(),))
+            );
+            register_tool!(
+                "sessions_send",
+                Arc::new(SessionsSendTool::new(backend, security.clone()))
+            );
         }
     }
 
     // LinkedIn integration (config-gated)
-    if root_config.linkedin.enabled {
-        tool_arcs.push(Arc::new(LinkedInTool::new(
-            security.clone(),
-            workspace_dir.to_path_buf(),
-            root_config.linkedin.api_version.clone(),
-            root_config.linkedin.content.clone(),
-            root_config.linkedin.image.clone(),
-        )));
+    #[cfg(not(feature = "tool-linkedin"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::LinkedIn,
+    );
+    #[cfg(feature = "tool-linkedin")]
+    if root_config.linkedin.enabled && select_tool!("linkedin") {
+        register_tool!(
+            "linkedin",
+            Arc::new(LinkedInTool::new(
+                security.clone(),
+                workspace_dir.to_path_buf(),
+                root_config.linkedin.api_version.clone(),
+                root_config.linkedin.content.clone(),
+                root_config.linkedin.image.clone(),
+            ))
+        );
     }
 
     // Standalone image generation tool (config-gated)
-    if root_config.image_gen.enabled {
+    #[cfg(feature = "tools-external")]
+    if root_config.image_gen.enabled && select_tool!("image_gen") {
         match ImageGenTool::new_with_persistence(
             security.clone(),
             workspace_dir.to_path_buf(),
@@ -2101,11 +2622,15 @@ fn all_tools_with_runtime_on_thread(
         .url
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
+        && select_tool!("file_upload")
     {
-        tool_arcs.push(Arc::new(FileUploadTool::new(
-            security.clone(),
-            root_config.file_upload.clone(),
-        )));
+        register_tool!(
+            "file_upload",
+            Arc::new(FileUploadTool::new(
+                security.clone(),
+                root_config.file_upload.clone(),
+            ))
+        );
     }
 
     // File upload bundle tool — enabled iff [file_upload_bundle].url is set
@@ -2114,11 +2639,15 @@ fn all_tools_with_runtime_on_thread(
         .url
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
+        && select_tool!("file_upload_bundle")
     {
-        tool_arcs.push(Arc::new(FileUploadBundleTool::new(
-            security.clone(),
-            root_config.file_upload_bundle.clone(),
-        )));
+        register_tool!(
+            "file_upload_bundle",
+            Arc::new(FileUploadBundleTool::new(
+                security.clone(),
+                root_config.file_upload_bundle.clone(),
+            ))
+        );
     }
 
     // File download tool — enabled iff [file_download].url is set
@@ -2127,6 +2656,7 @@ fn all_tools_with_runtime_on_thread(
         .url
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
+        && select_tool!("file_download")
     {
         let policy_resolver: Arc<dyn Fn() -> FileDownloadSsrfPolicy + Send + Sync> =
             if let Some(live) = live_config.clone() {
@@ -2144,95 +2674,152 @@ fn all_tools_with_runtime_on_thread(
                 };
                 Arc::new(move || snapshot.clone())
             };
-        tool_arcs.push(Arc::new(
-            FileDownloadTool::new_with_persistence_and_resolver(
+        register_tool!(
+            "file_download",
+            Arc::new(FileDownloadTool::new_with_persistence_and_resolver(
                 security.clone(),
                 root_config.file_download.clone(),
                 persistent_writes,
                 move || policy_resolver(),
-            ),
-        ));
+            ),)
+        );
     }
 
-    // Poll tool — always registered; owns its own late-bound channel map.
+    // Poll tool — opt-in; owns its own late-bound channel map.
     let poll_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    tool_arcs.push(Arc::new(PollTool::new(
-        security.clone(),
-        Arc::clone(&poll_handle),
-    )));
+    register_tool!(
+        "poll",
+        Arc::new(PollTool::new(security.clone(), Arc::clone(&poll_handle),))
+    );
 
     // SOP tools (registered when engine handle is provided)
     if let Some(ref sop_engine) = sop_engine {
-        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
+        register_tool!(
+            "sop_list",
+            Arc::new(SopListTool::new(Arc::clone(sop_engine)))
+        );
         if let Some(ref sop_audit) = sop_audit {
-            tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine))
-                    .with_audit(Arc::clone(sop_audit))
-                    .with_initiator(agent_alias),
-            ));
-            tool_arcs.push(Arc::new(
-                SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
-            ));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine))
-                    .with_agent_alias(agent_alias)
-                    .with_audit(Arc::clone(sop_audit)),
-            ));
+            register_tool!(
+                "sop_execute",
+                Arc::new(
+                    SopExecuteTool::new(Arc::clone(sop_engine))
+                        .with_audit(Arc::clone(sop_audit))
+                        .with_initiator(agent_alias),
+                )
+            );
+            register_tool!(
+                "sop_advance",
+                Arc::new(
+                    SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+                )
+            );
+            register_tool!(
+                "sop_approve",
+                Arc::new(
+                    SopApproveTool::new(Arc::clone(sop_engine))
+                        .with_agent_alias(agent_alias)
+                        .with_audit(Arc::clone(sop_audit)),
+                )
+            );
         } else {
-            tool_arcs.push(Arc::new(
-                SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),
-            ));
-            tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
-            tool_arcs.push(Arc::new(
-                SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
-            ));
+            register_tool!(
+                "sop_execute",
+                Arc::new(SopExecuteTool::new(Arc::clone(sop_engine)).with_initiator(agent_alias),)
+            );
+            register_tool!(
+                "sop_advance",
+                Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine)))
+            );
+            register_tool!(
+                "sop_approve",
+                Arc::new(SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),)
+            );
         }
-        tool_arcs.push(Arc::new(
-            SopStatusTool::new(Arc::clone(sop_engine))
-                .with_collector(crate::sop::SopMetricsCollector::shared()),
-        ));
+        register_tool!(
+            "sop_status",
+            Arc::new(
+                SopStatusTool::new(Arc::clone(sop_engine))
+                    .with_collector(crate::sop::SopMetricsCollector::shared()),
+            )
+        );
         if root_config.sop.procedural_memory_enabled {
-            tool_arcs.push(Arc::new(SopWorkshopTool::new(
-                Arc::clone(sop_engine),
-                root_config.install_root_dir(),
-            )));
+            register_tool!(
+                "sop_workshop",
+                Arc::new(SopWorkshopTool::new(
+                    Arc::clone(sop_engine),
+                    root_config.install_root_dir(),
+                ))
+            );
         }
     }
 
+    #[cfg(not(feature = "tool-composio"))]
+    {
+        // Reported whenever the section is enabled: the usual caller passes no
+        // key when the section has none, which is exactly when it matters.
+        let _ = (composio_key, composio_entity_id);
+        warn_tool_compiled_out(
+            root_config,
+            zeroclaw_config::opt_in_tools::OptInTool::Composio,
+        );
+    }
+    #[cfg(feature = "tool-composio")]
     if let Some(key) = composio_key
         && !key.is_empty()
+        && select_tool!("composio")
     {
-        tool_arcs.push(Arc::new(ComposioTool::new(
-            key,
-            composio_entity_id,
-            security.clone(),
-        )));
+        register_tool!(
+            "composio",
+            Arc::new(ComposioTool::new(key, composio_entity_id, security.clone(),))
+        );
     }
 
-    // Emoji reaction tool — always registered; owns its own late-bound channel map.
+    // Emoji reaction tool — opt-in; owns its own late-bound channel map.
     let reaction_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    let reaction_tool = ReactionTool::new(security.clone(), Arc::clone(&reaction_handle));
-    tool_arcs.push(Arc::new(reaction_tool));
+    register_tool!(
+        "reaction",
+        Arc::new(ReactionTool::new(
+            security.clone(),
+            Arc::clone(&reaction_handle)
+        ))
+    );
 
     // Unified forge operations tool, routes through the git channel via the
     // same late-bound channel map as the reaction tool. Resource/action grid
     // plus a raw catch-all over the channel's single forge_request transport.
-    let git_forge_tool = GitForgeTool::new(security.clone(), Arc::clone(&reaction_handle));
-    tool_arcs.push(Arc::new(git_forge_tool));
+    register_tool!(
+        "git_forge",
+        Arc::new(GitForgeTool::new(
+            security.clone(),
+            Arc::clone(&reaction_handle)
+        ))
+    );
 
-    // Channel room-management tool — always registered; owns its own late-bound channel map.
+    // Channel room-management tool — opt-in; owns its own late-bound channel map.
     let channel_room_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    let channel_room_handle = Some(Arc::clone(&channel_room_tool_handle));
-    let channel_room_tool = ChannelRoomTool::new(security.clone(), channel_room_tool_handle);
-    tool_arcs.push(Arc::new(channel_room_tool));
+    let channel_room_handle =
+        select_tool!("channel_room").then(|| Arc::clone(&channel_room_tool_handle));
+    register_tool!(
+        "channel_room",
+        Arc::new(ChannelRoomTool::new(
+            security.clone(),
+            channel_room_tool_handle
+        ))
+    );
 
-    // Interactive ask_user tool — always registered; owns its own late-bound channel map.
+    // Interactive ask_user tool — opt-in; owns its own late-bound channel map.
     let ask_user_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    let ask_user_handle = Some(Arc::clone(&ask_user_tool_handle));
-    let ask_user_tool = AskUserTool::new(security.clone(), Arc::clone(&ask_user_tool_handle));
-    tool_arcs.push(Arc::new(ask_user_tool));
+    let ask_user_handle = (select_tool!("ask_user") || select_tool!("send_via"))
+        .then(|| Arc::clone(&ask_user_tool_handle));
+    register_tool!(
+        "ask_user",
+        Arc::new(AskUserTool::new(
+            security.clone(),
+            Arc::clone(&ask_user_tool_handle)
+        ))
+    );
 
-    {
+    if select_tool!("send_via") {
         let agent_peer_groups: AgentPeerGroupResolver = if let Some(live) = live_config.clone() {
             let alias = agent_alias.to_string();
             Arc::new(move || filter_agent_peer_groups(&live.read(), &alias))
@@ -2240,25 +2827,37 @@ fn all_tools_with_runtime_on_thread(
             let snapshot = filter_agent_peer_groups(root_config, agent_alias);
             Arc::new(move || snapshot.clone())
         };
-        tool_arcs.push(Arc::new(SendViaTool::new(
-            security.clone(),
-            ask_user_tool_handle,
-            agent_peer_groups,
-        )));
+        register_tool!(
+            "send_via",
+            Arc::new(SendViaTool::new(
+                security.clone(),
+                ask_user_tool_handle,
+                agent_peer_groups,
+            ))
+        );
     }
 
-    // Human escalation tool — always registered; owns its own late-bound channel map.
+    // Human escalation tool — opt-in; owns its own late-bound channel map.
     let escalate_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
-    let escalate_handle = Some(Arc::clone(&escalate_tool_handle));
-    let escalate_tool = EscalateToHumanTool::new(
-        security.clone(),
-        root_config.escalation.alert_channels.clone(),
-        escalate_tool_handle,
+    let escalate_handle =
+        select_tool!("escalate_to_human").then(|| Arc::clone(&escalate_tool_handle));
+    register_tool!(
+        "escalate_to_human",
+        Arc::new(EscalateToHumanTool::new(
+            security.clone(),
+            root_config.escalation.alert_channels.clone(),
+            escalate_tool_handle,
+        ))
     );
-    tool_arcs.push(Arc::new(escalate_tool));
 
     // Microsoft 365 Graph API integration
-    if root_config.microsoft365.enabled {
+    #[cfg(not(feature = "tool-microsoft365"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::Microsoft365,
+    );
+    #[cfg(feature = "tool-microsoft365")]
+    if root_config.microsoft365.enabled && select_tool!("microsoft365") {
         let ms_cfg = &root_config.microsoft365;
         let tenant_id = ms_cfg
             .tenant_id
@@ -2289,13 +2888,14 @@ fn all_tools_with_runtime_on_thread(
                 return Ok(AllToolsResult {
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
+                    reserved_host_names,
                     delegate_handle: None,
                     #[cfg(test)]
                     delegate_tool: None,
                     ask_user_handle,
                     channel_room_handle,
                     reaction_handle,
-                    poll_handle: Some(poll_handle),
+                    poll_handle: root_config.tools.is_enabled("poll").then_some(poll_handle),
                     escalate_handle,
                 });
             }
@@ -2336,14 +2936,16 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Knowledge graph tool
-    if root_config.knowledge.enabled {
+    if root_config.knowledge.enabled && select_tool!("knowledge") {
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("knowledge-open", "actual", 0, 0);
         let db_path = root_config.knowledge.resolved_db_path();
         match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &db_path,
             root_config.knowledge.max_nodes,
         ) {
             Ok(graph) => {
-                tool_arcs.push(Arc::new(KnowledgeTool::new(Arc::new(graph))));
+                register_tool!("knowledge", Arc::new(KnowledgeTool::new(Arc::new(graph))));
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -2370,15 +2972,25 @@ fn all_tools_with_runtime_on_thread(
 
     #[cfg(test)]
     let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
-    let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
-        None
-    } else {
-        let delegate_agents: HashMap<String, AliasedAgentConfig> = agents
-            .iter()
-            .map(|(name, cfg)| (name.clone(), cfg.clone()))
-            .collect();
-        let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
-        let delegate_tool = DelegateTool::new_with_options(
+    let delegate_handle: Option<DelegateParentToolsHandle> =
+        if agents.is_empty() || !select_tool!("delegate") {
+            None
+        } else {
+            let delegate_agents: HashMap<String, AliasedAgentConfig> = agents
+                .iter()
+                .map(|(name, cfg)| (name.clone(), cfg.clone()))
+                .collect();
+            let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record(
+                "delegate-snapshot",
+                "original",
+                late_tool_search_observer::arc_id(&parent_tools),
+                tool_arcs.len(),
+            );
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record("constructor-enter", "delegate", 0, 0);
+            let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_global_credential.clone(),
             security.clone(),
@@ -2414,14 +3026,21 @@ fn all_tools_with_runtime_on_thread(
         .with_live_config(live_config.clone())
         .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
-        let delegate_tool = Arc::new(delegate_tool);
-        #[cfg(test)]
-        {
-            built_delegate_tool = Some(Arc::clone(&delegate_tool));
-        }
-        tool_arcs.push(delegate_tool as Arc<dyn Tool>);
-        Some(parent_tools)
-    };
+            let delegate_tool = Arc::new(delegate_tool);
+            #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+            late_tool_search_observer::record(
+                "constructor-return",
+                "delegate",
+                late_tool_search_observer::arc_id(&delegate_tool),
+                0,
+            );
+            #[cfg(test)]
+            {
+                built_delegate_tool = Some(Arc::clone(&delegate_tool));
+            }
+            tool_arcs.push(delegate_tool as Arc<dyn Tool>);
+            Some(parent_tools)
+        };
 
     // `vi_verify` is deliberately absent while no chain verifier exists: it checked
     // caller-supplied constraints against a caller-supplied fulfillment with nothing
@@ -2452,13 +3071,8 @@ fn all_tools_with_runtime_on_thread(
                         Arc::clone(&config),
                         live_config.clone(),
                     );
-                    let mut registered_names: std::collections::HashSet<String> = tool_arcs
-                        .iter()
-                        .map(|tool| tool.name().to_string())
-                        .collect();
-                    if root_config.pipeline.enabled {
-                        registered_names.insert(PipelineTool::NAME.to_string());
-                    }
+                    let mut registered_names = reserved_host_names.clone();
+                    registered_names.extend(tool_arcs.iter().map(|tool| tool.name().to_string()));
                     let plugin_limits = crate::plugin_runtime::plugin_limits(&config);
                     let egress_service =
                         plugin_egress_service(Arc::clone(&config), live_config.clone());
@@ -2507,23 +3121,44 @@ fn all_tools_with_runtime_on_thread(
     Ok(AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
         tools: boxed_registry_from_arcs(tool_arcs),
+        reserved_host_names,
         delegate_handle,
         ask_user_handle,
         channel_room_handle,
         reaction_handle,
-        poll_handle: Some(poll_handle),
+        poll_handle: root_config.tools.is_enabled("poll").then_some(poll_handle),
         escalate_handle,
         #[cfg(test)]
         delegate_tool: built_delegate_tool,
     })
 }
 
+/// Why [`claim_plugin_tool_name`] refused a guest-declared tool name.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginToolNameRefusal {
+    /// A tool this registry build already registered holds the name.
+    Taken,
+    /// The name contains the MCP separator, so it can match an MCP tool's
+    /// `<server>__<tool>` name, which registers only after plugin tools.
+    McpNamespace,
+}
+
+/// Claim a guest-declared tool name for a plugin tool. A refused name
+/// reserves nothing.
 #[cfg(feature = "plugins-wasm")]
 fn claim_plugin_tool_name(
     registered_names: &mut std::collections::HashSet<String>,
     plugin_name: &str,
-) -> bool {
-    registered_names.insert(plugin_name.to_string())
+) -> Result<(), PluginToolNameRefusal> {
+    if plugin_name.contains(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR) {
+        return Err(PluginToolNameRefusal::McpNamespace);
+    }
+    if registered_names.insert(plugin_name.to_string()) {
+        Ok(())
+    } else {
+        Err(PluginToolNameRefusal::Taken)
+    }
 }
 
 /// Construct and register every tool-plugin instance the activation plan
@@ -2604,6 +3239,8 @@ fn register_plugin_tools(
             continue;
         }
 
+        #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+        late_tool_search_observer::record("wasm-probe-enter", &package, 0, 0);
         let tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
             component.clone(),
             scope,
@@ -2613,21 +3250,52 @@ fn register_plugin_tools(
         );
         match tool {
             Ok(tool) => {
-                if !claim_plugin_tool_name(registered_names, tool.name()) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                match claim_plugin_tool_name(registered_names, tool.name()) {
+                    Ok(()) => {}
+                    Err(PluginToolNameRefusal::Taken) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Load
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "plugin": manifest.name,
                                 "tool": tool.name(),
                                 "error_key": "plugin_tool_name_conflict",
                             })),
-                        "Plugin tool conflicts with an already registered tool"
-                    );
-                    continue;
+                            "Plugin tool conflicts with an already registered tool"
+                        );
+                        continue;
+                    }
+                    Err(PluginToolNameRefusal::McpNamespace) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Load
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "plugin": manifest.name,
+                                "tool": tool.name(),
+                                "error_key": "plugin_tool_name_reserved",
+                            })),
+                            "Plugin tool name contains the MCP separator `__`, which \
+                             only MCP tool names may use"
+                        );
+                        continue;
+                    }
                 }
                 tool_arcs.push(Arc::new(tool));
+                #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+                late_tool_search_observer::record(
+                    "wasm-admitted",
+                    &package,
+                    late_tool_search_observer::arc_id(tool_arcs.last().expect("just appended")),
+                    0,
+                );
                 registered_count += 1;
             }
             Err(e) => {
@@ -2890,6 +3558,7 @@ mod tests {
     /// uses, so a schema-mirror value wins for the process while on-disk
     /// rotation stays in force when no override is active.
     #[test]
+    #[cfg(feature = "tools-external")]
     fn serply_api_key_override_mirrors_env_override_state() {
         let mut cfg = Config::default();
 
@@ -2913,8 +3582,136 @@ mod tests {
         assert_eq!(serply_api_key_override(&cfg), Some(None));
     }
 
+    #[test]
+    fn optional_builtin_is_not_constructed_or_exposed_until_selected() {
+        let mut selection = zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+            optional: Vec::new(),
+        };
+        let constructions = std::cell::Cell::new(0);
+        let mut registry = Vec::new();
+        let mut reserved = std::collections::HashSet::new();
+        register_builtin_tool(
+            &selection,
+            &mut registry,
+            &mut reserved,
+            "calculator",
+            || {
+                constructions.set(constructions.get() + 1);
+                Arc::new(CalculatorTool::new())
+            },
+        );
+        assert_eq!(constructions.get(), 0);
+        assert!(registry.is_empty());
+        assert!(reserved.contains("calculator"));
+        selection.optional.push("calculator".into());
+        register_builtin_tool(
+            &selection,
+            &mut registry,
+            &mut reserved,
+            "calculator",
+            || {
+                constructions.set(constructions.get() + 1);
+                Arc::new(CalculatorTool::new())
+            },
+        );
+        assert_eq!(constructions.get(), 1);
+        assert_eq!(registry[0].spec().name, "calculator");
+    }
+
+    #[tokio::test]
+    async fn minimal_assembly_exposes_eleven_and_does_not_open_optional_database() {
+        use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: Vec::new(),
+            },
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .agents
+            .insert("lean".into(), AliasedAgentConfig::default());
+        config
+            .providers
+            .models
+            .openai
+            .insert("lean".into(), Default::default());
+        config.agents.get_mut("lean").unwrap().model_provider = "openai.lean".into();
+        config.knowledge.enabled = true;
+        config.knowledge.db_path = tmp.path().join("optional.db").display().to_string();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().into(),
+            ..Default::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("lean"));
+        let built = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "lean",
+            Arc::clone(&runtime),
+            memory,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            tmp.path(),
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!tmp.path().join("optional.db").exists());
+        assert!(built.delegate_handle.is_none());
+        assert!(built.poll_handle.is_none());
+        assert!(built.ask_user_handle.is_none());
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "lean",
+            security: &security,
+            built,
+            skills: &[],
+            runtime,
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+        let mut names: Vec<_> = assembled
+            .registry
+            .iter()
+            .map(|tool| tool.spec().name)
+            .collect();
+        names.sort();
+        let mut core: Vec<_> = zeroclaw_config::builtin_tools::CORE_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        core.sort();
+        assert_eq!(names, core);
+        assert_eq!(names.len(), 11);
+    }
+
     fn test_config(tmp: &TempDir) -> Config {
         Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: vec!["*".into()],
+            },
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
@@ -3134,6 +3931,252 @@ const = true
         );
     }
 
+    #[cfg(feature = "plugins-wasm")]
+    #[tokio::test]
+    async fn plugin_tls_coherence_preserves_frame_identity_and_live_grants() {
+        use zeroclaw_plugins::egress::{EgressError, EgressRequest, EgressTransport};
+        use zeroclaw_plugins::{PluginCapability, PluginPermission};
+        let tmp = TempDir::new().unwrap();
+        let package = tmp.path().join("tls-coherence");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            package.join("manifest.toml"),
+            r#"
+name = "tls-coherence"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read", "socket_client", "websocket_client"]
+[config_schema]
+type = "object"
+additionalProperties = false
+[config_schema.properties.ca]
+type = "string"
+x-secret = true
+[config_schema.properties.cert]
+type = "string"
+x-secret = true
+[config_schema.properties.key]
+type = "string"
+x-secret = true
+"#,
+        )
+        .unwrap();
+        let host =
+            Arc::new(zeroclaw_plugins::host::PluginHost::from_plugins_dir(tmp.path()).unwrap());
+        let scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            host.manifest("tls-coherence").unwrap(),
+            PluginCapability::Tool,
+            "coherence",
+            [
+                PluginPermission::ConfigRead,
+                PluginPermission::SocketClient,
+                PluginPermission::WebSocketClient,
+            ],
+        )
+        .unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["test-ca".into()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params.self_signed(&ca_key).unwrap();
+        let client = |name: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![name.into()]).unwrap();
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            (cert, key)
+        };
+        let (cert_a, key_a) = client("identity-a");
+        let (cert_b, key_b) = client("identity-b");
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_cert =
+            rcgen::CertificateParams::new(vec!["a.example".into(), "b.example".into()])
+                .unwrap()
+                .signed_by(&server_key, &ca, &ca_key)
+                .unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let server = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![server_cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+                )
+                .unwrap(),
+        );
+        async fn peer_identity(
+            client: Arc<rustls::ClientConfig>,
+            server: Arc<rustls::ServerConfig>,
+            name: &'static str,
+        ) -> Vec<u8> {
+            let (a, b) = tokio::io::duplex(64 * 1024);
+            let future = async {
+                let (client, server) = tokio::join!(
+                    tokio_rustls::TlsConnector::from(client)
+                        .connect(rustls::pki_types::ServerName::try_from(name).unwrap(), a),
+                    tokio_rustls::TlsAcceptor::from(server).accept(b)
+                );
+                assert!(client.is_ok());
+                server.unwrap().get_ref().1.peer_certificates().unwrap()[0]
+                    .as_ref()
+                    .to_vec()
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(10), future)
+                .await
+                .unwrap()
+        }
+        let row = |destination: &str, cert: &rcgen::Certificate, key: &rcgen::KeyPair| {
+            zeroclaw_config::schema::PluginEntryConfig {
+                name: scope.id().config_entry_key().unwrap(),
+                config: HashMap::from([
+                    ("ca".into(), ca.pem()),
+                    ("cert".into(), cert.pem()),
+                    ("key".into(), key.serialize_pem()),
+                ]),
+                egress_hosts: vec![destination.into()],
+                tls_profiles: vec![zeroclaw_config::schema::PluginTlsProfileConfig {
+                    name: "identity".into(),
+                    hosts: vec![destination.into()],
+                    system_roots: false,
+                    custom_ca_secret: Some("ca".into()),
+                    client_certificate_secret: Some("cert".into()),
+                    client_private_key_secret: Some("key".into()),
+                }],
+                ..Default::default()
+            }
+        };
+        let mut initial = Config::default();
+        initial.plugins.entries = vec![row("a.example", &cert_a, &key_a)];
+        let live = zeroclaw_config::live::LiveConfig::new(initial.clone());
+        let withheld_scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            host.manifest("tls-coherence").unwrap(),
+            PluginCapability::Tool,
+            "withheld",
+            [PluginPermission::SocketClient],
+        )
+        .unwrap();
+        let services = plugin_host_services(host, Arc::new(initial.clone()), Some(live.handle()));
+        assert!(
+            services.resolve_config(&withheld_scope).is_ok(),
+            "withheld config remains an empty valid view without secret reads"
+        );
+        let egress = plugin_egress_service(Arc::new(initial.clone()), Some(live.handle()));
+        let authorize = |host: &str, transport| {
+            egress.authorize_addresses(
+                EgressRequest::new(scope.clone(), transport, host, 443)
+                    .unwrap()
+                    .with_tls_profile("identity")
+                    .unwrap(),
+                [std::net::SocketAddr::from(([1, 1, 1, 1], 443))],
+            )
+        };
+        let frame_a = services.resolve_config(&scope).unwrap();
+        let admission_a = authorize("a.example", EgressTransport::Tls).unwrap();
+        let connection_a = frame_a
+            .tls_client_config(&admission_a, &rustls::RootCertStore::empty())
+            .unwrap();
+        assert_eq!(
+            peer_identity(connection_a.clone(), server.clone(), "a.example").await,
+            cert_a.der().as_ref()
+        );
+        let mut updated = live.snapshot();
+        updated.plugins.entries = vec![row("b.example", &cert_b, &key_b)];
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
+        for transport in [
+            EgressTransport::Tls,
+            EgressTransport::StartTls,
+            EgressTransport::WebSocket { encrypted: true },
+        ] {
+            let admission_b = authorize("b.example", transport).unwrap();
+            let presented =
+                match frame_a.tls_client_config(&admission_b, &rustls::RootCertStore::empty()) {
+                    Ok(client) => Some(peer_identity(client, server.clone(), "b.example").await),
+                    Err(EgressError::TlsConfigMismatch) => None,
+                    Err(error) => panic!("unexpected materialization refusal: {error}"),
+                };
+            assert!(
+                presented.is_none(),
+                "destination B received an identity from the old frame: {presented:?}"
+            );
+        }
+        assert!(
+            authorize("a.example", EgressTransport::Tls).is_err(),
+            "grants remain live"
+        );
+        let frame_b = services.resolve_config(&scope).unwrap();
+        assert!(
+            matches!(
+                frame_b.ensure_tls_authorization(&admission_a),
+                Err(EgressError::TlsConfigMismatch)
+            ),
+            "old authorization cannot consume a newly resolved frame"
+        );
+        let admission_b = authorize("b.example", EgressTransport::Tls).unwrap();
+        let connection_b = frame_b
+            .tls_client_config(&admission_b, &rustls::RootCertStore::empty())
+            .unwrap();
+        assert_eq!(
+            peer_identity(connection_b, server.clone(), "b.example").await,
+            cert_b.der().as_ref()
+        );
+        assert_eq!(
+            peer_identity(connection_a, server, "a.example").await,
+            cert_a.der().as_ref(),
+            "already materialized connections keep their identity"
+        );
+        // Each material/reference field participates even if destination is unchanged.
+        let current = live.snapshot();
+        for property in ["ca", "cert", "key"] {
+            let mut updated = current.clone();
+            updated.plugins.entries[0]
+                .config
+                .insert(property.into(), "changed".into());
+            live.publish(live.next_revision().unwrap(), updated)
+                .unwrap();
+            let next = authorize("b.example", EgressTransport::Tls).unwrap();
+            assert!(matches!(
+                frame_b.ensure_tls_authorization(&next),
+                Err(EgressError::TlsConfigMismatch)
+            ));
+        }
+        for property in ["ca", "cert", "key"] {
+            let mut updated = current.clone();
+            let profile = &mut updated.plugins.entries[0].tls_profiles[0];
+            match property {
+                "ca" => profile.custom_ca_secret = Some("new_ca".into()),
+                "cert" => profile.client_certificate_secret = Some("new_cert".into()),
+                _ => profile.client_private_key_secret = Some("new_key".into()),
+            }
+            live.publish(live.next_revision().unwrap(), updated)
+                .unwrap();
+            let next = authorize("b.example", EgressTransport::Tls).unwrap();
+            assert!(matches!(
+                frame_b.ensure_tls_authorization(&next),
+                Err(EgressError::TlsConfigMismatch)
+            ));
+        }
+        let mut updated = current;
+        updated.plugins.entries[0].tls_profiles.clear();
+        live.publish(live.next_revision().unwrap(), updated)
+            .unwrap();
+        assert!(matches!(
+            authorize("b.example", EgressTransport::Tls),
+            Err(EgressError::UnknownTlsProfile(_))
+        ));
+    }
+
     /// End-to-end over the resolver the registry actually installs: an operator
     /// grant authored on the instance-key row that `zeroclaw plugin install`
     /// seeds must reach the policy, and nothing else may stand in for it.
@@ -3294,7 +4337,7 @@ permissions = ["http_client"]
             std::collections::HashSet::from(["shell".to_string(), PipelineTool::NAME.to_string()]);
         let accepted = ["shell", PipelineTool::NAME, "novel-tool", "novel-tool"]
             .into_iter()
-            .filter(|name| claim_plugin_tool_name(&mut registered_names, name))
+            .filter(|name| claim_plugin_tool_name(&mut registered_names, name).is_ok())
             .collect::<Vec<_>>();
 
         assert_eq!(accepted, vec!["novel-tool"]);
@@ -3305,6 +4348,41 @@ permissions = ["http_client"]
                 PipelineTool::NAME.to_string(),
                 "novel-tool".to_string(),
             ])
+        );
+    }
+
+    /// MCP tool names are not registered yet when plugin tools claim theirs,
+    /// so the separator itself is refused rather than any particular name.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_tool_names_in_the_mcp_namespace_are_refused() {
+        let mut registered_names = std::collections::HashSet::new();
+
+        for name in [
+            "filesystem__read_file",
+            "__leading",
+            "trailing__",
+            "a__b__c",
+        ] {
+            assert_eq!(
+                claim_plugin_tool_name(&mut registered_names, name),
+                Err(PluginToolNameRefusal::McpNamespace),
+                "`{name}` contains the MCP separator"
+            );
+        }
+        assert!(
+            registered_names.is_empty(),
+            "a refused name must reserve nothing: {registered_names:?}"
+        );
+
+        // A single underscore is an ordinary name character.
+        assert_eq!(
+            claim_plugin_tool_name(&mut registered_names, "redact_text"),
+            Ok(())
+        );
+        assert_eq!(
+            claim_plugin_tool_name(&mut registered_names, "redact_text"),
+            Err(PluginToolNameRefusal::Taken)
         );
     }
 
@@ -3416,6 +4494,18 @@ permissions = ["http_client"]
         host: &Arc<zeroclaw_plugins::host::PluginHost>,
         reserved: &[&str],
     ) -> Vec<String> {
+        run_tool_plugin_loader(config, host, reserved).0
+    }
+
+    /// Run the production tool loader once and report, each in sorted order,
+    /// the packages whose guest construction it entered and the names of the
+    /// tools it registered.
+    #[cfg(feature = "plugins-wasm")]
+    fn run_tool_plugin_loader(
+        config: &Config,
+        host: &Arc<zeroclaw_plugins::host::PluginHost>,
+        reserved: &[&str],
+    ) -> (Vec<String>, Vec<String>) {
         let (resolver, probed) = recording_resolver(host);
         let state_dir = tempfile::tempdir().expect("plugin state dir");
         let services = zeroclaw_plugins::services::PluginHostServices::new(
@@ -3438,7 +4528,12 @@ permissions = ["http_client"]
         );
         let mut probed = probed.lock().unwrap().clone();
         probed.sort();
-        probed
+        let mut registered: Vec<String> = tool_arcs
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        registered.sort();
+        (probed, registered)
     }
 
     /// A plugin whose name already belongs to a native, reserved, or
@@ -3490,6 +4585,107 @@ permissions = ["http_client"]
         let probed = tool_packages_reaching_construction(&config, &host, &[]);
 
         assert_eq!(probed, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// Build the in-tree tool fixture with `features` and return its component
+    /// bytes. Each variant gets its own target directory, so building one
+    /// cannot overwrite another's artifact, and the nested Cargo invocation
+    /// does not contend with this test process's build lock.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    fn tool_fixture_component(variant: &str, features: &[&str]) -> Vec<u8> {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixture_dir = manifest_dir.join("../zeroclaw-plugins/tests/fixtures/tool-fixture");
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(
+                || manifest_dir.join("../../target"),
+                std::path::PathBuf::from,
+            )
+            .join(format!("tool-plugin-fixture-{variant}"));
+        let mut cargo = std::process::Command::new(env!("CARGO"));
+        cargo
+            .current_dir(&fixture_dir)
+            .args([
+                "build",
+                "--locked",
+                "--quiet",
+                "--package",
+                "zeroclaw-tool-plugin-fixture",
+                "--target",
+                "wasm32-wasip2",
+                "--target-dir",
+            ])
+            .arg(&target_dir);
+        if !features.is_empty() {
+            cargo.arg("--features").arg(features.join(","));
+        }
+        let status = cargo
+            .status()
+            .expect("run Cargo for the tool component fixture");
+        assert!(
+            status.success(),
+            "tool fixture must build; install the wasm32-wasip2 target"
+        );
+        std::fs::read(target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm"))
+            .expect("tool fixture WASM was produced")
+    }
+
+    /// Lay out a loadable tool package the way `zeroclaw plugin install` does.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    fn install_tool_component(root: &std::path::Path, name: &str, component: &[u8]) {
+        let package_dir = root.join(name);
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"tool\"]\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(package_dir.join("plugin.wasm"), component).unwrap();
+    }
+
+    /// MCP tools register as `<server>__<tool>` after plugin registration, so
+    /// no reserved name can stand in for them when plugins load. A guest that
+    /// declares such a name must still not be registered, or it would sit
+    /// ahead of the real MCP tool in first-match dispatch and receive its
+    /// calls.
+    ///
+    /// Both packages run the same real component, so the one with the
+    /// ordinary name is the control: it shows the guests load and register
+    /// through this path, and that only the MCP-shaped name is refused.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[test]
+    fn colliding_plugin_tool_in_the_mcp_namespace_is_not_registered() {
+        let plugins = TempDir::new().unwrap();
+        install_tool_component(
+            plugins.path(),
+            "echo-tool",
+            &tool_fixture_component("default", &[]),
+        );
+        install_tool_component(
+            plugins.path(),
+            "mcp-shaped-tool",
+            &tool_fixture_component("namespace-mcp-tool", &["namespace-mcp-tool"]),
+        );
+
+        let host =
+            Arc::new(zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        let config = plugin_activation_config(plugins.path());
+
+        // Nothing is reserved: the MCP server that would own the name has not
+        // registered when plugins load.
+        let (constructed, registered) = run_tool_plugin_loader(&config, &host, &[]);
+
+        assert_eq!(
+            constructed,
+            vec!["echo-tool".to_string(), "mcp-shaped-tool".to_string()],
+            "both guests must be constructed so their declared names are known"
+        );
+        assert_eq!(
+            registered,
+            vec!["config-echo".to_string()],
+            "a plugin tool named like an MCP tool must not be registered"
+        );
     }
 
     /// A mixed channel/tool/skill candidate set that exceeds the shared
@@ -3737,6 +4933,7 @@ permissions = ["http_client"]
     ///   * unwrapped → `Err("SearXNG instance URL not configured…")` from the
     ///                 inner tool's own config resolution
     #[tokio::test]
+    #[cfg(feature = "tools-external")]
     async fn web_search_tool_is_registered_behind_the_rate_limiter() {
         let tmp = TempDir::new().unwrap();
 
@@ -4002,11 +5199,23 @@ permissions = ["http_client"]
         );
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     struct CapturingRuntime {
         seen_command: Arc<Mutex<Option<String>>>,
         filesystem_access: bool,
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     impl RuntimeAdapter for CapturingRuntime {
         fn name(&self) -> &str {
             "capturing-test"
@@ -4047,6 +5256,12 @@ permissions = ["http_client"]
         }
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     #[tokio::test]
     async fn registered_coding_cli_tools_use_configured_runtime_executor() {
         type EnableCodingCli = fn(&mut Config);
@@ -4161,6 +5376,12 @@ permissions = ["http_client"]
         }
     }
 
+    #[cfg(all(
+        feature = "tool-claude-code",
+        feature = "tool-codex-cli",
+        feature = "tool-gemini-cli",
+        feature = "tool-opencode-cli"
+    ))]
     #[tokio::test]
     async fn docker_without_workspace_mount_does_not_register_coding_cli_tools() {
         let tmp = TempDir::new().unwrap();
@@ -4227,6 +5448,87 @@ permissions = ["http_client"]
                 "{tool_name} must not register without runtime filesystem access"
             );
         }
+        assert!(
+            names.contains(&"shell"),
+            "positive control: ordinary tools should still register"
+        );
+    }
+
+    /// An integration enabled in config registers only when its feature is
+    /// compiled in. A compiled-out tool is absent from the registry and from
+    /// the prompt's tool descriptions, never listed as a name that fails.
+    #[tokio::test]
+    async fn enabled_integrations_register_only_when_compiled_in() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let mut cfg = test_config(&tmp);
+        cfg.notion.enabled = true;
+        cfg.notion.api_key = "secret_test".into();
+        cfg.jira.enabled = true;
+        cfg.jira.api_token = "token".into();
+        cfg.jira.base_url = "https://example.atlassian.net".into();
+        cfg.project_intel.enabled = true;
+        cfg.composio.enabled = true;
+
+        let tools = all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            Some("composio-key"),
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+
+        for (tool_name, compiled_in) in [
+            ("notion", cfg!(feature = "tool-notion")),
+            ("jira", cfg!(feature = "tool-jira")),
+            ("project_intel", cfg!(feature = "tool-project-intel")),
+            ("report_template", cfg!(feature = "tool-project-intel")),
+            ("composio", cfg!(feature = "tool-composio")),
+        ] {
+            assert_eq!(
+                names.contains(&tool_name),
+                compiled_in,
+                "{tool_name} must register exactly when its feature is compiled in"
+            );
+        }
+        assert_eq!(
+            composio_tool_available(&cfg),
+            cfg!(feature = "tool-composio"),
+            "the prompt must not describe a Composio tool this build lacks"
+        );
         assert!(
             names.contains(&"shell"),
             "positive control: ordinary tools should still register"
@@ -4988,7 +6290,10 @@ permissions = ["http_client"]
         assert!(!names.contains(&"browser"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
-        assert!(names.contains(&"pushover"));
+        assert_eq!(
+            names.contains(&"pushover"),
+            cfg!(feature = "tools-external")
+        );
         assert!(names.contains(&"proxy_config"));
     }
 
@@ -5047,6 +6352,7 @@ permissions = ["http_client"]
     }
 
     #[test]
+    #[cfg(feature = "tools-external")]
     fn all_tools_includes_browser_when_enabled() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
@@ -5096,13 +6402,17 @@ permissions = ["http_client"]
         );
         assert!(names.contains(&"content_search"));
         assert!(names.contains(&"model_routing_config"));
-        assert!(names.contains(&"pushover"));
+        assert_eq!(
+            names.contains(&"pushover"),
+            cfg!(feature = "tools-external")
+        );
         assert!(names.contains(&"proxy_config"));
     }
 
     /// Opting into `[browser] automation_enabled` registers the full
     /// `browser` automation tool alongside `browser_open`.
     #[test]
+    #[cfg(feature = "tools-external")]
     fn all_tools_includes_browser_automation_when_opted_in() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
@@ -5153,6 +6463,7 @@ permissions = ["http_client"]
     /// without `browser_open`, proving `automation_enabled` is the only
     /// thing standing between an operator and the automation tool.
     #[test]
+    #[cfg(feature = "tools-external")]
     fn all_tools_registers_automation_without_browser_open() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
@@ -5869,6 +7180,7 @@ permissions = ["http_client"]
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.tools.optional = vec!["llm_task".into()];
         config.agents.insert(
             "test-agent".to_string(),
             AliasedAgentConfig {
@@ -6070,6 +7382,7 @@ permissions = ["http_client"]
             Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let mut cfg = test_config(tmp);
+        cfg.tools.optional = vec!["*".into()];
         std::fs::create_dir_all(&cfg.data_dir).unwrap();
         // Plugin tools are outside the inventory, so plugins stay off, and the
         // plugin directory points under `tmp` as well.
@@ -6257,6 +7570,17 @@ permissions = ["http_client"]
              crates/zeroclaw-tools/src/inventory.rs; add each one there and to the \
              tier tables in docs/book/src/developing/tool-inventory.md: {uninventoried:?}"
         );
+
+        let uncompiled: Vec<&String> = registered
+            .iter()
+            .filter(|name| {
+                zeroclaw_tools::inventory::builtin_tool(name).is_some_and(|spec| !spec.compiled())
+            })
+            .collect();
+        assert!(
+            uncompiled.is_empty(),
+            "the registry registers tools outside their canonical compilation groups: {uncompiled:?}"
+        );
     }
 
     #[tokio::test]
@@ -6279,6 +7603,7 @@ permissions = ["http_client"]
         let registered = maximal_registry_names(&tmp).await;
         let missing: Vec<&str> = zeroclaw_tools::inventory::BUILTIN_TOOLS
             .iter()
+            .filter(|spec| spec.compiled())
             .map(|spec| spec.name)
             .filter(|name| !unconstructible.contains_key(name) && !registered.contains(*name))
             .collect();
@@ -6405,5 +7730,101 @@ mod wrapper_spec_forwarding_tests {
             "ArcDelegatingTool must forward spec() so the inner Arc-shared \
              schema survives; the trait default deep-clones it every call"
         );
+    }
+}
+
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+mod r5_namespace_tests;
+
+// Test evidence follows the actual case through the existing registry thread.
+// It owns no executable, policy, schema, or alternate registry.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+pub(crate) mod late_tool_search_observer {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub(crate) struct Event {
+        pub kind: &'static str,
+        pub label: String,
+        pub first: usize,
+        pub second: usize,
+    }
+
+    #[derive(Default)]
+    struct Events {
+        rows: Vec<Event>,
+        overflow: bool,
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CaseTrace(Arc<Mutex<Events>>);
+
+    tokio::task_local! {
+        static CASE: CaseTrace;
+    }
+    thread_local! {
+        static BUILDER: RefCell<Option<CaseTrace>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct TraceGuard(Option<CaseTrace>);
+
+    impl Drop for TraceGuard {
+        fn drop(&mut self) {
+            BUILDER.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub(crate) fn capture() -> Option<CaseTrace> {
+        CASE.try_with(Clone::clone)
+            .ok()
+            .or_else(|| BUILDER.with(|slot| slot.borrow().clone()))
+    }
+
+    pub(crate) fn enter_builder(trace: Option<CaseTrace>) -> TraceGuard {
+        TraceGuard(BUILDER.with(|slot| slot.replace(trace)))
+    }
+
+    pub(crate) async fn scope_case<T>(trace: CaseTrace, body: impl Future<Output = T>) -> T {
+        CASE.scope(trace, body).await
+    }
+
+    pub(crate) fn record(kind: &'static str, label: &str, first: usize, second: usize) {
+        let Some(trace) = capture() else { return };
+        let mut state = trace.0.lock().unwrap_or_else(|error| error.into_inner());
+        if state.rows.len() >= 4096 || label.len() > 128 {
+            state.overflow = true;
+            return;
+        }
+        state.rows.push(Event {
+            kind,
+            label: label.to_owned(),
+            first,
+            second,
+        });
+    }
+
+    pub(crate) fn arc_id<T: ?Sized>(value: &Arc<T>) -> usize {
+        Arc::as_ptr(value) as *const () as usize
+    }
+
+    pub(crate) fn borrowed_id<T: ?Sized>(value: &T) -> usize {
+        value as *const T as *const () as usize
+    }
+
+    impl CaseTrace {
+        pub(crate) fn events(&self) -> Vec<Event> {
+            let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(!state.overflow, "late ToolSearch trace overflow");
+            state.rows.clone()
+        }
+
+        pub(crate) fn count(&self, kind: &str, label: &str) -> usize {
+            self.events()
+                .iter()
+                .filter(|row| row.kind == kind && row.label == label)
+                .count()
+        }
     }
 }

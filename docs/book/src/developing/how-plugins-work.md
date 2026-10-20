@@ -37,7 +37,9 @@ one.
    the first and cheapest check.
 2. **Discover.** The loader scans the resolved plugins directory
    (`[plugins] plugins_dir`, default `~/.zeroclaw/plugins/`) for subdirectories
-   containing a `manifest.toml`.
+   containing a `manifest.toml`. It skips dot-prefixed directories, including
+   the hidden staging directory `zeroclaw plugin install` builds a package in
+   before renaming it into place, so a half-written install is never loaded.
 3. **Validate shape.** Each manifest must declare at least one capability, and
    a non-skill plugin must name a confined relative `wasm_path`. Traversal and
    symlink paths are rejected. A malformed manifest is skipped with a warning,
@@ -67,11 +69,93 @@ one.
    enumeration happens only when `[plugins] auto_discover = true` (default
    `false`, fail-closed): with `enabled = true` but `auto_discover = false`, no
    plugin tools or skills load, though channels you declare under
-   `[channels.plugin.<alias>]` still activate. The skill loader applies the same
-   `auto_discover` gate.
+   `[channels.plugin.<alias>]`, by hand or with `zeroclaw plugin bind`, still
+   activate. The skill loader applies the same `auto_discover` gate.
 
 The signature stage is the one most easily misconfigured, so it is worth
 understanding on its own.
+
+## Recovering legacy installations
+
+Run `zeroclaw plugin migrate` to relocate legacy package directories into
+`[plugins] plugins_dir`. Automatic recovery searches the configured data root's
+`plugins/`, the unsplit `<install>/workspace/plugins`, and the actual V2
+producer's `<install>/data/plugins` destination even if the data field differs.
+New V2 filesystem splits move plugins to host data, so fresh and resumed splits
+stay reachable without using
+the default agent's live writable workspace as a recovery source. Host data is
+not necessarily the configured runtime plugins directory; `plugin migrate`
+performs that later relocation. The configured target and canonical aliases of
+it are excluded, and duplicate roots are reported once.
+
+Supported aliases of these legacy roots are followed. Canonical target aliases
+are excluded and aliases of the same root are deduplicated. A root overlapping
+a known agent workspace is excluded whether it lies inside that workspace or
+contains it, including aliases. Known roles come from each configured agent's
+actual workspace path, the implicit default, and the historical default
+workspace. Existing paths are compared canonically; absent declared workspaces
+are conservatively compared as normalized lexical paths, resolving an existing
+ancestor alias when available. Selection does not create a missing workspace
+or treat the declared path as evidence of old migration.
+
+This is root selection: the existing mover still rescans an eligible root with
+its own package checks. Both the recovery hint and mover require an ordinary
+child package directory, matching runtime discovery. Child directory symlinks
+stay at the source; they are neither moved nor materialized, even in a root
+with ordinary packages. A manifest alias inside an ordinary package directory
+still uses the existing manifest-loading and admission checks.
+
+This does not create a global no-follow guarantee, an authenticated snapshot,
+or a new concurrent no-clobber contract. Its existing
+same-name destination check leaves colliding packages at the source for
+operator resolution and retry.
+
+The directory-migration helper does not edit plugin configuration, grants,
+publisher trust or enablement. Config loading before the command retains its
+normal initialization and migration effects. Moving packages makes them
+eligible for normal discovery: tool and skill plugins may become available
+when plugins are enabled and `auto_discover = true`, subject to admission.
+Relocation itself neither verifies ABI compatibility nor authenticates origin.
+
+### Packages already split into an agent workspace
+
+Earlier versions could move packages to
+`<install>/agents/default/workspace/plugins`. That historical location and a
+custom live agent workspace are no longer automatic sources for
+`plugin migrate`. A manifest, matching backup name, or caller-written marker
+does not authorize directory-wide adoption. Inspect each package you intend to
+adopt, then select its individual directory with the existing install command:
+
+```sh
+zeroclaw --config-dir '/operator/install' plugin install \
+  '/operator/install/agents/default/workspace/plugins/package-name'
+```
+
+Use your actual install and package paths; do not pass the entire `plugins/`
+directory. A package in a backup can likewise be selected explicitly by its
+actual path. The operator's install action supplies the authority, not the
+path's apparent history. This requires a build with plugin CLI support.
+
+This is a fresh installation of a compatible package. The host applies the
+current manifest, signature, payload and config-schema rules, and the CLI
+load-checks executable packages against its WIT ABI and limits by default.
+Unsigned/untrusted packages under strict policy, incomplete old manifests,
+incompatible components, or unsupported legacy config rows may be refused;
+follow the diagnostic and [typed-config migration guidance](../plugins/migrating-to-typed-config.md)
+before retrying. No historical-format conversion or signing-policy bypass is
+provided. Existing same-name installed packages are refused rather than
+silently replaced.
+
+Explicit install retains the source directory. It writes the admitted manifest
+and executable payload and copies declared skill content; arbitrary auxiliary
+files are not a full-directory recovery contract, and skill copying is not an
+immutable generation snapshot. For tool bindings needing host-owned state,
+install can create missing typed config rows and seed declared HTTP egress
+destinations into new rows. Existing rows and grants are not automatically
+extended, and old package-name rows are not silently converted. Review these
+installation effects and configure required values before enabling runtime
+use. Explicit adoption is therefore separate from the automatic migration
+helper's unchanged-config/grant behavior.
 
 ## Signature policy
 
@@ -112,16 +196,19 @@ one twice:
    only by instantiating the component to read its metadata. A plugin whose
    tool name matches an already registered tool is not registered. The host
    logs a `WARN` event with `error_key` `plugin_tool_name_conflict` in its
-   `attributes`.
+   `attributes`. A tool name that contains `__` is refused even when nothing
+   holds it yet, because MCP tools are named `<server>__<tool>` and register
+   after plugin tools. That refusal carries `error_key`
+   `plugin_tool_name_reserved`.
 
 The names checked are the tools that registry build has already registered,
 including plugin tools accepted earlier in the same pass, plus
 `execute_pipeline` when `[pipeline] enabled = true`. This is not a fixed list
 of every built-in name: a built-in that a build does not register, for example
-because its config section is disabled, is not reserved in that build. Tools
-that join the registry after plugin registration are outside this check. Give
-plugin packages and tools names that are unique outright rather than relying
-on it.
+because its config section is disabled, is not reserved in that build. Apart
+from the MCP namespace, tools that join the registry after plugin registration
+are outside this check. Give plugin packages and tools names that are unique
+outright rather than relying on it.
 
 ## Capabilities and permissions
 
@@ -172,6 +259,91 @@ it is `false` by default, so `enabled = true` alone activates only the channels
 you declare under `[channels.plugin.<alias>]` and no plugin tools or skills. A
 host that runs only plugins you build yourself can leave `signature_mode` at its
 `disabled` default during development and tighten it before the host is shared.
+
+A channel binding lives outside `plugins.*`, under `[channels.plugin.<alias>]`.
+You can write that table by hand, or let `zeroclaw plugin bind <package>
+--channel-alias <alias>` write it for an installed channel package. The command
+also seeds the instance's `[[plugins.entries]]` row, requires an explicit
+`--egress declared` or `--egress none` flag before it creates that row from a
+manifest that declares destinations and holds a transport that can reach them
+(`http_client`, `websocket_client`, or `socket_client`), and reports what the
+instance still needs before it can start. It never sets `plugins.enabled` and
+never edits an agent's `channels`. See
+[Binding a channel instance](../plugins/index.md#binding-a-channel-instance).
+
+## Running plugins from a release binary
+
+The plugin system is experimental: the `wit/v0` contract is unstable, so a
+plugin must be built against the WIT shipped with the release that runs it, and
+a mismatch surfaces at the install-time load check rather than in the manifest.
+Within that limit, the release archives for the 64-bit desktop and server
+targets carry the plugin host and the compiler that loads `.wasm` components,
+and every release executes a plugin from each of those archives before it
+publishes. The 32-bit ARM
+archives, the experimental Android archive, and source builds with Cargo
+defaults carry no plugin host; the
+[protocol page](./plugin-protocol.md#plugin-support-per-release-artifact)
+lists every artifact. Running a plugin on a release binary takes four operator
+decisions, each of them off by default:
+
+1. **Install the package.** `zeroclaw plugin install <directory>` for a local
+   package, or `zeroclaw plugin install <name>` for one from the plugin
+   registry. Install validates the manifest, runs the signature policy, checks
+   the payload digest when the manifest declares one, and instantiates the
+   component against this host's WIT (skipped with `--no-verify`); a package
+   that fails any of these is not installed. Install (unless `--no-verify`),
+   `zeroclaw plugin info <name>`, and `zeroclaw plugin list --verify` compile
+   and instantiate the component whether or not the plugin system is enabled.
+   Instantiation calls none of its exports, but it does run any start function
+   the component's core modules carry, in a store with no files, no network,
+   and the per-call fuel, memory, and time limits.
+2. **Turn the plugin system on.** `zeroclaw config set plugins.enabled true`,
+   then `zeroclaw config set plugins.auto_discover true` so tool and skill
+   plugins are enumerated. An installed tool or skill package contributes
+   nothing until both are set. Once they are, every build of the tool
+   registry compiles and instantiates each admitted tool component and asks
+   it for its name, description, and parameter schema; that is guest code
+   running under the package's declared permissions and egress policy, before
+   any approval, and the tool is then offered to the model. A channel package
+   needs `plugins.enabled`, a `[channels.plugin.<alias>]` declaration, and an
+   enabled agent that lists `plugin.<alias>` among its channels;
+   `auto_discover` plays no part in it. For a package that mirrors a native
+   channel through `provides`, activation under
+   `[channels.<provides>.<alias>]` is recorded but not constructed yet; the
+   same package bound under `[channels.plugin.<alias>]` runs.
+3. **Approve each tool call.** A plugin tool call needs operator approval like
+   any other tool that is not pre-approved: the CLI prompts on the terminal,
+   channels send their approval card. To let an agent call a plugin tool
+   unattended, add the tool to that agent's risk profile `auto_approve` list,
+   for example
+   `zeroclaw config set risk_profiles.default.auto_approve '["<tool-name>"]'`.
+   `config set` replaces the whole list: the built-in defaults are merged back
+   into `risk_profiles.default` when the config loads, but any entry you added
+   yourself must be repeated, and a profile with another name keeps only what
+   you pass. `level = "full"` and the `*` wildcard pre-approve every tool that
+   is not in `always_ask`, and an Always answer pre-approves the tool for the
+   rest of that CLI session or channel turn, except for tools in
+   `always_ask`, which prompt every time. Without an approver the call is
+   denied and does not run.
+4. **Choose a signature policy.** `signature_mode` stays `disabled` by default
+   so a plugin you built yourself installs without key management. Under
+   `strict`, only packages signed by a key in `trusted_publisher_keys` load,
+   and because the official registry publishes unsigned packages today, none
+   of them install in `strict` mode until their publishers sign them.
+
+Compiling a component needs memory that becomes executable after it is
+written. A host that forbids that, such as a systemd unit with
+`MemoryDenyWriteExecute=yes` (the Nix module's default), refuses every plugin
+load because the compiler cannot map code as executable; the rest of the
+daemon needs no such mappings and keeps running.
+
+To roll back, remove the package with `zeroclaw plugin remove <name>`, or set
+`plugins.enabled = false` to stop loading any plugin without uninstalling. To
+return to a release without the plugin host, pin the binary with
+`zeroclaw update --version <previous> --force`; without `--force` the updater
+refuses to move to an older version. The updater resolves Linux musl hosts to
+the glibc archive, so a musl install, like one that came from a package
+manager, rolls back by reinstalling the previous archive or package.
 
 ## What a plugin still cannot do
 
