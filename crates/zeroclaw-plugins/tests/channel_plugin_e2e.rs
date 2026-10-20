@@ -738,6 +738,29 @@ async fn warm_channel_resolves_one_rotated_config_revision_at_point_of_use() {
         .expect("warm channel reads one rotated canonical config revision");
 }
 
+/// The fixture exports reaction stubs that return `ok`, but does not declare
+/// the reaction capabilities. The host must not report success for a reaction
+/// it never delivered, so the reaction tool can surface the failure.
+#[tokio::test]
+async fn reactions_fail_closed_without_the_capability() {
+    let channel = channel("reactions").await;
+
+    let add = channel
+        .add_reaction("room", "msg-1", "\u{1F44D}")
+        .await
+        .expect_err("add without the capability must not report success");
+    assert!(add.to_string().contains("not supported"), "rendered: {add}");
+
+    let remove = channel
+        .remove_reaction("room", "msg-1", "\u{1F44D}")
+        .await
+        .expect_err("remove without the capability must not report success");
+    assert!(
+        remove.to_string().contains("not supported"),
+        "rendered: {remove}"
+    );
+}
+
 #[tokio::test]
 async fn channel_listener_stops_when_receiver_closes() {
     let channel = channel("closed").await;
