@@ -90,6 +90,48 @@ access, the agent may choose these tools during its work. To revoke access,
 remove `"parallel"` from every bundle granted to that agent, or add it to a
 granted bundle's `exclude` list, then restart the session.
 
+### Example: local code lookup with Sem
+
+[Sem](https://github.com/Ataraxy-Labs/sem) provides code-entity lookup and
+source context through a local stdio server. Install the Sem CLI on the
+ZeroClaw host first (this example was checked with Sem 0.27.0). Replace both
+absolute paths with the installed executable and a trusted Git checkout:
+
+```toml
+[[mcp.servers]]
+name = "sem"
+transport = "stdio"
+command = "/absolute/path/to/sem"
+args = ["mcp"]
+env = { SEM_REPO = "/absolute/path/to/checkout", SEM_NO_NETWORK = "1", SEM_NO_TELEMETRY = "1" }
+
+[mcp_bundles.code_lookup]
+servers = ["sem"]
+
+[agents.assistant]
+mcp_bundles = ["code_lookup"]
+```
+
+Merge these entries into your existing configuration. Append `"code_lookup"`
+to the intended agent's existing grants instead of replacing them, then
+restart its session. Ask it to use `sem__sem_find` to locate a known function
+and inspect its callers. For a checkout containing `parse_config`, an example
+call uses `query: "parse_config"`, `mode: "context"`, and `token_budget: 1200`.
+Check the returned source locations; static relationships may be incomplete.
+
+This grants access to the server, **not only its lookup tools**. Sem 0.27.0
+also exposes validation and command-running capabilities. Review the discovered
+tools and apply the [authorization controls](#authorization-allowed_tools--excluded_tools)
+before use. An `allowed_tools` list alone does not narrow MCP siblings because
+of the `__` auto-admit rule below. Do not automatically approve the whole server.
+
+Sem can write local index/cache data. `SEM_REPO` selects the checkout but is
+not a filesystem sandbox; the process runs with the host user's permissions.
+Use OS/container isolation when required. Returned source excerpts enter the
+agent context and may reach its model provider even with Sem's own network
+and telemetry disabled. To disconnect, remove `"sem"` from the bundles granted
+to the agent and restart the session.
+
 ## Editing servers
 
 Three surfaces edit the same `[[mcp.servers]]` table:
