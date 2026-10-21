@@ -104,6 +104,14 @@ Tables wider than 20 columns stay fenced as code, which is the Bot API column
 limit. If `sendRichMessage` fails, the reply is sent as HTML. Draft updates
 while a reply is still being written stay plain text.
 
+Inbound updates that carry only `rich_message` (including a reply to one of
+those messages) are projected to GitHub-flavored markdown before the agent
+sees them. The same markdown is what the WebUI chat already renders for
+assistant messages: headings, lists, quotes, tables, and fenced code. A
+Telegram client that does not implement Bot API 10.1 still shows its own
+"message is not supported" placeholder for the native rich bubble; that
+placeholder is client-side and is not the text ZeroClaw stores.
+
 ## 3. Choose how the first users are authorized
 
 Choose one of the following paths before starting the bot.

@@ -1127,11 +1127,22 @@ fn project_rich_message(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Visible body of an inbound Telegram message.
+///
+/// A plain `text` string wins. Rich-only messages, and messages whose `text`
+/// is itself a RichText value (string, array, or typed object), become
+/// GitHub-flavored markdown. Models and the WebUI already consume that form.
 fn incoming_message_text(message: &serde_json::Value) -> Option<String> {
-    if let Some(text) = message.get("text").and_then(serde_json::Value::as_str)
-        && !text.is_empty()
-    {
-        return Some(text.to_string());
+    if let Some(text) = message.get("text") {
+        let rendered = match text {
+            serde_json::Value::String(text) if !text.is_empty() => text.clone(),
+            serde_json::Value::String(_) => String::new(),
+            other => project_rich_text(other),
+        };
+        let trimmed = rendered.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
     }
     message.get("rich_message").and_then(project_rich_message)
 }
@@ -1171,6 +1182,11 @@ fn project_block(block: &serde_json::Value) -> String {
             format!("```{lang}\n{text}\n```")
         }
         "divider" => "---".to_string(),
+        "mathematical_expression" => block
+            .get("expression")
+            .map(project_rich_text)
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| project_nested_content(block)),
         "block_quotation" | "expandable_block_quotation" | "pull_quotation" => {
             project_nested_content(block)
                 .lines()
@@ -1196,6 +1212,12 @@ fn project_nested_content(block: &serde_json::Value) -> String {
             parts.push(rendered);
         }
     }
+    if let Some(caption) = block.get("caption") {
+        let rendered = project_rich_text(caption);
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
+    }
     if let Some(blocks) = block.get("blocks").and_then(serde_json::Value::as_array) {
         let nested = project_blocks(blocks);
         if !nested.is_empty() {
@@ -1209,24 +1231,92 @@ fn project_rich_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.clone(),
         serde_json::Value::Array(items) => items.iter().map(project_rich_text).collect(),
-        serde_json::Value::Object(map) => {
-            if let Some(text) = map.get("text") {
-                let rendered = project_rich_text(text);
-                if !rendered.is_empty() {
-                    return rendered;
-                }
-            }
-            for key in ["source", "expression", "latex", "value"] {
-                if let Some(text) = map.get(key).and_then(serde_json::Value::as_str)
-                    && !text.is_empty()
-                {
-                    return text.to_string();
-                }
-            }
-            String::new()
-        }
+        serde_json::Value::Object(map) => project_rich_text_object(map),
         _ => String::new(),
     }
+}
+
+fn project_rich_text_object(map: &serde_json::Map<String, serde_json::Value>) -> String {
+    let kind = map
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let inner = map.get("text").map(project_rich_text).unwrap_or_default();
+    let formatted = match kind {
+        "bold" => wrap_markdown_affix("**", &inner, "**"),
+        "italic" => wrap_markdown_affix("*", &inner, "*"),
+        "strikethrough" => wrap_markdown_affix("~~", &inner, "~~"),
+        "code" => wrap_inline_code(&inner),
+        "url" | "text_link" | "email_address" | "phone_number" | "text_mention" => {
+            project_rich_link(map, &inner)
+        }
+        "mathematical_expression" => first_nonempty_field(map, &["expression", "latex", "source"])
+            .unwrap_or_else(|| inner.clone()),
+        "custom_emoji" => first_nonempty_field(map, &["alternative_text", "emoji"])
+            .unwrap_or_else(|| inner.clone()),
+        "button" => map
+            .get("button")
+            .map(project_rich_text)
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| inner.clone()),
+        _ => String::new(),
+    };
+    let body = if !formatted.is_empty() {
+        formatted
+    } else if !inner.is_empty() {
+        inner
+    } else {
+        first_nonempty_field(
+            map,
+            &["source", "expression", "latex", "value", "alternative_text"],
+        )
+        .unwrap_or_default()
+    };
+    match map.get("credit").map(project_rich_text) {
+        Some(credit) if !credit.is_empty() && !body.is_empty() => format!("{body} {credit}"),
+        Some(credit) if !credit.is_empty() => credit,
+        _ => body,
+    }
+}
+
+fn wrap_markdown_affix(prefix: &str, text: &str, suffix: &str) -> String {
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}{text}{suffix}")
+    }
+}
+
+fn wrap_inline_code(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    if text.contains('`') {
+        format!("`` {text} ``")
+    } else {
+        format!("`{text}`")
+    }
+}
+
+fn project_rich_link(map: &serde_json::Map<String, serde_json::Value>, inner: &str) -> String {
+    let href = first_nonempty_field(map, &["url", "email", "email_address", "phone_number"]);
+    match (inner.is_empty(), href) {
+        (true, Some(href)) => href,
+        (false, Some(href)) if href != inner => format!("[{inner}]({href})"),
+        _ => inner.to_string(),
+    }
+}
+
+fn first_nonempty_field(
+    map: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        map.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn project_list(block: &serde_json::Value) -> String {
@@ -6663,8 +6753,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             })
             .unwrap_or("unknown");
 
-        let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
-            text.to_string()
+        let reply_text = if let Some(text) = incoming_message_text(reply) {
+            text
         } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
             let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
             let chat_id = message
@@ -14063,6 +14153,76 @@ mod tests {
             .expect("rich-only message should parse");
         assert_eq!(msg.content, "hello from rich");
         assert_eq!(msg.sender, "alice");
+    }
+
+    #[test]
+    fn project_rich_message_keeps_inline_markdown_for_models() {
+        let rich = serde_json::json!({
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "text": [
+                        "all ",
+                        { "type": "bold", "text": "green" },
+                        " ",
+                        { "type": "code", "text": "ok" }
+                    ]
+                },
+                {
+                    "type": "mathematical_expression",
+                    "expression": "E = mc^2"
+                },
+                {
+                    "type": "photo",
+                    "caption": { "text": "chart", "credit": "ops" }
+                }
+            ]
+        });
+        let projected = project_rich_message(&rich).unwrap();
+        assert!(projected.contains("all **green** `ok`"));
+        assert!(projected.contains("E = mc^2"));
+        assert!(projected.contains("chart ops"));
+    }
+
+    #[test]
+    fn parse_update_message_reads_reply_to_rich_message() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let update = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 5,
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 42 },
+                "text": "what about this",
+                "reply_to_message": {
+                    "message_id": 4,
+                    "from": { "username": "zeroclaw" },
+                    "rich_message": {
+                        "blocks": [
+                            { "type": "heading", "size": 2, "text": "Status" },
+                            {
+                                "type": "paragraph",
+                                "text": [
+                                    { "type": "bold", "text": "green" }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("reply to a rich message should parse");
+        assert!(msg.content.contains("> @zeroclaw:"));
+        assert!(msg.content.contains("> ## Status"));
+        assert!(msg.content.contains("> **green**"));
+        assert!(msg.content.contains("what about this"));
     }
 
     #[test]
