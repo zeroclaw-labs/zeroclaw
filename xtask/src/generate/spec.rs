@@ -988,9 +988,10 @@ pub enum Selection {
     /// channels, plugin hosts and native adapters. Runtime tool selection
     /// defaults to minimal; full uses the same artifact.
     Dist,
-    /// Measurement-only broad distribution: `Dist` plus the canonical
-    /// `channels-full` aggregate. Not offered by installer menus until a
-    /// stable broad artifact lifecycle exists.
+    /// Broad distribution: `Dist` plus the canonical `channels-full`
+    /// aggregate, published as the multi-arch `dist-broad` container image for
+    /// channels outside the lean standard distribution. Still not offered by
+    /// installer menus.
     DistBroad,
     /// Compatibility alias for the standard distribution.
     DistCompat,
