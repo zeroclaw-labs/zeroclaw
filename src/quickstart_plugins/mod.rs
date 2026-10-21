@@ -3479,7 +3479,7 @@ permissions = ["http_client"]
                 name: FIXTURE_NAME.to_string()
             }]
         );
-        assert!(workspace.installed_packages().is_empty());
+        assert_eq!(workspace.installed_packages(), Vec::<String>::new());
         assert!(workspace.config.plugins.entries.is_empty());
         assert_eq!(workspace.config_bytes(), before);
         assert_eq!(
@@ -3740,7 +3740,7 @@ permissions = ["http_client"]
             prompter.confirm_prompts.is_empty(),
             "refused before the summary, so nothing is asked"
         );
-        assert!(workspace.installed_packages().is_empty());
+        assert_eq!(workspace.installed_packages(), Vec::<String>::new());
         assert_eq!(workspace.config_bytes(), before);
         server.verify().await;
     }
@@ -3951,7 +3951,7 @@ permissions = ["http_client"]
                 reason: Refusal::NoIntegrityHash,
             }]
         );
-        assert!(workspace.installed_packages().is_empty());
+        assert_eq!(workspace.installed_packages(), Vec::<String>::new());
         assert_eq!(workspace.config_bytes(), before);
         assert!(
             server
@@ -4071,7 +4071,7 @@ permissions = ["http_client"]
             "the refusal names the install that accepts the package anyway, addressed to \
              this configuration: {output}"
         );
-        assert!(workspace.installed_packages().is_empty());
+        assert_eq!(workspace.installed_packages(), Vec::<String>::new());
         assert!(workspace.config.plugins.entries.is_empty());
         assert_eq!(workspace.config_bytes(), before);
         server.verify().await;
@@ -4660,7 +4660,10 @@ type = "string"
         );
         assert_eq!(workspace.config_bytes(), before);
         assert_eq!(phase.apply_failed_headline(&workspace.config), None);
-        assert!(phase.readiness_lines(&workspace.config).await.is_empty());
+        assert_eq!(
+            phase.readiness_lines(&workspace.config).await,
+            Vec::<String>::new()
+        );
         server.verify().await;
     }
 
@@ -5088,7 +5091,10 @@ capabilities = ["tool"]
             );
             assert!(workspace.config.plugins.entries.is_empty());
             assert_eq!(workspace.config_bytes(), before);
-            assert!(phase.readiness_lines(&workspace.config).await.is_empty());
+            assert_eq!(
+                phase.readiness_lines(&workspace.config).await,
+                Vec::<String>::new()
+            );
             assert!(
                 server
                     .received_requests()
@@ -6833,7 +6839,7 @@ enum = ["", "auto"]
         prompter.assert_done();
         assert_eq!(exit, RowExit::Done);
         assert!(row.visited(), "continuing without plugins is a choice");
-        assert!(row.selected.is_empty());
+        assert_eq!(row.selected, Vec::<PluginChoice>::new());
         assert!(prompter.output().contains("HTTP 500"));
         server.verify().await;
     }

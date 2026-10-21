@@ -109,7 +109,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -299,7 +299,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           components: clippy
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -391,7 +391,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           components: clippy
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -432,7 +432,7 @@ jobs:
           bash scripts/ci/windows_test_scope.test.sh
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - name: Select required Windows jobs
         id: select
         shell: bash
@@ -471,7 +471,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -537,7 +537,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -612,7 +612,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           targets: x86_64-pc-windows-msvc
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -678,7 +678,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           targets: x86_64-pc-windows-msvc
       # Keep a recovery cache on this runner; do not assume the GitHub build
       # cache's Rust environment hash matches. Only successful master pushes seed
@@ -739,7 +739,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -809,7 +809,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         if: steps.changed.outputs.run == 'true'
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - name: Install plugin fixture target
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: rustup target add wasm32-wasip2
@@ -1197,9 +1197,9 @@ jobs:
           expected = ['tools::r5_namespace_tests::late_tool_search_real_guest_metadata_preflight', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_registry_owner', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_delegate_retirement', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_pipeline_retirement', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_skill_direct_retirement', 'tools::r5_namespace_tests::late_tool_search_deferred_mcp_skill_pipeline_retirement', 'tools::r5_namespace_tests::late_tool_search_mcp_search_select_activation', 'tools::r5_namespace_tests::late_tool_search_builtin_only_views', 'tools::r5_namespace_tests::late_tool_search_builtin_only_schema_selection', 'tools::r5_namespace_tests::late_tool_search_no_host_disabled_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_connect_disabled_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_ungranted_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_eager_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_listing_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_empty_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_filtered_mcp_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_no_host_empty_builtin_catalog_keeps_real_guest', 'tools::r5_namespace_tests::late_tool_search_helper_denied_keeps_no_guest_recovery', 'tools::r5_namespace_tests::late_tool_search_caller_principal_context', 'tools::r5_namespace_tests::late_tool_search_recovery_cannot_reintroduce_guest', 'tools::r5_namespace_tests::late_tool_search_shared_registry_no_reconnect', 'tools::r5_namespace_tests::late_tool_search_minimal_full_compiled_semantics', 'tools::r5_namespace_tests::late_tool_search_registration_order_and_hidden_specs']
           prefix = 'tools::r5_namespace_tests::late_tool_search'
           manifest = workspace / 'crates/zeroclaw-plugins/tests/fixtures/tool-fixture/Cargo.toml'
-          cargo_version = checked(['cargo', '+1.98.0', '-Vv'])
-          rust_version = checked(['rustc', '+1.98.0', '-vV'])
-          installed = checked(['rustup', 'target', 'list', '--installed', '--toolchain', '1.98.0'])
+          cargo_version = checked(['cargo', '+1.99.1', '-Vv'])
+          rust_version = checked(['rustc', '+1.99.1', '-vV'])
+          installed = checked(['rustup', 'target', 'list', '--installed', '--toolchain', '1.99.1'])
           if 'wasm32-wasip2' not in installed.splitlines():
               raise RuntimeError('required installed wasm32-wasip2 target absent')
           head = checked(['git', 'rev-parse', 'HEAD'])
@@ -1216,7 +1216,7 @@ jobs:
           for kind, flags in [('default', []), ('namespace', ['--features', 'namespace-tool-search'])]:
               target = root / f'{kind}-target'
               target.mkdir(mode=0o700)
-              argv = ['cargo', '+1.98.0', 'build', '--locked', '--manifest-path', str(manifest),
+              argv = ['cargo', '+1.99.1', 'build', '--locked', '--manifest-path', str(manifest),
                       '--package', 'zeroclaw-tool-plugin-fixture', '--target', 'wasm32-wasip2',
                       '--target-dir', str(target)] + flags
               checked(argv)
@@ -1236,7 +1236,7 @@ jobs:
                      'cargo_version': cargo_version, 'rust_version': rust_version,
                      'inputs': input_rows, 'commands': commands, 'components': components}
           for tool in ['cargo', 'rustc']:
-              path = Path(checked(['rustup', 'which', '--toolchain', '1.98.0', tool])).resolve(strict=True)
+              path = Path(checked(['rustup', 'which', '--toolchain', '1.99.1', tool])).resolve(strict=True)
               receipt[f'{tool}_binary'] = digest(path, 512 * 1024 * 1024)
           receipt_path = root / 'fixture-receipt.json'
           exclusive_json(receipt_path, receipt)
@@ -1417,7 +1417,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           targets: i686-unknown-linux-gnu
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -1448,7 +1448,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -1504,7 +1504,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           components: rustfmt, clippy
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -1594,7 +1594,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
           components: rustfmt, clippy
       - uses: ./.github/actions/rust-cache
         with:
@@ -1631,7 +1631,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - uses: ./.github/actions/rust-cache
         with:
           use-blacksmith: 'true'
@@ -1688,7 +1688,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -1771,7 +1771,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -1800,7 +1800,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
@@ -1828,7 +1828,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
@@ -2033,7 +2033,7 @@ jobs:
         run: bash scripts/ci/install_target_triple_test.sh
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -2065,7 +2065,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.98.0
+          toolchain: 1.99.1
       - uses: ./.github/actions/rust-cache
         with:
           use-blacksmith: 'false'

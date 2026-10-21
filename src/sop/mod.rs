@@ -359,7 +359,7 @@ Some conditions here.
     #[test]
     fn parse_steps_empty_md() {
         let steps = parse_steps("# Nothing here\n\nNo steps section.");
-        assert!(steps.is_empty());
+        assert_eq!(steps, Vec::new());
     }
 
     #[test]
@@ -446,14 +446,14 @@ path = "/sop/test"
     fn load_sops_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let sops = load_sops_from_directory(dir.path(), SopExecutionMode::Supervised);
-        assert!(sops.is_empty());
+        assert_eq!(sops.len(), 0);
     }
 
     #[test]
     fn load_sops_nonexistent_dir() {
         let sops =
             load_sops_from_directory(Path::new("/nonexistent/path"), SopExecutionMode::Supervised);
-        assert!(sops.is_empty());
+        assert_eq!(sops.len(), 0);
     }
 
     #[test]
@@ -477,7 +477,7 @@ type = "manual"
 
         let sops = load_sops_from_directory(dir.path(), SopExecutionMode::Supervised);
         assert_eq!(sops.len(), 1);
-        assert!(sops[0].steps.is_empty());
+        assert_eq!(sops[0].steps, Vec::new());
     }
 
     #[test]
@@ -561,7 +561,7 @@ type = "manual"
         };
 
         let warnings = validate_sop(&sop);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, Vec::<String>::new());
     }
 
     #[test]

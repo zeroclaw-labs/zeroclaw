@@ -877,7 +877,7 @@ pub fn plugin_bind_decision_commands_for(
 #[cfg(test)]
 mod tests {
     use super::{
-        ALIAS_PLACEHOLDER, ShellDialect, config_set_command_for,
+        ALIAS_PLACEHOLDER, RequiredKey, ShellDialect, config_set_command_for,
         config_set_command_to_complete_for, config_verdict, plugin_bind_command_for,
         plugin_bind_decision_commands_for, required_keys,
     };
@@ -949,10 +949,16 @@ mod tests {
             .expect("admitted object schema");
         let mut entry = PluginEntryConfig::default();
         assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
-        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        assert_eq!(
+            required_keys(&manifest, Some(&entry)),
+            Vec::<RequiredKey>::new()
+        );
         entry.config.insert("connection".into(), "{}".into());
         assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
-        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        assert_eq!(
+            required_keys(&manifest, Some(&entry)),
+            Vec::<RequiredKey>::new()
+        );
         entry
             .config
             .insert("connection".into(), r#"{"token":"configured"}"#.into());
@@ -999,7 +1005,10 @@ mod tests {
                 .expect("admitted alternative schema");
             let mut entry = PluginEntryConfig::default();
             assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
-            assert!(required_keys(&manifest, Some(&entry)).is_empty());
+            assert_eq!(
+                required_keys(&manifest, Some(&entry)),
+                Vec::<RequiredKey>::new()
+            );
             entry.config.insert("left".into(), "configured".into());
             assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
         }
@@ -1014,10 +1023,16 @@ mod tests {
             .expect("admitted conditional schema");
         let mut entry = PluginEntryConfig::default();
         assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
-        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        assert_eq!(
+            required_keys(&manifest, Some(&entry)),
+            Vec::<RequiredKey>::new()
+        );
         entry.config.insert("trigger".into(), "true".into());
         assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
-        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        assert_eq!(
+            required_keys(&manifest, Some(&entry)),
+            Vec::<RequiredKey>::new()
+        );
     }
 
     #[test]

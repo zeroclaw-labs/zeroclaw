@@ -32,7 +32,7 @@ user_led: 5"#;
     #[test]
     fn parse_pin_aliases_empty() {
         let a = parse_pin_aliases("No aliases here");
-        assert!(a.is_empty());
+        assert_eq!(a.len(), 0);
     }
 
     #[test]
@@ -80,6 +80,6 @@ Pin 13: LED
         let base = tmp.path().join("empty_ds");
         std::fs::create_dir_all(&base).unwrap();
         let rag = HardwareRag::load(tmp.path(), "empty_ds").unwrap();
-        assert!(rag.is_empty());
+        assert_eq!(rag.len(), 0);
     }
 }

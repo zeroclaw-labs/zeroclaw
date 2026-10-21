@@ -594,8 +594,8 @@ fn published_relay_image_pins_its_base_images_by_digest() {
 #[test]
 fn base_image_pin_guard_reads_args_flags_and_stage_references() {
     let unpinned = unpinned_base_images(
-        "ARG PINNED=rust:1.98-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27\n\
-         ARG LOOSE=rust:1.98-slim\n\
+        "ARG PINNED=rust:1.99-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27\n\
+         ARG LOOSE=rust:1.99-slim\n\
          FROM --platform=$BUILDPLATFORM ${PINNED} AS builder\n\
          FROM ${LOOSE} AS loose\n\
          FROM ${UNDECLARED} AS undeclared\n\

@@ -215,7 +215,7 @@ and `release_tools_only: false` for a finite, nonpublishing qualification.
 Empty, unknown, malformed, broad-distribution, or tools-only combinations are
 refused. Four GNU build rows run on Ubuntu22: x86_64, aarch64, armv7, and arm.
 They call the same local `build-release-payloads` action as Stable, with its
-existing linker and ARMv6 bindings, Rust1.98, locked release profile, explicit
+existing linker and ARMv6 bindings, Rust 1.99.1, locked release profile, explicit
 canonical features, ordinary Cargo jobs, three payloads per row, 90-minute
 ceiling, and inclusive 83,886,080-byte main-binary cap. Only the qualifier
 enables the action's features output; its manifest consumes that single
