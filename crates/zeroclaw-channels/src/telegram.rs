@@ -4028,10 +4028,20 @@ impl TelegramChannel {
                     0
                 };
                 let mut attempt = 0u32;
+                // Retries share the format from the start of this send so
+                // `skip` keeps addressing the same chunk list.
+                let rich = self.rich_messages_enabled();
                 loop {
                     self.pace_multi_message_send(last_sent_at).await;
                     match self
-                        .send_text_chunks(cleaned, &chat_id, thread_id.as_deref(), skip)
+                        .send_text_chunks_resuming(
+                            cleaned,
+                            &chat_id,
+                            thread_id.as_deref(),
+                            skip,
+                            0,
+                            rich,
+                        )
                         .await
                     {
                         Ok(_) => {
@@ -7118,13 +7128,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         thread_id: Option<&str>,
         skip_chunks: usize,
     ) -> Result<usize, SendChunksError> {
-        if self.rich_messages_enabled() {
-            return self
-                .send_rich_text_chunks(message, chat_id, thread_id, skip_chunks, 0)
-                .await;
-        }
-        self.send_html_text_chunks(message, chat_id, thread_id, skip_chunks)
-            .await
+        self.send_text_chunks_resuming(
+            message,
+            chat_id,
+            thread_id,
+            skip_chunks,
+            0,
+            self.rich_messages_enabled(),
+        )
+        .await
     }
 
     async fn send_html_text_chunks(
@@ -7238,6 +7250,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(chunks.len())
     }
 
+    /// Continue a send in the format chosen when it started.
+    ///
+    /// `skip_chunks` and `html_fallback_skip` index that format's pieces.
+    /// A retry must pass the same `rich` value. Choosing again from live
+    /// config would apply those indexes to a different chunk list, skipping
+    /// the rest of the answer or repeating a prefix.
     async fn send_text_chunks_resuming(
         &self,
         message: &str,
@@ -7245,8 +7263,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         thread_id: Option<&str>,
         skip_chunks: usize,
         html_fallback_skip: usize,
+        rich: bool,
     ) -> Result<usize, SendChunksError> {
-        if self.rich_messages_enabled() {
+        if rich {
             return self
                 .send_rich_text_chunks(message, chat_id, thread_id, skip_chunks, html_fallback_skip)
                 .await;
@@ -7443,7 +7462,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         chat_id: &str,
         thread_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        match self.send_text_chunks(text, chat_id, thread_id, 0).await {
+        // Chunk indexes belong to the format chosen for this send. Keep that
+        // choice through the resume so a live reload cannot retarget them.
+        let rich = self.rich_messages_enabled();
+        match self
+            .send_text_chunks_resuming(text, chat_id, thread_id, 0, 0, rich)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(SendChunksError {
                 delivered: 0,
@@ -7477,7 +7502,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 // Some chunks are already posted. Resume from the first unsent
                 // chunk rather than restarting, then report the accepted prefix
                 // if it still cannot finish. A rich chunk that already fell
-                // back to HTML resumes inside that fallback.
+                // back to HTML resumes inside that fallback. `rich` stays the
+                // value from the start of this send.
                 match self
                     .send_text_chunks_resuming(
                         text,
@@ -7485,6 +7511,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         thread_id,
                         delivered,
                         html_fallback_skip,
+                        rich,
                     )
                     .await
                 {
@@ -11853,7 +11880,14 @@ mod tests {
             .await;
         let channel = channel.with_api_base(resume_server.uri());
         channel
-            .send_text_chunks_resuming(&message, "100", None, err.delivered, err.html_fallback_skip)
+            .send_text_chunks_resuming(
+                &message,
+                "100",
+                None,
+                err.delivered,
+                err.html_fallback_skip,
+                true,
+            )
             .await
             .unwrap();
         let resume_paths: Vec<String> = resume_server
@@ -11870,6 +11904,224 @@ mod tests {
             "resume must not retry sendRichMessage: {resume_paths:?}"
         );
         assert_eq!(resume_paths.len(), html_chunks.len() - 1);
+    }
+
+    fn config_with_rich_messages(alias: &str, rich: bool) -> Config {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                rich_messages: rich,
+                ..TelegramConfig::default()
+            },
+        );
+        config
+    }
+
+    /// Serves `succeed_before_fail` successes, then `fail_count` failures, then
+    /// successes. On call `flip_at` it publishes `rich_after` into the live config.
+    struct ScriptedSend {
+        calls: std::sync::atomic::AtomicUsize,
+        flip_at: usize,
+        rich_after: bool,
+        authority: LiveConfigAuthority,
+        alias: &'static str,
+        succeed_before_fail: usize,
+        fail_count: usize,
+    }
+
+    impl wiremock::Respond for ScriptedSend {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let seen = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if seen == self.flip_at {
+                let mut config = self.authority.snapshot_config();
+                config
+                    .channels
+                    .telegram
+                    .get_mut(self.alias)
+                    .expect("telegram alias")
+                    .rich_messages = self.rich_after;
+                self.authority.publish_for_test(config);
+            }
+            let failing = seen >= self.succeed_before_fail
+                && seen < self.succeed_before_fail + self.fail_count;
+            let status = if failing { 500 } else { 200 };
+            wiremock::ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                "ok": !failing,
+                "description": if failing { "send failed" } else { "ok" },
+                "result": { "message_id": 1 }
+            }))
+        }
+    }
+
+    struct FlipRichOnRichSend {
+        authority: LiveConfigAuthority,
+        alias: &'static str,
+        rich: bool,
+    }
+
+    impl wiremock::Respond for FlipRichOnRichSend {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let mut config = self.authority.snapshot_config();
+            config
+                .channels
+                .telegram
+                .get_mut(self.alias)
+                .expect("telegram alias")
+                .rich_messages = self.rich;
+            self.authority.publish_for_test(config);
+            wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            }))
+        }
+    }
+
+    fn two_format_message() -> String {
+        format!("HEADTOKEN{}TAILTOKEN", "a".repeat(5_000))
+    }
+
+    fn send_message_bodies_containing(requests: &[wiremock::Request], needle: &str) -> usize {
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter(|request| String::from_utf8_lossy(&request.body).contains(needle))
+            .count()
+    }
+
+    /// HTML chunks were already partly delivered. Turning rich messages on before
+    /// the resume must not skip the remaining HTML text just because it fits in
+    /// one rich chunk.
+    #[tokio::test]
+    async fn finalize_send_keeps_html_chunks_when_rich_messages_turns_on() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let alias = "telegram_test_alias";
+        let message = two_format_message();
+        let html_chunks = split_message_for_telegram(&message);
+        assert_eq!(
+            html_chunks.len(),
+            2,
+            "the fixture must be exactly two html chunks"
+        );
+        assert!(html_chunks[0].contains("HEADTOKEN"));
+        assert!(!html_chunks[0].contains("TAILTOKEN"));
+        assert!(html_chunks.last().unwrap().contains("TAILTOKEN"));
+        let prepared = prepare_rich_markdown(&message);
+        let rich_chunks = split_message_protecting(
+            &prepared,
+            TELEGRAM_RICH_MAX_MESSAGE_LENGTH
+                .saturating_sub(telegram_chunk_marker_len(true, true))
+                .max(1),
+            &protected_markdown_ranges(&prepared),
+        );
+        assert_eq!(
+            rich_chunks.len(),
+            1,
+            "the whole answer must fit in one rich chunk so skipping it would drop the tail"
+        );
+
+        let authority = LiveConfigAuthority::new(config_with_rich_messages(alias, false));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ScriptedSend {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                flip_at: 1,
+                rich_after: true,
+                authority: authority.clone(),
+                alias,
+                succeed_before_fail: 1,
+                fail_count: 2,
+            })
+            .mount(&server)
+            .await;
+
+        let channel =
+            TelegramChannel::new("token".into(), alias, Arc::new(|| vec!["*".into()]), false)
+                .with_rich_messages(true)
+                .with_persistence_authority(authority)
+                .with_api_base(server.uri());
+
+        channel
+            .finalize_send_chunks(&message, "100", None)
+            .await
+            .expect("resume must finish the html chunks already started");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path().ends_with("/sendMessage")),
+            "a send that started as html must not switch to sendRichMessage"
+        );
+        assert_eq!(send_message_bodies_containing(&requests, "HEADTOKEN"), 1);
+        // The unfinished chunk is posted three times: HTML failure, plain
+        // failure, then the successful resume. Skipping it would leave two.
+        assert_eq!(send_message_bodies_containing(&requests, "TAILTOKEN"), 3);
+    }
+
+    /// A rich chunk already fell back to HTML and delivered its first piece.
+    /// Turning rich messages off before the resume must not restart that HTML
+    /// fallback from the beginning.
+    #[tokio::test]
+    async fn finalize_send_keeps_rich_fallback_when_rich_messages_turns_off() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let alias = "telegram_test_alias";
+        let message = two_format_message();
+        let authority = LiveConfigAuthority::new(config_with_rich_messages(alias, true));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(FlipRichOnRichSend {
+                authority: authority.clone(),
+                alias,
+                rich: false,
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ScriptedSend {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                flip_at: usize::MAX,
+                rich_after: false,
+                authority: authority.clone(),
+                alias,
+                succeed_before_fail: 1,
+                fail_count: 2,
+            })
+            .mount(&server)
+            .await;
+
+        let channel =
+            TelegramChannel::new("token".into(), alias, Arc::new(|| vec!["*".into()]), false)
+                .with_rich_messages(false)
+                .with_persistence_authority(authority)
+                .with_api_base(server.uri());
+
+        channel
+            .finalize_send_chunks(&message, "100", None)
+            .await
+            .expect("resume must finish the html fallback already started");
+
+        let requests = server.received_requests().await.unwrap();
+        let rich_posts = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/sendRichMessage"))
+            .count();
+        assert_eq!(rich_posts, 1, "the rejected rich send is not retried");
+        assert_eq!(
+            send_message_bodies_containing(&requests, "HEADTOKEN"),
+            1,
+            "the html piece already delivered must not be sent again"
+        );
+        // Same unfinished chunk: HTML failure, plain failure, then resume.
+        assert_eq!(send_message_bodies_containing(&requests, "TAILTOKEN"), 3);
     }
 
     /// Regression: when finalization chunks a long final answer and a later
