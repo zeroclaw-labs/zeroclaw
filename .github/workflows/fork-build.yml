@@ -1,0 +1,72 @@
+name: Fork build
+
+# Builds the all-features image from this fork and publishes it to GHCR.
+# Upstream docker-publish is limited to zeroclaw-labs/zeroclaw, so a homelab
+# deploy of this branch needs its own image. The job does not run on the
+# upstream repository.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/telegram-rich-messages
+
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/laurensbosscher/zeroclaw
+
+jobs:
+  build:
+    name: Build all-features image
+    if: github.repository == 'LaurensBosscher/zeroclaw'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build and push
+        uses: docker/build-push-action@1dc73863535b631f98b2378be8619f83b136f4a0 # v6.18.0
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          build-args: |
+            ZEROCLAW_BUILD_ID=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE }}:pr-11862
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+
+      - name: Make the package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A private package cannot be pulled by the homelab build. Visibility
+          # changes need a token that owns the package; ignore a refusal so a
+          # public package (or a later manual flip) still leaves the image pushed.
+          gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/user/packages/container/zeroclaw" \
+            -f visibility=public || true
