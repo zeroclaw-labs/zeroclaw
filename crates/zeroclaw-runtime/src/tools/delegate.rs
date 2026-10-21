@@ -17231,6 +17231,10 @@ command = "rm independent-delegate-marker"
             level: AutonomyLevel::Supervised,
             allowed_commands: vec!["rm".into()],
             allowed_tools: vec!["shell".into()],
+            // The hard block is off so the allowlisted command reaches the
+            // approval route this fixture exercises; with it on the command
+            // stops at the high-risk block instead of the prompt.
+            block_high_risk_commands: false,
             always_ask: if always_ask {
                 vec!["shell".into()]
             } else {
