@@ -21099,7 +21099,7 @@ mod tests {
             mock_server
                 .received_requests()
                 .await
-                .map_or(true, |requests| requests.is_empty()),
+                .is_none_or(|requests| requests.is_empty()),
             "the exhausted-update gate must sit ahead of every download/transcription attempt"
         );
 
