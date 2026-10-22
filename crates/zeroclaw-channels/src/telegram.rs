@@ -159,6 +159,13 @@ struct MultiDraftState {
     /// split on the next flush before trusting `delivered_chunks` as a skip
     /// count, since tag-rewriting can change what the earlier chunks are.
     delivered_prefix: String,
+    /// HTML messages already accepted for the chunk at `delivered_chunks`
+    /// after `sendRichMessage` was rejected. The next flush resumes inside
+    /// that fallback instead of sending the accepted prefix again.
+    html_fallback_skip: usize,
+    /// Payload of the chunk `html_fallback_skip` belongs to. A mismatch on
+    /// the next flush drops the fallback position.
+    html_fallback_chunk: String,
 }
 
 impl MultiDraftState {
@@ -171,6 +178,39 @@ impl MultiDraftState {
             last_sent_at: None,
             delivered_chunks: 0,
             delivered_prefix: String::new(),
+            html_fallback_skip: 0,
+            html_fallback_chunk: String::new(),
+        }
+    }
+
+    fn clear_delivery_progress(&mut self) {
+        self.delivered_chunks = 0;
+        self.delivered_prefix.clear();
+        self.html_fallback_skip = 0;
+        self.html_fallback_chunk.clear();
+    }
+
+    fn note_partial_delivery(
+        &mut self,
+        chunks: &[String],
+        rich: bool,
+        delivered: usize,
+        html_fallback_skip: usize,
+    ) {
+        self.delivered_chunks = delivered;
+        self.delivered_prefix = chunks
+            .iter()
+            .take(delivered)
+            .cloned()
+            .collect::<Vec<_>>()
+            .concat();
+        if html_fallback_skip > 0 {
+            self.html_fallback_skip = html_fallback_skip;
+            self.html_fallback_chunk =
+                telegram_chunk_payload(chunks, delivered, rich).unwrap_or_default();
+        } else {
+            self.html_fallback_skip = 0;
+            self.html_fallback_chunk.clear();
         }
     }
 }
@@ -862,14 +902,18 @@ fn append_limited_pieces(chunks: &mut Vec<String>, piece: &str, limit: usize) {
 /// Keep a markdown table intact when it fits in `limit`. Otherwise break it
 /// between rows and repeat the header and separator on each continuation.
 /// A single row that still does not fit is split as plain text so later rows
-/// are not dropped.
+/// are not dropped. A fenced table is split as code, closing and reopening
+/// the fence on each piece.
 fn split_oversized_table(table: &str, limit: usize) -> Vec<String> {
     let limit = limit.max(1);
     if table.chars().count() <= limit {
         return vec![table.to_string()];
     }
     let Some((header, separator, rows)) = table_header_and_rows(table) else {
-        return split_plain_for_limit(table, limit);
+        // An opening fence (a wide table wrapped as code, or a table the
+        // caller already fenced) is not a header row. Split that block as
+        // code so each piece closes and reopens the fence.
+        return split_plain_keeping_fences(table, limit);
     };
     let prefix = format!("{header}\n{separator}\n");
     if prefix.chars().count() >= limit {
@@ -1480,6 +1524,69 @@ fn format_telegram_text_chunk(chunk: &str, index: usize, total: usize) -> String
         format!("{TELEGRAM_CONTINUED_PREFIX}{chunk}")
     } else {
         format!("{TELEGRAM_CONTINUED_PREFIX}{chunk}{TELEGRAM_CONTINUES_SUFFIX}")
+    }
+}
+
+/// Chunk list `send_text_chunks_resuming` posts for `rich`.
+///
+/// Narration progress indexes this list. A skip computed from another
+/// splitter would drop or repeat text.
+fn delivery_chunks(message: &str, rich: bool) -> Vec<String> {
+    if !rich {
+        return split_message_for_telegram(message);
+    }
+    let prepared = prepare_rich_markdown(message);
+    let budget = TELEGRAM_RICH_MAX_MESSAGE_LENGTH
+        .saturating_sub(telegram_chunk_marker_len(true, true))
+        .max(1);
+    split_message_protecting(&prepared, budget, &protected_markdown_ranges(&prepared))
+}
+
+/// Text actually handed to one send call for `chunks[index]`.
+fn telegram_chunk_payload(chunks: &[String], index: usize, rich: bool) -> Option<String> {
+    let chunk = chunks.get(index)?;
+    let marked = format_telegram_text_chunk(chunk, index, chunks.len());
+    let limit = if rich {
+        TELEGRAM_RICH_MAX_MESSAGE_LENGTH
+    } else {
+        TELEGRAM_MAX_MESSAGE_LENGTH
+    };
+    Some(if marked.chars().count() <= limit {
+        marked
+    } else {
+        chunk.clone()
+    })
+}
+
+/// `(skip_chunks, html_fallback_skip)` for a narration resume.
+///
+/// Complete chunks are trusted only when their concatenation still matches
+/// `prefix`. An HTML fallback position is trusted only when the chunk it
+/// belongs to is still the resume point.
+fn narration_resume_cursor(
+    chunks: &[String],
+    rich: bool,
+    delivered: usize,
+    prefix: &str,
+    html_fallback_skip: usize,
+    html_fallback_chunk: &str,
+) -> (usize, usize) {
+    let complete =
+        delivered > 0 && chunks.len() >= delivered && chunks[..delivered].concat() == prefix;
+    let skip = if complete { delivered } else { 0 };
+    if html_fallback_skip == 0 || html_fallback_chunk.is_empty() {
+        return (skip, 0);
+    }
+    let index = if delivered == 0 {
+        0
+    } else if complete {
+        delivered
+    } else {
+        return (0, 0);
+    };
+    match telegram_chunk_payload(chunks, index, rich) {
+        Some(payload) if payload == html_fallback_chunk => (index, html_fallback_skip),
+        _ => (skip, 0),
     }
 }
 
@@ -3848,8 +3955,7 @@ impl TelegramChannel {
                 .map(str::to_string)
             else {
                 draft.sent_text = current;
-                draft.delivered_chunks = 0;
-                draft.delivered_prefix = String::new();
+                draft.clear_delivery_progress();
                 return Ok(());
             };
             let thread_id = draft.thread_id.clone().or(parsed_thread);
@@ -3865,27 +3971,35 @@ impl TelegramChannel {
             let mut drafts = self.multi_message_drafts.lock();
             if let Some(draft) = drafts.get_mut(&key) {
                 draft.sent_text = current;
-                draft.delivered_chunks = 0;
-                draft.delivered_prefix = String::new();
+                draft.clear_delivery_progress();
             }
             return Ok(());
         }
 
         self.pace_multi_message_send(last_sent_at).await;
 
-        let skip = {
+        // One format for this flush. Chunk indexes and the HTML fallback
+        // position both address that format's pieces.
+        let rich = self.rich_messages_enabled();
+        let (skip, html_fallback_skip) = {
             let drafts = self.multi_message_drafts.lock();
             let d = drafts.get(&key);
             let delivered = d.map(|d| d.delivered_chunks).unwrap_or(0);
             let prefix = d.map(|d| d.delivered_prefix.clone()).unwrap_or_default();
-            let chunks = split_message_for_telegram(cleaned);
-            let ok = delivered > 0
-                && chunks.len() >= delivered
-                && chunks[..delivered].concat() == prefix;
-            if ok { delivered } else { 0 }
+            let html_skip = d.map(|d| d.html_fallback_skip).unwrap_or(0);
+            let html_chunk = d.map(|d| d.html_fallback_chunk.clone()).unwrap_or_default();
+            let chunks = delivery_chunks(cleaned, rich);
+            narration_resume_cursor(&chunks, rich, delivered, &prefix, html_skip, &html_chunk)
         };
         match self
-            .send_text_chunks(cleaned, &chat_id, thread_id.as_deref(), skip)
+            .send_text_chunks_resuming(
+                cleaned,
+                &chat_id,
+                thread_id.as_deref(),
+                skip,
+                html_fallback_skip,
+                rich,
+            )
             .await
         {
             Ok(_) => {
@@ -3893,26 +4007,25 @@ impl TelegramChannel {
                 if let Some(draft) = drafts.get_mut(&key) {
                     draft.sent_text = current;
                     draft.last_sent_at = Some(std::time::Instant::now());
-                    draft.delivered_chunks = 0;
-                    draft.delivered_prefix = String::new();
+                    draft.clear_delivery_progress();
                 }
             }
             Err(e) => {
                 {
                     let mut drafts = self.multi_message_drafts.lock();
                     if let Some(draft) = drafts.get_mut(&key) {
-                        let chunks = split_message_for_telegram(cleaned);
-                        draft.delivered_chunks = e.delivered;
-                        draft.delivered_prefix = chunks
-                            .iter()
-                            .take(e.delivered)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .concat();
-                        // A partial failure still physically sent `e.delivered`
-                        // chunks; record it so the next pace (finalize / approval
-                        // prompt) spaces off the real last send.
-                        if e.delivered > 0 {
+                        let chunks = delivery_chunks(cleaned, rich);
+                        draft.note_partial_delivery(
+                            &chunks,
+                            rich,
+                            e.delivered,
+                            e.html_fallback_skip,
+                        );
+                        // A partial failure still physically sent either a whole
+                        // chunk or an HTML fallback piece. Record it so the next
+                        // pace (finalize / approval prompt) spaces off the real
+                        // last send.
+                        if e.delivered > 0 || e.html_fallback_skip > 0 {
                             draft.last_sent_at = Some(std::time::Instant::now());
                         }
                     }
@@ -3991,6 +4104,8 @@ impl TelegramChannel {
                         unsent.to_string(),
                         draft.delivered_chunks,
                         draft.delivered_prefix.clone(),
+                        draft.html_fallback_skip,
+                        draft.html_fallback_chunk.clone(),
                     )
                 });
             (
@@ -4010,27 +4125,27 @@ impl TelegramChannel {
         // (in-order delivery preserved); a permanent failure drops the narration
         // with a WARN and still delivers the final answer below, rather than
         // re-inserting unreachable orphaned draft state.
-        if let Some((unsent, delivered_chunks, delivered_prefix)) = pending
+        if let Some((unsent, delivered_chunks, delivered_prefix, saved_html_skip, saved_html_chunk)) =
+            pending
             && !voice_only
         {
             let cleaned = strip_tool_call_tags(unsent.trim());
             let cleaned = cleaned.trim();
             if !cleaned.is_empty() {
-                let chunks = split_message_for_telegram(cleaned);
-                // Absolute count of physical chunks Telegram already accepted;
-                // advanced across retries so an accepted chunk is never re-sent.
-                let mut skip = if delivered_chunks > 0
-                    && chunks.len() >= delivered_chunks
-                    && chunks[..delivered_chunks].concat() == delivered_prefix
-                {
-                    delivered_chunks
-                } else {
-                    0
-                };
                 let mut attempt = 0u32;
                 // Retries share the format from the start of this send so
-                // `skip` keeps addressing the same chunk list.
+                // `skip` and the HTML fallback position keep addressing the
+                // same chunk list.
                 let rich = self.rich_messages_enabled();
+                let chunks = delivery_chunks(cleaned, rich);
+                let (mut skip, mut html_skip) = narration_resume_cursor(
+                    &chunks,
+                    rich,
+                    delivered_chunks,
+                    &delivered_prefix,
+                    saved_html_skip,
+                    &saved_html_chunk,
+                );
                 loop {
                     self.pace_multi_message_send(last_sent_at).await;
                     match self
@@ -4039,7 +4154,7 @@ impl TelegramChannel {
                             &chat_id,
                             thread_id.as_deref(),
                             skip,
-                            0,
+                            html_skip,
                             rich,
                         )
                         .await
@@ -4049,10 +4164,14 @@ impl TelegramChannel {
                             break;
                         }
                         Err(e) => {
-                            // Resume past chunks this attempt physically delivered
-                            // so a retry never duplicates them.
-                            if e.delivered > skip {
+                            // Resume past chunks and HTML fallback pieces this
+                            // attempt physically delivered so a retry never
+                            // duplicates them.
+                            let progressed = e.delivered > skip
+                                || (e.delivered == skip && e.html_fallback_skip > html_skip);
+                            if progressed {
                                 skip = e.delivered;
+                                html_skip = e.html_fallback_skip;
                                 last_sent_at = Some(std::time::Instant::now());
                             }
                             // Telegram is flood-limiting this chat: neither
@@ -4073,6 +4192,7 @@ impl TelegramChannel {
                                         ::serde_json::json!({
                                             "error": format!("{}", e.source),
                                             "chunks_delivered": skip,
+                                            "html_fallback_skip": html_skip,
                                         })
                                     ),
                                     "Telegram flood limit during multi-message pending narration; not sending more narration or the final answer"
@@ -4080,7 +4200,7 @@ impl TelegramChannel {
                                 return Err(zeroclaw_api::channel::FinalizeUndelivered {
                                     reason: format!(
                                         "flood-limited while delivering pending narration \
-                                         ({skip} chunk(s) accepted): {:#}",
+                                         ({skip} chunk(s) accepted, {html_skip} html fallback piece(s)): {:#}",
                                         e.source
                                     ),
                                 }
@@ -4099,6 +4219,7 @@ impl TelegramChannel {
                                         ::serde_json::json!({
                                             "error": format!("{}", e.source),
                                             "chunks_delivered": skip,
+                                            "html_fallback_skip": html_skip,
                                         })
                                     ),
                                     "Telegram multi-message pending narration undeliverable after retries; dropping it and delivering the final answer"
@@ -7282,12 +7403,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         skip_chunks: usize,
         html_fallback_skip: usize,
     ) -> Result<usize, SendChunksError> {
-        let prepared = prepare_rich_markdown(message);
-        let ranges = protected_markdown_ranges(&prepared);
-        let budget = TELEGRAM_RICH_MAX_MESSAGE_LENGTH
-            .saturating_sub(telegram_chunk_marker_len(true, true))
-            .max(1);
-        let chunks = split_message_protecting(&prepared, budget, &ranges);
+        let chunks = delivery_chunks(message, true);
         for (index, chunk) in chunks.iter().enumerate() {
             if index < skip_chunks {
                 continue;
@@ -11906,6 +12022,236 @@ mod tests {
         assert_eq!(resume_paths.len(), html_chunks.len() - 1);
     }
 
+    fn rich_html_narration() -> String {
+        format!("HEADTOKEN{}TAILTOKEN", "a".repeat(5_000))
+    }
+
+    fn rich_multi_message_channel(alias: &str) -> TelegramChannel {
+        let mut config = config_with_rich_messages(alias, true);
+        let telegram = config
+            .channels
+            .telegram
+            .get_mut(alias)
+            .expect("telegram alias");
+        telegram.multi_message_delay_ms = 0;
+        telegram.bot_token = "fake-token".into();
+        TelegramChannel::new(
+            "fake-token".into(),
+            alias,
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(LiveConfigAuthority::new(config))
+        .with_streaming(StreamMode::MultiMessage, 750)
+    }
+
+    fn seed_narration_draft(channel: &TelegramChannel, recipient: &str, narration: &str) -> String {
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        let mut state = MultiDraftState::new(None);
+        state.latest_visible = narration.to_string();
+        channel.multi_message_drafts.lock().insert(
+            TelegramChannel::multi_draft_key(recipient, &draft_id),
+            state,
+        );
+        draft_id
+    }
+
+    struct CountingSend {
+        calls: std::sync::atomic::AtomicUsize,
+        fail_from: usize,
+        fail_until: usize,
+    }
+
+    impl wiremock::Respond for CountingSend {
+        fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let seen = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let failing = seen >= self.fail_from && seen < self.fail_until;
+            let status = if failing { 500 } else { 200 };
+            wiremock::ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                "ok": !failing,
+                "description": if failing { "send failed" } else { "ok" },
+                "result": { "message_id": 1 }
+            }))
+        }
+    }
+
+    /// A rejected rich narration accepts its first HTML piece and then fails.
+    /// The finalize retry must continue that HTML fallback instead of sending
+    /// the accepted prefix again.
+    #[tokio::test]
+    async fn finalize_multi_message_keeps_html_fallback_position_across_retries() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let alias = "telegram_test_alias";
+        let narration = rich_html_narration();
+        let html_chunks = split_message_for_telegram(&narration);
+        assert!(
+            html_chunks.len() >= 2,
+            "the narration must fan out into HTML"
+        );
+        assert!(html_chunks[0].contains("HEADTOKEN"));
+        assert!(!html_chunks[0].contains("TAILTOKEN"));
+        assert_eq!(delivery_chunks(&narration, true).len(), 1);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(CountingSend {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_from: 1,
+                fail_until: 3,
+            })
+            .mount(&server)
+            .await;
+
+        let channel = rich_multi_message_channel(alias).with_api_base(server.uri());
+        let recipient = "123";
+        let draft_id = seed_narration_draft(&channel, recipient, &narration);
+        channel
+            .finalize_multi_message_draft(recipient, &draft_id, "Final answer", true)
+            .await
+            .expect("retries finish the narration then send the final answer");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("HEADTOKEN"))
+                .count(),
+            1,
+            "the accepted HTML prefix must be sent once: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|body| body.contains("TAILTOKEN")),
+            "the remaining HTML piece must still be sent: {bodies:?}"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("Final answer"))
+                .count(),
+            1,
+            "the final answer must follow the narration once"
+        );
+    }
+
+    /// `flush_unsent` saves the HTML fallback position. The next flush resumes
+    /// there instead of repeating the piece Telegram already accepted.
+    #[tokio::test]
+    async fn flush_unsent_resumes_rich_html_fallback_without_repeating_prefix() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let alias = "telegram_test_alias";
+        let narration = rich_html_narration();
+        assert!(split_message_for_telegram(&narration).len() >= 2);
+        assert_eq!(delivery_chunks(&narration, true).len(), 1);
+
+        let fail_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "rich unsupported"
+            })))
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&fail_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "send failed"
+            })))
+            .mount(&fail_server)
+            .await;
+
+        let channel = rich_multi_message_channel(alias).with_api_base(fail_server.uri());
+        let recipient = "123";
+        let draft_id = seed_narration_draft(&channel, recipient, &narration);
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("a partial flush is retained on the draft");
+        {
+            let drafts = channel.multi_message_drafts.lock();
+            let state = drafts
+                .get(&TelegramChannel::multi_draft_key(recipient, &draft_id))
+                .expect("draft survives a partial flush");
+            assert_eq!(state.delivered_chunks, 0);
+            assert_eq!(state.html_fallback_skip, 1);
+            assert!(state.html_fallback_chunk.contains("HEADTOKEN"));
+            assert_eq!(state.sent_text, "");
+        }
+
+        let resume_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 2 }
+            })))
+            .mount(&resume_server)
+            .await;
+        let channel = channel.with_api_base(resume_server.uri());
+        channel
+            .flush_unsent(recipient, &draft_id)
+            .await
+            .expect("the next flush finishes the fallback");
+        let requests = resume_server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path().ends_with("/sendMessage")),
+            "resume must stay on the HTML fallback"
+        );
+        let bodies: Vec<String> = requests
+            .into_iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("HEADTOKEN"))
+                .count(),
+            0,
+            "the accepted HTML prefix must not be sent again: {bodies:?}"
+        );
+        assert_eq!(
+            bodies
+                .iter()
+                .filter(|body| body.contains("TAILTOKEN"))
+                .count(),
+            1,
+            "the unsent HTML piece must be sent once: {bodies:?}"
+        );
+    }
+
     fn config_with_rich_messages(alias: &str, rich: bool) -> Config {
         let mut config = Config::default();
         config.channels.telegram.insert(
@@ -14186,6 +14532,113 @@ mod tests {
             chunks
                 .iter()
                 .any(|chunk| chunk.contains("After the block."))
+        );
+    }
+
+    fn rich_text_budget() -> usize {
+        TELEGRAM_RICH_MAX_MESSAGE_LENGTH
+            .saturating_sub(telegram_chunk_marker_len(true, true))
+            .max(1)
+    }
+
+    fn assert_balanced_fenced_chunks(chunks: &[String], budget: usize) {
+        assert!(chunks.len() > 1, "the fenced table must cross the limit");
+        for chunk in chunks {
+            assert!(
+                chunk.chars().count() <= budget,
+                "chunk length {} exceeds {budget}",
+                chunk.chars().count()
+            );
+            assert!(
+                !code_block_state_after(chunk, false),
+                "a chunk must close every fence it opens: {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_long_fenced_table_reopens_fence_within_rich_limit() {
+        let budget = rich_text_budget();
+        let mut table = String::from("```\n| A | B |\n| --- | --- |\n");
+        let mut index = 0usize;
+        while table.chars().count() <= budget {
+            table.push_str(&format!("| row{index} | value{index} |\n"));
+            index += 1;
+        }
+        table.push_str("```\nAfter the table.\n");
+        let ranges = protected_markdown_ranges(&table);
+        assert!(
+            !ranges.is_empty(),
+            "an existing fenced table must stay protected"
+        );
+        let chunks = split_message_protecting(&table, budget, &ranges);
+        assert_balanced_fenced_chunks(&chunks, budget);
+        assert!(
+            chunks.iter().skip(1).any(|chunk| chunk.starts_with("```")),
+            "a continued fenced table must reopen its fence"
+        );
+        let after = chunks
+            .iter()
+            .find(|chunk| chunk.contains("After the table."))
+            .expect("prose after the table");
+        let at = after.find("After the table.").expect("prose offset");
+        assert!(
+            !code_block_state_after(&after[..at], false),
+            "prose after the closing fence must stay outside the code block: {after}"
+        );
+        assert!(chunks.iter().any(|chunk| chunk.contains("| row0 |")));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.contains(&format!("| row{} |", index - 1)))
+        );
+    }
+
+    #[test]
+    fn split_wide_table_keeps_fence_across_rich_chunks() {
+        let budget = rich_text_budget();
+        let header = (0..21)
+            .map(|column| format!("c{column}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let separator = (0..21).map(|_| "---").collect::<Vec<_>>().join(" | ");
+        let mut body = format!("| {header} |\n| {separator} |\n");
+        let mut index = 0usize;
+        while body.chars().count() <= budget {
+            let row = (0..21)
+                .map(|column| format!("r{index}c{column}"))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            body.push_str(&format!("| {row} |\n"));
+            index += 1;
+        }
+        let message = format!("Before.\n\n{body}\nAfter the table.\n");
+        let prepared = prepare_rich_markdown(&message);
+        assert!(
+            prepared.contains("```\n"),
+            "a table wider than 20 columns must be fenced"
+        );
+        let chunks =
+            split_message_protecting(&prepared, budget, &protected_markdown_ranges(&prepared));
+        assert_balanced_fenced_chunks(&chunks, budget);
+        assert!(
+            chunks.iter().skip(1).any(|chunk| chunk.starts_with("```")),
+            "a continued wide table must reopen its fence"
+        );
+        let after = chunks
+            .iter()
+            .find(|chunk| chunk.contains("After the table."))
+            .expect("prose after the table");
+        let at = after.find("After the table.").expect("prose offset");
+        assert!(
+            !code_block_state_after(&after[..at], false),
+            "prose after a wide table must stay outside the code block: {after}"
+        );
+        assert!(chunks.iter().any(|chunk| chunk.contains("r0c0")));
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.contains(&format!("r{}c0", index - 1)))
         );
     }
 

@@ -101,8 +101,11 @@ rich_messages = true
 ```
 
 Tables wider than 20 columns stay fenced as code, which is the Bot API column
-limit. If `sendRichMessage` fails, the reply is sent as HTML. Draft updates
-while a reply is still being written stay plain text.
+limit. A fenced table longer than one rich message continues as code: each
+piece closes the fence, and the next piece opens it again, so the text after
+the table stays outside the block. If `sendRichMessage` fails, the reply is
+sent as HTML. A retry continues after the HTML pieces Telegram already
+accepted. Draft updates while a reply is still being written stay plain text.
 
 Inbound updates that carry only `rich_message` (including a reply to one of
 those messages) are projected to GitHub-flavored markdown before the agent
