@@ -2,6 +2,7 @@ import { Link } from 'react-router-dom';
 import type { ReactNode, CSSProperties, MouseEventHandler } from 'react';
 import { entityConfigPath, type EntityKind } from '@/lib/entityLinks';
 import { t } from '@/lib/i18n';
+import { useModelProfileAliases } from '@/lib/useModelProfileAliases';
 
 export interface EntityLinkProps {
   kind: EntityKind;
@@ -23,6 +24,7 @@ export default function EntityLink({
   children,
   stopPropagation = true,
 }: EntityLinkProps) {
+  const modelAliases = useModelProfileAliases(kind === 'model-provider' ? id : undefined);
   const onClick: MouseEventHandler = stopPropagation
     ? (e) => e.stopPropagation()
     : () => {};
@@ -31,7 +33,7 @@ export default function EntityLink({
   // still override color through `className`/`style`.
   return (
     <Link
-      to={entityConfigPath(kind, id)}
+      to={entityConfigPath(kind, id, modelAliases)}
       className={[
         'underline-offset-2 hover:underline rounded-[var(--radius-sm)]',
         'transition-colors duration-150',

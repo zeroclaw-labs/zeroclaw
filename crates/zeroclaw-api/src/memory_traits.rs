@@ -864,6 +864,25 @@ pub trait MemoryStrategy: Send + Sync {
         temperature: Option<f64>,
     ) -> anyhow::Result<()>;
 
+    /// Consolidate with an explicit per-call sampling policy.
+    async fn consolidate_turn_with_sampling(
+        &self,
+        user_message: &str,
+        assistant_response: &str,
+        provider: &dyn crate::model_provider::ModelProvider,
+        model: &str,
+        sampling: crate::model_provider::CallSampling,
+    ) -> anyhow::Result<()> {
+        self.consolidate_turn(
+            user_message,
+            assistant_response,
+            provider,
+            model,
+            sampling.resolve_for(None),
+        )
+        .await
+    }
+
     /// Run memory governance (cleanup, archiving, background consolidation).
     async fn run_governance(&self) -> anyhow::Result<()>;
 }

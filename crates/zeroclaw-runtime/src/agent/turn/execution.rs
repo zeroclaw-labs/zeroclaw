@@ -29,7 +29,8 @@ pub struct ResolvedModelAccess<'a> {
     /// Selector sent to `model_provider`. Routed providers may require a
     /// `hint:<name>` selector even though `model` records the resolved model.
     pub dispatch_model: &'a str,
-    pub temperature: Option<f64>,
+    /// Explicit invocation override plus thinking adjustment; Config owns defaults.
+    pub temperature: zeroclaw_providers::temperature::Temperature,
 }
 
 /// Owned per-attempt usage summary for a finished `run_model_query` call.
@@ -79,6 +80,20 @@ impl ResolvedModelAccess<'_> {
         request: ChatRequest<'_>,
         settled_out: &mut Vec<SettledAttemptSummary>,
     ) -> anyhow::Result<ChatResponse> {
+        self.run_model_query_with_sampling(
+            request,
+            settled_out,
+            self.temperature.resolve(None, self.provider_name).into(),
+        )
+        .await
+    }
+
+    pub async fn run_model_query_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        settled_out: &mut Vec<SettledAttemptSummary>,
+        sampling: zeroclaw_api::model_provider::CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
         crate::agent::turn::provider_call::enforce_tool_loop_budget()?;
@@ -114,7 +129,11 @@ impl ResolvedModelAccess<'_> {
             .scope(with_exact_dispatch_route(
                 self.provider_name.to_string(),
                 self.model.to_string(),
-                dispatcher.chat(request, self.dispatch_model, self.temperature),
+                dispatcher.chat_with_sampling(
+                    request,
+                    self.dispatch_model,
+                    sampling,
+                ),
             ))
             .await;
         if result.is_ok() {
@@ -480,7 +499,7 @@ mod run_model_query_tests {
             provider_name: "custom",
             model: "test-model",
             dispatch_model: "test-model",
-            temperature: None,
+            temperature: None.into(),
         }
     }
 
@@ -490,7 +509,7 @@ mod run_model_query_tests {
             provider_name: "custom",
             model: "test-model",
             dispatch_model: "test-model",
-            temperature: None,
+            temperature: None.into(),
         }
     }
 
@@ -574,7 +593,7 @@ mod run_model_query_tests {
                     provider_name: "reliable",
                     model: "test-model",
                     dispatch_model: "test-model",
-                    temperature: None,
+                    temperature: None.into(),
                 }
                 .run_model_query(
                     ChatRequest {
@@ -635,7 +654,7 @@ mod run_model_query_tests {
                     provider_name: "reliable",
                     model: "test-model",
                     dispatch_model: "test-model",
-                    temperature: None,
+                    temperature: None.into(),
                 }
                 .run_model_query(
                     ChatRequest {

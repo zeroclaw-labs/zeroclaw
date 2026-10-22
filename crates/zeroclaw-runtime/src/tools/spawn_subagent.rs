@@ -241,9 +241,6 @@ impl Tool for SpawnSubagentTool {
 
         let run_id = uuid::Uuid::new_v4().to_string();
 
-        let temperature: Option<f64> = config
-            .model_provider_for_agent(&self.parent_alias)
-            .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
         let mut run_overrides = child_run_overrides(subagent_ctx.policy.clone());
@@ -279,18 +276,13 @@ impl Tool for SpawnSubagentTool {
             agent_alias: parent_alias,
             session_key: run_id,
             =>
-            crate::agent::run(
-                (*config).clone(),
-                &self.parent_alias,
-                Some(prompt),
-                None,
-                None,
-                temperature,
-                vec![],
-                false,
-                Some(session_path),
-                None,
-                zeroclaw_api::ingress::TurnOrigin::SubTurn,
+            crate::agent::run_with_request(
+                Arc::clone(&config),
+                crate::agent::AgentRunRequest {
+                    message: Some(prompt),
+                    session_state_file: Some(session_path),
+                    ..crate::agent::AgentRunRequest::new(&self.parent_alias)
+                },
                 run_overrides,
             )
         ))

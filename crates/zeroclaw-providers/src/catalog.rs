@@ -306,18 +306,6 @@ pub async fn model_catalog_with_config_result(
     bool,
 )> {
     let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
-    let api_key = resolved
-        .as_ref()
-        .and_then(|(_family, _alias, base)| base.api_key.clone());
-    // Honor a configured custom endpoint so proxied / self-hosted OpenAI-compatible
-    // deployments list from their own `/models` rather than the family default.
-    let api_url = resolved.as_ref().and_then(|(_family, _alias, base)| {
-        base.uri
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map(ToString::to_string)
-    });
     // `create_model_provider` and the chat-catalog ranker expect a bare family
     // name, not a dotted ref. Prefer the family `find_by_name` resolved; when it
     // could not (no config / unknown alias) strip any `<family>.<alias>` suffix
@@ -344,13 +332,30 @@ pub async fn model_catalog_with_config_result(
     // A configured alias is the canonical source for provider construction:
     // it owns its endpoint, credential, headers, and typed runtime options.
     // Bare-family requests retain the public-catalog fallback below.
-    let handle = match (config, resolved.as_ref()) {
-        (Some(config), Some((resolved_family, resolved_alias, _))) => {
-            let canonical_ref = format!("{resolved_family}.{resolved_alias}");
-            crate::create_model_provider_from_ref(config, &canonical_ref)
-        }
-        _ => crate::create_model_provider_with_url(family, api_key.as_deref(), api_url.as_deref()),
-    };
+    let configured = config
+        .filter(|_| configured_profile)
+        .map(|config| Box::new(config.clone()));
+    let reference = resolved.as_ref().map_or_else(
+        || model_provider.to_owned(),
+        |(family, alias, _)| {
+            if model_provider.contains('.') {
+                model_provider.to_owned()
+            } else {
+                format!("{family}.{alias}")
+            }
+        },
+    );
+    let family_for_build = family.to_owned();
+    let handle = crate::model::build_nonblocking(move || match configured {
+        Some(config) => crate::model::build_raw_provider(
+            &config,
+            &reference,
+            crate::model::ProviderOverrides::default(),
+        )
+        .map(|binding| binding.provider),
+        None => crate::create_model_provider(&family_for_build, None),
+    })
+    .await;
 
     let live_models = match handle {
         Ok(handle) => match crate::ProviderDispatch::from_ref(&*handle)

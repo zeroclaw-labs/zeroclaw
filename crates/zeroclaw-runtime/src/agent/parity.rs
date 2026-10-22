@@ -153,7 +153,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
                 provider_name: "mock",
                 model: "mock-model",
                 dispatch_model: "mock-model",
-                temperature: None,
+                temperature: None.into(),
             },
             ResolvedIo {
                 tools_registry: &tools_registry,

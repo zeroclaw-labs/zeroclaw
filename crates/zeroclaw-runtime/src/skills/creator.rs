@@ -1,6 +1,7 @@
+use crate::agent::loop_::ResolvedModelAccess;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ModelProvider};
+use zeroclaw_api::model_provider::{CallSampling, ChatMessage, ChatRequest};
 use zeroclaw_config::schema::SkillCreationConfig;
 use zeroclaw_memory::embeddings::EmbeddingProvider;
 use zeroclaw_memory::vector::cosine_similarity;
@@ -79,9 +80,8 @@ impl SkillCreator {
         tool_calls: &[ToolCallRecord],
         final_answer: &str,
         embedding_provider: Option<&dyn EmbeddingProvider>,
-        provider_name: &str,
-        model_provider: &dyn ModelProvider,
-        model: &str,
+        access: ResolvedModelAccess<'_>,
+        sampling: CallSampling,
     ) -> Result<Option<String>> {
         let Some((slug, skill_dir)) = self
             .prepare_skill_dir(task_description, tool_calls, embedding_provider)
@@ -96,9 +96,8 @@ impl SkillCreator {
                 task_description,
                 tool_calls,
                 final_answer,
-                provider_name,
-                model_provider,
-                model,
+                &access,
+                sampling,
             )
             .await
         {
@@ -192,32 +191,25 @@ impl SkillCreator {
         task_description: &str,
         tool_calls: &[ToolCallRecord],
         final_answer: &str,
-        provider_name: &str,
-        model_provider: &dyn ModelProvider,
-        model: &str,
+        access: &ResolvedModelAccess<'_>,
+        sampling: CallSampling,
     ) -> Result<String> {
         let prompt = self.build_reflection_prompt(slug, task_description, tool_calls, final_answer);
         let messages = [
             ChatMessage::system(REFLECTION_SYSTEM_PROMPT),
             ChatMessage::user(prompt),
         ];
-        let access = crate::agent::loop_::ResolvedModelAccess {
-            model_provider,
-            provider_name,
-            model,
-            dispatch_model: model,
-            temperature: None,
-        };
         // Skill reflection is not part of any gateway turn ledger, so its
         // settled-attempt summaries are intentionally discarded.
         let resp = access
-            .run_model_query(
+            .run_model_query_with_sampling(
                 ChatRequest {
                     messages: &messages,
                     tools: None,
                     thinking: None,
                 },
                 &mut Vec::new(),
+                sampling,
             )
             .await
             .context("reflection provider call failed")?;
@@ -582,25 +574,24 @@ pub fn extract_tool_calls_from_history(
             continue;
         }
 
-        // Try parsing as JSON (native tool_calls format).
+        // Runtime history stores flattened calls; also accept the wire envelope.
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content)
             && let Some(tool_calls) = value.get("tool_calls").and_then(|v| v.as_array())
         {
             for call in tool_calls {
-                if let Some(function) = call.get("function") {
-                    let name = function
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let args_str = function
-                        .get("arguments")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("{}");
-                    let args = serde_json::from_str(args_str).unwrap_or_default();
-                    if !name.is_empty() {
-                        records.push(ToolCallRecord { name, args });
-                    }
+                let function = call.get("function").unwrap_or(call);
+                let name = function
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let args_str = function
+                    .get("arguments")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("{}");
+                let args = serde_json::from_str(args_str).unwrap_or_default();
+                if !name.is_empty() {
+                    records.push(ToolCallRecord { name, args });
                 }
             }
         }
@@ -657,6 +648,7 @@ pub fn extract_tool_calls_from_history(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use zeroclaw_api::model_provider::ModelProvider;
     use zeroclaw_memory::embeddings::{EmbeddingProvider, NoopEmbedding};
 
     fn set_test_modified_time(path: &std::path::Path, ordinal: u64) {
@@ -1137,6 +1129,30 @@ tags = ["auto-generated"]
         assert!(records.is_empty());
     }
 
+    #[test]
+    fn extract_from_runtime_native_history_and_wire_envelopes() {
+        use zeroclaw_providers::ChatMessage;
+        let history = [
+            ChatMessage::assistant(
+                serde_json::json!({"tool_calls": [{
+                    "name": "file_read", "arguments": "{\"path\":\"first.txt\"}"
+                }]})
+                .to_string(),
+            ),
+            ChatMessage::assistant(
+                serde_json::json!({"tool_calls": [{"function": {
+                    "name": "file_read", "arguments": "{\"path\":\"second.txt\"}"
+                }}]})
+                .to_string(),
+            ),
+        ];
+        let records = extract_tool_calls_from_history(&history);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].name, "file_read");
+        assert_eq!(records[0].args["path"], "first.txt");
+        assert_eq!(records[1].args["path"], "second.txt");
+    }
+
     // ── Fuzz-like tests for slug ─────────────────────────────────
 
     #[test]
@@ -1221,6 +1237,19 @@ tags = ["auto-generated"]
         reply: MockReply,
         calls: std::sync::atomic::AtomicUsize,
         last_prompt: std::sync::Mutex<Option<String>>,
+    }
+
+    fn reflection_access<'a>(
+        provider: &'a MockModelProvider,
+        model: &'a str,
+    ) -> ResolvedModelAccess<'a> {
+        ResolvedModelAccess {
+            model_provider: provider,
+            provider_name: "mock-provider",
+            model,
+            dispatch_model: model,
+            temperature: None.into(),
+        }
     }
 
     impl MockModelProvider {
@@ -1329,9 +1358,8 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "All tests passed.",
                 None,
-                "mock-provider",
-                &provider,
-                "test-model",
+                reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1365,9 +1393,8 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "Deployed.",
                 None,
-                "mock-provider",
-                &provider,
-                "test-model",
+                reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1428,9 +1455,8 @@ tags = ["auto-generated"]
                     &two_calls(),
                     "All tests passed.",
                     None,
-                    "mock-provider",
-                    &provider,
-                    "mock-model",
+                    reflection_access(&provider, "mock-model"),
+                    None.into(),
                 ),
             )
             .await
@@ -1463,9 +1489,8 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "Done.",
                 None,
-                "mock-provider",
-                &provider,
-                "test-model",
+                reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1490,9 +1515,8 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "Done.",
                 None,
-                "mock-provider",
-                &provider,
-                "test-model",
+                reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1521,9 +1545,8 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "answer",
                 None,
-                "mock-provider",
-                &provider,
-                "test-model",
+                reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap();
@@ -1549,9 +1572,8 @@ tags = ["auto-generated"]
                 &one_call,
                 "answer",
                 None,
-                "mock-provider",
-                &provider,
-                "test-model",
+                reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap();
@@ -1699,9 +1721,8 @@ tags = ["auto-generated"]
                 &calls,
                 &format!("Done. Authenticated with {aws_key}."),
                 None,
-                "mock-provider",
-                &provider,
-                "test-model",
+                reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap()
@@ -1942,9 +1963,8 @@ tags = ["auto-generated"]
                 &two_calls(),
                 "answer",
                 Some(&embed),
-                "mock-provider",
-                &provider,
-                "test-model",
+                reflection_access(&provider, "test-model"),
+                None.into(),
             )
             .await
             .unwrap();

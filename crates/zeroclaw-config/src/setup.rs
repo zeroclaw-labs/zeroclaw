@@ -271,7 +271,11 @@ mod tests {
                     "",
                     ConfigApiCode::InvalidFormat,
                     "model_provider",
-                    "model_provider must be dotted form `<type>.<alias>` (got \"openai\")",
+                    if section == "model_routes" {
+                        "model_provider must be dotted form `<type>.<alias>` (got \"openai\")"
+                    } else {
+                        "model_provider must use two-segment `<type>.<alias>` form; set embedding_routes[0].model separately (got \"openai\")"
+                    },
                 ),
                 (
                     "route",
@@ -287,7 +291,11 @@ mod tests {
                     " \t ",
                     ConfigApiCode::RequiredFieldEmpty,
                     "model",
-                    "model must not be empty",
+                    if section == "model_routes" {
+                        "model may be omitted only when model_provider resolves to a configured model id"
+                    } else {
+                        "model must not be empty"
+                    },
                 ),
             ] {
                 let mut config = Config::default();

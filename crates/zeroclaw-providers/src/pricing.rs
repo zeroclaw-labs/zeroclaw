@@ -229,7 +229,20 @@ async fn refresh_cycle() {
     let Some(cfg) = bound_config() else {
         return;
     };
-    let (groups, total_aliases_per_family) = enabled_pricing_groups(&cfg);
+    let (groups, total_aliases_per_family) =
+        match crate::model::build_nonblocking(move || Ok(enabled_pricing_groups(&cfg))).await {
+            Ok(groups) => groups,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({"error": error.to_string()})),
+                    "live pricing: provider construction task failed"
+                );
+                return;
+            }
+        };
     if groups.is_empty() {
         if !current_snapshot().is_empty() {
             store_snapshot(PriceSnapshot::new());
@@ -279,10 +292,11 @@ fn enabled_pricing_groups(
         if !base.live_pricing {
             continue;
         }
-        // Only a model with a known id can be matched against the catalog.
-        let Some(model_id) = base
-            .model
-            .as_deref()
+        let composite = format!("{ty}.{alias}");
+        let selection = config.resolve_model_selection(&composite);
+        let Some(model_id) = selection
+            .as_ref()
+            .and_then(|selection| selection.model_id.as_deref())
             .map(str::trim)
             .filter(|m| !m.is_empty())
         else {
@@ -291,11 +305,10 @@ fn enabled_pricing_groups(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({ "provider": format!("{ty}.{alias}") })),
-                "live pricing: provider opted in but sets no `model`; nothing to price"
+                "live pricing: provider opted in but has no effective model selection"
             );
             continue;
         };
-        let composite = format!("{ty}.{alias}");
         // Aliases on the same explicit endpoint share one call; aliases on a
         // family default share one call per family type.
         let gateway_key = base
@@ -323,23 +336,16 @@ fn enabled_pricing_groups(
             continue;
         }
         // First alias for this gateway: build the representative handle.
-        let options = crate::options_for_provider_ref(
+        match crate::model::build_raw_provider(
             config,
             &wanted.composite,
-            &crate::ModelProviderRuntimeOptions::default(),
-        );
-        match crate::create_model_provider_for_alias(
-            config,
-            ty,
-            alias,
-            base.api_key.as_deref(),
-            &options,
+            crate::model::ProviderOverrides::default(),
         ) {
-            Ok(handle) => {
+            Ok(binding) => {
                 groups.insert(
                     gateway_key,
                     GatewayGroup {
-                        handle: Arc::from(handle),
+                        handle: Arc::from(binding.provider),
                         wanted: vec![wanted],
                     },
                 );
@@ -586,6 +592,28 @@ mod tests {
             .expect("the opted-in provider exists")
             .base
             .live_pricing = false;
+    }
+
+    #[test]
+    fn pricing_groups_resolve_nested_default_and_sole_model() {
+        use zeroclaw_config::schema::ModelEntryConfig;
+        for alias in ["default", "only"] {
+            let mut config = opted_in_config();
+            let profile = config.providers.models.ensure("ollama", "priced").unwrap();
+            profile.model = None;
+            profile.models.insert(
+                alias.into(),
+                ModelEntryConfig {
+                    id: Some("nested-model".into()),
+                    ..Default::default()
+                },
+            );
+            let (groups, _) = enabled_pricing_groups(&config);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].wanted.len(), 1);
+            assert_eq!(groups[0].wanted[0].model_id, "nested-model");
+            assert_eq!(groups[0].wanted[0].provider_key, "ollama.priced");
+        }
     }
 
     /// An operator's opt-out written through the bound live handle, the way

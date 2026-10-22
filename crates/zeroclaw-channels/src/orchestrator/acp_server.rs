@@ -344,74 +344,31 @@ impl AcpServer {
         workspace_dir: &std::path::Path,
         enable_mcp: bool,
     ) -> Result<Agent> {
-        let Some(store) = self.store.as_ref() else {
-            return if let ConfigSource::Live(live_config) = &self.config_source {
-                Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-                    live_config.clone(),
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
+        let mut context = zeroclaw_runtime::agent::AgentBuildContext {
+            session_cwd: Some(workspace_dir),
+            initialize_mcp: enable_mcp,
+            approval_backchannel: true,
+            exclude_memory: true,
+            acp_delivery: true,
+            sop_engine: self.sop_engine.clone(),
+            sop_audit: self.sop_audit.clone(),
+            canvas_store: self.canvas_store.clone(),
+            acp_session_store: self.store.clone(),
+            ..Default::default()
+        };
+        match &self.config_source {
+            ConfigSource::Live(live_config) => {
+                context.execution_capability =
                     Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
                         live_config.clone(),
                         self.agent_lifecycle.clone(),
-                    )),
-                )
-                .await
-            } else {
-                Agent::from_config_with_session_cwd_and_mcp_backchannel(
-                    config,
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                )
-                .await
-            };
-        };
-        if let ConfigSource::Live(live_config) = &self.config_source {
-            let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                live_config.clone(),
-                self.agent_lifecycle.clone(),
-            );
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
-                live_config.clone(),
-                agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                true,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
-                Some(execution_capability),
-            )
-            .await
-        } else {
-            Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
-                config,
-                agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                true,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
-            )
-            .await
+                    ));
+                Agent::from_live_config_with_context(live_config.clone(), agent_alias, context)
+                    .await
+            }
+            ConfigSource::Standalone(_) => {
+                Agent::from_config_with_context(config, agent_alias, context).await
+            }
         }
     }
 
@@ -1003,8 +960,13 @@ impl AcpServer {
                     .model_provider_for_agent(&agent_alias)
                     .and_then(|mp| mp.model.clone())
                     .unwrap_or_default();
+                // `anyhow::Error::to_string()` only renders the outer context,
+                // which hid actionable provider failures (for example, an API
+                // key prefix mismatch) behind "Failed to create agent". Keep
+                // the complete chain while applying the provider sanitizer
+                // before exposing it over the RPC boundary.
                 let error = zeroclaw_runtime::security::scrub(
-                    &zeroclaw_providers::sanitize_api_error(&e.to_string()),
+                    &zeroclaw_providers::format_error_chain(e.as_ref()),
                 );
                 ::zeroclaw_log::scope!(
                     session_key: session_id.as_str(),
@@ -1282,7 +1244,10 @@ impl AcpServer {
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
-                message: format!("Failed to create agent: {e}"),
+                message: format!(
+                    "Failed to create agent: {}",
+                    zeroclaw_providers::format_error_chain(e.as_ref())
+                ),
                 data: None,
             });
 
@@ -1616,7 +1581,10 @@ impl AcpServer {
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
-                message: format!("Failed to create agent: {e}"),
+                message: format!(
+                    "Failed to create agent: {}",
+                    zeroclaw_providers::format_error_chain(e.as_ref())
+                ),
                 data: None,
             });
 

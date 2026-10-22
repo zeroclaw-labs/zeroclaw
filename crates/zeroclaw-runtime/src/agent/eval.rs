@@ -83,6 +83,27 @@ pub struct ResolvedEffortRoute<'a> {
     pub cloud_escalation: CloudEscalationPolicy,
 }
 
+impl ResolvedEffortRoute<'_> {
+    /// Materialize the physical-provider boundary from canonical profile lookup.
+    /// A selected nested model retains its raw route reference, while attempts
+    /// and side routes are authorized by the owning connection profile.
+    pub fn allowed_profile_refs(
+        &self,
+        config: &zeroclaw_config::schema::Config,
+    ) -> HashSet<String> {
+        self.allowed_provider_refs
+            .iter()
+            .filter_map(|reference| {
+                config
+                    .providers
+                    .models
+                    .profile_ref(reference)
+                    .map(|(family, alias)| format!("{family}.{alias}"))
+            })
+            .collect()
+    }
+}
+
 /// Resolve an opted-in effort route without making a model or network call.
 /// Standard (ambiguous) turns intentionally stay local.
 pub fn effort_routing_decision<'a>(
@@ -362,6 +383,55 @@ mod tests {
         assert_eq!(ac.hint_for(ComplexityTier::Simple), Some("fast"));
         assert_eq!(ac.hint_for(ComplexityTier::Standard), None);
         assert_eq!(ac.hint_for(ComplexityTier::Complex), Some("reasoning"));
+    }
+
+    #[test]
+    fn effort_routing_authorizes_nested_selections_by_canonical_profile() {
+        use zeroclaw_config::schema::{Config, ModelEntryConfig};
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "local.edge")
+            .unwrap();
+        profile.models.insert(
+            "small".into(),
+            ModelEntryConfig {
+                id: Some("local-model".into()),
+                ..Default::default()
+            },
+        );
+        config.providers.models.ensure("custom", "cloud").unwrap();
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local.edge.small".into(),
+                ..Default::default()
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                ..Default::default()
+            },
+        ];
+        let mut policy = EffortRoutingConfig {
+            local_hint: "local".into(),
+            cloud_hint: "cloud".into(),
+            cloud_escalation: CloudEscalationPolicy::Never,
+        };
+        let local = resolve_effort_route(&policy, &config.model_routes, "hello").unwrap();
+        assert_eq!(
+            local.allowed_profile_refs(&config),
+            HashSet::from(["custom.local.edge".into()])
+        );
+        assert_eq!(local.route.effective_model(&config), "local-model");
+        policy.cloud_escalation = CloudEscalationPolicy::Auto;
+        let cloud = resolve_effort_route(&policy, &config.model_routes, &"a".repeat(201)).unwrap();
+        assert_eq!(
+            cloud.allowed_profile_refs(&config),
+            HashSet::from(["custom.local.edge".into(), "custom.cloud".into()])
+        );
     }
 
     #[test]

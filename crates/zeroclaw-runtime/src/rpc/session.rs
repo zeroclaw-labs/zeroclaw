@@ -1,7 +1,6 @@
 //! RPC session state.
 
 use crate::agent::agent::{Agent, TurnEvent};
-use crate::agent::dispatcher::ToolDispatcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +8,6 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_infra::session_queue::SessionActorQueue;
-use zeroclaw_providers::ModelProvider;
 
 /// Error returned by [`SessionStore::lock_model_provider_update_with_timeout`].
 #[derive(Debug)]
@@ -18,20 +16,6 @@ pub(crate) enum WaitForProviderUpdateError {
     SessionNotFound,
     /// The update lock was not released within the requested timeout.
     Timeout,
-}
-
-/// One transient, generation-bound provider publication. Every field is
-/// derived from the same config snapshot and committed under the session
-/// generation fence; this is a transfer object, not another source of truth.
-pub(crate) struct ModelProviderUpdate {
-    pub model_provider: Box<dyn ModelProvider>,
-    pub model_provider_name: String,
-    pub model_name: String,
-    pub model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
-    pub tool_dispatcher: Box<dyn ToolDispatcher>,
-    pub config_generation: Arc<zeroclaw_config::schema::Config>,
-    pub temperature: Option<Option<f64>>,
-    pub multimodal_config: zeroclaw_config::schema::MultimodalConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1240,7 +1224,8 @@ impl SessionStore {
         }
     }
 
-    pub async fn set_overrides(
+    #[cfg(test)]
+    pub(crate) async fn set_overrides(
         &self,
         id: &str,
         patch: SessionOverrides,
@@ -1250,32 +1235,32 @@ impl SessionStore {
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(id)?;
         session.overrides = merged.clone();
-        // Apply to agent immediately.
+        // Model metadata is staged only; production installs a prepared binding.
         let overrides = session.overrides.clone();
         let agent = session.agent.clone();
         drop(sessions);
         let mut guard = agent.lock().await;
-        if let Some(ref m) = overrides.model {
-            guard.set_model_name(m.clone());
-        }
         if explicit_model_selection {
             guard.disable_automatic_model_routing();
         }
-        if overrides.temperature.is_some() {
-            guard.set_temperature(overrides.temperature);
+        if patch.temperature.is_some() {
+            guard.set_temperature(patch.temperature);
         }
         Some(overrides)
     }
 
-    /// Like `set_overrides`, but validates `generation` before mutating the
-    /// session entry or its agent. Returns `None` if the session is absent
+    /// Install overrides and their prepared binding under the caller's
+    /// session-update ordering guard. Temperature-only patches need no binding.
+    /// Validates `generation` before mutating the session entry or its agent.
+    /// Returns `None` if the session is absent
     /// *or* if it was replaced under the same ID — both cases mean the caller
     /// captured a stale generation and the work must be discarded.
-    pub async fn set_overrides_gated(
+    pub(crate) async fn set_overrides_gated(
         &self,
         id: &str,
         generation: u64,
         patch: SessionOverrides,
+        model_update: Option<crate::agent::agent::PreparedModelUpdate>,
     ) -> Option<SessionOverrides> {
         let explicit_model_selection = patch.model.is_some() || patch.model_provider.is_some();
         let done = self.wait_test_gate().await;
@@ -1299,19 +1284,17 @@ impl SessionStore {
             return None;
         }
         session.overrides = merged.clone();
-        // Apply to agent immediately.
         let overrides = session.overrides.clone();
         let agent = session.agent.clone();
         drop(sessions);
         let mut guard = agent.lock().await;
-        if let Some(ref m) = overrides.model {
-            guard.set_model_name(m.clone());
-        }
         if explicit_model_selection {
             guard.disable_automatic_model_routing();
         }
-        if overrides.temperature.is_some() {
-            guard.set_temperature(overrides.temperature);
+        if let Some(update) = model_update {
+            guard.install_model_update(update);
+        } else if patch.temperature.is_some() {
+            guard.set_temperature(patch.temperature);
         }
         self.signal_test_gate_done(done);
         Some(overrides)
@@ -1344,45 +1327,32 @@ impl SessionStore {
         Some(merged)
     }
 
-    /// Swap a freshly built `ModelProvider` box (and its name) onto the
-    /// session's agent. Called by the dispatcher after it constructs the
-    /// box from config, keeping model_provider-build logic out of the store.
+    /// Commit a freshly built model update
+    /// wholesale onto the session's agent. Called by the dispatcher after it
+    /// builds the runtime from config, keeping model-construction logic out of
+    /// the store.
     /// The route resolver is installed in the SAME state transition as the
     /// provider box: it holds the hint→route table bound to that provider set,
     /// so leaving the old resolver would resolve routed hints through the
     /// previous provider while the new box serves the call.
-    /// `config_generation` is the `Arc<Config>` the caller built this provider
-    /// box and resolver FROM. It is published onto the agent in the same state
-    /// transition, so a later explicit `model_switch` rebuilds dispatch from
-    /// that generation rather than the agent's construction-time snapshot, and
-    /// `context_limits_for_route` reports capacity and budget from it too.
-    /// Passing a generation the box was not built from reintroduces the
-    /// mixed-generation split this parameter exists to close.
+    /// The update retains the exact config generation used by its constructor,
+    /// so callers cannot independently pair a provider with another generation.
     ///
     /// `generation` is the orthogonal SESSION-identity fence: it must match the
     /// session's current generation (captured before the caller built the
     /// provider box). If the session was replaced under the same ID — e.g. by
     /// a cross-mode `session/new` replacement or ACP rehydration — while the
     /// provider was being built, the generations won't match and this call
-    /// becomes a no-op (returns `false`). `config_generation` answers "which
+    /// becomes a no-op (returns `false`). The update answers "which
     /// config was this built from"; `generation` answers "is this still the
     /// same session". Live same-ID `session/new` requests resume the existing
     /// incarnation rather than replacing it.
     ///
-    /// When `temperature` is `Some(v)`, the captured agent's temperature is
-    /// set to `v` (which may be `None`, clearing a prior profile temperature).
-    /// When `temperature` is `None`, the agent's temperature is left unchanged
-    /// — used by `session/configure` where temperature is already committed
-    /// via `set_overrides_gated`.
-    ///
-    /// `multimodal_config` must be the same `[multimodal]` policy snapshot the
-    /// caller built the provider box from, so the agent-side preparation pass
-    /// and the provider boundary stay on one policy after a live refresh.
     pub(crate) async fn apply_model_provider(
         &self,
         id: &str,
         generation: u64,
-        update: ModelProviderUpdate,
+        update: crate::agent::agent::PreparedModelUpdate,
     ) -> bool {
         let done = self.wait_test_gate().await;
         let agent = {
@@ -1400,16 +1370,7 @@ impl SessionStore {
             }
         };
         let mut guard = agent.lock().await;
-        guard.set_model_provider(update.model_provider);
-        guard.set_model_provider_name(update.model_provider_name);
-        guard.set_model_name(update.model_name);
-        guard.set_model_route_resolver(update.model_route_resolver);
-        guard.set_tool_dispatcher(update.tool_dispatcher);
-        guard.set_multimodal_config(update.multimodal_config);
-        guard.set_config_generation(update.config_generation);
-        if let Some(t) = update.temperature {
-            guard.set_temperature(t);
-        }
+        guard.install_model_update(update);
         self.signal_test_gate_done(done);
         true
     }
@@ -2874,7 +2835,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_overrides_applies_model_and_temperature_live() {
+    async fn set_overrides_stages_model_metadata_and_applies_temperature() {
         let store = make_store(4);
         store
             .insert(
@@ -2898,10 +2859,12 @@ mod tests {
         assert_eq!(merged.model.as_deref(), Some("model-x"));
         assert_eq!(merged.temperature, Some(0.42));
 
-        // The override is applied to the live agent immediately.
+        // Model metadata cannot independently change the installed binding.
         let agent = store.get_agent("s1").await.unwrap();
-        let (_, _, model_name) = agent.lock().await.attribution_fields();
-        assert_eq!(model_name, "model-x");
+        let agent = agent.lock().await;
+        let (_, _, model_name) = agent.attribution_fields();
+        assert_eq!(model_name, "<unconfigured>");
+        assert_eq!(agent.temperature_for_test(), Some(0.42));
     }
 
     #[tokio::test]
@@ -3409,6 +3372,11 @@ mod tests {
                     model: Some("intruder".into()),
                     ..Default::default()
                 },
+                Some(crate::agent::agent::PreparedModelUpdate::for_test(
+                    test_model_runtime("intruder-provider", "intruder"),
+                    Arc::new(zeroclaw_config::schema::Config::default()),
+                    Some(0.99),
+                )),
             )
             .await;
         assert!(result.is_none(), "stale generation must be rejected");
@@ -3420,6 +3388,10 @@ mod tests {
             overrides.temperature, None,
             "successor temperature must be untouched"
         );
+        let agent = store.get_agent("s").await.unwrap();
+        let agent = agent.lock().await;
+        assert_eq!(agent.attribution_fields().2, "<unconfigured>");
+        assert_eq!(agent.temperature_for_test(), None);
     }
 
     #[tokio::test]
@@ -3443,34 +3415,77 @@ mod tests {
                     temperature: Some(0.7),
                     ..Default::default()
                 },
+                Some(crate::agent::agent::PreparedModelUpdate::for_test(
+                    test_model_runtime("valid-provider", "valid"),
+                    Arc::new(zeroclaw_config::schema::Config::default()),
+                    Some(0.7),
+                )),
             )
             .await;
         assert!(result.is_some(), "current generation must be accepted");
         let overrides = result.unwrap();
         assert_eq!(overrides.model.as_deref(), Some("valid"));
         assert_eq!(overrides.temperature, Some(0.7));
+        let agent = store.get_agent("s").await.unwrap();
+        let agent = agent.lock().await;
+        let (_, provider, model) = agent.attribution_fields();
+        assert_eq!(provider, "valid-provider");
+        assert_eq!(model, "valid");
+        assert_eq!(agent.selected_model_provider_ref(), "valid-provider");
+        let route = agent.resolved_route_for_test("valid");
+        assert_eq!(route.provider_name, "valid-provider");
+        assert_eq!(route.model, "valid");
+        assert_eq!(agent.temperature_for_test(), Some(0.7));
     }
 
-    fn test_model_provider_update(
+    #[tokio::test]
+    async fn set_overrides_gated_updates_temperature_without_replacing_binding() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let generation = store.get_generation("s").await.unwrap();
+        let agent = store.get_agent("s").await.unwrap();
+        let before = agent.lock().await.attribution_fields();
+        store
+            .set_overrides_gated(
+                "s",
+                generation,
+                SessionOverrides {
+                    temperature: Some(0.3),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("current session accepts a temperature-only patch");
+        let agent = agent.lock().await;
+        assert_eq!(agent.attribution_fields(), before);
+        assert_eq!(agent.temperature_for_test(), Some(0.3));
+    }
+
+    /// Minimal [`crate::agent::agent::ModelRuntime`] for store tests: the
+    /// fields the assertions below read, with stub provider/dispatcher boxes.
+    fn test_model_runtime(
         provider_name: &str,
         model_name: &str,
-        temperature: Option<Option<f64>>,
-        multimodal_config: zeroclaw_config::schema::MultimodalConfig,
-    ) -> ModelProviderUpdate {
-        ModelProviderUpdate {
-            model_provider: Box::new(StubProvider),
-            model_provider_name: provider_name.into(),
-            model_name: model_name.into(),
-            model_route_resolver: Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
-                Vec::new(),
-                provider_name.into(),
-                model_name.into(),
-            )),
-            tool_dispatcher: Box::new(NativeToolDispatcher),
-            config_generation: Arc::new(zeroclaw_config::schema::Config::default()),
-            temperature,
-            multimodal_config,
-        }
+    ) -> crate::agent::agent::ModelRuntime {
+        crate::agent::agent::ModelRuntime::for_test(
+            zeroclaw_providers::model::BuiltModel::from_provider(
+                Box::new(StubProvider),
+                zeroclaw_config::schema::ModelIdentity {
+                    family: provider_name.to_string(),
+                    alias: String::new(),
+                    entry_alias: None,
+                    model_id: model_name.to_string(),
+                },
+            ),
+            Box::new(NativeToolDispatcher),
+        )
     }
 
     #[tokio::test]
@@ -3498,11 +3513,10 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                test_model_provider_update(
-                    "stale-provider",
-                    "stale-model",
-                    Some(Some(0.99)),
-                    zeroclaw_config::schema::MultimodalConfig::default(),
+                crate::agent::agent::PreparedModelUpdate::for_test(
+                    test_model_runtime("stale-provider", "stale-model"),
+                    Arc::new(zeroclaw_config::schema::Config::default()),
+                    Some(0.99),
                 ),
             )
             .await;
@@ -3633,11 +3647,10 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                test_model_provider_update(
-                    "new-provider",
-                    "new-model",
-                    Some(Some(0.42)),
-                    zeroclaw_config::schema::MultimodalConfig::default(),
+                crate::agent::agent::PreparedModelUpdate::for_test(
+                    test_model_runtime("new-provider", "new-model"),
+                    Arc::new(zeroclaw_config::schema::Config::default()),
+                    Some(0.42),
                 ),
             )
             .await;
@@ -3682,7 +3695,14 @@ mod tests {
             .apply_model_provider(
                 "s",
                 captured_gen,
-                test_model_provider_update("new-provider", "new-model", None, refreshed),
+                crate::agent::agent::PreparedModelUpdate::for_test(
+                    test_model_runtime("new-provider", "new-model"),
+                    Arc::new(zeroclaw_config::schema::Config {
+                        multimodal: refreshed,
+                        ..Default::default()
+                    }),
+                    None,
+                ),
             )
             .await;
         assert!(applied, "current generation must be accepted");

@@ -1333,7 +1333,7 @@ pub(crate) fn all_tools_with_runtime_context(
     web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
     workspace_dir: &std::path::Path,
     agents: &HashMap<String, AliasedAgentConfig>,
-    fallback_api_key: Option<&str>,
+    _fallback_api_key: Option<&str>,
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
@@ -1346,6 +1346,7 @@ pub(crate) fn all_tools_with_runtime_context(
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
+    model_config: Option<zeroclaw_tools::llm_task::ModelConfigResolver>,
 ) -> anyhow::Result<AllToolsResult> {
     #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
     let late_trace = late_tool_search_observer::capture();
@@ -1374,7 +1375,6 @@ pub(crate) fn all_tools_with_runtime_context(
             web_fetch_config,
             workspace_dir,
             agents,
-            fallback_api_key,
             root_config,
             canvas_store,
             is_subagent_caller,
@@ -1384,6 +1384,7 @@ pub(crate) fn all_tools_with_runtime_context(
             live_config,
             execution_capability,
             acp_sessions,
+            model_config,
         )
     };
     std::thread::scope(|scope| -> anyhow::Result<AllToolsResult> {
@@ -1463,6 +1464,7 @@ pub fn all_tools_with_runtime_and_acp_sessions(
         live_config,
         None,
         acp_sessions,
+        None,
     )
 }
 
@@ -1521,6 +1523,7 @@ pub fn all_tools_with_runtime_and_execution_capability(
         live_config,
         execution_capability,
         None,
+        None,
     )
 }
 
@@ -1544,7 +1547,6 @@ fn all_tools_with_runtime_on_thread(
     web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
     workspace_dir: &std::path::Path,
     agents: &HashMap<String, AliasedAgentConfig>,
-    fallback_api_key: Option<&str>,
     root_config: &zeroclaw_config::schema::Config,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
@@ -1554,6 +1556,7 @@ fn all_tools_with_runtime_on_thread(
     live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
+    model_config: Option<zeroclaw_tools::llm_task::ModelConfigResolver>,
 ) -> anyhow::Result<AllToolsResult> {
     #[cfg(feature = "tools-external")]
     let browser_config = _browser_config;
@@ -1587,6 +1590,11 @@ fn all_tools_with_runtime_on_thread(
     // of each taking a full `Config` clone: registry construction (per agent
     // build and per channel-message turn) previously paid three deep copies.
     let root_config_shared = Arc::new(root_config.clone());
+    let model_config = model_config.unwrap_or_else(|| {
+        let snapshot = Arc::clone(&config);
+        Arc::new(move || Arc::clone(&snapshot))
+    });
+    let model_config = zeroclaw_tools::llm_task::model_config_for_agent(model_config, agent_alias);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
     let mut reserved_host_names = std::collections::HashSet::new();
     reserve_deferred_host_names(root_config, &mut reserved_host_names);
@@ -1767,15 +1775,18 @@ fn all_tools_with_runtime_on_thread(
     );
     register_tool!(
         "model_routing_config",
-        Arc::new(ModelRoutingConfigTool::new(
-            config.clone(),
+        Arc::new(ModelRoutingConfigTool::with_config_resolver(
             security.clone(),
+            Arc::clone(&model_config),
         ))
     );
     if !is_subagent_caller {
         register_tool!(
             "model_switch",
-            Arc::new(ModelSwitchTool::new(security.clone(), config.clone()))
+            Arc::new(ModelSwitchTool::with_config_resolver(
+                security.clone(),
+                Arc::clone(&model_config),
+            ))
         );
     }
     register_tool!(
@@ -1879,26 +1890,17 @@ fn all_tools_with_runtime_on_thread(
     // LLM task tool — registered using the calling agent's provider.
     // Preserves family + alias identity so alias-specific typed config
     // (e.g. requires_openai_auth) survives into llm_task execution.
-    if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
+    if root_config
+        .resolved_model_provider_for_agent(agent_alias)
+        .is_some()
         && select_tool!("llm_task")
     {
-        let llm_task_model = entry
-            .model
-            .clone()
-            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
-        let llm_task_runtime_options =
-            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         register_tool!(
             "llm_task",
-            Arc::new(LlmTaskTool::new(
+            Arc::new(LlmTaskTool::with_config_resolver(
                 security.clone(),
-                config.clone(),
-                family.to_string(),
-                alias.to_string(),
-                llm_task_model,
-                entry.temperature,
-                entry.api_key.clone(),
-                llm_task_runtime_options,
+                Arc::clone(&model_config),
+                agent_alias,
             ))
         );
     }
@@ -2966,23 +2968,12 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Add delegation tool when agents are configured
-    let delegate_global_credential = fallback_api_key.and_then(|value| {
-        let trimmed_value = value.trim();
-        (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
-    });
-    let provider_runtime_options =
-        zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
-
     #[cfg(test)]
     let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
     let delegate_handle: Option<DelegateParentToolsHandle> =
         if agents.is_empty() || !select_tool!("delegate") {
             None
         } else {
-            let delegate_agents: HashMap<String, AliasedAgentConfig> = agents
-                .iter()
-                .map(|(name, cfg)| (name.clone(), cfg.clone()))
-                .collect();
             let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
             #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
             late_tool_search_observer::record(
@@ -2993,42 +2984,19 @@ fn all_tools_with_runtime_on_thread(
             );
             #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
             late_tool_search_observer::record("constructor-enter", "delegate", 0, 0);
-            let delegate_tool = DelegateTool::new_with_options(
-            delegate_agents,
-            delegate_global_credential.clone(),
-            security.clone(),
-            provider_runtime_options.clone(),
-        )
-        .with_parent_tools(Arc::clone(&parent_tools))
-        .with_runtime(runtime.clone())
-        .with_multimodal_config(root_config.multimodal.clone())
-        .with_delegate_config(root_config.delegate.clone())
-        .with_workspace_dir(workspace_dir.to_path_buf())
-        .with_memory(memory.clone())
-        .with_providers_models({
-            let mut m: std::collections::HashMap<
-                String,
-                std::collections::HashMap<String, zeroclaw_config::schema::ModelProviderConfig>,
-            > = std::collections::HashMap::new();
-            for (t, a, base) in root_config.providers.models.iter_entries() {
-                m.entry(t.to_string())
-                    .or_default()
-                    .insert(a.to_string(), base.clone());
-            }
-            m
-        })
-        .with_risk_profiles(root_config.risk_profiles.clone())
-        .with_runtime_profiles(root_config.runtime_profiles.clone())
-        .with_skill_bundles(root_config.skill_bundles.clone())
-        .with_root_config(config.clone())
-        // `with_root_config` above is only a snapshot. Delegated targets get
-        // their own nested registry, whose plugin tools and `send_via`
-        // authority resolve per execution; without the shared handle they would
-        // resolve against that snapshot forever. Same contract as the
-        // `live_config` argument this function received.
-        .with_live_config(live_config.clone())
-        .with_execution_capability(execution_capability.clone())
-        .with_caller_alias(agent_alias);
+            let delegate_tool = DelegateTool::from_config(
+                Arc::clone(&config),
+                agent_alias,
+                Arc::clone(security),
+                delegate::DelegateBuildContext {
+                    parent_tools: Arc::clone(&parent_tools),
+                    runtime: Arc::clone(&runtime),
+                    workspace_dir: workspace_dir.to_path_buf(),
+                    memory: Arc::clone(&memory),
+                    live_config: live_config.clone(),
+                    execution_capability: execution_capability.clone(),
+                },
+            );
             let delegate_tool = Arc::new(delegate_tool);
             #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
             late_tool_search_observer::record(
@@ -7441,6 +7409,7 @@ permissions = ["http_client"]
             OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
                     requires_openai_auth: true,
+                    model: Some("gpt-5-codex".into()),
                     ..ModelProviderConfig::default()
                 },
             },

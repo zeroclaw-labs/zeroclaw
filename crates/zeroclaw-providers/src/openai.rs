@@ -1820,6 +1820,39 @@ mod tool_round_policy_tests {
         policy: Option<ToolRoundPolicy>,
         tool_shape: u8,
     ) -> serde_json::Value {
+        wire_body_with_sampling(wire, streaming, policy, tool_shape, None).await
+    }
+
+    #[tokio::test]
+    async fn selected_sampling_and_single_tool_round_policy_reach_the_same_wire_call() {
+        use zeroclaw_api::model_provider::CallSampling;
+        for streaming in [false, true] {
+            let sampled = wire_body_with_sampling(
+                0,
+                streaming,
+                Some(ToolRoundPolicy::Single),
+                2,
+                Some(CallSampling::for_selection(Some(0.9), |reference| {
+                    Some(if reference == "openai.fixture.selected" {
+                        0.2
+                    } else {
+                        0.9
+                    })
+                })),
+            )
+            .await;
+            assert_eq!(sampled["temperature"], 0.2);
+            assert_eq!(sampled["parallel_tool_calls"], false);
+        }
+    }
+
+    async fn wire_body_with_sampling(
+        wire: u8,
+        streaming: bool,
+        policy: Option<ToolRoundPolicy>,
+        tool_shape: u8,
+        sampling: Option<zeroclaw_api::model_provider::CallSampling>,
+    ) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&captured);
         let path = match wire {
@@ -1885,6 +1918,24 @@ mod tool_round_policy_tests {
         let provider: Box<dyn ModelProvider> = Box::new(
             crate::vision_override::VisionOverrideProvider::new(Box::new(provider), true),
         );
+        let provider: Box<dyn ModelProvider> = if sampling.is_some() {
+            Box::new(crate::reliable::ReliableModelProvider::new_with_entries(
+                "reliable",
+                vec![
+                    crate::reliable::ReliableModelProviderEntry::new_with_candidate(
+                        "fixture",
+                        "openai.fixture",
+                        "openai.fixture",
+                        provider,
+                    )
+                    .with_selection_ref("openai.fixture.selected"),
+                ],
+                0,
+                1,
+            ))
+        } else {
+            provider
+        };
         let provider: Box<dyn ModelProvider> = if wire == 0 && streaming {
             Box::new(crate::router::RouterModelProvider::new(
                 "synthetic",
@@ -1923,15 +1974,23 @@ mod tool_round_policy_tests {
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             if streaming {
-                let mut stream = match policy {
-                    Some(policy) => dispatch.stream_chat_with_tool_round_policy(
+                let mut stream = match (policy, sampling) {
+                    (Some(policy), Some(sampling)) => dispatch
+                        .stream_chat_with_sampling_and_tool_round_policy(
+                            request,
+                            "ignored",
+                            sampling,
+                            StreamOptions::new(true),
+                            policy,
+                        ),
+                    (Some(policy), None) => dispatch.stream_chat_with_tool_round_policy(
                         request,
                         "ignored",
                         None,
                         StreamOptions::new(true),
                         policy,
                     ),
-                    None => {
+                    (None, _) => {
                         dispatch.stream_chat(request, "ignored", None, StreamOptions::new(true))
                     }
                 };
@@ -1944,12 +2003,18 @@ mod tool_round_policy_tests {
                 }
                 assert!(final_seen);
             } else {
-                match policy {
-                    Some(policy) => dispatch
+                match (policy, sampling) {
+                    (Some(policy), Some(sampling)) => dispatch
+                        .chat_with_sampling_and_tool_round_policy(
+                            request, "ignored", sampling, policy,
+                        )
+                        .await
+                        .unwrap(),
+                    (Some(policy), None) => dispatch
                         .chat_with_tool_round_policy(request, "ignored", None, policy)
                         .await
                         .unwrap(),
-                    None => dispatch.chat(request, "ignored", None).await.unwrap(),
+                    (None, _) => dispatch.chat(request, "ignored", None).await.unwrap(),
                 };
             }
         })
