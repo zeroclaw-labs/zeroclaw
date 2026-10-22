@@ -450,8 +450,10 @@ impl ScopedToolRegistry {
         }
     }
 
-    /// Whether this registry holds a tool that starts memory work for the
-    /// session: child runs, pipeline steps or SOP runs.
+    /// Whether this registry holds a native tool that starts memory work for
+    /// the session: child runs, pipeline steps or SOP runs. A tool a source
+    /// supplied is never one of them, whatever its name: routing does not
+    /// reach source tools.
     fn starts_memory_work(&self) -> bool {
         self.0.iter().any(|tool| {
             matches!(
@@ -461,17 +463,22 @@ impl ScopedToolRegistry {
                     | "sop_execute"
                     | "sop_advance"
                     | "sop_approve"
-            )
+            ) && !self.3.is_supplied_entry(tool.as_ref())
         })
     }
 
-    /// Refuse before anything moves: a registry that holds a memory-starting
-    /// tool but carries no route, or whose route is already pinned to another
-    /// plane, cannot take `memory`.
+    /// Refuse before anything moves: a registry that holds a native
+    /// memory-starting tool but carries no route, or whose route is already
+    /// pinned to another plane, cannot take `memory`. A supplied-only registry
+    /// holds no native tool to pin, so routing changes only the agent's own
+    /// memory there.
     pub(crate) fn check_session_memory_pin(
         &self,
         memory: &Arc<dyn zeroclaw_memory::Memory>,
     ) -> anyhow::Result<()> {
+        if self.2 == RegistryConstruction::SuppliedOnly {
+            return Ok(());
+        }
         match &self.5 {
             Some(route) => route.check_pin(memory),
             None if self.starts_memory_work() => anyhow::bail!(
@@ -497,6 +504,9 @@ impl ScopedToolRegistry {
         memory: Arc<dyn zeroclaw_memory::Memory>,
         security: Arc<SecurityPolicy>,
     ) -> anyhow::Result<()> {
+        if self.2 == RegistryConstruction::SuppliedOnly {
+            return Ok(());
+        }
         self.check_session_memory_pin(&memory)?;
         match &self.5 {
             Some(route) => route.pin(memory, security),
@@ -3193,6 +3203,68 @@ mod tests {
         .await
         .expect("assemble must not hang");
         out.registry.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    /// A routed handle over a fresh store, for the pin checks below.
+    fn pin_target() -> Arc<dyn zeroclaw_memory::Memory> {
+        Arc::new(zeroclaw_memory::PrincipalPlaneMemory::new(
+            Arc::new(zeroclaw_memory::NoneMemory::new("none")),
+            zeroclaw_api::memory_traits::PrincipalScope::new("user:alice"),
+        ))
+    }
+
+    /// A source tool named like a memory-starting native tool is not one.
+    /// A supplied-only registry pins nothing, and a native-compatibility
+    /// registry counts only the tools it did not take from a source.
+    #[test]
+    fn source_tools_named_like_memory_starters_do_not_refuse_the_pin() {
+        let security = Arc::new(SecurityPolicy::default());
+        for name in ["spawn_subagent", "execute_pipeline", "sop_execute"] {
+            let supplied_only = ScopedToolRegistry(
+                vec![Box::new(NamedSourceTool(name)) as Box<dyn Tool>],
+                None,
+                RegistryConstruction::SuppliedOnly,
+                Default::default(),
+                None,
+                None,
+            );
+            supplied_only
+                .check_session_memory_pin(&pin_target())
+                .unwrap_or_else(|e| panic!("supplied-only {name}: {e}"));
+            supplied_only
+                .pin_session_memory(pin_target(), Arc::clone(&security))
+                .unwrap_or_else(|e| panic!("supplied-only {name}: {e}"));
+
+            let mut projection = tools::NativeMemoryProjection::default();
+            let actual: Arc<dyn Tool> = Arc::new(NamedSourceTool(name));
+            projection.origins.mark_supplied(&actual);
+            let published = projection.publish(Arc::clone(&actual), None, true);
+            let native_compat = ScopedToolRegistry(
+                vec![published],
+                None,
+                RegistryConstruction::NativeCompat,
+                projection,
+                None,
+                None,
+            );
+            native_compat
+                .check_session_memory_pin(&pin_target())
+                .unwrap_or_else(|e| panic!("native-compat supplied {name}: {e}"));
+
+            // The same name as a native tool with no route is still refused.
+            let native = ScopedToolRegistry(
+                vec![Box::new(NamedSourceTool(name)) as Box<dyn Tool>],
+                None,
+                RegistryConstruction::NativeCompat,
+                Default::default(),
+                None,
+                None,
+            );
+            assert!(
+                native.check_session_memory_pin(&pin_target()).is_err(),
+                "a native {name} without a route must refuse the pin"
+            );
+        }
     }
 
     const SOURCE_DESCRIPTION: &str = "source tool reusing a native name";

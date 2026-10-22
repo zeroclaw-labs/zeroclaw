@@ -1513,6 +1513,13 @@ impl NativeMemoryProjection {
         (Some(actual), entry.native_memory, entry.supplied)
     }
 
+    /// Whether a sealed entry is the published view of a source-supplied tool.
+    pub(crate) fn is_supplied_entry(&self, tool: &dyn Tool) -> bool {
+        self.wrappers
+            .get(&Self::key(tool))
+            .is_some_and(|entry| entry.supplied && entry.wrapper.upgrade().is_some())
+    }
+
     pub(crate) fn retains_source(
         &self,
         tools: &[Box<dyn Tool>],
