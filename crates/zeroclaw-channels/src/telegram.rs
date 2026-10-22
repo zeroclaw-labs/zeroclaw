@@ -1108,13 +1108,13 @@ fn matching_backtick_span(line: &str) -> Option<usize> {
 
 fn take_math_span(line: &str) -> Option<(usize, &str)> {
     if let Some(rest) = line.strip_prefix("$$") {
-        let end = rest.find("$$")?;
+        let end = find_unescaped(rest, "$$")?;
         if end == 0 {
             return None;
         }
         Some((end + 4, &rest[..end]))
     } else if let Some(rest) = line.strip_prefix('$') {
-        let end = rest.find('$')?;
+        let end = find_unescaped(rest, "$")?;
         if end == 0 {
             return None;
         }
@@ -1133,13 +1133,37 @@ fn take_math_span(line: &str) -> Option<(usize, &str)> {
     }
 }
 
+/// Byte index of `delimiter` whose first byte is not escaped.
+///
+/// `$a\$b$` closes on the final dollar. The `\$` stays inside the span.
+fn find_unescaped(text: &str, delimiter: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index += 1;
+            if index < bytes.len() {
+                let next = text[index..].chars().next().unwrap_or('\0');
+                index += next.len_utf8();
+            }
+            continue;
+        }
+        if text[index..].starts_with(delimiter) {
+            return Some(index);
+        }
+        let ch = text[index..].chars().next().unwrap_or('\0');
+        index += ch.len_utf8();
+    }
+    None
+}
+
 fn rewrite_markdown_image(text: &str) -> Option<(usize, String)> {
     let rest = text.strip_prefix("![")?;
     let bracket_end = rest.find(']')?;
     let alt = &rest[..bracket_end];
     let after_bracket = rest.get(bracket_end + 1..)?;
     let url_body = after_bracket.strip_prefix('(')?;
-    let paren_end = url_body.find(')')?;
+    let paren_end = matching_paren_end(url_body)?;
     let url = &url_body[..paren_end];
     if url.is_empty() {
         return None;
@@ -1151,6 +1175,39 @@ fn rewrite_markdown_image(text: &str) -> Option<(usize, String)> {
     };
     let len = 2 + bracket_end + 1 + 1 + paren_end + 1;
     Some((len, replacement))
+}
+
+/// Byte index of the `)` that closes a markdown destination.
+///
+/// `![](https://example.com/a_(b).png)` keeps the parenthesis in the path.
+/// The wrapper's closer is the one that returns the depth to zero.
+fn matching_paren_end(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut depth = 1usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index += 1;
+            if index < bytes.len() {
+                let next = body[index..].chars().next().unwrap_or('\0');
+                index += next.len_utf8();
+            }
+            continue;
+        }
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        let ch = body[index..].chars().next().unwrap_or('\0');
+        index += ch.len_utf8();
+    }
+    None
 }
 
 /// Markdown passed to `sendRichMessage`. Strips math delimiters and image
@@ -14798,6 +14855,23 @@ mod tests {
         assert!(prepared.contains("echo \"$HOME$\""));
         assert!(prepared.contains("x^2"));
         assert!(!prepared.contains("$x^2$"));
+    }
+
+    #[test]
+    fn prepare_rich_markdown_keeps_parentheses_in_image_urls() {
+        let prepared = prepare_rich_markdown(
+            "See ![](https://example.com/a_(b).png) and ![plot](https://example.com/a_(b).png).",
+        );
+        assert_eq!(
+            prepared,
+            "See https://example.com/a_(b).png and [plot](https://example.com/a_(b).png)."
+        );
+    }
+
+    #[test]
+    fn prepare_rich_markdown_keeps_escaped_dollars_in_math() {
+        let prepared = prepare_rich_markdown("See $a\\$b$ and $$c\\$d$$. `$a\\$b$`");
+        assert_eq!(prepared, "See a\\$b and c\\$d. `$a\\$b$`");
     }
 
     #[test]
