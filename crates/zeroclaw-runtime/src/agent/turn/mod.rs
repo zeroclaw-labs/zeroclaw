@@ -4467,6 +4467,19 @@ async fn drive_live_sop_actions(
                                 let step_owner =
                                     run_owner.as_ref().or(reassembly.memory_owner.as_ref());
                                 let assembled = match reassembly.capabilities {
+                                    // The bound principal selects the step's provider
+                                    // credentials. Never pair them with another
+                                    // principal's memory and audit.
+                                    Some(bound)
+                                        if step_owner.is_some_and(|owner| {
+                                            bound.principal.as_ref().map(|p| p.as_str())
+                                                != Some(owner.principal_id.as_str())
+                                        }) =>
+                                    {
+                                        Err(anyhow::Error::msg(
+                                            "SOP step refused: the run's memory owner is not the principal this turn's capabilities resolve for",
+                                        ))
+                                    }
                                     Some(bound) => {
                                         assemble_owned_execution_with_capabilities(
                                             execution_config.as_deref().unwrap_or(reassembly.config),
@@ -9136,7 +9149,9 @@ mod sop_step_reassembly_tests {
                 memory: Arc::new(FixedMemory(Arc::clone(&shared))),
                 ..crate::composition::RuntimeCapabilities::config_backed_unobserved()
             },
-            principal: None,
+            principal: Some(zeroclaw_api::principal::PrincipalId(
+                "user:alice".to_string(),
+            )),
         };
         let (engine, _run_id, action) = start_single_cross_agent_step("stepper");
         let owner = PrincipalScope::new("user:alice").with_agent(Some("outer".to_string()));
@@ -9195,6 +9210,85 @@ mod sop_step_reassembly_tests {
                 .is_some(),
             "the bound step writes the owner's plane for the step agent"
         );
+    }
+
+    /// A bound turn's principal selects the step's provider credentials. A
+    /// step whose memory owner is another principal, or an owned step on an
+    /// anonymous bound turn, is refused before any provider is asked.
+    #[tokio::test]
+    async fn a_bound_cross_agent_step_refuses_a_foreign_memory_owner() {
+        use crate::composition::test_support::{
+            NoTools, RecordingMemory, RecordingProviders, recording_capabilities,
+        };
+        use zeroclaw_api::memory_traits::PrincipalScope;
+
+        for principal in [
+            Some(zeroclaw_api::principal::PrincipalId(
+                "user:operator".to_string(),
+            )),
+            None,
+        ] {
+            let providers = Arc::new(RecordingProviders::default());
+            let memory = Arc::new(RecordingMemory::default());
+            let bound = crate::composition::BoundCapabilities {
+                capabilities: recording_capabilities(
+                    Arc::clone(&providers),
+                    Arc::clone(&memory),
+                    Arc::new(NoTools),
+                ),
+                principal: principal.clone(),
+            };
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = stepper_config(tmp.path());
+            let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+            let handle = SopStepReassembly {
+                config: &config,
+                capabilities: Some(&bound),
+                live_config: None,
+                memory_owner: Some(
+                    PrincipalScope::new("user:alice").with_agent(Some("outer".to_string())),
+                ),
+            };
+            let parent_tools =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+            let mut history = vec![ChatMessage::system("parent system prompt")];
+            let mut exec_cache = std::collections::HashMap::new();
+            drive_step(
+                Arc::clone(&engine),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                None,
+                Some("outer"),
+                Some(handle),
+                None,
+                &mut exec_cache,
+            )
+            .await;
+
+            let result = step1_result(&engine, &run_id);
+            assert_ne!(
+                result.status,
+                crate::sop::types::SopStepStatus::Completed,
+                "{principal:?}: {result:?}"
+            );
+            assert!(
+                exec_cache.is_empty(),
+                "{principal:?}: nothing was assembled"
+            );
+            assert!(
+                providers.seen.lock().is_empty(),
+                "{principal:?}: no provider is asked for another principal's step"
+            );
+            assert!(
+                memory.agents.lock().is_empty(),
+                "{principal:?}: no memory is opened for the refused step"
+            );
+        }
     }
 
     /// A run owned by alice, driven in a session that is not hers (an
