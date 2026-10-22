@@ -471,7 +471,10 @@ impl ScopedToolRegistry {
     /// memory-starting tool but carries no route, or whose route is already
     /// pinned to another plane, cannot take `memory`. A supplied-only registry
     /// holds no native tool to pin, so routing changes only the agent's own
-    /// memory there.
+    /// memory there. An owned session needs a registry built by the native
+    /// factory (`defaults::native_compat_registry`, directly or wrapped) or a
+    /// supplied-only registry: a native recipe that hand-builds its tools
+    /// carries no route and is refused here.
     pub(crate) fn check_session_memory_pin(
         &self,
         memory: &Arc<dyn zeroclaw_memory::Memory>,
