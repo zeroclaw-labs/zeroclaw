@@ -2145,12 +2145,11 @@ impl Agent {
                 current.principal_id
             );
         }
-        if let Some(delegate) = &self.delegate_tool {
-            delegate.bind_principal_scope(scope.clone())?;
-        } else if self
-            .tools
-            .iter()
-            .any(|tool| tool.name() == crate::tools::DelegateTool::NAME)
+        if self.delegate_tool.is_none()
+            && self
+                .tools
+                .iter()
+                .any(|tool| tool.name() == crate::tools::DelegateTool::NAME)
         {
             anyhow::bail!("owned session has a delegate tool without a principal binding handle");
         }
@@ -2160,6 +2159,11 @@ impl Agent {
         ));
         self.tools
             .rebind_memory_tools(&self.memory, Arc::clone(&routed), &self.memory_security)?;
+        // The delegate binds after the memory tools, so a routing the memory
+        // binding refuses leaves the delegate unbound as well.
+        if let Some(delegate) = &self.delegate_tool {
+            delegate.bind_principal_scope(scope.clone())?;
+        }
         // Commit only after every genuine capture's shared owner accepted its
         // one-time binding. A used/foreign owner leaves the Agent unchanged.
         self.memory = routed;
@@ -6761,6 +6765,58 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// A routing the memory binding refuses (a native memory tool already ran)
+    /// must not bind the delegate either: its children would build their
+    /// memory for an owner the session never took.
+    #[tokio::test]
+    async fn refused_routing_leaves_the_delegate_unbound() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let shared: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::SqliteMemory::new("used", tmp.path()).unwrap());
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let delegate = Arc::new(crate::tools::DelegateTool::new(
+            std::collections::HashMap::new(),
+            None,
+            Arc::clone(&security),
+        ));
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }))
+            .tools(native_memory_registry(Arc::clone(&shared), Arc::clone(&security), &[]).await)
+            .delegate_tool(Some(Arc::clone(&delegate)))
+            .memory(Arc::clone(&shared))
+            .memory_security(Arc::clone(&security))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        let used = agent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "memory_store")
+            .unwrap()
+            .execute(serde_json::json!({"key": "before", "content": "shared-before"}))
+            .await
+            .unwrap();
+        assert!(used.success, "{used:?}");
+
+        assert!(
+            agent
+                .route_memory_to_principal(PrincipalScope::new("owner:late"))
+                .is_err()
+        );
+        assert!(agent.memory_principal().is_none());
+        assert!(
+            delegate
+                .bind_principal_scope(PrincipalScope::new("owner:other"))
+                .is_ok(),
+            "a refused routing must leave the delegate unbound"
         );
     }
 
