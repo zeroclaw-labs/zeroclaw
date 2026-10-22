@@ -1697,6 +1697,8 @@ jobs:
         with:
           toolchain: 1.98.0
           components: clippy
+          # The CLI-only set enables plugins-wasm, whose tests build the tool fixture for this target.
+          targets: wasm32-wasip2
       - uses: ./.github/actions/rust-cache
         with:
           use-blacksmith: 'true'
