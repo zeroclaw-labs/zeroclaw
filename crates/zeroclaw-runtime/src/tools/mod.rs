@@ -229,14 +229,6 @@ pub struct ArcToolRef(pub Arc<dyn Tool>);
 
 #[async_trait]
 impl Tool for ArcToolRef {
-    fn builtin_target_name(&self) -> Option<&str> {
-        self.0.builtin_target_name()
-    }
-
-    fn with_builtin_target(&self, target: Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
-        self.0.with_builtin_target(target)
-    }
-
     fn requires_unrestricted_principal(&self) -> bool {
         self.0.requires_unrestricted_principal()
     }
@@ -375,14 +367,6 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
-    fn builtin_target_name(&self) -> Option<&str> {
-        self.inner.builtin_target_name()
-    }
-
-    fn with_builtin_target(&self, target: Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
-        self.inner.with_builtin_target(target)
-    }
-
     fn requires_unrestricted_principal(&self) -> bool {
         self.inner.requires_unrestricted_principal()
     }
@@ -8747,34 +8731,6 @@ mod wrapper_spec_forwarding_tests {
             "ArcDelegatingTool must forward spec() so the inner Arc-shared \
              schema survives; the trait default deep-clones it every call"
         );
-    }
-
-    #[test]
-    fn arc_delegating_tool_forwards_builtin_target_identity() {
-        let spec: crate::skills::SkillTool = serde_json::from_value(serde_json::json!({
-            "name": "use", "description": "fixture", "kind": "builtin",
-            "target": "arc_schema_tool"
-        }))
-        .unwrap();
-        let alias: Arc<dyn Tool> = Arc::new(SkillBuiltinTool::new(
-            "bridge",
-            &spec,
-            Arc::new(ArcSchemaTool::new()),
-            HashMap::new(),
-        ));
-        let boxed = ArcDelegatingTool::boxed(Arc::clone(&alias));
-
-        assert_eq!(
-            boxed.builtin_target_name(),
-            Some("arc_schema_tool"),
-            "memory routing finds aliases by their builtin target, so the \
-             wrapper must report the alias's target"
-        );
-        let rebuilt = boxed
-            .with_builtin_target(Arc::new(ArcSchemaTool::new()))
-            .expect("the wrapper must let routing rebuild the alias");
-        assert_eq!(rebuilt.name(), alias.name());
-        assert_eq!(rebuilt.builtin_target_name(), Some("arc_schema_tool"));
     }
 }
 

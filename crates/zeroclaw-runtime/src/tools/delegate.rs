@@ -5813,14 +5813,6 @@ impl ::zeroclaw_api::attribution::Attributable for ToolArcRef {
 #[cfg(test)]
 #[async_trait]
 impl Tool for ToolArcRef {
-    fn builtin_target_name(&self) -> Option<&str> {
-        self.inner.builtin_target_name()
-    }
-
-    fn with_builtin_target(&self, target: Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
-        self.inner.with_builtin_target(target)
-    }
-
     fn requires_unrestricted_principal(&self) -> bool {
         self.inner.requires_unrestricted_principal()
     }
