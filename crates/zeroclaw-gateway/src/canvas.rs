@@ -157,10 +157,12 @@ pub async fn handle_canvas_clear(
 /// WS /ws/canvas/:id — real-time canvas updates.
 pub async fn handle_ws_canvas(
     State(state): State<AppState>,
+    dashboard: Option<axum::Extension<std::sync::Arc<crate::dashboard_session::DashboardAuth>>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    let mut session_watch = None;
     // Auth check (same pattern as ws::handle_ws_chat)
     if state.pairing.require_pairing() {
         let token = headers
@@ -181,12 +183,28 @@ pub async fn handle_ws_canvas(
             })
             .unwrap_or("");
 
-        if !state.pairing.is_authenticated(token) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization header or Sec-WebSocket-Protocol bearer",
+        // A signed-in administrator session presents no token; the feed
+        // ends when the session stops admitting it.
+        let session = if token.is_empty() {
+            crate::dashboard_session::operator_session(
+                dashboard.as_ref().map(|axum::Extension(auth)| auth),
+                &state,
             )
-                .into_response();
+        } else {
+            crate::dashboard_session::OperatorSession::Absent
+        };
+        match session {
+            crate::dashboard_session::OperatorSession::Admitted(watch) => session_watch = watch,
+            crate::dashboard_session::OperatorSession::Denied(denied) => return denied,
+            crate::dashboard_session::OperatorSession::Absent => {
+                if !state.pairing.is_authenticated(token) {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "Unauthorized — provide Authorization header or Sec-WebSocket-Protocol bearer",
+                    )
+                        .into_response();
+                }
+            }
         }
     }
 
@@ -203,11 +221,16 @@ pub async fn handle_ws_canvas(
         ws
     };
 
-    ws.on_upgrade(move |socket| handle_canvas_socket(socket, state, id))
+    ws.on_upgrade(move |socket| handle_canvas_socket(socket, state, id, session_watch))
         .into_response()
 }
 
-async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: String) {
+async fn handle_canvas_socket(
+    socket: WebSocket,
+    state: AppState,
+    canvas_id: String,
+    mut session_watch: Option<crate::dashboard_session::SessionWatch>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     // Subscribe to canvas updates
@@ -240,9 +263,10 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
     });
     let _ = sender.send(Message::Text(ack.to_string().into())).await;
 
-    // Spawn a task that forwards broadcast updates to the WebSocket
+    // Forward broadcast updates to the WebSocket. It never completes on its
+    // own: once the feed ends the socket stays open until the client leaves.
     let canvas_id_clone = canvas_id.clone();
-    let send_task = zeroclaw_spawn::spawn!(async move {
+    let forward = async {
         loop {
             match rx.recv().await {
                 Ok(frame) => {
@@ -271,16 +295,26 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+        std::future::pending::<()>().await;
+    };
 
     // Read loop: we mostly ignore incoming messages but handle close/ping
-    while let Some(msg) = receiver.next().await {
-        match msg {
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => {} // Ignore all other messages (pings are handled by axum)
+    let read_loop = async {
+        while let Some(msg) = receiver.next().await {
+            match msg {
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {} // Ignore all other messages (pings are handled by axum)
+            }
         }
+    };
+    // A dashboard session that ends, or loses its access, ends the feed with
+    // the session's close code.
+    let lost = tokio::select! {
+        () = read_loop => None,
+        () = forward => None,
+        code = crate::dashboard_session::session_lost(&mut session_watch, &state) => Some(code),
+    };
+    if let Some(code) = lost {
+        crate::ws::close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
     }
-
-    // Abort the send task when the connection is closed
-    send_task.abort();
 }
