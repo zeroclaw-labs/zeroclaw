@@ -1589,8 +1589,14 @@ pub async fn run(
     let __zc_alias = agent_alias.to_string();
     let __zc_attribution_span =
         ::zeroclaw_log::attribution_span!(&crate::agent::AgentAttribution(__zc_alias.as_str()));
+    // The scope span must record the attribution span as its parent: the
+    // log layer walks recorded span parents (leaf→root), so a span merely
+    // `.instrument()`ed around the body is invisible to events emitted
+    // under this scope span — `agent_alias` would be lost on every event
+    // in the body (tool/provider records included).
     let __zc_scope_span = ::zeroclaw_log::info_span!(
         target: "zeroclaw_log_internal_scope",
+        parent: &__zc_attribution_span,
         "zeroclaw_scope",
         risk_profile = %agent.risk_profile,
         runtime_profile = %agent.runtime_profile,
@@ -3669,8 +3675,14 @@ async fn process_message_inner(
     let __zc_session_id = session_id.map(str::to_string);
     let __zc_attribution_span =
         ::zeroclaw_log::attribution_span!(&crate::agent::AgentAttribution(__zc_alias.as_str()));
+    // The scope span must record the attribution span as its parent: the
+    // log layer walks recorded span parents (leaf→root), so a span merely
+    // `.instrument()`ed around the body is invisible to events emitted
+    // under this scope span — `agent_alias` would be lost on every event
+    // in the body (tool/provider records included).
     let __zc_scope_span = ::zeroclaw_log::info_span!(
         target: "zeroclaw_log_internal_scope",
+        parent: &__zc_attribution_span,
         "zeroclaw_scope",
         risk_profile = %agent.risk_profile,
         runtime_profile = %agent.runtime_profile,
@@ -19403,6 +19415,87 @@ Let me check the result."#;
         assert_eq!(
             value["zeroclaw"]["agent_alias"], "trimtest",
             "trim record must inherit agent_alias from the agent attribution span, got: {value}"
+        );
+    }
+
+    /// Regression: `agent::run` / `process_message_inner` build the body as
+    /// `body.instrument(scope_span).instrument(attribution_span)`. The log
+    /// layer walks *recorded span parents* (leaf→root), so the scope span
+    /// must name the attribution span as its parent — otherwise events
+    /// emitted under the scope span (every tool/provider record in the
+    /// turn) never reach the attribution span and `agent_alias` is lost.
+    /// Cron-triggered runs surfaced this: their events carried
+    /// `cron_job_id` and `risk_profile` but no `agent_alias`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn run_body_scope_span_keeps_agent_attribution_reachable() {
+        use ::zeroclaw_log::Instrument;
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        // Mirror the production wiring in `run`/`process_message_inner`:
+        // attribution + scope spans created at the callsite, body
+        // instrumented scope-in-attribution, nested tool span inside.
+        let attribution =
+            zeroclaw_log::attribution_span!(&crate::agent::AgentAttribution("attributiontest"));
+        let scope = zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            parent: &attribution,
+            "zeroclaw_scope",
+            risk_profile = "test-risk",
+        );
+        async {
+            let tool_span = zeroclaw_log::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "zeroclaw_scope",
+                tool = "attribution_probe",
+            );
+            let _guard = tool_span.enter();
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "attribution probe tool complete"
+            );
+        }
+        .instrument(scope)
+        .instrument(attribution)
+        .await;
+
+        let mut probe = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while probe.is_none() && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.contains("attribution probe tool complete"))
+                    {
+                        probe = Some(value);
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = probe.expect("probe event must be captured");
+        assert_eq!(
+            value["zeroclaw"]["agent_alias"], "attributiontest",
+            "nested tool event must inherit agent_alias from the agent attribution span, \
+             got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["risk_profile"], "test-risk",
+            "nested tool event must keep scope-span fields, got: {value}"
         );
     }
 
