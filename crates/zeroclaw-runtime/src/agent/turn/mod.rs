@@ -19,6 +19,7 @@ pub(crate) mod progress;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
+pub(crate) mod repetition;
 pub(crate) mod results_collect;
 pub(crate) mod steering;
 pub(crate) mod stream_consume;
@@ -1597,25 +1598,56 @@ pub(crate) enum InitialIngressSubject<'a> {
 
 /// `reported_usage` is the last provider-reported usage from a run that
 /// yielded with `SteeringPending`, so the resumed run calibrates its first
-/// dispatch exactly as the yielded run would have.
+/// dispatch exactly as the yielded run would have. Agent owns the repetition
+/// guard for its API turn, including steering/model-switch reentry.
 pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     p: ToolLoop<'a>,
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage)
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
+        run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard),
+    )))
+}
+
+/// Non-streamed Agent turns own the guard without steering ingress.
+/// Low-level and nested SOP callers use the public wrapper without a guard.
+pub(crate) fn run_tool_call_loop_with_guard<'a>(
+    p: ToolLoop<'a>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
+        run_tool_call_loop_impl(p, None, None, repetition_guard),
+    )))
+}
+
+/// Recovery evidence owned by one logical turn, including model switches.
+/// Contains only hashed completed-dispatch evidence, never tool arguments.
+#[derive(Default)]
+pub struct ToolLoopRecovery(std::sync::Mutex<repetition::RepetitionGuard>);
+
+/// Run a channel turn with the same result-aware recovery used by Agent APIs.
+pub fn run_tool_call_loop_with_recovery<'a>(
+    p: ToolLoop<'a>,
+    recovery: &'a ToolLoopRecovery,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    run_tool_call_loop_with_guard(p, Some(&recovery.0))
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
+    Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
+        run_tool_call_loop_impl(p, None, None, None),
+    )))
 }
 
 async fn run_tool_call_loop_impl<'a>(
     mut p: ToolLoop<'a>,
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> Result<String> {
     let model_switch_state = p
         .exec
@@ -1813,10 +1845,17 @@ async fn run_tool_call_loop_impl<'a>(
         .collect();
     let mut consecutive_identical_outputs: usize = 0;
     let mut last_tool_output_hash: Option<u64> = None;
-
+    let mut warned_call = repetition_guard
+        .filter(|_| pacing.loop_detection_enabled)
+        .and_then(|guard| {
+            guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recovery_call_hash()
+        });
     let mut loop_detector = crate::agent::loop_detector::LoopDetector::new(
         crate::agent::loop_detector::LoopDetectorConfig {
-            enabled: pacing.loop_detection_enabled,
+            enabled: pacing.loop_detection_enabled && repetition_guard.is_none(),
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
             no_progress_min_calls: pacing.loop_detection_no_progress_min_calls,
@@ -1877,6 +1916,7 @@ async fn run_tool_call_loop_impl<'a>(
     // One `BudgetWarning` per turn at most (see `announce_budget_warning`).
     let mut budget_warning_sent = false;
 
+    let mut completion_limit = max_iter::CompletionLimit::LocalIterations(max_iterations);
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
         // Re-resolved every iteration, against the tools callable *right now*.
@@ -3266,10 +3306,11 @@ async fn run_tool_call_loop_impl<'a>(
         }
 
         let PreparedToolCalls {
+            preflight_loop_stopped,
             mut ordered_results,
-            executable_indices,
-            executable_calls,
-            stream_calls,
+            mut executable_indices,
+            mut executable_calls,
+            mut stream_calls,
         } = prepare_tool_calls(
             &ctx,
             tools_registry,
@@ -3279,8 +3320,81 @@ async fn run_tool_call_loop_impl<'a>(
             &mut prompt_approval_tool_signatures,
             iteration,
             knobs.dedup_enabled,
+            Some(&loop_detector),
         )
         .await?;
+
+        // Hooks and approvals have resolved the effective call. Admit one
+        // recovery dispatch for the warned identity; record the remaining
+        // identical requests as synthetic pairs rather than executing them.
+        if let Some(warned_call) = warned_call {
+            let mut recovery_admitted = false;
+            let dispatch = ToolDispatchContext {
+                tools_registry,
+                activated_tools,
+                excluded_tools,
+                model_switch_callback: model_switch_callback.as_ref(),
+            };
+            let mut retained_indices = Vec::new();
+            let mut retained_calls = Vec::new();
+            let mut retained_stream_calls = Vec::new();
+            for ((call_idx, call), stream_call) in executable_indices
+                .drain(..)
+                .zip(executable_calls.drain(..))
+                .zip(stream_calls.drain(..))
+            {
+                let recovery =
+                    crate::agent::tool_execution::dispatch_tool_name(&call.name, dispatch)
+                        .is_some_and(|name| {
+                            repetition::call_signature(&name, &call.arguments) == warned_call
+                        });
+                if recovery && recovery_admitted {
+                    call_prep::abandon_unexecuted_prepared_contexts(
+                        &ctx,
+                        iteration,
+                        &[call_idx],
+                        std::slice::from_ref(&call),
+                        &[],
+                    )
+                    .await;
+                    let outcome = crate::agent::tool_execution::ToolExecutionOutcome {
+                        output: crate::i18n::get_required_cli_string(
+                            "turn-repeated-failure-retry-skipped",
+                        ),
+                        output_data: None,
+                        success: false,
+                        error_reason: None,
+                        duration: std::time::Duration::ZERO,
+                        receipt: None,
+                        attachments: Vec::new(),
+                    };
+                    if let Some(tx) = ctx.event_tx {
+                        events::emit_tool_call_pair(tx, &call, &outcome).await;
+                    }
+                    if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call) {
+                        let _ = tx
+                            .send(StreamDelta::ToolComplete {
+                                tool: call.name.clone(),
+                                arguments: stream_call.arguments,
+                                tool_provenance: stream_call.tool_provenance,
+                                secs: 0,
+                                success: false,
+                                error: Some(outcome.output.clone()),
+                            })
+                            .await;
+                    }
+                    ordered_results[call_idx] = Some((call.name, call.tool_call_id, outcome));
+                } else {
+                    recovery_admitted |= recovery;
+                    retained_indices.push(call_idx);
+                    retained_calls.push(call);
+                    retained_stream_calls.push(stream_call);
+                }
+            }
+            executable_indices = retained_indices;
+            executable_calls = retained_calls;
+            stream_calls = retained_stream_calls;
+        }
 
         // Hooks and preparation may rewrite tool names or arguments. Decide
         // parallel eligibility from the final executable calls so policy is
@@ -3379,12 +3493,33 @@ async fn run_tool_call_loop_impl<'a>(
             }
         }
 
+        let repetition_disposition = if let Some(guard) =
+            repetition_guard.filter(|_| pacing.loop_detection_enabled && !cancelled_mid_batch)
+        {
+            let mut guard = guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let disposition = guard.observe_round(
+                &executed_completed_calls,
+                &executed_completed_outcomes,
+                &loop_ignore_tools,
+                pacing.loop_detection_max_repeats,
+            );
+            warned_call = guard.recovery_call_hash();
+            disposition
+        } else {
+            repetition::RepetitionDisposition::default()
+        };
+
         record_executed_outcomes(
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
             &executed_completed_stream_calls,
-            executed_completed_outcomes,
+            executed_completed_outcomes
+                .into_iter()
+                .map(|completed| completed.outcome)
+                .collect(),
             &mut ordered_results,
             iteration,
         )
@@ -3452,6 +3587,7 @@ async fn run_tool_call_loop_impl<'a>(
             individual_results,
             tool_results,
             detection_relevant_output,
+            loop_stopped,
         } = collect_tool_results(
             ordered_results,
             &tool_calls,
@@ -3465,7 +3601,9 @@ async fn run_tool_call_loop_impl<'a>(
             turn_id,
         )?;
 
-        if !cancelled_mid_batch {
+        let loop_stopped = preflight_loop_stopped || loop_stopped;
+
+        if !cancelled_mid_batch && !loop_stopped && repetition_guard.is_none() {
             check_identical_output_abort(
                 &detection_relevant_output,
                 loop_started_at,
@@ -3488,6 +3626,33 @@ async fn run_tool_call_loop_impl<'a>(
 
         if cancelled_mid_batch {
             return Err(ToolLoopCancelled.into());
+        }
+
+        if let Some(key) = repetition_disposition.message_key {
+            if cancellation_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                return Err(ToolLoopCancelled.into());
+            }
+            let reason = crate::i18n::get_required_cli_string(key);
+            let visible_reason = format!("{reason}\n\n");
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &visible_reason).await;
+            if let Some(ref tx) = on_delta {
+                events::stream_text_posthoc_chunks(
+                    tx,
+                    &visible_reason,
+                    cancellation_token.as_ref(),
+                )
+                .await?;
+            }
+            accumulated_display_text.push_str(&visible_reason);
+            if repetition_disposition.close {
+                turn_state.push_dual(ChatMessage::assistant(reason));
+                *history_has_trim_breadcrumb = turn_state.crumb_present;
+                return Ok(accumulated_display_text);
+            }
+            turn_state.push_dual(ChatMessage::system(reason));
         }
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
@@ -3547,6 +3712,13 @@ async fn run_tool_call_loop_impl<'a>(
             turn_state.mark_all_synced();
         }
 
+        // A completed tool may have queued authorized SOP work in this batch.
+        // Settle that queue before closing, rather than orphaning a started run.
+        if loop_stopped {
+            completion_limit = max_iter::CompletionLimit::LoopDetected;
+            break;
+        }
+
         pending_reported_usage = reported_input_tokens.map(|reported| ReportedRequestUsage {
             provider_name: served_provider.clone(),
             model: served_model_key.to_string(),
@@ -3573,7 +3745,7 @@ async fn run_tool_call_loop_impl<'a>(
         temperature,
         pacing,
         cancellation_token.as_ref(),
-        max_iter::CompletionLimit::LocalIterations(max_iterations),
+        completion_limit,
         accumulated_display_text,
         turn_id,
         knobs,
@@ -8282,7 +8454,7 @@ mod sop_step_reassembly_tests {
         start_single_step_with_capability(Some(step_agent), None)
     }
 
-    fn start_single_step_with_capability(
+    pub(super) fn start_single_step_with_capability(
         step_agent: Option<&str>,
         capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     ) -> (
@@ -9727,6 +9899,221 @@ mod tool_lifecycle_abandonment_tests {
             served_route_sink: None,
         })
         .await
+    }
+
+    async fn run_loop_review_scenario(
+        provider: &ScriptedProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        hooks: Option<&crate::hooks::HookRunner>,
+        history: &mut Vec<ChatMessage>,
+        knobs: &LoopKnobs,
+    ) -> anyhow::Result<String> {
+        let observer = &NoopObserver;
+        let pacing = &zeroclaw_config::schema::PacingConfig::default();
+        let turn_id = "loop-review";
+        let parallel_tools = false;
+        let cancellation_token = None;
+        let context_token_budget = 0;
+        let image_cache = None;
+        let mut crumb_present = false;
+        let mut injected_preamble = None;
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    dispatch_model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry,
+                observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing,
+                strict_tool_parsing: false,
+                parallel_tools,
+                max_tool_result_chars: 0,
+                context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                    context_token_budget,
+                    ..zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0)
+                },
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs,
+                security: None,
+            },
+            history,
+            history_has_trim_breadcrumb: &mut crumb_present,
+            injected_memory_preamble: &mut injected_preamble,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+            served_route_sink: None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn preflight_refusal_survives_hook_cancelled_result_before_it() {
+        let repeated = |id: &str| tool_call(id, "repeat", serde_json::json!({"n":1}));
+        let response = |tool_calls| ChatResponse {
+            text: None,
+            tool_calls,
+            usage: None,
+            reasoning_content: None,
+        };
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![
+                response(vec![repeated("a-0"), repeated("a-1"), repeated("a-2")]),
+                response(vec![
+                    tool_call("b", "cancelled", serde_json::json!({})),
+                    repeated("a-3"),
+                ]),
+            ]),
+        };
+        let tools = registry_with(vec![
+            Box::new(EchoTool {
+                name: "repeat".into(),
+            }),
+            Box::new(EchoTool {
+                name: "cancelled".into(),
+            }),
+        ]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let hooks = lifecycle_runner(events, vec!["cancelled".into()]);
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("run")];
+        let output = run_loop_review_scenario(
+            &provider,
+            &tools,
+            Some(&hooks),
+            &mut history,
+            &LoopKnobs {
+                dedup_enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("closeout");
+        assert!(
+            output.contains(&crate::i18n::get_required_cli_string("turn-loop-detected")),
+            "a refused dispatch stays terminal after an unrelated cancelled result: {output}"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content.contains("Refused repeated tool"))
+        );
+    }
+
+    struct QueueSopForLoopReview {
+        engine: Arc<Mutex<crate::sop::SopEngine>>,
+        action: crate::sop::types::SopRunAction,
+    }
+    impl zeroclaw_api::attribution::Attributable for QueueSopForLoopReview {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "queue_sop"
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for QueueSopForLoopReview {
+        fn name(&self) -> &str {
+            "queue_sop"
+        }
+        fn description(&self) -> &str {
+            "queue a test SOP action"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            crate::sop::executor::enqueue_live_action(Arc::clone(&self.engine), None, &self.action);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "queued".into(),
+                error: None,
+            })
+        }
+    }
+    #[tokio::test]
+    async fn loop_closeout_settles_sop_queued_by_a_completed_sibling_tool() {
+        let (engine, run_id, action) =
+            super::sop_step_reassembly_tests::start_single_step_with_capability(None, None);
+        let mut calls: Vec<_> = (0..4)
+            .map(|i| tool_call(&format!("repeat-{i}"), "repeat", serde_json::json!({"n":1})))
+            .collect();
+        calls.push(tool_call("sop", "queue_sop", serde_json::json!({})));
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: calls,
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let tools = registry_with(vec![
+            Box::new(EchoTool {
+                name: "repeat".into(),
+            }),
+            Box::new(QueueSopForLoopReview {
+                engine: Arc::clone(&engine),
+                action,
+            }),
+        ]);
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("run")];
+        let output = run_loop_review_scenario(
+            &provider,
+            &tools,
+            None,
+            &mut history,
+            &LoopKnobs {
+                dedup_enabled: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("closeout");
+        assert!(output.contains(&crate::i18n::get_required_cli_string("turn-loop-detected")));
+        let engine = engine.lock().expect("engine lock");
+        let run = engine.get_run(&run_id).expect("retained run");
+        assert_eq!(run.status, crate::sop::types::SopRunStatus::Completed);
+        assert_eq!(
+            run.step_results.len(),
+            1,
+            "queued SOP step cannot disappear at closeout"
+        );
+        assert_eq!(
+            run.step_results[0].status,
+            crate::sop::types::SopStepStatus::Completed
+        );
     }
 
     fn registry_with(

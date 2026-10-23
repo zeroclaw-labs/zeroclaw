@@ -16105,6 +16105,12 @@ pub struct ChannelsConfig {
     /// not forwarded as individual channel messages. Default: `false`.
     #[serde(default = "default_false")]
     pub show_tool_calls: bool,
+    /// Periodic plain-text liveness notices during channel turns. Zero disables
+    /// them (default). Nonzero values are clamped to 15..3600 seconds. Notices
+    /// contain no tool arguments, model reasoning or completion claims.
+    #[serde(default)]
+    pub message_progress_interval_secs: u64,
+
     /// Notice mode for ordinary same-family, different-model fallback: `off`
     /// (default), `redacted`, or `detailed`. Applies globally to all orchestrated
     /// channels and is read from live config at outbound delivery. Detailed
@@ -16575,6 +16581,7 @@ impl Default for ChannelsConfig {
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
+            message_progress_interval_secs: 0,
             model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
@@ -33795,6 +33802,7 @@ auto_save = true
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
+                message_progress_interval_secs: 0,
                 model_fallback_notice: ModelFallbackNotice::default(),
                 session_persistence: true,
                 session_backend: default_session_backend(),
@@ -36218,6 +36226,7 @@ allowed_users = ["@u:matrix.org"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            message_progress_interval_secs: 0,
             model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),
@@ -36837,6 +36846,7 @@ allowed_numbers = ["+1", "+2"]
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
+            message_progress_interval_secs: 0,
             model_fallback_notice: ModelFallbackNotice::default(),
             session_persistence: true,
             session_backend: default_session_backend(),

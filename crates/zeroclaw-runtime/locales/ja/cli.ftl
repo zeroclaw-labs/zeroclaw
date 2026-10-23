@@ -1355,3 +1355,7 @@ channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
 tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。
+
+# Generated with the official Fluent fill workflow for channel turn progress.
+channel-runtime-task-deadline = ⚠️ タスクが処理期限に達しました。一部のアクションは完了している可能性があります。再試行する前にそれらの状態を確認してください。
+channel-runtime-still-working = リクエストを処理中です（{ $seconds } 秒経過）。まだ最終結果はありません。
