@@ -146,6 +146,9 @@ mod tests {
         };
 
         let lark = LarkConfig {
+            ack_reaction_in_progress: None,
+            ack_reaction_done: None,
+            ack_reaction_error: None,
             enabled: true,
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),

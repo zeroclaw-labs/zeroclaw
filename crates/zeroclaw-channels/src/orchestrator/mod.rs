@@ -9083,12 +9083,119 @@ fn resolve_channel_ack_reactions(
     }
 }
 
+/// Acknowledgement emoji lifecycle resolved for one channel message.
+///
+/// The in-progress emoji is added on receipt; on completion it is withdrawn and
+/// the outcome emoji takes its place. An empty string disables that step, so
+/// `ack_reaction_done = ""` withdraws the acknowledgement and adds nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelAckEmojis {
+    in_progress: String,
+    done: String,
+    error: String,
+}
+
+/// Which configured outcome emoji to leave behind once the in-progress
+/// acknowledgement is withdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckCompletion {
+    /// The turn completed successfully.
+    Done,
+    /// The turn failed.
+    Error,
+}
+
+/// Resolve the effective acknowledgement emoji set for a channel message.
+///
+/// Alias-scoped overrides (`[channels.slack.<alias>]`,
+/// `[channels.matrix.<alias>]`, `[channels.lark.<alias>]`) win field by field
+/// over the global `[channels]` values, which in turn fall back to the
+/// documented defaults. An unset override inherits the global value.
+fn resolve_channel_ack_emojis(
+    config: &zeroclaw_config::schema::Config,
+    channel: &str,
+    alias: Option<&str>,
+) -> ChannelAckEmojis {
+    let channels = &config.channels;
+    let overrides = match (channel, alias) {
+        ("slack", Some(alias)) => channels.slack.get(alias).map(|c| {
+            (
+                c.ack_reaction_in_progress.as_deref(),
+                c.ack_reaction_done.as_deref(),
+                c.ack_reaction_error.as_deref(),
+            )
+        }),
+        ("matrix", Some(alias)) => channels.matrix.get(alias).map(|c| {
+            (
+                c.ack_reaction_in_progress.as_deref(),
+                c.ack_reaction_done.as_deref(),
+                c.ack_reaction_error.as_deref(),
+            )
+        }),
+        ("lark" | "feishu", Some(alias)) => channels.lark.get(alias).map(|c| {
+            (
+                c.ack_reaction_in_progress.as_deref(),
+                c.ack_reaction_done.as_deref(),
+                c.ack_reaction_error.as_deref(),
+            )
+        }),
+        _ => None,
+    }
+    .unwrap_or((None, None, None));
+    let pick = |override_value: Option<&str>, global: &str| -> String {
+        override_value.unwrap_or(global).to_string()
+    };
+    ChannelAckEmojis {
+        in_progress: pick(overrides.0, &channels.ack_reaction_in_progress),
+        done: pick(overrides.1, &channels.ack_reaction_done),
+        error: pick(overrides.2, &channels.ack_reaction_error),
+    }
+}
+
+/// Withdraw an acknowledgement reaction. A configured empty emoji means no
+/// reaction was ever added, so there is nothing to remove.
+async fn withdraw_ack(channel: &dyn Channel, target: &str, message_id: &str, emoji: &str) {
+    if emoji.is_empty() {
+        return;
+    }
+    let _ = channel.remove_reaction(target, message_id, emoji).await;
+}
+
+/// Add the outcome reaction. A configured empty emoji is the "withdraw and add
+/// nothing" mode.
+async fn add_outcome_ack(channel: &dyn Channel, target: &str, message_id: &str, emoji: &str) {
+    if emoji.is_empty() {
+        return;
+    }
+    let _ = channel.add_reaction(target, message_id, emoji).await;
+}
+
+/// Wait for an in-progress acknowledgement add to finish before its
+/// withdrawal. The wait is bounded by the turn's cancellation token so a
+/// stalled reaction endpoint cannot pin the turn: `/stop` releases the wait
+/// instead of leaving the execution slot occupied.
+async fn await_ack_add(
+    task: Option<tokio::task::JoinHandle<()>>,
+    cancellation_token: &CancellationToken,
+) {
+    let Some(task) = task else {
+        return;
+    };
+    tokio::select! {
+        _ = task => {}
+        _ = cancellation_token.cancelled() => {}
+    }
+}
+
 async fn reconcile_early_ack(
     ctx: &ChannelRuntimeContext,
     msg: &ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
     early_ack_task: Option<tokio::task::JoinHandle<()>>,
-    done_emoji: Option<&str>,
+    inbound_ack_completion: Option<tokio::task::JoinHandle<()>>,
+    emojis: &ChannelAckEmojis,
+    completion: Option<AckCompletion>,
+    cancellation_token: &CancellationToken,
 ) {
     if !resolve_channel_ack_reactions(ctx, msg) {
         return;
@@ -9096,18 +9203,18 @@ async fn reconcile_early_ack(
     let Some(channel) = target_channel else {
         return;
     };
-    // Wait for the spawned 👀 add to land first; otherwise a fast early-return
-    // path could remove before the add runs and strand the ack.
-    if let Some(task) = early_ack_task {
-        let _ = task.await;
-    }
-    let _ = channel
-        .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
-        .await;
-    if let Some(emoji) = done_emoji {
-        let _ = channel
-            .add_reaction(&msg.reply_target, &msg.id, emoji)
-            .await;
+    // Wait for the spawned in-progress adds to land first; otherwise a fast
+    // early-return path could remove before the add runs and strand the ack.
+    await_ack_add(early_ack_task, cancellation_token).await;
+    await_ack_add(inbound_ack_completion, cancellation_token).await;
+    withdraw_ack(&**channel, &msg.reply_target, &msg.id, &emojis.in_progress).await;
+    let outcome = match completion {
+        Some(AckCompletion::Done) => Some(emojis.done.as_str()),
+        Some(AckCompletion::Error) => Some(emojis.error.as_str()),
+        None => None,
+    };
+    if let Some(emoji) = outcome {
+        add_outcome_ack(&**channel, &msg.reply_target, &msg.id, emoji).await;
     }
 }
 
@@ -9361,12 +9468,41 @@ async fn process_channel_message_body(
 
     // The early ack is spawned (fire-and-forget) so it lands before the
     // enrichment/model pipeline without blocking it. The join handle is kept so
-    // any early-return reconciliation can await the add before removing the 👀,
+    // any early-return reconciliation can await the add before withdrawing it,
     // making the swap deterministic instead of racing the spawned add.
+    // Resolve the acknowledgement emoji lifecycle from the canonical live
+    // config (not a startup snapshot), so a published change reaches the next
+    // message without rebuilding the channels. The resolved set is kept for
+    // this message only, so its cleanup withdraws exactly the in-progress
+    // emoji that was added.
+    let mut ack_emojis = resolve_channel_ack_emojis(
+        &ctx.live_config.read(),
+        msg.channel.as_str(),
+        msg.channel_alias.as_deref(),
+    );
+    // When the channel already posted the in-progress acknowledgement on
+    // receipt (Lark's inbound fast-ack), withdraw exactly the emoji it added
+    // instead of the value resolved now: a configured value that changed
+    // between receipt and cleanup would otherwise withdraw a different emoji
+    // and strand the reaction the channel left on the message. The channel is
+    // the canonical source for what it added. Its add task is carried forward
+    // and awaited only during cleanup, never here, so a stalled reaction
+    // endpoint can never delay the reply.
+    let mut inbound_ack_completion: Option<tokio::task::JoinHandle<()>> = None;
+    let inbound_ack = match target_channel.as_ref() {
+        Some(channel) => channel.inbound_ack(&msg.id).await,
+        None => None,
+    };
+    if let Some(ack) = inbound_ack {
+        ack_emojis.in_progress = ack.emoji;
+        inbound_ack_completion = ack.completion;
+    }
     let early_ack_task: Option<tokio::task::JoinHandle<()>> =
         if resolve_channel_ack_reactions(&ctx, &msg)
+            && !ack_emojis.in_progress.is_empty()
             && let Some(channel) = target_channel.clone()
         {
+            let ack_emoji = ack_emojis.in_progress.clone();
             let reply_target = msg.reply_target.clone();
             let message_id = msg.id.clone();
             let message_id_label = message_id.clone();
@@ -9385,7 +9521,7 @@ async fn process_channel_message_body(
                 => async move {
                     let _lease = ack_lease;
                     if let Err(e) = channel
-                        .add_reaction(&reply_target, &message_id, "\u{1F440}")
+                        .add_reaction(&reply_target, &message_id, &ack_emoji)
                         .await
                     {
                         ::zeroclaw_log::record!(
@@ -9505,7 +9641,10 @@ async fn process_channel_message_body(
             &msg,
             target_channel.as_ref(),
             early_ack_task,
-            Some("\u{2705}"),
+            inbound_ack_completion,
+            &ack_emojis,
+            Some(AckCompletion::Done),
+            &cancellation_token,
         )
         .await;
         return;
@@ -9555,7 +9694,10 @@ async fn process_channel_message_body(
                     &msg,
                     target_channel.as_ref(),
                     early_ack_task,
-                    Some("\u{26A0}\u{FE0F}"),
+                    inbound_ack_completion,
+                    &ack_emojis,
+                    Some(AckCompletion::Error),
+                    &cancellation_token,
                 )
                 .await;
                 return;
@@ -9624,7 +9766,10 @@ async fn process_channel_message_body(
                 &msg,
                 target_channel.as_ref(),
                 early_ack_task,
-                Some("\u{26A0}\u{FE0F}"),
+                inbound_ack_completion,
+                &ack_emojis,
+                Some(AckCompletion::Error),
+                &cancellation_token,
             )
             .await;
             return;
@@ -10035,7 +10180,10 @@ async fn process_channel_message_body(
             &msg,
             target_channel.as_ref(),
             early_ack_task,
+            inbound_ack_completion,
+            &ack_emojis,
             None,
+            &cancellation_token,
         )
         .await;
         if resolve_channel_ack_reactions(&ctx, &msg)
@@ -10767,10 +10915,9 @@ async fn process_channel_message_body(
         typing.pause().await;
     }
 
-    let reaction_done_emoji = match &llm_result {
-        LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
-        _ => "\u{26A0}\u{FE0F}",                                // ⚠️
-    };
+    // Selects which configured outcome emoji replaces the in-progress
+    // acknowledgement once the turn ends.
+    let reaction_succeeded = matches!(&llm_result, LlmExecutionResult::Completed(Ok(Ok(_))));
 
     match llm_result {
         LlmExecutionResult::Cancelled => {
@@ -11483,20 +11630,27 @@ async fn process_channel_message_body(
         }
     }
 
-    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete. Await the
-    // spawned ack add first so the remove can never race ahead of it.
+    // Swap the in-progress acknowledgement for the configured outcome emoji
+    // (withdraw-only when that emoji is empty). Await the spawned ack adds
+    // first so the remove can never race ahead of them.
     if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
     {
-        if let Some(task) = early_ack_task {
-            let _ = task.await;
-        }
-        let _ = channel
-            .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
-            .await;
-        let _ = channel
-            .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
-            .await;
+        await_ack_add(early_ack_task, &cancellation_token).await;
+        await_ack_add(inbound_ack_completion, &cancellation_token).await;
+        withdraw_ack(
+            &**channel,
+            &msg.reply_target,
+            &msg.id,
+            &ack_emojis.in_progress,
+        )
+        .await;
+        let outcome = if reaction_succeeded {
+            &ack_emojis.done
+        } else {
+            &ack_emojis.error
+        };
+        add_outcome_ack(&**channel, &msg.reply_target, &msg.id, outcome).await;
     }
 }
 
@@ -13500,6 +13654,14 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
+                let ack_emoji_resolver: Arc<dyn Fn() -> String + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || {
+                        resolve_channel_ack_emojis(&cfg_arc.read(), "lark", Some(&alias))
+                            .in_progress
+                    })
+                };
                 Ok(Arc::new(
                     LarkChannel::from_config(lk, alias, peer_resolver)
                         .with_workspace_dir(one_shot_channel_workspace_dir(
@@ -13510,6 +13672,7 @@ fn build_channel_by_id(
                         .with_ack_reactions(
                             lk.ack_reactions.unwrap_or(config.channels.ack_reactions),
                         )
+                        .with_ack_emoji_resolver(ack_emoji_resolver)
                         .with_streaming(lk.stream_mode, lk.draft_update_interval_ms),
                 ))
             }
@@ -15582,6 +15745,16 @@ fn collect_configured_channels_with_authority(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
         };
+        // Resolve the inbound fast-ack emoji from the canonical live config
+        // per message, so a published change reaches the channel without a
+        // rebuild and the orchestrator withdraws exactly what it added.
+        let ack_emoji_resolver: Arc<dyn Fn() -> String + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                resolve_channel_ack_emojis(&cfg_arc.read(), "lark", Some(&alias)).in_progress
+            })
+        };
         let display_name = if lk.use_feishu { "Feishu" } else { "Lark" };
         channels.push(ConfiguredChannel {
             display_name,
@@ -15592,6 +15765,7 @@ fn collect_configured_channels_with_authority(
                     .with_approval_timeout_secs(lk.approval_timeout_secs)
                     .with_per_user_session(lk.per_user_session)
                     .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
+                    .with_ack_emoji_resolver(ack_emoji_resolver)
                     .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                     .with_transcription_manager(
                         config.transcription.clone(),
@@ -25529,6 +25703,13 @@ api_key = "anthropic-key"
         reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
         reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
         finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
+        /// In-progress acknowledgement emoji this channel already posted on
+        /// receipt, reported back to the orchestrator so a test can prove the
+        /// cleanup withdraws that emoji rather than a changed setting.
+        inbound_ack: Option<String>,
+        /// Pending add task handed back with the recorded acknowledgement, so a
+        /// test can prove the reply never waits for the channel's own add.
+        inbound_ack_completion: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     }
 
     /// Records every outbound `SendMessage` whole, so a test can assert on
@@ -26521,6 +26702,15 @@ api_key = "anthropic-key"
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
             self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+
+        async fn inbound_ack(
+            &self,
+            _message_id: &str,
+        ) -> Option<::zeroclaw_api::channel::InboundAck> {
+            let emoji = self.inbound_ack.clone()?;
+            let completion = self.inbound_ack_completion.lock().await.take();
+            Some(::zeroclaw_api::channel::InboundAck { emoji, completion })
         }
 
         async fn add_reaction(
@@ -37198,15 +37388,29 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn process_channel_message_adds_and_swaps_reactions() {
-        let channel_impl = Arc::new(RecordingChannel::default());
-        let channel: Arc<dyn Channel> = channel_impl.clone();
+    /// Build the orchestrator runtime context shared by the acknowledgement
+    /// reaction tests. `config` supplies the `[channels]` acknowledgement
+    /// settings under test.
+    fn ack_reaction_test_context(
+        channel: Arc<dyn Channel>,
+        config: zeroclaw_config::schema::Config,
+    ) -> Arc<ChannelRuntimeContext> {
+        ack_reaction_test_context_with(channel, config.clone(), config)
+    }
 
+    /// Like [`ack_reaction_test_context`], but seeds `prompt_config` and
+    /// `live_config` from different configs. Used to prove the acknowledgement
+    /// path reads the canonical live config rather than the startup snapshot.
+    fn ack_reaction_test_context_with(
+        channel: Arc<dyn Channel>,
+        prompt_config: zeroclaw_config::schema::Config,
+        live_config: zeroclaw_config::schema::Config,
+    ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
+        let ack_reactions = prompt_config.channels.ack_reactions;
 
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(5),
@@ -37247,11 +37451,8 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            live_config: zeroclaw_config::live::LiveConfig::new(
-                zeroclaw_config::schema::Config::default(),
-            )
-            .handle(),
+            prompt_config: Arc::new(prompt_config),
+            live_config: zeroclaw_config::live::LiveConfig::new(live_config).handle(),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -37271,7 +37472,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
-            ack_reactions: true,
+            ack_reactions,
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
@@ -37294,8 +37495,286 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
             security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
-        });
+        })
+    }
 
+    #[test]
+    fn resolve_channel_ack_emojis_defaults_match_current_behavior() {
+        let config = zeroclaw_config::schema::Config::default();
+        let emojis = resolve_channel_ack_emojis(&config, "slack", Some("work"));
+        assert_eq!(emojis.in_progress, "\u{1F440}");
+        assert_eq!(emojis.done, "\u{2705}");
+        assert_eq!(emojis.error, "\u{26A0}\u{FE0F}");
+    }
+
+    #[test]
+    fn resolve_channel_ack_emojis_global_values_apply_to_any_channel() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.ack_reaction_in_progress = "\u{23F3}".to_string();
+        config.channels.ack_reaction_done = String::new();
+
+        let emojis = resolve_channel_ack_emojis(&config, "discord", None);
+        assert_eq!(emojis.in_progress, "\u{23F3}");
+        assert_eq!(
+            emojis.done, "",
+            "empty completion emoji withdraws and adds nothing"
+        );
+        assert_eq!(emojis.error, "\u{26A0}\u{FE0F}");
+    }
+
+    #[test]
+    fn resolve_channel_ack_emojis_alias_override_wins_field_by_field() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.ack_reaction_in_progress = "\u{23F3}".to_string();
+
+        config.channels.slack.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::SlackConfig {
+                ack_reaction_done: Some(String::new()),
+                ..Default::default()
+            },
+        );
+
+        let emojis = resolve_channel_ack_emojis(&config, "slack", Some("work"));
+        assert_eq!(
+            emojis.in_progress, "\u{23F3}",
+            "an unset alias override inherits the global value"
+        );
+        assert_eq!(emojis.done, "", "the alias override wins");
+        assert_eq!(emojis.error, "\u{26A0}\u{FE0F}");
+    }
+
+    #[test]
+    fn resolve_channel_ack_emojis_unknown_alias_falls_back_to_global() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.ack_reaction_done = "\u{1F389}".to_string();
+
+        let emojis = resolve_channel_ack_emojis(&config, "slack", Some("missing"));
+        assert_eq!(emojis.done, "\u{1F389}");
+    }
+
+    // Pins the configurable acknowledgement emoji end to end: the configured
+    // in-progress emoji replaces 👀, and an empty completion emoji leaves the
+    // message with no reaction at all once the turn ends (the withdraw-only
+    // mode).
+    #[tokio::test]
+    async fn process_channel_message_uses_configured_ack_emojis() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.ack_reaction_in_progress = "\u{23F3}".to_string();
+        config.channels.ack_reaction_done = String::new();
+        let runtime_ctx = ack_reaction_test_context(channel, config);
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "react-msg-configured".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert_eq!(
+            added.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
+            vec!["\u{23F3}"],
+            "only the configured in-progress acknowledgement should be added"
+        );
+        drop(added);
+
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert_eq!(
+            removed.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
+            vec!["\u{23F3}"],
+            "the acknowledgement should be withdrawn with nothing added in its place"
+        );
+    }
+
+    // The acknowledgement emoji must come from the canonical live config, not
+    // the startup `prompt_config` snapshot: a change published after startup has
+    // to reach the next message without rebuilding the channels. Here the
+    // snapshot still carries the built-in 👀/✅ defaults while the live config
+    // asks for ⏳ and no completion emoji.
+    #[tokio::test]
+    async fn process_channel_message_reads_ack_emojis_from_live_config() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let prompt_config = zeroclaw_config::schema::Config::default();
+        let mut live_config = zeroclaw_config::schema::Config::default();
+        live_config.channels.ack_reaction_in_progress = "\u{23F3}".to_string();
+        live_config.channels.ack_reaction_done = String::new();
+        let runtime_ctx = ack_reaction_test_context_with(channel, prompt_config, live_config);
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "react-msg-live".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert_eq!(
+            added.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
+            vec!["\u{23F3}"],
+            "the live config's in-progress emoji must be used, not the startup snapshot's"
+        );
+        drop(added);
+
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert_eq!(
+            removed.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
+            vec!["\u{23F3}"],
+            "the acknowledgement must be withdrawn using the live config's emoji"
+        );
+    }
+
+    // The in-progress acknowledgement must be withdrawn with the emoji the
+    // channel actually posted on receipt, not one recomputed at cleanup: here
+    // the channel posted the hourglass and the live config then moved to the
+    // fire emoji, so cleanup must still withdraw the hourglass instead of
+    // stranding it and adding nothing.
+    #[tokio::test]
+    async fn process_channel_message_withdraws_inbound_ack_after_setting_change() {
+        let channel_impl = Arc::new(RecordingChannel {
+            inbound_ack: Some("\u{23F3}".to_string()),
+            ..Default::default()
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.ack_reaction_in_progress = "\u{1F525}".to_string();
+        config.channels.ack_reaction_done = String::new();
+        let runtime_ctx = ack_reaction_test_context(channel, config);
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "react-msg-inbound".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert_eq!(
+            added.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
+            vec!["\u{23F3}"],
+            "the emoji the channel posted on receipt must be reused, not the changed setting"
+        );
+        drop(added);
+
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert_eq!(
+            removed.iter().map(|r| r.2.as_str()).collect::<Vec<_>>(),
+            vec!["\u{23F3}"],
+            "cleanup must withdraw the emoji the channel posted, not the new setting"
+        );
+    }
+
+    // A stalled inbound acknowledgement add must not delay the reply: the
+    // channel's own add task is awaited only during cleanup, so the model
+    // answer is delivered while that task is still pending.
+    #[tokio::test]
+    async fn process_channel_message_reply_does_not_wait_for_inbound_ack() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let channel_impl = Arc::new(RecordingChannel {
+            inbound_ack: Some("\u{1F440}".to_string()),
+            inbound_ack_completion: tokio::sync::Mutex::new(Some(zeroclaw_spawn::spawn!(
+                async move {
+                    let _ = release_rx.await;
+                }
+            ))),
+            ..Default::default()
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx =
+            ack_reaction_test_context(channel, zeroclaw_config::schema::Config::default());
+
+        let turn = zeroclaw_spawn::spawn!(process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "react-msg-pending-ack".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        ));
+
+        let replied = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !channel_impl.sent_messages.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            replied.is_ok(),
+            "the reply must be sent without waiting for the pending inbound ack add"
+        );
+
+        let _ = release_tx.send(());
+        turn.await.expect("turn task");
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_adds_and_swaps_reactions() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let runtime_ctx =
+            ack_reaction_test_context(channel, zeroclaw_config::schema::Config::default());
         process_channel_message(
             runtime_ctx,
             zeroclaw_api::channel::ChannelMessage {
