@@ -1654,3 +1654,7 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 skill-http-request-timeout = HTTP request timed out
+
+turn-loop-detected = Repeated tool calls were stopped. Completed work is retained; unresolved actions remain pending.
+
+turn-loop-repeat-refused = Refused repeated tool { $tool } before execution after { $repeats } identical calls. Stop retrying and report completed, failed and pending work.
