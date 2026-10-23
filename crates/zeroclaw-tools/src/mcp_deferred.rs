@@ -231,6 +231,21 @@ impl ActivatedToolSet {
             .retain(|name| self.deferred_builtin_specs.contains_key(name));
     }
 
+    /// Replace the stored schema of each still-deferred name with the live
+    /// tool's current spec. Specs can follow live config, so the copy that
+    /// `tool_search` returns must not keep the values from assembly. Names
+    /// are never added or removed and the selection is kept.
+    pub fn sync_deferred_builtin_specs<'a>(
+        &mut self,
+        specs: impl IntoIterator<Item = &'a ToolSpec>,
+    ) {
+        for spec in specs {
+            if let Some(stored) = self.deferred_builtin_specs.get_mut(&spec.name) {
+                *stored = spec.clone();
+            }
+        }
+    }
+
     pub fn hidden_builtin_names(&self) -> HashSet<String> {
         self.deferred_builtin_specs
             .keys()
@@ -551,6 +566,40 @@ mod tests {
         // A later refresh cannot revive a revoked schema.
         set.refresh_deferred_builtin_specs(vec![make_spec("keep", "Reintroduced")]);
         assert!(set.select_builtin_schema("keep").is_none());
+    }
+
+    #[test]
+    fn builtin_catalog_sync_replaces_stored_specs_without_changing_names() {
+        let make_spec = |name: &str, description: &str| {
+            ToolSpec::new(name, description, serde_json::json!({"type": "object"}))
+        };
+        let mut set = ActivatedToolSet::new();
+        set.set_deferred_builtin_specs(vec![
+            make_spec("selected", "Assembly description"),
+            make_spec("hidden", "Assembly description"),
+        ]);
+        set.select_builtin_schema("selected").unwrap();
+
+        set.sync_deferred_builtin_specs(&[
+            make_spec("selected", "Live description"),
+            make_spec("hidden", "Live description"),
+            make_spec("eager", "Eager tool stays eager"),
+        ]);
+
+        assert!(set.selected_builtin_names.contains("selected"));
+        assert_eq!(
+            set.hidden_builtin_names(),
+            HashSet::from(["hidden".to_string()])
+        );
+        assert_eq!(
+            set.select_builtin_schema("selected").unwrap().description,
+            "Live description"
+        );
+        assert_eq!(
+            set.select_builtin_schema("hidden").unwrap().description,
+            "Live description"
+        );
+        assert!(set.select_builtin_schema("eager").is_none());
     }
 
     #[test]
