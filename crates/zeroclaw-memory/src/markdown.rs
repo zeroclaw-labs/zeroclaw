@@ -101,7 +101,7 @@ impl MarkdownMemory {
             // two separate syscalls, so a loser can append its row in between and
             // land before the header. Cosmetic only — `parse_entries_from_file`
             // below drops every line starting with `#` regardless of position, so
-            // no row is lost and no entry is misread; see PR description.
+            // no row is lost and no entry is misread.
             match OpenOptions::new().create_new(true).append(true).open(&path) {
                 Ok(mut file) => file.write_all(first_write.as_bytes()),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
