@@ -905,6 +905,25 @@ impl SessionBackend for SqliteSessionBackend {
         rows.filter_map(|r| r.ok()).collect()
     }
 
+    /// Like `load`, but a transcript that can't be read, or a row that can't be
+    /// decoded, is an error rather than a shorter history.
+    fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .map_err(std::io::Error::other)?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
+
     fn load_with_timestamps(
         &self,
         session_key: &str,
@@ -2021,6 +2040,36 @@ mod tests {
 
         assert!(backend.delete_session("ghost").unwrap());
         assert!(!backend.session_exists("ghost"));
+    }
+
+    /// `try_load` is the read that refuses to guess: a transcript that can't
+    /// be read, or has a row that can't be decoded, is an error, never a
+    /// shorter history.
+    #[test]
+    fn try_load_reports_an_unreadable_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s", &ChatMessage::user("hello")).unwrap();
+        backend.append("s", &ChatMessage::assistant("hi")).unwrap();
+        assert_eq!(backend.try_load("s").unwrap().len(), 2);
+
+        let db = Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
+        db.execute(
+            "UPDATE sessions SET content = CAST(x'ff' AS BLOB) WHERE content = 'hi'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            backend.try_load("s").is_err(),
+            "an undecodable row must not read as a shorter transcript"
+        );
+
+        db.execute_batch("ALTER TABLE sessions RENAME TO sessions_unreadable;")
+            .unwrap();
+        assert!(
+            backend.try_load("s").is_err(),
+            "an unreadable transcript must not read as an empty one"
+        );
     }
 
     #[test]

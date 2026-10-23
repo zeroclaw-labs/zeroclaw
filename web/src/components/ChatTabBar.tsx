@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { Plus, X, Columns2, Square, Bot, Loader2 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import { Button } from '@/components/ui';
-import { getMapKeys } from '@/lib/api';
+import { getAvailableAgents, getMapKeys } from '@/lib/api';
+import { useNavAccess } from '@/hooks/useNavAccess';
 
 /** Per-alias indicator state surfaced in the tab bar. */
 export interface TabIndicator {
@@ -68,6 +69,7 @@ export function ChatTabBar({
   const [pickerError, setPickerError] = useState(false);
   const pickerRef = useRef<HTMLDivElement>(null);
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const operator = useNavAccess().operatorPages;
 
   // Close the agent picker on outside click.
   useEffect(() => {
@@ -83,14 +85,21 @@ export function ChatTabBar({
 
   // Enumerate configured agents when the picker opens. Aliases come straight
   // from the config map key `agents` — the same source the Dashboard and
-  // agents list use — so the picker never drifts from real configuration.
+  // agents list use — so the picker never drifts from real configuration. A
+  // signed-in account without the operator dashboard gets only the enabled
+  // agents it may chat with.
   function openPicker() {
     setPickerOpen((v) => !v);
     if (pickerOpen) return;
     setPickerLoading(true);
     setPickerError(false);
-    getMapKeys('agents')
-      .then((r) => setAllAgents(r.keys))
+    const aliases = operator
+      ? getMapKeys('agents').then((r) => r.keys)
+      : getAvailableAgents().then((agents) =>
+          agents.filter((a) => a.enabled).map((a) => a.alias),
+        );
+    aliases
+      .then(setAllAgents)
       .catch(() => setPickerError(true))
       .finally(() => setPickerLoading(false));
   }

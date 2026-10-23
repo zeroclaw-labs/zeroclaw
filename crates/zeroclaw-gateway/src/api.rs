@@ -52,6 +52,12 @@ pub(crate) fn require_auth(
     // Defense-in-depth: reject empty tokens explicitly so a future
     // refactor of is_authenticated cannot accidentally treat "" as valid.
     if token.is_empty() {
+        // No bearer: a signed-in dashboard session may stand in for one,
+        // as classified by the session layer for this request. Only an
+        // administrator session is operator-equivalent.
+        if let Some(caller) = crate::dashboard_session::current_caller() {
+            return caller.admit_operator();
+        }
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
@@ -281,6 +287,36 @@ pub struct StatusResponse {
 /// have `model_provider`, `model`, `temperature`, and `memory_backend`
 /// reflect that specific agent's resolved config; omit it for the
 /// install-wide summary.
+/// The model a configured agent answers with, as the status page reports
+/// it.
+#[derive(Debug, Default)]
+pub(crate) struct AgentModel {
+    pub(crate) provider_ref: Option<String>,
+    pub(crate) model: String,
+    pub(crate) temperature: Option<f64>,
+}
+
+/// [`AgentModel`] for `alias`, or `None` when no such agent is configured.
+pub(crate) fn agent_model(config: &Config, alias: &str) -> Option<AgentModel> {
+    let agent = config.agent(alias)?;
+    let provider_ref = if agent.model_provider.is_empty() {
+        None
+    } else {
+        Some(agent.model_provider.as_str().to_string())
+    };
+    let resolved = config.resolved_model_provider_for_agent(alias);
+    let model = resolved
+        .as_ref()
+        .and_then(|(_, _, cfg)| cfg.model.clone())
+        .unwrap_or_default();
+    let temperature = resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
+    Some(AgentModel {
+        provider_ref,
+        model,
+        temperature,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct StatusQuery {
     #[serde(default)]
@@ -323,18 +359,11 @@ pub async fn handle_api_status(
     let (model_provider, model, temperature, memory_backend) =
         match agent_alias.and_then(|alias| config.agent(alias).map(|a| (alias, a))) {
             Some((alias, agent)) => {
-                let provider_ref = if agent.model_provider.is_empty() {
-                    None
-                } else {
-                    Some(agent.model_provider.as_str().to_string())
-                };
-                let resolved = config.resolved_model_provider_for_agent(alias);
-                let model = resolved
-                    .as_ref()
-                    .and_then(|(_, _, cfg)| cfg.model.clone())
-                    .unwrap_or_default();
-                let temperature: Option<f64> =
-                    resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
+                let AgentModel {
+                    provider_ref,
+                    model,
+                    temperature,
+                } = agent_model(&config, alias).unwrap_or_default();
                 let backend_kind = agent.memory.backend;
                 let backend = serde_json::to_value(backend_kind)
                     .ok()

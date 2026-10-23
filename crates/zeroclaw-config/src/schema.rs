@@ -7954,6 +7954,13 @@ pub struct GatewayConfig {
     #[nested]
     pub pairing_dashboard: PairingDashboardConfig,
 
+    /// Opt-in dashboard sign-in through configured OIDC providers
+    /// (`[gateway.dashboard_sign_in]`). Off by default: the dashboard keeps
+    /// pairing as its only sign-in until `oidc` names a provider.
+    #[serde(default)]
+    #[nested]
+    pub dashboard_sign_in: DashboardSignInConfig,
+
     /// Path to the web dashboard `dist` directory. When set, the gateway
     /// serves the compiled frontend from the filesystem instead of requiring
     /// it to be embedded in the binary. Accepts absolute paths or paths
@@ -8070,6 +8077,7 @@ impl Default for GatewayConfig {
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
+            dashboard_sign_in: DashboardSignInConfig::default(),
             web_dist_dir: None,
             tls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
@@ -8127,6 +8135,60 @@ impl Default for PairingDashboardConfig {
             max_failed_attempts: default_max_failed_attempts(),
             lockout_secs: default_pairing_lockout_secs(),
         }
+    }
+}
+
+/// Shortest accepted `gateway.dashboard_sign_in.session_lifetime_secs`.
+pub const DASHBOARD_SESSION_LIFETIME_MIN_SECS: u64 = 300;
+
+/// Longest accepted `gateway.dashboard_sign_in.session_lifetime_secs`.
+pub const DASHBOARD_SESSION_LIFETIME_MAX_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Opt-in dashboard sign-in (`[gateway.dashboard_sign_in]`).
+///
+/// The providers named here are `[oidc.<alias>]` entries, verified and
+/// mapped to principals exactly as RPC verifies them. The gateway runs the
+/// browser's Authorization Code + PKCE flow and keeps the resulting access
+/// token server-side behind a session cookie; the token never reaches the
+/// browser. Pairing keeps working alongside it.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "gateway.dashboard_sign_in"]
+pub struct DashboardSignInConfig {
+    /// `[oidc.<alias>]` entries the dashboard offers on its sign-in screen,
+    /// in display order. Empty (the default) turns dashboard sign-in off.
+    /// Turning it on requires `gateway.require_pairing = true`.
+    #[serde(default)]
+    pub oidc: Vec<String>,
+    /// Hard cap on one dashboard session, in seconds, whatever the access
+    /// token's own lifetime. A session also ends when its token expires.
+    /// Range: 300..=604800. Default: 28800 (8 hours).
+    #[serde(default = "default_dashboard_session_lifetime_secs")]
+    pub session_lifetime_secs: u64,
+}
+
+fn default_dashboard_session_lifetime_secs() -> u64 {
+    8 * 60 * 60
+}
+
+impl Default for DashboardSignInConfig {
+    fn default() -> Self {
+        Self {
+            oidc: Vec::new(),
+            session_lifetime_secs: default_dashboard_session_lifetime_secs(),
+        }
+    }
+}
+
+impl DashboardSignInConfig {
+    /// Whether the dashboard offers OIDC sign-in at all.
+    pub fn enabled(&self) -> bool {
+        !self.oidc.is_empty()
+    }
+
+    /// Whether `alias` is one of the providers the dashboard offers.
+    pub fn offers(&self, alias: &str) -> bool {
+        self.oidc.iter().any(|offered| offered == alias)
     }
 }
 
@@ -8291,6 +8353,20 @@ pub struct WssConfig {
     /// it on slow links rather than disabling the bound.
     #[serde(default = "default_wss_incomplete_message_timeout_secs")]
     pub incomplete_message_timeout_secs: u64,
+    /// How long, in seconds, a remote client's sessions stay open after its
+    /// last connection ends (default: 1800). Past that, the daemon closes each
+    /// of them that has been idle as long, has no turn running and has no
+    /// approval pending, which frees its place among the daemon's live
+    /// sessions. The transcript is kept, and never written by this: a chat
+    /// session whose store doesn't already hold all of its history stays
+    /// open. A client
+    /// that reconnects with its identity in time keeps its sessions; one that
+    /// returns later can't reach the closed sessions over WSS. Sessions of local clients (the
+    /// RPC socket) are not affected. `0` keeps orphaned sessions open until
+    /// the daemon restarts. Read on every check, so a change applies without
+    /// a restart.
+    #[serde(default = "default_wss_orphaned_session_timeout_secs")]
+    pub orphaned_session_timeout_secs: u64,
 }
 
 impl Default for WssConfig {
@@ -8308,6 +8384,7 @@ impl Default for WssConfig {
             max_sessions: default_wss_max_sessions(),
             max_sessions_per_client: default_wss_max_sessions_per_client(),
             incomplete_message_timeout_secs: default_wss_incomplete_message_timeout_secs(),
+            orphaned_session_timeout_secs: default_wss_orphaned_session_timeout_secs(),
         }
     }
 }
@@ -8422,6 +8499,10 @@ fn default_wss_max_sessions_per_client() -> usize {
 
 fn default_wss_incomplete_message_timeout_secs() -> u64 {
     60
+}
+
+fn default_wss_orphaned_session_timeout_secs() -> u64 {
+    30 * 60
 }
 
 /// Local IPC endpoint limits (`[rpc]`).
@@ -14321,6 +14402,58 @@ impl Config {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// `[gateway.dashboard_sign_in]`: every offered provider is a configured
+    /// `[oidc.<alias>]` entry, offered once, and sign-in is only turned on
+    /// where the dashboard is not already open to anyone who reaches it.
+    ///
+    /// Kept out of [`Self::validate_auth`] on purpose: that boundary is
+    /// shared with policy compilation, and a dashboard misconfiguration must
+    /// not keep RPC's inbound-auth policy from compiling.
+    fn validate_dashboard_sign_in(&self) -> Result<()> {
+        let sign_in = &self.gateway.dashboard_sign_in;
+        if !(DASHBOARD_SESSION_LIFETIME_MIN_SECS..=DASHBOARD_SESSION_LIFETIME_MAX_SECS)
+            .contains(&sign_in.session_lifetime_secs)
+        {
+            validation_bail!(
+                InvalidNumericRange,
+                "gateway.dashboard_sign_in.session_lifetime_secs",
+                "gateway.dashboard_sign_in.session_lifetime_secs must be between {DASHBOARD_SESSION_LIFETIME_MIN_SECS} and {DASHBOARD_SESSION_LIFETIME_MAX_SECS} seconds, got {}",
+                sign_in.session_lifetime_secs
+            );
+        }
+        if !sign_in.enabled() {
+            return Ok(());
+        }
+        for (index, alias) in sign_in.oidc.iter().enumerate() {
+            if !self.oidc.contains_key(alias) {
+                validation_bail!(
+                    DanglingReference,
+                    "gateway.dashboard_sign_in.oidc",
+                    "gateway.dashboard_sign_in.oidc names {alias:?} but [oidc.{alias}] is not configured",
+                );
+            }
+            if sign_in.oidc[..index].contains(alias) {
+                validation_bail!(
+                    ValidationFailed,
+                    "gateway.dashboard_sign_in.oidc",
+                    "gateway.dashboard_sign_in.oidc lists {alias:?} more than once",
+                );
+            }
+        }
+        // With pairing off every dashboard route is open to whoever reaches
+        // the gateway, so a sign-in screen would protect nothing. The Docker
+        // image writes `require_pairing = false` into its default config, so
+        // the message names that case and both ways to change it.
+        if !self.gateway.require_pairing {
+            validation_bail!(
+                ValidationFailed,
+                "gateway.require_pairing",
+                "[gateway.dashboard_sign_in] needs gateway.require_pairing = true, but it is false. Set require_pairing = true under [gateway] (or ZEROCLAW_gateway__require_pairing=true); the official Docker image's default config sets it to false",
+            );
         }
         Ok(())
     }
@@ -24807,6 +24940,8 @@ impl Config {
             );
         }
 
+        self.validate_dashboard_sign_in()?;
+
         // Security OTP / estop
         if self.security.otp.challenge_max_attempts == 0 {
             validation_bail!(
@@ -30503,6 +30638,85 @@ zeroclaw-operators = "operator"
         config
             .validate()
             .expect("an existing paired token is a path");
+    }
+
+    #[::core::prelude::v1::test]
+    fn dashboard_sign_in_is_off_by_default() {
+        let config = Config::default();
+        assert!(!config.gateway.dashboard_sign_in.enabled());
+        assert_eq!(
+            config.gateway.dashboard_sign_in.session_lifetime_secs,
+            28_800
+        );
+
+        let parsed: Config = toml::from_str("[gateway]\n").unwrap();
+        assert!(!parsed.gateway.dashboard_sign_in.enabled());
+
+        let parsed: Config =
+            toml::from_str("[gateway.dashboard_sign_in]\noidc = [\"corp\"]\n").unwrap();
+        assert!(parsed.gateway.dashboard_sign_in.offers("corp"));
+        assert!(!parsed.gateway.dashboard_sign_in.offers("other"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn dashboard_sign_in_offers_only_configured_providers_once() {
+        let mut config = auth_config();
+        config.gateway.dashboard_sign_in.oidc = vec!["corp".into()];
+        config
+            .validate()
+            .expect("a configured provider with pairing required validates");
+
+        config.gateway.dashboard_sign_in.oidc = vec!["corp".into(), "missing".into()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("names \"missing\" but [oidc.missing] is not configured"),
+            "got: {err}"
+        );
+
+        config.gateway.dashboard_sign_in.oidc = vec!["corp".into(), "corp".into()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn dashboard_sign_in_with_pairing_off_names_the_fix() {
+        let mut config = auth_config();
+        config.gateway.dashboard_sign_in.oidc = vec!["corp".into()];
+        config.gateway.require_pairing = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("require_pairing = true"), "got: {err}");
+        assert!(
+            err.contains("ZEROCLAW_gateway__require_pairing=true"),
+            "got: {err}"
+        );
+        assert!(err.contains("Docker"), "got: {err}");
+
+        // Off, the same pairing posture is still a valid config.
+        config.gateway.dashboard_sign_in.oidc.clear();
+        config
+            .validate()
+            .expect("pairing off without dashboard sign-in validates");
+    }
+
+    #[::core::prelude::v1::test]
+    fn dashboard_session_lifetime_is_bounded_even_when_off() {
+        let mut config = Config::default();
+        for bad in [
+            0,
+            DASHBOARD_SESSION_LIFETIME_MIN_SECS - 1,
+            DASHBOARD_SESSION_LIFETIME_MAX_SECS + 1,
+        ] {
+            config.gateway.dashboard_sign_in.session_lifetime_secs = bad;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("session_lifetime_secs"), "{bad}: {err}");
+        }
+        for good in [
+            DASHBOARD_SESSION_LIFETIME_MIN_SECS,
+            DASHBOARD_SESSION_LIFETIME_MAX_SECS,
+        ] {
+            config.gateway.dashboard_sign_in.session_lifetime_secs = good;
+            config.validate().expect("bound is inclusive");
+        }
     }
 
     #[::core::prelude::v1::test]
@@ -36933,6 +37147,7 @@ allowed_numbers = ["+1", "+2"]
             websocket_ping_interval_secs: 30,
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
+            dashboard_sign_in: DashboardSignInConfig::default(),
             web_dist_dir: None,
             tls: None,
             request_timeout_secs: 30,

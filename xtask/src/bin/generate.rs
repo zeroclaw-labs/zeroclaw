@@ -27,6 +27,14 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Render the OpenRPC contract document for the daemon RPC from
+    /// `zeroclaw-rpc-proto`.
+    Openrpc {
+        /// Regenerate to memory and diff against on-disk; nonzero on drift.
+        /// Writes nothing. This is the CI drift gate.
+        #[arg(long)]
+        check: bool,
+    },
     /// Render the source-backed SOP syntax reference.
     SopSyntax {
         /// Regenerate to memory and diff against on-disk; nonzero on drift.
@@ -54,6 +62,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Cmd::Installers { targets, check } => xtask::generate::run(&targets, check),
         Cmd::ReviewDocs { check } => xtask::generate::review_docs::run(check),
+        Cmd::Openrpc { check } => xtask::generate::openrpc::run(check),
         Cmd::SopSyntax { check } => xtask::generate::sop_syntax::run(check),
         Cmd::Features {
             selection,

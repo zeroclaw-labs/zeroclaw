@@ -30,5 +30,7 @@ mod ci_runner_labels;
 #[path = "architecture/auth_boundary.rs"]
 mod auth_boundary;
 
+#[path = "architecture/rpc_proto_boundary.rs"]
+mod rpc_proto_boundary;
 #[path = "architecture/stream_error_terminal.rs"]
 mod stream_error_terminal;

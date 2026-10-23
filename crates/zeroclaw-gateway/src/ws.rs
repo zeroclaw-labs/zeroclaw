@@ -10,6 +10,7 @@ use super::{
 };
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
+    Extension,
     extract::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
@@ -60,9 +61,9 @@ fn gateway_steering_input(content: String) -> SteeringInput {
 }
 
 #[derive(Debug, Deserialize)]
-struct ConnectParams {
+pub(crate) struct ConnectParams {
     #[serde(rename = "type")]
-    msg_type: String,
+    pub(crate) msg_type: String,
     /// Client-chosen session ID for memory persistence
     #[serde(default)]
     session_id: Option<String>,
@@ -74,11 +75,11 @@ struct ConnectParams {
     capabilities: Vec<String>,
     /// Project root / working directory for this session.
     #[serde(default, alias = "workspaceDir", alias = "workspace_dir")]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
 }
 
 /// The sub-protocol we support for the chat WebSocket.
-const WS_PROTOCOL: &str = "zeroclaw.v1";
+pub(crate) const WS_PROTOCOL: &str = "zeroclaw.v1";
 
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
@@ -139,16 +140,65 @@ fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) ->
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
+    dashboard: Option<Extension<Arc<crate::dashboard_session::DashboardAuth>>>,
+    core: Option<Extension<crate::core_rpc::CoreRpc>>,
     Query(params): Query<WsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // A scoped dashboard session chats through the core, as its own
+    // principal, whenever this gateway runs inside the daemon: the core
+    // applies the account's grants and keeps the conversation as its own.
+    // The socket closes when the session ends or no longer admits it. An
+    // administrator session keeps the in-process chat below.
+    if state.pairing.require_pairing()
+        && extract_ws_token(&headers, params.token.as_deref()).is_none()
+        && let Some(caller) = crate::dashboard_core::core_caller(
+            &state,
+            &headers,
+            core,
+            dashboard.clone(),
+            crate::dashboard_core::Reach::ScopedOnly,
+        )
+    {
+        let watch = dashboard.as_ref().map(|Extension(auth)| {
+            crate::dashboard_session::SessionWatch::new(
+                Arc::clone(auth),
+                Arc::clone(&caller.session),
+                false,
+                &state,
+            )
+        });
+        return crate::chat_core::ws_chat_through_core(caller, state, params, &headers, ws, watch)
+            .await;
+    }
+    // A signed-in dashboard session presents no token; the session layer
+    // classified it for this upgrade, the dashboard's own origin included.
+    // The in-process chat runs as the operator, so only an administrator
+    // session may open it, and the socket closes when that stops holding.
+    let mut session_watch = None;
+    if state.pairing.require_pairing()
+        && extract_ws_token(&headers, params.token.as_deref()).is_none()
+        && let Some(caller) = crate::dashboard_session::current_caller()
+    {
+        if let Err(denied) = caller.admit_operator() {
+            return denied.into_response();
+        }
+        use crate::dashboard_session::{DashboardCaller, SessionWatch};
+        if let (DashboardCaller::Session(session), Some(Extension(auth))) = (caller, dashboard) {
+            session_watch = Some(SessionWatch::new(auth, session, true, &state));
+        }
+    }
+
     // Auth: check header, subprotocol, then query param (precedence order). On
     // success derive a STABLE transport-authenticated subject (the paired-token
     // hash) so a required-group approval policy can be satisfied over WS; an
     // operator grants approval rights to this paired device via a `ws:<token-hash>`
-    // group member. `None` when pairing is not required (no auth identity).
-    let auth_subject = if state.pairing.require_pairing() {
+    // group member. `None` when pairing is not required (no auth identity), and
+    // for a dashboard session, which grants no such membership.
+    let auth_subject = if session_watch.is_some() {
+        None
+    } else if state.pairing.require_pairing() {
         let token = extract_ws_token(&headers, params.token.as_deref()).unwrap_or("");
         match state.pairing.authenticate_and_hash(token) {
             Some(hash) => Some(hash),
@@ -200,6 +250,22 @@ pub async fn handle_ws_chat(
     let session_id = params.session_id;
     let session_name = params.name;
     let session_cwd = params.cwd.or(params.workspace_dir);
+    if let Some(watch) = &session_watch {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Connect).with_attrs(
+                ::serde_json::json!({
+                    "principal_id": watch.principal_id(),
+                    "agent": agent_alias,
+                })
+            ),
+            "dashboard chat opened by a signed-in administrator"
+        );
+    }
+    let caller = SocketCaller {
+        approval_subject: auth_subject,
+        session: session_watch,
+    };
     ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
@@ -208,13 +274,13 @@ pub async fn handle_ws_chat(
             session_id,
             session_name,
             session_cwd,
-            auth_subject,
+            caller,
         )
     })
     .into_response()
 }
 
-fn websocket_ping_interval(
+pub(crate) fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tokio::time::Interval> {
     let seconds = config.gateway.websocket_ping_interval_secs;
@@ -242,17 +308,36 @@ const WS_CLOSE_HANDSHAKE_GRACE: Duration = Duration::from_secs(2);
 /// message with a refusal, and clients reconnect on a close, not on an error
 /// frame. The peer's close is awaited briefly: dropping the socket straight
 /// after sending can reset the connection and lose the frame.
-async fn close_for_reconnect<S, R>(sender: &mut S, receiver: &mut R, reason: &'static str)
-where
+pub(crate) async fn close_for_reconnect<S, R>(
+    sender: &mut S,
+    receiver: &mut R,
+    reason: &'static str,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
+    close_with(sender, receiver, WS_CLOSE_GOING_AWAY, reason).await;
+}
+
+/// Close a socket with `code`, waiting briefly for the peer's close.
+pub(crate) async fn close_with<S, R>(
+    sender: &mut S,
+    receiver: &mut R,
+    code: u16,
+    reason: &'static str,
+) where
     S: futures_util::Sink<Message> + Unpin,
     R: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
     let close = Message::Close(Some(axum::extract::ws::CloseFrame {
-        code: WS_CLOSE_GOING_AWAY,
+        code,
         reason: axum::extract::ws::Utf8Bytes::from_static(reason),
     }));
-    if sender.send(close).await.is_err() {
-        return;
+    // A peer that stopped reading holds up neither the close frame nor
+    // what follows it.
+    match tokio::time::timeout(WS_CLOSE_HANDSHAKE_GRACE, sender.send(close)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => return,
     }
     let _ = tokio::time::timeout(WS_CLOSE_HANDSHAKE_GRACE, async {
         while let Some(Ok(frame)) = receiver.next().await {
@@ -262,6 +347,36 @@ where
         }
     })
     .await;
+}
+
+/// What became of a frame sent while the socket's dashboard session may end.
+enum Sent {
+    Delivered,
+    PeerGone,
+    /// The session ended first, with this close code; the frame was not sent.
+    SessionLost(u16),
+}
+
+/// Send `message` unless the session behind the socket ends first. A peer
+/// that stops reading stalls the send on the transport, and the session
+/// ending must not wait for it.
+async fn send_unless_lost(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+    session: &mut Option<crate::dashboard_session::SessionWatch>,
+    state: &AppState,
+) -> Sent {
+    tokio::select! {
+        biased;
+        code = crate::dashboard_session::session_lost(session, state) => Sent::SessionLost(code),
+        sent = sender.send(message) => {
+            if sent.is_ok() {
+                Sent::Delivered
+            } else {
+                Sent::PeerGone
+            }
+        }
+    }
 }
 
 /// Answer a turn the agent lifecycle did not admit. Returns `true` when the
@@ -303,13 +418,13 @@ where
 /// waits for a new signal rather than reading the current value: the channel
 /// outlives one gateway instance, so a value left by an earlier stop says
 /// nothing about this one. Never resolves if the signal can no longer arrive.
-async fn gateway_stop_signal(stopping: &mut tokio::sync::watch::Receiver<bool>) {
+pub(crate) async fn gateway_stop_signal(stopping: &mut tokio::sync::watch::Receiver<bool>) {
     if stopping.changed().await.is_err() {
         std::future::pending::<()>().await;
     }
 }
 
-async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
+pub(crate) async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
     if let Some(interval) = interval.as_mut() {
         interval.tick().await;
     } else {
@@ -468,6 +583,17 @@ where
     true
 }
 
+/// Who opened a chat socket.
+struct SocketCaller {
+    // The transport-authenticated approval subject (paired-token hash), if the
+    // connection was authenticated. Threaded to SOP approval frames so a policied
+    // gate can be satisfied by an identified WS caller.
+    approval_subject: Option<String>,
+    /// The dashboard session that opened the socket, if one did. The socket
+    /// closes when the session stops admitting it.
+    session: Option<crate::dashboard_session::SessionWatch>,
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -475,11 +601,12 @@ async fn handle_socket(
     session_id: Option<String>,
     session_name: Option<String>,
     session_cwd: Option<String>,
-    // The transport-authenticated approval subject (paired-token hash), if the
-    // connection was authenticated. Threaded to SOP approval frames so a policied
-    // gate can be satisfied by an identified WS caller.
-    auth_subject: Option<String>,
+    caller: SocketCaller,
 ) {
+    let SocketCaller {
+        approval_subject: auth_subject,
+        session: mut session_watch,
+    } = caller;
     let (mut sender, mut receiver) = socket.split();
     // An upgraded socket outlives the listener it arrived on, so a reload or
     // stop of this gateway instance has to end it here. Subscribed before any
@@ -589,6 +716,10 @@ async fn handle_socket(
             first = receiver.next() => first,
             _ = gateway_stop_signal(&mut gateway_stopping) => {
                 close_for_reconnect(&mut sender, &mut receiver, "gateway restarting").await;
+                return;
+            }
+            code = crate::dashboard_session::session_lost(&mut session_watch, &state) => {
+                close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
                 return;
             }
             _ = tick_websocket_ping(&mut ping_interval) => {
@@ -833,7 +964,23 @@ async fn handle_socket(
                         }
                     };
                     if let Some(_turn_lease) = turn_lease {
-                        let _session_guard = match state.session_queue.acquire(&session_key).await {
+                        let acquired =
+                            match acquire_turn_permit(&state, &session_key, &mut session_watch)
+                                .await
+                            {
+                                Ok(acquired) => acquired,
+                                Err(code) => {
+                                    close_with(
+                                        &mut sender,
+                                        &mut receiver,
+                                        code,
+                                        "dashboard session ended",
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            };
+                        let _session_guard = match acquired {
                             Ok(guard) => guard,
                             Err(e) => {
                                 let err = serde_json::json!({
@@ -859,6 +1006,7 @@ async fn handle_socket(
                             &session_key,
                             &session_id,
                             auth_subject.as_deref(),
+                            &mut session_watch,
                         )
                         .await;
                         if client_gone {
@@ -899,8 +1047,13 @@ async fn handle_socket(
 
             // ── Keepalive ─────────────────────────────────────────────
             _ = tick_websocket_ping(&mut ping_interval) => {
-                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                    break;
+                match send_unless_lost(&mut sender, Message::Ping(Vec::new().into()), &mut session_watch, &state).await {
+                    Sent::Delivered => {}
+                    Sent::PeerGone => break,
+                    Sent::SessionLost(code) => {
+                        close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                        break;
+                    }
                 }
             }
 
@@ -917,6 +1070,16 @@ async fn handle_socket(
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => continue,
                 };
+
+                // Checked before anything the socket sent is acted on, so
+                // input buffered after the session ended starts no turn and
+                // answers no approval.
+                if let Err(code) =
+                    crate::dashboard_session::session_admits_now(&mut session_watch, &state).await
+                {
+                    close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                    break;
+                }
 
                 // Parse incoming message
                 let parsed: serde_json::Value = match serde_json::from_str(&msg) {
@@ -1027,7 +1190,16 @@ async fn handle_socket(
                 };
 
                 // Acquire session lock to serialize concurrent turns
-                let _session_guard = match state.session_queue.acquire(&session_key).await {
+                let acquired =
+                    match acquire_turn_permit(&state, &session_key, &mut session_watch).await {
+                        Ok(acquired) => acquired,
+                        Err(code) => {
+                            close_with(&mut sender, &mut receiver, code, "dashboard session ended")
+                                .await;
+                            break;
+                        }
+                    };
+                let _session_guard = match acquired {
                     Ok(guard) => guard,
                     Err(e) => {
                         let err = serde_json::json!({
@@ -1054,6 +1226,7 @@ async fn handle_socket(
                     &session_key,
                     &session_id,
                     auth_subject.as_deref(),
+                    &mut session_watch,
                 )
                 .await;
                 if client_gone {
@@ -1071,13 +1244,29 @@ async fn handle_socket(
                 break;
             }
 
+            // ── Dashboard session ended or lost its access ────────────
+            // Between turns, like the stop arm, and with a code the client
+            // must not answer by reconnecting.
+            code = crate::dashboard_session::session_lost(&mut session_watch, &state) => {
+                close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                break;
+            }
+
             // ── Broadcast event (cron/heartbeat results) ──────────────
             event = broadcast_rx.recv() => {
                 if let Ok(event) = event
                     && event_matches_session(&event, &session_id)
                     && !is_observability_telemetry(&event)
+                    && let Sent::SessionLost(code) = send_unless_lost(
+                        &mut sender,
+                        Message::Text(event.to_string().into()),
+                        &mut session_watch,
+                        &state,
+                    )
+                    .await
                 {
-                    let _ = sender.send(Message::Text(event.to_string().into())).await;
+                    close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                    break;
                 }
             }
 
@@ -1103,11 +1292,44 @@ async fn handle_socket(
                         continue;
                     }
                 };
-                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                if let Sent::SessionLost(code) = send_unless_lost(
+                    &mut sender,
+                    Message::Text(frame.to_string().into()),
+                    &mut session_watch,
+                    &state,
+                )
+                .await
+                {
+                    close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
+                    break;
+                }
             }
 
         }
     }
+}
+
+/// Wait for the permit that serializes a session's turns, for as long as the
+/// dashboard session behind the socket still admits it, then check it once
+/// more: the wait can outlast the session or its access. `Err` carries the
+/// code to close the socket with.
+async fn acquire_turn_permit(
+    state: &AppState,
+    session_key: &str,
+    session_watch: &mut Option<crate::dashboard_session::SessionWatch>,
+) -> Result<Result<crate::session_queue::SessionGuard, crate::session_queue::SessionQueueError>, u16>
+{
+    let acquired = tokio::select! {
+        biased;
+        code = crate::dashboard_session::session_lost(&mut *session_watch, state) => {
+            return Err(code);
+        }
+        acquired = state.session_queue.acquire(session_key) => acquired,
+    };
+    if acquired.is_ok() {
+        crate::dashboard_session::session_admits_now(session_watch, state).await?;
+    }
+    Ok(acquired)
 }
 
 fn resolve_session_cwd(
@@ -1457,7 +1679,7 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
     })
 }
 
-fn history_trimmed_ws_frame(
+pub(crate) fn history_trimmed_ws_frame(
     dropped_messages: usize,
     dropped_turns: usize,
     kept_turns: usize,
@@ -1546,7 +1768,7 @@ fn needs_onboarding_ws_error(
     }))
 }
 
-fn first_chat_message_content(text: &str) -> Option<String> {
+pub(crate) fn first_chat_message_content(text: &str) -> Option<String> {
     let parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
     (parsed["type"].as_str() == Some("message"))
         .then(|| parsed["content"].as_str().unwrap_or("").to_string())
@@ -1836,6 +2058,8 @@ async fn process_chat_message(
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
+    // The dashboard session that opened the socket, if one did.
+    session: &mut Option<crate::dashboard_session::SessionWatch>,
 ) -> bool {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
@@ -1979,6 +2203,34 @@ async fn process_chat_message(
     let forward_fut = async {
         let mut cancel_drained = false;
         let mut client_gone = false;
+        // Every write to the viewer races the session ending: a viewer that
+        // stops reading stalls the write, and the session's loss must not
+        // wait behind it. Either way the viewer is detached and its session
+        // watch released.
+        macro_rules! send_to_viewer {
+            ($message:expr) => {
+                match send_unless_lost(&mut *sender, $message, &mut *session, state).await {
+                    Sent::Delivered => {}
+                    Sent::PeerGone => {
+                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        *session = None;
+                        client_gone = true;
+                    }
+                    Sent::SessionLost(code) => {
+                        detach_mid_turn(session_key, &turn_id, pending_approvals);
+                        *session = None;
+                        close_with(
+                            &mut *sender,
+                            &mut *receiver,
+                            code,
+                            "dashboard session ended",
+                        )
+                        .await;
+                        client_gone = true;
+                    }
+                }
+            };
+        }
         loop {
             tokio::select! {
                             biased;
@@ -1991,30 +2243,47 @@ async fn process_chat_message(
                                 // a ToolLoopCancelled error which closes event_rx and
                                 // breaks this loop on the `event_rx.recv()` arm below.
                             }
+                            // The session behind a signed-in socket ended or lost the
+                            // access it needs: the socket closes now, not when the turn
+                            // finishes, and is treated as a viewer that left. Ahead of
+                            // the client arm so buffered input cannot win the race.
+                            code = crate::dashboard_session::session_lost(&mut *session, state), if !client_gone => {
+                                detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                *session = None;
+                                close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
+                                client_gone = true;
+                            }
                             client_msg = receiver.next(), if !client_gone => {
                                 let text = match classify_client_frame(client_msg) {
                                     ClientFrame::Text(text) => text,
                                     ClientFrame::Ping(payload) => {
-                                        if sender.send(Message::Pong(payload)).await.is_err() {
-                                            detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                            client_gone = true;
-                                        }
+                                        send_to_viewer!(Message::Pong(payload));
                                         continue;
                                     }
                                     ClientFrame::Ignore => continue,
                                     ClientFrame::Gone => {
                                         detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                        *session = None;
                                         client_gone = true;
                                         continue;
                                     }
                                 };
+                                if let Err(code) =
+                                    crate::dashboard_session::session_admits_now(&mut *session, state).await
+                                {
+                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
+                                    *session = None;
+                                    close_with(&mut *sender, &mut *receiver, code, "dashboard session ended").await;
+                                    client_gone = true;
+                                    continue;
+                                }
                                 let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
                                     let err = serde_json::json!({
                                         "type": "error",
                                         "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
                                         "code": "INVALID_JSON"
                                     });
-                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    send_to_viewer!(Message::Text(err.to_string().into()));
                                     continue;
                                 };
                                 match parsed["type"].as_str() {
@@ -2058,7 +2327,7 @@ async fn process_chat_message(
                                                 "message": "Message content cannot be empty",
                                                 "code": "EMPTY_CONTENT"
                                             });
-                                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            send_to_viewer!(Message::Text(err.to_string().into()));
                                             continue;
                                         }
                                         match steering_tx.try_send(gateway_steering_input(content)) {
@@ -2069,7 +2338,7 @@ async fn process_chat_message(
                                                     "message": "Steering queue is full for the running turn",
                                                     "code": "STEERING_QUEUE_FULL"
                                                 });
-                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                                send_to_viewer!(Message::Text(err.to_string().into()));
                                             }
                                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                                 let err = serde_json::json!({
@@ -2077,7 +2346,7 @@ async fn process_chat_message(
                                                     "message": "Running turn is no longer accepting steering messages",
                                                     "code": "STEERING_CLOSED"
                                                 });
-                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                                send_to_viewer!(Message::Text(err.to_string().into()));
                                             }
                                         }
                                     }
@@ -2106,17 +2375,11 @@ async fn process_chat_message(
                                         "arguments_summary": arguments_summary,
                                         "timeout_secs": timeout_secs,
                                     });
-                                    if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
-                                        detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                        client_gone = true;
-                                    }
+                                    send_to_viewer!(Message::Text(frame.to_string().into()));
                                 }
                             }
                             _ = tick_websocket_ping(ping_interval), if !client_gone => {
-                                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                    client_gone = true;
-                                }
+                                send_to_viewer!(Message::Ping(Vec::new().into()));
                             }
                                 event_opt = event_rx.recv() => {
                                 let Some(event) = event_opt else { break };
@@ -2196,10 +2459,7 @@ async fn process_chat_message(
                                 if client_gone {
                                     continue;
                                 }
-                                if sender.send(Message::Text(ws_msg.to_string().into())).await.is_err() {
-                                    detach_mid_turn(session_key, &turn_id, pending_approvals);
-                                    client_gone = true;
-                                }
+                                send_to_viewer!(Message::Text(ws_msg.to_string().into()));
                             }
                         }
         }
@@ -3126,6 +3386,37 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         )
     }
 
+    type ScriptedTails = Arc<parking_lot::Mutex<std::collections::HashMap<usize, String>>>;
+
+    /// A reply that ends the head's empty text block and calls `tool` with
+    /// `input`.
+    fn tool_call_stream_tail(tool: &str, input: &serde_json::Value) -> String {
+        let start = serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "tool_use", "id": "toolu_fixture", "name": tool, "input": {}},
+        });
+        let delta = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": input.to_string()},
+        });
+        format!(
+            "event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+event: content_block_start\n\
+data: {start}\n\n\
+event: content_block_delta\n\
+data: {delta}\n\n\
+event: content_block_stop\n\
+data: {{\"type\":\"content_block_stop\",\"index\":1}}\n\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\n"
+        )
+    }
+
     type WsClient = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
@@ -3143,22 +3434,64 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         /// How many parked completions may finish; the n-th request finishes
         /// once this reaches n.
         released: tokio::sync::watch::Sender<usize>,
+        /// Replies scripted for particular requests (1-based), sent in place
+        /// of the parked text reply once that request is released.
+        scripted_tails: ScriptedTails,
         servers: Vec<tokio::task::JoinHandle<()>>,
+        /// Present when the gateway serves dashboard sign-in.
+        signed_in: Option<SignedInParts>,
         _tmp: tempfile::TempDir,
+    }
+
+    /// The sign-in half of a signed-in fixture: the session authority, and
+    /// the inbound authority shared with it, so a test can publish a policy
+    /// change the open sockets must see.
+    struct SignedInParts {
+        dashboard: Arc<crate::dashboard_session::DashboardAuth>,
+        rpc_auth: Arc<zeroclaw_runtime::rpc::auth::RpcInboundAuth>,
+        config: zeroclaw_config::schema::Config,
     }
 
     impl ParkedTurnFixture {
         async fn spawn() -> Self {
+            Self::spawn_with(None, |_| {}).await
+        }
+
+        /// The same gateway with dashboard sign-in offering `corp` at
+        /// `issuer`, under the session layer, with `/auth/sign-out` served.
+        async fn spawn_signed_in(issuer: &str) -> Self {
+            Self::spawn_with(Some(issuer), |_| {}).await
+        }
+
+        /// A signed-in fixture whose config `adjust` changes before the
+        /// gateway starts.
+        async fn spawn_signed_in_with(
+            issuer: &str,
+            adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
+        ) -> Self {
+            Self::spawn_with(Some(issuer), adjust).await
+        }
+
+        async fn spawn_with(
+            sign_in: Option<&str>,
+            adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
+        ) -> Self {
             let (request_seen_tx, request_seen) =
                 tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
             let (released, released_rx) = tokio::sync::watch::channel(0usize);
             let arrivals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let scripted_tails = ScriptedTails::default();
+            let mock_tails = Arc::clone(&scripted_tails);
             let mock_app = Router::new().route(
                 "/v1/messages",
                 post(move |Json(request): Json<serde_json::Value>| {
                     let request_seen_tx = request_seen_tx.clone();
                     let mut released_rx = released_rx.clone();
                     let index = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let tail_text = mock_tails
+                        .lock()
+                        .remove(&index)
+                        .unwrap_or_else(parked_stream_tail);
                     async move {
                         assert_eq!(
                             request["stream"].as_bool(),
@@ -3173,7 +3506,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         });
                         let tail = futures_util::stream::once(async move {
                             let _ = released_rx.wait_for(|released| *released >= index).await;
-                            Ok::<_, std::io::Error>(axum::body::Bytes::from(parked_stream_tail()))
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(tail_text))
                         });
                         (
                             [(header::CONTENT_TYPE, "text/event-stream")],
@@ -3236,34 +3569,183 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 },
             );
 
+            if let Some(issuer) = sign_in {
+                crate::dashboard_session::test_support::add_sign_in(&mut config, issuer);
+            }
+            adjust(&mut config);
+
             let backend = zeroclaw_infra::make_session_backend(&workspace, "sqlite")
                 .expect("sqlite session backend");
+            if sign_in.is_none() {
+                let state = AppState {
+                    session_backend: Some(backend.clone()),
+                    ..crate::api::tests::test_state(config)
+                };
+                let gateway_app = Router::new()
+                    .route("/ws/chat", get(handle_ws_chat))
+                    .with_state(state.clone());
+                let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind local WebSocket gateway");
+                let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+                let gateway_server = zeroclaw_spawn::spawn!(async move {
+                    axum::serve(gateway_listener, gateway_app)
+                        .await
+                        .expect("local WebSocket gateway serves");
+                });
+                return Self {
+                    state,
+                    backend,
+                    gateway_addr,
+                    request_seen,
+                    released,
+                    scripted_tails: Arc::clone(&scripted_tails),
+                    servers: vec![mock_server, gateway_server],
+                    signed_in: None,
+                    _tmp: tmp,
+                };
+            }
+
+            let pairing = Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+                config.gateway.require_pairing,
+                &config.gateway.paired_tokens,
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            ));
+            let rpc_auth = Arc::new(
+                zeroclaw_runtime::rpc::auth::RpcInboundAuth::from_config(
+                    &config,
+                    Arc::clone(&pairing),
+                )
+                .expect("inbound auth builds"),
+            );
             let state = AppState {
                 session_backend: Some(backend.clone()),
-                ..crate::api::tests::test_state(config)
+                pairing,
+                ..crate::api::tests::test_state(config.clone())
             };
+            let dashboard = Arc::new(
+                crate::dashboard_session::DashboardAuth::new(
+                    Arc::new(crate::dashboard_session::DashboardSessions::default()),
+                    Arc::new(crate::principal_gate::GatewayInboundAuth::from_shared(
+                        Arc::clone(&rpc_auth),
+                    )),
+                )
+                .for_generation(&state),
+            );
             let gateway_app = Router::new()
                 .route("/ws/chat", get(handle_ws_chat))
-                .with_state(state.clone());
-            let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind local WebSocket gateway");
-            let gateway_addr = gateway_listener.local_addr().expect("gateway address");
-            let gateway_server = zeroclaw_spawn::spawn!(async move {
-                axum::serve(gateway_listener, gateway_app)
-                    .await
-                    .expect("local WebSocket gateway serves");
-            });
-
+                .merge(crate::api_oidc::routes())
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::dashboard_session::DashboardLayer {
+                        state: state.clone(),
+                        auth: Arc::clone(&dashboard),
+                    },
+                    crate::dashboard_session::layer,
+                ));
+            let (gateway_addr, gateway_server) =
+                crate::dashboard_session::test_support::serve(gateway_app).await;
             Self {
                 state,
                 backend,
                 gateway_addr,
                 request_seen,
                 released,
+                scripted_tails: Arc::clone(&scripted_tails),
                 servers: vec![mock_server, gateway_server],
+                signed_in: Some(SignedInParts {
+                    dashboard,
+                    rpc_auth,
+                    config,
+                }),
                 _tmp: tmp,
             }
+        }
+
+        fn signed_in(&self) -> &SignedInParts {
+            self.signed_in
+                .as_ref()
+                .expect("a fixture spawned with spawn_signed_in")
+        }
+
+        /// Sign `alice` in through the configured provider; the cookie header
+        /// and the session's CSRF token.
+        async fn sign_in(&self, lifetime_secs: u64) -> (String, String) {
+            let parts = self.signed_in();
+            let (cookie, session) = parts
+                .dashboard
+                .sign_in(
+                    "corp",
+                    crate::dashboard_session::ProviderPin::of(&parts.config.oidc["corp"]),
+                    "at-alice".to_string(),
+                    lifetime_secs,
+                )
+                .await
+                .expect("alice signs in");
+            (
+                format!("{}={cookie}", crate::dashboard_session::SESSION_COOKIE),
+                session.csrf.clone(),
+            )
+        }
+
+        /// Open a chat socket on `session_id` with the session cookie, from
+        /// the gateway's own origin; the socket and its `session_start`.
+        async fn connect_signed_in(
+            &self,
+            session_id: &str,
+            cookie: &str,
+        ) -> (WsClient, serde_json::Value) {
+            let mut client = crate::dashboard_session::test_support::connect(
+                self.gateway_addr,
+                &format!("/ws/chat?agent=web&session_id={session_id}"),
+                cookie,
+            )
+            .await
+            .expect("a signed-in administrator opens the chat");
+            let session_start = next_text_frame(&mut client).await;
+            assert_eq!(session_start["type"], "session_start");
+            (client, session_start)
+        }
+
+        /// Answer the `index`-th provider request (1-based) with a text reply
+        /// of about `bytes`, in 64 KiB pieces, instead of the parked one.
+        fn script_long_reply(&self, index: usize, bytes: usize) {
+            let piece = "x".repeat(64 * 1024);
+            let mut tail = String::new();
+            for _ in 0..bytes.div_ceil(piece.len()) {
+                tail.push_str(&format!(
+                    "event: content_block_delta\n\
+data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{piece}\"}}}}\n\n"
+                ));
+            }
+            tail.push_str(
+                "event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n",
+            );
+            self.scripted_tails.lock().insert(index, tail);
+        }
+
+        /// Answer the `index`-th provider request (1-based) with a call to
+        /// `tool`, instead of the parked text reply.
+        fn script_tool_call(&self, index: usize, tool: &str, input: serde_json::Value) {
+            self.scripted_tails
+                .lock()
+                .insert(index, tool_call_stream_tail(tool, &input));
+        }
+
+        /// Publish the same policy with the `admins` group no longer mapped.
+        fn revoke_admin(&self) {
+            let parts = self.signed_in();
+            let revoked =
+                crate::dashboard_session::test_support::without_admin_mapping(&parts.config);
+            parts
+                .rpc_auth
+                .publish_accepted(&revoked, parts.rpc_auth.accepted_revision() + 1)
+                .expect("the revoked policy is accepted");
         }
 
         /// Open a chat socket on `session_id` and return it with the
@@ -3405,6 +3887,652 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         client.close(None).await.expect("client close frame");
         drop(client);
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // ── Dashboard sign-in: a session that ends takes the socket with it ──
+    //
+    // Each socket below belongs to a signed-in administrator, and each test
+    // ends that authority while the socket is open: by sign-out over HTTP,
+    // by expiry, or by a policy that no longer grants it. The socket must
+    // close with the session's code, and nothing it sends afterwards may be
+    // acted on. The admitted turn itself is not cancelled; it finishes
+    // unattended, as when a viewer detaches.
+
+    /// Read frames until one of type `kind` arrives.
+    async fn next_frame_of(client: &mut WsClient, kind: &str) -> serde_json::Value {
+        loop {
+            let frame = next_text_frame(client).await;
+            if frame["type"] == kind {
+                break frame;
+            }
+        }
+    }
+
+    async fn send_raw(client: &mut WsClient, frame: serde_json::Value) {
+        // The server may already be closing; a failed send is not the point.
+        let _ = client
+            .send(ClientMessage::Text(frame.to_string().into()))
+            .await;
+    }
+
+    #[test]
+    fn a_signed_in_chat_socket_closes_on_sign_out_mid_turn() {
+        run_ws_regression(
+            "ws-signin-signout-mid-turn",
+            a_signed_in_chat_socket_closes_on_sign_out_mid_turn_inner,
+        );
+    }
+
+    async fn a_signed_in_chat_socket_closes_on_sign_out_mid_turn_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let session_id = "signin-signout-mid-turn";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture
+            .start_parked_turn(&mut client, "hold this turn")
+            .await;
+        assert!(fixture.has_live_turn(&session_key), "the turn is in flight");
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        // What the old socket sends after sign-out must not be acted on.
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "approval_response", "request_id": "r-1", "decision": "approve"}),
+        )
+        .await;
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "message", "content": "steer after sign-out"}),
+        )
+        .await;
+
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(4401),
+            "the socket closes as soon as the session ends"
+        );
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "closing the socket does not cancel the admitted turn"
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let followed_up = fixture.request_seen.try_recv().is_ok();
+        assert!(
+            !followed_up,
+            "nothing sent after sign-out reached the model"
+        );
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_signed_in_chat_socket_closes_when_its_session_expires_mid_turn() {
+        run_ws_regression(
+            "ws-signin-expiry-mid-turn",
+            a_signed_in_chat_socket_closes_when_its_session_expires_mid_turn_inner,
+        );
+    }
+
+    async fn a_signed_in_chat_socket_closes_when_its_session_expires_mid_turn_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, _) = fixture.sign_in(2).await;
+        let session_id = "signin-expiry-mid-turn";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture
+            .start_parked_turn(&mut client, "hold this turn")
+            .await;
+
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(8),
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(4401),
+            "the socket closes when the session expires, mid-turn"
+        );
+        assert!(fixture.has_live_turn(&session_key));
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_signed_in_chat_socket_closes_when_the_account_loses_admin_mid_turn() {
+        run_ws_regression(
+            "ws-signin-admin-removed-mid-turn",
+            a_signed_in_chat_socket_closes_when_the_account_loses_admin_mid_turn_inner,
+        );
+    }
+
+    async fn a_signed_in_chat_socket_closes_when_the_account_loses_admin_mid_turn_inner() {
+        // In both groups: losing the admin mapping leaves a valid session
+        // that may no longer use the in-process chat.
+        let idp = crate::dashboard_session::test_support::idp(&["admins", "ops"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, _) = fixture.sign_in(3600).await;
+        let session_id = "signin-admin-removed-mid-turn";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture
+            .start_parked_turn(&mut client, "hold this turn")
+            .await;
+
+        fixture.revoke_admin();
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "message", "content": "steer after revocation"}),
+        )
+        .await;
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(4403),
+            "the socket closes once its account loses the access it needs"
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let followed_up = fixture.request_seen.try_recv().is_ok();
+        assert!(
+            !followed_up,
+            "the steering sent after revocation never reached the model"
+        );
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn input_buffered_after_sign_out_between_turns_starts_no_turn() {
+        run_ws_regression(
+            "ws-signin-buffered-after-signout",
+            input_buffered_after_sign_out_between_turns_starts_no_turn_inner,
+        );
+    }
+
+    async fn input_buffered_after_sign_out_between_turns_starts_no_turn_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let (mut client, _) = fixture.connect_signed_in("signin-buffered", &cookie).await;
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204);
+        for n in 0..5 {
+            send_raw(
+                &mut client,
+                serde_json::json!({"type": "message", "content": format!("message {n} after sign-out")}),
+            )
+            .await;
+        }
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(code, Some(4401));
+        let started = tokio::time::timeout(Duration::from_millis(500), fixture.request_seen.recv())
+            .await
+            .is_ok();
+        assert!(!started, "a message buffered after sign-out started a turn");
+        fixture.shutdown();
+    }
+
+    /// What the fixture file holds: it reaches the model only if a file-read
+    /// approval was honored.
+    const APPROVED_READ: &str = "contents only an honored approval reveals";
+
+    #[test]
+    fn an_approval_sent_after_sign_out_resolves_nothing() {
+        run_ws_regression(
+            "ws-signin-approval-after-signout",
+            an_approval_sent_after_sign_out_resolves_nothing_inner,
+        );
+    }
+
+    async fn an_approval_sent_after_sign_out_resolves_nothing_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        // Every file read asks first, and the turn's first reply reads one.
+        let mut fixture = ParkedTurnFixture::spawn_signed_in_with(&idp.uri(), |config| {
+            config
+                .risk_profiles
+                .get_mut("fixture")
+                .expect("the fixture's risk profile")
+                .always_ask = vec!["file_read".to_string()];
+            std::fs::write(config.data_dir.join("note.txt"), APPROVED_READ).expect("fixture file");
+        })
+        .await;
+        fixture.script_tool_call(1, "file_read", serde_json::json!({"path": "note.txt"}));
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let session_id = "signin-approval-after-signout";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture
+            .start_parked_turn(&mut client, "read the note")
+            .await;
+        fixture.release_next();
+        let prompt = next_frame_of(&mut client, "approval_request").await;
+        let request_id = prompt["request_id"]
+            .as_str()
+            .expect("the prompt names its request")
+            .to_string();
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "approval_response", "request_id": request_id, "decision": "approve"}),
+        )
+        .await;
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "message", "content": "steer after sign-out"}),
+        )
+        .await;
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(4401),
+            "the socket closes as soon as the session ends"
+        );
+
+        // The turn runs on unattended, and its prompt resolves as a refusal.
+        let follow_up = fixture.next_provider_request().await.to_string();
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        assert!(
+            !follow_up.contains(APPROVED_READ),
+            "an approval sent after sign-out was honored"
+        );
+        assert!(
+            !follow_up.contains("steer after sign-out"),
+            "steering sent after sign-out reached the model"
+        );
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_message_waiting_for_the_session_permit_starts_no_turn_after_sign_out() {
+        run_ws_regression(
+            "ws-signin-permit-wait-after-signout",
+            a_message_waiting_for_the_session_permit_starts_no_turn_after_sign_out_inner,
+        );
+    }
+
+    async fn a_message_waiting_for_the_session_permit_starts_no_turn_after_sign_out_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let session_id = "signin-permit-wait";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        // A first viewer's turn holds the session's permit and runs on after
+        // the viewer leaves.
+        let (mut first, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture
+            .start_parked_turn(&mut first, "hold the permit")
+            .await;
+        disconnect_viewer(first).await;
+        // A second socket's message, sent while still signed in, waits for it.
+        let (mut second, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        send_chat(&mut second, "queued before sign-out").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut second,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(4401),
+            "a socket waiting for the permit closes when the session ends"
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        let started = tokio::time::timeout(Duration::from_millis(500), fixture.request_seen.recv())
+            .await
+            .is_ok();
+        assert!(!started, "the queued message started a turn after sign-out");
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_message_after_the_account_loses_admin_between_turns_starts_no_turn() {
+        run_ws_regression(
+            "ws-signin-admin-removed-between-turns",
+            a_message_after_the_account_loses_admin_between_turns_starts_no_turn_inner,
+        );
+    }
+
+    async fn a_message_after_the_account_loses_admin_between_turns_starts_no_turn_inner() {
+        // Still signed in afterwards (`ops`), so the socket must close for the
+        // lost access (4403), not for an ended session.
+        let idp = crate::dashboard_session::test_support::idp(&["admins", "ops"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, _) = fixture.sign_in(3600).await;
+        // One socket past its connect frame, one whose message is its first.
+        let (mut connected, _) = fixture
+            .connect_signed_in("signin-revoked-connected", &cookie)
+            .await;
+        send_raw(&mut connected, serde_json::json!({"type": "connect"})).await;
+        assert_eq!(
+            next_frame_of(&mut connected, "connected").await["type"],
+            "connected"
+        );
+        let (mut fresh, _) = fixture
+            .connect_signed_in("signin-revoked-fresh", &cookie)
+            .await;
+
+        fixture.revoke_admin();
+        // Past its connect frame, a frame that takes no turn permit (an
+        // approval) is checked on its own; a first message, through the permit.
+        send_raw(
+            &mut connected,
+            serde_json::json!({"type": "approval_response", "request_id": "r-1", "decision": "approve"}),
+        )
+        .await;
+        send_chat(&mut fresh, "sent after the account lost admin").await;
+        for client in [&mut connected, &mut fresh] {
+            let (code, _) = crate::dashboard_session::test_support::until_closed(
+                client,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(code, Some(4403), "the socket closes for the access it lost");
+        }
+        let started = tokio::time::timeout(Duration::from_millis(500), fixture.request_seen.recv())
+            .await
+            .is_ok();
+        assert!(
+            !started,
+            "a message sent after the account lost admin started a turn"
+        );
+        fixture.shutdown();
+    }
+
+    // ── Dashboard sign-in: a check that outlasts its session ──────────
+
+    #[derive(Clone, Copy, Debug)]
+    enum SlowCheckEnd {
+        /// The session's hard expiry passes during the check.
+        Expiry,
+        /// The socket's gateway generation stops during the check.
+        GenerationStop,
+    }
+
+    /// A real approval prompt is answered while the frame's check has to
+    /// verify the session again and the provider is slow; meanwhile the
+    /// session's hard expiry passes, or its generation stops. The socket
+    /// closes with the matching code, the approval resolves nothing, and the
+    /// steering sent with it never reaches the model.
+    async fn an_approval_answered_during_a_slow_check(end: SlowCheckEnd) {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in_with(&idp.uri(), |config| {
+            config
+                .risk_profiles
+                .get_mut("fixture")
+                .expect("the fixture's risk profile")
+                .always_ask = vec!["file_read".to_string()];
+            std::fs::write(config.data_dir.join("note.txt"), APPROVED_READ).expect("fixture file");
+            crate::dashboard_session::test_support::revalidate_after(config, 2);
+        })
+        .await;
+        fixture.script_tool_call(1, "file_read", serde_json::json!({"path": "note.txt"}));
+        let lifetime = match end {
+            SlowCheckEnd::Expiry => 12,
+            SlowCheckEnd::GenerationStop => 3600,
+        };
+        let (cookie, _) = fixture.sign_in(lifetime).await;
+        let session_id = match end {
+            SlowCheckEnd::Expiry => "signin-slow-check-expiry",
+            SlowCheckEnd::GenerationStop => "signin-slow-check-stop",
+        };
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture
+            .start_parked_turn(&mut client, "read the note")
+            .await;
+        fixture.release_next();
+        let prompt = next_frame_of(&mut client, "approval_request").await;
+        let request_id = prompt["request_id"]
+            .as_str()
+            .expect("the prompt names its request")
+            .to_string();
+
+        // The approval's check is due to verify again, and the provider is
+        // now slower than what is left of the session.
+        tokio::time::sleep(crate::dashboard_session::test_support::UNTIL_DUE).await;
+        crate::dashboard_session::test_support::slow_introspection(
+            &idp,
+            &["admins"],
+            "gw",
+            Duration::from_secs(16),
+        )
+        .await;
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "approval_response", "request_id": request_id, "decision": "approve"}),
+        )
+        .await;
+        send_raw(
+            &mut client,
+            serde_json::json!({"type": "message", "content": "steer after the end"}),
+        )
+        .await;
+        let expected = match end {
+            SlowCheckEnd::Expiry => 4401,
+            SlowCheckEnd::GenerationStop => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                fixture.state.shutdown_tx.send_replace(true);
+                1001
+            }
+        };
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(12),
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(expected),
+            "{end:?}: the socket closes at the end"
+        );
+
+        let follow_up = fixture.next_provider_request().await.to_string();
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        assert!(
+            !follow_up.contains(APPROVED_READ),
+            "{end:?}: an approval checked past the end was honored"
+        );
+        assert!(
+            !follow_up.contains("steer after the end"),
+            "{end:?}: steering checked past the end reached the model"
+        );
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn an_approval_checked_past_the_sessions_hard_expiry_resolves_nothing() {
+        run_ws_regression(
+            "ws-signin-slow-check-expiry",
+            an_approval_checked_past_the_sessions_hard_expiry_resolves_nothing_inner,
+        );
+    }
+
+    async fn an_approval_checked_past_the_sessions_hard_expiry_resolves_nothing_inner() {
+        an_approval_answered_during_a_slow_check(SlowCheckEnd::Expiry).await;
+    }
+
+    #[test]
+    fn an_approval_checked_across_a_generation_stop_resolves_nothing() {
+        run_ws_regression(
+            "ws-signin-slow-check-stop",
+            an_approval_checked_across_a_generation_stop_resolves_nothing_inner,
+        );
+    }
+
+    async fn an_approval_checked_across_a_generation_stop_resolves_nothing_inner() {
+        an_approval_answered_during_a_slow_check(SlowCheckEnd::GenerationStop).await;
+    }
+
+    #[test]
+    fn a_chat_socket_closed_mid_turn_releases_its_session_watch() {
+        run_ws_regression(
+            "ws-signin-release-watch",
+            a_chat_socket_closed_mid_turn_releases_its_session_watch_inner,
+        );
+    }
+
+    /// Once a signed-in chat socket closes mid-turn, the turn that runs on
+    /// unattended holds nothing of the session: not its watch, nor any
+    /// recheck (and token copy) the watch had in flight.
+    async fn a_chat_socket_closed_mid_turn_releases_its_session_watch_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let dashboard = Arc::clone(&fixture.signed_in().dashboard);
+        let baseline = Arc::strong_count(&dashboard);
+        let session_id = "signin-release-watch";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture
+            .start_parked_turn(&mut client, "hold this turn")
+            .await;
+        assert!(
+            Arc::strong_count(&dashboard) > baseline,
+            "the open socket holds its session watch"
+        );
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        let (code, _) = crate::dashboard_session::test_support::until_closed(
+            &mut client,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(code, Some(4401));
+        let released = tokio::time::timeout(Duration::from_secs(3), async {
+            while Arc::strong_count(&dashboard) > baseline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "the turn is still running unattended"
+        );
+        assert!(
+            released,
+            "the unattended turn still holds the session watch ({} > {baseline})",
+            Arc::strong_count(&dashboard)
+        );
+        fixture.release_next();
+        fixture.wait_for_turn_to_settle(&session_key).await;
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn a_stalled_viewer_does_not_hold_an_ended_sessions_watch() {
+        run_ws_regression(
+            "ws-signin-stalled-viewer",
+            a_stalled_viewer_does_not_hold_an_ended_sessions_watch_inner,
+        );
+    }
+
+    /// A viewer that stops reading stalls the socket's writes. Ending the
+    /// session must still release the socket's session watch, without the
+    /// viewer reading anything and while the turn is still running.
+    async fn a_stalled_viewer_does_not_hold_an_ended_sessions_watch_inner() {
+        let idp = crate::dashboard_session::test_support::idp(&["admins"], "gw").await;
+        let mut fixture = ParkedTurnFixture::spawn_signed_in(&idp.uri()).await;
+        // Far more than the socket buffers hold, so the gateway's writes stall.
+        fixture.script_long_reply(1, 48 * 1024 * 1024);
+        let (cookie, csrf) = fixture.sign_in(3600).await;
+        let dashboard = Arc::clone(&fixture.signed_in().dashboard);
+        let baseline = Arc::strong_count(&dashboard);
+        let session_id = "signin-stalled-viewer";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect_signed_in(session_id, &cookie).await;
+        fixture.start_parked_turn(&mut client, "write a lot").await;
+        // From here on the viewer reads nothing.
+        fixture.release_next();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            Arc::strong_count(&dashboard) > baseline,
+            "the open socket holds its session watch"
+        );
+
+        let status = crate::dashboard_session::test_support::sign_out_over_http(
+            fixture.gateway_addr,
+            &cookie,
+            &csrf,
+        )
+        .await;
+        assert_eq!(status, 204, "sign-out succeeds");
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&dashboard) > baseline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            fixture.has_live_turn(&session_key),
+            "the turn is still running"
+        );
+        assert!(
+            released,
+            "a stalled write kept the ended session's watch ({} > {baseline})",
+            Arc::strong_count(&dashboard)
+        );
+        drop(client);
+        fixture.shutdown();
     }
 
     #[test]

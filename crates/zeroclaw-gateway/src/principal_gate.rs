@@ -56,6 +56,7 @@ use zeroclaw_runtime::rpc::transport::TransportKind;
 use zeroclaw_runtime::security::auth_provider::Credential;
 
 use crate::ConfigWriteGuard;
+use crate::dashboard_session::DashboardCaller;
 
 /// Header naming the auth provider to verify the bearer with, mirroring
 /// the RPC handshake's `auth_provider` field (e.g. `oidc.corp`). Absent
@@ -117,10 +118,30 @@ impl GatewayInboundAuth {
         self.inner.publish_accepted(persisted, revision)
     }
 
+    /// The grants `auth` holds under the accepted policy in force now; see
+    /// [`RpcInboundAuth::current_grants`].
+    pub(crate) fn current_grants(
+        &self,
+        auth: &ConnectionAuth,
+    ) -> Result<zeroclaw_api::grants::ResolvedGrants, AuthDenied> {
+        self.inner.current_grants(auth)
+    }
+
+    /// A handle naming this authority, for a binding that must notice when
+    /// a later generation's authority replaced it.
+    pub(crate) fn authority_ref(&self) -> std::sync::Weak<RpcInboundAuth> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// Whether `authority` names this authority.
+    pub(crate) fn is_authority(&self, authority: &std::sync::Weak<RpcInboundAuth>) -> bool {
+        std::sync::Weak::ptr_eq(authority, &Arc::downgrade(&self.inner))
+    }
+
     /// Verify a bearer against an explicitly selected provider and
     /// resolve it to a principal with grants, both against the accepted
     /// policy snapshot as it stands.
-    async fn authenticate_scoped(
+    pub(crate) async fn authenticate_scoped(
         &self,
         token: &str,
         provider: &str,
@@ -132,6 +153,21 @@ impl GatewayInboundAuth {
                 Some(token),
                 Some(provider),
             )
+            .await
+    }
+
+    /// [`Self::authenticate_scoped`] for a bearer bound to the provider as
+    /// it was configured when the bearer was issued: refused before it is
+    /// sent if the accepted policy's provider by that name is another one
+    /// now. See [`RpcInboundAuth::authenticate_bound`].
+    pub(crate) async fn authenticate_bound(
+        &self,
+        token: &str,
+        provider: &str,
+        binding: &zeroclaw_runtime::rpc::auth::OidcBinding,
+    ) -> Result<ConnectionAuth, AuthDenied> {
+        self.inner
+            .authenticate_bound(TransportKind::Wss, token, provider, binding)
             .await
     }
 
@@ -501,6 +537,40 @@ pub async fn config_route_auth(
     // convention this replaces never authenticated OPTIONS either (the
     // explicit `handle_options_*` handlers carry no check).
     if request.method() == Method::OPTIONS {
+        return next.run(request).await;
+    }
+
+    // A signed-in dashboard session carries no bearer: the session layer
+    // already verified it and resolved the grants in force now, and put
+    // its verdict on the request. An explicit credential always wins, so
+    // this applies only when the request presents none.
+    if !request
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION)
+        && !request.headers().contains_key(AUTH_PROVIDER_HEADER)
+        && let Some(caller) = request.extensions().get::<DashboardCaller>().cloned()
+    {
+        let session = match caller {
+            DashboardCaller::Session(session) => session,
+            DashboardCaller::Rejected(rejection) => {
+                return crate::dashboard_session::rejection_response(rejection);
+            }
+        };
+        let Some(floor) = method_floor(request.method()) else {
+            return forbidden("Unsupported method for the config surface");
+        };
+        if !floor
+            .iter()
+            .any(|verb| session.grants.permits(Resource::Config, *verb))
+        {
+            return forbidden("Principal lacks the config grant required for this method");
+        }
+        let mut conn = session.connection.clone();
+        conn.grants = session.grants.clone();
+        request.extensions_mut().insert(RequestAuth {
+            principal: Some(Arc::new(conn)),
+            authority: Arc::clone(&auth),
+        });
         return next.run(request).await;
     }
 
