@@ -19,8 +19,24 @@
 # `plugins-wasm`, so the default-feature Test job cannot run their tests and
 # this job is where they run. `src/main.rs` holds the plugin CLI itself, and
 # the plugin CLI component tests that drive it run only in this job too.
+# The gateway's `/plugin/{path}` ingress is listed for the same reason: its
+# handler and HTTP tests compile only under the gateway's `plugins-wasm`
+# feature, so this job is the only required one that runs them and the plugin
+# webhook golden frames that pin its public HTTP contract. The paths are the
+# handler and its tests, the router that mounts it, the manifest that defines
+# the feature, the golden harness and fixtures, the shared webhook types in
+# zeroclaw-api, and the plugin webhook ingress in zeroclaw-infra. The infra
+# crate root and manifest are listed too: the root holds the dedup limit
+# helpers that size the ingress's reservation store, and the manifest defines
+# the ingress's dependencies. Other gateway and infra paths stay out: the
+# default-feature Test job covers them.
 # The plugin artifact smoke harness is listed as well: this job is the only
 # place its scripts run before a release, so a change to them has to run it.
+# The standalone gateway's forwarder and the two-process IPC proof run only
+# here, so the gateway's core connection, the RPC client and wire crates they
+# compile against, the JSON-RPC request plumbing in zeroclaw-api that the
+# client sends through (`RpcOutbound`), the root IPC e2e target, and the
+# channel fixture helpers shared by both root e2e targets are listed too.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
 # printed value to GITHUB_OUTPUT.
 
@@ -37,6 +53,20 @@ while IFS= read -r path; do
         tests/plugin_channel_runtime_e2e.rs|\
         tests/channel_egress_e2e.rs|\
         tests/component/plugin_info_cli.rs|tests/component/plugin_update_cli.rs|\
+        tests/plugin_webhook_ipc_e2e.rs|\
+        tests/support/plugin_channel_fixture.rs|\
+        crates/zeroclaw-gateway/src/core_rpc.rs|\
+        crates/zeroclaw-rpc-client/*|\
+        crates/zeroclaw-rpc-proto/*|\
+        crates/zeroclaw-api/src/jsonrpc.rs|\
+        crates/zeroclaw-gateway/src/plugin_webhook*|\
+        crates/zeroclaw-gateway/src/lib.rs|\
+        crates/zeroclaw-gateway/Cargo.toml|\
+        crates/zeroclaw-gateway/tests/golden*|\
+        crates/zeroclaw-api/src/webhook.rs|\
+        crates/zeroclaw-infra/src/plugin_webhook*|\
+        crates/zeroclaw-infra/src/lib.rs|\
+        crates/zeroclaw-infra/Cargo.toml|\
         src/plugins/*|src/plugin_registry.rs|src/quickstart_plugins/*|src/main.rs|\
         wit/*|\
         Cargo.toml|Cargo.lock|\
