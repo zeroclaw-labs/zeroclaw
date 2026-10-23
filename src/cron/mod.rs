@@ -112,6 +112,48 @@ fn cron_update_payload_confirmation(
     }
 }
 
+/// Short stable prefix of a job id for compact run-history rows.
+fn short_job_id(job_id: &str) -> &str {
+    job_id.get(..8).unwrap_or(job_id)
+}
+
+/// First line of a run's output, capped at 80 chars, with a marker when the
+/// preview had to drop output.
+fn output_preview(output: &str) -> String {
+    const PREVIEW_MAX_CHARS: usize = 80;
+    let first_line = output.lines().next().unwrap_or("");
+    let truncated =
+        first_line.chars().count() > PREVIEW_MAX_CHARS || output.lines().nth(1).is_some();
+    let preview: String = first_line.chars().take(PREVIEW_MAX_CHARS).collect();
+    if truncated {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
+/// Render one `cron runs` row: UTC start, short job id, status, duration, and
+/// a one-line output preview. Data-only line, matching `cron list` row style.
+fn format_run_line(run: &CronRun) -> String {
+    let duration = run
+        .duration_ms
+        .map(|ms| ms.to_string())
+        .unwrap_or_else(|| "n/a".into());
+    let preview = run
+        .output
+        .as_deref()
+        .map(output_preview)
+        .unwrap_or_else(|| "n/a".into());
+    format!(
+        "- {} | {} | {} | {}ms | {}",
+        run.started_at.to_rfc3339(),
+        short_job_id(&run.job_id),
+        run.status,
+        duration,
+        preview,
+    )
+}
+
 /// Print where a created/updated job's output will go, so an `ok` job status is
 /// never mistaken for a successful delivery.
 fn print_delivery_line(job: &CronJob) {
@@ -179,6 +221,28 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         )
                     );
                 }
+            }
+            Ok(())
+        }
+        crate::CronCommands::Runs { job, limit } => {
+            let limit = usize::try_from(limit).unwrap_or(10);
+            let runs = match job.as_deref() {
+                Some(job_id) => list_runs(config, job_id, limit)?,
+                None => list_recent_runs(config, limit)?,
+            };
+            if runs.is_empty() {
+                println!("{}", get_required_cli_string("cli-cron-runs-none"));
+                return Ok(());
+            }
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-cron-runs-header",
+                    &[("count", &runs.len().to_string())]
+                )
+            );
+            for run in &runs {
+                println!("{}", format_run_line(run));
             }
             Ok(())
         }
@@ -1405,5 +1469,63 @@ mod tests {
             line,
             get_required_cli_string_with_args("cli-cron-cmd", &[("v", "echo new")])
         );
+    }
+
+    fn sample_run(output: Option<&str>, duration_ms: Option<i64>) -> CronRun {
+        CronRun {
+            id: 7,
+            job_id: "abcdef1234567890".into(),
+            started_at: "2026-10-19T08:30:00Z".parse().unwrap(),
+            finished_at: "2026-10-19T08:30:01Z".parse().unwrap(),
+            status: "ok".into(),
+            output: output.map(str::to_string),
+            duration_ms,
+            execution: Some("ok".into()),
+            delivery: Some("not_required".into()),
+            persistence: Some("not_bound".into()),
+            principal: None,
+            executing_agent: None,
+            job_source: None,
+            owner_agent: None,
+        }
+    }
+
+    #[test]
+    fn cron_runs_line_renders_fields_and_short_job_id() {
+        let run = sample_run(Some("first line of output"), Some(1500));
+        let line = format_run_line(&run);
+        assert!(line.contains("2026-10-19T08:30:00+00:00"), "line: {line}");
+        assert!(line.contains("abcdef12"), "line: {line}");
+        assert!(!line.contains("abcdef1234567890"), "line: {line}");
+        assert!(line.contains("ok"), "line: {line}");
+        assert!(line.contains("1500ms"), "line: {line}");
+        assert!(line.contains("first line of output"), "line: {line}");
+    }
+
+    #[test]
+    fn cron_runs_line_falls_back_to_n_a_for_missing_output_and_duration() {
+        let line = format_run_line(&sample_run(None, None));
+        assert!(line.contains("n/a"), "line: {line}");
+    }
+
+    #[test]
+    fn cron_runs_preview_keeps_first_line_and_caps_at_80_chars() {
+        let long_line = "x".repeat(120);
+        let preview = output_preview(&long_line);
+        assert!(preview.chars().count() <= 81, "preview: {preview}");
+        assert!(preview.ends_with('…'), "preview: {preview}");
+
+        let multi_line = "hello\nworld hidden";
+        let preview = output_preview(multi_line);
+        assert_eq!(preview, "hello…");
+
+        let short = "short output";
+        assert_eq!(output_preview(short), "short output");
+    }
+
+    #[test]
+    fn cron_runs_short_job_id_handles_short_ids() {
+        assert_eq!(short_job_id("abc"), "abc");
+        assert_eq!(short_job_id("123456789"), "12345678");
     }
 }

@@ -644,6 +644,8 @@ cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
 cli-cron-delivery = {"  "}Delivery: {$v}
 cli-cron-delivery-disabled = disabled (output is not sent anywhere)
+cli-cron-runs-header = 🕒 Recent cron runs ({$count}):
+cli-cron-runs-none = No cron runs found.
 
 # ── main / status / quickstart / pairing / desktop ──
 cli-no-command = No command provided.
