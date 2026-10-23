@@ -8,13 +8,34 @@ Two email channels depending on how you want inbound messages delivered.
 
 ## IMAP + SMTP (`email_channel`)
 
-The general-purpose email channel. Polls IMAP for new messages, sends via SMTP. Works with Gmail, Outlook, Fastmail, self-hosted Postfix, and anything else that speaks IMAP/SMTP.
+The general-purpose email channel. Polls IMAP for new messages and, when SMTP is configured, sends via SMTP. Works with Gmail, Outlook, Fastmail, self-hosted Postfix, and anything else that speaks IMAP/SMTP.
 
 {{#config-fields channels.email}}
 
 `password` (and `smtp_password` if you use a separate relay) are secrets:
 
 {{#secret-config channels.email.<alias>.password}}
+
+### Inbound-only mode (no SMTP)
+
+`imap_host` is the only transport endpoint required. Leave `smtp_host` and
+`from_address` unset (or blank) to give the agent read-write access to the
+mailbox without the ability to send email:
+
+- IMAP still runs: new mail is delivered to the agent and read/flag updates are
+  written unless `observer_mode = true`.
+- Every outbound send from this channel is refused with an `outbound email is
+  disabled` error, so agent replies fail rather than leaving the mailbox.
+  Surfaces that require real delivery (SOP approval routes, no-reply notices,
+  escalations, text polls) treat the channel as unable to deliver and reject or
+  skip it up front.
+- Set both `smtp_host` and `from_address` to enable sending again; either one
+  alone keeps the channel inbound-only and raises an
+  `email_smtp_partially_configured` config warning naming the missing field.
+
+The restriction is outbound-only. Pair it with a peer group (above) to control
+who may address the agent, and with `observer_mode` if the mailbox must not be
+mutated at all.
 
 ### Gmail gotchas
 
@@ -45,7 +66,9 @@ Real-time delivery via Google Cloud Pub/Sub, no polling.
 3. Authorize the agent's Gmail access and store the resulting token via the secret path above
 4. The agent watches for new-mail notifications and routes them to the bound agent
 
-Outbound sends still go via SMTP: configure an IMAP+SMTP `[channels.email.<alias>]` block.
+Gmail Push sends through the Gmail API using its own `oauth_token`, independently
+of SMTP. Omitting `smtp_host` and `from_address` disables sending only for an
+IMAP+SMTP `[channels.email.<alias>]` block, not for Gmail Push.
 
 ---
 

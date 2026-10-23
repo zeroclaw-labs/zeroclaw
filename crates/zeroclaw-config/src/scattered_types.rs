@@ -582,7 +582,11 @@ pub struct EmailConfig {
     pub imap_port: u16,
     #[serde(default = "default_imap_folder")]
     pub imap_folder: String,
-    pub smtp_host: String,
+    /// SMTP relay host. Optional: when omitted (or blank) the channel stays
+    /// read-write on IMAP (inbound processing, flag updates) but refuses to
+    /// send, so an operator can grant mailbox access without outbound email.
+    #[serde(default)]
+    pub smtp_host: Option<String>,
     #[serde(default = "default_smtp_port")]
     pub smtp_port: u16,
     #[serde(default = "default_true")]
@@ -595,7 +599,11 @@ pub struct EmailConfig {
     pub username: String,
     #[secret]
     pub password: String,
-    pub from_address: String,
+    /// From identity for outbound mail. Optional for the same reason as
+    /// `smtp_host`: outbound sending requires both, and inbound-only channels
+    /// never build an outbound message.
+    #[serde(default)]
+    pub from_address: Option<String>,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
     /// Polling interval used when the IMAP server does not advertise the IDLE
@@ -641,14 +649,14 @@ impl Default for EmailConfig {
             imap_host: String::new(),
             imap_port: default_imap_port(),
             imap_folder: default_imap_folder(),
-            smtp_host: String::new(),
+            smtp_host: None,
             smtp_port: default_smtp_port(),
             smtp_tls: true,
             smtp_username: None,
             smtp_password: None,
             username: String::new(),
             password: String::new(),
-            from_address: String::new(),
+            from_address: None,
             idle_timeout_secs: default_idle_timeout(),
             poll_interval_secs: default_poll_interval_secs(),
             default_subject: default_subject(),

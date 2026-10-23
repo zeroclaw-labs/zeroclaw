@@ -13122,6 +13122,46 @@ pub fn validate_memory_semantics(
         .collect()
 }
 
+/// Warn when only one half of the outbound SMTP pair is configured.
+///
+/// `smtp_host` and `from_address` are each optional so an IMAP-only mailbox can
+/// be read without granting send access. That makes a half-configured pair — a
+/// relay host with no From identity, or the reverse — look like a working
+/// channel that silently never sends: the channel loads, reads mail, and
+/// refuses every send. Surface the cause once per alias instead of leaving the
+/// operator to discover it from a reply that never leaves.
+///
+/// Called from `Config::collect_warnings`, so this reaches the CLI and the
+/// gateway dashboard on the same path as the other warnings.
+pub fn validate_email_smtp_semantics(
+    alias: &str,
+    em: &crate::scattered_types::EmailConfig,
+) -> Vec<crate::validation_warnings::ValidationWarning> {
+    if !em.enabled {
+        return Vec::new();
+    }
+    let non_blank = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+    let has_host = non_blank(em.smtp_host.as_deref());
+    let has_from = non_blank(em.from_address.as_deref());
+    if has_host == has_from {
+        return Vec::new();
+    }
+    let (set, missing) = if has_host {
+        ("smtp_host", "from_address")
+    } else {
+        ("from_address", "smtp_host")
+    };
+    vec![crate::validation_warnings::ValidationWarning::new(
+        crate::validation_warnings::EMAIL_SMTP_PARTIALLY_CONFIGURED,
+        format!(
+            "channels.email.{alias}.{set} is set but {missing} is not, so outbound \
+             sending stays disabled. Set both to enable SMTP, or neither for an \
+             inbound-only mailbox."
+        ),
+        format!("channels.email.{alias}.{missing}"),
+    )]
+}
+
 /// Surface WhatsApp chat-policy keys that are accepted but never consulted.
 ///
 /// `self_chat_mode` is read only by the Web transport inside its
@@ -23419,6 +23459,9 @@ impl Config {
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
+        }
+        for (alias, em) in &self.channels.email {
+            warnings.extend(validate_email_smtp_semantics(alias, em));
         }
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
@@ -50012,6 +50055,58 @@ group_policy = "all"
 
     fn owned_codex_args(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    async fn email_half_configured_smtp_warns_while_inbound_only_and_full_outbound_stay_quiet() {
+        let code = crate::validation_warnings::EMAIL_SMTP_PARTIALLY_CONFIGURED;
+        let email_config = |enabled: bool, extra: &str| -> Config {
+            toml::from_str(&format!(
+                "[channels.email.mail]\nenabled = {enabled}\nimap_host = \"imap.example.com\"\n\
+                 username = \"u\"\npassword = \"p\"\n{extra}"
+            ))
+            .unwrap()
+        };
+
+        for (extra, missing) in [
+            ("smtp_host = \"smtp.example.com\"\n", "from_address"),
+            ("from_address = \"bot@example.com\"\n", "smtp_host"),
+        ] {
+            let warnings = warnings_with_code(&email_config(true, extra), code);
+            assert_eq!(warnings.len(), 1, "one warning for a half pair: {extra}");
+            assert_eq!(
+                warnings[0].path,
+                format!("channels.email.mail.{missing}"),
+                "the warning must point at the missing half"
+            );
+            assert!(
+                warnings[0].message.contains(missing),
+                "the message must name the missing field: {}",
+                warnings[0].message
+            );
+        }
+
+        for quiet in [
+            // Inbound-only: the supported read-write, never-send mode.
+            "",
+            // Fully configured outbound.
+            "smtp_host = \"smtp.example.com\"\nfrom_address = \"bot@example.com\"\n",
+        ] {
+            assert!(
+                warnings_with_code(&email_config(true, quiet), code).is_empty(),
+                "no half-pair warning expected for: {quiet:?}"
+            );
+        }
+
+        // A disabled channel is inert, so it is not diagnosed.
+        assert!(
+            warnings_with_code(
+                &email_config(false, "smtp_host = \"smtp.example.com\"\n"),
+                code
+            )
+            .is_empty(),
+            "a disabled channel must not be diagnosed as a half-configured sender"
+        );
     }
 
     #[::core::prelude::v1::test]

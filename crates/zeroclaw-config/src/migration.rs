@@ -1090,6 +1090,24 @@ mod tests {
     // ── resilient daemon load: starts no matter what, so config can be repaired ──
 
     #[test]
+    fn email_alias_without_smtp_loads_read_only() {
+        let raw = r#"
+    schema_version = 3
+
+    [channels.email.fakeemail]
+    enabled = true
+    imap_host = "imap.example.com"
+    username = "u"
+    password = "p"
+    "#;
+        let cfg = migrate_to_current_resilient(raw);
+        assert!(cfg.channels.email.contains_key("fakeemail"));
+        let e = &cfg.channels.email["fakeemail"];
+        assert!(e.smtp_host.is_none());
+        assert!(e.from_address.is_none());
+    }
+
+    #[test]
     fn broken_channel_alias_is_dropped_not_fatal() {
         // Email alias missing required `imap_host` must not abort the load.
         let raw = r#"

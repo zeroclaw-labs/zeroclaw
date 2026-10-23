@@ -25679,7 +25679,7 @@ api_key = "anthropic-key"
     fn email_wire(message: &SendMessage) -> String {
         let channel = EmailChannel::new(
             crate::email_channel::EmailConfig {
-                from_address: "bot@example.invalid".to_string(),
+                from_address: Some("bot@example.invalid".to_string()),
                 ..crate::email_channel::EmailConfig::default()
             },
             "test",
