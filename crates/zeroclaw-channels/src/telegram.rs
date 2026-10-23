@@ -1,3 +1,4 @@
+use crate::util::reaction_error;
 use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -751,10 +752,6 @@ enum ReactionWrite {
     Set(String),
 }
 
-fn reaction_error(key: &str, args: &[(&str, &str)]) -> anyhow::Error {
-    anyhow::Error::msg(i18n::get_required_cli_string_with_args(key, args))
-}
-
 /// Shared `setMessageReaction` writer. Holds the message's slot lock across
 /// the request so concurrent ack and tool writes to one message serialize
 /// and the tracked slot stays consistent with what Telegram last received.
@@ -789,7 +786,6 @@ async fn send_reaction_request(
     client: reqwest::Client,
     url: String,
     chat_id: String,
-    thread_id: Option<String>,
     message_id: i64,
     emoji: &str,
     explicit: bool,
@@ -866,14 +862,13 @@ async fn send_reaction_request(
         None => Vec::new(),
         Some(emoji) => vec![::serde_json::json!({"type": "emoji", "emoji": emoji})],
     };
-    let mut body = ::serde_json::json!({
+    // No `message_thread_id`: setMessageReaction addresses a message by chat
+    // and message id alone, and message ids are unique within a chat.
+    let body = ::serde_json::json!({
         "chat_id": chat_id,
         "message_id": message_id,
         "reaction": reaction_list,
     });
-    if let Some(thread_id) = thread_id {
-        body["message_thread_id"] = ::serde_json::Value::String(thread_id);
-    }
 
     // Mark the slot unverified before the request leaves: if this future is
     // dropped or the request times out, Telegram's state is unknown.
@@ -926,11 +921,11 @@ async fn send_reaction_request(
     };
     // Telegram can answer HTTP 200 with `ok: false`; only an explicit
     // `ok: true` confirms the write landed.
+    let envelope = serde_json::from_str::<serde_json::Value>(&response_body).ok();
     let accepted = status.is_success()
-        && serde_json::from_str::<serde_json::Value>(&response_body)
-            .ok()
-            .and_then(|v| v.get("ok").and_then(serde_json::Value::as_bool))
-            == Some(true);
+        && envelope
+            .as_ref()
+            .is_some_and(TelegramChannel::telegram_api_envelope_ok);
     if !accepted {
         let err_body = zeroclaw_runtime::security::scrub(&response_body);
         ::zeroclaw_log::record!(
@@ -945,9 +940,21 @@ async fn send_reaction_request(
                 })),
             "setMessageReaction failed"
         );
-        // Telegram answered and refused the write, so the previous state
-        // still stands.
-        *tracked = previous;
+        // A 4xx, or any non-5xx answer carrying `ok: false`, is Telegram
+        // refusing the write, so the previous state still stands. A 5xx
+        // (often a proxy or gateway that may have forwarded the write) or an
+        // unreadable 2xx body leaves the outcome unknown, so the slot stays
+        // unverified.
+        let refused = status.is_client_error()
+            || (!status.is_server_error()
+                && envelope
+                    .as_ref()
+                    .and_then(|v| v.get("ok"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false));
+        if refused {
+            *tracked = previous;
+        }
         let status = status.to_string();
         return Err(reaction_error(
             "channel-telegram-reaction-api-error",
@@ -3869,7 +3876,7 @@ impl TelegramChannel {
             // Automatic acknowledgement write; send_reaction_request skips it
             // and logs when the message holds an explicit (tool) reaction.
             let _ = send_reaction_request(
-                &slots, client, url, chat_id, None, message_id, &emoji, false, false,
+                &slots, client, url, chat_id, message_id, &emoji, false, false,
             )
             .await;
         });
@@ -3927,7 +3934,8 @@ impl TelegramChannel {
         explicit: bool,
         remove: bool,
     ) -> anyhow::Result<()> {
-        let (chat_id, thread_id) = Self::parse_reply_target(channel_id);
+        // A forum-topic target (`chat_id:thread_id`) reacts by chat alone.
+        let (chat_id, _thread_id) = Self::parse_reply_target(channel_id);
         let message_id = Self::parse_reaction_message_id(message_id, &chat_id)?;
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
@@ -3936,7 +3944,6 @@ impl TelegramChannel {
             client,
             url,
             chat_id,
-            thread_id,
             message_id,
             emoji,
             explicit,
@@ -25070,8 +25077,9 @@ mod tests {
     }
 
     /// The orchestrator passes composite `chat_id:thread_id` targets
-    /// unchanged; reaction calls must split them into Telegram's
-    /// `chat_id` + `message_thread_id` fields.
+    /// unchanged; reaction calls must strip the topic and address the
+    /// message by `chat_id` alone, since setMessageReaction has no
+    /// `message_thread_id` parameter.
     #[tokio::test]
     async fn reaction_targets_topic_threads() {
         let server = wiremock::MockServer::start().await;
@@ -25085,8 +25093,53 @@ mod tests {
         let bodies = reaction_request_bodies(&server).await;
         assert_eq!(bodies.len(), 1, "{bodies:?}");
         assert_eq!(bodies[0]["chat_id"], "-100200300");
-        assert_eq!(bodies[0]["message_thread_id"], "77");
+        assert!(bodies[0].get("message_thread_id").is_none(), "{bodies:?}");
         assert_eq!(bodies[0]["message_id"], 42);
+    }
+
+    /// A 5xx can come from a proxy or gateway after Telegram applied the
+    /// write, so it must leave the slot unverified rather than restoring a
+    /// verified state that a later removal would trust.
+    #[tokio::test]
+    async fn server_error_leaves_slot_unverified() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        mount_reaction_ok(&server).await;
+        let ch = reaction_channel(server.uri());
+
+        // Verified-clear tombstone: add then remove 👍.
+        ch.set_explicit_reaction("8943231406", "893", "\u{1F44D}", true)
+            .await
+            .unwrap();
+        ch.set_explicit_reaction("8943231406", "893", "\u{1F44D}", false)
+            .await
+            .unwrap();
+
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123456:ABC-def_GHI/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("Bad Gateway"))
+            .mount(&server)
+            .await;
+        ch.set_explicit_reaction("8943231406", "893", "\u{1F525}", true)
+            .await
+            .expect_err("a 502 must not report success");
+
+        // 🔥 may have landed; the tombstone must not vouch for a clear slot.
+        let err = ch
+            .set_explicit_reaction("8943231406", "893", "\u{1F525}", false)
+            .await
+            .expect_err("removal after a 5xx must not report success");
+        assert!(
+            err.to_string().contains("cannot verify removal"),
+            "rendered: {err}"
+        );
+        assert_eq!(
+            reaction_request_bodies(&server).await.len(),
+            1,
+            "the unverifiable removal must not reach Telegram"
+        );
     }
 
     /// Telegram's native ack owns the single bot reaction slot; the channel
