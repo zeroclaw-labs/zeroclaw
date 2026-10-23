@@ -485,6 +485,12 @@ pub enum MessageEntryKind {
 
 rpc_type! {
     pub struct MessageEntry {
+        #[serde(default,skip_serializing_if="Option::is_none")]
+        pub message_id: Option<String>,
+        #[serde(default,skip_serializing_if="Vec::is_empty")]
+        pub file_ids: Vec<String>,
+        #[serde(default,skip_serializing_if="Vec::is_empty")]
+        pub unavailable_parts: Vec<zeroclaw_api::session_events::UnavailableContentPart>,
         pub role: String,
         pub content: String,
         #[serde(default)]
@@ -519,6 +525,9 @@ rpc_type! {
     pub struct SessionDeleteResult {
         pub session_id: String,
         pub deleted: bool,
+        /// Native deletion closes the session; content erasure is a separate command.
+        #[serde(default)]
+        pub history_retained: bool,
     }
 }
 

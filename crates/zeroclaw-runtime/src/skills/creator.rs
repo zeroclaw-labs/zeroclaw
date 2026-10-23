@@ -109,6 +109,9 @@ impl SkillCreator {
                     .with_context(|| format!("Failed to write {}", md_path.display()))?;
             }
             Err(err) => {
+                if zeroclaw_api::session_events::capture::is_capture_stopped(&err) {
+                    return Err(err);
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

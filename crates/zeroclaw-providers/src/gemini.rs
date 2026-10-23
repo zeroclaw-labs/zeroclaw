@@ -170,6 +170,9 @@ struct GenerationConfig {
 
 #[derive(Debug, Deserialize)]
 struct GenerateContentResponse {
+    #[serde(default, rename = "modelVersion")]
+    model_version: Option<String>,
+
     candidates: Option<Vec<Candidate>>,
     error: Option<ApiError>,
     #[serde(default)]
@@ -188,22 +191,26 @@ struct GeminiUsageMetadata {
 
 #[derive(Debug, Deserialize)]
 struct Candidate {
+    #[serde(default, rename = "finishReason")]
+    finish_reason: Option<String>,
     #[serde(default)]
     content: Option<CandidateContent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct CandidateContent {
     parts: Vec<ResponsePart>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ResponsePart {
     #[serde(default)]
     text: Option<String>,
     /// Thinking models (e.g. gemini-3-pro-preview) mark reasoning parts with `thought: true`.
     #[serde(default)]
     thought: bool,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 impl CandidateContent {
@@ -232,9 +239,11 @@ impl CandidateContent {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, serde::Serialize, Deserialize)]
 struct ApiError {
     message: String,
+    #[serde(flatten)]
+    fields: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl GenerateContentResponse {
@@ -244,10 +253,14 @@ impl GenerateContentResponse {
             Self {
                 response: Some(mut inner),
                 usage_metadata,
+                model_version,
                 ..
             } => {
                 if inner.usage_metadata.is_none() {
                     inner.usage_metadata = usage_metadata;
+                }
+                if inner.model_version.is_none() {
+                    inner.model_version = model_version;
                 }
                 *inner
             }
@@ -1156,6 +1169,7 @@ impl GeminiModelProvider {
         let (contents, system_instruction) = Self::build_chat_contents(messages, None)?;
         self.send_generate_content(contents, system_instruction, model, temperature)
             .await
+            .map(|(text, usage, _)| (text, usage))
     }
 
     fn token_usage_from_metadata(usage: GeminiUsageMetadata) -> Option<TokenUsage> {
@@ -1176,7 +1190,11 @@ impl GeminiModelProvider {
         system_instruction: Option<Content>,
         model: &str,
         temperature: Option<f64>,
-    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+    ) -> anyhow::Result<(
+        String,
+        Option<TokenUsage>,
+        Vec<zeroclaw_api::model_provider::ProviderOutputBlock>,
+    )> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1346,7 +1364,7 @@ impl GeminiModelProvider {
                         .send()
                         .await?;
                 } else {
-                    anyhow::bail!("Gemini API error ({status}): {error_text}");
+                    return Err(super::api_error_from_parts("Gemini", status, &error_text));
                 }
             } else if auth.is_oauth()
                 && Self::should_retry_oauth_without_generation_config(status, &error_text)
@@ -1370,7 +1388,7 @@ impl GeminiModelProvider {
                     .send()
                     .await?;
             } else {
-                anyhow::bail!("Gemini API error ({status}): {error_text}");
+                return Err(super::api_error_from_parts("Gemini", status, &error_text));
             }
         }
 
@@ -1399,45 +1417,59 @@ impl GeminiModelProvider {
                     .send()
                     .await?;
             } else {
-                anyhow::bail!("Gemini API error ({status}): {error_text}");
+                return Err(super::api_error_from_parts("Gemini", status, &error_text));
             }
         }
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Gemini API error ({status}): {error_text}");
+            return Err(super::api_error_from_parts("Gemini", status, &error_text));
         }
 
         let result: GenerateContentResponse = response.json().await?;
         if let Some(err) = &result.error {
-            anyhow::bail!("Gemini API error: {}", err.message);
+            return Err(crate::dispatch::ProviderProtocolFailure::new(
+                serde_json::json!({"error":err}),
+            )
+            .into());
         }
         let result = result.into_effective_response();
         if let Some(err) = result.error {
-            anyhow::bail!("Gemini API error: {}", err.message);
+            return Err(crate::dispatch::ProviderProtocolFailure::new(
+                serde_json::json!({"error":err}),
+            )
+            .into());
         }
 
         let usage = result
             .usage_metadata
             .and_then(Self::token_usage_from_metadata);
 
-        let text = result
+        let candidate = result
             .candidates
             .and_then(|c| c.into_iter().next())
-            .and_then(|c| c.content)
-            .and_then(|c| c.effective_text())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    "gemini: empty response text"
-                );
-                anyhow::Error::msg("No response from Gemini")
-            })?;
+            .ok_or_else(|| anyhow::Error::msg("No response from Gemini"))?;
+        let mut output_blocks = Vec::new();
+        if let Some(model) = result.model_version {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {metadata:serde_json::json!({"kind":"served_attribution","protocol":"gemini","model":model})});
+        }
+        if let Some(reason) = candidate.finish_reason {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"gemini", "finish_reason":reason}),
+            });
+        }
+        let candidate = candidate
+            .content
+            .ok_or_else(|| anyhow::Error::msg("No response from Gemini"))?;
+        for part in &candidate.parts {
+            output_blocks.extend(crate::output::gemini_blocks(&serde_json::to_value(part)?));
+        }
+        // Media-only responses are valid semantic output. Retain the legacy
+        // display projection independently from complete ordered blocks.
+        let text = candidate.effective_text().unwrap_or_default();
 
-        Ok((text, usage))
+        Ok((text, usage, output_blocks))
     }
 }
 
@@ -1474,7 +1506,7 @@ impl ModelProvider for GeminiModelProvider {
             parts: build_parts(message),
         }];
 
-        let (text, _usage) = self
+        let (text, _usage, _blocks) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
         Ok(text)
@@ -1515,14 +1547,25 @@ impl ModelProvider for GeminiModelProvider {
         };
         let (contents, system_instruction) =
             Self::build_chat_contents(request.messages, tool_instructions.as_deref())?;
-        let (text, usage) = self
+        let (text, usage, output_blocks) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
+        let reasoning_content = output_blocks
+            .iter()
+            .filter_map(|block| match block {
+                zeroclaw_api::model_provider::ProviderOutputBlock::Reasoning { bytes, .. } => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         Ok(ProviderChatResponse {
+            output_blocks,
             text: Some(text),
             tool_calls: Vec::new(),
             usage,
-            reasoning_content: None,
+            reasoning_content: (!reasoning_content.is_empty())
+                .then(|| reasoning_content.join("\n")),
         })
     }
 

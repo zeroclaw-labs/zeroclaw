@@ -592,6 +592,17 @@ impl Channel for PacedChannel {
         self.inner.request_choice(question, choices, timeout).await
     }
 
+    async fn request_choice_outcome(
+        &self,
+        question: &str,
+        choices: &[String],
+        timeout: Duration,
+    ) -> Result<zeroclaw_api::channel::ChannelChoiceOutcome> {
+        self.inner
+            .request_choice_outcome(question, choices, timeout)
+            .await
+    }
+
     async fn request_multi_choice(
         &self,
         question: &str,

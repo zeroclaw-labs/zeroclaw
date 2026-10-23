@@ -78,6 +78,7 @@ const DUPLICATE_TOOL_RESULT_PREFIX: &str = "[duplicate result for tool call";
 /// wrapped payload. See [`AnthropicModelProvider::residual_payload_end`].
 const WRAPPED_BASE64_WIDTH_MIN: usize = 16;
 
+#[cfg(test)]
 use crate::stream_guard::AbortOnDrop;
 use std::borrow::Cow;
 
@@ -202,6 +203,18 @@ const ANTHROPIC_OAUTH_BETA_FEATURES: &str =
 /// (`thinking.display` controls omitted/updates/summarized thinking blocks).
 const ANTHROPIC_THINKING_DISPLAY_BETA: &str = "thinking-display-updates-2026-08-18";
 
+pub(crate) const SIGNED_REPLAY_REPRESENTATION: &str = "anthropic.signed_replay";
+
+fn signed_replay_block(payload: &str) -> StreamEvent {
+    StreamEvent::OutputBlock(
+        zeroclaw_api::model_provider::ProviderOutputBlock::Reasoning {
+            representation: SIGNED_REPLAY_REPRESENTATION.into(),
+            bytes: payload.as_bytes().to_vec(),
+            replay_requirement: "provider_defined".into(),
+        },
+    )
+}
+
 /// Flush an in-flight streaming thinking block as a durable reasoning chunk.
 ///
 /// Emits the accumulated `{"thinking":..,"signature":..}` JSON object in the
@@ -235,6 +248,10 @@ async fn flush_streaming_thinking_block(
     payload
         .push_str(&serde_json::json!({ "thinking": thinking, "signature": signature }).to_string());
     *reasoning_block_emitted = true;
+    if tx.send(Ok(signed_replay_block(&payload))).await.is_err() {
+        return false;
+    }
+    // Legacy consumers still assemble continuation from this projection.
     tx.send(Ok(StreamEvent::ReasoningFinalized(payload)))
         .await
         .is_ok()
@@ -355,6 +372,8 @@ enum NativeContentOut {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 /// `tool_result.content` accepts either a plain string or a list of nested
@@ -542,6 +561,8 @@ struct SystemBlock {
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     content: Vec<NativeContentIn>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
@@ -603,6 +624,8 @@ struct AnthropicUsageIteration {
 
 #[derive(Debug, Deserialize)]
 struct NativeContentIn {
+    #[serde(flatten)]
+    content_extensions: serde_json::Map<String, serde_json::Value>,
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
@@ -869,7 +892,8 @@ impl AnthropicModelProvider {
                 }
                 NativeContentOut::ToolUse { .. }
                 | NativeContentOut::Image { .. }
-                | NativeContentOut::Thinking { .. } => {}
+                | NativeContentOut::Thinking { .. }
+                | NativeContentOut::RedactedThinking { .. } => {}
             }
         }
         false
@@ -923,6 +947,14 @@ impl AnthropicModelProvider {
         {
             for part in reasoning.split('\n') {
                 if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
+                    if block.get("type").and_then(serde_json::Value::as_str)
+                        == Some("redacted_thinking")
+                    {
+                        if let Some(data) = block.get("data").and_then(serde_json::Value::as_str) {
+                            blocks.push(NativeContentOut::RedactedThinking { data: data.into() });
+                        }
+                        continue;
+                    }
                     let thinking = block
                         .get("thinking")
                         .and_then(|t| t.as_str())
@@ -2127,6 +2159,54 @@ impl AnthropicModelProvider {
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
         let mut content_block_types = Vec::with_capacity(content_block_count);
+        let mut output_blocks: Vec<_> = response
+            .content
+            .iter()
+            .enumerate()
+            .flat_map(|(index, block)| {
+                // NativeContentIn contains content fields only, never headers.
+                let mut value = block.content_extensions.clone();
+                value.insert("type".into(), serde_json::json!(block.kind));
+                for (key, field) in [
+                    ("text", &block.text),
+                    ("thinking", &block.thinking),
+                    ("signature", &block.signature),
+                    ("id", &block.id),
+                    ("name", &block.name),
+                ] {
+                    if let Some(field) = field {
+                        value.insert(key.into(), serde_json::json!(field));
+                    }
+                }
+                if let Some(input) = &block.input {
+                    value.insert("input".into(), input.clone());
+                }
+                let mut blocks = crate::output::content_blocks(&serde_json::Value::Object(value));
+                for block in &mut blocks {
+                    if let zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                        metadata,
+                    } = block
+                    {
+                        metadata["position"] =
+                            serde_json::json!({"output_index":0,"content_index":index});
+                    }
+                }
+                blocks
+            })
+            .collect();
+        if let Some(id) = &response.id {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"provider_item","type_name":"message","position":{"output_index":0,"content_index":null},"fields":{"id":id}}),
+            });
+        }
+        if let Some(model) = &response.model {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {metadata:serde_json::json!({"kind":"served_attribution","protocol":"anthropic","model":model})});
+        }
+        if let Some(reason) = &response.stop_reason {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"anthropic", "stop_reason":reason}),
+            });
+        }
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
@@ -2160,6 +2240,17 @@ impl AnthropicModelProvider {
                         thinking_parts.push(json_block.to_string());
                     }
                 }
+                "redacted_thinking" => {
+                    if let Some(data) = block
+                        .content_extensions
+                        .get("data")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        thinking_parts.push(
+                            serde_json::json!({"type":"redacted_thinking","data":data}).to_string(),
+                        );
+                    }
+                }
                 "tool_use" => {
                     let name = block.name.unwrap_or_default();
                     if !name.is_empty() {
@@ -2186,6 +2277,7 @@ impl AnthropicModelProvider {
         };
 
         let parsed = ProviderChatResponse {
+            output_blocks,
             text: if text_parts.is_empty() {
                 None
             } else {
@@ -2512,7 +2604,10 @@ impl AnthropicModelProvider {
 
             let event: serde_json::Value = match serde_json::from_str(json_str) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(error) => {
+                    let _ = tx.send(Err(StreamError::Json(error))).await;
+                    return;
+                }
             };
 
             let event_type = event
@@ -2522,11 +2617,23 @@ impl AnthropicModelProvider {
 
             match event_type {
                 "message_start" => {
+                    if let Some(id) = event.pointer("/message/id").and_then(serde_json::Value::as_str)
+                        && tx.send(Ok(StreamEvent::ProtocolMetadata(serde_json::json!({"kind":"provider_item","type_name":"message","position":{"output_index":0,"content_index":null},"fields":{"id":id}})))).await.is_err() {
+                        return;
+                    }
                     let model = event
                         .get("message")
                         .and_then(|m| m.get("model"))
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown");
+                    if let Some(model) = event
+                        .get("message")
+                        .and_then(|m| m.get("model"))
+                        .and_then(serde_json::Value::as_str)
+                        && tx.send(Ok(StreamEvent::ProtocolMetadata(serde_json::json!({"kind":"served_attribution","protocol":"anthropic","model":model})))).await.is_err()
+                    {
+                        return;
+                    }
                     let usage = event.get("message").and_then(|m| m.get("usage"));
                     let observed_input = usage
                         .and_then(|u| u.get("input_tokens"))
@@ -2573,6 +2680,46 @@ impl AnthropicModelProvider {
                         {
                             return;
                         }
+                        if !matches!(block_type, "text" | "thinking" | "tool_use")
+                            && tx
+                                .send(Ok(StreamEvent::OutputBlock(crate::output::content_block(
+                                    block,
+                                ))))
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                        if let Some(
+                            zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                                mut metadata,
+                            },
+                        ) = crate::output::content_metadata(block)
+                        {
+                            metadata["position"] = serde_json::json!({"output_index":0,"content_index":event.get("index")});
+                            if tx
+                                .send(Ok(StreamEvent::ProtocolMetadata(metadata)))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        if block_type == "redacted_thinking" {
+                            let mut payload = String::new();
+                            if reasoning_block_emitted {
+                                payload.push('\n');
+                            }
+                            payload.push_str(&block.to_string());
+                            reasoning_block_emitted = true;
+                            if tx
+                                .send(Ok(StreamEvent::ReasoningFinalized(payload)))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         if block_type == "thinking" {
                             thinking_block_active = true;
                             thinking_text.clear();
@@ -2609,6 +2756,15 @@ impl AnthropicModelProvider {
                             .get("type")
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
+                        if !matches!(delta_type, "text_delta" | "thinking_delta")
+                            && tx.send(Ok(StreamEvent::ProtocolMetadata(serde_json::json!({
+                                "kind":"partial_content", "protocol":"anthropic",
+                                "component":if delta_type == "signature_delta" {"reasoning"} else {"opaque"},
+                                "type_name":delta_type, "activity":event,
+                            })))).await.is_err()
+                        {
+                            return;
+                        }
                         match delta_type {
                             "text_delta" => {
                                 if let Some(text) = delta.get("text").and_then(|t| t.as_str())
@@ -2632,8 +2788,8 @@ impl AnthropicModelProvider {
                             }
                             "thinking_delta" => {
                                 if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
-                                    // Transient, human-readable progress: goes
-                                    // to the UI immediately, never persisted.
+                                    // Readable progress is separate from signed replay
+                                    // content; native capture checkpoints it before UI delivery.
                                     if !text.is_empty()
                                         && tx
                                             .send(Ok(StreamEvent::ThinkingDelta(text.to_string())))
@@ -2687,6 +2843,16 @@ impl AnthropicModelProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
+                    if stop_reason != "none"
+                        && tx
+                            .send(Ok(StreamEvent::ProtocolMetadata(serde_json::json!({
+                                "kind":"finish", "protocol":"anthropic", "stop_reason":stop_reason
+                            }))))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
                     if stop_reason != "none" && collect_debug_metadata {
                         last_stop_reason = Some(stop_reason.to_string());
                     }
@@ -2812,19 +2978,10 @@ impl AnthropicModelProvider {
                     return;
                 }
                 "error" => {
-                    let error = event.get("error");
-                    let msg = error
-                        .and_then(|e| e.get("message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown streaming error");
-                    // Carry the machine-readable type (`overloaded_error`,
-                    // `rate_limit_error`, ...) so downstream retry
-                    // classification can match on it.
-                    let msg = match error.and_then(|e| e.get("type")).and_then(|t| t.as_str()) {
-                        Some(error_type) => format!("{error_type}: {msg}"),
-                        None => msg.to_string(),
-                    };
-                    let _ = tx.send(Err(StreamError::ModelProvider(msg))).await;
+                    let failure = crate::dispatch::ProviderProtocolFailure::new(event);
+                    let _ = tx
+                        .send(Err(StreamError::ProtocolFailure(Box::new(failure))))
+                        .await;
                     return;
                 }
                 _ => {}
@@ -3345,6 +3502,8 @@ impl ModelProvider for AnthropicModelProvider {
                     // the redirect limit.
                     if e.is_connect() {
                         StreamError::ConnectFailed(e.to_string())
+                    } else if e.is_timeout() {
+                        StreamError::ResponseTimeout(e.to_string())
                     } else {
                         StreamError::Http(e.to_string())
                     }
@@ -3363,7 +3522,7 @@ impl ModelProvider for AnthropicModelProvider {
                 let parsed: NativeChatResponse = response
                     .json()
                     .await
-                    .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
+                    .map_err(|e| StreamError::ProtocolFailure(Box::new(e)))?;
                 commit_safeguard_fallback(None);
                 Self::check_refusal(&parsed, &requested_model)
                     .map_err(|refusal| StreamError::ModelRefusal(Box::new(refusal)))?;
@@ -3376,26 +3535,76 @@ impl ModelProvider for AnthropicModelProvider {
             })
             .flat_map(|result| match result {
                 Ok(resp) => {
+                    use zeroclaw_api::model_provider::ProviderOutputBlock;
                     let mut events: Vec<StreamResult<StreamEvent>> = Vec::new();
-                    if let Some(rc) = resp.reasoning_content {
-                        // Readable thinking progress (transient): the raw
-                        // text without the signed JSON envelope. Visible
-                        // thinking must never carry the signature payload.
-                        for part in rc.split('\n') {
-                            if let Ok(block) = serde_json::from_str::<serde_json::Value>(part)
-                                && let Some(text) = block.get("thinking").and_then(|t| t.as_str())
-                                && !text.is_empty()
-                            {
-                                events.push(Ok(StreamEvent::ThinkingDelta(text.to_string())));
+                    let mut reasoning_emitted = false;
+                    for block in resp.output_blocks {
+                        match block {
+                            ProviderOutputBlock::Text { text } => {
+                                if !text.is_empty() {
+                                    events
+                                        .push(Ok(StreamEvent::TextDelta(StreamChunk::delta(text))));
+                                }
                             }
+                            ProviderOutputBlock::ToolCall { call } => {
+                                events.push(Ok(StreamEvent::ToolCall(call)));
+                            }
+                            ProviderOutputBlock::Reasoning {
+                                ref representation,
+                                ref bytes,
+                                ..
+                            } if matches!(
+                                representation.as_str(),
+                                "thinking" | "redacted_thinking"
+                            ) =>
+                            {
+                                let value: serde_json::Value = match serde_json::from_slice(bytes) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        return stream::iter(vec![Err(StreamError::Json(error))]);
+                                    }
+                                };
+                                if representation == "redacted_thinking" {
+                                    let mut payload = String::new();
+                                    if reasoning_emitted {
+                                        payload.push('\n');
+                                    }
+                                    payload.push_str(&value.to_string());
+                                    reasoning_emitted = true;
+                                    events.push(Ok(StreamEvent::OutputBlock(block)));
+                                    events.push(Ok(StreamEvent::ReasoningFinalized(payload)));
+                                    continue;
+                                }
+                                let thinking = value
+                                    .get("thinking")
+                                    .or_else(|| value.get("text"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                let signature = value
+                                    .get("signature")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("");
+                                if thinking.is_empty() && signature.is_empty() {
+                                    events.push(Ok(StreamEvent::OutputBlock(block)));
+                                    continue;
+                                }
+                                if !thinking.is_empty() {
+                                    events.push(Ok(StreamEvent::ThinkingDelta(thinking.into())));
+                                }
+                                let mut payload = String::new();
+                                if reasoning_emitted {
+                                    payload.push('\n');
+                                }
+                                payload.push_str(
+                                    &serde_json::json!({"thinking":thinking,"signature":signature})
+                                        .to_string(),
+                                );
+                                reasoning_emitted = true;
+                                events.push(Ok(signed_replay_block(&payload)));
+                                events.push(Ok(StreamEvent::ReasoningFinalized(payload)));
+                            }
+                            block => events.push(Ok(StreamEvent::OutputBlock(block))),
                         }
-                        events.push(Ok(StreamEvent::ReasoningFinalized(rc)));
-                    }
-                    if let Some(text) = resp.text.filter(|t| !t.is_empty()) {
-                        events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(text))));
-                    }
-                    for tc in resp.tool_calls {
-                        events.push(Ok(StreamEvent::ToolCall(tc)));
                     }
                     if let Some(usage) = resp.usage {
                         events.push(Ok(StreamEvent::Usage(usage)));
@@ -3476,7 +3685,7 @@ impl ModelProvider for AnthropicModelProvider {
             "stream: spawning detached Anthropic SSE parser task"
         );
 
-        let parser_handle = ::zeroclaw_spawn::spawn!(async move {
+        let parser = async move {
             let mut req = client
                 .post(&url)
                 .header("anthropic-version", "2023-06-01")
@@ -3506,6 +3715,8 @@ impl ModelProvider for AnthropicModelProvider {
                     // unclassified Http form.
                     let error = if e.is_connect() {
                         StreamError::ConnectFailed(super::format_error_chain(&e))
+                    } else if e.is_timeout() {
+                        StreamError::ResponseTimeout(super::format_error_chain(&e))
                     } else {
                         StreamError::Http(super::format_error_chain(&e))
                     };
@@ -3514,7 +3725,7 @@ impl ModelProvider for AnthropicModelProvider {
                 }
                 Err(_) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(format!(
+                        .send(Err(StreamError::ResponseTimeout(format!(
                             "streaming response headers not received within {}s",
                             phase_timeout.as_secs()
                         ))))
@@ -3543,17 +3754,8 @@ impl ModelProvider for AnthropicModelProvider {
             }
 
             Self::parse_anthropic_sse(response, &tx, &requested_model).await;
-        });
-
-        // The guard travels inside the unfold state so it is dropped at the
-        // exact moment the consumer drops the stream — turning a turn cancel
-        // (or normal completion) into an immediate parser-task abort instead
-        // of a leaked socket that lingers until STREAM_IDLE_TIMEOUT.
-        let guard = AbortOnDrop::new(parser_handle.abort_handle());
-        stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            rx.recv().await.map(|event| (event, (rx, guard)))
-        })
-        .boxed()
+        };
+        crate::stream_guard::parser_stream(parser, rx)
     }
 }
 
@@ -3907,11 +4109,14 @@ data: {\"type\":\"message_stop\"}\n\n"
             .map(|e| match e.as_ref() {
                 Ok(StreamEvent::TextDelta(_)) => "text",
                 Ok(StreamEvent::ThinkingDelta(_)) => "thinking",
+                Ok(StreamEvent::OutputBlock(_)) => "output_block",
                 Ok(StreamEvent::ReasoningFinalized(_)) => "reasoning_final",
                 Ok(StreamEvent::ToolCall(_)) => "tool_call",
                 Ok(StreamEvent::PreExecutedToolCall { .. }) => "pre_tool_call",
                 Ok(StreamEvent::PreExecutedToolResult { .. }) => "pre_tool_result",
                 Ok(StreamEvent::Usage(_)) => "usage",
+                Ok(StreamEvent::ProtocolMetadata(_)) => "protocol_metadata",
+                Ok(StreamEvent::ContentPosition(_)) => "content_position",
                 Ok(StreamEvent::Final) => "final",
                 Err(_) => "err",
             })
@@ -3980,13 +4185,14 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             }
         }
         match last_err.expect("error frame must emit a StreamError") {
-            StreamError::ModelProvider(msg) => {
+            StreamError::ProtocolFailure(cause) => {
                 assert_eq!(
-                    msg, "overloaded_error: Overloaded",
+                    cause.to_string(),
+                    "overloaded_error: Overloaded",
                     "the machine-readable type must prefix the message so retry classification can match it"
                 );
             }
-            other => panic!("expected ModelProvider error, got {other:?}"),
+            other => panic!("expected protocol failure, got {other:?}"),
         }
     }
 
@@ -4010,13 +4216,14 @@ data: {\"type\":\"error\",\"error\":{\"message\":\"Overloaded\"}}\n\n";
             }
         }
         match last_err.expect("error frame must emit a StreamError") {
-            StreamError::ModelProvider(msg) => {
+            StreamError::ProtocolFailure(cause) => {
                 assert_eq!(
-                    msg, "Overloaded",
+                    cause.to_string(),
+                    "Overloaded",
                     "message must be unchanged when the type is absent"
                 );
             }
-            other => panic!("expected ModelProvider error, got {other:?}"),
+            other => panic!("expected protocol failure, got {other:?}"),
         }
     }
 
@@ -4201,7 +4408,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         assert!(!saw_final, "truncated stream must not emit Final");
         let err = last_err.expect("truncated stream must emit a StreamError");
         assert!(
-            matches!(err, StreamError::Http(ref m) if m.contains("truncated")),
+            matches!(err, StreamError::MissingFinal(ref signal) if signal == "message_stop"),
             "expected truncation error, got: {err:?}"
         );
     }
@@ -5412,7 +5619,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                 NativeContentOut::Text { cache_control, .. }
                 | NativeContentOut::ToolResult { cache_control, .. }
                 | NativeContentOut::ToolUse { cache_control, .. } => cache_control.is_some(),
-                NativeContentOut::Image { .. } | NativeContentOut::Thinking { .. } => false,
+                NativeContentOut::Image { .. }
+                | NativeContentOut::Thinking { .. }
+                | NativeContentOut::RedactedThinking { .. } => false,
             })
             .count();
         assert_eq!(
@@ -6537,12 +6746,17 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn anthropic_factory_forwards_timeout_to_native_provider() {
         use crate::ModelProviderRuntimeOptions;
         use crate::factory::FamilyProviderFactory;
-        use axum::{Json, Router, routing::post};
+        use axum::{Json, Router, extract::State, routing::post};
         use serde_json::json;
-        use tokio::time::{Duration, Instant};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio::time::Duration;
         use zeroclaw_config::schema::AnthropicModelProviderConfig;
 
-        async fn slow_messages() -> Json<serde_json::Value> {
+        async fn slow_messages(State(received): State<Arc<AtomicBool>>) -> Json<serde_json::Value> {
+            received.store(true, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_secs(3)).await;
             Json(json!({
                 "id": "msg_late",
@@ -6559,7 +6773,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             .await
             .expect("bind test server");
         let addr = listener.local_addr().expect("test server addr");
-        let app = Router::new().route("/v1/messages", post(slow_messages));
+        let received = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route("/v1/messages", post(slow_messages))
+            .with_state(Arc::clone(&received));
         let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app).await.expect("serve test server");
         });
@@ -6577,21 +6794,26 @@ data: {\"type\":\"message_stop\"}\n\n";
             )
             .expect("anthropic provider should build");
 
-        let started = Instant::now();
         let result = provider
             .chat_with_system(None, "hello", "claude-sonnet-4-5", Some(0.7))
             .await;
-        let elapsed = started.elapsed();
 
         server.abort();
 
-        assert!(
-            result.is_err(),
-            "slow response should time out when factory forwards provider_timeout_secs"
+        let error = result.expect_err(
+            "slow response should time out when factory forwards provider_timeout_secs",
         );
         assert!(
-            elapsed < Duration::from_secs(3),
-            "request waited for the server response instead of using configured timeout: {elapsed:?}"
+            received.load(Ordering::SeqCst),
+            "the mock must receive the request before the response timeout"
+        );
+        // Client construction precedes the request deadline; wall time also
+        // includes that synchronous work and scheduler contention.
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)),
+            "the configured request timeout must cause the failure: {error:#}"
         );
     }
 
@@ -10310,7 +10532,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         }
         server.abort();
         match saw_error.expect("the SSE error frame must surface an error") {
-            StreamError::ModelProvider(message) => {
+            StreamError::ProtocolFailure(cause) => {
+                let message = cause.to_string();
                 assert!(
                     message.contains("failed to resolve backend"),
                     "the frame text must stay in the message: {message}"

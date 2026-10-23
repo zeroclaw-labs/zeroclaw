@@ -276,6 +276,7 @@ mod tests {
     #[test]
     fn xml_dispatcher_parses_tool_calls() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(
                 "Checking\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
                     .into(),
@@ -293,6 +294,7 @@ mod tests {
     #[test]
     fn xml_dispatcher_strips_think_before_tool_call() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(
                 "<think>I should list files</think>\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
                     .into(),
@@ -314,6 +316,7 @@ mod tests {
     #[test]
     fn xml_dispatcher_think_only_returns_no_calls() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("<think>Just thinking</think>".into()),
             tool_calls: vec![],
             usage: None,
@@ -327,6 +330,7 @@ mod tests {
     #[test]
     fn native_dispatcher_roundtrip() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("ok".into()),
             tool_calls: vec![zeroclaw_providers::ToolCall {
                 id: "tc1".into(),

@@ -72,6 +72,7 @@ mod tests {
     #[test]
     fn chat_response_helpers() {
         let empty = ChatResponse {
+            output_blocks: Vec::new(),
             text: None,
             tool_calls: vec![],
             usage: None,
@@ -81,6 +82,7 @@ mod tests {
         assert_eq!(empty.text_or_empty(), "");
 
         let with_tools = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("Let me check".into()),
             tool_calls: vec![ToolCall {
                 id: "1".into(),
@@ -105,6 +107,7 @@ mod tests {
     #[test]
     fn chat_response_with_usage() {
         let resp = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("Hello".into()),
             tool_calls: vec![],
             usage: Some(TokenUsage {

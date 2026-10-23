@@ -4174,8 +4174,8 @@ impl TelegramChannel {
     async fn resolve_after_deadline(
         &self,
         approval_id: &str,
-        rx: &mut tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
-    ) -> zeroclaw_api::channel::AttributedApprovalResponse {
+        rx: &mut tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult>,
+    ) -> zeroclaw_api::channel::ApprovalReplyResult {
         let claimed = self
             .pending_approvals
             .lock()
@@ -4183,18 +4183,20 @@ impl TelegramChannel {
             .remove(approval_id)
             .is_some();
         if claimed {
-            return zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                zeroclaw_api::channel::ChannelApprovalResponse::Deny,
-                zeroclaw_api::channel::ApprovalSource::TimedOut,
+            return Ok(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
             );
         }
         match tokio::time::timeout(Self::CALLBACK_CLAIM_GRACE, rx).await {
-            Ok(Ok(response)) => {
-                zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
-            }
-            _ => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                zeroclaw_api::channel::ChannelApprovalResponse::Deny,
-                zeroclaw_api::channel::ApprovalSource::TimedOut,
+            Ok(Ok(response)) => response,
+            _ => Ok(
+                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                    zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                    zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ),
             ),
         }
     }
@@ -6846,7 +6848,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// dismiss the spinner, and rewrite the prompt with the outcome, dropping
     /// the buttons
     /// best-effort rewrite, a stale tap is a no-op
-    async fn handle_approval_callback(&self, cb: &serde_json::Value) {
+    async fn handle_approval_callback(&self, cb: &serde_json::Value) -> anyhow::Result<()> {
         use crate::util::PendingApprovalResolution;
 
         let cb_id = cb
@@ -6859,10 +6861,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .unwrap_or_default();
 
         let Some(rest) = cb_data.strip_prefix("approval:") else {
-            return;
+            return Ok(());
         };
         let Some((approval_id, action)) = rest.rsplit_once(':') else {
-            return;
+            return Ok(());
         };
 
         let response = match action {
@@ -6889,13 +6891,37 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 crate::util::resolve_pending_approval_with_tool(
                     &self.pending_approvals,
                     approval_id,
-                    response,
+                    crate::util::ApprovalReply::authenticated(
+                        response,
+                        self,
+                        cb["from"]["id"]
+                            .as_i64()
+                            .map(|id| id.to_string())
+                            .as_deref()
+                            .unwrap_or_default(),
+                    ),
                     responder_allowed,
                     chat_id,
                 )
-                .await
+                .await?
             }
-            _ => (PendingApprovalResolution::NotFound, None),
+            _ => {
+                let audit = self
+                    .pending_approvals
+                    .lock()
+                    .await
+                    .get(approval_id)
+                    .map(|pending| pending.audit.clone());
+                if let Some(audit) = audit {
+                    audit.record_rejection(
+                        if has_response { "wrong_destination" } else { "invalid_decision" },
+                        serde_json::json!({"decision": action, "responder_allowed": responder_allowed}),
+                    ).await?;
+                    (PendingApprovalResolution::Rejected, None)
+                } else {
+                    (PendingApprovalResolution::NotFound, None)
+                }
+            }
         };
 
         if matches!(resolution, PendingApprovalResolution::Rejected) {
@@ -7029,6 +7055,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
             }
         }
+        Ok(())
     }
 
     /// Fixed, bounded delay between retries of a transiently failing update.
@@ -7099,7 +7126,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 return UpdateOutcome::Advanced;
             }
 
-            self.handle_approval_callback(cb).await;
+            if let Err(error) = self.handle_approval_callback(cb).await {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({"error": error.to_string()})),
+                    "Telegram approval audit failed; retaining update for retry"
+                );
+                return Self::pause_for_transient_update(uid, transient_retry).await;
+            }
 
             // A callback_query is terminal for inbound processing: there is
             // no message to deliver downstream, so nothing can be lost by
@@ -8698,18 +8734,14 @@ impl TelegramChannel {
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps the button before the sender is in the map.
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals.lock().await.insert(
-            approval_id.clone(),
-            crate::util::PendingApproval {
-                sender: tx,
-                destination: chat_id.to_string(),
-                tool_name: request.tool_name.clone(),
-            },
-        );
-        let mut guard = crate::util::PendingApprovalGuard::new(
+        let mut guard = crate::util::register_pending_approval(
             Arc::clone(&self.pending_approvals),
             approval_id.clone(),
-        );
+            tx,
+            chat_id.to_string(),
+            request.tool_name.clone(),
+        )
+        .await?;
 
         let send_prompt = async {
             let resp = self
@@ -8777,21 +8809,36 @@ impl TelegramChannel {
         };
 
         let send_result = if let Some(deadline) = absolute_deadline {
-            match tokio::time::timeout_at(deadline, send_prompt).await {
+            match tokio::time::timeout_at(
+                deadline,
+                zeroclaw_api::channel::await_approval_prompt_send(send_prompt, &mut rx),
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_) => {
-                    let response = self.resolve_after_deadline(&approval_id, &mut rx).await;
+                    let response = self.resolve_after_deadline(&approval_id, &mut rx).await?;
                     guard.disarm();
                     return Ok(Some(response));
                 }
             }
         } else {
-            send_prompt.await
+            zeroclaw_api::channel::await_approval_prompt_send(send_prompt, &mut rx).await
         };
 
-        if let Err(error) = send_result {
-            guard.remove().await;
-            return Err(error);
+        match send_result {
+            Ok(zeroclaw_api::channel::ApprovalPromptOutcome::Sent(())) => {}
+            Ok(zeroclaw_api::channel::ApprovalPromptOutcome::Replied(response)) => {
+                guard.disarm();
+                return Ok(Some(response));
+            }
+            Err(error) if zeroclaw_api::session_events::capture::is_capture_stopped(&error) => {
+                return Err(error);
+            }
+            Err(error) => {
+                guard.remove().await;
+                return Err(error);
+            }
         }
 
         // Wait for the user to tap a button. Direct callers supply the channel's
@@ -8810,9 +8857,7 @@ impl TelegramChannel {
         let result = match wait_result {
             Ok(Ok(response)) => {
                 guard.disarm();
-                Some(zeroclaw_api::channel::AttributedApprovalResponse::operator(
-                    response,
-                ))
+                Some(response?)
             }
             Ok(Err(_)) => {
                 // Sender dropped — clean up and deny. Nobody tapped.
@@ -8825,7 +8870,7 @@ impl TelegramChannel {
                 )
             }
             Err(_) => {
-                let response = self.resolve_after_deadline(&approval_id, &mut rx).await;
+                let response = self.resolve_after_deadline(&approval_id, &mut rx).await?;
                 guard.disarm();
                 Some(response)
             }
@@ -18744,6 +18789,8 @@ mod tests {
             ch.pending_approvals.lock().await.insert(
                 format!("approval-{i}"),
                 crate::util::PendingApproval {
+                    registration_id: uuid::Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::current(),
                     sender,
                     destination: "-2001".to_string(),
                     tool_name: format!("tool-{i}"),
@@ -21350,7 +21397,9 @@ mod tests {
     async fn media_group_rejects_mixed_sender_before_download() {
         use wiremock::MockServer;
 
-        let server = MockServer::start().await;
+        // A pooled listener can receive a late request from its previous fixture.
+        // This test asserts zero requests, so give it an exclusive listener.
+        let server = MockServer::builder().start().await;
         let workspace = tempfile::tempdir().unwrap();
         let channel = TelegramChannel::new(
             "fake-token".into(),
@@ -21383,7 +21432,7 @@ mod tests {
     async fn media_group_rejects_captionless_video_with_mixed_sender_or_thread_before_download() {
         use wiremock::MockServer;
 
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let workspace = tempfile::tempdir().unwrap();
         let channel = TelegramChannel::new(
             "fake-token".into(),
@@ -23129,6 +23178,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
@@ -23148,7 +23199,8 @@ mod tests {
                     ch.is_any_user_allowed(["other-user", "1002"]),
                     "-2001",
                 )
-                .await,
+                .await
+                .unwrap(),
                 crate::util::PendingApprovalResolution::Rejected,
             );
             assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
@@ -23162,7 +23214,8 @@ mod tests {
                 ch.is_any_user_allowed(["operator", "1001"]),
                 "-2002",
             )
-            .await,
+            .await
+            .unwrap(),
             crate::util::PendingApprovalResolution::Rejected,
         );
         assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
@@ -23175,15 +23228,21 @@ mod tests {
                 ch.is_any_user_allowed(["operator", "1001"]),
                 "-2001",
             )
-            .await,
+            .await
+            .unwrap(),
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::AlwaysApprove
+        );
 
         let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.lock().await.insert(
             "approve-id".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: approve_tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
@@ -23197,10 +23256,14 @@ mod tests {
                 ch.is_any_user_allowed(["operator", "1001"]),
                 "-2001",
             )
-            .await,
+            .await
+            .unwrap(),
             crate::util::PendingApprovalResolution::Resolved,
         );
-        assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            approve_rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     #[test]
@@ -23297,6 +23360,8 @@ mod tests {
         channel.pending_approvals.lock().await.insert(
             "approval-id".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: approval_tx,
                 destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
@@ -23410,6 +23475,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
@@ -23423,8 +23490,11 @@ mod tests {
             "data": format!("approval:{approval_id}:approve"),
         });
 
-        ch.handle_approval_callback(&callback).await;
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        ch.handle_approval_callback(&callback).await.unwrap();
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
@@ -23674,6 +23744,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: resp_tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
@@ -23694,7 +23766,10 @@ mod tests {
 
         let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
         assert!(matches!(outcome, UpdateOutcome::Advanced));
-        assert_eq!(resp_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            resp_rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             rx.try_recv().is_err(),
             "a callback_query is terminal: no downstream message may be delivered"
@@ -23868,7 +23943,7 @@ mod tests {
             "message": { "message_id": 55, "chat": { "id": 12345 } },
             "data": format!("approval:{approval_id}:approve"),
         });
-        ch.handle_approval_callback(&callback).await;
+        ch.handle_approval_callback(&callback).await.unwrap();
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2, "no editMessageText may be sent");
@@ -23879,23 +23954,36 @@ mod tests {
 
     #[tokio::test]
     async fn routed_approval_times_out_when_prompt_delivery_exceeds_route_budget() {
-        use wiremock::matchers::{method, path_regex};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path_regex(r"/bot[^/]+/sendMessage$"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(250))
-                    .set_body_json(serde_json::json!({
-                        "ok": true,
-                        "result": { "message_id": 66 }
-                    })),
-            )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/botfake-token/sendMessage",
+            axum::routing::post({
+                let sent = Arc::clone(&sent);
+                let release = Arc::clone(&release);
+                let requests = Arc::clone(&requests);
+                move || {
+                    let sent = Arc::clone(&sent);
+                    let release = Arc::clone(&release);
+                    let requests = Arc::clone(&requests);
+                    async move {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        sent.notify_one();
+                        release.notified().await;
+                        axum::Json(serde_json::json!({
+                            "ok": true,
+                            "result": { "message_id": 66 }
+                        }))
+                    }
+                }
+            }),
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
         let ch = TelegramChannel::new(
             "fake-token".into(),
@@ -23903,7 +23991,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_api_base(mock_server.uri())
+        .with_mock_api_base(format!("http://{address}"))
         .with_approval_timeout_secs(120);
 
         let request = zeroclaw_api::channel::ChannelApprovalRequest {
@@ -23912,11 +24000,38 @@ mod tests {
             raw_arguments: None,
             position: None,
         };
-        let attributed = ch
-            .request_approval_attributed_with_timeout("12345", &request, Duration::from_millis(100))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut waiter = Box::pin(ch.request_approval_attributed_with_timeout(
+            "12345",
+            &request,
+            Duration::from_millis(100),
+        ));
+        let sent = sent.notified();
+        tokio::pin!(sent);
+        let hang_guard = std::time::Instant::now();
+        // Keep the paused clock from auto-advancing while real HTTP I/O starts.
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut sent => break,
+                result = &mut waiter => panic!("approval ended before prompt arrived: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert!(
+                hang_guard.elapsed() < LISTEN_HANG_GUARD,
+                "prompt never arrived"
+            );
+        }
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ch.pending_approvals.lock().await.len(), 1);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        // Tokio timers fire on millisecond ticks; cross the deadline by one tick.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let attributed = waiter.await.unwrap().unwrap();
+        assert_eq!(started.elapsed(), Duration::from_millis(101));
 
         assert_eq!(
             attributed.response,
@@ -23927,6 +24042,10 @@ mod tests {
             zeroclaw_api::channel::ApprovalSource::TimedOut
         );
         assert!(ch.pending_approvals.lock().await.is_empty());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.notify_one();
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -23997,7 +24116,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(550)).await;
         pending
             .sender
-            .send(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
+            .send(Ok(
+                zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                    zeroclaw_api::channel::ChannelApprovalResponse::Approve,
+                ),
+            ))
             .expect("claimed callback response receiver must remain live");
 
         let attributed = waiter.await.unwrap().unwrap().unwrap();
@@ -24028,6 +24151,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "a1".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
@@ -24036,9 +24161,13 @@ mod tests {
         // the callback claims the entry first and its response is already in
         // flight on the channel when the deadline fires
         let pending = ch.pending_approvals.lock().await.remove("a1").unwrap();
-        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+        let _ = pending.sender.send(Ok(
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                ChannelApprovalResponse::Approve,
+            ),
+        ));
 
-        let outcome = ch.resolve_after_deadline("a1", &mut rx).await;
+        let outcome = ch.resolve_after_deadline("a1", &mut rx).await.unwrap();
         assert_eq!(outcome.response, ChannelApprovalResponse::Approve);
         assert!(ch.pending_approvals.lock().await.is_empty());
     }
@@ -24059,13 +24188,15 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "a2".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
             },
         );
 
-        let outcome = ch.resolve_after_deadline("a2", &mut rx).await;
+        let outcome = ch.resolve_after_deadline("a2", &mut rx).await.unwrap();
         assert_eq!(outcome.response, ChannelApprovalResponse::Deny);
         assert!(
             ch.pending_approvals.lock().await.is_empty(),

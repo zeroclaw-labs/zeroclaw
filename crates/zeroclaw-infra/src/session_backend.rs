@@ -72,6 +72,12 @@ pub struct TimestampedMessage {
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// Legacy inspection must fail once installation history is native.
+    /// In-memory backends have no installation fence.
+    fn require_legacy_access(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 

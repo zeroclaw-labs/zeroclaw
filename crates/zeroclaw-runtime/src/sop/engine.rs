@@ -5167,6 +5167,23 @@ impl SopEngine {
         };
         let result = self.capabilities.execute_step(ctx, step, input);
         self.metrics.record_capability_executed(&sop.name);
+        if let Err(error) = &result
+            && zeroclaw_api::session_events::capture::is_capture_stopped(error)
+        {
+            let mut fail_closed = step.clone();
+            fail_closed.on_failure = super::step_contract::StepFailure::Fail;
+            let message = error.to_string();
+            return self.record_deterministic_step_result(
+                run_id,
+                sop,
+                &fail_closed,
+                SopStepStatus::Failed,
+                message.clone(),
+                serde_json::Value::String(message),
+                started_at,
+                Some(now_iso8601()),
+            );
+        }
         let completed_at = Some(now_iso8601());
         match result {
             Ok(result) if result.success => self.record_deterministic_step_result(
@@ -8569,6 +8586,44 @@ mod tests {
                 && event.payload["to_step"] == serde_json::json!(3)
         }));
         assert_eq!(engine.active_runs()[&run_id].current_step, 3);
+    }
+
+    #[test]
+    fn native_capture_unknown_never_routes_to_retry_or_failure_goto() {
+        struct UnknownLlm(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl super::super::capability::LlmGenerateAdapter for UnknownLlm {
+            fn generate(&self, _: Option<&str>, _: &str) -> std::result::Result<String, String> {
+                Err("fixture_unknown".into())
+            }
+            fn generate_typed(&self, _: Option<&str>, _: &str) -> Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow::Error::msg("fixture_remote_outcome_unknown")
+                    .context(zeroclaw_api::session_events::capture::SessionCaptureStopped))
+            }
+        }
+        for policy in [StepFailure::Retry { max: 3 }, StepFailure::Goto { step: 2 }] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut registry = super::super::capability::SopCapabilityRegistry::with_builtins();
+            registry.register(super::super::capability::LlmGenerateCapability::new(Some(
+                Arc::new(UnknownLlm(calls.clone())),
+            )));
+            let mut sop = capability_checkpoint_sop("native-unknown");
+            sop.steps[0].capability = Some("llm.generate".into());
+            sop.steps[0].capability_input =
+                Some(serde_json::json!({"instruction":"fixture generation"}));
+            sop.steps[0].on_failure = policy;
+            let mut engine = engine_with_sops(vec![sop]).with_capabilities(Arc::new(registry));
+            let action = engine
+                .start_deterministic_run("native-unknown", manual_event())
+                .expect("durable failure");
+            let run_id = extract_run_id(&action).to_owned();
+            let action = engine
+                .drive_headless_deterministic(&run_id, action)
+                .expect("drive capability");
+            assert!(matches!(action, SopRunAction::Failed { .. }), "{action:?}");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(engine.active_runs().is_empty());
+        }
     }
 
     #[test]

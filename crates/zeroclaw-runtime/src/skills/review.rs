@@ -40,9 +40,9 @@ pub async fn maybe_run_skill_review(
     context_token_budget: usize,
     cancellation_token: Option<&CancellationToken>,
     agent_alias: Option<&str>,
-) {
+) -> anyhow::Result<String> {
     if !config.enabled {
-        return;
+        return Ok(String::new());
     }
     if SKILL_REVIEW_ACTIVE.try_with(|()| ()).is_ok() {
         ::zeroclaw_log::record!(
@@ -50,7 +50,7 @@ pub async fn maybe_run_skill_review(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Skill review: recursion guard tripped, skipping nested review"
         );
-        return;
+        return Ok(String::new());
     }
     if !should_trigger(&history, config.nudge_interval_iterations) {
         ::zeroclaw_log::record!(
@@ -63,7 +63,7 @@ pub async fn maybe_run_skill_review(
             ),
             "Skill review: iteration budget not reached, skipping"
         );
-        return;
+        return Ok(String::new());
     }
 
     let review_tools = build_review_tools(workspace_dir.clone(), config.clone(), allow_scripts);
@@ -106,7 +106,8 @@ pub async fn maybe_run_skill_review(
     review_history.push(ChatMessage::user(&review_input));
 
     let receipts: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id = zeroclaw_api::session_events::capture::current_engine_turn_id()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // The review fork owns a fresh transcript: no prior trim ran, so no
     // crumb exists and none can outlive this scoped loop.
     let mut fork_crumb_present = false;
@@ -208,6 +209,34 @@ pub async fn maybe_run_skill_review(
         })
         .await;
 
+    if let Some(capture) = zeroclaw_api::session_events::capture::current_provider_admission() {
+        use zeroclaw_api::session_events::capture::{ContextSnapshot, ContextTransformIntent};
+        let transform = capture
+            .begin_context_transform(ContextTransformIntent {
+                reason_key: "skill_review_context".into(),
+                algorithm_version: "skill-review/v1".into(),
+                budget: 0,
+            })
+            .await?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                    "native_skill_review_context_capture_missing"
+                );
+                anyhow::Error::msg("native skill review context capture missing")
+            })?;
+        transform
+            .complete_snapshot(ContextSnapshot {
+                messages: review_history
+                    .into_iter()
+                    .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                    .collect(),
+                history_has_trim_breadcrumb: Some(fork_crumb_present),
+            })
+            .await?;
+    }
+
     match result {
         Ok(final_text) => {
             let summary = summarize_actions(&receipts, &fork_messages, &final_text);
@@ -220,8 +249,12 @@ pub async fn maybe_run_skill_review(
                     )
                 );
             }
+            Ok(final_text)
         }
         Err(e) => {
+            if zeroclaw_api::session_events::capture::current_provider_admission().is_some() {
+                return Err(e);
+            }
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -229,6 +262,7 @@ pub async fn maybe_run_skill_review(
                     .with_attrs(::serde_json::json!({"error": format!("{e}")})),
                 "Skill review fork failed"
             );
+            Ok(String::new())
         }
     }
 }
@@ -261,7 +295,7 @@ fn build_review_input(failed_slugs: &[String]) -> String {
 /// `nudge_interval_iterations == 0` disables iteration-based triggering.
 /// Otherwise, count `role == "tool"` messages in history — each represents a
 /// completed tool call. Fire if we've crossed the threshold.
-fn should_trigger(history: &[ChatMessage], threshold: u32) -> bool {
+pub(crate) fn should_trigger(history: &[ChatMessage], threshold: u32) -> bool {
     if threshold == 0 {
         return false;
     }

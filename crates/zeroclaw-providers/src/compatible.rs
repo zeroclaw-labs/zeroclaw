@@ -6,7 +6,6 @@ use crate::auth::AuthService;
 use crate::multimodal;
 use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
 use crate::opencode_session::OPENCODE_SESSION_HEADER;
-use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult,
@@ -359,6 +358,23 @@ fn structured_api_error_message(value: &serde_json::Value) -> Option<String> {
 }
 
 fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
+    // Preserve the protocol envelope when it supplies a code. Message-only
+    // envelopes keep the established bounded display representation.
+    if serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .pointer("/error/code")
+                .or_else(|| value.pointer("/error/type"))
+                .or_else(|| value.get("code"))
+                .is_some()
+        })
+    {
+        return StreamError::HttpStatus {
+            status: status.as_u16(),
+            message: super::sanitize_api_error(body),
+        };
+    }
     let message = serde_json::from_str(body)
         .ok()
         .and_then(|value| structured_api_error_message(&value));
@@ -371,10 +387,8 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
 
 fn provider_http_error(name: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
     let error = super::api_error_from_parts(name, status, body);
-    anyhow::Error::new(crate::reliable::ProviderHttpError::new(
-        status,
-        error.to_string(),
-    ))
+    let classification = crate::reliable::ProviderHttpError::new(status, error.to_string());
+    error.context(classification)
 }
 
 /// Upper bound on a `/models` catalog response buffered before parsing. Real
@@ -1592,7 +1606,7 @@ impl OpenAiCompatibleModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|choice| (choice.message, usage))
+            .map(|choice| (choice.into_message(), usage))
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -1926,10 +1940,34 @@ struct ImageUrlPart {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawApiChatResponse")]
 struct ApiChatResponse {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<UsageInfo>,
+}
+#[derive(Debug, Deserialize)]
+struct RawApiChatResponse {
+    choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+    #[serde(default)]
+    model: Option<String>,
+}
+impl From<RawApiChatResponse> for ApiChatResponse {
+    fn from(mut raw: RawApiChatResponse) -> Self {
+        if let Some(model) = raw.model {
+            for choice in &mut raw.choices {
+                choice.message.output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                    metadata: serde_json::json!({"kind":"served_attribution", "protocol":"chat_completions", "model":model, "source":"provider_response"}),
+                });
+            }
+        }
+        Self {
+            choices: raw.choices,
+            usage: raw.usage,
+        }
+    }
 }
 
 /// OpenAI-compatible chat response, either in the standard top-level shape or
@@ -2080,6 +2118,18 @@ fn normalize_token_count_float(value: f64) -> Option<u64> {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+impl Choice {
+    fn into_message(mut self) -> ResponseMessage {
+        if let Some(reason) = self.finish_reason {
+            self.message.output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"chat_completions", "finish_reason":reason}),
+            });
+        }
+        self.message
+    }
 }
 
 /// OpenAI Chat Completions may return assistant `message.content` as a string,
@@ -2098,16 +2148,20 @@ fn openai_assistant_content_plaintext(content: Option<OpenAiAssistantContent>) -
         OpenAiAssistantContent::Parts(parts) => {
             let mut text = String::new();
             for part in parts {
-                if part.kind.as_deref() != Some("text") {
+                if part.get("type").and_then(serde_json::Value::as_str) != Some("text") {
                     continue;
                 }
-                let Some(part_text) = part.text.filter(|text| !text.is_empty()) else {
+                let Some(part_text) = part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                else {
                     continue;
                 };
                 if !text.is_empty() {
                     text.push('\n');
                 }
-                text.push_str(&part_text);
+                text.push_str(part_text);
             }
 
             if text.is_empty() { None } else { Some(text) }
@@ -2119,19 +2173,14 @@ fn openai_assistant_content_plaintext(content: Option<OpenAiAssistantContent>) -
 #[serde(untagged)]
 enum OpenAiAssistantContent {
     Text(String),
-    Parts(Vec<OpenAiAssistantContentPart>),
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiAssistantContentPart {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    text: Option<String>,
+    Parts(Vec<serde_json::Value>),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(from = "RawResponseMessage")]
 struct ResponseMessage {
+    #[serde(skip_serializing)]
+    output_blocks: Vec<zeroclaw_api::model_provider::ProviderOutputBlock>,
     content: Option<String>,
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
@@ -2157,6 +2206,8 @@ struct RawResponseMessage {
     /// (e.g. `thinking_blocks` on LiteLLM / passthrough responses).
     #[serde(default)]
     thinking_blocks: Option<Vec<serde_json::Value>>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 impl From<RawResponseMessage> for ResponseMessage {
@@ -2164,7 +2215,51 @@ impl From<RawResponseMessage> for ResponseMessage {
         // Canonical field wins when both are present; the alias fills in only
         // when the canonical name is absent or null.
         let reasoning_content = raw.reasoning_content.or(raw.reasoning);
+        let mut output_blocks = match &raw.content {
+            Some(OpenAiAssistantContent::Text(text)) => {
+                vec![zeroclaw_api::model_provider::ProviderOutputBlock::Text { text: text.clone() }]
+            }
+            Some(OpenAiAssistantContent::Parts(parts)) => crate::output::content_parts(parts),
+            None => Vec::new(),
+        };
+        if let Some(blocks) = &raw.thinking_blocks {
+            output_blocks.splice(0..0, blocks.iter().flat_map(crate::output::content_blocks));
+        } else if let Some(reasoning) = &reasoning_content {
+            output_blocks.insert(
+                0,
+                zeroclaw_api::model_provider::ProviderOutputBlock::Reasoning {
+                    representation: "provider_replay".into(),
+                    bytes: reasoning.to_owned().into_bytes(),
+                    replay_requirement: "provider_defined".into(),
+                },
+            );
+        }
+        if let Some(calls) = &raw.tool_calls {
+            for call in calls {
+                output_blocks.extend(crate::output::chat_tool_metadata(
+                    call.id.as_deref(),
+                    &call.extensions,
+                    call.function.as_ref().map(|function| &function.extensions),
+                ));
+            }
+        }
+        for (name, content) in raw.extensions {
+            if name == "role" {
+                continue;
+            }
+            if name == "audio" {
+                output_blocks.extend(crate::output::content_blocks(
+                    &serde_json::json!({"type":"audio","source":content}),
+                ));
+            } else {
+                output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::Other {
+                    type_name: format!("assistant.{name}"),
+                    content,
+                });
+            }
+        }
         ResponseMessage {
+            output_blocks,
             content: openai_assistant_content_plaintext(raw.content),
             reasoning_content,
             tool_calls: raw.tool_calls,
@@ -2246,6 +2341,8 @@ struct ToolCall {
     /// See [`zeroclaw_api::ToolCall::extra_content`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     extra_content: Option<serde_json::Value>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ToolCall {
@@ -2287,6 +2384,8 @@ struct Function {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2403,6 +2502,8 @@ struct NativeMessage {
 #[derive(Debug, Deserialize)]
 struct StreamChunkResponse {
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     choices: Vec<StreamChoice>,
     /// Final-chunk usage counts. Populated only when the request includes
     /// `stream_options.include_usage: true` and the provider supports it.
@@ -2413,6 +2514,8 @@ struct StreamChunkResponse {
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
     #[serde(default)]
+    index: Option<u64>,
+    #[serde(default)]
     delta: StreamDelta,
     #[serde(default)]
     finish_reason: Option<String>,
@@ -2420,22 +2523,25 @@ struct StreamChoice {
 
 #[derive(Debug, Default)]
 struct StreamDelta {
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     reasoning_content: Option<String>,
     /// Native tool-calling deltas in OpenAI chat-completions streaming format.
     tool_calls: Option<Vec<StreamToolCallDelta>>,
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct RawStreamDelta {
     #[serde(default)]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
     reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<StreamToolCallDelta>>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 impl<'de> Deserialize<'de> for StreamDelta {
@@ -2448,6 +2554,7 @@ impl<'de> Deserialize<'de> for StreamDelta {
             content: raw.content,
             reasoning_content: raw.reasoning_content.or(raw.reasoning),
             tool_calls: raw.tool_calls,
+            extensions: raw.extensions,
         })
     }
 }
@@ -2467,6 +2574,8 @@ struct StreamToolCallDelta {
     arguments: Option<String>,
     #[serde(default)]
     extra_content: Option<serde_json::Value>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2475,6 +2584,8 @@ struct StreamFunctionDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default)]
@@ -2557,7 +2668,13 @@ fn parse_sse_chunk(line: &str) -> StreamResult<Option<StreamChunkResponse>> {
         return Ok(None);
     }
 
-    serde_json::from_str(data)
+    let value: serde_json::Value = serde_json::from_str(data).map_err(StreamError::Json)?;
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(StreamError::ProtocolFailure(Box::new(
+            crate::dispatch::ProviderProtocolFailure::new(value),
+        )));
+    }
+    serde_json::from_value(value)
         .map(Some)
         .map_err(StreamError::Json)
 }
@@ -2584,7 +2701,15 @@ fn parse_proxy_tool_event(line: &str) -> Option<StreamEvent> {
             .and_then(|v| v.as_str())
             .unwrap_or("{}")
             .to_string();
-        return Some(StreamEvent::PreExecutedToolCall { name, args });
+        return Some(StreamEvent::PreExecutedToolCall {
+            provider_call_id: ts
+                .get("call_id")
+                .or_else(|| ts.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            name,
+            args,
+        });
     }
 
     if let Some(tr) = obj.get("x_tool_result") {
@@ -2598,20 +2723,164 @@ fn parse_proxy_tool_event(line: &str) -> Option<StreamEvent> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        return Some(StreamEvent::PreExecutedToolResult { name, output });
+        return Some(StreamEvent::PreExecutedToolResult {
+            provider_call_id: tr
+                .get("call_id")
+                .or_else(|| tr.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            name,
+            output,
+        });
     }
 
+    // Proxies can expose progress, cancellation, failure and future activity
+    // fields. Preserve that classified protocol evidence without dispatching
+    // a local tool or inventing a terminal result.
+    let activities: serde_json::Map<String, serde_json::Value> = obj
+        .as_object()?
+        .iter()
+        .filter(|(key, _)| key.starts_with("x_tool_"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if !activities.is_empty() {
+        return Some(StreamEvent::ProtocolMetadata(serde_json::json!({
+            "kind":"provider_tool_activity", "protocol":"proxy", "activity":activities,
+            "provider_call_id": activities.values().find_map(|activity| activity.get("call_id").or_else(|| activity.get("id")).and_then(serde_json::Value::as_str)),
+        })));
+    }
     None
 }
 
 fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
-    if let Some(content) = &choice.delta.content
-        && !content.is_empty()
-    {
-        return Some(content.clone());
-    }
+    crate::output::assistant_content(choice.delta.content.as_ref()).0
+}
 
-    None
+fn sse_choice_content_events(
+    choice: &StreamChoice,
+    choice_index: usize,
+    count_tokens: bool,
+) -> Vec<StreamEvent> {
+    use zeroclaw_api::model_provider::{ProviderContentPosition, ProviderOutputBlock};
+
+    let output_index = choice.index.unwrap_or(choice_index as u64);
+    let mut events = Vec::new();
+    if let Some(calls) = &choice.delta.tool_calls {
+        for call in calls {
+            if let Some(metadata) = crate::output::chat_tool_metadata(
+                call.id.as_deref(),
+                &call.extensions,
+                call.function.as_ref().map(|function| &function.extensions),
+            ) {
+                events.push(StreamEvent::ContentPosition(ProviderContentPosition {
+                    output_index,
+                    content_index: call.index.map(|index| index as u64),
+                }));
+                events.push(StreamEvent::OutputBlock(metadata));
+            }
+        }
+    }
+    let mut emit = |block, content_index| {
+        events.push(StreamEvent::ContentPosition(ProviderContentPosition {
+            output_index,
+            content_index,
+        }));
+        events.push(match block {
+            ProviderOutputBlock::Text { text } => {
+                let chunk = StreamChunk::delta(text);
+                StreamEvent::TextDelta(if count_tokens {
+                    chunk.with_token_estimate()
+                } else {
+                    chunk
+                })
+            }
+            ProviderOutputBlock::ProtocolMetadata { metadata } => {
+                StreamEvent::ProtocolMetadata(metadata)
+            }
+            ProviderOutputBlock::Other { type_name, content } => {
+                StreamEvent::OutputBlock(ProviderOutputBlock::Other { type_name, content })
+            }
+            block => StreamEvent::OutputBlock(block),
+        });
+    };
+    match &choice.delta.content {
+        Some(serde_json::Value::String(text)) if !text.is_empty() => {
+            emit(ProviderOutputBlock::Text { text: text.clone() }, None);
+        }
+        Some(serde_json::Value::Array(parts)) => {
+            for (index, part) in parts.iter().enumerate() {
+                let content_index = part
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(index as u64);
+                for block in crate::output::content_blocks(part) {
+                    emit(block, Some(content_index));
+                }
+            }
+        }
+        Some(value) if !value.is_null() && !value.is_string() => {
+            emit(
+                ProviderOutputBlock::Other {
+                    type_name: "assistant.content".into(),
+                    content: value.clone(),
+                },
+                None,
+            );
+        }
+        _ => {}
+    }
+    for (name, value) in &choice.delta.extensions {
+        if name == "role" {
+            continue;
+        }
+        if name == "thinking_blocks"
+            && let Some(blocks) = value.as_array()
+        {
+            for (index, block) in blocks.iter().enumerate() {
+                let content_index = block
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(index as u64);
+                for block in crate::output::content_blocks(block) {
+                    emit(block, Some(content_index));
+                }
+            }
+        } else if name == "audio" {
+            let block =
+                crate::output::content_block(&serde_json::json!({"type":"audio", "source":value}));
+            let media = matches!(&block, ProviderOutputBlock::Media { .. });
+            emit(block, None);
+            let mut metadata = if media {
+                value.as_object().cloned().unwrap_or_default()
+            } else {
+                serde_json::Map::new()
+            };
+            if media {
+                for field in ["data", "url", "format", "media_type"] {
+                    metadata.remove(field);
+                }
+            }
+            emit(
+                ProviderOutputBlock::ProtocolMetadata {
+                    metadata: serde_json::json!({
+                        "kind":"partial_content", "protocol":"chat_completions",
+                        "type_name":"chat_completions.audio_delta", "component":"media",
+                        "metadata":metadata,
+                    }),
+                },
+                None,
+            );
+        } else {
+            emit(
+                ProviderOutputBlock::Other {
+                    type_name: format!("assistant.{name}"),
+                    content: value.clone(),
+                },
+                None,
+            );
+        }
+    }
+    events
 }
 
 fn extract_sse_reasoning_delta(choice: &StreamChoice) -> Option<String> {
@@ -2695,10 +2964,8 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
     };
 
     if let Some(choice) = chunk.choices.first() {
-        if let Some(content) = &choice.delta.content
-            && !content.is_empty()
-        {
-            return Ok(Some(StreamChunk::delta(content.clone())));
+        if let Some(content) = extract_sse_text_delta(choice) {
+            return Ok(Some(StreamChunk::delta(content)));
         }
         if let Some(reasoning) = &choice.delta.reasoning_content
             && !reasoning.is_empty()
@@ -2721,7 +2988,7 @@ fn sse_bytes_to_chunks(
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-    let handle = ::zeroclaw_spawn::spawn!(async move {
+    let parser = async move {
         let mut buffer = String::new();
 
         match response.error_for_status_ref() {
@@ -2796,10 +3063,7 @@ fn sse_bytes_to_chunks(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::stream_idle_error_message(
-                            &e,
-                            idle_timeout,
-                        ))))
+                        .send(Err(super::stream_read_error(&e, idle_timeout)))
                         .await;
                     return;
                 }
@@ -2807,13 +3071,9 @@ fn sse_bytes_to_chunks(
         }
 
         let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
-    });
+    };
 
-    let guard = AbortOnDrop::new(handle.abort_handle());
-    stream::unfold((rx, guard), |(mut rx, guard)| async {
-        rx.recv().await.map(|chunk| (chunk, (rx, guard)))
-    })
-    .boxed()
+    crate::stream_guard::parser_stream(parser, rx)
 }
 
 /// Convert SSE byte stream to structured streaming events.
@@ -2837,12 +3097,14 @@ fn sse_bytes_to_events_for_contract(
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-    let handle = ::zeroclaw_spawn::spawn!(async move {
+    let parser = async move {
         let mut buffer = String::new();
         let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut emitted_tool_calls = false;
         let mut saw_completion = false;
+        let mut saw_done = false;
+        let mut frame_open = false;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
@@ -2861,32 +3123,37 @@ fn sse_bytes_to_events_for_contract(
             match item {
                 Ok(bytes) => {
                     utf8_buf.extend_from_slice(&bytes);
-                    let text = match std::str::from_utf8(&utf8_buf) {
+                    let (text, decode_error) = match std::str::from_utf8(&utf8_buf) {
                         Ok(s) => {
                             let owned = s.to_string();
                             utf8_buf.clear();
-                            owned
+                            (owned, None)
                         }
                         Err(e) => {
                             let valid_up_to = e.valid_up_to();
-                            if valid_up_to == 0 && utf8_buf.len() < 4 {
-                                continue;
-                            }
+                            let error = e
+                                .error_len()
+                                .map(|_| format!("Invalid UTF-8 in compatible SSE stream: {e}"));
                             let valid =
                                 String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
                             utf8_buf.drain(..valid_up_to);
-                            valid
+                            (valid, error)
                         }
                     };
-                    if text.is_empty() {
-                        continue;
-                    }
 
                     buffer.push_str(&text);
 
                     while let Some(pos) = buffer.find('\n') {
                         let line = buffer[..pos].to_string();
                         buffer.drain(..=pos);
+                        if line.trim().is_empty() {
+                            frame_open = false;
+                        } else if !line.starts_with(':') {
+                            frame_open = true;
+                        }
+                        if saw_done {
+                            continue;
+                        }
 
                         // Custom proxy events for pre-executed tool calls
                         // (e.g. claude-max-api-proxy streaming x_tool_start/x_tool_result)
@@ -2904,7 +3171,7 @@ fn sse_bytes_to_events_for_contract(
                                     == Some("[DONE]")
                                 {
                                     saw_completion = true;
-                                    break 'stream;
+                                    saw_done = true;
                                 }
                                 continue;
                             }
@@ -2914,12 +3181,28 @@ fn sse_bytes_to_events_for_contract(
                             }
                         };
 
+                        if let Some(model) = &chunk.model
+                            && tx.send(Ok(StreamEvent::ProtocolMetadata(serde_json::json!({"kind":"served_attribution","protocol":"openai_chat","model":model})))).await.is_err()
+                        {
+                            return;
+                        }
                         let mut should_emit_tool_calls = false;
-                        for choice in &chunk.choices {
-                            if choice.finish_reason.is_some() {
-                                saw_completion = true;
-                            }
+                        for (choice_index, choice) in chunk.choices.iter().enumerate() {
                             if let Some(reasoning_delta) = extract_sse_reasoning_delta(choice) {
+                                if tx
+                                    .send(Ok(StreamEvent::ContentPosition(
+                                        zeroclaw_api::model_provider::ProviderContentPosition {
+                                            output_index: choice
+                                                .index
+                                                .unwrap_or(choice_index as u64),
+                                            content_index: None,
+                                        },
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
                                 let reasoning_chunk = StreamChunk::reasoning(reasoning_delta);
                                 if tx
                                     .send(Ok(StreamEvent::TextDelta(reasoning_chunk)))
@@ -2929,16 +3212,10 @@ fn sse_bytes_to_events_for_contract(
                                     return;
                                 }
                             }
-                            if let Some(text_delta) = extract_sse_text_delta(choice) {
-                                let mut text_chunk = StreamChunk::delta(text_delta);
-                                if count_tokens {
-                                    text_chunk = text_chunk.with_token_estimate();
-                                }
-                                if tx
-                                    .send(Ok(StreamEvent::TextDelta(text_chunk)))
-                                    .await
-                                    .is_err()
-                                {
+                            for event in
+                                sse_choice_content_events(choice, choice_index, count_tokens)
+                            {
+                                if tx.send(Ok(event)).await.is_err() {
                                     return;
                                 }
                             }
@@ -2955,6 +3232,12 @@ fn sse_bytes_to_events_for_contract(
                                 }
                             }
 
+                            if let Some(reason) = &choice.finish_reason {
+                                saw_completion = true;
+                                if tx.send(Ok(StreamEvent::ProtocolMetadata(serde_json::json!({
+                                    "kind":"finish", "protocol":"chat_completions", "finish_reason":reason
+                                })))).await.is_err() { return; }
+                            }
                             if choice.finish_reason.as_deref() == Some("tool_calls") {
                                 should_emit_tool_calls = true;
                             }
@@ -2981,17 +3264,40 @@ fn sse_bytes_to_events_for_contract(
                             }
                         }
                     }
+                    // Commit the complete valid prefix before reporting a
+                    // malformed byte from the same transport chunk.
+                    if let Some(detail) = decode_error {
+                        let _ = tx.send(Err(StreamError::InvalidSse(detail))).await;
+                        return;
+                    }
+                    if saw_done && !frame_open && buffer.is_empty() && utf8_buf.is_empty() {
+                        break 'stream;
+                    }
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::stream_idle_error_message(
-                            &e,
-                            idle_timeout,
-                        ))))
+                        .send(Err(super::stream_read_error(&e, idle_timeout)))
                         .await;
                     return;
                 }
             }
+        }
+
+        if !utf8_buf.is_empty() {
+            let _ = tx
+                .send(Err(StreamError::InvalidSse(
+                    "Incomplete UTF-8 sequence at end of compatible SSE stream".into(),
+                )))
+                .await;
+            return;
+        }
+        if frame_open || !buffer.trim().is_empty() {
+            let _ = tx
+                .send(Err(StreamError::InvalidSse(
+                    "Unterminated SSE frame at end of compatible SSE stream".into(),
+                )))
+                .await;
+            return;
         }
 
         if !emitted_tool_calls {
@@ -3009,19 +3315,24 @@ fn sse_bytes_to_events_for_contract(
 
         crate::stream_guard::finish_sse_stream(&tx, saw_completion, "[DONE] or finish_reason")
             .await;
-    });
+    };
 
-    let guard = AbortOnDrop::new(handle.abort_handle());
-    stream::unfold((rx, guard), |(mut rx, guard)| async move {
-        rx.recv().await.map(|event| (event, (rx, guard)))
-    })
-    .boxed()
+    crate::stream_guard::parser_stream(parser, rx)
 }
 
 fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
-    serde_json::from_str::<ApiChatResponseEnvelope>(body)
+    let decoded = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) if value.get("error").is_some_and(|error| !error.is_null()) => {
+            return Err(anyhow::Error::new(
+                crate::dispatch::ProviderProtocolFailure::new(value),
+            ));
+        }
+        Ok(value) => serde_json::from_value::<ApiChatResponseEnvelope>(value),
+        Err(error) => Err(error),
+    };
+    decoded
         .map(ApiChatResponseEnvelope::into_response)
-        .map_err(|_| {
+        .map_err(|error| {
             let sanitized = super::sanitize_api_error(body);
             ::zeroclaw_log::record!(
                 ERROR,
@@ -3033,7 +3344,7 @@ fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatRes
                     })),
                 "compatible: unexpected chat-completions payload"
             );
-            anyhow::Error::msg(format!(
+            anyhow::Error::new(error).context(format!(
                 "{name} API returned an unexpected chat-completions payload; body={sanitized}"
             ))
         })
@@ -3513,6 +3824,7 @@ impl OpenAiCompatibleModelProvider {
                             let tc_name = tc.name.clone();
                             tool_name_map.insert(tc_id, tc_name);
                             ToolCall {
+                                extensions: Default::default(),
                                 id: Some({
                                     let normalized_id = reserve_tool_call_id_for_contract(
                                         targets_mistral_tool_call_contract,
@@ -3524,6 +3836,7 @@ impl OpenAiCompatibleModelProvider {
                                 }),
                                 kind: Some("function".to_string()),
                                 function: Some(Function {
+                                    extensions: Default::default(),
                                     name: Some(tc.name),
                                     arguments: Some(tc.arguments),
                                 }),
@@ -3817,7 +4130,15 @@ impl OpenAiCompatibleModelProvider {
             })
             .collect::<Vec<_>>();
 
+        let mut output_blocks = message.output_blocks;
+        output_blocks.extend(
+            tool_calls
+                .iter()
+                .cloned()
+                .map(|call| zeroclaw_api::model_provider::ProviderOutputBlock::ToolCall { call }),
+        );
         ProviderChatResponse {
+            output_blocks,
             text,
             tool_calls,
             usage: None,
@@ -4374,6 +4695,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     );
                     let text = self.chat_with_history(messages, model, temperature).await?;
                     return Ok(ProviderChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some(text),
                         tool_calls: vec![],
                         usage: None,
@@ -4430,7 +4752,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             anyhow::Error::msg(format!("No response from {}", self.name))
         })?;
 
-        let mut result = self.parse_native_response(choice.message);
+        let mut result = self.parse_native_response(choice.into_message());
         result.usage = usage;
         Ok(result)
     }
@@ -4570,7 +4892,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|choice| choice.message)
+            .map(Choice::into_message)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -4636,7 +4958,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        let parser = async move {
             let normalized = match provider
                 .normalize_messages_for_upstream(&messages_owned)
                 .await
@@ -4795,10 +5117,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                                     idle_timeout,
                                 ))
                             } else {
-                                StreamError::Http(super::stream_idle_error_message(
-                                    &e,
-                                    idle_timeout,
-                                ))
+                                super::stream_read_error(&e, idle_timeout)
                             }))
                             .await;
                         return;
@@ -4854,13 +5173,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     break;
                 }
             }
-        });
+        };
 
-        let guard = AbortOnDrop::new(handle.abort_handle());
-        stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            rx.recv().await.map(|event| (event, (rx, guard)))
-        })
-        .boxed()
+        crate::stream_guard::parser_stream(parser, rx)
     }
 
     fn stream_chat_with_system(
@@ -4885,7 +5200,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        let parser = async move {
             // Normalize image markers in the user-supplied message before
             // forwarding upstream — seefor the OpenAI-compatible
             // remote-vs-local file path problem.
@@ -5007,7 +5322,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                                 idle_timeout,
                             ))
                         } else {
-                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                            super::stream_read_error(&e, idle_timeout)
                         }))
                         .await;
                     return;
@@ -5032,14 +5347,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     break; // Receiver dropped
                 }
             }
-        });
+        };
 
-        // Convert channel receiver to stream
-        let guard = AbortOnDrop::new(handle.abort_handle());
-        stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            rx.recv().await.map(|chunk| (chunk, (rx, guard)))
-        })
-        .boxed()
+        crate::stream_guard::parser_stream(parser, rx)
     }
 
     fn stream_chat_with_history(
@@ -5061,7 +5371,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        let parser = async move {
             let normalized = match provider
                 .normalize_messages_for_upstream(&messages_owned)
                 .await
@@ -5154,7 +5464,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                                 idle_timeout,
                             ))
                         } else {
-                            StreamError::Http(super::stream_idle_error_message(&e, idle_timeout))
+                            super::stream_read_error(&e, idle_timeout)
                         }))
                         .await;
                     return;
@@ -5177,13 +5487,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     break;
                 }
             }
-        });
+        };
 
-        let guard = AbortOnDrop::new(handle.abort_handle());
-        stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            rx.recv().await.map(|chunk| (chunk, (rx, guard)))
-        })
-        .boxed()
+        crate::stream_guard::parser_stream(parser, rx)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -9922,10 +10228,7 @@ mod tests {
             "truncated stream must not emit Final, got: {events:?}"
         );
         assert!(
-            matches!(
-                events.last(),
-                Some(Err(StreamError::Http(msg))) if msg.contains("truncated")
-            ),
+            matches!(events.last(), Some(Err(StreamError::MissingFinal(_)))),
             "expected truncation error, got: {events:?}"
         );
     }
@@ -10004,6 +10307,33 @@ mod tests {
             value.get("stream_options").is_none(),
             "non-streaming NativeChatRequest must not emit a stream_options key"
         );
+    }
+
+    #[test]
+    fn known_content_and_tool_extensions_survive_chat_normalization() {
+        let message: ResponseMessage = serde_json::from_value(serde_json::json!({
+            "role":"assistant","content":[{"type":"text","text":"answer","annotations":[{"url":"https://fixture.invalid"}],"future":true}],
+            "tool_calls":[{"id":"call_fixture","type":"function","namespace":"search","function":{"name":"lookup","arguments":"{}","future_function":7}}]
+        })).unwrap();
+        let metadata: Vec<_> = message
+            .output_blocks
+            .iter()
+            .filter_map(|block| match block {
+                zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                    metadata,
+                } => Some(metadata),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0]["fields"]["future"], true);
+        assert_eq!(metadata[1]["call_id"], "call_fixture");
+        assert_eq!(metadata[1]["fields"]["namespace"], "search");
+        assert_eq!(metadata[1]["fields"]["function"]["future_function"], 7);
+        assert!(metadata[1]["fields"]["function"].get("arguments").is_none());
+        let choice: StreamChoice = serde_json::from_value(serde_json::json!({"index":1,"delta":{"tool_calls":[{"index":0,"id":"call_fixture","namespace":"search","function":{"name":"lookup","arguments":"{}","future":true}}]}})).unwrap();
+        let events = sse_choice_content_events(&choice, 0, false);
+        assert!(events.iter().any(|event| matches!(event, StreamEvent::OutputBlock(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {metadata}) if metadata["fields"]["namespace"]=="search" && metadata["fields"]["function"]["future"]==true)));
     }
 
     #[test]
@@ -11000,11 +11330,14 @@ mod tests {
     fn parse_native_response_preserves_tool_call_id() {
         let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             tool_calls: Some(vec![ToolCall {
+                extensions: Default::default(),
                 id: Some("call_123".to_string()),
                 kind: Some("function".to_string()),
                 function: Some(Function {
+                    extensions: Default::default(),
                     name: Some("shell".to_string()),
                     arguments: Some(r#"{"command":"pwd"}"#.to_string()),
                 }),
@@ -11027,11 +11360,14 @@ mod tests {
     fn parse_native_response_rejects_non_object_tool_arguments() {
         let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             tool_calls: Some(vec![ToolCall {
+                extensions: Default::default(),
                 id: Some("call_123".to_string()),
                 kind: Some("function".to_string()),
                 function: Some(Function {
+                    extensions: Default::default(),
                     name: Some("shell".to_string()),
                     arguments: Some(r#"["not", "an", "object"]"#.to_string()),
                 }),
@@ -11116,11 +11452,14 @@ mod tests {
     fn parse_native_response_mistral_normalizes_invalid_tool_call_id() {
         let provider = make_model_provider("Mistral", "https://api.mistral.ai/v1", None);
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             tool_calls: Some(vec![ToolCall {
+                extensions: Default::default(),
                 id: Some("xvL0p9bZ41j2X0O3Q1y9vL0p9bZ41j2X".to_string()),
                 kind: Some("function".to_string()),
                 function: Some(Function {
+                    extensions: Default::default(),
                     name: Some("shell".to_string()),
                     arguments: Some(r#"{"command":"pwd"}"#.to_string()),
                 }),
@@ -11144,11 +11483,14 @@ mod tests {
     fn parse_native_response_mistral_generates_valid_id_when_missing() {
         let provider = make_model_provider("Mistral", "https://api.mistral.ai/v1", None);
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             tool_calls: Some(vec![ToolCall {
+                extensions: Default::default(),
                 id: None,
                 kind: Some("function".to_string()),
                 function: Some(Function {
+                    extensions: Default::default(),
                     name: Some("shell".to_string()),
                     arguments: Some(r#"{"command":"pwd"}"#.to_string()),
                 }),
@@ -11172,11 +11514,14 @@ mod tests {
     fn parse_native_response_custom_mistral_endpoint_normalizes_tool_call_id() {
         let provider = make_model_provider("Custom", "https://api.mistral.ai/v1", None);
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             tool_calls: Some(vec![ToolCall {
+                extensions: Default::default(),
                 id: Some("xvL0p9bZ41j2X0O3Q1y9vL0p9bZ41j2X".to_string()),
                 kind: Some("function".to_string()),
                 function: Some(Function {
+                    extensions: Default::default(),
                     name: Some("shell".to_string()),
                     arguments: Some(r#"{"command":"pwd"}"#.to_string()),
                 }),
@@ -11200,12 +11545,15 @@ mod tests {
     fn parse_native_response_mistral_avoids_id_collision_after_normalization() {
         let provider = make_model_provider("Mistral", "https://api.mistral.ai/v1", None);
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             tool_calls: Some(vec![
                 ToolCall {
+                    extensions: Default::default(),
                     id: Some("ABCDEFGHI123".to_string()),
                     kind: Some("function".to_string()),
                     function: Some(Function {
+                        extensions: Default::default(),
                         name: Some("shell".to_string()),
                         arguments: Some(r#"{"command":"pwd"}"#.to_string()),
                     }),
@@ -11215,9 +11563,11 @@ mod tests {
                     extra_content: None,
                 },
                 ToolCall {
+                    extensions: Default::default(),
                     id: Some("ABCDEFGHIxyz".to_string()),
                     kind: Some("function".to_string()),
                     function: Some(Function {
+                        extensions: Default::default(),
                         name: Some("echo".to_string()),
                         arguments: Some(r#"{"text":"ok"}"#.to_string()),
                     }),
@@ -13464,9 +13814,11 @@ mod tests {
     fn stream_tool_call_accumulator_combines_deltas() {
         let mut acc = StreamToolCallAccumulator::default();
         acc.apply_delta(&StreamToolCallDelta {
+            extensions: Default::default(),
             index: Some(0),
             id: Some("call_1".to_string()),
             function: Some(StreamFunctionDelta {
+                extensions: Default::default(),
                 name: Some("shell".to_string()),
                 arguments: Some("{\"command\":\"".to_string()),
             }),
@@ -13475,9 +13827,11 @@ mod tests {
             extra_content: None,
         });
         acc.apply_delta(&StreamToolCallDelta {
+            extensions: Default::default(),
             index: Some(0),
             id: None,
             function: Some(StreamFunctionDelta {
+                extensions: Default::default(),
                 name: None,
                 arguments: Some("date\"}".to_string()),
             }),
@@ -13499,9 +13853,11 @@ mod tests {
     fn stream_tool_call_accumulator_mistral_normalizes_invalid_id() {
         let mut acc = StreamToolCallAccumulator::default();
         acc.apply_delta(&StreamToolCallDelta {
+            extensions: Default::default(),
             index: Some(0),
             id: Some("chatcmpl-tool-abc".to_string()),
             function: Some(StreamFunctionDelta {
+                extensions: Default::default(),
                 name: Some("shell".to_string()),
                 arguments: Some(r#"{"command":"date"}"#.to_string()),
             }),
@@ -14257,12 +14613,15 @@ mod tests {
     fn parse_native_response_captures_reasoning_content() {
         let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("answer".to_string()),
             reasoning_content: Some("thinking step".to_string()),
             tool_calls: Some(vec![ToolCall {
+                extensions: Default::default(),
                 id: Some("call_1".to_string()),
                 kind: Some("function".to_string()),
                 function: Some(Function {
+                    extensions: Default::default(),
                     name: Some("shell".to_string()),
                     arguments: Some(r#"{"cmd":"ls"}"#.to_string()),
                 }),
@@ -14284,6 +14643,7 @@ mod tests {
     fn parse_native_response_none_reasoning_content_for_normal_model() {
         let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("hello".to_string()),
             reasoning_content: None,
             tool_calls: None,
@@ -14301,6 +14661,7 @@ mod tests {
         // untouched and gateway `thinking_blocks` are ignored entirely.
         let provider = make_model_provider("test", "https://example.com", None);
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             reasoning_content: Some("raw chain of thought".to_string()),
             tool_calls: None,
@@ -14329,6 +14690,7 @@ mod tests {
             .with_thinking_passthrough()
             .build();
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             reasoning_content: None,
             tool_calls: None,
@@ -14367,6 +14729,7 @@ mod tests {
             .with_thinking_passthrough()
             .build();
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             reasoning_content: Some("plain reasoning".to_string()),
             tool_calls: None,
@@ -14394,6 +14757,7 @@ mod tests {
             .with_thinking_passthrough()
             .build();
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             reasoning_content: Some("unsigned duplicate".to_string()),
             tool_calls: None,
@@ -14424,6 +14788,7 @@ mod tests {
             .with_thinking_passthrough()
             .build();
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: None,
             reasoning_content: Some("fallback thought".to_string()),
             tool_calls: None,
@@ -14660,6 +15025,7 @@ mod tests {
             "data": "ErUBCkEIRAP...opaque"
         });
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("answer".to_string()),
             reasoning_content: None,
             tool_calls: None,
@@ -14715,6 +15081,7 @@ mod tests {
             .build();
 
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("answer".to_string()),
             reasoning_content: None,
             tool_calls: None,
@@ -14747,6 +15114,7 @@ mod tests {
             .with_thinking_passthrough()
             .build();
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("answer".to_string()),
             reasoning_content: None,
             tool_calls: None,
@@ -14795,6 +15163,7 @@ mod tests {
             .with_thinking_passthrough()
             .build();
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("answer".to_string()),
             reasoning_content: None,
             tool_calls: None,
@@ -14924,6 +15293,7 @@ mod tests {
             .with_thinking_passthrough()
             .build();
         let message = ResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("answer".to_string()),
             reasoning_content: None,
             tool_calls: None,
@@ -15491,8 +15861,8 @@ mod tests {
             .expect("stalled chunk stream must yield an item");
         server.abort();
         let message = match item {
-            Err(StreamError::Http(message)) => message,
-            Err(other) => panic!("expected an HTTP stream error, got {other:?}"),
+            Err(StreamError::ResponseTimeout(message)) => message,
+            Err(other) => panic!("expected a response timeout, got {other:?}"),
             Ok(_) => panic!("expected an error after the stalled body"),
         };
         assert!(
@@ -15596,9 +15966,11 @@ mod tests {
         // Ensures model_providers like Mistral that reject extra fields (e.g. "name": null)
         // don't receive them when the ToolCall compat fields are None.
         let tc = ToolCall {
+            extensions: Default::default(),
             id: Some("call_1".to_string()),
             kind: Some("function".to_string()),
             function: Some(Function {
+                extensions: Default::default(),
                 name: Some("shell".to_string()),
                 arguments: Some("{\"command\":\"ls\"}".to_string()),
             }),
@@ -15621,6 +15993,7 @@ mod tests {
     fn tool_call_with_compat_fields_serializes_them() {
         // When compat fields are Some, they should appear in the output.
         let tc = ToolCall {
+            extensions: Default::default(),
             id: None,
             kind: None,
             function: None,
@@ -15647,7 +16020,7 @@ mod tests {
         let event = parse_proxy_tool_event(line);
         assert!(matches!(
             event,
-            Some(StreamEvent::PreExecutedToolCall { ref name, ref args })
+            Some(StreamEvent::PreExecutedToolCall { ref name, ref args, .. })
             if name == "bash" && args == r#"{"cmd":"ls"}"#
         ));
     }
@@ -15664,7 +16037,7 @@ mod tests {
         let event = parse_proxy_tool_event(line);
         assert!(matches!(
             event,
-            Some(StreamEvent::PreExecutedToolCall { ref name, ref args })
+            Some(StreamEvent::PreExecutedToolCall { ref name, ref args, .. })
             if name == "read" && args == "{}"
         ));
     }
@@ -15675,7 +16048,7 @@ mod tests {
         let event = parse_proxy_tool_event(line);
         assert!(matches!(
             event,
-            Some(StreamEvent::PreExecutedToolResult { ref name, ref output })
+            Some(StreamEvent::PreExecutedToolResult { ref name, ref output, .. })
             if name == "bash" && output == "hello world"
         ));
     }
@@ -15686,7 +16059,7 @@ mod tests {
         let event = parse_proxy_tool_event(line);
         assert!(matches!(
             event,
-            Some(StreamEvent::PreExecutedToolResult { ref name, ref output })
+            Some(StreamEvent::PreExecutedToolResult { ref name, ref output, .. })
             if name == "unknown" && output.is_empty()
         ));
     }

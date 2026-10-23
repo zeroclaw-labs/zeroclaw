@@ -1,15 +1,34 @@
 //! Channel infrastructure: session backends, debouncing, and stall watchdog.
 //! These are cross-cutting utilities used by multiple channel implementations.
 
-pub mod acp_session_store;
 pub mod conversation_owners;
 pub mod debounce;
 pub mod net_guard;
 pub mod session_backend;
+pub mod session_events;
 pub mod session_queue;
+pub mod session_repository;
 pub mod session_sqlite;
 pub mod session_store;
 pub mod stall_watchdog;
+
+/// Explicit bridge for pre-event-store protocol test harnesses. Shipped
+/// entrances must use the admitted execution port for transcript mutations.
+#[macro_export]
+macro_rules! legacy_fixture_call {
+    ($repository:expr, $method:ident($($argument:expr),* $(,)?)) => {
+        $crate::legacy_fixture_call!($repository, $method($($argument),*) => ())
+    };
+    ($repository:expr, $method:ident($($argument:expr),* $(,)?) => $result:ty) => {{
+        #[cfg(any(test, feature = "test-util"))]
+        { $repository.$method($($argument),*) }
+        #[cfg(not(any(test, feature = "test-util")))]
+        {
+            let _ = (&$repository, $(&$argument),*);
+            Err::<$result, anyhow::Error>(anyhow::Error::msg("legacy transcript operations require the session execution port"))
+        }
+    }};
+}
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -37,12 +56,27 @@ pub fn make_session_backend(
     workspace_dir: &Path,
     backend: &str,
 ) -> std::io::Result<Arc<dyn SessionBackend>> {
+    let guard =
+        session_events::installation::InstallationGuard::acquire(&workspace_dir.join("sessions"))
+            .map_err(std::io::Error::other)?;
+    if let Err(error) = guard.require_legacy() {
+        if error.kind() != std::io::ErrorKind::PermissionDenied {
+            return Err(error);
+        }
+        // Compatibility-only consumers cannot recreate an old SQLite file.
+        // The directory reader shares the durable native writer fence; native
+        // entrances and tools read through their authorized event query port.
+        return Ok(Arc::new(session_store::SessionStore::new(workspace_dir)?));
+    }
     match backend {
         "jsonl" => {
             let store = session_store::SessionStore::new(workspace_dir)?;
             Ok(Arc::new(store))
         }
-        "sqlite" => Ok(Arc::new(open_sqlite_with_jsonl_import(workspace_dir)?)),
+        "sqlite" => Ok(Arc::new(open_sqlite_with_jsonl_import(
+            workspace_dir,
+            guard,
+        )?)),
         other => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -52,16 +86,21 @@ pub fn make_session_backend(
                 "Unknown session_backend ''; falling back to sqlite. \
                  Valid values: 'sqlite' (default), 'jsonl'."
             );
-            Ok(Arc::new(open_sqlite_with_jsonl_import(workspace_dir)?))
+            Ok(Arc::new(open_sqlite_with_jsonl_import(
+                workspace_dir,
+                guard,
+            )?))
         }
     }
 }
 
 fn open_sqlite_with_jsonl_import(
     workspace_dir: &Path,
+    guard: session_events::installation::InstallationGuard,
 ) -> std::io::Result<session_sqlite::SqliteSessionBackend> {
-    let backend = session_sqlite::SqliteSessionBackend::new(workspace_dir)
+    let backend = session_sqlite::SqliteSessionBackend::open_locked(&guard)
         .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+    drop(guard);
     match backend
         .migrate_from_jsonl(workspace_dir)
         .map_err(|e| std::io::Error::other(format!("{e:#}")))?

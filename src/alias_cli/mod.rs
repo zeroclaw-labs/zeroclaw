@@ -681,13 +681,9 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
     }
 }
 
-/// Memory + optional session-backend handles opened from `data_dir` for the
-/// owned-state cascade.
+/// Memory handle retained across config deletion for the owned-state cascade.
 #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
-type OwnedStateHandles = (
-    std::sync::Arc<dyn zeroclaw_memory::Memory>,
-    Option<std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
-);
+type OwnedStateHandles = std::sync::Arc<dyn zeroclaw_memory::Memory>;
 
 #[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
 type OwnedStateHandles = ();
@@ -703,18 +699,7 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
                 .context("open memory backend for the owned-state cascade")?,
         )
     };
-    let session_backend = if config.gateway.session_persistence {
-        Some(
-            zeroclaw_infra::make_session_backend(
-                &config.data_dir,
-                &config.channels.session_backend,
-            )
-            .context("open session backend for the owned-state cascade")?,
-        )
-    } else {
-        None
-    };
-    Ok((mem, session_backend))
+    Ok(mem)
 }
 
 #[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
@@ -752,7 +737,7 @@ async fn agent_delete_owned_state(
     config: &Config,
     alias: &str,
     workspace: &std::path::Path,
-    (mem, session_backend): OwnedStateHandles,
+    mem: OwnedStateHandles,
 ) -> Result<()> {
     let archive =
         zeroclaw_runtime::agent_lifecycle::archive_agent_workspace(config, alias, workspace).await;
@@ -767,14 +752,9 @@ async fn agent_delete_owned_state(
         );
     }
     let archive_dir = archive.archive_dir;
-    let report = crate::gateway::agent_owned_state::cascade_owned_state(
-        config,
-        &mem,
-        session_backend.as_ref(),
-        alias,
-        &archive_dir,
-    )
-    .await;
+    let report =
+        crate::gateway::agent_owned_state::cascade_owned_state(config, &mem, alias, &archive_dir)
+            .await;
     let memory = report.memory_purged.to_string();
     let cron = report.cron_removed.to_string();
     let acp = report.acp_removed.to_string();
@@ -844,15 +824,9 @@ async fn agent_rename_owned_state(
             );
         }
     }
-    let (mem, session_backend) = build_owned_state_handles(config)?;
-    let report = crate::gateway::agent_owned_state::cascade_rename_agent(
-        config,
-        Some(&mem),
-        session_backend.as_ref(),
-        from,
-        to,
-    )
-    .await;
+    let mem = build_owned_state_handles(config)?;
+    let report =
+        crate::gateway::agent_owned_state::cascade_rename_agent(config, Some(&mem), from, to).await;
     let memory = report.memory_rows.to_string();
     let cron = report.cron_jobs.to_string();
     let acp = report.acp_sessions.to_string();
@@ -964,13 +938,41 @@ pub async fn handle_providers(cmd: ProvidersCommands, config: &mut Config) -> Re
             to,
         } => {
             let category = parse_provider_category(&category)?;
-            rename_config(
-                config,
-                &AliasKind::Provider { category, family },
-                &from,
-                &to,
-            )?;
-            save(config).await
+            let kind = AliasKind::Provider { category, family };
+            #[cfg(feature = "agent-runtime")]
+            let _offline_ownership = if category == ProviderCategory::Models {
+                match route_agent_mutation(
+                    config,
+                    "config/map-key-rename",
+                    serde_json::json!({ "path": section_path(&kind), "from": from, "to": to }),
+                )
+                .await?
+                {
+                    AgentMutationRoute::Daemon(value) => return print_daemon_rename(value),
+                    AgentMutationRoute::Offline(ownership) => Some(ownership),
+                }
+            } else {
+                None
+            };
+            let native_history_guard = if category == ProviderCategory::Models {
+                let guard =
+                    zeroclaw_infra::session_events::installation::InstallationGuard::acquire(
+                        &config.data_dir.join("sessions"),
+                    )?;
+                guard.require_legacy().map_err(|_| {
+                    anyhow::Error::msg(mt(
+                        "cli-alias-rename-model-native-history",
+                        "model provider aliases cannot be renamed while native session history exists or is being migrated; keep the existing alias so recorded model selections remain resolvable",
+                    ))
+                })?;
+                Some(guard)
+            } else {
+                None
+            };
+            rename_config(config, &kind, &from, &to)?;
+            let result = save(config).await;
+            drop(native_history_guard);
+            result
         }
         ProvidersCommands::Delete {
             category,
@@ -1141,7 +1143,7 @@ mod tests {
 
         let workspace = config.agent_workspace_dir("victim");
         let handles = build_owned_state_handles(&config).unwrap();
-        let retained_memory = Arc::clone(&handles.0);
+        let retained_memory = Arc::clone(&handles);
         let agent_id = retained_memory.ensure_agent_uuid("victim").await.unwrap();
         retained_memory
             .store_with_agent(

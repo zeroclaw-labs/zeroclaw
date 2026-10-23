@@ -20,7 +20,7 @@ use zeroclaw_api::jsonrpc::{
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_config::schema::Config;
-use zeroclaw_infra::acp_session_store::AcpSessionStore;
+use zeroclaw_infra::session_repository::SessionRepository;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
 use zeroclaw_runtime::tools::CanvasStore;
 
@@ -125,7 +125,22 @@ enum ConfigSource {
     Live(zeroclaw_config::live::LiveConfigHandle),
 }
 
+/// The authenticated transport supplies current authorization, not a snapshot.
+pub type SessionHistoryAuthorityFactory = Arc<
+    dyn Fn(
+            &str,
+            zeroclaw_api::session_events::SessionStreamId,
+        )
+            -> anyhow::Result<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionAuthority>>
+        + Send
+        + Sync,
+>;
+
 pub struct AcpServer {
+    native_history: Option<(
+        Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>,
+        SessionHistoryAuthorityFactory,
+    )>,
     /// The sole authority for `Config`-backed settings. Managed stdio and
     /// gateway ACP resolve their shared authority's config.
     config_source: ConfigSource,
@@ -151,7 +166,7 @@ pub struct AcpServer {
     /// replacement agent from pre-append rows. Keyed by session id; entries are
     /// tiny and bounded by the distinct sessions seen.
     session_gates: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    store: Option<Arc<AcpSessionStore>>,
+    store: Option<Arc<SessionRepository>>,
     /// Shared canvas store from the gateway / daemon supervisor.  When set,
     /// agents created by this server write canvas frames to the same store
     /// that `/ws/canvas/:id` WebSocket subscribers read from.  `None` in
@@ -175,7 +190,7 @@ impl AcpServer {
     pub fn new_stdio_with_authority(
         authority: &zeroclaw_runtime::LiveConfigAuthority,
         acp_config: AcpServerConfig,
-        store: Option<Arc<AcpSessionStore>>,
+        store: Option<Arc<SessionRepository>>,
     ) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
         Self::with_writer(
@@ -218,7 +233,7 @@ impl AcpServer {
     pub fn new_with_store(
         config: Config,
         acp_config: AcpServerConfig,
-        store: Arc<AcpSessionStore>,
+        store: Arc<SessionRepository>,
     ) -> Self {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(256);
         Self::with_writer(
@@ -235,7 +250,7 @@ impl AcpServer {
         config: Config,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
-        store: Arc<AcpSessionStore>,
+        store: Arc<SessionRepository>,
     ) -> Self {
         Self::with_writer(
             ConfigSource::Standalone(Box::new(config)),
@@ -276,7 +291,7 @@ impl AcpServer {
         agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
-        store: Arc<AcpSessionStore>,
+        store: Arc<SessionRepository>,
     ) -> Self {
         Self::with_writer(
             ConfigSource::Live(live_config),
@@ -294,9 +309,10 @@ impl AcpServer {
         acp_config: AcpServerConfig,
         writer_tx: mpsc::Sender<String>,
         writer_rx: Option<mpsc::Receiver<String>>,
-        store: Option<Arc<AcpSessionStore>>,
+        store: Option<Arc<SessionRepository>>,
     ) -> Self {
         Self {
+            native_history: None,
             config_source,
             agent_lifecycle,
             acp_config,
@@ -313,6 +329,88 @@ impl AcpServer {
             connection_default_agent: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
         }
+    }
+
+    pub fn with_session_history(
+        mut self,
+        source: Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>,
+        authority: SessionHistoryAuthorityFactory,
+    ) -> Self {
+        self.native_history = Some((source, authority));
+        self
+    }
+
+    async fn record_history_cancellation(&self, session_id: &str, reason: &str) -> RpcResult {
+        if let Some((source, factory)) = &self.native_history {
+            let family = format!("acp_{session_id}");
+            let command = async {
+                let Some(descriptor) = source.describe(family.clone()).await? else {
+                    return Ok::<_, anyhow::Error>(());
+                };
+                let authority = factory(&descriptor.owning_agent, descriptor.stream)?;
+                let port = source
+                    .open(
+                        family,
+                        descriptor.owning_agent,
+                        zeroclaw_api::principal::PrincipalId::shared_operator(),
+                        authority,
+                        zeroclaw_api::session_events::capture::ContextSnapshot {
+                            messages: vec![],
+                            history_has_trim_breadcrumb: None,
+                        },
+                    )
+                    .await?;
+                port.request_cancellation(None, session_id, reason).await
+            }
+            .await;
+            command.map_err(|error| RpcError {
+                code: INTERNAL_ERROR,
+                message: zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error),
+                data: None,
+            })?;
+        }
+        Ok(serde_json::json!({}))
+    }
+
+    async fn restore_native_history(
+        &self,
+        session_id: &str,
+        alias: &str,
+    ) -> anyhow::Result<
+        Option<(
+            Arc<dyn zeroclaw_api::session_events::capture::SessionExecutionPort>,
+            zeroclaw_api::session_events::capture::ContextSnapshot,
+        )>,
+    > {
+        let Some((source, factory)) = &self.native_history else {
+            return Ok(None);
+        };
+        let family = format!("acp_{session_id}");
+        let Some(descriptor) = source.describe(family.clone()).await? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            descriptor.owning_agent == alias,
+            "native ACP owning agent differs"
+        );
+        let authority = factory(alias, descriptor.stream)?;
+        let port = source
+            .open(
+                family,
+                alias.into(),
+                zeroclaw_api::principal::PrincipalId::shared_operator(),
+                authority,
+                zeroclaw_api::session_events::capture::ContextSnapshot {
+                    messages: vec![],
+                    history_has_trim_breadcrumb: None,
+                },
+            )
+            .await?;
+        let snapshot = port
+            .restore_context()
+            .await?
+            .ok_or_else(|| anyhow::Error::msg("native ACP context missing"))?;
+        Ok(Some((port, snapshot)))
     }
 
     fn config_snapshot(&self) -> Config {
@@ -1245,7 +1343,7 @@ impl AcpServer {
             });
 
         // On error (SQLite failure or not-found), release the reservation.
-        let data = match data {
+        let mut data = match data {
             Ok(d) => d,
             Err(e) => {
                 self.loading_sessions.lock().await.remove(&session_id);
@@ -1294,6 +1392,40 @@ impl AcpServer {
             }
         };
 
+        let native_restore = match self
+            .restore_native_history(&session_id, &restore_alias)
+            .await
+        {
+            Ok(Some((port, snapshot))) => {
+                let restored_model = async {
+                    if let Some(selection) = port.restore_model_override().await? {
+                        agent.restore_session_model_selection(selection)?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(error) = restored_model {
+                    self.loading_sessions.lock().await.remove(&session_id);
+                    return Err(RpcError {
+                        code: INTERNAL_ERROR,
+                        message: Agent::session_execution_diagnostic(&error),
+                        data: None,
+                    });
+                }
+                data.messages = snapshot.messages;
+                data.trim_breadcrumb = snapshot.history_has_trim_breadcrumb.unwrap_or(false);
+                Some(port)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error),
+                    data: None,
+                });
+            }
+        };
         // Repair an interrupted native-tool exchange left by a failed/cancelled
         // turn and drop the replay-only cancellation sentinel before seeding, on
         // the same typed-restore path `session/resume` uses. `stored_messages`
@@ -1339,14 +1471,28 @@ impl AcpServer {
             // A failure here must not let the session go live against a
             // store that still has the untrimmed prefix, so it fails the
             // restore instead of swallowing the error.
-            if let Err(e) = Self::replace_transcript(
-                self.store.clone(),
-                session_id.clone(),
-                agent.history().to_vec(),
-                agent.history_has_trim_breadcrumb(),
-            )
-            .await
-            {
+            let persisted = if let Some(port) = &native_restore {
+                port.replace_context(
+                    zeroclaw_api::session_events::capture::ContextSnapshot {
+                        messages: agent.history().to_vec(),
+                        history_has_trim_breadcrumb: Some(agent.history_has_trim_breadcrumb()),
+                    },
+                    "acp_restore_trim",
+                )
+                .await
+                .map_err(|error| {
+                    zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error)
+                })
+            } else {
+                Self::replace_transcript(
+                    self.store.clone(),
+                    session_id.clone(),
+                    agent.history().to_vec(),
+                    agent.history_has_trim_breadcrumb(),
+                )
+                .await
+            };
+            if let Err(e) = persisted {
                 self.loading_sessions.lock().await.remove(&session_id);
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
@@ -1407,6 +1553,7 @@ impl AcpServer {
                 return Err(Self::agent_admission_error(error));
             }
         };
+        let (_, restored_provider, restored_model) = agent.attribution_fields();
         let now = Instant::now();
         // The session is about to become live, so `session/close` owns the gate
         // from here on.
@@ -1423,14 +1570,8 @@ impl AcpServer {
                     _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
-                    model_provider: config
-                        .agent(&restore_alias)
-                        .map(|a| a.model_provider.to_string())
-                        .unwrap_or_default(),
-                    model: config
-                        .model_provider_for_agent(&restore_alias)
-                        .and_then(|mp| mp.model.clone())
-                        .unwrap_or_default(),
+                    model_provider: restored_provider.clone(),
+                    model: restored_model.clone(),
                     workspace_dir: workspace_dir.to_string_lossy().into_owned(),
                 })),
             );
@@ -1467,14 +1608,8 @@ impl AcpServer {
             }
         }
 
-        let mp = config
-            .agent(&restore_alias)
-            .map(|a| a.model_provider.to_string())
-            .unwrap_or_default();
-        let model_name = config
-            .model_provider_for_agent(&restore_alias)
-            .and_then(|mp| mp.model.clone())
-            .unwrap_or_default();
+        let mp = restored_provider;
+        let model_name = restored_model;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
@@ -1579,7 +1714,7 @@ impl AcpServer {
             });
 
         // On error (SQLite failure or not-found), release the reservation.
-        let data = match data {
+        let mut data = match data {
             Ok(d) => d,
             Err(e) => {
                 self.loading_sessions.lock().await.remove(&session_id);
@@ -1628,6 +1763,40 @@ impl AcpServer {
             }
         };
 
+        let native_restore = match self
+            .restore_native_history(&session_id, &restore_alias)
+            .await
+        {
+            Ok(Some((port, snapshot))) => {
+                let restored_model = async {
+                    if let Some(selection) = port.restore_model_override().await? {
+                        agent.restore_session_model_selection(selection)?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(error) = restored_model {
+                    self.loading_sessions.lock().await.remove(&session_id);
+                    return Err(RpcError {
+                        code: INTERNAL_ERROR,
+                        message: Agent::session_execution_diagnostic(&error),
+                        data: None,
+                    });
+                }
+                data.messages = snapshot.messages;
+                data.trim_breadcrumb = snapshot.history_has_trim_breadcrumb.unwrap_or(false);
+                Some(port)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error),
+                    data: None,
+                });
+            }
+        };
         // `session/resume` seeds provider history but emits no client replay, so
         // it needs the same typed sanitization `session/load` applies: repair an
         // interrupted native-tool exchange and drop the replay-only cancellation
@@ -1666,14 +1835,28 @@ impl AcpServer {
             // session go live against a store that still has the untrimmed
             // prefix, so it fails the restore instead of swallowing the
             // error.
-            if let Err(e) = Self::replace_transcript(
-                self.store.clone(),
-                session_id.clone(),
-                agent.history().to_vec(),
-                agent.history_has_trim_breadcrumb(),
-            )
-            .await
-            {
+            let persisted = if let Some(port) = &native_restore {
+                port.replace_context(
+                    zeroclaw_api::session_events::capture::ContextSnapshot {
+                        messages: agent.history().to_vec(),
+                        history_has_trim_breadcrumb: Some(agent.history_has_trim_breadcrumb()),
+                    },
+                    "acp_restore_trim",
+                )
+                .await
+                .map_err(|error| {
+                    zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error)
+                })
+            } else {
+                Self::replace_transcript(
+                    self.store.clone(),
+                    session_id.clone(),
+                    agent.history().to_vec(),
+                    agent.history_has_trim_breadcrumb(),
+                )
+                .await
+            };
+            if let Err(e) = persisted {
                 self.loading_sessions.lock().await.remove(&session_id);
                 return Err(RpcError {
                     code: INTERNAL_ERROR,
@@ -1700,6 +1883,7 @@ impl AcpServer {
                 return Err(Self::agent_admission_error(error));
             }
         };
+        let (_, restored_provider, restored_model) = agent.attribution_fields();
         let now = Instant::now();
         // The session is about to become live, so `session/close` owns the gate
         // from here on.
@@ -1716,14 +1900,8 @@ impl AcpServer {
                     _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
-                    model_provider: config
-                        .agent(&restore_alias)
-                        .map(|a| a.model_provider.to_string())
-                        .unwrap_or_default(),
-                    model: config
-                        .model_provider_for_agent(&restore_alias)
-                        .and_then(|mp| mp.model.clone())
-                        .unwrap_or_default(),
+                    model_provider: restored_provider.clone(),
+                    model: restored_model.clone(),
                     workspace_dir: workspace_dir.to_string_lossy().into_owned(),
                 })),
             );
@@ -1735,14 +1913,8 @@ impl AcpServer {
             self.write_notification(&notification).await;
         }
 
-        let mp = config
-            .agent(&restore_alias)
-            .map(|a| a.model_provider.to_string())
-            .unwrap_or_default();
-        let model_name = config
-            .model_provider_for_agent(&restore_alias)
-            .and_then(|mp| mp.model.clone())
-            .unwrap_or_default();
+        let mp = restored_provider;
+        let model_name = restored_model;
 
         // Replay the durable TodoWrite plan so the resuming client's tracker
         // repopulates without a model round-trip — parity with the daemon RPC
@@ -1790,6 +1962,8 @@ impl AcpServer {
             .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
             .get(session_id)
             .cloned();
+        self.record_history_cancellation(session_id, "acp_protocol_close")
+            .await?;
         if let Some(token) = token {
             token.cancel();
             ::zeroclaw_log::record!(
@@ -1963,23 +2137,72 @@ impl AcpServer {
             }
         }
 
-        let prompt = match Self::materialize_prompt(
-            params,
-            if workspace_dir.is_empty() {
-                None
-            } else {
-                Some(Path::new(&workspace_dir))
-            },
-        ) {
-            Ok(prompt) => prompt,
-            Err(e) => {
-                // Release the reservation we just took so a bad attachment doesn't
-                // wedge the session for subsequent prompts.
-                self.remove_cancel_token(&session_id);
-                return Err(e);
+        let native = if let Some((source, factory)) = &self.native_history {
+            let family = format!("acp_{session_id}");
+            let initial = {
+                let session = session_arc.lock().await;
+                zeroclaw_api::session_events::capture::ContextSnapshot {
+                    messages: (session.agent.history()).to_vec(),
+                    history_has_trim_breadcrumb: Some(session.agent.history_has_trim_breadcrumb()),
+                }
+            };
+            let admitted = async {
+                let authority = factory(&agent_alias, source.stream_id(&family).await?)?;
+                source
+                    .open(
+                        family,
+                        agent_alias.clone(),
+                        zeroclaw_api::principal::PrincipalId::shared_operator(),
+                        authority,
+                        initial,
+                    )
+                    .await
             }
+            .await;
+            match admitted {
+                Ok(port) => Some(port),
+                Err(error) => {
+                    self.remove_cancel_token(&session_id);
+                    return Err(RpcError {
+                        code: INTERNAL_ERROR,
+                        message: zeroclaw_runtime::agent::Agent::session_execution_diagnostic(
+                            &error,
+                        ),
+                        data: None,
+                    });
+                }
+            }
+        } else {
+            None
         };
+        let (prompt, native_parts) = if native.is_some() {
+            match Self::prepare_prompt_history(params, &session_id) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.remove_cancel_token(&session_id);
+                    return Err(error);
+                }
+            }
+        } else {
+            let prompt = match Self::materialize_prompt(
+                params,
+                if workspace_dir.is_empty() {
+                    None
+                } else {
+                    Some(Path::new(&workspace_dir))
+                },
+            ) {
+                Ok(prompt) => prompt,
+                Err(e) => {
+                    // Release the reservation we just took so a bad attachment doesn't
+                    // wedge the session for subsequent prompts.
+                    self.remove_cancel_token(&session_id);
+                    return Err(e);
+                }
+            };
 
+            (prompt, Vec::new())
+        };
         let session_id_s = session_id.clone();
         let agent_alias_s = agent_alias.clone();
         let model_provider_s = model_provider.clone();
@@ -2021,12 +2244,28 @@ impl AcpServer {
         // await this lock) cannot expose the session for reload before the
         // terminal transcript is committed.
         let session_id_for_task = session_id.clone();
-        let persist_store = self.store.clone();
+        let metadata_port = native.clone();
+        let metadata_cancel = cancel_token.clone();
+        let mut metadata_error = None;
+        let persist_store = if native.is_some() { None } else { self.store.clone() };
         let persist_session_id = session_id.clone();
         let turn_handle = zeroclaw_spawn::spawn!(async move {
             let mut session = session_arc.lock().await;
-            let (turn_alias, turn_provider, turn_model) = session.agent.attribution_fields();
             let history_trim_generation_before_turn = session.agent.history_trim_generation();
+            if let Some(port)=&native {
+                let restored=async {
+                    if let Some(selection)=port.restore_model_override().await? {session.agent.restore_session_model_selection(selection)?;}
+                    if let Some(context)=port.restore_context().await? {
+                        session.agent.clear_history();
+                        session.agent.set_history_has_trim_breadcrumb(context.history_has_trim_breadcrumb.unwrap_or(false));
+                        session.agent.seed_conversation_history(context.messages);
+                        port.replace_context(zeroclaw_api::session_events::capture::ContextSnapshot {messages:(session.agent.history()).to_vec(),history_has_trim_breadcrumb:Some(session.agent.history_has_trim_breadcrumb())},"acp_restore_trim").await?;
+                    }
+                    Ok::<_,anyhow::Error>(())
+                }.await;
+                if let Err(error)=restored {let (error,rpc_error)=acp_turn_failure(&error);return TerminalOutcome::Failed {error,rpc_error,persist_error:None};}
+            }
+            let (turn_alias, turn_provider, turn_model) = session.agent.attribution_fields();
             // Stamp the resolved per-turn alias so `/api/cost?agent=<alias>`
             // attributes this spend.
             let cost_context = cost_tracker.map(|tracker| {
@@ -2052,15 +2291,54 @@ impl AcpServer {
                     Some(session_id_for_task),
                     zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                         cost_context,
-                        session
-                            .agent
-                            .turn_streamed_with_steering_state(
-                                &prompt,
-                                event_tx,
-                                Some(cancel_token),
-                                None,
-                            )
-                            .instrument(span),
+                        async {
+                            let Some(port)=native else {
+                                return session.agent.turn_streamed_with_steering_state(
+                                    &prompt, event_tx, Some(cancel_token), None,
+                                ).instrument(span).await;
+                            };
+                            let pending = port.pending_inputs(turn_provider.clone(), turn_model.clone()).await
+                                .map_err(|error| zeroclaw_runtime::agent::agent::StreamedTurnError {
+                                    error, committed_response: String::new(), new_messages: vec![],
+                                })?;
+                            let workspace = if workspace_dir.is_empty() { None } else { Some(Path::new(&workspace_dir)) };
+                            for input in pending {
+                                if input.agent_alias.as_deref() != Some(turn_alias.as_str())
+                                    || input.ingress.transport != zeroclaw_api::ingress::Transport::Acp
+                                {
+                                    ::zeroclaw_log::record!(
+                                        ERROR,
+                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject),
+                                        "acp_recovered_input_scope_mismatch"
+                                    );
+                                    return Err(zeroclaw_runtime::agent::agent::StreamedTurnError {
+                                        error: anyhow::Error::msg("ACP recovered input scope mismatch"),
+                                        committed_response: String::new(), new_messages: vec![],
+                                    });
+                                }
+                                // A disconnected request's output belongs to its
+                                // stored turn, never to this prompt's wire reply.
+                                let (events, mut receiver) = mpsc::channel(64);
+                                let recovered = Self::execute_native_turn(
+                                    &mut session.agent, port.clone(), input, workspace,
+                                    events, cancel_token.clone(),
+                                );
+                                let (result, ()) = tokio::join!(recovered, async {
+                                    while receiver.recv().await.is_some() {}
+                                });
+                                result.map_err(|failure| zeroclaw_runtime::agent::agent::StreamedTurnError {
+                                    error: failure.error,
+                                    committed_response: String::new(), new_messages: vec![],
+                                })?;
+                            }
+                            let mut ingress=zeroclaw_api::ingress::IngressContext::interactive();
+                            ingress.transport=zeroclaw_api::ingress::Transport::Acp;
+                            ingress.source_class=zeroclaw_api::ingress::SourceClass::External;
+                            let input=zeroclaw_api::session_events::capture::EngineTurnInput { execution_workspace: None, reply_route: None,turn_id:uuid::Uuid::new_v4().to_string(),agent_alias:Some(turn_alias.clone()),ingress,parts:native_parts,provider_ref:turn_provider.clone(),model:turn_model.clone()};
+                            Self::execute_native_turn(
+                                &mut session.agent, port, input, workspace, event_tx, cancel_token,
+                            ).instrument(span).await
+                        },
                     ),
                 )
                 .await
@@ -2227,6 +2505,18 @@ impl AcpServer {
         // resume/restart replay the daemon RPC bridge already provides.
         let mut latest_plan: Option<Vec<PlanEntry>> = None;
         while let Some(event) = event_rx.recv().await {
+            if let Some(port) = &metadata_port {
+                if metadata_error.is_none()
+                    && let Some(value) = zeroclaw_api::session_events::capture::SessionMetadataObservation::from_turn_event(&event)
+                    && let Err(error) = port.observe_metadata(value).await
+                {
+                    metadata_error = Some(error);
+                    metadata_cancel.cancel();
+                }
+                if matches!(event, TurnEvent::Usage { .. }) {
+                    continue;
+                }
+            }
             if let TurnEvent::Usage {
                 input_tokens,
                 accepted,
@@ -2296,6 +2586,9 @@ impl AcpServer {
             message: format!("Agent task panicked: {e}"),
             data: None,
         })?;
+        if let Some(error) = metadata_error {
+            return Err(acp_turn_failure(&error).1);
+        }
 
         // The terminal transcript was already persisted inside the turn task,
         // under the session lock. Here we only render the client-facing result,
@@ -2360,7 +2653,8 @@ impl AcpServer {
         // replays on session/resume (best-effort; the live emission above
         // already reached the client). Whole-list replace, including an
         // empty list (a cleared plan).
-        if let Some(store) = &self.store
+        if metadata_port.is_none()
+            && let Some(store) = &self.store
             && let Some(entries) = latest_plan
         {
             let store = store.clone();
@@ -2776,7 +3070,7 @@ impl AcpServer {
     /// no-op, and a store error is logged while the live session continues in
     /// memory.
     async fn append_transcript(
-        store: Option<Arc<AcpSessionStore>>,
+        store: Option<Arc<SessionRepository>>,
         session_id: String,
         messages: Vec<ConversationMessage>,
     ) -> Result<(), String> {
@@ -2786,8 +3080,10 @@ impl AcpServer {
         if messages.is_empty() {
             return Ok(());
         }
-        let persisted =
-            tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await;
+        let persisted = tokio::task::spawn_blocking(move || {
+            zeroclaw_infra::legacy_fixture_call!(store, append_turn(&session_id, &messages))
+        })
+        .await;
         let error = match persisted {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e.to_string()),
@@ -2835,7 +3131,7 @@ impl AcpServer {
     /// failed/cancelled durability contract can surface the loss instead of
     /// reporting a clean terminal result.
     async fn replace_transcript(
-        store: Option<Arc<AcpSessionStore>>,
+        store: Option<Arc<SessionRepository>>,
         session_id: String,
         full_history: Vec<ConversationMessage>,
         trim_breadcrumb: bool,
@@ -2844,7 +3140,10 @@ impl AcpServer {
             return Ok(());
         };
         let persisted = tokio::task::spawn_blocking(move || {
-            store.replace_messages_and_breadcrumb(&session_id, &full_history, trim_breadcrumb)
+            zeroclaw_infra::legacy_fixture_call!(
+                store,
+                replace_messages_and_breadcrumb(&session_id, &full_history, trim_breadcrumb)
+            )
         })
         .await;
         let error = match persisted {
@@ -2911,6 +3210,308 @@ impl AcpServer {
         }
     }
 
+    /// Normalize embedded ACP resources once for capture and materialization.
+    /// References and future content types stay opaque and never trigger fetch.
+    fn prompt_resource(part: &Value) -> Option<std::borrow::Cow<'_, Value>> {
+        if let Some(resource) = part.get("resource") {
+            return Some(std::borrow::Cow::Borrowed(resource));
+        }
+        let kind = part.get("type").and_then(Value::as_str)?;
+        if !matches!(kind, "image" | "audio") {
+            return None;
+        }
+        let data = part.get("data").and_then(Value::as_str)?;
+        let mime = part
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream");
+        let essence = mime
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let ext = match essence.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            "audio/wav" | "audio/x-wav" => "wav",
+            "audio/mpeg" => "mp3",
+            "audio/ogg" => "ogg",
+            "audio/flac" => "flac",
+            _ => "bin",
+        };
+        Some(std::borrow::Cow::Owned(serde_json::json!({
+            "uri":format!("upload.{ext}"), "mimeType":mime, "blob":data
+        })))
+    }
+
+    async fn execute_native_turn(
+        agent: &mut zeroclaw_runtime::agent::Agent,
+        port: Arc<dyn zeroclaw_api::session_events::capture::SessionExecutionPort>,
+        mut input: zeroclaw_api::session_events::capture::EngineTurnInput,
+        workspace: Option<&Path>,
+        events: mpsc::Sender<TurnEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> std::result::Result<
+        zeroclaw_runtime::agent::agent::StreamedTurnSuccess,
+        zeroclaw_runtime::agent::agent::StreamedTurnError,
+    > {
+        use zeroclaw_runtime::agent::agent::{StreamedTurnError, StreamedTurnSuccess};
+        let restored = async {
+            if let Some(selection) = port.restore_model_override().await? {
+                agent.restore_session_model_selection(selection)?;
+            }
+            if let Some(context) = port.restore_context().await? {
+                agent.clear_history();
+                agent.seed_conversation_history(context.messages);
+                agent.set_history_has_trim_breadcrumb(
+                    context.history_has_trim_breadcrumb.unwrap_or(false),
+                );
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        restored.map_err(|error| StreamedTurnError {
+            error,
+            committed_response: String::new(),
+            new_messages: vec![],
+        })?;
+        let (_, provider, model) = agent.attribution_fields();
+        input.provider_ref = provider;
+        input.model = model;
+        input.execution_workspace = Some(agent.execution_workspace().to_path_buf());
+        let parts = input.parts.clone();
+        let provider_name = input.provider_ref.clone();
+        let model = input.model.clone();
+        let mut success = None;
+        let mut failed = None;
+        let result = zeroclaw_api::session_events::capture::scope_session_execution(
+            port.clone(),
+            port.execute(
+                input,
+                Box::pin(async {
+                    let prompt = Self::materialize_history_parts(&parts, workspace)?;
+                    match agent
+                        .turn_streamed_with_steering_state(&prompt, events, Some(cancel), None)
+                        .await
+                    {
+                        Ok(value) => {
+                            let text = value.response.clone();
+                            success = Some(value);
+                            Ok(text)
+                        }
+                        Err(value) => {
+                            failed = Some((value.committed_response, value.new_messages));
+                            Err(value.error)
+                        }
+                    }
+                }),
+            ),
+        )
+        .await;
+        match result {
+            Ok(response) => Ok(success.unwrap_or(StreamedTurnSuccess {
+                response,
+                new_messages: vec![],
+                provider_name,
+                model,
+                final_context_limits: None,
+                safeguard_fallback: None,
+            })),
+            Err(error) => {
+                let (committed_response, new_messages) = failed.unwrap_or_default();
+                Err(StreamedTurnError {
+                    error,
+                    committed_response,
+                    new_messages,
+                })
+            }
+        }
+    }
+
+    fn materialize_history_parts(
+        parts: &[zeroclaw_api::session_events::capture::EngineInputPart],
+        workspace: Option<&Path>,
+    ) -> anyhow::Result<String> {
+        use base64::Engine as _;
+        use zeroclaw_api::session_events::capture::EngineInputPart;
+        let mut total = 0usize;
+        for part in parts {
+            if let EngineInputPart::File(file) = part {
+                file.representation.validate()?;
+                anyhow::ensure!(
+                    file.representation.codec == "session.bytes/v1",
+                    "ACP file codec unsupported"
+                );
+                total = total.saturating_add(file.representation.body.len());
+                anyhow::ensure!(
+                    total <= 20 * 1024 * 1024,
+                    "ACP attachments exceed request byte limit"
+                );
+                anyhow::ensure!(
+                    workspace.is_some(),
+                    "ACP file requires an active session workspace"
+                );
+            }
+        }
+        let mut text = Vec::new();
+        for part in parts {
+            match part {
+                EngineInputPart::Text(value) => text.push(value.clone()),
+                EngineInputPart::File(file) => {
+                    let workspace = workspace.ok_or_else(|| {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            ),
+                            "acp_workspace_missing"
+                        );
+                        anyhow::Error::msg("ACP workspace missing")
+                    })?;
+                    let blob =
+                        base64::engine::general_purpose::STANDARD.encode(&file.representation.body);
+                    let materialized = acp_embedded::materialize_resource_blob(
+                        workspace,
+                        file.registration.get("uri").and_then(Value::as_str),
+                        file.registration.get("mime_type").and_then(Value::as_str),
+                        &blob,
+                    )
+                    .map_err(|error| {
+                        let diagnostic = error.0.to_owned();
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(serde_json::json!({"error": diagnostic})),
+                            "acp_resource_materialization_failed"
+                        );
+                        anyhow::Error::msg(diagnostic)
+                    })?;
+                    text.push(materialized.marker);
+                }
+                EngineInputPart::Opaque { .. } => {}
+            }
+        }
+        anyhow::ensure!(!text.is_empty(), "ACP prompt contains no supported content");
+        Ok(text.join("\n\n"))
+    }
+
+    /// Freeze the incoming parts without filesystem effects. Registration
+    /// identity belongs to the ACP ingress and uses the shared embedded-file
+    /// owner's content identity. Materialization runs only after turn start.
+    fn prepare_prompt_history(
+        params: &Value,
+        session: &str,
+    ) -> std::result::Result<
+        (
+            String,
+            Vec<zeroclaw_api::session_events::capture::EngineInputPart>,
+        ),
+        RpcError,
+    > {
+        use zeroclaw_api::session_events::{Digest, PayloadId, PayloadRecord};
+        match params.get("prompt") {
+            Some(Value::String(text)) => Ok((
+                text.clone(),
+                vec![zeroclaw_api::session_events::capture::EngineInputPart::Text(text.clone())],
+            )),
+            Some(Value::Array(parts)) => {
+                let mut texts = Vec::new();
+                let mut ordered = Vec::new();
+                let mut total = 0usize;
+                for (index, part) in parts.iter().enumerate() {
+                    let before = ordered.len();
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        texts.push(text.to_owned());
+                        ordered.push(
+                            zeroclaw_api::session_events::capture::EngineInputPart::Text(
+                                text.to_owned(),
+                            ),
+                        );
+                    }
+                    if let Some(resource) = Self::prompt_resource(part) {
+                        if let Some(text) = resource.get("text").and_then(Value::as_str) {
+                            texts.push(text.to_owned());
+                            ordered.push(
+                                zeroclaw_api::session_events::capture::EngineInputPart::Text(
+                                    text.to_owned(),
+                                ),
+                            );
+                        }
+                        if let Some(blob) = resource.get("blob").and_then(Value::as_str) {
+                            let bytes =
+                                acp_embedded::decode_embedded_blob(blob).map_err(|error| {
+                                    RpcError {
+                                        code: INVALID_PARAMS,
+                                        message: error.0,
+                                        data: None,
+                                    }
+                                })?;
+                            total = total.saturating_add(bytes.len());
+                            if total > 20 * 1024 * 1024 {
+                                return Err(RpcError {
+                                    code: INVALID_PARAMS,
+                                    message: "ACP attachments exceed request byte limit".into(),
+                                    data: None,
+                                });
+                            }
+                            let file_id = format!(
+                                "acp-upload-{session}-{}",
+                                Digest::from_bytes(&bytes).as_str()
+                            );
+                            let representation = PayloadRecord::new(
+                                PayloadId::new(),
+                                "session.bytes/v1".into(),
+                                bytes,
+                            )
+                            .map_err(|error| RpcError {
+                                code: INTERNAL_ERROR,
+                                message: error.to_string(),
+                                data: None,
+                            })?;
+                            ordered.push(zeroclaw_api::session_events::capture::EngineInputPart::File(zeroclaw_api::session_events::capture::EngineFileInput {
+                                file_id,representation,
+                                registration:serde_json::json!({"source":"acp_embedded_registration","uri":resource.get("uri"),"mime_type":resource.get("mimeType"),"source_part_index":index}),
+                                policy_evidence:serde_json::json!({"source":"admitted_acp_prompt","session_id":session}),
+                            }));
+                        }
+                    }
+                    if ordered.len() == before {
+                        ordered.push(
+                            zeroclaw_api::session_events::capture::EngineInputPart::Opaque {
+                                type_name: part
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown")
+                                    .to_owned(),
+                                body: part.clone(),
+                            },
+                        );
+                    }
+                }
+                if texts.is_empty() && ordered.is_empty() {
+                    return Err(RpcError {
+                        code: INVALID_PARAMS,
+                        message: "ACP prompt contains no supported content".into(),
+                        data: None,
+                    });
+                }
+                Ok((texts.join("\n\n"), ordered))
+            }
+            _ => Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: prompt".into(),
+                data: None,
+            }),
+        }
+    }
+
     /// Join prompt parts into a string. When `workspace_dir` is set, ACP
     /// `resource.blob` parts are materialized under `{workspace}/uploads/`.
     fn materialize_prompt(
@@ -2923,9 +3524,11 @@ impl AcpServer {
                 // Stage: validate every embedded blob (decode + size cap) before
                 // writing any, so an invalid later part cannot leave earlier parts
                 // already materialized in uploads/.
+                let mut total = 0usize;
                 for part in arr {
-                    if let Some(blob) = part
-                        .get("resource")
+                    let resource = Self::prompt_resource(part);
+                    if let Some(blob) = resource
+                        .as_deref()
                         .and_then(|res| res.get("blob"))
                         .and_then(|v| v.as_str())
                     {
@@ -2937,11 +3540,20 @@ impl AcpServer {
                                 data: None,
                             });
                         }
-                        acp_embedded::decode_embedded_blob(blob).map_err(|e| RpcError {
-                            code: INVALID_PARAMS,
-                            message: e.0,
-                            data: None,
-                        })?;
+                        let bytes =
+                            acp_embedded::decode_embedded_blob(blob).map_err(|e| RpcError {
+                                code: INVALID_PARAMS,
+                                message: e.0,
+                                data: None,
+                            })?;
+                        total = total.saturating_add(bytes.len());
+                        if total > 20 * 1024 * 1024 {
+                            return Err(RpcError {
+                                code: INVALID_PARAMS,
+                                message: "ACP attachments exceed request byte limit".into(),
+                                data: None,
+                            });
+                        }
                     }
                 }
 
@@ -2958,7 +3570,7 @@ impl AcpServer {
                     // Support ACP resource blocks for @-notation file attachments
                     // (clients send {"type":"resource","resource":{"uri":"...","text":"..."}})
                     // and embedded binary context via `resource.blob` (base64).
-                    if let Some(res) = part.get("resource") {
+                    if let Some(res) = Self::prompt_resource(part) {
                         if let Some(text) = res.get("text").and_then(|v| v.as_str()) {
                             if added || !joined.is_empty() {
                                 joined.push_str("\n\n");
@@ -3031,6 +3643,8 @@ impl AcpServer {
             .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
             .get(session_id)
             .cloned();
+        self.record_history_cancellation(session_id, "acp_protocol_stop")
+            .await?;
         if let Some(token) = token {
             token.cancel();
             ::zeroclaw_log::record!(
@@ -3121,6 +3735,8 @@ impl AcpServer {
             .get(session_id)
             .cloned();
 
+        self.record_history_cancellation(session_id, "acp_user_cancel")
+            .await?;
         if let Some(token) = token {
             token.cancel();
             ::zeroclaw_log::record!(
@@ -3448,7 +4064,7 @@ fn map_tool_kind(name: &str) -> &'static str {
 /// completion before the prompt result. Rejected billing telemetry never
 /// touches the store; failures are best-effort WARN logs.
 async fn persist_acp_usage_snapshot_ordered(
-    store: &Arc<AcpSessionStore>,
+    store: &Arc<SessionRepository>,
     session_id: &str,
     input_tokens: Option<u64>,
     accepted: bool,
@@ -3799,7 +4415,7 @@ impl RpcError {
 /// Keep the stable diagnostic used by logs separate from the localized text
 /// exposed through the ACP JSON-RPC boundary.
 fn acp_turn_failure(error: &anyhow::Error) -> (String, RpcError) {
-    let diagnostic = error.to_string();
+    let diagnostic = Agent::session_execution_diagnostic(error);
     let user_message = zeroclaw_runtime::agent::terminal_completion_error_message(error, None);
     (
         diagnostic.clone(),
@@ -3903,6 +4519,7 @@ mod tests {
         ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
             self.requests.lock().push(request.messages.to_vec());
             Ok(zeroclaw_api::model_provider::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("recovered".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -3966,6 +4583,7 @@ mod tests {
         ) -> anyhow::Result<zeroclaw_api::model_provider::ChatResponse> {
             self.requests.lock().push(request.messages.to_vec());
             Ok(zeroclaw_api::model_provider::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("recovered".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -4001,8 +4619,10 @@ mod tests {
         // The ordered drain awaits each write, so the clear is durable before
         // the prompt result is returned and an immediate load/resume sees it.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-acp-usage-order";
         store
             .create_session(
@@ -4039,8 +4659,10 @@ mod tests {
     #[tokio::test]
     async fn estimated_usage_is_never_persisted_as_a_session_token_count() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-acp-estimate-not-persisted";
         store
             .create_session(
@@ -4429,8 +5051,10 @@ mod tests {
     #[test]
     fn initialize_advertises_load_session_when_store_present() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -5302,8 +5926,10 @@ mod tests {
     #[tokio::test]
     async fn session_load_restore_ignores_connection_default_when_persisted_agent_deleted() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         let session_id = "sess-restore-ignores-conn-default";
         store
@@ -5388,8 +6014,10 @@ mod tests {
     #[tokio::test]
     async fn session_load_restore_skips_missing_config_default_to_sole_agent() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         let session_id = "sess-restore-missing-config-default";
         store
@@ -5433,8 +6061,10 @@ mod tests {
     #[tokio::test]
     async fn session_resume_restore_skips_disabled_persisted_owner() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         let session_id = "sess-resume-disabled-owner";
         store
@@ -5477,8 +6107,10 @@ mod tests {
     #[tokio::test]
     async fn session_resume_restore_ignores_connection_default_when_persisted_agent_deleted() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         let session_id = "sess-resume-ignores-conn-default";
         store
@@ -5614,6 +6246,7 @@ mod tests {
                             "deliver_file path requirement was not exposed"
                         );
                         Ok(zeroclaw_api::model_provider::ChatResponse {
+                            output_blocks: Vec::new(),
                             text: None,
                             tool_calls: vec![ToolCall {
                                 id: "tc-deliver".to_string(),
@@ -5655,6 +6288,7 @@ mod tests {
                             "base64 leaked into the provider-visible tool round"
                         );
                         Ok(zeroclaw_api::model_provider::ChatResponse {
+                            output_blocks: Vec::new(),
                             text: Some("Delivered the requested file.".to_string()),
                             tool_calls: Vec::new(),
                             usage: None,
@@ -5894,6 +6528,84 @@ mod tests {
                 assert!(!message.content.contains(&outbound_b64));
             }
         }
+    }
+
+    #[test]
+    fn native_prompt_preserves_unknown_and_reference_positions_before_media() {
+        use zeroclaw_api::session_events::capture::EngineInputPart;
+        let dir = tempfile::tempdir().unwrap();
+        let jpeg = [0xff, 0xd8, 0xff, 0xe0];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, jpeg);
+        let params = serde_json::json!({"prompt":[
+            {"type":"text","text":"before"},
+            {"type":"future_block","body":{"fixture":true}},
+            {"type":"resource_link","uri":"https://fixture.invalid/no-fetch"},
+            {"type":"image","mimeType":"image/jpeg","data":b64},
+            {"type":"audio","mimeType":"audio/wav","data":"YWJj"},
+            {"type":"text","text":"after"}
+        ]});
+        let (text, parts) = AcpServer::prepare_prompt_history(&params, "fixture-session").unwrap();
+        assert_eq!(text, "before\n\nafter");
+        assert_eq!(parts.len(), 6);
+        assert!(
+            matches!(&parts[1],EngineInputPart::Opaque {type_name,body} if type_name=="future_block" && body==&params["prompt"][1])
+        );
+        assert!(
+            matches!(&parts[2],EngineInputPart::Opaque {type_name,..} if type_name=="resource_link")
+        );
+        assert!(
+            matches!(&parts[3],EngineInputPart::File(file) if file.representation.body==jpeg && file.registration["source_part_index"]==3)
+        );
+        assert!(
+            !dir.path().join("uploads").exists(),
+            "capture has no filesystem effect"
+        );
+        let text = AcpServer::materialize_prompt(&params, Some(dir.path())).unwrap();
+        assert!(text.contains(".jpg"));
+        let files: Vec<_> = std::fs::read_dir(dir.path().join("uploads"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "reference-only and unknown blocks do not fetch"
+        );
+        assert!(files.iter().any(
+            |p| p.extension().is_some_and(|e| e == "jpg") && std::fs::read(p).unwrap() == jpeg
+        ));
+    }
+
+    #[test]
+    fn recovered_acp_parts_rebuild_original_media_and_validate_before_writing() {
+        use zeroclaw_api::session_events::capture::EngineInputPart;
+        let directory = tempfile::tempdir().unwrap();
+        let params = serde_json::json!({"prompt":[
+            {"type":"text","text":"original before"},
+            {"type":"resource","resource":{"uri":"file:///original.txt","mimeType":"text/plain","blob":"b3JpZ2luYWwgYnl0ZXM="}},
+            {"type":"future_block","value":"retained evidence"},
+            {"type":"text","text":"original after"}
+        ]});
+        let (_, parts) = AcpServer::prepare_prompt_history(&params, "original-session").unwrap();
+        let expected = AcpServer::materialize_prompt(&params, Some(directory.path())).unwrap();
+        let uploads: Vec<_> = std::fs::read_dir(directory.path().join("uploads"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        std::fs::remove_file(&uploads[0]).unwrap();
+        let restored =
+            AcpServer::materialize_history_parts(&parts, Some(directory.path())).unwrap();
+        assert_eq!(restored, expected);
+        assert_eq!(std::fs::read(&uploads[0]).unwrap(), b"original bytes");
+        std::fs::remove_file(&uploads[0]).unwrap();
+        let mut corrupt = parts.clone();
+        let EngineInputPart::File(file) = &mut corrupt[1] else {
+            panic!("file")
+        };
+        file.representation.body.push(b'!');
+        assert!(AcpServer::materialize_history_parts(&corrupt, Some(directory.path())).is_err());
+        assert!(!uploads[0].exists());
+        assert!(AcpServer::materialize_history_parts(&parts, None).is_err());
     }
 
     #[test]
@@ -6762,8 +7474,10 @@ mod tests {
     #[tokio::test]
     async fn session_new_persists_to_store() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -6783,7 +7497,7 @@ mod tests {
         let data = store.load_session(session_id).unwrap();
         assert!(
             data.is_some(),
-            "session/new must persist to AcpSessionStore"
+            "session/new must persist to SessionRepository"
         );
     }
 
@@ -6871,6 +7585,228 @@ mod tests {
             dispatchable_test_agent("anthropic.default"),
         );
         cfg
+    }
+
+    #[tokio::test]
+    async fn native_acp_wire_retains_ordered_media_and_resumes_without_old_transcript_writes() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        use zeroclaw_api::session_events::{
+            ContentPayload, EventActor, EventCursor, EventData, EventKind, PayloadRead,
+            RecordedContentPart, SessionEventStore,
+        };
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+        async fn response(rx: &mut mpsc::Receiver<String>, id: i64) -> Value {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let value: Value =
+                        serde_json::from_str(&rx.recv().await.expect("wire")).expect("json");
+                    if value["id"] == id {
+                        return value;
+                    }
+                }
+            })
+            .await
+            .expect("response deadline")
+        }
+        for backend in ["sqlite", "jsonl"] {
+            let directory = tempfile::tempdir().expect("directory");
+            let endpoint = MockServer::start().await;
+            let stream = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fixture answer\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
+                .expect(1)
+                .mount(&endpoint)
+                .await;
+            let mut config = make_test_config(directory.path());
+            config.channels.session_backend = backend.into();
+            config.memory.backend = "none".into();
+            config.memory.auto_save = false;
+            config.reliability.provider_retries = 0;
+            let base = config
+                .providers
+                .models
+                .ensure("custom", "fixture")
+                .expect("profile");
+            base.uri = Some(format!("{}/v1", endpoint.uri()));
+            base.api_key = Some("test-key".into());
+            base.model = Some("fixture-model".into());
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("agent")
+                .model_provider = "custom.fixture".into();
+            config
+                .risk_profiles
+                .get_mut("default")
+                .expect("risk")
+                .allowed_tools = vec!["__fixture_no_tools__".into()];
+            let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+            let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                authority.live_handle(),
+            ));
+            let store = Arc::new(
+                SessionRepository::legacy_fixture(directory.path()).expect("protocol store"),
+            );
+            let (tx, mut rx) = mpsc::channel(256);
+            let capability = authority.execution_capability();
+            let server = Arc::new(
+                AcpServer::new_with_live_config_and_writer_and_store(
+                    authority.live_handle(),
+                    authority.agent_lifecycle(),
+                    AcpServerConfig::default(),
+                    tx,
+                    store.clone(),
+                )
+                .with_session_history(
+                    source.clone(),
+                    Arc::new(move |alias, stream| {
+                        Ok(Arc::new(
+                            zeroclaw_runtime::live_config_authority::AgentHistoryAuthority {
+                                admission: capability.admit(alias)?,
+                                actor: EventActor::Principal {
+                                    principal_id:
+                                        zeroclaw_api::principal::PrincipalId::shared_operator().0,
+                                },
+                                stream,
+                                origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
+                                parent_alias: None,
+                            },
+                        ))
+                    }),
+                ),
+            );
+            server.process_line(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":directory.path(),"agentAlias":"test-agent"}}).to_string()).await;
+            let created = response(&mut rx, 1).await;
+            assert!(created.get("error").is_none(), "{created}");
+            let sid = created["result"]["sessionId"].as_str().expect("sid");
+            let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1kAAAAASUVORK5CYII=";
+            server.process_line(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":sid,"prompt":[
+                {"type":"text","text":"before"},{"type":"image","mimeType":"image/png","data":png},
+                {"type":"future_block","value":"opaque fixture"},{"type":"text","text":"after"}
+            ]}}).to_string()).await;
+            let result = response(&mut rx, 2).await;
+            assert!(result.get("error").is_none(), "{backend}: {result}");
+            let family = format!("acp_{sid}");
+            let stream = source.stream_id(&family).await.expect("stream");
+            let native = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                directory.path(),
+                &family,
+            )
+            .expect("store");
+            let page = native
+                .read_page(
+                    &stream,
+                    &EventCursor::beginning(stream.clone()),
+                    None,
+                    256,
+                    4 * 1024 * 1024,
+                )
+                .expect("events");
+            assert_eq!(
+                page.events
+                    .iter()
+                    .filter(|event| event.body.kind() == EventKind::ProviderAttemptCompleted)
+                    .count(),
+                1
+            );
+            let content = page
+                .events
+                .iter()
+                .find_map(|event| match &event.body.data {
+                    EventData::UserContentRecorded { content_ref, .. } => Some(content_ref),
+                    _ => None,
+                })
+                .expect("input");
+            let binding = page
+                .events
+                .iter()
+                .find_map(|event| match &event.body.data {
+                    EventData::TurnStarted {
+                        execution_binding_ref,
+                        ..
+                    } => Some(execution_binding_ref),
+                    _ => None,
+                })
+                .expect("turn binding");
+            let PayloadRead::Present(binding) =
+                native.read_payload(&binding.payload_id).expect("binding")
+            else {
+                panic!("binding missing")
+            };
+            let binding: Value = serde_json::from_slice(&binding.body).expect("binding json");
+            let sessions = server.sessions.lock().await;
+            let session = sessions.get(sid).expect("session").lock().await;
+            assert_eq!(
+                binding["execution_context"]["cwd"],
+                serde_json::json!(session.agent.execution_workspace())
+            );
+            drop(session);
+            drop(sessions);
+            let PayloadRead::Present(payload) =
+                native.read_payload(&content.payload_id).expect("payload")
+            else {
+                panic!("content unavailable")
+            };
+            let content: ContentPayload = serde_json::from_slice(&payload.body).expect("content");
+            assert_eq!(content.parts.len(), 4);
+            assert!(matches!(
+                &content.parts[1],
+                RecordedContentPart::File { .. }
+            ));
+            assert!(
+                matches!(&content.parts[2],RecordedContentPart::Opaque {type_name,..} if type_name=="future_block")
+            );
+            assert!(
+                store
+                    .load_session(sid)
+                    .expect("metadata")
+                    .expect("session")
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, ConversationMessage::Chat(chat) if chat.content.contains("fixture answer")))
+            );
+            assert_eq!(
+                store
+                    .load_session(sid)
+                    .expect("metadata")
+                    .expect("session")
+                    .token_count,
+                2
+            );
+            assert!(
+                store
+                    .append_turn(
+                        sid,
+                        &[ConversationMessage::Chat(ChatMessage::user("obsolete"))]
+                    )
+                    .is_err()
+            );
+            server.process_line(&serde_json::json!({"jsonrpc":"2.0","id":3,"method":"session/close","params":{"sessionId":sid}}).to_string()).await;
+            assert!(response(&mut rx, 3).await.get("error").is_none());
+            server.process_line(&serde_json::json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":sid}}).to_string()).await;
+            let resumed = response(&mut rx, 4).await;
+            assert!(resumed.get("error").is_none(), "{resumed}");
+            assert_eq!(
+                endpoint.received_requests().await.expect("requests").len(),
+                1,
+                "resume never executes the model"
+            );
+            let sessions = server.sessions.lock().await;
+            let session = sessions.get(sid).expect("restored").lock().await;
+            assert!(
+                zeroclaw_api::model_provider::durable_chat_messages(session.agent.history())
+                    .iter()
+                    .any(|message| message.content.contains("fixture answer"))
+            );
+        }
     }
 
     #[test]
@@ -7142,8 +8078,10 @@ mod tests {
     async fn session_load_restores_history_and_streams_notifications() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         let session_id = "sess-load-test";
         store
@@ -7216,8 +8154,10 @@ mod tests {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-load-trimmed-test";
         store
             .create_session(
@@ -7304,8 +8244,10 @@ mod tests {
         // turn whole, and replay must begin at the new turn, not at the old
         // turn's assistant reply.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-load-crumb-replay";
         store
             .create_session(
@@ -7403,8 +8345,10 @@ mod tests {
         // path as a success, plus a trailing failure marker. Simulate that
         // failed-turn transcript and confirm it survives `load_session`.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-failed-turn-persist";
         store
             .create_session(
@@ -7589,8 +8533,10 @@ mod tests {
         use zeroclaw_api::model_provider::{ConversationMessage, ToolCall};
 
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-failed-turn-incomplete-tool";
         store
             .create_session(
@@ -7721,8 +8667,10 @@ mod tests {
         }
 
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -7791,8 +8739,10 @@ mod tests {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         // `replace_messages_and_breadcrumb` errors for a session with no
         // record. `replace_transcript` must propagate that as `Err` so a
@@ -7829,7 +8779,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_persistence_replaces_same_shape_trimmed_history() {
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(SessionRepository::legacy_fixture(cwd.path()).unwrap());
         let session_id = "same-shape-trim";
         store
             .create_session(
@@ -7908,7 +8858,7 @@ mod tests {
         // prompt, the next `session/load` must see the already-capped
         // transcript, not the untrimmed rows that produced it.
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(SessionRepository::legacy_fixture(cwd.path()).unwrap());
         let session_id = "session-load-restore-trim";
         store
             .create_session(
@@ -7978,7 +8928,7 @@ mod tests {
         // but for `session/resume`, which seeds the agent's history the same
         // way `session/load` does.
         let cwd = tempfile::tempdir().unwrap();
-        let store = Arc::new(AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(SessionRepository::legacy_fixture(cwd.path()).unwrap());
         let session_id = "session-resume-restore-trim";
         store
             .create_session(
@@ -8057,8 +9007,10 @@ mod tests {
         // here would leave the discarded turn in the store for the next
         // `session/load` to resurrect.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-replace-not-append";
         store
             .create_session(
@@ -8172,6 +9124,7 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
                 Ok(zeroclaw_api::model_provider::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -8181,8 +9134,10 @@ mod tests {
         }
 
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -8297,8 +9252,10 @@ mod tests {
         // incomplete native call and a cancellation sentinel restored here must
         // not reach the next provider request.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-resume-sanitize";
         store
             .create_session(
@@ -8398,8 +9355,10 @@ mod tests {
         // drops the unsafe partial exchange. Repairing the replay source too
         // would delete the tool call the user already saw.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-replay-vs-seed";
         store
             .create_session(
@@ -8497,8 +9456,10 @@ mod tests {
         std::fs::write(&image_path, b"not really a png").unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-rejected-image";
         store
             .create_session(
@@ -8598,8 +9559,10 @@ mod tests {
         std::fs::write(&image_path, valid_1x1_png()).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-cross-locale-failed-turn";
         store
             .create_session(
@@ -8789,6 +9752,7 @@ mod tests {
                     anyhow::bail!("400 Bad Request: provider rejected the request");
                 }
                 Ok(zeroclaw_api::model_provider::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("recovered".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -8802,8 +9766,10 @@ mod tests {
         std::fs::write(&image_path, valid_1x1_png()).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -8922,8 +9888,10 @@ mod tests {
         std::fs::write(&image_path, &file_bytes).unwrap();
         let marker = format!("look at this [IMAGE:{}]", image_path.display());
 
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-carrier-failed-turn";
         store
             .create_session(
@@ -9073,6 +10041,7 @@ mod tests {
                 self.requests.lock().push(request.messages.to_vec());
                 match call {
                     0 => Ok(zeroclaw_api::model_provider::ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some(self.tool_call_response.clone()),
                         tool_calls: Vec::new(),
                         usage: None,
@@ -9080,6 +10049,7 @@ mod tests {
                     }),
                     1 => anyhow::bail!("400 Bad Request: provider rejected the request"),
                     _ => Ok(zeroclaw_api::model_provider::ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("recovered".to_string()),
                         tool_calls: Vec::new(),
                         usage: None,
@@ -9100,7 +10070,8 @@ mod tests {
         );
 
         let live_store = Arc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(live_cwd.path()).unwrap(),
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(live_cwd.path())
+                .unwrap(),
         );
         let live_server = Arc::new(AcpServer::new_with_store(
             make_test_config(live_cwd.path()),
@@ -9222,8 +10193,10 @@ mod tests {
         // the provider's retained history.
 
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-trim-repair-alignment";
         store
             .create_session(
@@ -9365,8 +10338,10 @@ mod tests {
         // before the existence check, so a client that asks for session ids that
         // do not exist could otherwise grow `session_gates` without bound.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -9508,7 +10483,8 @@ mod tests {
 
         let cwd = tempfile::tempdir().unwrap();
         let store = StdArc::new(
-            zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap(),
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
         );
         let server = StdArc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
@@ -9620,8 +10596,10 @@ mod tests {
             zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc");
 
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-cancelled-turn";
         store
             .create_session(
@@ -9766,6 +10744,7 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
                 Ok(zeroclaw_api::model_provider::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -9775,8 +10754,10 @@ mod tests {
         }
 
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -9904,6 +10885,7 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
                 Ok(zeroclaw_api::model_provider::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -9913,8 +10895,10 @@ mod tests {
         }
 
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -10038,8 +11022,10 @@ mod tests {
         // not return before the admitted prompt's terminal (cancelled)
         // transcript is committed, and nothing may append after it returns.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -10179,8 +11165,10 @@ mod tests {
 
         // Same scheduling window as the close variant, for `session/stop`.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -10283,8 +11271,10 @@ mod tests {
         // append an assistant-only `turn-failed` marker, otherwise repeating an
         // invalid request would pollute `session/load`.
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -10333,8 +11323,10 @@ mod tests {
     #[tokio::test]
     async fn session_load_returns_not_found_for_unknown_id() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
         let server = AcpServer::new_with_writer_and_store(
             make_test_config(cwd.path()),
@@ -10354,8 +11346,10 @@ mod tests {
     #[tokio::test]
     async fn session_load_rejects_already_active_session() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
             make_test_config(cwd.path()),
@@ -10421,8 +11415,10 @@ mod tests {
         let mcp = start_mock_mcp_http_server("records.list").await;
         let config = make_cross_agent_restore_config(cwd.path(), mcp.uri());
 
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-cross-agent-load";
         store
             .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
@@ -10464,8 +11460,10 @@ mod tests {
         let mcp = start_mock_mcp_http_server("records.list").await;
         let config = make_cross_agent_restore_config(cwd.path(), mcp.uri());
 
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let session_id = "sess-cross-agent-resume";
         store
             .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
@@ -10519,8 +11517,10 @@ mod tests {
     async fn session_resume_restores_without_replay() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         let session_id = "sess-resume-test";
         store
@@ -10572,8 +11572,10 @@ mod tests {
     async fn session_resume_replays_stored_plan() {
         use zeroclaw_api::plan::{PlanEntry, PlanPriority, PlanStatus};
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         let session_id = "sess-resume-plan";
         store
@@ -10627,8 +11629,10 @@ mod tests {
     #[tokio::test]
     async fn session_close_releases_memory_but_keeps_store_record() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
         let server = Arc::new(AcpServer::new_with_store(
             make_test_config(cwd.path()),
             AcpServerConfig::default(),
@@ -10712,8 +11716,10 @@ mod tests {
     #[tokio::test]
     async fn session_load_respects_max_sessions() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         // Pre-create a stored session that we'll attempt to load
         let stored_id = "sess-load-limit-test";
@@ -10756,8 +11762,10 @@ mod tests {
     #[tokio::test]
     async fn session_resume_respects_max_sessions() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         // Pre-create a stored session that we'll attempt to resume
         let stored_id = "sess-resume-limit-test";
@@ -10800,8 +11808,10 @@ mod tests {
     #[tokio::test]
     async fn session_load_releases_reservation_on_store_error() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         let session_id = "sess-load-store-err";
         store
@@ -10862,8 +11872,10 @@ mod tests {
     #[tokio::test]
     async fn session_resume_releases_reservation_on_store_error() {
         let cwd = tempfile::tempdir().unwrap();
-        let store =
-            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let store = Arc::new(
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(cwd.path())
+                .unwrap(),
+        );
 
         let session_id = "sess-resume-store-err";
         store

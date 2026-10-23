@@ -192,12 +192,16 @@ struct NativeToolCall {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     function: NativeFunctionCall,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct NativeFunctionCall {
     name: String,
     arguments: String,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Multi-part content for vision messages (OpenAI format).
@@ -227,6 +231,8 @@ struct ApiChatResponse {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<UsageInfo>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,14 +246,22 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
     #[serde(default)]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 // ── ModelProvider ─────────────────────────────────────────────────────
@@ -384,9 +398,11 @@ impl CopilotModelProvider {
                         .map(|tool_call| {
                             let name = tool_call.name;
                             NativeToolCall {
+                                extensions: Default::default(),
                                 id: Some(tool_call.id),
                                 kind: Some("function".to_string()),
                                 function: NativeFunctionCall {
+                                    extensions: Default::default(),
                                     arguments: crate::compatible::sanitize_tool_arguments(
                                         &name,
                                         &tool_call.arguments,
@@ -495,6 +511,55 @@ impl CopilotModelProvider {
             anyhow::Error::msg("No response from GitHub Copilot")
         })?;
 
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
+        let (text, mut output_blocks) =
+            crate::output::assistant_content(choice.message.content.as_ref());
+        for (representation, reasoning) in [
+            ("reasoning_content", &choice.message.reasoning_content),
+            ("reasoning", &choice.message.reasoning),
+        ] {
+            if let Some(reasoning) = reasoning {
+                output_blocks.push(ProviderOutputBlock::Reasoning {
+                    representation: representation.into(),
+                    bytes: reasoning.to_owned().into_bytes(),
+                    replay_requirement: "provider_defined".into(),
+                });
+            }
+        }
+        if let Some(calls) = &choice.message.tool_calls {
+            for call in calls {
+                output_blocks.extend(crate::output::chat_tool_metadata(
+                    call.id.as_deref(),
+                    &call.extensions,
+                    Some(&call.function.extensions),
+                ));
+            }
+        }
+        for (name, content) in choice.message.extensions {
+            if name == "role" {
+                continue;
+            }
+            if name == "audio" {
+                output_blocks.extend(crate::output::content_blocks(
+                    &serde_json::json!({"type":"audio","source":content}),
+                ));
+            } else {
+                output_blocks.push(ProviderOutputBlock::Other {
+                    type_name: format!("assistant.{name}"),
+                    content,
+                });
+            }
+        }
+        if let Some(model) = api_response.model {
+            output_blocks.push(ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"served_attribution","protocol":"chat_completions","model":model,"source":"provider_response"}),
+            });
+        }
+        if let Some(reason) = choice.finish_reason {
+            output_blocks.push(ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish","protocol":"chat_completions","finish_reason":reason}),
+            });
+        }
         let tool_calls = choice
             .message
             .tool_calls
@@ -511,10 +576,14 @@ impl CopilotModelProvider {
             .collect();
 
         Ok(ProviderChatResponse {
-            text: choice.message.content,
+            output_blocks,
+            text,
             tool_calls,
             usage,
-            reasoning_content: None,
+            reasoning_content: choice
+                .message
+                .reasoning_content
+                .or(choice.message.reasoning),
         })
     }
 

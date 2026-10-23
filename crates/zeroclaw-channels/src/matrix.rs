@@ -29,8 +29,9 @@ use matrix_sdk::{
 };
 
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
-    DraftProgressKind, RoomCreationOptions, RoomVisibility, SendMessage,
+    ApprovalPromptOutcome, Channel, ChannelApprovalRequest, ChannelApprovalResponse,
+    ChannelMessage, DraftProgress, DraftProgressKind, RoomCreationOptions, RoomVisibility,
+    SendMessage, await_approval_prompt_send,
 };
 use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
 use zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER;
@@ -2300,11 +2301,17 @@ mod inbound {
             && crate::util::resolve_pending_approval(
                 &ctx.pending_approvals,
                 &token,
-                response,
+                crate::util::ApprovalReply {
+                    response,
+                    actor: zeroclaw_api::session_events::EventActor::ChannelResponder {
+                        channel: format!("matrix.{}", ctx.alias),
+                        responder_id: sender.into(),
+                    },
+                },
                 sender_allowed && room_allowed,
                 room_id,
             )
-            .await
+            .await?
             .suppresses_message()
         {
             return Ok(());
@@ -5482,24 +5489,30 @@ impl Channel for MatrixChannel {
             request.position_counter(),
         );
 
-        let (tx, rx) = oneshot::channel();
-        self.pending_approvals.lock().await.insert(
-            token.clone(),
-            crate::util::PendingApproval {
-                sender: tx,
-                destination,
-                tool_name: request.tool_name.clone(),
-            },
-        );
-        let mut guard = crate::util::PendingApprovalGuard::new(
+        let (tx, mut rx) = oneshot::channel();
+        let mut guard = crate::util::register_pending_approval(
             Arc::clone(&self.pending_approvals),
             token.clone(),
-        );
+            tx,
+            destination,
+            request.tool_name.clone(),
+        )
+        .await?;
 
         let send_msg = approval::build_prompt_message(prompt, recipient);
-        if let Err(e) = self.send(&send_msg).await {
-            guard.remove().await;
-            return Err(e);
+        match await_approval_prompt_send(self.send(&send_msg), &mut rx).await {
+            Ok(ApprovalPromptOutcome::Sent(())) => {}
+            Ok(ApprovalPromptOutcome::Replied(response)) => {
+                guard.remove().await;
+                return Ok(Some(response));
+            }
+            Err(e) if zeroclaw_api::session_events::capture::is_capture_stopped(&e) => {
+                return Err(e);
+            }
+            Err(e) => {
+                guard.remove().await;
+                return Err(e);
+            }
         }
 
         let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
@@ -5509,9 +5522,7 @@ impl Channel for MatrixChannel {
         match result {
             Ok(Ok(resp)) => {
                 guard.disarm();
-                Ok(Some(
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
-                ))
+                Ok(Some(resp?))
             }
             Ok(Err(_)) => {
                 guard.remove().await;
@@ -7728,6 +7739,8 @@ mod tests {
                 approvals.insert(
                     "AUTH0001".into(),
                     crate::util::PendingApproval {
+                        registration_id: uuid::Uuid::new_v4(),
+                        audit: crate::util::ApprovalAudit::current(),
                         sender: approved_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
@@ -7736,6 +7749,8 @@ mod tests {
                 approvals.insert(
                     "WRONG001".into(),
                     crate::util::PendingApproval {
+                        registration_id: uuid::Uuid::new_v4(),
+                        audit: crate::util::ApprovalAudit::current(),
                         sender: wrong_tx,
                         destination: "!other:localhost".into(),
                         tool_name: "tool".to_string(),
@@ -7744,6 +7759,8 @@ mod tests {
                 approvals.insert(
                     "OTHER001".into(),
                     crate::util::PendingApproval {
+                        registration_id: uuid::Uuid::new_v4(),
+                        audit: crate::util::ApprovalAudit::current(),
                         sender: unauthorized_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
@@ -7787,7 +7804,9 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(5), approved_rx)
                     .await
                     .expect("sync ingress should resolve the authorized approval")
-                    .expect("sync ingress should resolve the authorized approval"),
+                    .expect("sync ingress should resolve the authorized approval")
+                    .expect("approval capture should succeed")
+                    .response,
                 ChannelApprovalResponse::Approve
             );
             assert!(
@@ -7906,6 +7925,8 @@ mod tests {
             pending.lock().await.insert(
                 "APPROVAL".to_string(),
                 crate::util::PendingApproval {
+                    registration_id: uuid::Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::current(),
                     sender: tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
@@ -7928,7 +7949,8 @@ mod tests {
                         ),
                         "!origin:example.invalid",
                     )
-                    .await,
+                    .await
+                    .unwrap(),
                     crate::util::PendingApprovalResolution::Rejected,
                 );
                 assert!(pending.lock().await.contains_key("APPROVAL"));
@@ -7945,7 +7967,8 @@ mod tests {
                     ),
                     "!other:example.invalid",
                 )
-                .await,
+                .await
+                .unwrap(),
                 crate::util::PendingApprovalResolution::Rejected,
             );
             assert!(pending.lock().await.contains_key("APPROVAL"));
@@ -7961,15 +7984,21 @@ mod tests {
                     ),
                     "!origin:example.invalid",
                 )
-                .await,
+                .await
+                .unwrap(),
                 crate::util::PendingApprovalResolution::Resolved,
             );
-            assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+            assert_eq!(
+                rx.await.unwrap().unwrap().response,
+                ChannelApprovalResponse::AlwaysApprove
+            );
 
             let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
             pending.lock().await.insert(
                 "APPROVE2".to_string(),
                 crate::util::PendingApproval {
+                    registration_id: uuid::Uuid::new_v4(),
+                    audit: crate::util::ApprovalAudit::current(),
                     sender: approve_tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
@@ -7986,10 +8015,14 @@ mod tests {
                     ),
                     "!origin:example.invalid",
                 )
-                .await,
+                .await
+                .unwrap(),
                 crate::util::PendingApprovalResolution::Resolved,
             );
-            assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+            assert_eq!(
+                approve_rx.await.unwrap().unwrap().response,
+                ChannelApprovalResponse::Approve
+            );
         }
 
         #[test]

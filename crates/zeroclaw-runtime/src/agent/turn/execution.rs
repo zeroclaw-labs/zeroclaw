@@ -367,6 +367,7 @@ mod run_model_query_tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -415,6 +416,7 @@ mod run_model_query_tests {
             let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
             let rejected = self.persist_empty || attempt == 0;
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: (!rejected).then(|| "recovered".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -691,6 +693,7 @@ mod run_model_query_tests {
         // accepted: exactly the rejected-attempt shape under test.
         let provider = DirectResponseProvider {
             response: ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -757,6 +760,7 @@ mod run_model_query_tests {
         for text in ["", " \n\t", "<think>internal reasoning</think>"] {
             let provider = DirectResponseProvider {
                 response: ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some(text.to_string()),
                     tool_calls: Vec::new(),
                     usage: Some(TokenUsage {
@@ -802,6 +806,7 @@ mod run_model_query_tests {
     async fn run_model_query_keeps_direct_tool_only_response_valid() {
         let provider = DirectResponseProvider {
             response: ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_string(),

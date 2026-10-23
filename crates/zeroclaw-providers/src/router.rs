@@ -346,6 +346,10 @@ impl CostOptimizedStrategy {
 
 #[async_trait]
 impl ModelProvider for RouterModelProvider {
+    fn is_dispatch_composite(&self) -> bool {
+        true
+    }
+
     fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
         let (provider_idx, resolved_model) = self.resolve(model);
         self.model_providers
@@ -1689,6 +1693,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: vec![],
                 usage: None,
@@ -1771,6 +1776,7 @@ mod tests {
         ) -> anyhow::Result<ChatResponse> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: vec![ToolCall {
                     id: "call_1".to_string(),

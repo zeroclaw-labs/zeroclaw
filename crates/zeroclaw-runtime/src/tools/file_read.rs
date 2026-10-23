@@ -1226,6 +1226,7 @@ mod tests {
                 let mut guard = self.responses.lock().unwrap();
                 if guard.is_empty() {
                     return Ok(ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("done".into()),
                         tool_calls: vec![],
                         usage: None,
@@ -1287,6 +1288,7 @@ mod tests {
 
         let (model_provider, recorded) = RecordingModelProvider::new(vec![
             ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "tc1".into(),
@@ -1298,6 +1300,7 @@ mod tests {
                 reasoning_content: None,
             },
             ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("The file appears to be binary data.".into()),
                 tool_calls: vec![],
                 usage: None,

@@ -1,5 +1,6 @@
 use crate::compatible::sse_bytes_to_events;
 use crate::multimodal;
+#[cfg(test)]
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -153,12 +154,16 @@ struct NativeToolCall {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     kind: Option<String>,
     function: NativeFunctionCall,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct NativeFunctionCall {
     name: String,
     arguments: String,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,17 +195,85 @@ struct PromptTokensDetails {
 #[derive(Debug, Deserialize)]
 struct NativeChoice {
     message: NativeResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+impl NativeChoice {
+    fn into_message(mut self) -> NativeResponseMessage {
+        if let Some(reason) = self.finish_reason {
+            self.message.output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"chat_completions", "finish_reason":reason}),
+            });
+        }
+        self.message
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawNativeResponseMessage")]
 struct NativeResponseMessage {
-    #[serde(default)]
     content: Option<String>,
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<NativeToolCall>>,
+    output_blocks: Vec<zeroclaw_api::model_provider::ProviderOutputBlock>,
+}
+#[derive(Debug, Deserialize)]
+struct RawNativeResponseMessage {
+    #[serde(default)]
+    content: Option<serde_json::Value>,
     /// Reasoning/thinking models may return output in `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<NativeToolCall>>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
+}
+impl From<RawNativeResponseMessage> for NativeResponseMessage {
+    fn from(raw: RawNativeResponseMessage) -> Self {
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
+        let (content, mut output_blocks) = crate::output::assistant_content(raw.content.as_ref());
+        if let Some(reasoning) = &raw.reasoning_content {
+            output_blocks.insert(
+                0,
+                ProviderOutputBlock::Reasoning {
+                    representation: "reasoning_content".into(),
+                    bytes: reasoning.to_owned().into_bytes(),
+                    replay_requirement: "provider_defined".into(),
+                },
+            );
+        }
+        if let Some(calls) = &raw.tool_calls {
+            for call in calls {
+                output_blocks.extend(crate::output::chat_tool_metadata(
+                    call.id.as_deref(),
+                    &call.extensions,
+                    Some(&call.function.extensions),
+                ));
+            }
+        }
+        for (name, content) in raw.extensions {
+            if name == "role" {
+                continue;
+            }
+            if name == "audio" {
+                output_blocks.extend(crate::output::content_blocks(
+                    &serde_json::json!({"type":"audio","source":content}),
+                ));
+            } else {
+                output_blocks.push(ProviderOutputBlock::Other {
+                    type_name: format!("assistant.{name}"),
+                    content,
+                });
+            }
+        }
+        Self {
+            content,
+            reasoning_content: raw.reasoning_content,
+            tool_calls: raw.tool_calls,
+            output_blocks,
+        }
+    }
 }
 
 /// Typed builder for [`OpenRouterModelProvider`].
@@ -323,9 +396,11 @@ impl OpenRouterModelProvider {
                         .map(|tc| {
                             let name = tc.name;
                             NativeToolCall {
+                                extensions: Default::default(),
                                 id: Some(tc.id),
                                 kind: Some("function".to_string()),
                                 function: NativeFunctionCall {
+                                    extensions: Default::default(),
                                     arguments: crate::compatible::sanitize_tool_arguments(
                                         &name,
                                         &tc.arguments,
@@ -461,7 +536,15 @@ impl OpenRouterModelProvider {
             })
             .collect::<Vec<_>>();
 
+        let mut output_blocks = message.output_blocks;
+        output_blocks.extend(
+            tool_calls
+                .iter()
+                .cloned()
+                .map(|call| zeroclaw_api::model_provider::ProviderOutputBlock::ToolCall { call }),
+        );
         ProviderChatResponse {
+            output_blocks,
             text: message.content,
             tool_calls,
             usage: None,
@@ -850,7 +933,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
+            .map(NativeChoice::into_message)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -931,7 +1014,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-        let handle = ::zeroclaw_spawn::spawn!(async move {
+        let parser = async move {
             let response = match client
                 .post(endpoint_url)
                 .header("Authorization", format!("Bearer {credential}"))
@@ -976,14 +1059,9 @@ impl ModelProvider for OpenRouterModelProvider {
                     break;
                 }
             }
-        });
+        };
 
-        let guard = AbortOnDrop::new(handle.abort_handle());
-
-        stream::unfold((rx, guard), |(mut rx, guard)| async move {
-            rx.recv().await.map(|event| (event, (rx, guard)))
-        })
-        .boxed()
+        crate::stream_guard::parser_stream(parser, rx)
     }
 
     async fn chat_with_tools(
@@ -1087,7 +1165,7 @@ impl ModelProvider for OpenRouterModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
+            .map(NativeChoice::into_message)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -1130,6 +1208,25 @@ impl ::zeroclaw_api::attribution::Attributable for OpenRouterModelProvider {
 mod tests {
     use super::*;
     use crate::traits::{ChatMessage, ModelProvider};
+
+    #[test]
+    fn native_plain_reasoning_is_preserved_without_inferring_signed_content() {
+        let reasoning =
+            r#"{"thinking":"ordinary token=fixture-token","signature":"sk-fixture-signature"}"#;
+        let message: NativeResponseMessage = serde_json::from_value(serde_json::json!({
+            "content":"answer", "reasoning_content":reasoning,
+        }))
+        .expect("native response");
+        assert_eq!(message.reasoning_content.as_deref(), Some(reasoning));
+        let zeroclaw_api::model_provider::ProviderOutputBlock::Reasoning { bytes, .. } =
+            &message.output_blocks[0]
+        else {
+            panic!("typed reasoning");
+        };
+        assert_eq!(bytes, reasoning.to_owned().as_bytes());
+        assert!(String::from_utf8_lossy(bytes).contains("fixture-token"));
+        assert!(String::from_utf8_lossy(bytes).contains("sk-fixture-signature"));
+    }
 
     #[test]
     fn capabilities_report_vision_support() {
@@ -1302,26 +1399,48 @@ data: [DONE]
             crate::traits::StreamOptions::new(true),
         );
 
-        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("stream should yield the first SSE event")
-            .expect("stream should yield at least one event")
-            .expect("first SSE event should be readable");
+        let first = tokio::time::timeout(Duration::from_secs(1), async {
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(StreamEvent::ContentPosition(_)))
+            ));
+            stream.next().await
+        })
+        .await
+        .expect("stream should yield the first SSE event")
+        .expect("stream should yield at least one event")
+        .expect("first SSE event should be readable");
         match first {
             StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "first"),
             event => panic!("expected first text delta, got {event:?}"),
         }
 
-        let second = tokio::time::timeout(Duration::from_secs(3), stream.next())
-            .await
-            .expect("stream should remain open past the request timeout")
-            .expect("stream should yield the second SSE event")
-            .expect("second SSE event should be readable");
+        let second = tokio::time::timeout(Duration::from_secs(3), async {
+            assert!(matches!(
+                stream.next().await,
+                Some(Ok(StreamEvent::ContentPosition(_)))
+            ));
+            stream.next().await
+        })
+        .await
+        .expect("stream should remain open past the request timeout")
+        .expect("stream should yield the second SSE event")
+        .expect("second SSE event should be readable");
         match second {
             StreamEvent::TextDelta(chunk) => assert_eq!(chunk.delta, "second"),
             event => panic!("expected second text delta, got {event:?}"),
         }
 
+        let evidence = stream
+            .next()
+            .await
+            .expect("stream should yield finish evidence");
+        assert!(matches!(evidence, Ok(StreamEvent::ProtocolMetadata(_))));
+        let boundary = stream
+            .next()
+            .await
+            .expect("stream should yield completion boundary");
+        assert!(matches!(boundary, Ok(StreamEvent::ProtocolMetadata(_))));
         let final_event = stream.next().await.expect("stream should yield Final");
         assert!(matches!(final_event, Ok(StreamEvent::Final)));
 
@@ -1738,12 +1857,15 @@ data: [DONE]
     #[test]
     fn parse_native_response_converts_to_chat_response() {
         let message = NativeResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("Here you go.".into()),
             reasoning_content: None,
             tool_calls: Some(vec![NativeToolCall {
+                extensions: Default::default(),
                 id: Some("call_789".into()),
                 kind: Some("function".into()),
                 function: NativeFunctionCall {
+                    extensions: Default::default(),
                     name: "file_read".into(),
                     arguments: r#"{"path":"test.txt"}"#.into(),
                 },
@@ -2041,12 +2163,15 @@ data: [DONE]
     #[test]
     fn parse_native_response_captures_reasoning_content() {
         let message = NativeResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("answer".into()),
             reasoning_content: Some("thinking step".into()),
             tool_calls: Some(vec![NativeToolCall {
+                extensions: Default::default(),
                 id: Some("call_1".into()),
                 kind: Some("function".into()),
                 function: NativeFunctionCall {
+                    extensions: Default::default(),
                     name: "shell".into(),
                     arguments: "{}".into(),
                 },
@@ -2060,6 +2185,7 @@ data: [DONE]
     #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
         let message = NativeResponseMessage {
+            output_blocks: Vec::new(),
             content: Some("hello".into()),
             reasoning_content: None,
             tool_calls: None,

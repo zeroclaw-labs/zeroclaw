@@ -150,6 +150,27 @@ pub enum ChannelApprovalResponse {
     DenyWithEdit { replacement: String },
 }
 
+/// A structured question's observed outcome, before legacy option projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelChoiceOutcome {
+    Answered(String),
+    Declined,
+    Cancelled,
+    TimedOut,
+    /// No native result is available; only free-form channels may fall back.
+    Unavailable,
+}
+
+impl ChannelChoiceOutcome {
+    pub fn into_legacy_response(self) -> anyhow::Result<Option<String>> {
+        match self {
+            Self::Answered(answer) => Ok(Some(answer)),
+            Self::Declined | Self::Cancelled | Self::Unavailable => Ok(None),
+            Self::TimedOut => anyhow::bail!("structured choice timed out"),
+        }
+    }
+}
+
 /// An approval response together with the back-channel that produced it.
 ///
 /// When a channel fans one approval request out to several back-channels,
@@ -170,6 +191,9 @@ pub enum ChannelApprovalResponse {
 pub struct AttributedApprovalResponse {
     pub response: ChannelApprovalResponse,
     pub decided_by: Option<String>,
+    /// Reference returned by the durable reply owner and delivered with this
+    /// exact response. It never grants permission by itself.
+    pub reply_event_id: Option<crate::session_events::EventId>,
     /// WHO produced this response — an operator, or the runtime failing closed.
     ///
     /// This cannot be inferred from the other two fields, which is why it is
@@ -183,6 +207,62 @@ pub struct AttributedApprovalResponse {
     /// Conflating the two produced a tool result that told the model
     /// "Denied by user." on runs where no human was ever asked.
     pub source: ApprovalSource,
+}
+
+/// A reply waiter must preserve a durable-capture failure instead of reporting
+/// a closed transport as an ordinary runtime denial.
+pub type ApprovalReplyResult = anyhow::Result<AttributedApprovalResponse>;
+
+/// The original reply receiver remains authoritative while its prompt is
+/// being sent. An authenticated early answer can precede a transport ACK.
+#[derive(Debug)]
+pub enum ApprovalPromptOutcome<T> {
+    Sent(T),
+    Replied(AttributedApprovalResponse),
+}
+
+pub async fn await_approval_prompt_send<T>(
+    send: impl std::future::Future<Output = anyhow::Result<T>>,
+    reply: &mut tokio::sync::oneshot::Receiver<ApprovalReplyResult>,
+) -> anyhow::Result<ApprovalPromptOutcome<T>> {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let resolve_reply =
+        |response: Result<ApprovalReplyResult, tokio::sync::oneshot::error::RecvError>| {
+            response
+                .unwrap_or_else(|_| {
+                    Ok(AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        ApprovalSource::Unreachable,
+                    ))
+                })
+                .map(ApprovalPromptOutcome::Replied)
+        };
+    tokio::pin!(send);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(response) = std::pin::Pin::new(&mut *reply).poll(cx) {
+            return Poll::Ready(resolve_reply(response));
+        }
+        match send.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(match reply.try_recv() {
+                Ok(response) => response.map(ApprovalPromptOutcome::Replied),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    result.map(ApprovalPromptOutcome::Sent)
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => result.map(|_| {
+                    ApprovalPromptOutcome::Replied(AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        ApprovalSource::Unreachable,
+                    ))
+                }),
+            }),
+            // Sending can enqueue a callback result in this same poll. Observe
+            // it before an outer deadline can replace it with a timeout.
+            Poll::Pending => std::pin::Pin::new(&mut *reply).poll(cx).map(resolve_reply),
+        }
+    })
+    .await
 }
 
 /// Who decided an approval outcome.
@@ -231,6 +311,7 @@ impl AttributedApprovalResponse {
         Self {
             response,
             decided_by: None,
+            reply_event_id: None,
             source: ApprovalSource::Operator,
         }
     }
@@ -240,6 +321,7 @@ impl AttributedApprovalResponse {
         Self {
             response,
             decided_by: None,
+            reply_event_id: None,
             source,
         }
     }
@@ -262,6 +344,15 @@ impl AttributedApprovalResponse {
     #[must_use]
     pub fn with_decider_opt(mut self, decider: Option<String>) -> Self {
         self.decided_by = decider;
+        self
+    }
+
+    #[must_use]
+    pub fn with_reply_event_id(
+        mut self,
+        reply_event_id: Option<crate::session_events::EventId>,
+    ) -> Self {
+        self.reply_event_id = reply_event_id;
         self
     }
 }
@@ -1478,6 +1569,22 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Preserve explicit refusal, cancellation and timeout for durable audit.
+    /// Existing channels can keep implementing the legacy choice method.
+    async fn request_choice_outcome(
+        &self,
+        question: &str,
+        choices: &[String],
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<ChannelChoiceOutcome> {
+        Ok(
+            match self.request_choice(question, choices, timeout).await? {
+                Some(answer) => ChannelChoiceOutcome::Answered(answer),
+                None => ChannelChoiceOutcome::Unavailable,
+            },
+        )
+    }
+
     async fn request_multi_choice(
         &self,
         _question: &str,
@@ -1501,6 +1608,128 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approval_capture_failure() -> anyhow::Error {
+        crate::session_events::capture::capture_stopped(
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "fixture approval append failed",
+            )
+            .into(),
+        )
+    }
+
+    fn assert_approval_capture_failure(error: &anyhow::Error) {
+        assert!(crate::session_events::capture::is_capture_stopped(error));
+        assert!(error.chain().any(|source| {
+            source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|source| source.kind() == std::io::ErrorKind::BrokenPipe)
+        }));
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_preserves_queued_capture_error_before_expired_outer_timeout() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tx.send(Err(approval_capture_failure())).unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            await_approval_prompt_send(std::future::pending::<anyhow::Result<()>>(), &mut rx),
+        )
+        .await
+        .expect("queued capture failure must precede an expired outer timeout")
+        .unwrap_err();
+        assert_approval_capture_failure(&error);
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_observes_capture_error_enqueued_by_pending_send_in_same_poll() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut tx = Some(tx);
+        let send = std::future::poll_fn(move |_| {
+            if let Some(tx) = tx.take() {
+                tx.send(Err(approval_capture_failure())).unwrap();
+            }
+            std::task::Poll::<anyhow::Result<()>>::Pending
+        });
+        let error = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            await_approval_prompt_send(send, &mut rx),
+        )
+        .await
+        .expect("same-poll capture failure must precede the outer timeout")
+        .unwrap_err();
+        assert_approval_capture_failure(&error);
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_drains_capture_error_before_returning_transport_failure() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let send = async move {
+            tx.send(Err(approval_capture_failure())).unwrap();
+            anyhow::bail!("ordinary transport failure")
+        };
+        let error = await_approval_prompt_send::<()>(send, &mut rx)
+            .await
+            .unwrap_err();
+        assert_approval_capture_failure(&error);
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_drains_authenticated_reply_before_returning_transport_failure() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let receipt = crate::session_events::EventId::new();
+        let expected = AttributedApprovalResponse::operator(ChannelApprovalResponse::AlwaysApprove)
+            .with_reply_event_id(Some(receipt));
+        let delivered = expected.clone();
+        let send = async move {
+            tx.send(Ok(delivered)).unwrap();
+            anyhow::bail!("ordinary transport failure")
+        };
+        let result = await_approval_prompt_send::<()>(send, &mut rx)
+            .await
+            .unwrap();
+        match result {
+            ApprovalPromptOutcome::Replied(reply) => assert_eq!(reply, expected),
+            ApprovalPromptOutcome::Sent(()) => {
+                panic!("the delivered reply must remain authoritative")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_sender_closed_during_successful_send_is_unreachable() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let send = async move {
+            drop(tx);
+            Ok(())
+        };
+        let result = await_approval_prompt_send(send, &mut rx).await.unwrap();
+        match result {
+            ApprovalPromptOutcome::Replied(reply) => {
+                assert_eq!(reply.response, ChannelApprovalResponse::Deny);
+                assert_eq!(reply.source, ApprovalSource::Unreachable);
+                assert!(reply.reply_event_id.is_none());
+            }
+            ApprovalPromptOutcome::Sent(()) => {
+                panic!("a completed receiver cannot be returned for another wait")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_sender_closed_during_failed_send_preserves_transport_error() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let send = async move {
+            drop(tx);
+            anyhow::bail!("ordinary transport failure")
+        };
+        let error = await_approval_prompt_send::<()>(send, &mut rx)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "ordinary transport failure");
+        assert!(!crate::session_events::capture::is_capture_stopped(&error));
+    }
 
     #[test]
     fn gate_choice_kind_ids_round_trip_and_reject_unknown() {

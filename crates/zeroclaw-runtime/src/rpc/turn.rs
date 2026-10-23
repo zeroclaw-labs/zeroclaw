@@ -55,7 +55,18 @@ impl std::error::Error for TurnRefusal {}
 /// Judges a turn's caller on the Agent guard the turn runs under, after the
 /// last wait before the turn, and applies the caller's tool posture to that
 /// Agent. A refusal stops the turn before it touches the Agent.
-pub type TurnAdmission = Box<dyn FnOnce(&mut Agent) -> Result<(), TurnRefusal> + Send>;
+pub type TurnAdmission = Box<dyn FnMut(&mut Agent) -> Result<(), TurnRefusal> + Send>;
+
+/// Rebuild execution text from the accepted input's durable parts. The host
+/// owns attachment materialization and rechecks its live admission there.
+pub type TurnRecovery = Box<
+    dyn Fn(
+            zeroclaw_api::session_events::capture::EngineTurnInput,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl std::fmt::Display for TurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -103,6 +114,7 @@ pub async fn execute_turn<F, Fut>(
     connection_activity: Option<crate::rpc::ConnectionActivity>,
     steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
     admission: Option<TurnAdmission>,
+    recovery: Option<TurnRecovery>,
     on_event: F,
 ) -> Result<TurnOutcome, TurnError>
 where
@@ -113,6 +125,10 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
 
+    // Tokio task locals do not propagate through spawn. Transfer only the
+    // bound command and its execution port, not a backend or policy snapshot.
+    let native_session = zeroclaw_api::session_events::capture::current_session_execution();
+    let mut native_input = zeroclaw_api::session_events::capture::current_engine_input();
     let turn_handle = zeroclaw_spawn::spawn!(async move {
         // Held inside the task body so the connection stays counted until this
         // task's future is actually dropped. An abort requested by the caller
@@ -120,10 +136,12 @@ where
         // it, and the reload drain must not read zero while it does.
         let _connection_activity = connection_activity;
         let mut steering_rx = steering_rx;
+        let mut admission = admission;
+        let mut attribution = attribution;
         let mut guard = agent.lock().await;
         // Judged on this guard, with no await before the turn starts under
         // it: every earlier check predates at least this lock wait.
-        if let Some(admit) = admission
+        if let Some(admit) = admission.as_mut()
             && let Err(refusal) = admit(&mut guard)
         {
             return Err(StreamedTurnError {
@@ -132,8 +150,93 @@ where
                 new_messages: Vec::new(),
             });
         }
+        if let Some(session) = &native_session {
+            let recovered = async {
+                let pending = session
+                    .pending_inputs(
+                        attribution.model_provider.clone(),
+                        attribution.model.clone(),
+                    )
+                    .await?;
+                for mut input in pending {
+                    restore_native_agent(session.as_ref(), &mut guard).await?;
+                    let (_, provider, model) = guard.attribution_fields();
+                    input.provider_ref = provider;
+                    input.model = model;
+                    let materialize = recovery.as_ref().ok_or_else(|| {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            ),
+                            "native_rpc_recovery_materializer_missing"
+                        );
+                        anyhow::Error::msg("native RPC recovery materializer missing")
+                    })?;
+                    let accepted = input.clone();
+                    let engine = async {
+                        let prompt = materialize(accepted).await?;
+                        if let Some(admit) = admission.as_mut() {
+                            admit(&mut guard)?;
+                        }
+                        // The prior RPC request no longer owns a live response.
+                        // Its output stays in history, never in the new reply.
+                        let (events, mut receiver) = mpsc::channel(64);
+                        let turn = guard.turn_streamed_with_steering_state(
+                            &prompt,
+                            events,
+                            Some(cancel_clone.clone()),
+                            None,
+                        );
+                        let (result, ()) =
+                            tokio::join!(turn, async { while receiver.recv().await.is_some() {} });
+                        result
+                            .map(|value| value.response)
+                            .map_err(|value| value.error)
+                    };
+                    zeroclaw_api::session_events::capture::scope_session_execution(
+                        session.clone(),
+                        crate::agent::loop_::scope_session_key(
+                            attribution.session_key.clone(),
+                            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                                cost_context.clone(),
+                                session.execute(input, Box::pin(engine)),
+                            ),
+                        ),
+                    )
+                    .await?;
+                }
+                restore_native_agent(session.as_ref(), &mut guard).await?;
+                let (_, provider, model) = guard.attribution_fields();
+                attribution.model_provider = provider.clone();
+                attribution.model = model.clone();
+                if let Some(input) = native_input.as_mut() {
+                    input.provider_ref = provider;
+                    input.model = model;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = recovered {
+                return Err(StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: Vec::new(),
+                });
+            }
+            if let Some(admit) = admission.as_mut()
+                && let Err(refusal) = admit(&mut guard)
+            {
+                return Err(StreamedTurnError {
+                    error: anyhow::Error::new(refusal),
+                    committed_response: String::new(),
+                    new_messages: Vec::new(),
+                });
+            }
+        }
         let sk = attribution.session_key.clone();
-        crate::agent::loop_::scope_session_key(attribution.session_key, async move {
+        let engine = crate::agent::loop_::scope_session_key(attribution.session_key, async move {
             use ::zeroclaw_log::Instrument as _;
             let span = ::zeroclaw_log::info_span!(
                 target: "zeroclaw_log_internal_scope",
@@ -157,8 +260,68 @@ where
                         .instrument(span),
                 )
                 .await
-        })
-        .await
+        });
+        if let Some(session) = native_session {
+            let Some(input) = native_input else {
+                return Err(StreamedTurnError {
+                    error: anyhow::Error::msg("native engine input missing"),
+                    committed_response: String::new(),
+                    new_messages: vec![],
+                });
+            };
+            let mut observed = None;
+            let recorded = session
+                .execute(
+                    input,
+                    Box::pin(async {
+                        let result = engine.await;
+                        match result {
+                            Ok(success) => {
+                                let response = success.response.clone();
+                                observed = Some(Ok(success));
+                                Ok(response)
+                            }
+                            Err(failure) => {
+                                observed =
+                                    Some(Err((failure.committed_response, failure.new_messages)));
+                                Err(failure.error)
+                            }
+                        }
+                    }),
+                )
+                .await;
+            match recorded {
+                Ok(response) => observed.and_then(Result::ok).map(Ok).unwrap_or_else(|| {
+                    Ok(StreamedTurnSuccess {
+                        response,
+                        new_messages: vec![],
+                        provider_name: String::new(),
+                        model: String::new(),
+                        final_context_limits: None,
+                        safeguard_fallback: None,
+                    })
+                }),
+                Err(error) => {
+                    // Durable commit failure takes precedence. Preserve the
+                    // original engine error and partial result when it ran.
+                    if let Some(Err((committed_response, new_messages))) = observed {
+                        Err(StreamedTurnError {
+                            error,
+                            committed_response,
+                            new_messages,
+                        })
+                    } else {
+                        Err(StreamedTurnError {
+                            error,
+                            committed_response: String::new(),
+                            new_messages: vec![],
+                        })
+                    }
+                }
+            }
+        } else {
+            engine.await
+        }
     });
 
     let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));
@@ -213,6 +376,20 @@ where
             }
         }
     }
+}
+
+async fn restore_native_agent(
+    session: &dyn zeroclaw_api::session_events::capture::SessionExecutionPort,
+    agent: &mut Agent,
+) -> anyhow::Result<()> {
+    if let Some(selection) = session.restore_model_override().await? {
+        agent.restore_session_model_selection(selection)?;
+    }
+    if let Some(context) = session.restore_context().await? {
+        agent.seed_conversation_history(context.messages);
+        agent.set_history_has_trim_breadcrumb(context.history_has_trim_breadcrumb.unwrap_or(false));
+    }
+    Ok(())
 }
 
 type TurnJoinHandle = tokio::task::JoinHandle<
@@ -373,7 +550,9 @@ fn outcome_from_task_result(
                     user_message,
                 });
             }
-            Err(TurnError::AgentError(error.to_string()))
+            Err(TurnError::AgentError(Agent::session_execution_diagnostic(
+                &error,
+            )))
         }
     }
 }
@@ -675,6 +854,252 @@ mod tests {
     use zeroclaw_providers::ChatRequest;
     use zeroclaw_providers::traits::TokenUsage;
     use zeroclaw_providers::{ChatResponse, ToolCall};
+
+    #[tokio::test]
+    async fn native_recovery_executes_original_inputs_before_new_prompt_and_rechecks_admission() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use zeroclaw_api::session_events::capture::{
+            EngineInputPart, EngineTurnFuture, EngineTurnInput, ProviderAdmissionPort,
+            ProviderDispatchIntent, ProviderObservationPort, SessionExecutionPort,
+            scope_engine_input, scope_provider_capture, scope_session_execution,
+        };
+        use zeroclaw_api::session_events::{
+            AppendReceipt, Digest, EventCursor, EventData, EventId, PayloadRecord, SessionStreamId,
+        };
+
+        struct EchoProvider(Arc<StdMutex<Vec<String>>>);
+        #[async_trait]
+        impl ModelProvider for EchoProvider {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                message: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(message.to_owned())
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                let prompt = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "user")
+                    .expect("user input")
+                    .content
+                    .clone();
+                self.0.lock().unwrap().push(prompt.clone());
+                Ok(ChatResponse {
+                    text: Some(format!("answer:{prompt}")),
+                    output_blocks: vec![],
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl Attributable for EchoProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "recovery-provider"
+            }
+        }
+        struct ReplayPort {
+            pending: Vec<EngineTurnInput>,
+            executed: StdMutex<Vec<String>>,
+        }
+        #[derive(Clone)]
+        struct ReplayCapture(EventId);
+        #[async_trait]
+        impl ProviderAdmissionPort for ReplayCapture {
+            async fn admit(
+                &self,
+                _intent: ProviderDispatchIntent,
+            ) -> anyhow::Result<Arc<dyn ProviderObservationPort>> {
+                Ok(Arc::new(self.clone()))
+            }
+        }
+        #[async_trait]
+        impl ProviderObservationPort for ReplayCapture {
+            fn started_event_id(&self) -> EventId {
+                self.0.clone()
+            }
+            async fn observe(
+                &self,
+                _data: EventData,
+                _payloads: Vec<PayloadRecord>,
+            ) -> anyhow::Result<AppendReceipt> {
+                let cursor = EventCursor::beginning(SessionStreamId::new());
+                Ok(AppendReceipt {
+                    first: cursor.clone(),
+                    last: cursor,
+                    event_ids: vec![EventId::new()],
+                    head_hash: Digest::zero(),
+                })
+            }
+        }
+        #[async_trait]
+        impl SessionExecutionPort for ReplayPort {
+            async fn pending_inputs(
+                &self,
+                provider: String,
+                model: String,
+            ) -> anyhow::Result<Vec<EngineTurnInput>> {
+                assert_eq!(provider, "recovery-provider");
+                assert_eq!(model, "test-model");
+                Ok(self.pending.clone())
+            }
+            async fn execute(
+                &self,
+                input: EngineTurnInput,
+                engine: EngineTurnFuture<'_>,
+            ) -> anyhow::Result<String> {
+                self.executed.lock().unwrap().push(input.turn_id.clone());
+                // Match native execution's admission scope so the tool loop
+                // recognizes this input as already admitted.
+                scope_engine_input(
+                    input,
+                    scope_provider_capture(Arc::new(ReplayCapture(EventId::new())), engine),
+                )
+                .await
+            }
+        }
+        fn input(id: &str, text: &str) -> EngineTurnInput {
+            EngineTurnInput {
+                execution_workspace: None,
+                turn_id: id.into(),
+                agent_alias: Some("rpc-agent".into()),
+                ingress: zeroclaw_api::ingress::IngressContext::interactive(),
+                reply_route: None,
+                parts: vec![EngineInputPart::Text(text.into())],
+                provider_ref: "recovery-provider".into(),
+                model: "test-model".into(),
+            }
+        }
+        let fixed = chrono::DateTime::parse_from_rfc3339("2026-06-25T12:00:00+00:00")
+            .expect("fixed recovery fixture timestamp")
+            .with_timezone(&chrono::Local);
+        let expected_prompts = ["first accepted", "second accepted", "new request"].map(|prompt| {
+            format!(
+                "[CURRENT DATE & TIME: {}]\n\n{prompt}",
+                fixed.format("%Y-%m-%d %H:%M:%S %Z")
+            )
+        });
+        for revoked in [false, true] {
+            let prompts = Arc::new(StdMutex::new(Vec::new()));
+            let mut agent = Agent::builder()
+                .model_provider(Box::new(EchoProvider(prompts.clone())))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(Arc::from(
+                    zeroclaw_memory::create_memory(
+                        &zeroclaw_config::schema::MemoryConfig {
+                            backend: "none".into(),
+                            ..Default::default()
+                        },
+                        std::path::Path::new("/tmp"),
+                        None,
+                    )
+                    .expect("memory"),
+                ))
+                .observer(Arc::new(NoopObserver {}))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(std::path::PathBuf::from("/tmp"))
+                .model_name("test-model".into())
+                .model_provider_name("recovery-provider".into())
+                .agent_alias("rpc-agent".into())
+                .build()
+                .expect("agent");
+            agent.set_turn_datetime_for_test(move || fixed);
+            let port = Arc::new(ReplayPort {
+                pending: vec![
+                    input("old-1", "first accepted"),
+                    input("old-2", "second accepted"),
+                ],
+                executed: StdMutex::new(Vec::new()),
+            });
+            let allowed = Arc::new(AtomicBool::new(true));
+            let admission_allowed = allowed.clone();
+            let materializer_allowed = allowed.clone();
+            let delivered = Arc::new(StdMutex::new(String::new()));
+            let delivered_events = delivered.clone();
+            let result = scope_session_execution(
+                port.clone(),
+                scope_engine_input(
+                    input("new", "new request"),
+                    execute_turn(
+                        Arc::new(Mutex::new(agent)),
+                        "new request".into(),
+                        CancellationToken::new(),
+                        TurnAttribution {
+                            session_key: Some("recovery-session".into()),
+                            agent_alias: "rpc-agent".into(),
+                            model_provider: "recovery-provider".into(),
+                            model: "test-model".into(),
+                            channel: "rpc",
+                        },
+                        None,
+                        None,
+                        None,
+                        Some(Box::new(move |_| {
+                            if admission_allowed.load(Ordering::SeqCst) {
+                                Ok(())
+                            } else {
+                                Err(TurnRefusal {
+                                    code: -32003,
+                                    message: "fixture revoked".into(),
+                                })
+                            }
+                        })),
+                        Some(Box::new(move |input| {
+                            let allowed = materializer_allowed.clone();
+                            Box::pin(async move {
+                                if revoked {
+                                    allowed.store(false, Ordering::SeqCst);
+                                }
+                                Ok(input
+                                    .parts
+                                    .into_iter()
+                                    .filter_map(|part| match part {
+                                        EngineInputPart::Text(text) => Some(text),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"))
+                            })
+                        })),
+                        move |event| {
+                            if let TurnEvent::Chunk { delta } = event {
+                                delivered_events.lock().unwrap().push_str(&delta);
+                            }
+                            std::future::ready(())
+                        },
+                    ),
+                ),
+            )
+            .await;
+            if revoked {
+                assert!(matches!(result, Err(TurnError::Refused(_))));
+                assert!(prompts.lock().unwrap().is_empty());
+                assert_eq!(*port.executed.lock().unwrap(), ["old-1"]);
+            } else {
+                assert_eq!(*prompts.lock().unwrap(), expected_prompts);
+                assert_eq!(*port.executed.lock().unwrap(), ["old-1", "old-2", "new"]);
+                assert!(
+                    matches!(result, Ok(TurnOutcome::Completed { text, .. }) if text == format!("answer:{}", expected_prompts[2]))
+                );
+                assert!(!delivered.lock().unwrap().contains("accepted"));
+            }
+        }
+    }
 
     /// Scripted two-call provider: call 1 emits a tool call + usage,
     /// call 2 emits final text + usage. The drain must process both
@@ -1234,6 +1659,7 @@ mod tests {
                 _temperature: Option<f64>,
             ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -1316,6 +1742,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             noop,
         )
         .await
@@ -1390,6 +1817,7 @@ mod tests {
                 _temperature: Option<f64>,
             ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("hello world".into()),
                     tool_calls: vec![],
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -1468,6 +1896,7 @@ mod tests {
                 model: "test-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             None,
@@ -1583,6 +2012,7 @@ mod tests {
             // call 2 carries final text + usage. The drain sees the full
             // interleaved sequence through the real execute_turn boundary.
             let first = ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "tc-matrix".into(),
@@ -1594,6 +2024,7 @@ mod tests {
                 reasoning_content: None,
             };
             let second = ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("matrix done".into()),
                 tool_calls: vec![],
                 usage: Some(token_usage(20, 8)),
@@ -1643,6 +2074,7 @@ mod tests {
                     model: "matrix-model".into(),
                     channel: "rpc",
                 },
+                None,
                 None,
                 None,
                 None,
@@ -1851,6 +2283,7 @@ mod tests {
         // call 2 carries final text + usage. The drain sees the full
         // interleaved sequence through the real execute_turn boundary.
         let first = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(String::new()),
             tool_calls: vec![ToolCall {
                 id: "tc-w1".into(),
@@ -1862,6 +2295,7 @@ mod tests {
             reasoning_content: None,
         };
         let second = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("w1 done".into()),
             tool_calls: vec![],
             usage: Some(token_usage(200, 80)),
@@ -1909,6 +2343,7 @@ mod tests {
                 model: "w1-model".into(),
                 channel: "rpc",
             },
+            None,
             None,
             None,
             None,
@@ -2190,6 +2625,7 @@ mod tests {
                 },
                 None,
                 Some(activity),
+                None,
                 None,
                 None,
                 noop,

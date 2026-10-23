@@ -1026,6 +1026,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -1072,6 +1073,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("fail".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -1118,6 +1120,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,

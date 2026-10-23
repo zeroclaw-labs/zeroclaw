@@ -27,6 +27,10 @@ use zeroclaw_providers::{
     self, ChatMessage, ConversationMessage, ModelProvider, ToolResultMessage,
 };
 
+#[path = "session_adapter.rs"]
+mod session_adapter;
+use session_adapter::{RestoreTurnModel, SessionModelProvider};
+
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
 
@@ -35,81 +39,9 @@ pub use zeroclaw_api::agent::TurnEvent;
 /// type (see `crate::agent::turn::ContextLimitsResolver`).
 use crate::agent::loop_::ContextLimitsResolver;
 
-/// Provider handle, its `<type>.<alias>` reference, the resolved model name,
-/// and the route resolver bound to that provider — the four values a session
-/// needs to swap a model provider while keeping route-aware limits correct.
-type SessionModelProvider = (
-    Box<dyn ModelProvider>,
-    String,
-    String,
-    Arc<zeroclaw_providers::router::ModelRouteResolver>,
-);
-
 struct TurnModelSelection {
     selector: String,
     allowed_provider_refs: Option<Arc<HashSet<String>>>,
-}
-
-pub fn build_session_model_provider(
-    config: &Config,
-    model_provider_ref: &str,
-    model_override: Option<&str>,
-) -> Result<SessionModelProvider> {
-    let (model_provider_name, model_provider_alias) = model_provider_ref
-        .split_once('.')
-        .map(|(t, a)| (t.to_string(), a.to_string()))
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
-            ))
-        })?;
-
-    let entry = config
-        .providers
-        .models
-        .find(&model_provider_name, &model_provider_alias);
-    let model_name = model_override
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            entry
-                .and_then(|e| e.model.as_deref())
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "model_provider `{model_provider_ref}` has no `model` configured and no model \
-                 override was supplied"
-            ))
-        })?;
-
-    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
-        config,
-        &model_provider_name,
-        &model_provider_alias,
-    );
-
-    let (model_provider, model_route_resolver) =
-        zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-            config,
-            model_provider_ref,
-            entry.and_then(|e| e.api_key.as_deref()),
-            entry.and_then(|e| e.uri.as_deref()),
-            &config.reliability,
-            &config.model_routes,
-            &model_name,
-            &model_provider_runtime_options,
-        )?;
-
-    Ok((
-        model_provider,
-        model_provider_ref.to_string(),
-        model_name,
-        model_route_resolver,
-    ))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -147,6 +79,7 @@ pub(crate) enum RoutedApproval {
         response: zeroclaw_api::channel::ChannelApprovalResponse,
         decider: Option<String>,
         source: zeroclaw_api::channel::ApprovalSource,
+        reply_event_id: Option<zeroclaw_api::session_events::EventId>,
     },
     /// Explicit `InheritOriginator` — defer to the originating-channel fan-out.
     Fallthrough,
@@ -157,7 +90,7 @@ pub(crate) async fn resolve_routed_approval(
     route: &zeroclaw_config::autonomy::ApprovalRoute,
     _recipient: &str,
     request: &zeroclaw_api::channel::ChannelApprovalRequest,
-) -> RoutedApproval {
+) -> anyhow::Result<RoutedApproval> {
     let approver_recipient = route
         .approver_recipient
         .as_deref()
@@ -192,16 +125,20 @@ pub(crate) async fn resolve_routed_approval(
                     attributed.source,
                 ),
                 Ok(Some(attributed)) => {
-                    return RoutedApproval::Decided {
+                    return Ok(RoutedApproval::Decided {
                         response: attributed.response,
                         decider: Some(channel_name),
                         source: attributed.source,
-                    };
+                        reply_event_id: attributed.reply_event_id,
+                    });
                 }
                 Ok(None) => (
                     "approver returned no decision",
                     zeroclaw_api::channel::ApprovalSource::Unreachable,
                 ),
+                Err(error) if zeroclaw_api::session_events::capture::is_capture_stopped(&error) => {
+                    return Err(error);
+                }
                 Err(_) => (
                     "approver channel unreachable",
                     zeroclaw_api::channel::ApprovalSource::Unreachable,
@@ -219,7 +156,7 @@ pub(crate) async fn resolve_routed_approval(
             )
         };
 
-    match route.on_no_approver {
+    Ok(match route.on_no_approver {
         zeroclaw_config::autonomy::OnNoApprover::Deny => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -240,6 +177,7 @@ pub(crate) async fn resolve_routed_approval(
                 // reason lets the tool result say so instead of reporting a
                 // user denial that never happened.
                 source,
+                reply_event_id: None,
             }
         }
         zeroclaw_config::autonomy::OnNoApprover::InheritOriginator => {
@@ -257,7 +195,7 @@ pub(crate) async fn resolve_routed_approval(
             );
             RoutedApproval::Fallthrough
         }
-    }
+    })
 }
 
 pub(crate) struct RoutedApprovalChannel {
@@ -352,7 +290,7 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
-        match resolve_routed_approval(&self.handles, &self.route, recipient, request).await {
+        match resolve_routed_approval(&self.handles, &self.route, recipient, request).await? {
             // The deciding approver's name travels on the response itself;
             // `None` for a bridge-synthesized fail-closed deny.
             //
@@ -363,9 +301,11 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
                 response,
                 decider,
                 source,
+                reply_event_id,
             } => Ok(Some(
                 zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(response, source)
-                    .with_decider_opt(decider),
+                    .with_decider_opt(decider)
+                    .with_reply_event_id(reply_event_id),
             )),
             RoutedApproval::Fallthrough => match self.origin.as_ref() {
                 Some(origin) => match origin
@@ -932,7 +872,7 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_history_turn_limit_resolver(
+    pub(super) fn structured_history_turn_limit_resolver(
         mut self,
         resolver: Arc<dyn Fn() -> usize + Send + Sync>,
     ) -> Self {
@@ -940,7 +880,7 @@ impl AgentBuilder {
         self
     }
 
-    fn context_limits_resolver(mut self, resolver: ContextLimitsResolver) -> Self {
+    pub(super) fn context_limits_resolver(mut self, resolver: ContextLimitsResolver) -> Self {
         self.context_limits_resolver = Some(resolver);
         self
     }
@@ -1681,6 +1621,11 @@ impl Agent {
         )
     }
 
+    /// Execution directory owned by this constructed agent's workspace jail.
+    pub fn execution_workspace(&self) -> &std::path::Path {
+        &self.workspace_dir
+    }
+
     /// Capacity and proactive-trim budget for the currently selected route.
     /// This is resolved on demand so a model/provider switch cannot leave a
     /// stale snapshot in a long-lived session.
@@ -2414,7 +2359,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
-        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        session_repository: Arc<zeroclaw_infra::session_repository::SessionRepository>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -2428,7 +2373,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
-            Some(acp_session_store),
+            Some(session_repository),
             None,
             None,
             None,
@@ -2537,7 +2482,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
-        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        session_repository: Arc<zeroclaw_infra::session_repository::SessionRepository>,
     ) -> Result<Self> {
         Self::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
             live_config,
@@ -2549,7 +2494,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
-            acp_session_store,
+            session_repository,
             None,
         )
         .await
@@ -2566,7 +2511,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
-        acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        session_repository: Arc<zeroclaw_infra::session_repository::SessionRepository>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Result<Self> {
         let config = live_config.read().clone();
@@ -2582,7 +2527,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
-            Some(acp_session_store),
+            Some(session_repository),
             Some(live_config),
             None,
             None,
@@ -2755,7 +2700,7 @@ impl Agent {
         sop_audit: Option<Arc<SopAuditLogger>>,
         principal_allowed_tools: Option<Vec<String>>,
         execution_capability: Option<AgentExecutionCapability>,
-        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+        session_repository: Option<Arc<zeroclaw_infra::session_repository::SessionRepository>>,
     ) -> Result<Self> {
         // Keep deep Agent construction off the transport's default worker stack.
         // Carry the caller's exact snapshot; rereading live config here would
@@ -2785,7 +2730,7 @@ impl Agent {
                 sop_engine,
                 sop_audit,
                 None,
-                acp_session_store,
+                session_repository,
                 Some(live_config.clone()),
                 Some(live_config),
                 principal_allowed_tools,
@@ -2811,7 +2756,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         canvas_store: Option<tools::CanvasStore>,
-        acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+        session_repository: Option<Arc<zeroclaw_infra::session_repository::SessionRepository>>,
         live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
         live_model_config: Option<zeroclaw_config::live::LiveConfigHandle>,
         // The caller principal's tool selector (RFC 7141 composition by
@@ -2941,7 +2886,7 @@ impl Agent {
         };
 
         let acp_sessions =
-            acp_session_store.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
+            session_repository.map(|store| tools::AcpSessionReadView::new(store, agent_alias));
         let tui_env = tui_env.map(Arc::new);
         let all_tools_result = tools::all_tools_with_runtime_context(
             Arc::new(config.clone()),
@@ -3062,23 +3007,15 @@ impl Agent {
         };
 
         let provider_ref = format!("{provider_name}.{provider_alias}");
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        let zeroclaw_providers::factory::SessionModelProvider {
+            provider: model_provider,
+            route_resolver: model_route_resolver,
+            ..
+        } = zeroclaw_providers::factory::build_session_model_provider(
             config,
-            provider_name,
-            provider_alias,
-        );
-
-        let (model_provider, model_route_resolver) =
-            zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                config,
-                &provider_ref,
-                agent_model_provider.and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.and_then(|e| e.uri.as_deref()),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
+            &provider_ref,
+            Some(&model_name),
+        )?;
 
         let tool_dispatcher =
             tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref(), &model_name);
@@ -3561,108 +3498,6 @@ impl Agent {
         Ok(())
     }
 
-    fn try_apply_model_switch(
-        &mut self,
-        current_effective_model: &str,
-        new_model_provider: String,
-        new_model: String,
-    ) -> Option<String> {
-        // Same-provider, same-model: nothing to do. The request is owned by
-        // the completed tool-loop scope, so there is no persistent slot to clear.
-        if new_model_provider == self.model_provider_name && new_model == current_effective_model {
-            return None;
-        }
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!(
-                "Model switch detected in turn_streamed: {} {} -> {} {}",
-                self.model_provider_name, current_effective_model, new_model_provider, new_model
-            )
-        );
-
-        let switch_outcome: anyhow::Result<(
-            Box<dyn ModelProvider>,
-            Arc<zeroclaw_providers::router::ModelRouteResolver>,
-        )> = match self
-            .provider_switch_config
-            .as_ref()
-            .and_then(|cfg| cfg.config.as_ref())
-        {
-            Some(full_config) => {
-                let target_entry = new_model_provider
-                    .split_once('.')
-                    .and_then(|(family, alias)| full_config.providers.models.find(family, alias));
-                // A dotted target profile is the canonical source of endpoint
-                // and credentials. Falling back to the current agent profile is
-                // only retained for legacy bare-family switch requests.
-                let current_agent_entry = full_config
-                    .resolved_model_provider_for_agent(&self.agent_alias)
-                    .map(|(_ty, _alias, entry)| entry);
-                let target_or_current = target_entry.or(current_agent_entry);
-                let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
-                let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
-
-                // Prefer a route-specific api_key when the switched
-                // provider/model matches a configured model_route entry.
-                let route_api_key = full_config
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.as_deref());
-                let api_key = route_api_key.or(default_api_key);
-
-                let runtime_options =
-                    switch_runtime_options(full_config.as_ref(), &new_model_provider);
-
-                zeroclaw_providers::create_routed_model_provider_with_options_and_resolver(
-                    full_config.as_ref(),
-                    &new_model_provider,
-                    api_key,
-                    default_base_url,
-                    &full_config.reliability,
-                    &full_config.model_routes,
-                    &new_model,
-                    &runtime_options,
-                )
-            }
-            None => Err(anyhow::Error::msg(
-                "model_switch requested but agent has no provider_switch_config; \
-                 cannot rebuild provider safely",
-            )),
-        };
-
-        match switch_outcome {
-            Ok((new_prov, new_route_resolver)) => {
-                // Commit state only after the provider was built
-                // successfully.
-                self.model_provider = new_prov;
-                self.model_route_resolver = new_route_resolver;
-                self.model_provider_name = new_model_provider;
-                self.model_name = new_model.clone();
-                Some(new_model)
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"err": e.to_string()})),
-                    &format!(
-                        "Failed to apply model_switch in turn_streamed; staying on {} {}",
-                        self.model_provider_name, current_effective_model
-                    )
-                );
-                None
-            }
-        }
-    }
-
     fn classify_model(&self, user_message: &str) -> Result<TurnModelSelection> {
         let resolved_agent = self
             .full_config()
@@ -3922,7 +3757,71 @@ impl Agent {
         )
     }
 
+    /// Format the observed error chain for the canonical session diagnostic.
+    pub fn session_execution_diagnostic(error: &anyhow::Error) -> String {
+        format!("{error:#}")
+    }
+
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        self.sync_config_generation();
+        let thinking = self.native_thinking_for_turn(user_message).await?;
+        let user_message = crate::agent::thinking::strip_thinking_directive(user_message);
+        let result = zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(thinking, Box::pin(self.turn_body(user_message.as_ref())))
+            .await;
+        self.capture_context_projection("agent_turn_projection")
+            .await?;
+        result
+    }
+
+    async fn native_thinking_for_turn(
+        &self,
+        user_message: &str,
+    ) -> Result<Option<zeroclaw_api::model_provider::NativeThinkingParams>> {
+        // An established outer scope has already resolved inline directives;
+        // its explicit None also overrides session and configuration defaults.
+        if let Ok(thinking) = zeroclaw_api::NATIVE_THINKING_OVERRIDE.try_with(Clone::clone) {
+            return Ok(thinking);
+        }
+        let session = crate::agent::thinking::restore_session_thinking_override().await?;
+        let resolved = self
+            .full_config()
+            .and_then(|config| config.resolved_agent_config(&self.agent_alias));
+        let defaults = crate::agent::thinking::ThinkingConfig::default();
+        let config = resolved
+            .as_ref()
+            .map(|agent| &agent.resolved.thinking)
+            .unwrap_or(&defaults);
+        let inline =
+            crate::agent::thinking::parse_thinking_directive(user_message).map(|(level, _)| level);
+        let level = crate::agent::thinking::resolve_thinking_level(inline, session, config);
+        Ok(crate::agent::thinking::apply_thinking_level_with_config(level, config).native_thinking)
+    }
+
+    async fn capture_context_projection(&self, reason_key: &str) -> Result<()> {
+        use zeroclaw_api::session_events::capture::{
+            ContextSnapshot, ContextTransformIntent, current_provider_admission,
+        };
+        if let Some(admission) = current_provider_admission()
+            && let Some(transform) = admission
+                .begin_context_transform(ContextTransformIntent {
+                    reason_key: reason_key.into(),
+                    algorithm_version: "agent-context/v1".into(),
+                    budget: 0,
+                })
+                .await?
+        {
+            transform
+                .complete_snapshot(ContextSnapshot {
+                    messages: self.history.to_vec(),
+                    history_has_trim_breadcrumb: Some(self.history_has_trim_breadcrumb),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn turn_body(&mut self, user_message: &str) -> Result<String> {
         if user_message.trim().is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -3948,11 +3847,6 @@ impl Agent {
                     system_prompt,
                 )));
         }
-
-        // Pin one config generation for this whole turn BEFORE resolving a
-        // route, so the provider this turn may rebuild and the limits it
-        // reports come from the same generation.
-        self.sync_config_generation();
 
         let model_selection = self.classify_model(user_message)?;
         let effective_model = model_selection.selector;
@@ -4429,13 +4323,49 @@ impl Agent {
         steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         let mut steering = CloseSteeringOnExit(steering_rx);
-        self.turn_streamed_with_steering_body(
-            user_message,
-            event_tx,
-            cancel_token,
-            steering.0.as_deref_mut(),
-        )
-        .await
+        #[cfg(test)]
+        if let Some(pause) = self.turn_entry_pause.clone() {
+            pause.wait().await;
+        }
+        // Resolve both thinking and routing from the same turn generation.
+        self.sync_config_generation();
+        let thinking = self
+            .native_thinking_for_turn(user_message)
+            .await
+            .map_err(|error| StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            })?;
+        let user_message = crate::agent::thinking::strip_thinking_directive(user_message);
+        let mut turn_model = RestoreTurnModel {
+            agent: self,
+            base: None,
+        };
+        let result = zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(
+                thinking,
+                Box::pin(turn_model.agent.turn_streamed_with_steering_body(
+                    user_message.as_ref(),
+                    event_tx,
+                    cancel_token,
+                    steering.0.as_deref_mut(),
+                    &mut turn_model.base,
+                )),
+            )
+            .await;
+        if let Err(error) = turn_model
+            .agent
+            .capture_context_projection("agent_streamed_turn_projection")
+            .await
+        {
+            return Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            });
+        }
+        result
     }
 
     /// Body of [`Self::turn_streamed_with_steering_state`]. The successful
@@ -4447,6 +4377,7 @@ impl Agent {
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
+        turn_base: &mut Option<SessionModelProvider>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
@@ -4471,11 +4402,6 @@ impl Agent {
             });
         }
 
-        #[cfg(test)]
-        if let Some(pause) = self.turn_entry_pause.clone() {
-            pause.wait().await;
-        }
-
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
             let system_prompt = self
@@ -4492,10 +4418,6 @@ impl Agent {
         }
 
         let mut new_msgs: Vec<ConversationMessage> = Vec::new();
-        // Pin one config generation for this whole turn BEFORE resolving a
-        // route, so a mid-turn `model_switch` rebuilds the provider from the
-        // same generation the limits below are resolved from.
-        self.sync_config_generation();
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
@@ -5133,11 +5055,19 @@ impl Agent {
                     // error) falls through to the normal error handling below.
                     if let Some((new_model_provider, new_model)) =
                         crate::agent::loop_::is_model_switch_requested(&error)
-                        && let Some(new_effective_model) = self.try_apply_model_switch(
-                            &effective_model,
-                            new_model_provider,
-                            new_model,
-                        )
+                        && let Some(new_effective_model) = self
+                            .apply_observed_model_switch(
+                                &effective_model,
+                                new_model_provider,
+                                new_model,
+                                attempt_allowlist.is_some().then_some(&mut *turn_base),
+                            )
+                            .await
+                            .map_err(|error| StreamedTurnError {
+                                error,
+                                committed_response: committed_response.clone(),
+                                new_messages: new_msgs.clone(),
+                            })?
                     {
                         // Rebuild the per-turn protocol prompts too: a capped
                         // native request is built from them, so keeping the
@@ -5285,30 +5215,6 @@ impl Agent {
     }
 }
 
-/// Runtime options for the provider a live model switch rebuilds.
-///
-/// Dotted aliases resolve their entry through `provider_runtime_options_for_alias`;
-/// a bare family reference has no entry, and must take the config-owned
-/// `[multimodal]` policy through `provider_runtime_options_for_bare_family`
-/// rather than `ModelProviderRuntimeOptions::default()`. The default embeds
-/// `max_images = 4` / `max_image_size_mb = 5`, so a bare-family switch built
-/// on defaults would re-normalize already-prepared history under narrower
-/// caps than the operator configured and silently drop images.
-///
-/// A free function so a regression can pin the switch path's options
-/// directly — the rebuilt provider box is opaque to the runtime's tests.
-fn switch_runtime_options(
-    config: &zeroclaw_config::schema::Config,
-    new_model_provider: &str,
-) -> zeroclaw_providers::ModelProviderRuntimeOptions {
-    match new_model_provider.split_once('.') {
-        Some((family, alias)) => {
-            zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias)
-        }
-        None => zeroclaw_providers::provider_runtime_options_for_bare_family(config),
-    }
-}
-
 pub async fn run(
     config: Config,
     agent_alias: &str,
@@ -5399,53 +5305,6 @@ mod tests {
             origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
             internal_principal: None,
         }
-    }
-
-    #[test]
-    fn build_session_model_provider_rejects_undotted_ref() {
-        let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic", Some("m")) {
-            Ok(_) => panic!("undotted ref must error"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("<type>.<alias>"), "got: {err}");
-    }
-
-    #[test]
-    fn build_session_model_provider_requires_a_model() {
-        // No configured entry and no override → cannot resolve a model name.
-        let config = Config::default();
-        let err = match build_session_model_provider(&config, "anthropic.default", None) {
-            Ok(_) => panic!("missing model must error"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string().contains("no `model` configured"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn build_session_model_provider_returns_full_canonical_ref() {
-        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
-
-        let mut config = Config::default();
-        config.providers.models.openai.insert(
-            "fast".to_string(),
-            OpenAIModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("gpt-4o-mini".to_string()),
-                    api_key: Some("test-key".to_string()),
-                    ..Default::default()
-                },
-            },
-        );
-
-        let (_provider, provider_ref, model, _route_resolver) =
-            build_session_model_provider(&config, "openai.fast", None).unwrap();
-
-        assert_eq!(provider_ref, "openai.fast");
-        assert_eq!(model, "gpt-4o-mini");
     }
 
     /// Regression: trim write-back must never persist the provider-only
@@ -5676,6 +5535,7 @@ mod tests {
             let mut guard = self.responses.lock();
             if guard.is_empty() {
                 return Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -5735,6 +5595,7 @@ mod tests {
                 },
             ));
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("accepted response".into()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -6699,6 +6560,7 @@ mod tests {
                 anyhow::bail!("chat path must not be used for this probe");
             };
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(text.to_string()),
                 tool_calls: vec![],
                 usage: None,
@@ -6988,6 +6850,7 @@ mod tests {
                     "fallback".to_string(),
                     Box::new(MockModelProvider {
                         responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            output_blocks: Vec::new(),
                             text: Some("fallback final".to_string()),
                             tool_calls: vec![],
                             usage: None,
@@ -7077,6 +6940,7 @@ mod tests {
                     anyhow::bail!("primary unavailable for first tool request");
                 }
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("primary final".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -7102,6 +6966,7 @@ mod tests {
                 _: Option<f64>,
             ) -> Result<zeroclaw_providers::ChatResponse> {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("tool request".into()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "fallback-tool".into(),
@@ -7215,6 +7080,7 @@ mod tests {
             let mut guard = self.responses.lock();
             if guard.is_empty() {
                 return Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -7276,6 +7142,7 @@ mod tests {
                 ),
             });
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -7444,6 +7311,7 @@ mod tests {
             let mut responses = self.responses.lock();
             if responses.is_empty() {
                 return Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -7537,6 +7405,7 @@ mod tests {
                 anyhow::bail!("input exceeds the context window of this model")
             }
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(self.answer.clone()),
                 tool_calls: vec![],
                 usage: None,
@@ -7629,6 +7498,7 @@ mod tests {
                 },
             ));
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(self.answer.clone()),
                 tool_calls: vec![],
                 usage: None,
@@ -7808,6 +7678,7 @@ mod tests {
                 request.messages.to_vec(),
             ));
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("routed response".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -7876,6 +7747,7 @@ mod tests {
                 anyhow::bail!("synthetic provider failure after delta on call {call}");
             }
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(if call == 1 { "draft" } else { "final" }.into()),
                 tool_calls: vec![],
                 usage: None,
@@ -7987,6 +7859,7 @@ mod tests {
                 .expect("final-completion test should still be observing the provider");
             self.release.notified().await;
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("root-final".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -8062,6 +7935,7 @@ mod tests {
                 self.seen_user_messages.lock().push(message.content.clone());
             }
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -8275,6 +8149,7 @@ mod tests {
         input_tokens: u64,
     ) -> zeroclaw_providers::ChatResponse {
         zeroclaw_providers::ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(text.into()),
             tool_calls: ids
                 .iter()
@@ -8786,6 +8661,7 @@ mod tests {
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![
                 zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("intermediate native narration".into()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "tc1".into(),
@@ -8797,6 +8673,7 @@ mod tests {
                     reasoning_content: None,
                 },
                 zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("final answer".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -8898,6 +8775,7 @@ mod tests {
         ) -> Result<zeroclaw_providers::ChatResponse> {
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 return Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("running tool".into()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "error-path-call".into(),
@@ -9020,6 +8898,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let response = |names: &[&str]| zeroclaw_providers::ChatResponse {
+            output_blocks: Vec::new(),
             text: None,
             tool_calls: names
                 .iter()
@@ -9035,6 +8914,7 @@ mod tests {
             reasoning_content: None,
         };
         let done = || zeroclaw_providers::ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("done".into()),
             tool_calls: vec![],
             usage: None,
@@ -9342,6 +9222,7 @@ mod tests {
     async fn turn_without_tools_returns_text() {
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("hello".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -9379,6 +9260,7 @@ mod tests {
     async fn direct_agent_strict_tool_parsing_ignores_xml_dispatcher_calls() {
         let provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(
                     r#"<tool_call>{"name":"echo","arguments":{"value":"ignored"}}</tool_call>"#
                         .into(),
@@ -9609,6 +9491,7 @@ mod tests {
                 let mut guard = self.responses.lock();
                 if guard.is_empty() {
                     return Ok(zeroclaw_providers::ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("done".into()),
                         tool_calls: vec![],
                         usage: None,
@@ -9763,6 +9646,7 @@ mod tests {
             let captured_specs = Arc::new(Mutex::new(Vec::new()));
             let tool_response = |name: &str, arguments: serde_json::Value| {
                 zeroclaw_providers::ChatResponse {
+                    output_blocks: vec![],
                     text: (!supports_native).then(|| {
                         format!("<tool_call>{{\"name\":\"{name}\",\"arguments\":{arguments}}}</tool_call>")
                     }),
@@ -10555,6 +10439,7 @@ mod tests {
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![
                 zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some(String::new()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "tc1".into(),
@@ -10566,6 +10451,7 @@ mod tests {
                     reasoning_content: None,
                 },
                 zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -10611,6 +10497,7 @@ mod tests {
         let seen_models = Arc::new(Mutex::new(Vec::new()));
         let model_provider = Box::new(ModelCaptureModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("classified".into()),
                 tool_calls: vec![],
                 usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -11179,7 +11066,7 @@ mod tests {
             AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
             RiskProfileConfig,
         };
-        use zeroclaw_infra::acp_session_store::AcpSessionStore;
+        use zeroclaw_infra::session_repository::SessionRepository;
 
         let tmp = TempDir::new().expect("temp dir");
         let data_dir = tmp.path().join("data");
@@ -11220,7 +11107,7 @@ mod tests {
             },
         );
 
-        let store = Arc::new(AcpSessionStore::new(tmp.path()).expect("ACP store"));
+        let store = Arc::new(SessionRepository::legacy_fixture(tmp.path()).expect("ACP store"));
         let current = "11111111-1111-4111-8111-111111111111";
         let previous = "22222222-2222-4222-8222-222222222222";
         store
@@ -11918,6 +11805,7 @@ mod tests {
             *count += 1;
             if *count == 1 {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some(String::new()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "00000000-0000-0000-0000-000000000001".into(),
@@ -11930,6 +11818,7 @@ mod tests {
                 })
             } else {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("stream-done".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -12310,6 +12199,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -12480,6 +12370,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![],
                 usage: None,
@@ -12506,24 +12397,28 @@ mod tests {
             stream::iter(vec![
                 Ok(
                     zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
+                        provider_call_id: None,
                         name: "file_read".into(),
                         args: "{\"path\":\"a.txt\"}".into(),
                     },
                 ),
                 Ok(
                     zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
+                        provider_call_id: None,
                         name: "shell".into(),
                         args: "{\"command\":\"pwd\"}".into(),
                     },
                 ),
                 Ok(
                     zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
+                        provider_call_id: None,
                         name: "file_read".into(),
                         output: "a".into(),
                     },
                 ),
                 Ok(
                     zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
+                        provider_call_id: None,
                         name: "shell".into(),
                         output: "b".into(),
                     },
@@ -13406,6 +13301,7 @@ mod tests {
 
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("I will echo the message.".into()),
                 tool_calls: vec![zeroclaw_providers::ToolCall {
                     id: "tc1".into(),
@@ -13475,6 +13371,7 @@ mod tests {
             _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -13622,6 +13519,7 @@ mod tests {
         let provider_a = Box::new(TranscriptCaptureModelProvider {
             alias: "transcript-a".into(),
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("from prior transcript".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -13632,6 +13530,7 @@ mod tests {
         let provider_b = Box::new(TranscriptCaptureModelProvider {
             alias: "transcript-b".into(),
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("from fresh transcript".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -13714,6 +13613,7 @@ mod tests {
             .model_provider(Box::new(TranscriptCaptureModelProvider {
                 alias: "shared-provider-alias".into(),
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("cached answer".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -13748,6 +13648,7 @@ mod tests {
             .model_provider(Box::new(TranscriptCaptureModelProvider {
                 alias: "shared-provider-alias".into(),
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("must not be returned".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -13821,6 +13722,7 @@ mod tests {
                 self.seen_messages.lock().push(request.messages.to_vec());
                 self.seen_models.lock().push(model.to_string());
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("provider answer".into()),
                     tool_calls: vec![],
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -14234,6 +14136,7 @@ mod tests {
                     .model_provider(Box::new(TranscriptCaptureModelProvider {
                         alias: provider_alias.into(),
                         responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            output_blocks: Vec::new(),
                             text: Some(answer.into()),
                             tool_calls: vec![],
                             usage: None,
@@ -14734,6 +14637,7 @@ mod tests {
                 .inner(Box::new(TranscriptCaptureModelProvider {
                     alias: "shared-child".into(),
                     responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some(answer.into()),
                         tool_calls: vec![],
                         usage: None,
@@ -14813,6 +14717,7 @@ mod tests {
                     Box::new(TranscriptCaptureModelProvider {
                         alias: "shared-child".into(),
                         responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            output_blocks: Vec::new(),
                             text: Some(answer.into()),
                             tool_calls: vec![],
                             usage: None,
@@ -14906,6 +14811,7 @@ mod tests {
                     .model_provider(Box::new(TranscriptCaptureModelProvider {
                         alias: "thinking-provider".into(),
                         responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            output_blocks: Vec::new(),
                             text: Some(answer.into()),
                             tool_calls: vec![],
                             usage: None,
@@ -14985,6 +14891,7 @@ mod tests {
                     .model_provider(Box::new(TranscriptCaptureModelProvider {
                         alias: "tool-capable".into(),
                         responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            output_blocks: Vec::new(),
                             text: Some(answer.into()),
                             tool_calls: vec![],
                             usage: None,
@@ -15149,6 +15056,7 @@ mod tests {
                 let provider = Box::new(TranscriptCaptureModelProvider {
                     alias: "memory-regression".into(),
                     responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("answer".into()),
                         tool_calls: vec![],
                         usage: None,
@@ -15763,6 +15671,7 @@ mod tests {
         zeroclaw_api::mock_tool_attribution!(SteerDuringTool);
 
         let tool_step = |id: &str| zeroclaw_providers::ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(String::new()),
             tool_calls: vec![zeroclaw_providers::ToolCall {
                 id: id.into(),
@@ -15782,6 +15691,7 @@ mod tests {
                 tool_step("call-1"),
                 tool_step("call-2"),
                 zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("final".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -15925,6 +15835,7 @@ mod tests {
             ) -> Result<zeroclaw_providers::ChatResponse> {
                 if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
                     return Ok(zeroclaw_providers::ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("final".into()),
                         tool_calls: vec![],
                         usage: None,
@@ -15936,6 +15847,7 @@ mod tests {
                         .tools
                         .map_or(0, crate::agent::history::estimate_tool_schema_tokens);
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some(String::new()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "call-1".into(),
@@ -17446,6 +17358,7 @@ mod tests {
         let mut agent_a = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("cached answer".into()),
                     tool_calls: vec![],
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -17479,6 +17392,7 @@ mod tests {
         let mut agent_b = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("uncached answer".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -17528,6 +17442,7 @@ mod tests {
         let mut agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("I will echo.".into()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "tc1".into(),
@@ -17638,6 +17553,7 @@ mod tests {
         let mut agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("turn cost".into()),
                     tool_calls: vec![],
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -17740,6 +17656,7 @@ mod tests {
         let mut agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("streamed cost".into()),
                     tool_calls: vec![],
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -17857,6 +17774,7 @@ mod tests {
 
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -17905,6 +17823,7 @@ mod tests {
 
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -17961,6 +17880,7 @@ mod tests {
         // Single response with no token usage.
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -18035,6 +17955,7 @@ mod tests {
         // Single response carrying usage WITHOUT token counts (kilocli-style).
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: Some(zeroclaw_providers::traits::TokenUsage::default()),
@@ -18090,6 +18011,7 @@ mod tests {
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![
                 zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("calling tool".into()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "tc1".into(),
@@ -18106,6 +18028,7 @@ mod tests {
                     reasoning_content: None,
                 },
                 zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("final answer".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -18265,6 +18188,7 @@ vision_model_provider = "custom.vision"
             ) -> Result<zeroclaw_providers::ChatResponse> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: None,
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "c1".into(),
@@ -18601,6 +18525,7 @@ model_provider = "custom.primary"
             ) -> Result<zeroclaw_providers::ChatResponse> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("backup answered".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -18816,6 +18741,7 @@ model_provider = "custom.only"
                 if model == "small-model" {
                     self.small_calls.fetch_add(1, Ordering::SeqCst);
                     return Ok(zeroclaw_providers::ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("fallback model answered".to_string()),
                         tool_calls: Vec::new(),
                         usage: None,
@@ -19453,7 +19379,9 @@ model_provider = "custom.only"
             &mut snapshot.retained_messages
         ));
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        let store =
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
+                .unwrap();
         store
             .create_session("bare-cancel", "agent", "/tmp", None)
             .unwrap();
@@ -19461,7 +19389,9 @@ model_provider = "custom.only"
             .persist_retained_context_seed("bare-cancel", &snapshot.retained_messages, false)
             .unwrap();
         drop(store);
-        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        let store =
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
+                .unwrap();
         let restored = store
             .load_session("bare-cancel")
             .unwrap()
@@ -19505,6 +19435,536 @@ model_provider = "custom.only"
             agent.model_name, "gpt-4o-mini",
             "model_name must NOT change when provider rebuild is not possible"
         );
+    }
+
+    #[tokio::test]
+    async fn native_session_thinking_reaches_agent_requests_without_scope_leaks() {
+        use crate::live_config_authority::{AgentHistoryAuthority, LiveConfigAuthority};
+        use zeroclaw_api::ingress::{IngressContext, TurnOrigin};
+        use zeroclaw_api::model_provider::{
+            NativeThinkingParams, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+        };
+        use zeroclaw_api::session_events::{
+            EventActor, EventCursor, EventData, PayloadRead, SessionEventStore,
+            capture::{
+                ContextSnapshot, EngineInputPart, EngineTurnInput, ModelChangeDisposition,
+                ModelOverrideSelection, ModelRouteMode, SessionExecutionPort,
+            },
+        };
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+
+        type ObservedThinking = Arc<Mutex<Vec<(bool, Option<NativeThinkingParams>)>>>;
+        struct ThinkingProbe(ObservedThinking);
+
+        #[async_trait]
+        impl ModelProvider for ThinkingProbe {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                anyhow::bail!("thinking probe requires a structured request")
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.0.lock().push((false, request.thinking));
+                Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
+                    text: Some("thinking answer".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn supports_streaming_tool_events(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+                _options: StreamOptions,
+            ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
+                use futures_util::StreamExt;
+                self.0.lock().push((true, request.thinking));
+                futures_util::stream::iter([
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                        "thinking answer",
+                    ))),
+                    Ok(StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+
+        impl zeroclaw_api::attribution::Attributable for ThinkingProbe {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "old"
+            }
+        }
+
+        async fn request(
+            port: &dyn SessionExecutionPort,
+            agent: &mut Agent,
+            streamed: bool,
+            turn: usize,
+            message: &str,
+            outer: Option<Option<NativeThinkingParams>>,
+        ) {
+            let result = port
+                .execute(
+                    EngineTurnInput {
+                        execution_workspace: None,
+                        turn_id: format!("thinking-{turn}"),
+                        agent_alias: Some("direct".into()),
+                        ingress: IngressContext::from_origin(TurnOrigin::Interactive),
+                        reply_route: None,
+                        parts: vec![EngineInputPart::Text(message.into())],
+                        provider_ref: "custom.old".into(),
+                        model: "old-model".into(),
+                    },
+                    Box::pin(async {
+                        let run = async {
+                            if streamed {
+                                let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                                agent
+                                    .turn_streamed(message, tx, None)
+                                    .await
+                                    .map(|(text, _)| text)
+                            } else {
+                                agent.turn(message).await
+                            }
+                        };
+                        match outer {
+                            Some(thinking) => {
+                                zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                    .scope(thinking, Box::pin(run))
+                                    .await
+                            }
+                            None => run.await,
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result, "thinking answer");
+            assert!(
+                zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .is_err()
+            );
+        }
+
+        for backend in ["sqlite", "jsonl"] {
+            for streamed in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut config = direct_live_generation_config(
+                    directory.path(),
+                    "old",
+                    "old-model",
+                    128_000,
+                    100,
+                );
+                config.channels.session_backend = backend.into();
+                let thinking = &mut config.runtime_profiles.get_mut("default").unwrap().thinking;
+                thinking.native_thinking = true;
+                thinking.default_level = crate::agent::thinking::ThinkingLevel::Max;
+                thinking.budget_tokens = [
+                    ("low".into(), 2_048),
+                    ("max".into(), 4_096),
+                    ("high".into(), 8_192),
+                ]
+                .into();
+                let live = LiveConfigAuthority::new(config.clone());
+                let mut agent = build_test_agent(
+                    "custom.old",
+                    "old-model",
+                    Some(ProviderSwitchConfig {
+                        config: Some(Arc::new(config.clone())),
+                        live: Some(live.live_handle()),
+                        live_config: None,
+                    }),
+                );
+                agent.agent_alias = "direct".into();
+                agent.config = config.resolved_agent_config("direct").unwrap();
+                agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+                let observed = Arc::new(Mutex::new(Vec::new()));
+                agent.model_provider = Box::new(ThinkingProbe(Arc::clone(&observed)));
+                let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
+                let family = "agent-thinking";
+                let stream = source.stream_id(family).await.unwrap();
+                let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
+                let port = source
+                    .open(
+                        family.into(),
+                        "direct".into(),
+                        principal.clone(),
+                        Arc::new(AgentHistoryAuthority {
+                            admission: live.execution_capability().admit("direct").unwrap(),
+                            actor: EventActor::Principal {
+                                principal_id: principal.0,
+                            },
+                            stream: stream.clone(),
+                            origin: TurnOrigin::Interactive,
+                            parent_alias: None,
+                        }),
+                        ContextSnapshot {
+                            messages: vec![],
+                            history_has_trim_breadcrumb: Some(false),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let high = ModelOverrideSelection::Inherit {
+                    thinking: Some("high".into()),
+                };
+                let outer = NativeThinkingParams {
+                    budget_tokens: 16_384,
+                    display: Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+                };
+                let cases = [
+                    (None, "default", None, Some(4_096)),
+                    (Some(high.clone()), "inherited", None, Some(8_192)),
+                    (None, "/think:low inline", None, None),
+                    (None, "after inline", None, Some(8_192)),
+                    (None, "/think:low outer", Some(Some(outer)), Some(16_384)),
+                    (None, "after outer", None, Some(8_192)),
+                    (None, "/think:max disabled", Some(None), None),
+                    (None, "after disable", None, Some(8_192)),
+                    (
+                        Some(ModelOverrideSelection::Set {
+                            provider_ref: "custom.old".into(),
+                            model: "old-model".into(),
+                            thinking: Some("high".into()),
+                            route_mode: ModelRouteMode::Manual,
+                        }),
+                        "explicit",
+                        None,
+                        Some(8_192),
+                    ),
+                    (
+                        Some(ModelOverrideSelection::Set {
+                            provider_ref: "custom.old".into(),
+                            model: "old-model".into(),
+                            thinking: None,
+                            route_mode: ModelRouteMode::Manual,
+                        }),
+                        "clear thinking",
+                        None,
+                        Some(4_096),
+                    ),
+                    (
+                        Some(ModelOverrideSelection::Clear),
+                        "legacy clear",
+                        None,
+                        Some(4_096),
+                    ),
+                    (
+                        Some(ModelOverrideSelection::Inherit { thinking: None }),
+                        "inherit default",
+                        None,
+                        Some(4_096),
+                    ),
+                ];
+                let mut selection = None;
+                let mut expected = Vec::new();
+                for (turn, (change, message, outer, budget)) in cases.into_iter().enumerate() {
+                    if let Some(change) = change {
+                        port.observe_model_change(change.clone(), ModelChangeDisposition::Applied)
+                            .await
+                            .unwrap();
+                        selection = Some(change);
+                    }
+                    request(port.as_ref(), &mut agent, streamed, turn, message, outer).await;
+                    expected.push(budget);
+                    {
+                        let observed = observed.lock();
+                        assert_eq!(
+                            observed.len(),
+                            expected.len(),
+                            "{backend}/{streamed}/{turn}"
+                        );
+                        assert_eq!(observed.last().unwrap().0, streamed);
+                        assert_eq!(
+                            observed
+                                .last()
+                                .unwrap()
+                                .1
+                                .as_ref()
+                                .map(|value| value.budget_tokens),
+                            budget,
+                            "{backend}/{streamed}/{turn}"
+                        );
+                        assert_eq!(
+                            observed.last().unwrap().1.and_then(|value| value.display),
+                            (budget == Some(16_384)).then_some(
+                                zeroclaw_api::model_provider::ThinkingDisplay::Summarized
+                            ),
+                        );
+                    }
+                    assert_eq!(
+                        port.restore_model_override().await.unwrap(),
+                        selection,
+                        "inline and outer scopes must not rewrite the durable selection"
+                    );
+                }
+                // Resolve the next turn from the newly published config, even
+                // though the Agent's construction profile has the old budget.
+                for (native, budget) in [(true, Some(5_120)), (false, None)] {
+                    let thinking =
+                        &mut config.runtime_profiles.get_mut("default").unwrap().thinking;
+                    thinking.native_thinking = native;
+                    thinking.budget_tokens.insert("max".into(), 5_120);
+                    let commit = live.begin_config_commit().await.unwrap();
+                    commit
+                        .publish(commit.next_revision().unwrap(), config.clone())
+                        .unwrap();
+                    drop(commit);
+                    request(
+                        port.as_ref(),
+                        &mut agent,
+                        streamed,
+                        expected.len(),
+                        "current config",
+                        None,
+                    )
+                    .await;
+                    expected.push(budget);
+                    assert_eq!(
+                        observed
+                            .lock()
+                            .last()
+                            .unwrap()
+                            .1
+                            .as_ref()
+                            .map(|value| value.budget_tokens),
+                        budget
+                    );
+                }
+                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                    directory.path(),
+                    family,
+                )
+                .unwrap();
+                let events = store
+                    .read_page(
+                        &stream,
+                        &EventCursor::beginning(stream.clone()),
+                        None,
+                        1024,
+                        16 * 1024 * 1024,
+                    )
+                    .unwrap()
+                    .events;
+                let frozen = events
+                    .iter()
+                    .filter_map(|event| match &event.body.data {
+                        EventData::ProviderRequestPrepared { request_ref, .. } => {
+                            let PayloadRead::Present(payload) =
+                                store.read_payload(&request_ref.payload_id).unwrap()
+                            else {
+                                panic!("request payload missing")
+                            };
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&payload.body).unwrap();
+                            Some(
+                                serde_json::from_value::<Option<NativeThinkingParams>>(
+                                    request["thinking"].clone(),
+                                )
+                                .unwrap(),
+                            )
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let actual = observed
+                    .lock()
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    frozen, actual,
+                    "frozen requests must equal the actual provider requests: {backend}/{streamed}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_model_switch_preserves_durable_thinking_on_success_and_rejection() {
+        use crate::live_config_authority::{AgentHistoryAuthority, LiveConfigAuthority};
+        use zeroclaw_api::ingress::{IngressContext, TurnOrigin};
+        use zeroclaw_api::session_events::{
+            EventActor, EventCursor, EventData, ModelResolution, PayloadRead, SessionEventStore,
+            capture::{
+                ContextSnapshot, EngineInputPart, EngineTurnInput, ModelChangeDisposition,
+                ModelOverrideSelection,
+            },
+        };
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+
+        for backend in ["sqlite", "jsonl"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config =
+                direct_live_generation_config(directory.path(), "old", "old-model", 32_000, 10);
+            config.channels.session_backend = backend.into();
+            let next = config.providers.models.ensure("custom", "next").unwrap();
+            next.uri = Some("http://127.0.0.1:1/v1".into());
+            next.model = Some("next-model".into());
+            let mut agent = build_test_agent(
+                "custom.old",
+                "old-model",
+                Some(ProviderSwitchConfig {
+                    config: Some(Arc::new(config.clone())),
+                    ..Default::default()
+                }),
+            );
+            let live = LiveConfigAuthority::new(config);
+            let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
+            let family = "observed-model-switch";
+            let stream = source.stream_id(family).await.unwrap();
+            let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
+            let port = source
+                .open(
+                    family.into(),
+                    "direct".into(),
+                    principal.clone(),
+                    Arc::new(AgentHistoryAuthority {
+                        admission: live.execution_capability().admit("direct").unwrap(),
+                        actor: EventActor::Principal {
+                            principal_id: principal.0,
+                        },
+                        stream: stream.clone(),
+                        origin: TurnOrigin::Interactive,
+                        parent_alias: None,
+                    }),
+                    ContextSnapshot {
+                        messages: vec![],
+                        history_has_trim_breadcrumb: Some(false),
+                    },
+                )
+                .await
+                .unwrap();
+            port.observe_model_change(
+                ModelOverrideSelection::Inherit {
+                    thinking: Some("high".into()),
+                },
+                ModelChangeDisposition::Applied,
+            )
+            .await
+            .unwrap();
+            for rejected in [false, true] {
+                if rejected {
+                    agent.provider_switch_config = None;
+                }
+                let current = agent.model_name.clone();
+                let (provider, model) = if rejected {
+                    ("custom.old", "old-model")
+                } else {
+                    ("custom.next", "next-model")
+                };
+                port.execute(
+                    EngineTurnInput {
+                        execution_workspace: None,
+                        turn_id: format!("model-switch-{rejected}"),
+                        agent_alias: Some("direct".into()),
+                        ingress: IngressContext::from_origin(TurnOrigin::Interactive),
+                        reply_route: None,
+                        parts: vec![EngineInputPart::Text("switch model".into())],
+                        provider_ref: agent.model_provider_name.clone(),
+                        model: current.clone(),
+                    },
+                    Box::pin(async {
+                        let switched = agent
+                            .apply_observed_model_switch(
+                                &current,
+                                provider.into(),
+                                model.into(),
+                                None,
+                            )
+                            .await?;
+                        assert_eq!(switched, (!rejected).then(|| "next-model".into()));
+                        Ok("switch handled".into())
+                    }),
+                )
+                .await
+                .unwrap();
+                assert_eq!(agent.model_provider_name, "custom.next");
+                assert_eq!(agent.model_name, "next-model");
+                assert_eq!(
+                    port.restore_model_override().await.unwrap(),
+                    Some(ModelOverrideSelection::Set {
+                        provider_ref: "custom.next".into(),
+                        model: "next-model".into(),
+                        thinking: Some("high".into()),
+                        route_mode:
+                            zeroclaw_api::session_events::capture::ModelRouteMode::Automatic,
+                    }),
+                    "{backend}, rejected={rejected}",
+                );
+            }
+            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                directory.path(),
+                family,
+            )
+            .unwrap();
+            let events = store
+                .read_page(
+                    &stream,
+                    &EventCursor::beginning(stream.clone()),
+                    None,
+                    256,
+                    4 * 1024 * 1024,
+                )
+                .unwrap()
+                .events;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event.body.data,
+                        EventData::SessionModelOverrideChanged {
+                            resolution: ModelResolution::Rejected { .. },
+                        }
+                    ))
+                    .count(),
+                1,
+            );
+            for event in &events {
+                let EventData::ControlInputRecorded { control_ref, .. } = &event.body.data else {
+                    continue;
+                };
+                let PayloadRead::Present(payload) =
+                    store.read_payload(&control_ref.payload_id).unwrap()
+                else {
+                    panic!("model control missing");
+                };
+                let control: serde_json::Value = serde_json::from_slice(&payload.body).unwrap();
+                assert_eq!(control["selection"]["thinking"], "high");
+            }
+        }
     }
 
     #[tokio::test]
@@ -19629,6 +20089,91 @@ model_provider = "custom.only"
     }
 
     #[test]
+    fn native_inherited_model_uses_current_config_while_automatic_set_keeps_explicit_base() {
+        use zeroclaw_api::session_events::capture::{ModelOverrideSelection, ModelRouteMode};
+        let directory = tempfile::TempDir::new().expect("directory");
+        let config =
+            |model| direct_live_generation_config(directory.path(), "large", model, 32_000, 20);
+        let live = zeroclaw_config::live::LiveConfig::new(config("large-v1"));
+        let mut agent = build_test_agent(
+            "custom.large",
+            "large-v1",
+            Some(ProviderSwitchConfig {
+                config: Some(Arc::new(live.snapshot())),
+                live_config: None,
+                live: Some(live.handle()),
+            }),
+        );
+        agent.agent_alias = "direct".into();
+        agent.disable_automatic_model_routing();
+        live.publish(live.next_revision().unwrap(), config("large-v2"))
+            .expect("publish inherited default");
+        agent
+            .restore_session_model_selection(ModelOverrideSelection::Inherit {
+                thinking: Some("high".into()),
+            })
+            .expect("restore current inherited default");
+        assert_eq!(agent.model_name, "large-v2");
+        assert!(agent.automatic_model_routing);
+
+        let explicit = ModelOverrideSelection::Set {
+            provider_ref: "custom.large".into(),
+            model: "explicit-model".into(),
+            thinking: Some("high".into()),
+            route_mode: ModelRouteMode::Automatic,
+        };
+        agent
+            .restore_session_model_selection(explicit.clone())
+            .expect("automatic route with explicit base");
+        live.publish(live.next_revision().unwrap(), config("large-v3"))
+            .expect("publish another inherited default");
+        agent
+            .restore_session_model_selection(explicit)
+            .expect("restore explicit base after config publication");
+        assert_eq!(agent.model_name, "explicit-model");
+        assert!(agent.automatic_model_routing);
+
+        agent
+            .restore_session_model_selection(ModelOverrideSelection::Clear)
+            .expect("legacy clear inherits current default");
+        assert_eq!(agent.model_name, "large-v3");
+        assert!(agent.automatic_model_routing);
+    }
+
+    #[test]
+    fn native_model_restore_preserves_route_mode_without_provider_rebuild() {
+        use zeroclaw_api::session_events::capture::{ModelOverrideSelection, ModelRouteMode};
+        let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
+        for route_mode in [ModelRouteMode::Manual, ModelRouteMode::Automatic] {
+            agent
+                .restore_session_model_selection(ModelOverrideSelection::Set {
+                    provider_ref: "openai".into(),
+                    model: "gpt-4o-mini".into(),
+                    thinking: None,
+                    route_mode,
+                })
+                .expect("same route needs no provider rebuild");
+            assert_eq!(
+                agent.automatic_model_routing,
+                route_mode == ModelRouteMode::Automatic,
+            );
+        }
+        assert!(
+            agent
+                .restore_session_model_selection(ModelOverrideSelection::Set {
+                    provider_ref: "missing.provider".into(),
+                    model: "missing-model".into(),
+                    thinking: None,
+                    route_mode: ModelRouteMode::Manual,
+                })
+                .is_err()
+        );
+        assert!(agent.automatic_model_routing);
+        assert_eq!(agent.model_provider_name, "openai");
+        assert_eq!(agent.model_name, "gpt-4o-mini");
+    }
+
+    #[test]
     fn try_apply_model_switch_succeeds_with_switch_config() {
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(
@@ -19746,31 +20291,6 @@ model_provider = "custom.only"
             "provider_name must update on a provider-only switch"
         );
         assert_eq!(agent.model_name, "shared-name");
-    }
-
-    #[test]
-    fn model_switch_options_carry_the_configured_policy_for_bare_families() {
-        // A live switch to a bare family rebuilds the provider from the
-        // config. Building it on `ModelProviderRuntimeOptions::default()`
-        // reset the provider boundary to `max_images = 4` /
-        // `max_image_size_mb = 5`, so a request the operator had configured
-        // for 8 images was re-trimmed to 4 after the switch. The switch path
-        // must resolve the config-owned policy for bare families, the same
-        // way dotted aliases resolve theirs.
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.multimodal.max_images = 8;
-        config.multimodal.max_image_size_mb = 10;
-
-        let options = switch_runtime_options(&config, "ollama");
-
-        assert_eq!(
-            options.multimodal.max_images, 8,
-            "a bare-family switch must carry the configured max_images, not the default 4"
-        );
-        assert_eq!(
-            options.multimodal.max_image_size_mb, 10,
-            "a bare-family switch must carry the configured max_image_size_mb, not the default 5"
-        );
     }
 
     #[test]
@@ -19893,6 +20413,7 @@ model_provider = "custom.only"
             *count += 1;
             if *count == 1 {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some(String::new()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "00000000-0000-0000-0000-000000000002".into(),
@@ -19907,6 +20428,7 @@ model_provider = "custom.only"
                 // Should not be reached: after the switch, the next call goes
                 // to the switched provider, not this one.
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("original-provider-should-not-be-reused".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -20046,6 +20568,301 @@ model_provider = "custom.only"
         }
     }
     zeroclaw_api::mock_tool_attribution!(SwitchAndSteerTool);
+
+    #[tokio::test]
+    async fn scoped_model_switch_restores_native_base_on_success_error_and_future_drop() {
+        use crate::live_config_authority::{AgentHistoryAuthority, LiveConfigAuthority};
+        use axum::{Json, Router, response::IntoResponse};
+        use zeroclaw_api::ingress::{IngressContext, TurnOrigin};
+        use zeroclaw_api::session_events::{
+            EventActor, EventCursor, EventData, ModelResolution, SessionEventStore,
+            capture::{ContextSnapshot, EngineInputPart, EngineTurnInput},
+        };
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+
+        for backend in ["sqlite", "jsonl"] {
+            for ending in ["success", "error", "cancel", "drop"] {
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let server_entered = Arc::clone(&entered);
+                let app = Router::new().fallback(move |body: axum::body::Bytes| {
+                    let entered = Arc::clone(&server_entered);
+                    async move {
+                        entered.notify_one();
+                        if matches!(ending, "cancel" | "drop") {
+                            std::future::pending::<()>().await;
+                        }
+                        if ending == "error" {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({"error":{"message":"synthetic rejection"}})),
+                            )
+                                .into_response();
+                        }
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(request["model"], "next-model");
+                        if request["stream"].as_bool().unwrap_or(false) {
+                            let chunk = serde_json::json!({
+                                "choices": [{"delta": {"content": "temporary answer"}, "finish_reason": "stop"}]
+                            });
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                            )
+                                .into_response()
+                        } else {
+                            Json(serde_json::json!({
+                                "choices": [{"message": {"role": "assistant", "content": "temporary answer"}, "finish_reason": "stop"}]
+                            }))
+                            .into_response()
+                        }
+                    }
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = zeroclaw_spawn::spawn!(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let directory = tempfile::tempdir().unwrap();
+                let mut config = direct_live_generation_config(
+                    directory.path(),
+                    "old",
+                    "configured-default",
+                    32_000,
+                    100,
+                );
+                config.channels.session_backend = backend.into();
+                config.reliability.provider_retries = 0;
+                config.reliability.provider_backoff_ms = 0;
+                let next = config.providers.models.ensure("custom", "next").unwrap();
+                next.uri = Some(format!("http://{address}/v1"));
+                next.model = Some("next-model".into());
+                // Complex input starts on the cloud route; the tool then
+                // switches to the other allowed provider for this turn.
+                config.model_routes = vec![
+                    zeroclaw_config::schema::ModelRouteConfig {
+                        hint: "local".into(),
+                        model_provider: "custom.next".into(),
+                        model: "next-model".into(),
+                        api_key: None,
+                    },
+                    zeroclaw_config::schema::ModelRouteConfig {
+                        hint: "cloud".into(),
+                        model_provider: "custom.old".into(),
+                        model: "configured-default".into(),
+                        api_key: None,
+                    },
+                ];
+                config
+                    .runtime_profiles
+                    .get_mut("default")
+                    .unwrap()
+                    .effort_routing = Some(zeroclaw_config::scattered_types::EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: zeroclaw_config::scattered_types::CloudEscalationPolicy::Auto,
+                });
+                let live = LiveConfigAuthority::new(config.clone());
+                let calls = Arc::new(Mutex::new(0));
+                let resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+                    config
+                        .model_routes
+                        .iter()
+                        .map(|route| {
+                            (
+                                route.hint.clone(),
+                                zeroclaw_providers::router::Route {
+                                    provider_name: route.model_provider.clone(),
+                                    model: route.model.clone(),
+                                },
+                            )
+                        })
+                        .collect(),
+                    "custom.old".into(),
+                    "initial-pin".into(),
+                ));
+                let mut agent = build_test_agent(
+                    "custom.old",
+                    "initial-pin",
+                    Some(ProviderSwitchConfig {
+                        config: Some(Arc::new(config.clone())),
+                        live: Some(live.live_handle()),
+                        live_config: None,
+                    }),
+                );
+                agent.agent_alias = "direct".into();
+                agent.config = config.resolved_agent_config("direct").unwrap();
+                agent.model_route_resolver = Arc::clone(&resolver);
+                agent.model_provider = Box::new(StreamSwitchTriggerProvider {
+                    call_count: Arc::clone(&calls),
+                });
+                agent.tools =
+                    crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                        ModelSwitchTriggerTool {
+                            target_provider: "custom.next".into(),
+                            target_model: "next-model".into(),
+                        },
+                    )]);
+                let source = zeroclaw_session_host::NativeSessionHub::new(live.live_handle());
+                let family = "scoped-model-switch";
+                let stream = source.stream_id(family).await.unwrap();
+                let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
+                let port = source
+                    .open(
+                        family.into(),
+                        "direct".into(),
+                        principal.clone(),
+                        Arc::new(AgentHistoryAuthority {
+                            admission: live.execution_capability().admit("direct").unwrap(),
+                            actor: EventActor::Principal {
+                                principal_id: principal.0,
+                            },
+                            stream: stream.clone(),
+                            origin: TurnOrigin::Interactive,
+                            parent_alias: None,
+                        }),
+                        ContextSnapshot {
+                            messages: vec![],
+                            history_has_trim_breadcrumb: Some(false),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let input = |turn: &str| EngineTurnInput {
+                    execution_workspace: None,
+                    turn_id: turn.into(),
+                    agent_alias: Some("direct".into()),
+                    ingress: IngressContext::from_origin(TurnOrigin::Interactive),
+                    reply_route: None,
+                    parts: vec![EngineInputPart::Text(
+                        "Please analyze and compare these architecture tradeoffs.".into(),
+                    )],
+                    provider_ref: "custom.old".into(),
+                    model: "initial-pin".into(),
+                };
+                let result = port.execute(input("temporary-route"), Box::pin(async {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let turn = agent.turn_streamed(
+                        "Please analyze and compare these architecture tradeoffs.", tx, Some(cancel.clone()),
+                    );
+                    tokio::pin!(turn);
+                    if matches!(ending, "cancel" | "drop") {
+                        tokio::select! {
+                            _ = entered.notified() => {},
+                            result = &mut turn => panic!("temporary request did not remain pending: {result:?}"),
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("temporary request not reached"),
+                        }
+                        if ending == "drop" {
+                            anyhow::bail!("synthetic caller interruption");
+                        }
+                        cancel.cancel();
+                    }
+                    turn.await.map(|(text, _)| text)
+                })).await;
+                assert_eq!(
+                    result.is_ok(),
+                    ending == "success",
+                    "{backend}/{ending}: {result:?}"
+                );
+                if ending == "success" {
+                    assert_eq!(result.as_deref().unwrap(), "temporary answer");
+                }
+                assert_eq!(
+                    agent.model_provider_name, "custom.old",
+                    "{backend}/{ending}"
+                );
+                assert_eq!(
+                    agent.model_name, "initial-pin",
+                    "the actual builder pin must survive"
+                );
+                assert!(Arc::ptr_eq(&agent.model_route_resolver, &resolver));
+                assert_eq!(
+                    *calls.lock(),
+                    1,
+                    "{backend}/{ending}: {result:?}; history={:?}",
+                    agent.history
+                );
+                assert_eq!(port.restore_model_override().await.unwrap(), None);
+
+                config
+                    .runtime_profiles
+                    .get_mut("default")
+                    .unwrap()
+                    .effort_routing = None;
+                let commit = live.begin_config_commit().await.unwrap();
+                commit
+                    .publish(commit.next_revision().unwrap(), config)
+                    .unwrap();
+                drop(commit);
+                for streamed in [false, true] {
+                    let answer = port
+                        .execute(
+                            input(if streamed {
+                                "next-streamed"
+                            } else {
+                                "next-buffered"
+                            }),
+                            Box::pin(async {
+                                if streamed {
+                                    let (tx, _rx) = tokio::sync::mpsc::channel(128);
+                                    agent
+                                        .turn_streamed("hello", tx, None)
+                                        .await
+                                        .map(|(text, _)| text)
+                                } else {
+                                    agent.turn("hello").await
+                                }
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        answer, "original-provider-should-not-be-reused",
+                        "{backend}/{ending}/{streamed}"
+                    );
+                }
+                assert_eq!(
+                    *calls.lock(),
+                    3,
+                    "both next-turn entrypoints must use the retained provider"
+                );
+                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                    directory.path(),
+                    family,
+                )
+                .unwrap();
+                let events = store
+                    .read_page(
+                        &stream,
+                        &EventCursor::beginning(stream.clone()),
+                        None,
+                        512,
+                        8 * 1024 * 1024,
+                    )
+                    .unwrap()
+                    .events;
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(
+                            event.body.data,
+                            EventData::SessionModelOverrideChanged {
+                                resolution: ModelResolution::AppliedForTurn
+                            }
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(!events.iter().any(|event| matches!(
+                    event.body.data,
+                    EventData::SessionModelOverrideChanged {
+                        resolution: ModelResolution::Applied { .. }
+                    }
+                )));
+                server.abort();
+            }
+        }
+    }
 
     #[test]
     fn steering_in_the_same_batch_as_a_model_switch_keeps_the_switch() {
@@ -20543,6 +21360,12 @@ mod approval_route_tests {
 
     enum StubBehavior {
         Answer(ChannelApprovalResponse),
+        CapturedAnswer(
+            ChannelApprovalResponse,
+            zeroclaw_api::session_events::EventId,
+        ),
+        CaptureFailure,
+        PendingSendCaptureFailure,
         NoDecision,
         Slow,
         RuntimeTimeout,
@@ -20584,7 +21407,18 @@ mod approval_route_tests {
             _request: &ChannelApprovalRequest,
         ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
             match &self.behavior {
-                StubBehavior::Answer(resp) => Ok(Some(resp.clone())),
+                StubBehavior::Answer(resp) | StubBehavior::CapturedAnswer(resp, _) => {
+                    Ok(Some(resp.clone()))
+                }
+                StubBehavior::CaptureFailure | StubBehavior::PendingSendCaptureFailure => {
+                    Err(zeroclaw_api::session_events::capture::capture_stopped(
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "fixture approval commit outcome unknown",
+                        )
+                        .into(),
+                    ))
+                }
                 StubBehavior::NoDecision => Ok(None),
                 StubBehavior::Slow => {
                     // Far exceeds the route timeout; with a paused clock the
@@ -20602,6 +21436,39 @@ mod approval_route_tests {
             request: &ChannelApprovalRequest,
         ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
             *self.seen_recipient.lock() = Some(recipient.to_string());
+            if matches!(&self.behavior, StubBehavior::PendingSendCaptureFailure) {
+                let (tx, mut rx) = tokio::sync::oneshot::channel();
+                let mut tx = Some(tx);
+                let send_prompt = std::future::poll_fn(move |_| {
+                    if let Some(tx) = tx.take() {
+                        tx.send(Err(zeroclaw_api::session_events::capture::capture_stopped(
+                            std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "fixture capture failure while prompt transport is pending",
+                            )
+                            .into(),
+                        )))
+                        .unwrap();
+                    }
+                    std::task::Poll::<anyhow::Result<()>>::Pending
+                });
+                return match zeroclaw_api::channel::await_approval_prompt_send(send_prompt, &mut rx)
+                    .await?
+                {
+                    zeroclaw_api::channel::ApprovalPromptOutcome::Replied(response) => {
+                        Ok(Some(response))
+                    }
+                    zeroclaw_api::channel::ApprovalPromptOutcome::Sent(()) => {
+                        unreachable!("fixture send never completes")
+                    }
+                };
+            }
+            if let StubBehavior::CapturedAnswer(response, reply_event_id) = &self.behavior {
+                return Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response.clone())
+                        .with_reply_event_id(Some(reply_event_id.clone())),
+                ));
+            }
             if matches!(&self.behavior, StubBehavior::RuntimeTimeout) {
                 return Ok(Some(
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
@@ -20627,12 +21494,14 @@ mod approval_route_tests {
             if let Some(seen) = &self.seen_route_timeout {
                 *seen.lock() = Some(timeout);
             }
-            match tokio::time::timeout(
+            let response = tokio::time::timeout(
                 timeout,
                 self.request_approval_attributed(recipient, request),
-            )
-            .await
-            {
+            );
+            if matches!(&self.behavior, StubBehavior::PendingSendCaptureFailure) {
+                tokio::time::advance(timeout).await;
+            }
+            match response.await {
                 Ok(result) => result,
                 Err(_) => Ok(Some(
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
@@ -20684,16 +21553,100 @@ mod approval_route_tests {
     }
 
     #[tokio::test]
+    async fn routed_approval_preserves_reply_receipt_and_stops_on_capture_failure() {
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_api::session_events::capture::is_capture_stopped;
+
+        let receipt = zeroclaw_api::session_events::EventId::new();
+        let handles = registry(vec![stub(
+            "ops",
+            StubBehavior::CapturedAnswer(ChannelApprovalResponse::Approve, receipt.clone()),
+        )]);
+        let channel = RoutedApprovalChannel {
+            handles,
+            route: route("ops", OnNoApprover::InheritOriginator),
+            origin: None,
+        };
+        let reply = channel
+            .request_approval_attributed("origin", &req())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.reply_event_id, Some(receipt));
+        assert_eq!(reply.decided_by.as_deref(), Some("ops"));
+
+        let origin = Arc::new(stub(
+            "origin",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        ));
+        let seen_origin = Arc::clone(&origin.seen_recipient);
+        let channel = RoutedApprovalChannel {
+            handles: registry(vec![stub("ops", StubBehavior::CaptureFailure)]),
+            route: route("ops", OnNoApprover::InheritOriginator),
+            origin: Some(origin),
+        };
+        let error = channel
+            .request_approval_attributed("origin", &req())
+            .await
+            .unwrap_err();
+        assert!(is_capture_stopped(&error));
+        assert!(error.chain().any(|source| {
+            source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|source| source.kind() == std::io::ErrorKind::BrokenPipe)
+        }));
+        assert!(
+            seen_origin.lock().is_none(),
+            "capture failure cannot select the fallback approver"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn routed_capture_failure_during_send_precedes_expired_timeout_without_fallback() {
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_api::session_events::capture::is_capture_stopped;
+
+        let origin = Arc::new(stub(
+            "origin",
+            StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        ));
+        let seen_origin = Arc::clone(&origin.seen_recipient);
+        let channel = RoutedApprovalChannel {
+            handles: registry(vec![stub("ops", StubBehavior::PendingSendCaptureFailure)]),
+            route: route("ops", OnNoApprover::InheritOriginator),
+            origin: Some(origin),
+        };
+        let error = channel
+            .request_approval_attributed("origin", &req())
+            .await
+            .unwrap_err();
+        assert!(is_capture_stopped(&error));
+        assert!(error.chain().any(|source| {
+            source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|source| source.kind() == std::io::ErrorKind::BrokenPipe)
+        }));
+        assert!(
+            seen_origin.lock().is_none(),
+            "origin fallback must be invoked zero times"
+        );
+    }
+
+    #[tokio::test]
     async fn approver_answer_is_used_and_attributed() {
         let h = registry(vec![stub(
             "ops",
             StubBehavior::Answer(ChannelApprovalResponse::Approve),
         )]);
-        match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
+        match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req())
+            .await
+            .unwrap()
+        {
             RoutedApproval::Decided {
                 response,
                 decider,
                 source,
+                ..
             } => {
                 assert_eq!(response, ChannelApprovalResponse::Approve);
                 assert_eq!(
@@ -20721,8 +21674,9 @@ mod approval_route_tests {
         approver.seen_recipient = Arc::clone(&seen);
         let h = registry(vec![approver]);
 
-        let out =
-            resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "origin", &req()).await;
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "origin", &req())
+            .await
+            .unwrap();
         assert!(matches!(out, RoutedApproval::Decided { .. }));
         assert_eq!(
             seen.lock().as_deref(),
@@ -20741,8 +21695,9 @@ mod approval_route_tests {
         approver.seen_route_timeout = Some(Arc::clone(&seen));
         let h = registry(vec![approver]);
 
-        let out =
-            resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "origin", &req()).await;
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "origin", &req())
+            .await
+            .unwrap();
 
         assert!(matches!(
             out,
@@ -20758,11 +21713,15 @@ mod approval_route_tests {
     #[tokio::test]
     async fn unregistered_approver_fails_closed_by_default() {
         let h = registry(vec![]);
-        match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await {
+        match resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req())
+            .await
+            .unwrap()
+        {
             RoutedApproval::Decided {
                 response,
                 decider,
                 source,
+                ..
             } => {
                 assert_eq!(response, ChannelApprovalResponse::Deny, "fail-closed deny");
                 assert!(decider.is_none(), "synthetic deny has no decider");
@@ -20789,7 +21748,8 @@ mod approval_route_tests {
             "r",
             &req(),
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             matches!(out, RoutedApproval::Fallthrough),
             "InheritOriginator must fall through to the originating fan-out"
@@ -20804,13 +21764,16 @@ mod approval_route_tests {
             "ops",
             StubBehavior::Answer(ChannelApprovalResponse::Approve),
         )]);
-        let out = resolve_routed_approval(&h, &route, "origin", &req()).await;
+        let out = resolve_routed_approval(&h, &route, "origin", &req())
+            .await
+            .unwrap();
         assert!(matches!(
             out,
             RoutedApproval::Decided {
                 response: ChannelApprovalResponse::Deny,
                 source: zeroclaw_api::channel::ApprovalSource::Unavailable,
                 decider: None,
+                ..
             }
         ));
     }
@@ -20840,7 +21803,9 @@ mod approval_route_tests {
     #[tokio::test]
     async fn no_decision_fails_closed() {
         let h = registry(vec![stub("ops", StubBehavior::NoDecision)]);
-        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req())
+            .await
+            .unwrap();
         assert!(
             matches!(
                 out,
@@ -20859,7 +21824,9 @@ mod approval_route_tests {
     #[tokio::test]
     async fn slow_approver_times_out_and_fails_closed() {
         let h = registry(vec![stub("ops", StubBehavior::Slow)]);
-        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req())
+            .await
+            .unwrap();
         // A timeout is the case most easily mistaken for a user's "no": the
         // route returns Some(Deny) exactly as an operator denial would.
         assert!(
@@ -20900,13 +21867,16 @@ mod approval_route_tests {
     #[tokio::test]
     async fn runtime_attributed_timeout_denies_without_decider() {
         let h = registry(vec![stub("ops", StubBehavior::RuntimeTimeout)]);
-        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req()).await;
+        let out = resolve_routed_approval(&h, &route("ops", OnNoApprover::Deny), "r", &req())
+            .await
+            .unwrap();
 
         match &out {
             RoutedApproval::Decided {
                 response: ChannelApprovalResponse::Deny,
                 decider,
                 source: zeroclaw_api::channel::ApprovalSource::TimedOut,
+                ..
             } => assert!(
                 decider.is_none(),
                 "a runtime timeout denial must not name a deciding operator"
@@ -20927,13 +21897,15 @@ mod approval_route_tests {
             "r",
             &req(),
         )
-        .await;
+        .await
+        .unwrap();
 
         match &out {
             RoutedApproval::Decided {
                 response: ChannelApprovalResponse::Deny,
                 decider: Some(decider),
                 source: zeroclaw_api::channel::ApprovalSource::Operator,
+                ..
             } => assert_eq!(decider, "ops"),
             _ => panic!("an operator denial must remain final under inherit-originator: {out:?}"),
         }

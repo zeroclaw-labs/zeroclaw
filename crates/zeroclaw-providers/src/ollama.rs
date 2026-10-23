@@ -523,6 +523,16 @@ impl OllamaModelProvider {
     }
 
     fn response_to_chat_response(&self, response: ApiChatResponse, model: &str) -> ChatResponse {
+        let mut output_blocks = Vec::new();
+        if let Some(model) = &response.model {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {metadata:serde_json::json!({"kind":"served_attribution","protocol":"ollama","model":model})});
+        }
+        if let Some(reason) = &response.done_reason {
+            output_blocks.push(zeroclaw_api::model_provider::ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({"kind":"finish", "protocol":"ollama", "done_reason":reason}),
+            });
+        }
+        let reasoning_content = response.message.thinking.clone();
         let usage = if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
             Some(TokenUsage {
                 input_tokens: response.prompt_eval_count,
@@ -555,10 +565,11 @@ impl OllamaModelProvider {
                 .collect();
             let text = Self::normalize_response_text(response.message.content);
             return ChatResponse {
+                output_blocks,
                 text,
                 tool_calls,
                 usage,
-                reasoning_content: None,
+                reasoning_content,
             };
         }
 
@@ -571,10 +582,11 @@ impl OllamaModelProvider {
         });
 
         ChatResponse {
+            output_blocks,
             text: Some(text),
             tool_calls: vec![],
             usage,
-            reasoning_content: None,
+            reasoning_content,
         }
     }
 
@@ -640,11 +652,10 @@ impl OllamaModelProvider {
                     status, sanitized
                 )
             );
-            anyhow::bail!(
+            return Err(super::api_error_from_parts("ollama", status, &raw).context(format!(
                 "Ollama API error ({}): {}. Is Ollama running? (brew install ollama && ollama serve)",
-                status,
-                sanitized
-            );
+                status, sanitized
+            )));
         }
 
         let chat_response: ApiChatResponse = match serde_json::from_slice(&body) {

@@ -204,6 +204,11 @@ tool-sessions-send-output-appended-alias = Legacy content appended to session '{
 tool-sessions-send-error-append = Failed to append content to session history: { $error }
 tool-sessions-send-error-acp-unsupported = { $tool } does not support { $channel } sessions because durable transcript writes do not deliver messages to the live { $product } session.
 tool-sessions-current-channel = Channel: { $channel }
+tool-sessions-native-empty = No active sessions found.
+tool-sessions-native-reader-unavailable = Native session history is unavailable in this execution context.
+tool-sessions-native-mutation-unsupported = { $tool } cannot mutate native event history. Use an authorized session command.
+tool-sessions-native-history = Session '{ $session_id }': recent messages
+tool-sessions-native-summary = { $session_id }: channel={ $channel }, messages={ $messages }, last_activity={ $last_activity }
 
 tool-screenshot = Capture a screenshot of the current screen. Returns the saved file path.
 tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
@@ -275,3 +280,8 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+# Interactive questions
+tool-ask-user-invalid-timeout = timeout_secs must be at least 1.
+tool-ask-user-choice-outcome = Channel '{ $channel }' structured choice: { $state }.
+tool-ask-user-listener-failed = Channel '{ $channel }' listener failed: { $error }.

@@ -11,6 +11,8 @@ publish = true
 [dependencies]
 # Internal workspace crates
 zeroclaw-api.workspace = true
+zeroclaw-kernel.workspace = true
+zeroclaw-session-host.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tls.workspace = true
@@ -86,6 +88,7 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 libc = "0.2"
 
 [dev-dependencies]
+zeroclaw-infra = { workspace = true, features = ["test-util"] }
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }
 rand = "0.10"
 rcgen = "0.13"

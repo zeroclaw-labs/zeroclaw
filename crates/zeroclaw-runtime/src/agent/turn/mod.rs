@@ -1126,6 +1126,58 @@ fn record_dispatch_trim(
 /// Drop at most one whole turn, then let the caller rebuild and recount the
 /// actual prepared request. Raw-history estimates cannot decide how many
 /// prepared turns fit, especially after hooks or multimodal expansion.
+async fn capture_oversized_dispatch_trim(
+    injected_memory_preamble: &mut Option<MemoryPreamble>,
+    history: &mut Vec<ChatMessage>,
+    crumb_present: &mut bool,
+    reported_tokens: u64,
+    budget: usize,
+) -> Result<PreDispatchTrimResult> {
+    use zeroclaw_api::session_events::capture::{
+        ContextTransformIntent, current_provider_admission,
+    };
+    let capture = if budget > 0 && reported_tokens > budget as u64 {
+        match current_provider_admission() {
+            Some(port) => {
+                port.begin_context_transform(ContextTransformIntent {
+                    reason_key: "pre_dispatch_budget_trim".into(),
+                    algorithm_version: "whole-turn-budget/v1".into(),
+                    budget: budget as u64,
+                })
+                .await?
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let result = surface_oversized_dispatch_if_needed(
+        injected_memory_preamble,
+        history,
+        crumb_present,
+        reported_tokens,
+        budget,
+    );
+    if let Some(capture) = capture {
+        if result.dropped_messages > 0 {
+            capture
+                .complete_snapshot(zeroclaw_api::session_events::capture::ContextSnapshot {
+                    messages: (history.clone())
+                        .into_iter()
+                        .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                        .collect(),
+                    history_has_trim_breadcrumb: Some(*crumb_present),
+                })
+                .await?;
+        } else {
+            capture
+                .failed("retention floor prevents local budget trim".into())
+                .await?;
+        }
+    }
+    Ok(result)
+}
+
 fn surface_oversized_dispatch_if_needed(
     injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
@@ -1602,17 +1654,95 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     p: ToolLoop<'a>,
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
+) -> futures_util::future::BoxFuture<'a, Result<String>> {
     run_tool_call_loop_impl(p, Some(subject), reported_usage)
 }
 
-pub fn run_tool_call_loop(
-    p: ToolLoop<'_>,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
+pub fn run_tool_call_loop(p: ToolLoop<'_>) -> futures_util::future::BoxFuture<'_, Result<String>> {
     run_tool_call_loop_impl(p, None, None)
 }
 
-async fn run_tool_call_loop_impl<'a>(
+fn run_tool_call_loop_impl<'a>(
+    p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+    seed_reported_usage: Option<ReportedRequestUsage>,
+) -> futures_util::future::BoxFuture<'a, Result<String>> {
+    Box::pin(async move {
+        use zeroclaw_api::session_events::capture::{
+            EngineTurnInput, current_provider_admission, current_session_execution,
+        };
+        if current_provider_admission().is_none()
+            && let Some(port) = current_session_execution()
+        {
+            let input = EngineTurnInput {
+                execution_workspace: None,
+                reply_route: None,
+                turn_id: p.turn_id.to_owned(),
+                agent_alias: p.agent_alias.map(str::to_owned),
+                ingress: p.ingress.clone(),
+                parts: zeroclaw_api::session_events::capture::EngineInputPart::text_and_files(
+                    p.memory
+                        .as_ref()
+                        .map(|memory| memory.query.clone())
+                        .or_else(|| {
+                            p.history
+                                .iter()
+                                .rev()
+                                .find(|message| message.role == "user")
+                                .map(|message| message.content.clone())
+                        })
+                        .ok_or_else(|| {
+                            anyhow::Error::msg("session turn has no observed user input")
+                        })?,
+                    vec![],
+                ),
+                provider_ref: p.exec.model_access.provider_name.to_owned(),
+                model: p.exec.model_access.model.to_owned(),
+            };
+            let history = p.history;
+            let crumb = p.history_has_trim_breadcrumb;
+            let engine = async move {
+                let result = run_tool_call_loop_inner(
+                    ToolLoop {
+                        history: &mut *history,
+                        history_has_trim_breadcrumb: &mut *crumb,
+                        ..p
+                    },
+                    initial_ingress,
+                    seed_reported_usage,
+                )
+                .await;
+                if let Some(admission) = current_provider_admission() {
+                    use zeroclaw_api::session_events::capture::{
+                        ContextSnapshot, ContextTransformIntent,
+                    };
+                    let transform = admission
+                        .begin_context_transform(ContextTransformIntent {
+                            reason_key: "turn_history_projection".into(),
+                            algorithm_version: "engine-history/v1".into(),
+                            budget: 0,
+                        })
+                        .await?
+                        .ok_or_else(|| anyhow::Error::msg("native context capture missing"))?;
+                    transform
+                        .complete_snapshot(ContextSnapshot {
+                            messages: (history.clone())
+                                .into_iter()
+                                .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                                .collect(),
+                            history_has_trim_breadcrumb: Some(*crumb),
+                        })
+                        .await?;
+                }
+                result
+            };
+            return port.execute(input, Box::pin(engine)).await;
+        }
+        run_tool_call_loop_inner(p, initial_ingress, seed_reported_usage).await
+    })
+}
+
+async fn run_tool_call_loop_inner<'a>(
     mut p: ToolLoop<'a>,
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
@@ -2379,13 +2509,14 @@ async fn run_tool_call_loop_impl<'a>(
         // rebuilt post-hook request re-measured below is authoritative. A
         // floor is fatal only when the rebuilt request exceeds model capacity.
         // A newest turn above the proactive target can still be dispatched.
-        let mut trim_result = surface_oversized_dispatch_if_needed(
+        let mut trim_result = capture_oversized_dispatch_trim(
             injected_memory_preamble,
             turn_state.history,
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
             trim_budget,
-        );
+        )
+        .await?;
         *history_has_trim_breadcrumb = turn_state.crumb_present;
         let history_was_trimmed = turn_state.history.len() != history_len_before
             || turn_state.crumb_present != crumb_before;
@@ -2483,13 +2614,14 @@ async fn run_tool_call_loop_impl<'a>(
                 // heuristic that decided the previous round stopped early.
                 let before_len = turn_state.history.len();
                 let before_crumb = turn_state.crumb_present;
-                trim_result = surface_oversized_dispatch_if_needed(
+                trim_result = capture_oversized_dispatch_trim(
                     injected_memory_preamble,
                     turn_state.history,
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
                     trim_budget,
-                );
+                )
+                .await?;
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
                 dropped_turns += usize::from(trim_result.dropped_messages > 0);
@@ -2727,6 +2859,18 @@ async fn run_tool_call_loop_impl<'a>(
             );
         }
 
+        use zeroclaw_api::session_events::capture::{
+            ProviderRouteSource, scope_provider_route_source,
+        };
+        let route_source = if hook_selected_model.is_some() {
+            ProviderRouteSource::BeforeCallHook
+        } else if vision_model_provider_box.is_some() {
+            ProviderRouteSource::Vision
+        } else if dispatch_model.starts_with("hint:") {
+            ProviderRouteSource::Routing
+        } else {
+            ProviderRouteSource::Configured
+        };
         let ProviderCallOutcome {
             chat_result,
             attempts,
@@ -2735,25 +2879,28 @@ async fn run_tool_call_loop_impl<'a>(
             streamed_protocol_suppressed,
             streamed_visible_text,
             image_recovery_succeeded,
-        } = call_provider(
-            &ctx,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            provider_dispatch_model,
-            zeroclaw_api::model_provider::ChatRequest {
-                messages: &provider_request_messages,
-                tools: request_tools,
-                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .try_with(Clone::clone)
-                    .ok()
-                    .flatten(),
-            },
-            image_recovery_messages.as_deref(),
-            should_consume_provider_stream,
-            policy,
-            iteration,
-            use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+        } = scope_provider_route_source(
+            route_source,
+            call_provider(
+                &ctx,
+                active_model_provider,
+                active_model_provider_name,
+                provider_request_model,
+                provider_dispatch_model,
+                zeroclaw_api::model_provider::ChatRequest {
+                    messages: &provider_request_messages,
+                    tools: request_tools,
+                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .flatten(),
+                },
+                image_recovery_messages.as_deref(),
+                should_consume_provider_stream,
+                policy,
+                iteration,
+                use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+            ),
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
@@ -2908,7 +3055,7 @@ async fn run_tool_call_loop_impl<'a>(
                     turn_id,
                     &mut turn_state.crumb_present,
                 )
-                .await;
+                .await?;
                 if recovered.recovered() {
                     continue;
                 }
@@ -3270,6 +3417,7 @@ async fn run_tool_call_loop_impl<'a>(
             executable_indices,
             executable_calls,
             stream_calls,
+            capture_handles,
         } = prepare_tool_calls(
             &ctx,
             tools_registry,
@@ -3333,6 +3481,10 @@ async fn run_tool_call_loop_impl<'a>(
             knobs.provider_attempt_allowlist.clone(),
             execution,
         );
+        let execution = zeroclaw_api::session_events::capture::scope_tool_batch(
+            capture_handles.clone(),
+            execution,
+        );
         let execution_result = match shared_budget.clone() {
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,
@@ -3352,8 +3504,9 @@ async fn run_tool_call_loop_impl<'a>(
                     &executable_indices,
                     &executable_calls,
                     &[],
+                    &capture_handles,
                 )
-                .await;
+                .await?;
                 return Err(e);
             }
         };
@@ -3399,8 +3552,9 @@ async fn run_tool_call_loop_impl<'a>(
                 &executable_indices,
                 &executable_calls,
                 &executed_completed_indices,
+                &capture_handles,
             )
-            .await;
+            .await?;
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -3959,8 +4113,12 @@ pub(crate) async fn assemble_owned_execution_with_admission(
                 "SOP step agent '{alias}' has no resolved model provider"
             ))
         })?;
-    let (model_provider, provider_name, model, _model_route_resolver) =
-        crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
+    let zeroclaw_providers::factory::SessionModelProvider {
+        provider: model_provider,
+        provider_ref: provider_name,
+        model,
+        ..
+    } = zeroclaw_providers::factory::build_session_model_provider(config, &provider_ref, None)?;
     // The step agent's own configured temperature — the same source the
     // headless driver reads for `crate::agent::run`.
     let temperature = config
@@ -6366,6 +6524,7 @@ mod active_route_context_tests {
         };
         let call_ctx = base_ctx.for_route("custom.vision", "vision-model", vision_limits);
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("done".to_string()),
             tool_calls: Vec::new(),
             usage: Some(TokenUsage {
@@ -6595,6 +6754,7 @@ vision_model_provider = "custom.vision"
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     Ok(ChatResponse {
+                        output_blocks: Vec::new(),
                         text: None,
                         tool_calls: vec![ToolCall {
                             id: "c1".into(),
@@ -6607,6 +6767,7 @@ vision_model_provider = "custom.vision"
                     })
                 } else {
                     Ok(ChatResponse {
+                        output_blocks: Vec::new(),
                         text: Some("text follow-up".into()),
                         tool_calls: Vec::new(),
                         usage: None,
@@ -7294,6 +7455,7 @@ mod sop_step_reassembly_tests {
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "c1".into(),
@@ -7372,6 +7534,7 @@ mod sop_step_reassembly_tests {
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -7437,6 +7600,7 @@ mod sop_step_reassembly_tests {
                 temperature,
             ));
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("child-done".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -7767,6 +7931,7 @@ mod sop_step_reassembly_tests {
         ) -> Result<ChatResponse> {
             if request.tools.is_none_or(<[_]>::is_empty) {
                 return Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("local-cap-summary".into()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -7775,6 +7940,7 @@ mod sop_step_reassembly_tests {
             }
 
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "budget-call".into(),
@@ -7942,6 +8108,7 @@ mod sop_step_reassembly_tests {
                 );
                 assert!(request.messages.iter().any(|m| m.content == "hook-rewrite"));
                 Ok(ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("prepared summary".into()),
                     tool_calls: vec![],
                     usage: None,
@@ -9098,6 +9265,7 @@ mod sop_step_reassembly_tests {
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
                     id: "00000000-0000-0000-0000-000000000099".into(),
@@ -9457,6 +9625,7 @@ mod tool_lifecycle_abandonment_tests {
 
     fn text_response() -> ChatResponse {
         ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("done".to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -10086,6 +10255,7 @@ mod tool_lifecycle_abandonment_tests {
         let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![
                     tool_call("call-a", "echo_first", serde_json::json!({"n": 1})),
@@ -10139,6 +10309,7 @@ mod tool_lifecycle_abandonment_tests {
         let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![tool_call(
                     "call-1",
@@ -10187,6 +10358,7 @@ mod tool_lifecycle_abandonment_tests {
         let token = CancellationToken::new();
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![
                     tool_call("call-a", "interrupt_tool", serde_json::json!({"n": 1})),
@@ -10356,6 +10528,7 @@ mod tool_lifecycle_abandonment_tests {
         let token = CancellationToken::new();
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![tool_call(
                     "call-a",

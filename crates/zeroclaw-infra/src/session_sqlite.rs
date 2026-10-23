@@ -18,6 +18,7 @@ const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5)
 
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
+    sessions_dir: PathBuf,
     conn: Mutex<Connection>,
 }
 
@@ -59,6 +60,52 @@ pub(crate) fn has_committed_jsonl_import_receipts(workspace_dir: &Path) -> Resul
 }
 
 impl SqliteSessionBackend {
+    pub(crate) fn upgrade_keys(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare("SELECT session_key FROM session_metadata UNION SELECT session_key FROM sessions ORDER BY session_key")?;
+        let keys = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(keys)
+    }
+
+    pub(crate) fn upgrade_metadata(&self, session_key: &str) -> Result<Option<SessionMetadata>> {
+        let conn = self.conn.lock();
+        let raw = conn.query_row(
+            "SELECT created_at,last_activity,message_count,name,agent_alias,channel_id,room_id,sender_id,principal_id FROM session_metadata WHERE session_key=?1",
+            params![session_key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?)),
+        ).optional()?;
+        raw.map(
+            |(
+                created,
+                activity,
+                count,
+                name,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
+                principal_id,
+            )| {
+                Ok(SessionMetadata {
+                    key: session_key.into(),
+                    name,
+                    agent_alias,
+                    channel_id,
+                    room_id,
+                    sender_id,
+                    principal_id,
+                    created_at: DateTime::parse_from_rfc3339(&created)?.with_timezone(&Utc),
+                    last_activity: DateTime::parse_from_rfc3339(&activity)?.with_timezone(&Utc),
+                    message_count: usize::try_from(count)?,
+                })
+            },
+        )
+        .transpose()
+    }
+
     /// Open or create the sessions database.
     ///
     /// A daemon's gateway, channels and RPC plane each open this database
@@ -67,8 +114,17 @@ impl SqliteSessionBackend {
     /// schema and column migration run in one IMMEDIATE transaction: a later
     /// opener waits for the first and then finds every column in place.
     pub fn new(workspace_dir: &Path) -> Result<Self> {
-        let sessions_dir = workspace_dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
+        let guard =
+            crate::session_events::installation::legacy_guard(&workspace_dir.join("sessions"))?;
+        Self::open_locked(&guard)
+    }
+
+    /// The borrowed installation fence covers schema initialization and source
+    /// reads during upgrade. Public constructors admit legacy mode first.
+    pub(crate) fn open_locked(
+        guard: &crate::session_events::installation::InstallationGuard,
+    ) -> Result<Self> {
+        let sessions_dir = guard.directory().to_owned();
         let db_path = sessions_dir.join("sessions.db");
 
         let mut conn = Connection::open(&db_path)
@@ -208,6 +264,7 @@ impl SqliteSessionBackend {
         tx.commit().context("Failed to commit the session schema")?;
 
         Ok(Self {
+            sessions_dir,
             conn: Mutex::new(conn),
         })
     }
@@ -520,6 +577,11 @@ impl SqliteSessionBackend {
         F: FnMut(&Path, &Path, &(String, i64)) -> Result<()>,
     {
         let sessions_dir = workspace_dir.join("sessions");
+        // Same publication lock as every legacy writer. Native-fenced
+        // families may not be staged, imported, or archived by this migrator.
+        let family_guard =
+            crate::session_events::installation::InstallationGuard::acquire(&sessions_dir)?;
+        family_guard.require_legacy()?;
         let mutation_lock = crate::session_store::mutation_lock_for(&sessions_dir)
             .context("Failed to acquire JSONL session mutation lock")?;
         let mut mutation_guard = mutation_lock.lock();
@@ -883,6 +945,26 @@ impl SqliteSessionBackend {
 }
 
 impl SessionBackend for SqliteSessionBackend {
+    fn require_legacy_access(&self) -> std::io::Result<()> {
+        crate::session_events::installation::legacy_guard(&self.sessions_dir).map(|_| ())
+    }
+
+    fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare("SELECT role, content FROM sessions WHERE session_key = ?1 ORDER BY id ASC")
+            .map_err(std::io::Error::other)?;
+        let rows = statement
+            .query_map(params![session_key], |row| {
+                Ok(ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                })
+            })
+            .map_err(std::io::Error::other)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(std::io::Error::other)
+    }
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -939,12 +1021,14 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
     }
 
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(std::io::Error::other)?;
         Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
@@ -965,6 +1049,7 @@ impl SessionBackend for SqliteSessionBackend {
         messages: &[ChatMessage],
         breadcrumb_present: bool,
     ) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(std::io::Error::other)?;
         Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
@@ -989,6 +1074,7 @@ impl SessionBackend for SqliteSessionBackend {
         messages: &[ChatMessage],
         breadcrumb_present: bool,
     ) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(std::io::Error::other)?;
         let exists = tx
@@ -1011,6 +1097,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
 
         let last_id: Option<i64> = conn
@@ -1042,6 +1129,7 @@ impl SessionBackend for SqliteSessionBackend {
     /// Efficiently update the last message in-place (single UPDATE instead of
     /// DELETE + INSERT). Used for incremental persistence during streaming.
     fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
 
         let last_id: Option<i64> = conn
@@ -1145,6 +1233,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let cutoff = (Utc::now() - Duration::hours(i64::from(ttl_hours))).to_rfc3339();
 
@@ -1172,6 +1261,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
 
         conn.execute(
@@ -1196,6 +1286,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
 
         // Check if session exists
@@ -1233,6 +1324,7 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         owner_principal_id: &str,
     ) -> std::io::Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         // The predicated metadata delete IS the ownership check: zero rows
         // means not-owned (or missing) and nothing else is touched.
@@ -1256,6 +1348,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let rows = conn
             .execute(
@@ -1267,6 +1360,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn rename_agent_attribution(&self, from: &str, to: &str) -> std::io::Result<usize> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let rows = conn
             .execute(
@@ -1302,6 +1396,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let name_val = if name.is_empty() { None } else { Some(name) };
         conn.execute(
@@ -1371,6 +1466,7 @@ impl SessionBackend for SqliteSessionBackend {
         state: &str,
         turn_id: Option<&str>,
     ) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         let started_at = if state == "running" {
@@ -1588,6 +1684,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let alias_val = if agent_alias.is_empty() {
             None
@@ -1606,6 +1703,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn set_session_principal(&self, session_key: &str, principal_id: &str) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         let principal_val = if principal_id.is_empty() {
             None
@@ -1637,6 +1735,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         Self::set_session_trim_breadcrumb_on(&conn, session_key, present)
             .map_err(std::io::Error::other)
@@ -1661,6 +1760,7 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         context: SessionContext<'_>,
     ) -> std::io::Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let conn = self.conn.lock();
         fn normalize(v: Option<&str>) -> Option<&str> {
             v.map(str::trim).filter(|s| !s.is_empty())

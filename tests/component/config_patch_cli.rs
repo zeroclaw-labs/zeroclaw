@@ -118,6 +118,7 @@ fn test_state(config: Config) -> AppState {
         path_prefix: String::new(),
         web_dist_dir: None,
         session_backend: None,
+        native_sessions: None,
         session_queue: Arc::new(gateway::session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry: None,
         pending_pairings: None,
@@ -1014,6 +1015,238 @@ fn agent_targeting_config_commands_fail_closed_while_daemon_owns_config() {
     assert!(!config.agents.contains_key("recreated"));
 }
 
+fn seed_provider_rename_config(config_dir: &std::path::Path) {
+    let config = format!(
+        r#"schema_version = {}
+locale = "en"
+
+[providers.models.ollama.original]
+model = "local-model"
+
+[providers.tts.elevenlabs.original]
+
+[risk_profiles.default]
+
+[agents.fixture]
+model_provider = "ollama.original"
+tts_provider = "elevenlabs.original"
+risk_profile = "default"
+"#,
+        zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+    );
+    std::fs::write(config_dir.join("config.toml"), config).expect("seed provider aliases");
+}
+
+fn run_provider_rename(config_dir: &std::path::Path, category: &str, family: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .current_dir(config_dir)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env_remove("ZEROCLAW_DATA_DIR")
+        .env_remove("ZEROCLAW_WORKSPACE")
+        .env("RUST_LOG", "off")
+        .arg("--config-dir")
+        .arg(config_dir)
+        .args([
+            "providers",
+            "rename",
+            category,
+            family,
+            "original",
+            "renamed",
+        ])
+        .output()
+        .expect("run provider rename CLI")
+}
+
+fn seed_native_provider_rename_family(
+    data_dir: &std::path::Path,
+    backend: zeroclaw_infra::session_events::installation::NativeBackend,
+) {
+    use zeroclaw_api::session_events::{
+        AppendRequest, BranchId, CaptureMode, EventActor, EventCursor, EventData, SessionEvent,
+        SessionId, SessionStreamId,
+    };
+    use zeroclaw_infra::session_events::installation::{NativeBackend, family_identity};
+
+    zeroclaw_infra::session_events::upgrade::upgrade_installation(data_dir, backend, |_| {
+        "fixture".into()
+    })
+    .expect("upgrade format");
+
+    let store = zeroclaw_infra::session_events::open_event_store(
+        data_dir,
+        match backend {
+            NativeBackend::Sqlite => "sqlite",
+            NativeBackend::Jsonl => "jsonl",
+        },
+    )
+    .expect("open native store");
+    let stream = SessionStreamId::new();
+    let mut event = SessionEvent::typed(
+        stream.clone(),
+        EventData::SessionStarted {
+            session_id: SessionId::new(),
+            owning_agent: "fixture".into(),
+            capture_mode: CaptureMode::Native,
+        },
+        EventActor::System {
+            component: "fixture".into(),
+        },
+    )
+    .expect("native event");
+    event.branch_id = Some(BranchId::new());
+    let (identity, payload) = family_identity(stream.clone(), "fixture").unwrap();
+    store
+        .append_batch(AppendRequest {
+            stream_id: stream.clone(),
+            expected_head: EventCursor::beginning(stream.clone()),
+            idempotency_key: "initialize".into(),
+            events: vec![event, identity],
+            payloads: vec![payload],
+            erasure_reference_commitment: None,
+        })
+        .expect("initialize native family");
+}
+
+#[test]
+fn model_provider_rename_cli_without_native_history_updates_saved_config() {
+    let config_dir = tempfile::tempdir().unwrap();
+    seed_provider_rename_config(config_dir.path());
+    let output = run_provider_rename(config_dir.path(), "models", "ollama");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config: Config =
+        toml::from_str(&std::fs::read_to_string(config_dir.path().join("config.toml")).unwrap())
+            .unwrap();
+    assert!(config.providers.models.find("ollama", "original").is_none());
+    assert!(config.providers.models.find("ollama", "renamed").is_some());
+    assert_eq!(config.agents["fixture"].model_provider, "ollama.renamed");
+    assert_eq!(config.agents["fixture"].tts_provider, "elevenlabs.original");
+}
+
+#[test]
+fn model_provider_rename_cli_refuses_native_frozen_and_migrating_history() {
+    use zeroclaw_infra::session_events::installation::{InstallationGuard, NativeBackend};
+    for phase in ["sqlite", "jsonl", "frozen", "migrating"] {
+        let config_dir = tempfile::tempdir().unwrap();
+        seed_provider_rename_config(config_dir.path());
+        let data_dir = config_dir.path().join("data");
+        if phase == "frozen" {
+            std::fs::create_dir_all(data_dir.join("sessions")).unwrap();
+            std::fs::write(data_dir.join("sessions/broken.jsonl"), b"invalid json\n").unwrap();
+            assert!(
+                zeroclaw_infra::session_events::upgrade::upgrade_installation(
+                    &data_dir,
+                    NativeBackend::Sqlite,
+                    |_| "fixture".into(),
+                )
+                .is_err()
+            );
+        } else {
+            seed_native_provider_rename_family(
+                &data_dir,
+                if phase == "jsonl" {
+                    NativeBackend::Jsonl
+                } else {
+                    NativeBackend::Sqlite
+                },
+            );
+            if phase == "migrating" {
+                // A failed target open leaves the actual migration's durable fence.
+                std::fs::write(
+                    data_dir.join("sessions/session-events-jsonl"),
+                    b"blocked target",
+                )
+                .unwrap();
+                assert!(
+                    zeroclaw_infra::session_events::migration::migrate_installation(
+                        &data_dir,
+                        NativeBackend::Jsonl
+                    )
+                    .is_err()
+                );
+                let format = InstallationGuard::acquire(&data_dir.join("sessions")).unwrap();
+                assert!(format.active().is_err());
+            }
+        }
+        let config_path = config_dir.path().join("config.toml");
+        let locator_path = data_dir.join("sessions/session-format.json");
+        let before = std::fs::read(&config_path).unwrap();
+        let before_locator = std::fs::read(&locator_path).unwrap();
+        let output = run_provider_rename(config_dir.path(), "models", "ollama");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{phase} must reject rename");
+        assert!(
+            stderr.contains("native session history"),
+            "{phase}: {stderr}"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), before, "{phase}");
+        assert_eq!(
+            std::fs::read(&locator_path).unwrap(),
+            before_locator,
+            "{phase}"
+        );
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[test]
+fn model_provider_rename_cli_cannot_bypass_live_owner_without_endpoint() {
+    let config_dir = tempfile::tempdir().unwrap();
+    seed_provider_rename_config(config_dir.path());
+    let config_path = config_dir.path().join("config.toml");
+    let before = std::fs::read(&config_path).unwrap();
+    let owner = zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(
+        &config_dir.path().join("data"),
+    )
+    .unwrap();
+    let output = run_provider_rename(config_dir.path(), "models", "ollama");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ownership could not be acquired"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), before);
+    drop(owner);
+    let output = run_provider_rename(config_dir.path(), "models", "ollama");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn non_model_provider_rename_cli_ignores_native_history_guard() {
+    let config_dir = tempfile::tempdir().unwrap();
+    seed_provider_rename_config(config_dir.path());
+    seed_native_provider_rename_family(
+        &config_dir.path().join("data"),
+        zeroclaw_infra::session_events::installation::NativeBackend::Sqlite,
+    );
+    let output = run_provider_rename(config_dir.path(), "tts", "elevenlabs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config: Config =
+        toml::from_str(&std::fs::read_to_string(config_dir.path().join("config.toml")).unwrap())
+            .unwrap();
+    assert_eq!(config.agents["fixture"].tts_provider, "elevenlabs.renamed");
+    assert_eq!(config.agents["fixture"].model_provider, "ollama.original");
+    assert!(
+        config
+            .get_map_keys("providers.tts.elevenlabs")
+            .unwrap()
+            .contains(&"renamed".to_string())
+    );
+}
+
 #[cfg(feature = "agent-runtime")]
 #[test]
 fn standalone_agent_ownership_uses_resolved_temp_data_dir_and_preserves_alias_validation() {
@@ -1118,9 +1351,16 @@ fn standalone_acp_ownership_refuses_before_store_open_and_retains_stdio_authorit
         String::from_utf8_lossy(&started.stderr)
     );
     assert!(
-        store_path.exists(),
-        "successful startup must open the ACP store"
+        resolved_data_dir
+            .join("sessions/session-events.db")
+            .is_file(),
+        "successful startup must prepare the standard session store"
     );
+    assert!(
+        !store_path.exists(),
+        "fresh startup must not create an ACP DB"
+    );
+    assert!(!store_path.with_extension("db.backup").exists());
 
     // The server must retain ownership even after its construction authority is dropped.
     let config = Config {
@@ -1137,4 +1377,32 @@ fn standalone_acp_ownership_refuses_before_store_open_and_retains_stdio_authorit
     drop(server);
     let _released = ConfigOwnershipGuard::acquire(&resolved_data_dir)
         .expect("dropping the final server owner must release ownership");
+}
+
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+#[test]
+fn standalone_acp_refuses_startup_when_standard_session_storage_is_unavailable() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.8"}]"#,
+    );
+    let data_dir = config_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("data directory");
+    std::fs::write(data_dir.join("sessions"), b"fixture storage obstruction")
+        .expect("block session directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("ZEROCLAW_CONFIG_DIR", config_dir.path())
+        .env_remove("ZEROCLAW_DATA_DIR")
+        .env_remove("ZEROCLAW_WORKSPACE")
+        .env("RUST_LOG", "off")
+        .arg("acp")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ACP with unavailable standard storage");
+    assert!(
+        !output.status.success(),
+        "ACP must propagate persistent storage initialization failure"
+    );
+    assert!(data_dir.join("sessions").is_file());
 }

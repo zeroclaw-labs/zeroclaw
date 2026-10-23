@@ -693,14 +693,19 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
+    let execution = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
         &config,
         &job,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
         Some(selection),
-    )
-    .await;
+    );
+    let result = match state.native_sessions.clone() {
+        Some(source) => {
+            zeroclaw_kernel::session::engine::scope_engine_session_source(source, execution).await
+        }
+        None => execution.await,
+    };
 
     Json(serde_json::json!({
         "status": result.status,
@@ -1769,6 +1774,16 @@ pub async fn handle_api_sessions_list(
         return e.into_response();
     }
 
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(
+            async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                crate::session_history::list(&state, subject.as_deref(), false).await
+            }
+            .await,
+        );
+    }
+
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
             "sessions": [],
@@ -1886,6 +1901,16 @@ pub async fn handle_api_session_messages(
         return e.into_response();
     }
 
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                let native = crate::session_history::query(&state, &family, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
+                let messages = native.query.messages(native.stream.clone()).await?.into_iter().map(|message| serde_json::json!({"message_id":message.message_id,"role":message.role,"content":message.text,"files":message.files,"unavailable_parts":message.unavailable_parts})).collect::<Vec<_>>();
+                Ok(serde_json::json!({"session_id":id,"messages":messages,"session_persistence":true}))
+        }.await);
+    }
+
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
             "session_id": id,
@@ -1925,6 +1950,19 @@ pub async fn handle_api_session_message_post(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
+    }
+
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(async {
+                anyhow::ensure!(!body.content.trim().is_empty(), "empty_assistant_content");
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                let port = crate::session_history::command(&state, &family, subject.as_deref()).await?;
+                let message_id = port.append_assistant(&body.content).await?;
+                let display_id = gateway_display_session_id(&family);
+                let _ = state.event_tx.send(serde_json::json!({"type":"message","session_id":display_id,"role":"assistant","content":body.content,"source":"api"}));
+                Ok(serde_json::json!({"status":"ok","session_id":display_id,"message_id":message_id,"message":{"role":"assistant","content":body.content},"session_persistence":true}))
+        }.await);
     }
 
     if body.content.trim().is_empty() {
@@ -2016,6 +2054,33 @@ pub async fn handle_api_session_delete(
         return e.into_response();
     }
 
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(
+            async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                let port =
+                    crate::session_history::command(&state, &family, subject.as_deref()).await?;
+                port.request_cancellation(None, &family, "gateway_session_delete")
+                    .await?;
+                let cancellation = {
+                    let tokens = state
+                        .cancel_tokens
+                        .lock()
+                        .map_err(|_| anyhow::Error::msg("gateway_cancellation_lock_poisoned"))?;
+                    resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key))
+                        .and_then(|key| tokens.get(&key).cloned())
+                };
+                if let Some(token) = cancellation {
+                    token.cancel();
+                }
+                port.close("gateway_session_delete").await?;
+                Ok(serde_json::json!({"deleted":true,"session_id":id,"history_retained":true}))
+            }
+            .await,
+        );
+    }
+
     let Some(ref backend) = state.session_backend else {
         return (
             StatusCode::NOT_FOUND,
@@ -2100,6 +2165,22 @@ pub async fn handle_api_session_rename(
         return e.into_response();
     }
 
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(
+            async {
+                let name = body["name"].as_str().unwrap_or("").trim();
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                crate::session_history::command(&state, &family, subject.as_deref())
+                    .await?
+                    .rename(name)
+                    .await?;
+                Ok(serde_json::json!({"session_id":id,"name":name}))
+            }
+            .await,
+        );
+    }
+
     let Some(ref backend) = state.session_backend else {
         return (
             StatusCode::NOT_FOUND,
@@ -2147,6 +2228,16 @@ pub async fn handle_api_sessions_running(
         return e.into_response();
     }
 
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(
+            async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                crate::session_history::list(&state, subject.as_deref(), true).await
+            }
+            .await,
+        );
+    }
+
     let Some(ref backend) = state.session_backend else {
         return Json(serde_json::json!({
             "sessions": [],
@@ -2180,6 +2271,19 @@ pub async fn handle_api_session_state(
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
+    }
+
+    if state.native_sessions.is_some() {
+        return crate::session_history::response(async {
+                use zeroclaw_api::session_events::projection::TurnStatus;
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                let native = crate::session_history::query(&state, &family, subject.as_deref()).await?.ok_or_else(|| anyhow::Error::msg("session_not_found"))?;
+                let history = native.query.project_history(native.stream).await?;
+                let active = history.turns.iter().find(|(_, turn)| matches!(turn.status, TurnStatus::Queued|TurnStatus::Running));
+                let unknown = history.turns.values().max_by_key(|turn| turn.accepted_sequence).is_some_and(|turn| turn.status == TurnStatus::Unknown);
+                Ok(serde_json::json!({"session_id":id,"state":if active.is_some(){"running"}else if unknown{"unknown"}else{"idle"},"turn_id":active.map(|(id,_)| id.to_string()),"source_cursor":history.source_cursor}))
+        }.await);
     }
 
     let Some(ref backend) = state.session_backend else {
@@ -2244,6 +2348,20 @@ pub async fn handle_api_session_abort(
     };
 
     if let (Some(cancel_key), Some(token)) = (cancel_key, token) {
+        if state.native_sessions.is_some() {
+            let recorded = async {
+                let subject = crate::session_history::header_subject(&state, &headers)?;
+                let family = crate::session_history::family(&state, &id).await?;
+                crate::session_history::command(&state, &family, subject.as_deref())
+                    .await?
+                    .request_cancellation(None, &cancel_key, "gateway_operator_abort")
+                    .await
+            }
+            .await;
+            if let Err(error) = recorded {
+                return crate::session_history::response(Err(error));
+            }
+        }
         token.cancel();
         ::zeroclaw_log::record!(
             INFO,
@@ -2509,6 +2627,7 @@ pub(crate) mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             session_backend: None,
+            native_sessions: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
             pending_pairings: None,

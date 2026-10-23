@@ -60,6 +60,7 @@ impl ModelProvider for ScriptedModelProvider {
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("done".into()),
                 tool_calls: vec![],
                 usage: None,
@@ -391,6 +392,7 @@ fn build_agent_with_config(
 /// Helper: create a ChatResponse with tool calls (native format).
 fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(String::new()),
         tool_calls: calls,
         usage: None,
@@ -401,6 +403,7 @@ fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
 /// Helper: create a plain text ChatResponse.
 fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(text.into()),
         tool_calls: vec![],
         usage: None,
@@ -411,6 +414,7 @@ fn text_response(text: &str) -> ChatResponse {
 /// Helper: create an XML-style tool call response.
 fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
     ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(format!(
             "<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>"
         )),
@@ -890,6 +894,7 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 #[tokio::test]
 async fn turn_rejects_empty_text_response() {
     let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(String::new()),
         tool_calls: vec![],
         usage: None,
@@ -911,6 +916,7 @@ async fn turn_rejects_empty_text_response() {
 #[tokio::test]
 async fn turn_rejects_none_text_response() {
     let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+        output_blocks: Vec::new(),
         text: None,
         tool_calls: vec![],
         usage: None,
@@ -937,6 +943,7 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
     };
 
     let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+        output_blocks: Vec::new(),
         text: Some("<think>internal reasoning</think>".to_string()),
         tool_calls: vec![],
         usage: Some(zeroclaw_providers::traits::TokenUsage {
@@ -976,6 +983,7 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
 async fn turn_preserves_text_alongside_tool_calls() {
     let model_provider = Box::new(ScriptedModelProvider::new(vec![
         ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("Let me check...".into()),
             tool_calls: vec![ToolCall {
                 id: "tc1".into(),
@@ -1402,6 +1410,7 @@ async fn multi_turn_maintains_growing_history() {
 async fn native_dispatcher_handles_stringified_arguments() {
     let dispatcher = NativeToolDispatcher;
     let response = ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(String::new()),
         tool_calls: vec![ToolCall {
             id: "tc1".into(),
@@ -1429,6 +1438,7 @@ async fn native_dispatcher_handles_stringified_arguments() {
 #[test]
 fn xml_dispatcher_handles_nested_json() {
     let response = ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(
             r#"<tool_call>
 {"name": "file_write", "arguments": {"path": "test.json", "content": "{\"key\": \"value\"}"}}
@@ -1453,6 +1463,7 @@ fn xml_dispatcher_handles_nested_json() {
 #[test]
 fn xml_dispatcher_handles_empty_tool_call_tag() {
     let response = ChatResponse {
+        output_blocks: Vec::new(),
         text: Some("<tool_call>\n</tool_call>\nSome text".into()),
         tool_calls: vec![],
         usage: None,
@@ -1468,6 +1479,7 @@ fn xml_dispatcher_handles_empty_tool_call_tag() {
 #[test]
 fn xml_dispatcher_handles_unclosed_tool_call() {
     let response = ChatResponse {
+        output_blocks: Vec::new(),
         text: Some("Before\n<tool_call>\n{\"name\": \"shell\"}".into()),
         tool_calls: vec![],
         usage: None,

@@ -629,6 +629,7 @@ mod argument_preservation_tests {
         };
         let resp = if native {
             ChatResponse {
+                output_blocks: Vec::new(),
                 text: None,
                 tool_calls: vec![ToolCall {
                     id: "call-test".into(),
@@ -641,6 +642,7 @@ mod argument_preservation_tests {
             }
         } else {
             ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(format!(
                     "<tool_call>{}</tool_call>",
                     json!({"id": "call-test", "name": name, "arguments": arguments})
@@ -945,6 +947,7 @@ mod cost_usd_regression_tests {
         };
 
         let resp = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("hello".to_string()),
             tool_calls: vec![],
             usage: Some(TokenUsage {
@@ -1103,6 +1106,7 @@ mod cost_usd_regression_tests {
             "served.provider",
             "served-model",
             ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(
                     "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}</tool_call>"
                         .to_string(),

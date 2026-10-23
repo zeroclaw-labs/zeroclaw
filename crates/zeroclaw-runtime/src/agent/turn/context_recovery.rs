@@ -85,6 +85,71 @@ pub(crate) async fn try_recover_context_overflow(
     context_limits: zeroclaw_config::schema::ResolvedContextLimits,
     agent_alias: Option<&str>,
     turn_id: &str,
+    crumb_present: &mut bool,
+) -> anyhow::Result<ContextRecovery> {
+    if !zeroclaw_providers::reliable::is_context_window_exceeded(e) {
+        return Ok(ContextRecovery::NotOverflow);
+    }
+    use zeroclaw_api::session_events::capture::{
+        ContextTransformIntent, current_provider_admission,
+    };
+    let capture = match current_provider_admission() {
+        Some(port) => {
+            port.begin_context_transform(ContextTransformIntent {
+                reason_key: "context_overflow_repair".into(),
+                algorithm_version: "whole-turn-recovery/v1".into(),
+                budget: (estimate_history_tokens(history).saturating_mul(2) / 3) as u64,
+            })
+            .await?
+        }
+        None => None,
+    };
+    let outcome = try_recover_context_overflow_unrecorded(
+        injected_memory_preamble,
+        history,
+        e,
+        iteration,
+        event_tx,
+        on_delta,
+        observer,
+        context_limits,
+        agent_alias,
+        turn_id,
+        crumb_present,
+    )
+    .await;
+    if let Some(capture) = capture {
+        if outcome.recovered() {
+            capture
+                .complete_snapshot(zeroclaw_api::session_events::capture::ContextSnapshot {
+                    messages: (history.clone())
+                        .into_iter()
+                        .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                        .collect(),
+                    history_has_trim_breadcrumb: Some(*crumb_present),
+                })
+                .await?;
+        } else {
+            capture
+                .failed("retention floor prevents local context recovery".into())
+                .await?;
+        }
+    }
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_recover_context_overflow_unrecorded(
+    injected_memory_preamble: &mut Option<super::MemoryPreamble>,
+    history: &mut Vec<ChatMessage>,
+    e: &anyhow::Error,
+    iteration: usize,
+    event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<super::events::DraftEvent>>,
+    observer: &dyn Observer,
+    context_limits: zeroclaw_config::schema::ResolvedContextLimits,
+    agent_alias: Option<&str>,
+    turn_id: &str,
     // Owner-tracked breadcrumb provenance for `history` (see
     // `history_trim::insert_breadcrumb_deduped`); set when this recovery
     // inserts a fresh crumb so classification never depends on text.
@@ -290,7 +355,8 @@ mod tests {
                 "test",
                 &mut crumb,
             )
-            .await,
+            .await
+            .expect("context recovery capture"),
             ContextRecovery::Recovered
         );
         let first = rx.try_recv().unwrap();
@@ -307,7 +373,9 @@ mod tests {
         assert!(json.contains("genuine retry text"));
         assert!(!json.contains("private reasoning"));
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        let store =
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
+                .unwrap();
         store
             .create_session("typed-trim", "agent", "/tmp", None)
             .unwrap();
@@ -315,7 +383,9 @@ mod tests {
             .persist_retained_context_seed("typed-trim", &first.retained_messages, first.breadcrumb)
             .unwrap();
         drop(store);
-        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        let store =
+            zeroclaw_infra::session_repository::SessionRepository::legacy_fixture(tmp.path())
+                .unwrap();
         let retained = store
             .load_session("typed-trim")
             .unwrap()
@@ -345,7 +415,8 @@ mod tests {
                 "test",
                 &mut crumb,
             )
-            .await,
+            .await
+            .expect("context recovery capture"),
             ContextRecovery::Recovered
         );
         let second = rx.try_recv().unwrap();
@@ -389,6 +460,7 @@ mod tests {
             crumb_present,
         )
         .await
+        .expect("context recovery capture")
     }
 
     #[derive(Default)]
@@ -439,7 +511,8 @@ mod tests {
             "turn-1",
             &mut false,
         )
-        .await;
+        .await
+        .expect("context recovery capture");
         assert_eq!(recovered, ContextRecovery::Recovered);
         let events = observer.0.lock().expect("trim events lock");
         assert!(events.iter().any(|event| matches!(

@@ -293,6 +293,37 @@ pub async fn process_file_entry(
     persist_upload_bytes(bytes, &filename, session_id, upload_root, sessions).await
 }
 
+/// Historical rendition comes from the exact bytes the upload owner admitted
+/// and persisted. No pathname is re-read and no second file id is allocated.
+pub async fn process_file_entry_with_history(
+    entry: &FileEntry,
+    session_id: &str,
+    upload_root: &str,
+    is_wss: bool,
+    source: Option<&AttachmentSource>,
+    sessions: &SessionStore,
+) -> Result<
+    (
+        FileEntryResult,
+        zeroclaw_api::session_events::capture::EngineFileInput,
+    ),
+    JsonRpcError,
+> {
+    use zeroclaw_api::session_events::{PayloadId, PayloadRecord};
+    let (bytes, filename) = load_file_entry(entry, is_wss, source).await?;
+    let representation =
+        PayloadRecord::new(PayloadId::new(), "session.bytes/v1".into(), bytes.clone())
+            .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))?;
+    let result = persist_upload_bytes(bytes, &filename, session_id, upload_root, sessions).await?;
+    let history = zeroclaw_api::session_events::capture::EngineFileInput {
+        file_id: result.ref_id.clone(),
+        representation,
+        registration: serde_json::json!({"source":"rpc_upload_owner","filename":filename,"workspace_path":result.workspace_path,"byte_len":result.size_bytes}),
+        policy_evidence: serde_json::json!({"source":"authorized_rpc_attachment","transport":if is_wss {"wss"}else{"local"}}),
+    };
+    Ok((result, history))
+}
+
 /// Resolve one file entry to its bytes and display filename, without
 /// persisting anything: decode `data_b64`, or read `path` through the
 /// authorized source.
@@ -747,6 +778,7 @@ mod tests {
             _: Option<f64>,
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("stub".into()),
                 tool_calls: vec![],
                 usage: None,

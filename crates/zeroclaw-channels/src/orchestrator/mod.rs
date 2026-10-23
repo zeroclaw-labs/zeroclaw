@@ -7,6 +7,7 @@ pub mod acp_server;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
+mod session_history;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -735,6 +736,7 @@ struct ChannelRuntimeContext {
     ack_reactions: bool,
     show_tool_calls: bool,
     session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+    native_sessions: Option<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[risk_profiles]` config while preserving the initiating channel as a
@@ -2713,6 +2715,39 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     )
 }
 
+async fn record_channel_model_switch(
+    ctx: &ChannelRuntimeContext,
+    history_key: &str,
+    provider_ref: &str,
+    model: &str,
+    automatic: bool,
+    disposition: zeroclaw_api::session_events::capture::ModelChangeDisposition,
+) -> anyhow::Result<()> {
+    if let Some(port) = zeroclaw_api::session_events::capture::current_provider_admission() {
+        let thinking = ctx
+            .thinking_overrides
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(history_key)
+            .map(|level| level.as_str().to_string());
+        port.observe_model_change(
+            zeroclaw_api::session_events::capture::ModelOverrideSelection::Set {
+                provider_ref: provider_ref.into(),
+                model: model.into(),
+                thinking,
+                route_mode: if automatic {
+                    zeroclaw_api::session_events::capture::ModelRouteMode::Automatic
+                } else {
+                    zeroclaw_api::session_events::capture::ModelRouteMode::Manual
+                },
+            },
+            disposition,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn should_bypass_reply_intent_precheck(
     msg: &zeroclaw_api::channel::ChannelMessage,
     direct_message: bool,
@@ -3162,8 +3197,12 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             defaults: next_defaults.clone(),
             generation: next_generation,
         });
-        let cache_key =
-            provider_cache_key(&next_defaults.default_model_provider, None, next_generation);
+        let cache_key = provider_cache_key(
+            &next_defaults.default_model_provider,
+            None,
+            next_generation,
+            None,
+        );
 
         let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
@@ -4228,6 +4267,12 @@ impl ChannelConversationOwner {
         if self.owner_by_channel_key.get(&binding.route) != Some(self.ctx.agent_alias.as_ref()) {
             anyhow::bail!("this agent is not serving the conversation's channel");
         }
+        // The synchronous legacy owner cannot acquire native execution
+        // admission. Refuse rather than acknowledge a cache-only exchange
+        // that the event store and the next native turn would never observe.
+        if self.ctx.native_sessions.is_some() {
+            anyhow::bail!("bound conversation access requires the session execution port");
+        }
         Ok(&binding.key)
     }
 }
@@ -4756,8 +4801,14 @@ fn load_cached_model_preview(
 /// Build a cache key that includes the runtime-defaults generation, the
 /// model_provider name, and, when a route-specific API key is supplied, a hash
 /// of that key. Generation `0` is the immutable startup config, so its key shape
-/// stays unchanged; hot-reload generations get isolated cache entries.
-fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>, generation: u64) -> String {
+/// stays unchanged; hot-reload generations and explicit model pins get
+/// isolated cache entries.
+fn provider_cache_key(
+    provider_name: &str,
+    route_api_key: Option<&str>,
+    generation: u64,
+    model_override: Option<&str>,
+) -> String {
     let base = match route_api_key {
         Some(key) => {
             use std::hash::{Hash, Hasher};
@@ -4766,6 +4817,10 @@ fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>, generati
             format!("{provider_name}@{:x}", hasher.finish())
         }
         None => provider_name.to_string(),
+    };
+    let base = match model_override {
+        Some(model) => format!("m{}:{model}:{base}", model.len()),
+        None => base,
     };
     if generation == 0 {
         base
@@ -4790,13 +4845,35 @@ fn provider_credentials_for_ref(
         })
 }
 
+fn provider_model_override<'a>(
+    config: &Config,
+    provider_ref: &str,
+    model: Option<&'a str>,
+) -> Option<&'a str> {
+    let (family, alias) = provider_ref.split_once('.')?;
+    let configured = config
+        .providers
+        .models
+        .find(family, alias)?
+        .model
+        .as_deref()?;
+    model.filter(|model| *model != configured)
+}
+
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
     route_api_key: Option<&str>,
+    model: Option<&str>,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-    let cache_key = provider_cache_key(provider_name, route_api_key, defaults_snapshot.generation);
+    let model_override = provider_model_override(&defaults_snapshot.config, provider_name, model);
+    let cache_key = provider_cache_key(
+        provider_name,
+        route_api_key,
+        defaults_snapshot.generation,
+        model_override,
+    );
 
     if let Some(existing) = ctx
         .provider_cache
@@ -4816,6 +4893,7 @@ async fn get_or_create_provider(
     // route-specific credential override. Once config reload changes defaults,
     // the cache/store path above owns the live default provider.
     if route_api_key.is_none()
+        && model_override.is_none()
         && provider_name == defaults.default_model_provider.as_str()
         && provider_name == ctx.model_provider_ref.as_str()
         && !defaults_snapshot.hot
@@ -4833,6 +4911,7 @@ async fn get_or_create_provider(
         entry_api_url,
         defaults.reliability,
         ctx.provider_runtime_options.clone(),
+        model_override.map(ToOwned::to_owned),
     )
     .await?;
     let model_provider: Arc<dyn ModelProvider> = Arc::from(model_provider);
@@ -4863,6 +4942,7 @@ async fn create_resilient_model_provider_nonblocking(
     api_url: Option<String>,
     reliability: zeroclaw_config::schema::ReliabilityConfig,
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+    model_override: Option<String>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let provider_name = provider_name.to_string();
     tokio::task::spawn_blocking(move || {
@@ -4871,13 +4951,14 @@ async fn create_resilient_model_provider_nonblocking(
             &provider_name,
             &provider_runtime_options,
         );
-        zeroclaw_providers::create_resilient_model_provider_from_ref(
+        zeroclaw_providers::create_resilient_model_provider_from_ref_with_model_override(
             &config,
             &provider_name,
             api_key.as_deref(),
             api_url.as_deref(),
             &reliability,
             &options,
+            model_override.as_deref(),
         )
     })
     .await
@@ -5176,7 +5257,7 @@ fn build_scope_override_summary(
         let scope_line = |scope: OverrideScope| -> String {
             overrides
                 .get(&scope_override_key(scope, msg, ctx.agent_alias.as_str()))
-                .map(&fmt_sel)
+                .map(fmt_sel)
                 .unwrap_or_else(|| "—".to_string())
         };
         (
@@ -5228,6 +5309,27 @@ fn scrub_native_model_picker_error(error: &anyhow::Error) -> String {
     zeroclaw_runtime::security::scrub(&error.to_string())
 }
 
+fn channel_selection_with_thinking(
+    selection: Option<zeroclaw_api::session_events::capture::ModelOverrideSelection>,
+    thinking: Option<String>,
+) -> zeroclaw_api::session_events::capture::ModelOverrideSelection {
+    use zeroclaw_api::session_events::capture::ModelOverrideSelection;
+    match selection {
+        Some(ModelOverrideSelection::Set {
+            provider_ref,
+            model,
+            route_mode,
+            ..
+        }) => ModelOverrideSelection::Set {
+            provider_ref,
+            model,
+            thinking,
+            route_mode,
+        },
+        _ => ModelOverrideSelection::Inherit { thinking },
+    }
+}
+
 #[cfg(test)]
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
@@ -5265,6 +5367,42 @@ async fn handle_runtime_command_for_delivery(
         .config
         .resolved_agent_config(ctx.agent_alias.as_str())
         .is_some_and(|agent| agent.resolved.effort_routing.is_some());
+    let prior_route = ctx
+        .route_overrides
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&sender_key)
+        .cloned()
+        .unwrap_or_else(|| default_route_selection_from_snapshot(&defaults_snapshot));
+    let prior_thinking = ctx
+        .thinking_overrides
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&sender_key)
+        .copied();
+    let command_kind = command.clone();
+    let mut applied_selection = false;
+    let prior_selection = if matches!(
+        &command,
+        ChannelRuntimeCommand::SetThinking(_) | ChannelRuntimeCommand::NewSession
+    ) && let Some(port) =
+        zeroclaw_api::session_events::capture::current_session_execution()
+    {
+        match port.restore_model_override().await {
+            Ok(selection) => selection,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_attrs(serde_json::json!({"error":error.to_string()})),
+                    "channel_model_restore_failed"
+                );
+                return true;
+            }
+        }
+    } else {
+        None
+    };
 
     if command == ChannelRuntimeCommand::ShowModel && is_bare_model_picker_command(&msg.content) {
         let request = zeroclaw_api::channel::ChannelModelPickerRequest {
@@ -5308,14 +5446,36 @@ async fn handle_runtime_command_for_delivery(
         }
     }
 
+    if let Some(port) = zeroclaw_api::session_events::capture::current_session_execution()
+        && let Err(error) = port
+            .record_control(serde_json::json!({"command":"channel_runtime_command",
+            "input":msg.content,"transport_message_id":delivery_message_id}))
+            .await
+    {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_attrs(serde_json::json!({"error":error.to_string()})),
+            "channel_control_admission_failed"
+        );
+        return true;
+    }
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_model_provider) => {
             match resolve_models_command(defaults_snapshot.config.as_ref(), &raw_model_provider) {
                 ModelsCommandResolution::Resolved(provider_ref) => {
-                    match get_or_create_provider(ctx, &provider_ref, None, &defaults_snapshot).await
+                    match get_or_create_provider(
+                        ctx,
+                        &provider_ref,
+                        None,
+                        Some(&current.model),
+                        &defaults_snapshot,
+                    )
+                    .await
                     {
                         Ok(_) => {
+                            applied_selection = true;
                             current.model_provider = provider_ref.clone();
                             current.automatic = false;
                             set_route_selection(
@@ -5484,6 +5644,7 @@ async fn handle_runtime_command_for_delivery(
                     return true;
                 }
 
+                applied_selection = true;
                 channel_runtime_cli_string_with_args(
                     "channel-runtime-model-switched",
                     &[
@@ -5523,6 +5684,7 @@ async fn handle_runtime_command_for_delivery(
                     return true;
                 }
 
+                applied_selection = true;
                 let mut resp = channel_runtime_cli_string_with_args(
                     "channel-runtime-model-switched",
                     &[
@@ -5555,6 +5717,36 @@ async fn handle_runtime_command_for_delivery(
             }
         }
         ChannelRuntimeCommand::NewSession => {
+            if let Some(port) = zeroclaw_api::session_events::capture::current_session_execution() {
+                use zeroclaw_api::session_events::capture::{
+                    ContextSnapshot, ModelChangeDisposition,
+                };
+                let reset = async {
+                    port.replace_context(
+                        ContextSnapshot {
+                            messages: vec![],
+                            history_has_trim_breadcrumb: Some(false),
+                        },
+                        "channel_new_session",
+                    )
+                    .await?;
+                    port.observe_model_change(
+                        channel_selection_with_thinking(prior_selection.clone(), None),
+                        ModelChangeDisposition::Applied,
+                    )
+                    .await
+                }
+                .await;
+                if let Err(error) = reset {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_attrs(serde_json::json!({"error":error.to_string()})),
+                        "channel_session_reset_failed"
+                    );
+                    return true;
+                }
+            }
             // Serialize per-sender persistence to prevent interleaving
             let persist_lock = acquire_persist_lock(ctx, &sender_key);
             let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -5564,6 +5756,7 @@ async fn handle_runtime_command_for_delivery(
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&sender_key);
             if let Some(ref store) = ctx.session_store
+                && zeroclaw_api::session_events::capture::current_session_execution().is_none()
                 && let Err(e) = store.delete_session(&sender_key)
             {
                 ::zeroclaw_log::record!(
@@ -5617,7 +5810,76 @@ async fn handle_runtime_command_for_delivery(
         ),
     };
 
-    if let Err(err) = channel.send(&SendMessage::reply_to(msg, response)).await {
+    if let Some(port) = zeroclaw_api::session_events::capture::current_session_execution() {
+        use zeroclaw_api::session_events::capture::{
+            ModelChangeDisposition, ModelOverrideSelection,
+        };
+        let selected = matches!(
+            &command_kind,
+            ChannelRuntimeCommand::SetProvider(_)
+                | ChannelRuntimeCommand::SetModel(_)
+                | ChannelRuntimeCommand::SetThinking(_)
+        );
+        if selected {
+            if matches!(&command_kind, ChannelRuntimeCommand::SetThinking(_)) {
+                applied_selection = true;
+            }
+            let thinking = ctx
+                .thinking_overrides
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&sender_key)
+                .map(|level| level.as_str().to_string());
+            let selection = if matches!(&command_kind, ChannelRuntimeCommand::SetThinking(_)) {
+                channel_selection_with_thinking(prior_selection, thinking)
+            } else if matches!(&command_kind, ChannelRuntimeCommand::SetModel(raw)
+                if effort_auto_reset_enabled && raw.trim().trim_matches('`').eq_ignore_ascii_case("auto"))
+            {
+                ModelOverrideSelection::Inherit { thinking }
+            } else {
+                ModelOverrideSelection::Set {
+                    provider_ref: current.model_provider.clone(),
+                    model: current.model.clone(),
+                    thinking,
+                    route_mode: if current.automatic {
+                        zeroclaw_api::session_events::capture::ModelRouteMode::Automatic
+                    } else {
+                        zeroclaw_api::session_events::capture::ModelRouteMode::Manual
+                    },
+                }
+            };
+            let disposition = if applied_selection {
+                ModelChangeDisposition::Applied
+            } else {
+                ModelChangeDisposition::Rejected {
+                    reason_key: "channel_model_command_rejected".into(),
+                    diagnostic: None,
+                }
+            };
+            if let Err(error) = port.observe_model_change(selection, disposition).await {
+                set_route_selection(ctx, &sender_key, prior_route, &defaults_snapshot);
+                let mut overrides = ctx
+                    .thinking_overrides
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(level) = prior_thinking {
+                    overrides.insert(sender_key.clone(), level);
+                } else {
+                    overrides.remove(&sender_key);
+                }
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_attrs(serde_json::json!({"error":error.to_string()})),
+                    "channel_model_command_commit_failed"
+                );
+                return true;
+            }
+        }
+    }
+    if let Err(err) =
+        session_history::send(channel.as_ref(), &SendMessage::reply_to(msg, response)).await
+    {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5955,6 +6217,7 @@ async fn resolve_classifier_route(
         ctx,
         provider_str,
         model_cfg.api_key.as_deref(),
+        Some(&model),
         defaults_snapshot,
     )
     .await
@@ -6475,9 +6738,14 @@ async fn run_draft_updater_with_leak_detection(
             // A lifecycle event is a typed signal, not assistant text, so it
             // carries nothing to sanitize and passes straight through.
             StreamDelta::Lifecycle(event) => {
-                if let Err(e) = channel
-                    .update_draft_lifecycle(&reply_target, &draft_id, event)
-                    .await
+                if let Err(e) = session_history::observe_delivery(
+                    "draft_lifecycle",
+                    channel.name(),
+                    &reply_target,
+                    &format!("{event:?}"),
+                    channel.update_draft_lifecycle(&reply_target, &draft_id, event),
+                )
+                .await
                 {
                     ::zeroclaw_log::record!(
                         DEBUG,
@@ -6511,9 +6779,14 @@ async fn run_draft_updater_with_leak_detection(
                     .await;
                 }
                 let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
-                if let Err(e) = channel
-                    .update_draft_progress(&reply_target, &draft_id, &visible)
-                    .await
+                if let Err(e) = session_history::observe_delivery(
+                    "update_draft_progress",
+                    channel.name(),
+                    &reply_target,
+                    &visible,
+                    channel.update_draft_progress(&reply_target, &draft_id, &visible),
+                )
+                .await
                 {
                     ::zeroclaw_log::record!(
                         DEBUG,
@@ -6530,9 +6803,14 @@ async fn run_draft_updater_with_leak_detection(
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
                 if let Some(text) = event.legacy_status() {
                     let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
-                    if let Err(e) = channel
-                        .update_draft_progress(&reply_target, &draft_id, &visible)
-                        .await
+                    if let Err(e) = session_history::observe_delivery(
+                        "update_draft_progress",
+                        channel.name(),
+                        &reply_target,
+                        &visible,
+                        channel.update_draft_progress(&reply_target, &draft_id, &visible),
+                    )
+                    .await
                     {
                         ::zeroclaw_log::record!(
                             DEBUG,
@@ -6561,9 +6839,14 @@ async fn run_draft_updater_with_leak_detection(
                 // retaining the raw accumulation here could reintroduce a
                 // protocol payload during finalization.
                 *streamed_text.lock().unwrap_or_else(|e| e.into_inner()) = visible.clone();
-                if let Err(e) = channel
-                    .update_draft(&reply_target, &draft_id, &visible)
-                    .await
+                if let Err(e) = session_history::observe_delivery(
+                    "update_draft",
+                    channel.name(),
+                    &reply_target,
+                    &visible,
+                    channel.update_draft(&reply_target, &draft_id, &visible),
+                )
+                .await
                 {
                     ::zeroclaw_log::record!(
                         DEBUG,
@@ -6868,9 +7151,14 @@ async fn flush_completed_narration_turn(
             // turn re-guarded, and a stateful hook rewrite cannot retroactively
             // alter an already-owned turn.
             owned_guarded.push_str(&guarded_turn);
-            if let Err(e) = channel
-                .flush_draft_turn(reply_target, draft_id, owned_guarded)
-                .await
+            if let Err(e) = session_history::observe_delivery(
+                "draft_narration_flush",
+                channel.name(),
+                reply_target,
+                owned_guarded,
+                channel.flush_draft_turn(reply_target, draft_id, owned_guarded),
+            )
+            .await
             {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -6885,9 +7173,14 @@ async fn flush_completed_narration_turn(
         // delivered-prefix bookkeeping to the unchanged owned snapshot so its
         // suffix accounting stays aligned with what policy has approved.
         None => {
-            if let Err(e) = channel
-                .discard_draft_turn(reply_target, draft_id, owned_guarded)
-                .await
+            if let Err(e) = session_history::observe_delivery(
+                "draft_narration_discard",
+                channel.name(),
+                reply_target,
+                owned_guarded,
+                channel.discard_draft_turn(reply_target, draft_id, owned_guarded),
+            )
+            .await
             {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -8299,14 +8592,14 @@ async fn process_channel_message_with_delivery_id(
         sender: sender.as_str(),
         message_id: message_id.as_str(),
         => async move {
-            process_channel_message_body(
+            Box::pin(process_channel_message_body(
                 ctx,
                 msg,
                 cancellation_token,
                 composite_for_body,
                 delivery_message_id,
                 turn_lease,
-            )
+            ))
             .await;
         }
     )
@@ -8990,12 +9283,30 @@ async fn run_matrix_single_message_draft_updater(
                 let reply_target = reply_target.clone();
                 let draft_id = draft_id.clone();
                 let flush_tx = flush_tx.clone();
+                let delivery_scope = session_history::DeliveryScope::current();
                 flush_in_flight = true;
                 zeroclaw_spawn::spawn!(async move {
-                    let result = channel
-                        .update_typed_draft_progress_batch(&reply_target, &draft_id, &batch)
-                        .await
-                        .map_err(|e| e.to_string());
+                    let content = batch
+                        .iter()
+                        .map(|entry| entry.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let result = session_history::DeliveryScope::run(
+                        delivery_scope,
+                        session_history::observe_delivery(
+                            "typed_draft_progress",
+                            channel.name(),
+                            &reply_target,
+                            &content,
+                            channel.update_typed_draft_progress_batch(
+                                &reply_target,
+                                &draft_id,
+                                &batch,
+                            ),
+                        ),
+                    )
+                    .await
+                    .map_err(|e| e.to_string());
                     let _ = flush_tx.send(result.err()).await;
                 });
             }
@@ -9268,6 +9579,138 @@ async fn process_channel_message_body(
     delivery_message_id: String,
     turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
 ) {
+    if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg)
+        && (channel.drop_self_messages(&msg)
+            || zeroclaw_runtime::peers::should_drop_self_loop(
+                &msg.sender,
+                channel.self_handle().as_deref(),
+            ))
+    {
+        return;
+    }
+    let result = async {
+        let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+        let native = session_history::open(ctx.clone(), &msg, &history_key).await?;
+        if let Some(port) = &native
+            && !msg.passive_context
+        {
+            let defaults = runtime_defaults_snapshot(ctx.as_ref());
+            let route = get_route_selection(ctx.as_ref(), &msg, &history_key, &defaults);
+            for mut queued in port
+                .pending_inputs(route.model_provider, route.model)
+                .await?
+            {
+                anyhow::ensure!(
+                    !cancellation_token.is_cancelled(),
+                    "channel_recovery_cancelled"
+                );
+                let recovered =
+                    session_history::recover_message(ctx.as_ref(), &queued, &history_key)?;
+                if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &recovered)
+                    && (channel.drop_self_messages(&recovered)
+                        || zeroclaw_runtime::peers::should_drop_self_loop(
+                            &recovered.sender,
+                            channel.self_handle().as_deref(),
+                        ))
+                {
+                    port.reject_pending_input(&queued.turn_id, "channel_recovery_sender_is_self")
+                        .await?;
+                    continue;
+                }
+                // The new sender can read this shared lane but cannot lend
+                // their authority to an older sender's queued action.
+                let recovered_port =
+                    match session_history::open(ctx.clone(), &recovered, &history_key).await {
+                        Ok(Some(port)) => port,
+                        Ok(None) => anyhow::bail!("channel_recovery_session_unavailable"),
+                        Err(error)
+                            if matches!(
+                                error.downcast_ref::<zeroclaw_kernel::session::SessionError>(),
+                                Some(zeroclaw_kernel::session::SessionError::PermissionDenied(_))
+                            ) =>
+                        {
+                            port.reject_pending_input(
+                                &queued.turn_id,
+                                "recovered_input_sender_no_longer_authorized",
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                let defaults = runtime_defaults_snapshot(ctx.as_ref());
+                let route = get_route_selection(ctx.as_ref(), &recovered, &history_key, &defaults);
+                queued.provider_ref = route.model_provider;
+                queued.model = route.model;
+                let recovered_composite = channel_scope(&recovered);
+                let recovered_message_id = recovered.id.clone();
+                let recovered_sender = recovered.sender.clone();
+                let engine = Box::pin(process_channel_message_body_inner(
+                    ctx.clone(),
+                    recovered,
+                    cancellation_token.clone(),
+                    recovered_composite.clone(),
+                    recovered_message_id.clone(),
+                    turn_lease.clone(),
+                    Some(recovered_port.clone()),
+                ));
+                zeroclaw_log::scope!(
+                    category: "channel",
+                    agent_alias: ctx.agent_alias.as_str(),
+                    channel: recovered_composite.as_str(),
+                    sender: recovered_sender.as_str(),
+                    message_id: recovered_message_id.as_str(),
+                    => recovered_port.execute(queued, engine)
+                )
+                .await?;
+            }
+        }
+        let input = if native.is_some() && !msg.passive_context {
+            let defaults = runtime_defaults_snapshot(ctx.as_ref());
+            let route = get_route_selection(ctx.as_ref(), &msg, &history_key, &defaults);
+            Some(session_history::input(
+                ctx.as_ref(),
+                &msg,
+                msg.content.clone(),
+                route.model_provider,
+                route.model,
+            )?)
+        } else {
+            None
+        };
+        // Allocate before wrapping the engine so every ingress path keeps the
+        // large turn state out of its nested poll frames, including reloads.
+        let engine = Box::pin(process_channel_message_body_inner(
+            ctx,
+            msg,
+            cancellation_token,
+            channel_composite,
+            delivery_message_id,
+            turn_lease,
+            native.clone(),
+        ));
+        match (native, input) {
+            (Some(port), Some(input)) => port.execute(input, engine).await,
+            _ => engine.await,
+        }
+    }
+    .await;
+    if let Err(error) = result {
+        ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_attrs(serde_json::json!({"error": zeroclaw_runtime::agent::Agent::session_execution_diagnostic(&error)})),
+            "channel_session_execution_failed");
+    }
+}
+
+async fn process_channel_message_body_inner(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: zeroclaw_api::channel::ChannelMessage,
+    cancellation_token: CancellationToken,
+    channel_composite: String,
+    delivery_message_id: String,
+    turn_lease: Option<Arc<zeroclaw_runtime::live_config_authority::AgentTurnLease>>,
+    native_history: Option<Arc<dyn zeroclaw_api::session_events::capture::SessionExecutionPort>>,
+) -> anyhow::Result<String> {
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
@@ -9284,6 +9727,8 @@ async fn process_channel_message_body(
         "channel inbound message"
     );
 
+    let raw_user_content = msg.content.clone();
+
     // The modifying `on_message_received` hook already ran in the dispatch
     // path (see `run_inbound_message_hook`): it can rewrite routing, and the
     // conversation lane that serializes this turn has to be selected from the
@@ -9291,30 +9736,6 @@ async fn process_channel_message_body(
     let mut msg = msg;
 
     let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
-
-    if let Some(channel) = target_channel.as_ref() {
-        if channel.drop_self_messages(&msg) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "dropping self-authored inbound message (self-loop guard, sdk layer)"
-            );
-            return;
-        }
-        if zeroclaw_runtime::peers::should_drop_self_loop(
-            &msg.sender,
-            channel.self_handle().as_deref(),
-        ) {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "dropping self-authored inbound message (self-loop guard, agent-loop fallback)"
-            );
-            return;
-        }
-    }
 
     // Dispatch executes steps even though its result is discarded here.
     if !msg.passive_context && (ctx.sop_engine.is_some() || ctx.sop_audit.is_some()) {
@@ -9343,10 +9764,155 @@ async fn process_channel_message_body(
     }
 
     let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+    if let Some(native) = &native_history {
+        match native.restore_context().await {
+            Ok(Some(context)) => {
+                ctx.conversation_histories
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .put(
+                        history_key.clone(),
+                        context.chat_projection().into_iter().collect(),
+                    );
+                ctx.history_crumb_flags
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .put(
+                        history_key.clone(),
+                        context.history_has_trim_breadcrumb.unwrap_or(false),
+                    );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_attrs(serde_json::json!({"error":error.to_string()})),
+                    "channel_session_context_unavailable"
+                );
+                return Err(error);
+            }
+        }
+    }
+    if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+            "Failed to apply runtime config update"
+        );
+    }
+    if let Some(native) = &native_history {
+        use zeroclaw_api::session_events::capture::ModelOverrideSelection;
+        match native.restore_model_override().await {
+            Ok(Some(selection)) => {
+                let thinking = match selection {
+                    ModelOverrideSelection::Set {
+                        provider_ref,
+                        model,
+                        thinking,
+                        route_mode,
+                    } => {
+                        let snapshot = runtime_defaults_snapshot(ctx.as_ref());
+                        let api_key = snapshot
+                            .config
+                            .model_routes
+                            .iter()
+                            .find(|route| {
+                                route.model_provider.eq_ignore_ascii_case(&provider_ref)
+                                    && (route.model.eq_ignore_ascii_case(&model)
+                                        || route.hint.eq_ignore_ascii_case(&model))
+                            })
+                            .and_then(|route| route.api_key.clone());
+                        ctx.route_overrides
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert(
+                                history_key.clone(),
+                                ChannelRouteSelection {
+                                    model_provider: provider_ref,
+                                    model,
+                                    automatic: route_mode
+                                        == zeroclaw_api::session_events::capture::ModelRouteMode::Automatic,
+                                    api_key,
+                                },
+                            );
+                        thinking
+                    }
+                    ModelOverrideSelection::Inherit { thinking } => {
+                        ctx.route_overrides
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .remove(&history_key);
+                        thinking
+                    }
+                    ModelOverrideSelection::Clear => {
+                        ctx.route_overrides
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .remove(&history_key);
+                        None
+                    }
+                };
+                let mut overrides = ctx
+                    .thinking_overrides
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(level) =
+                    thinking.and_then(|value| ThinkingLevel::from_str_insensitive(&value))
+                {
+                    overrides.insert(history_key.clone(), level);
+                } else {
+                    overrides.remove(&history_key);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_attrs(serde_json::json!({"error":error.to_string()})),
+                    "channel_model_restore_failed"
+                );
+                return Err(error);
+            }
+        }
+    }
     stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
-        record_passive_context(ctx.as_ref(), &msg, &history_key);
-        return;
+        if let Some(native) = &native_history {
+            let context_text = timestamped_channel_user_history_content(
+                &msg,
+                WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL,
+            );
+            let captured = async {
+                let defaults = runtime_defaults_snapshot(ctx.as_ref());
+                let route = get_route_selection(ctx.as_ref(), &msg, &history_key, &defaults);
+                let input = session_history::input(
+                    ctx.as_ref(),
+                    &msg,
+                    raw_user_content,
+                    route.model_provider,
+                    route.model,
+                )?;
+                native
+                    .record_context_input(input, &context_text, "passive_channel_context")
+                    .await
+            }
+            .await;
+            if let Err(error) = captured {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_attrs(serde_json::json!({"error":error.to_string()})),
+                    "channel_passive_context_commit_failed"
+                );
+            }
+        } else {
+            record_passive_context(ctx.as_ref(), &msg, &history_key);
+        }
+        return Ok(String::new());
     }
 
     // A picker selection whose bounded delivery-ack wait elapsed was
@@ -9356,7 +9922,7 @@ async fn process_channel_message_body(
     // delivery ack, so `take_revoked` is a no-op for it.
     #[cfg(feature = "channel-telegram")]
     if crate::model_picker_delivery::take_revoked(&delivery_message_id) {
-        return;
+        return Ok(String::new());
     }
 
     // The early ack is spawned (fire-and-forget) so it lands before the
@@ -9476,23 +10042,19 @@ async fn process_channel_message_body(
         }
     }
 
-    if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-            "Failed to apply runtime config update"
-        );
-    }
-    if handle_runtime_command_for_delivery(
+    let command = handle_runtime_command_for_delivery(
         ctx.as_ref(),
         &msg,
         target_channel.as_ref(),
         &delivery_message_id,
-    )
-    .await
-    {
+    );
+    let handled = if let Some(native) = &native_history {
+        zeroclaw_api::session_events::capture::scope_session_execution(native.clone(), command)
+            .await
+    } else {
+        command.await
+    };
+    if handled {
         // Confirm picker-selection delivery only now that the command was
         // actually handled: the Telegram callback waits on this
         // acknowledgement before reporting the selection as queued, so a
@@ -9508,12 +10070,18 @@ async fn process_channel_message_body(
             Some("\u{2705}"),
         )
         .await;
-        return;
+        return Ok(String::new());
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let (mut route, route_is_scoped) =
         get_route_selection_with_scope(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
+    let mut pin_selected_model = route_is_scoped
+        || ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&history_key);
     let mut attempt_allowlist: Option<Arc<HashSet<String>>> = None;
 
     let resolved_agent = runtime_defaults
@@ -9558,9 +10126,10 @@ async fn process_channel_message_body(
                     Some("\u{26A0}\u{FE0F}"),
                 )
                 .await;
-                return;
+                return Err(anyhow::Error::msg("channel_effort_routing_invalid"));
             };
             attempt_allowlist = Some(Arc::new(selection.allowed_provider_refs.clone()));
+            pin_selected_model = false;
             route = ChannelRouteSelection {
                 model_provider: selection.route.model_provider.clone(),
                 model: selection.route.model.clone(),
@@ -9581,6 +10150,7 @@ async fn process_channel_message_body(
             .find(|r| r.hint.eq_ignore_ascii_case(&hint))
     {
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint.as_str(), "model_provider": matched_route.model_provider.as_str(), "model": matched_route.model.as_str()})), "Channel message classified — overriding route");
+        pin_selected_model = false;
         route = ChannelRouteSelection {
             model_provider: matched_route.model_provider.clone(),
             model: matched_route.model.clone(),
@@ -9600,6 +10170,7 @@ async fn process_channel_message_body(
         ctx.as_ref(),
         &route.model_provider,
         route.api_key.as_deref(),
+        pin_selected_model.then_some(route.model.as_str()),
         &runtime_defaults,
     )
     .await
@@ -9615,9 +10186,11 @@ async fn process_channel_message_body(
                 ],
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(&SendMessage::reply_to(&msg, message).suppress_voice())
-                    .await;
+                let _ = session_history::send(
+                    channel.as_ref(),
+                    &SendMessage::reply_to(&msg, message).suppress_voice(),
+                )
+                .await;
             }
             reconcile_early_ack(
                 ctx.as_ref(),
@@ -9627,7 +10200,7 @@ async fn process_channel_message_body(
                 Some("\u{26A0}\u{FE0F}"),
             )
             .await;
-            return;
+            return Err(err);
         }
     };
     let history_user_content = msg.content.clone();
@@ -9662,6 +10235,25 @@ async fn process_channel_message_body(
 
     let force_fresh_session = take_pending_new_session(ctx.as_ref(), &history_key);
     if force_fresh_session {
+        if let Some(native) = &native_history
+            && let Err(error) = native
+                .replace_context(
+                    zeroclaw_api::session_events::capture::ContextSnapshot {
+                        messages: vec![],
+                        history_has_trim_breadcrumb: Some(false),
+                    },
+                    "channel_new_session",
+                )
+                .await
+        {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_attrs(serde_json::json!({"error":error.to_string()})),
+                "channel_session_reset_failed"
+            );
+            return Err(error);
+        }
         // `/new` should make the next user turn completely fresh even if
         // older cached turns reappear before this message starts.
         // Serialize per-sender persistence to prevent interleaving
@@ -9714,7 +10306,7 @@ async fn process_channel_message_body(
                 })),
             "deferring channel turn: durable history unavailable and unverified"
         );
-        return;
+        return Err(anyhow::Error::msg("channel_durable_context_unavailable"));
     };
 
     // Build history from per-sender conversation cache.
@@ -9871,7 +10463,7 @@ async fn process_channel_message_body(
         model_provider: route.model_provider.as_str(),
         model: route.model.as_str(),
         => async {
-            if should_bypass_reply_intent_precheck(&msg, direct_message) {
+            let outcome = if should_bypass_reply_intent_precheck(&msg, direct_message) {
                 AssistantChannelOutcome::Reply(String::new())
             } else if !precheck.enabled {
                 ::zeroclaw_log::record!(
@@ -9954,6 +10546,9 @@ async fn process_channel_message_body(
                         outcome
                     }
                     Ok(Err(e)) => {
+                        if zeroclaw_api::session_events::capture::is_capture_stopped(&e) {
+                            return Err(e);
+                        }
                         let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
                         ::zeroclaw_log::record!(
                             WARN,
@@ -9972,6 +10567,9 @@ async fn process_channel_message_body(
                         AssistantChannelOutcome::Reply(String::new())
                     }
                     Err(_) => {
+                        if native_history.is_some() {
+                            return Err(anyhow::Error::msg("channel_precheck_timeout"));
+                        }
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -9989,10 +10587,11 @@ async fn process_channel_message_body(
                         AssistantChannelOutcome::Reply(String::new())
                     }
                 }
-            }
+            };
+            Ok::<_, anyhow::Error>(outcome)
         }
     )
-    .await;
+    .await?;
 
     let is_acp_channel = target_channel
         .as_ref()
@@ -10066,9 +10665,15 @@ async fn process_channel_message_body(
             && let Some(notice_key) = kind.notice_key()
         {
             let notice_text = zeroclaw_runtime::i18n::get_required_cli_string(notice_key);
-            let send_result = channel
-                .send(&build_no_reply_notice(&msg, notice_text.clone()))
-                .await;
+            let notice = build_no_reply_notice(&msg, notice_text.clone());
+            let send_result = session_history::observe_delivery(
+                "no_reply_notice",
+                channel.name(),
+                &msg.reply_target,
+                &notice.content,
+                channel.send(&notice),
+            )
+            .await;
             Some((notice_text, send_result))
         } else {
             None
@@ -10125,7 +10730,33 @@ async fn process_channel_message_body(
                 })),
             "channel_message_no_reply"
         );
-        return;
+        if let Some(port) = zeroclaw_api::session_events::capture::current_provider_admission() {
+            use zeroclaw_api::session_events::capture::{ContextSnapshot, ContextTransformIntent};
+            let transform = port
+                .begin_context_transform(ContextTransformIntent {
+                    reason_key: "channel_no_reply_projection".into(),
+                    algorithm_version: "channel-history/v1".into(),
+                    budget: 0,
+                })
+                .await?
+                .ok_or_else(|| anyhow::Error::msg("native context capture missing"))?;
+            let mut messages = history
+                .iter()
+                .filter(|message| message.role != "system")
+                .cloned()
+                .collect::<Vec<_>>();
+            messages.push(ChatMessage::assistant(&history_response));
+            transform
+                .complete_snapshot(ContextSnapshot {
+                    messages: messages
+                        .into_iter()
+                        .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                        .collect(),
+                    history_has_trim_breadcrumb: Some(history_has_trim_breadcrumb),
+                })
+                .await?;
+        }
+        return Ok(history_response);
     }
 
     let use_draft_streaming = target_channel
@@ -10150,12 +10781,16 @@ async fn process_channel_message_body(
             {
                 stop_matrix_single_message_typing_scope(scope).await;
             }
-            match channel
-                .send_draft(&SendMessage::reply_to(
-                    &msg,
-                    zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER,
-                ))
-                .await
+            let draft =
+                SendMessage::reply_to(&msg, zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER);
+            match session_history::observe_delivery(
+                "draft_started",
+                channel.name(),
+                &msg.reply_target,
+                &draft.content,
+                channel.send_draft(&draft),
+            )
+            .await
             {
                 Ok(id) => id,
                 Err(e) => {
@@ -10191,6 +10826,7 @@ async fn process_channel_message_body(
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
             let draft_lease = turn_lease.clone();
+            let delivery_scope = session_history::DeliveryScope::current();
             if matrix_single_message_streaming {
                 let interval_ms = matrix_draft_update_interval_ms(ctx.as_ref(), &msg);
                 let stream_draft_lines = matrix_stream_draft_lines(ctx.as_ref(), &msg);
@@ -10198,15 +10834,18 @@ async fn process_channel_message_body(
                 let matrix_alias = msg.channel_alias.clone().unwrap_or_default();
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
-                    run_matrix_single_message_draft_updater(
-                        rx,
-                        channel,
-                        reply_target,
-                        draft_id,
-                        interval_ms,
-                        stream_draft_lines,
-                        matrix_config,
-                        matrix_alias,
+                    session_history::DeliveryScope::run(
+                        delivery_scope,
+                        run_matrix_single_message_draft_updater(
+                            rx,
+                            channel,
+                            reply_target,
+                            draft_id,
+                            interval_ms,
+                            stream_draft_lines,
+                            matrix_config,
+                            matrix_alias,
+                        ),
                     )
                     .await;
                 }))
@@ -10229,18 +10868,21 @@ async fn process_channel_message_body(
                 let content_format = outbound_content_format_for_channel(&msg.channel);
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
-                    run_draft_updater_with_leak_detection(
-                        channel,
-                        reply_target,
-                        draft_id,
-                        known_tool_names,
-                        streamed_draft_text,
-                        leak_detection,
-                        content_format,
-                        turn_flush_narration,
-                        outbound_hooks,
-                        outbound_channel,
-                        rx,
+                    session_history::DeliveryScope::run(
+                        delivery_scope,
+                        run_draft_updater_with_leak_detection(
+                            channel,
+                            reply_target,
+                            draft_id,
+                            known_tool_names,
+                            streamed_draft_text,
+                            leak_detection,
+                            content_format,
+                            turn_flush_narration,
+                            outbound_hooks,
+                            outbound_channel,
+                            rx,
+                        ),
                     )
                     .await;
                 }))
@@ -10319,27 +10961,36 @@ async fn process_channel_message_body(
         let notify_reply_target = msg.reply_target.clone();
         let notify_thread_root = followup_thread_id(&msg);
         let notify_lease = turn_lease.clone();
+        let notify_delivery_scope = session_history::DeliveryScope::current();
         let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
             Some(zeroclaw_spawn::spawn!(async move {
                 let _lease = notify_lease;
                 while notify_rx.recv().await.is_some() {}
             }))
         } else {
-            Some(zeroclaw_spawn::spawn!(async move {
-                let _lease = notify_lease;
-                let thread_ts = notify_thread_root;
-                while let Some(text) = notify_rx.recv().await {
-                    if let Some(ref ch) = notify_channel {
-                        let _ = ch
-                            .send(
+            Some(zeroclaw_spawn::spawn!(session_history::DeliveryScope::run(
+                notify_delivery_scope,
+                async move {
+                    let _lease = notify_lease;
+                    let thread_ts = notify_thread_root;
+                    while let Some(text) = notify_rx.recv().await {
+                        if let Some(ref ch) = notify_channel
+                            && session_history::send(
+                                ch.as_ref(),
                                 &SendMessage::new(&text, &notify_reply_target)
                                     .in_thread(thread_ts.clone())
                                     .suppress_voice(),
                             )
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            // A failed/unknown delivery ends this worker; the
+                            // event owner retains the adapter diagnostic.
+                            break;
+                        }
                     }
                 }
-            }))
+            )))
         };
         (Some(notify_tx), notify_task)
     };
@@ -10398,7 +11049,8 @@ async fn process_channel_message_body(
     if matrix_single_message_streaming {
         loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
     }
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id = zeroclaw_api::session_events::capture::current_engine_turn_id()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Bracket the channel turn so lifecycle events
     // reach observers (and, via the broadcast hook, /api/events and
     // /api/events/history) for channel-originated turns — mirroring the CLI
@@ -10419,6 +11071,8 @@ async fn process_channel_message_body(
         ctx.prompt_config
             .effective_max_execution_tree_iterations(&ctx.agent_alias),
     );
+    let native_turn_id = zeroclaw_api::session_events::capture::current_engine_turn_id()
+        .unwrap_or_else(|| turn_id.clone());
     let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -10574,6 +11228,21 @@ async fn process_channel_message_body(
                 ) {
                     Ok(provider_ref) => provider_ref,
                     Err(err) => {
+                        if let Err(error) = record_channel_model_switch(
+                            ctx.as_ref(),
+                            &history_key,
+                            &new_model_provider,
+                            &new_model,
+                            route.automatic,
+                            zeroclaw_api::session_events::capture::ModelChangeDisposition::Rejected {
+                                reason_key: "channel_model_provider_resolution_failed".into(),
+                                diagnostic: Some(err.to_string()),
+                            },
+                        )
+                        .await
+                        {
+                            break LlmExecutionResult::Completed(Ok(Err(error)));
+                        }
                         ::zeroclaw_log::record!(
                             ERROR,
                             ::zeroclaw_log::Event::new(
@@ -10588,7 +11257,8 @@ async fn process_channel_message_body(
                     }
                 };
 
-                let resolved_api_key = ctx
+                let resolved_api_key = runtime_defaults
+                    .config
                     .model_routes
                     .iter()
                     .find(|r| {
@@ -10602,16 +11272,34 @@ async fn process_channel_message_body(
                     ctx.as_ref(),
                     &resolved_model_provider,
                     resolved_api_key.as_deref(),
+                    Some(&new_model),
                     &runtime_defaults,
                 )
                 .await
                 {
                     Ok(new_prov) => {
+                        if let Err(error) = record_channel_model_switch(
+                            ctx.as_ref(),
+                            &history_key,
+                            &resolved_model_provider,
+                            &new_model,
+                            route.automatic,
+                            if route_is_scoped {
+                                zeroclaw_api::session_events::capture::ModelChangeDisposition::AppliedForTurn
+                            } else {
+                                zeroclaw_api::session_events::capture::ModelChangeDisposition::Applied
+                            },
+                        )
+                        .await
+                        {
+                            break LlmExecutionResult::Completed(Ok(Err(error)));
+                        }
                         // Commit state only after the provider was built
                         // successfully, so a failure leaves the turn on the
                         // original provider/model pair instead of a
                         // half-switched state.
                         active_model_provider = new_prov;
+                        pin_selected_model = true;
                         apply_model_issued_route_switch(
                             &mut route,
                             resolved_model_provider,
@@ -10662,6 +11350,21 @@ async fn process_channel_message_body(
                         continue;
                     }
                     Err(err) => {
+                        if let Err(error) = record_channel_model_switch(
+                            ctx.as_ref(),
+                            &history_key,
+                            &resolved_model_provider,
+                            &new_model,
+                            route.automatic,
+                            zeroclaw_api::session_events::capture::ModelChangeDisposition::Rejected {
+                                reason_key: "channel_model_provider_construction_failed".into(),
+                                diagnostic: Some(err.to_string()),
+                            },
+                        )
+                        .await
+                        {
+                            break LlmExecutionResult::Completed(Ok(Err(error)));
+                        }
                         ::zeroclaw_log::record!(
                             ERROR,
                             ::zeroclaw_log::Event::new(
@@ -10679,11 +11382,57 @@ async fn process_channel_message_body(
 
             break loop_result;
         };
+        let mut llm_result = llm_result;
+        if let Some(port) = zeroclaw_api::session_events::capture::current_provider_admission() {
+            use zeroclaw_api::session_events::capture::{ContextSnapshot, ContextTransformIntent};
+            let capture = async {
+                let transform = port
+                    .begin_context_transform(ContextTransformIntent {
+                        reason_key: "turn_history_projection".into(),
+                        algorithm_version: "channel-history/v1".into(),
+                        budget: 0,
+                    })
+                    .await?
+                    .ok_or_else(|| anyhow::Error::msg("native context capture missing"))?;
+                transform
+                    .complete_snapshot(ContextSnapshot {
+                        messages: history
+                            .iter()
+                            .filter(|message| message.role != "system")
+                            .cloned()
+                            .map(zeroclaw_api::model_provider::ConversationMessage::Chat)
+                            .collect(),
+                        history_has_trim_breadcrumb: Some(history_has_trim_breadcrumb),
+                    })
+                    .await
+            }
+            .await;
+            if let Err(error) = capture {
+                llm_result = LlmExecutionResult::Completed(Ok(Err(error)));
+            }
+        }
         let fb = take_last_provider_fallback();
         let safeguard = take_last_safeguard_fallback();
         (llm_result, fb, safeguard)
     }));
-    let (llm_result, fallback_info, safeguard_notice) = scope_safeguard_fallback(scoped_turn).await;
+    let full_turn = scope_safeguard_fallback(scoped_turn);
+    let (llm_result, fallback_info, safeguard_notice) = full_turn.await;
+    let terminal_result = match &llm_result {
+        LlmExecutionResult::Completed(Ok(Ok(text))) => Ok(text.clone()),
+        LlmExecutionResult::Completed(Ok(Err(error))) => {
+            let diagnostic = zeroclaw_runtime::agent::Agent::session_execution_diagnostic(error);
+            let failure = anyhow::Error::msg(diagnostic);
+            Err(
+                if zeroclaw_api::session_events::capture::is_capture_stopped(error) {
+                    zeroclaw_api::session_events::capture::capture_stopped(failure)
+                } else {
+                    failure
+                },
+            )
+        }
+        LlmExecutionResult::Completed(Err(error)) => Err(anyhow::Error::msg(error.to_string())),
+        LlmExecutionResult::Cancelled => Err(anyhow::Error::msg("channel_turn_cancelled")),
+    };
 
     if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
         && let Some(tx) = delta_tx.as_ref()
@@ -10797,7 +11546,9 @@ async fn process_channel_message_body(
             );
             if let (Some(channel), Some(draft_id)) =
                 (target_channel.as_ref(), draft_message_id.as_deref())
-                && let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await
+                && let Err(err) =
+                    session_history::cancel_draft(channel.as_ref(), &msg.reply_target, draft_id)
+                        .await
             {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -10832,9 +11583,14 @@ async fn process_channel_message_body(
                         if let (Some(channel), Some(draft_id)) =
                             (target_channel.as_ref(), draft_message_id.as_deref())
                         {
-                            let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                            let _ = session_history::cancel_draft(
+                                channel.as_ref(),
+                                &msg.reply_target,
+                                draft_id,
+                            )
+                            .await;
                         }
-                        return;
+                        return terminal_result;
                     }
                     zeroclaw_runtime::hooks::HookResult::Continue((
                         hook_channel,
@@ -11071,7 +11827,12 @@ async fn process_channel_message_body(
                     if let (Some(orig_ch), Some(draft_id)) =
                         (target_channel.as_ref(), draft_message_id.as_deref())
                     {
-                        let _ = orig_ch.cancel_draft(&msg.reply_target, draft_id).await;
+                        let _ = session_history::cancel_draft(
+                            orig_ch.as_ref(),
+                            &msg.reply_target,
+                            draft_id,
+                        )
+                        .await;
                     }
                     let suppress = suppress_voice_override.unwrap_or(false);
                     let mut send_msg = SendMessage::new(&delivered_response, &delivery_recipient)
@@ -11081,22 +11842,41 @@ async fn process_channel_message_body(
                     } else if force_voice_override {
                         send_msg = send_msg.force_voice();
                     }
-                    channel.send_final(&send_msg).await.is_ok()
+                    session_history::deliver(
+                        native_history.as_ref(),
+                        &native_turn_id,
+                        channel.name(),
+                        &delivery_recipient,
+                        &delivered_response,
+                        channel.send_final(&send_msg),
+                    )
+                    .await
+                    .is_ok()
                 } else if let Some(ref draft_id) = draft_message_id {
                     // Same channel with draft. For force-voice routing: cancel the
                     // draft placeholder and deliver via send_final() so force_voice
                     // reaches the channel's voice path (finalize_draft has no
                     // force_voice concept).
                     if force_voice_override {
-                        let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
-                        channel
-                            .send_final(
-                                &SendMessage::new(&delivered_response, &delivery_recipient)
-                                    .force_voice()
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await
-                            .is_ok()
+                        let _ = session_history::cancel_draft(
+                            channel.as_ref(),
+                            &delivery_recipient,
+                            draft_id,
+                        )
+                        .await;
+                        let message = SendMessage::new(&delivered_response, &delivery_recipient)
+                            .force_voice()
+                            .in_thread(msg.thread_ts.clone());
+                        session_history::deliver(
+                            native_history.as_ref(),
+                            &native_turn_id,
+                            channel.name(),
+                            &delivery_recipient,
+                            &delivered_response,
+                            channel.send_final(&message),
+                        )
+                        .await
+                        .is_ok()
                     } else {
                         let suppress = suppress_voice_override.unwrap_or(false);
                         let draft_final_response = if channel.supports_multi_message_streaming() {
@@ -11117,14 +11897,12 @@ async fn process_channel_message_body(
                         } else {
                             delivered_response.clone()
                         };
-                        match channel
-                            .finalize_draft(
+                        match session_history::deliver(native_history.as_ref(),&native_turn_id,channel.name(),&delivery_recipient,&draft_final_response,channel.finalize_draft(
                                 &delivery_recipient,
                                 draft_id,
                                 &draft_final_response,
                                 suppress,
-                            )
-                            .await
+                            )).await
                         {
                             Ok(()) => true,
                             Err(e)
@@ -11176,6 +11954,19 @@ async fn process_channel_message_body(
                                 );
                                 false
                             }
+                            Err(e) if native_history.is_some() => {
+                                // Native capture preserves uncertain acceptance.
+                                // A persistence failure or an unverified network
+                                // error never authorizes sending the answer again.
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                                    "Native draft delivery unresolved"
+                                );
+                                false
+                            }
                             Err(e) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -11191,7 +11982,7 @@ async fn process_channel_message_body(
                                 if suppress {
                                     fallback = fallback.suppress_voice();
                                 }
-                                channel.send_final(&fallback).await.is_ok()
+                                session_history::deliver(native_history.as_ref(),&native_turn_id,channel.name(),&delivery_recipient,&delivered_response,channel.send_final(&fallback)).await.is_ok()
                             }
                         }
                     }
@@ -11205,7 +11996,16 @@ async fn process_channel_message_body(
                     } else if force_voice_override {
                         send_msg = send_msg.force_voice();
                     }
-                    match channel.send_final(&send_msg).await {
+                    match session_history::deliver(
+                        native_history.as_ref(),
+                        &native_turn_id,
+                        channel.name(),
+                        &delivery_recipient,
+                        &delivered_response,
+                        channel.send_final(&send_msg),
+                    )
+                    .await
+                    {
                         Ok(()) => true,
                         Err(e) => {
                             ::zeroclaw_log::record!(
@@ -11232,13 +12032,13 @@ async fn process_channel_message_body(
                 // so a dropped send must leave a log signal rather than silently
                 // disappear.
                 if let Some(ref block) = receipts_block
-                    && let Err(e) = channel
-                        .send(
-                            &SendMessage::new(block, &delivery_recipient)
-                                .in_thread(msg.thread_ts.clone())
-                                .suppress_voice(),
-                        )
-                        .await
+                    && let Err(e) = session_history::send(
+                        channel.as_ref(),
+                        &SendMessage::new(block, &delivery_recipient)
+                            .in_thread(msg.thread_ts.clone())
+                            .suppress_voice(),
+                    )
+                    .await
                 {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -11277,7 +12077,9 @@ async fn process_channel_message_body(
                 );
                 if let (Some(channel), Some(draft_id)) =
                     (target_channel.as_ref(), draft_message_id.as_deref())
-                    && let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await
+                    && let Err(err) =
+                        session_history::cancel_draft(channel.as_ref(), &msg.reply_target, draft_id)
+                            .await
                 {
                     ::zeroclaw_log::record!(
                         DEBUG,
@@ -11316,11 +12118,18 @@ async fn process_channel_message_body(
                 );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(draft_id) = draft_message_id.as_deref() {
-                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
-                    }
-                    let _ = channel
-                        .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
+                        let _ = session_history::cancel_draft(
+                            channel.as_ref(),
+                            &msg.reply_target,
+                            draft_id,
+                        )
                         .await;
+                    }
+                    let _ = session_history::send(
+                        channel.as_ref(),
+                        &SendMessage::reply_to(&msg, error_text).suppress_voice(),
+                    )
+                    .await;
                 }
             } else {
                 let context_window_exceeded =
@@ -11349,6 +12158,11 @@ async fn process_channel_message_body(
                         &route.model_provider,
                         route.api_key.as_deref(),
                         runtime_defaults.generation,
+                        provider_model_override(
+                            &runtime_defaults.config,
+                            &route.model_provider,
+                            pin_selected_model.then_some(route.model.as_str()),
+                        ),
                     );
                     let mut cache = ctx.provider_cache.lock().unwrap_or_else(|p| p.into_inner());
                     if cache.remove(&cache_key).is_some() {
@@ -11419,11 +12233,18 @@ async fn process_channel_message_body(
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
                     if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
-                    }
-                    let _ = channel
-                        .send(&SendMessage::reply_to(&msg, user_msg).suppress_voice())
+                        let _ = session_history::cancel_draft(
+                            channel.as_ref(),
+                            &msg.reply_target,
+                            draft_id,
+                        )
                         .await;
+                    }
+                    let _ = session_history::send(
+                        channel.as_ref(),
+                        &SendMessage::reply_to(&msg, user_msg).suppress_voice(),
+                    )
+                    .await;
                 }
             }
         }
@@ -11474,11 +12295,18 @@ async fn process_channel_message_body(
                     "channel-runtime-request-timeout",
                 );
                 if let Some(draft_id) = draft_message_id.as_deref() {
-                    let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
-                }
-                let _ = channel
-                    .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
+                    let _ = session_history::cancel_draft(
+                        channel.as_ref(),
+                        &msg.reply_target,
+                        draft_id,
+                    )
                     .await;
+                }
+                let _ = session_history::send(
+                    channel.as_ref(),
+                    &SendMessage::reply_to(&msg, error_text).suppress_voice(),
+                )
+                .await;
             }
         }
     }
@@ -11498,6 +12326,7 @@ async fn process_channel_message_body(
             .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
             .await;
     }
+    terminal_result
 }
 
 /// Claim the sender's interruption slot for a message that is about to be
@@ -16972,6 +17801,30 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
     sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Result<()> {
+    start_channels_with_history(
+        authority,
+        canvas_store,
+        cancel,
+        sop_engine,
+        sop_audit,
+        plugin_webhooks,
+        sop_driver_sink,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_history(
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    plugin_webhooks: Option<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
+    sop_driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
+    native_sessions: Option<Arc<dyn zeroclaw_kernel::session::engine::EngineSessionSource>>,
+) -> Result<()> {
     let plugin_webhook_registry_lease = plugin_webhooks
         .as_ref()
         .map(|registry| registry.start_generation());
@@ -17019,7 +17872,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     // `session_key` (which already encodes `<channel_type>.<alias>`), so
     // multiple agent ctxs reading the same backend never overlap.
     let shared_session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>> =
-        if config.channels.session_persistence {
+        if config.channels.session_persistence && native_sessions.is_none() {
             match zeroclaw_infra::make_session_backend(
                 &config.data_dir,
                 &config.channels.session_backend,
@@ -17095,6 +17948,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 provider_api_url.clone(),
                 provider_reliability.clone(),
                 provider_runtime_options.clone(),
+                None,
             )
             .await?,
         );
@@ -17610,7 +18464,12 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             query_classification: config.query_classification.clone(),
             ack_reactions: config.channels.ack_reactions,
             show_tool_calls: config.channels.show_tool_calls,
-            session_store: shared_session_store.clone(),
+            session_store: if native_sessions.is_some() {
+                None
+            } else {
+                shared_session_store.clone()
+            },
+            native_sessions: native_sessions.clone(),
             approval_manager: Arc::new(channel_approval_manager(&risk_profile)),
             activated_tools: ch_activated_handle,
             cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
@@ -17664,7 +18523,9 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     // `conversation_histories` LRU. Sessions whose channel has no enabled
     // owner are skipped so their history doesn't end up loaded into the
     // fallback agent (which wouldn't reply on that channel anyway).
-    if let Some(ref store) = shared_session_store {
+    if native_sessions.is_none()
+        && let Some(ref store) = shared_session_store
+    {
         let mut metadata = store.list_sessions_with_metadata();
         metadata.sort_by_key(|m| std::cmp::Reverse(m.last_activity));
         // Budget proportional to the number of agents — each gets up to
@@ -18307,6 +19168,7 @@ fn concurrent_persist_lock_serialization() {
         ack_reactions: true,
         show_tool_calls: true,
         session_store: Some(Arc::new(backend) as Arc<dyn SessionBackend>),
+        native_sessions: None,
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
         )),
@@ -18490,6 +19352,7 @@ fn test_channel_ctx_with_backend(
         ack_reactions: true,
         show_tool_calls: true,
         session_store: Some(backend),
+        native_sessions: None,
         approval_manager: Arc::new(
             zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -18611,6 +19474,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
         ack_reactions: true,
         show_tool_calls: true,
         session_store: Some(backend),
+        native_sessions: None,
         approval_manager: Arc::new(
             zeroclaw_runtime::approval::ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -19578,6 +20442,38 @@ fn test_conversation_binding(key: &str) -> zeroclaw_api::conversation_binding::C
         route: TEST_BOUND_ROUTE.to_string(),
         key: key.to_string(),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn bound_conversation_refuses_native_history_without_execution_admission() {
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+
+    let directory = tempfile::TempDir::new().expect("tempdir");
+    let mut ctx = test_channel_ctx_with_backend(Arc::new(
+        zeroclaw_infra::session_store::SessionStore::new(directory.path())
+            .expect("legacy fixture store"),
+    ));
+    let inner = Arc::get_mut(&mut ctx).expect("unshared context");
+    inner.native_sessions = Some(Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+        inner.live_config.clone(),
+    )));
+    inner.session_store = None;
+    let owner = test_conversation_owner(&ctx);
+    let binding = test_conversation_binding("native-bound-history");
+    assert!(owner.load(&binding).is_err());
+    assert!(
+        owner
+            .append(&binding, &[ChatMessage::user("retain me")])
+            .is_err()
+    );
+    assert!(
+        ctx.conversation_histories
+            .lock()
+            .unwrap()
+            .peek(&binding.key)
+            .is_none()
+    );
 }
 
 /// An internally initiated exchange appended while a channel turn is in
@@ -22844,6 +23740,7 @@ temperature = 0.3
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -22937,6 +23834,7 @@ temperature = 0.3
         let single_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&single_registry),
             session_store: Some(Arc::clone(&single_store)),
+            native_sessions: None,
             security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
@@ -23007,6 +23905,7 @@ temperature = 0.3
             channels_by_name: Arc::clone(&multi_registry),
             agent_alias: Arc::new("alpha-agent".to_string()),
             session_store: Some(Arc::clone(&multi_store)),
+            native_sessions: None,
             security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
@@ -23014,6 +23913,7 @@ temperature = 0.3
             channels_by_name: Arc::clone(&multi_registry),
             agent_alias: Arc::new("beta-agent".to_string()),
             session_store: Some(Arc::clone(&multi_store)),
+            native_sessions: None,
             security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         });
@@ -23223,6 +24123,7 @@ temperature = 0.3
             Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
         let ctx = ChannelRuntimeContext {
             session_store: Some(Arc::clone(&session_store)),
+            native_sessions: None,
             security: Arc::new(SecurityPolicy::default()),
             ..(*router_test_ctx()).clone()
         };
@@ -23824,6 +24725,7 @@ temperature = 0.3
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -24068,13 +24970,19 @@ api_key = "anthropic-key"
 
     #[test]
     fn provider_cache_key_isolates_hot_generations() {
-        let startup = provider_cache_key("openrouter.default", None, 0);
-        let hot_1 = provider_cache_key("openrouter.default", None, 1);
-        let hot_2 = provider_cache_key("openrouter.default", None, 2);
+        let startup = provider_cache_key("openrouter.default", None, 0, None);
+        let hot_1 = provider_cache_key("openrouter.default", None, 1, None);
+        let hot_2 = provider_cache_key("openrouter.default", None, 2, None);
+        let explicit = provider_cache_key("openrouter.default", None, 1, Some("selected"));
 
         assert_eq!(startup, "openrouter.default");
         assert_ne!(hot_1, startup);
         assert_ne!(hot_1, hot_2);
+        assert_ne!(explicit, hot_1);
+        assert_ne!(
+            explicit,
+            provider_cache_key("openrouter.default", None, 1, Some("another"))
+        );
     }
 
     #[test]
@@ -24308,6 +25216,7 @@ api_key = "anthropic-key"
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -24417,6 +25326,7 @@ api_key = "anthropic-key"
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -24544,6 +25454,7 @@ api_key = "anthropic-key"
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -24675,6 +25586,7 @@ api_key = "anthropic-key"
             ack_reactions: true,
             show_tool_calls: true,
             session_store: Some(Arc::clone(&store)),
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -25728,6 +26640,7 @@ api_key = "anthropic-key"
         channel_name: &'static str,
         supports_multi_message_streaming: bool,
         finalize_should_fail: bool,
+        finalize_undelivered: bool,
         fallback_send_should_fail: bool,
         final_send_calls: AtomicUsize,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
@@ -25783,6 +26696,7 @@ api_key = "anthropic-key"
                 channel_name: "test-channel",
                 supports_multi_message_streaming: false,
                 finalize_should_fail,
+                finalize_undelivered: false,
                 fallback_send_should_fail,
                 final_send_calls: AtomicUsize::new(0),
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
@@ -26388,6 +27302,12 @@ api_key = "anthropic-key"
             text: &str,
             _suppress_voice: bool,
         ) -> anyhow::Result<()> {
+            if self.finalize_undelivered {
+                return Err(zeroclaw_api::channel::FinalizeUndelivered {
+                    reason: "fixture platform rejection".into(),
+                }
+                .into());
+            }
             if self.finalize_should_fail {
                 anyhow::bail!("finalize boom")
             }
@@ -26703,6 +27623,7 @@ api_key = "anthropic-key"
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
             activated_tools: None,
             cost_tracking: None,
@@ -26810,6 +27731,7 @@ api_key = "anthropic-key"
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -27902,6 +28824,7 @@ api_key = "anthropic-key"
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("Понял, запускаю инструмент".to_string()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "call-1".to_string(),
@@ -27914,6 +28837,7 @@ api_key = "anthropic-key"
                 })
             } else {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("Инструмент отклонён, завершаю ход.".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -27987,6 +28911,7 @@ api_key = "anthropic-key"
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some(format!(
                         "Ключ {LEAKING_NARRATION_SECRET}, запускаю инструмент"
                     )),
@@ -28001,6 +28926,7 @@ api_key = "anthropic-key"
                 })
             } else {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("Инструмент отклонён, завершаю ход.".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -28867,6 +29793,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
             if call_index == 0 {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some(String::new()),
                     tool_calls: vec![zeroclaw_providers::ToolCall {
                         id: "switch-call".to_string(),
@@ -28884,6 +29811,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 })
             } else {
                 Ok(zeroclaw_providers::ChatResponse {
+                    output_blocks: Vec::new(),
                     text: Some("original-provider-should-not-be-reused".to_string()),
                     tool_calls: vec![],
                     usage: None,
@@ -29802,6 +30730,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -29986,6 +30915,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -30166,6 +31096,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -30372,6 +31303,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -30564,6 +31496,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -30765,6 +31698,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -31340,6 +32274,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -31491,6 +32426,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: Some(Arc::clone(&session_store)),
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
                 let mut profile = zeroclaw_config::schema::RiskProfileConfig::default();
                 profile.auto_approve.push("sessions_current".to_string());
@@ -31619,6 +32555,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -31931,6 +32868,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -32064,6 +33002,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -32224,6 +33163,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -32366,6 +33306,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -32493,6 +33434,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -32635,6 +33577,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -32805,6 +33748,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -32867,6 +33811,719 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn native_channel_explicit_default_survives_reload_and_resolves_current_route_key() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::session_events::capture::{
+            ModelChangeDisposition, ModelOverrideSelection, ModelRouteMode,
+        };
+
+        for backend in ["sqlite", "jsonl"] {
+            for route_key in [false, true] {
+                let directory = tempfile::TempDir::new().expect("directory");
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/v1/models"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "data":[],
+                    })))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .and(header(
+                        "authorization",
+                        if route_key {
+                            "Bearer fixture-route-after"
+                        } else {
+                            "Bearer fixture-profile"
+                        },
+                    ))
+                    .and(body_partial_json(serde_json::json!({"model":"test-model"})))
+                    .respond_with(|request: &wiremock::Request| {
+                        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                        if body["stream"] == true {
+                            ResponseTemplate::new(200).set_body_raw(
+                                concat!(
+                                    "data: {\"choices\":[{\"delta\":{\"content\":\"route reply\"},\"index\":0}]}\n\n",
+                                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\n",
+                                    "data: [DONE]\n\n"
+                                ),
+                                "text/event-stream",
+                            )
+                        } else {
+                            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                                "choices":[{"message":{"role":"assistant","content":"route reply"},"finish_reason":"stop"}],
+                            }))
+                        }
+                    })
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let mut config = Config {
+                    data_dir: directory.path().to_owned(),
+                    ..Default::default()
+                };
+                config.channels.session_backend = backend.into();
+                config.reliability.provider_retries = 0;
+                let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                    channels: vec![zeroclaw_config::providers::ChannelRef("matrix".into())],
+                    model_provider: "openai.primary".into(),
+                    ..Default::default()
+                };
+                config.agents.insert("test-agent".into(), agent.clone());
+                config
+                    .peer_groups
+                    .insert("fixture".into(), peer_group("matrix", &["alice"], false));
+                let profile = config.providers.models.ensure("openai", "primary").unwrap();
+                profile.model = Some("test-model".into());
+                profile.api_key = Some("fixture-profile".into());
+                profile.uri = Some(format!("{}/v1", server.uri()));
+                profile.wire_api = Some(zeroclaw_config::schema::WireApi::ChatCompletions);
+                config
+                    .model_routes
+                    .push(zeroclaw_config::schema::ModelRouteConfig {
+                        hint: "pinned".into(),
+                        model_provider: "openai.primary".into(),
+                        model: "test-model".into(),
+                        api_key: route_key.then(|| "fixture-route-before".into()),
+                    });
+                let channel = Arc::new(SendMessageRecordingChannel::matrix());
+                let mut ctx = test_runtime_ctx_with_observer_and_tools(
+                    channel.clone(),
+                    Arc::new(ModelCaptureModelProvider::default()),
+                    config.clone(),
+                    agent,
+                    "openai.primary",
+                    None,
+                    Arc::new(NoopObserver),
+                    vec![],
+                );
+                let inner = Arc::get_mut(&mut ctx).expect("unshared context");
+                inner.workspace_dir = Arc::new(directory.path().to_owned());
+                inner.ack_reactions = false;
+                inner.provider_runtime_options.zeroclaw_dir = Some(directory.path().to_owned());
+                inner.model_routes = Arc::new(config.model_routes.clone());
+                inner.native_sessions = Some(Arc::new(
+                    zeroclaw_session_host::NativeSessionHub::new(inner.live_config.clone()),
+                ));
+                let mut msg =
+                    ChannelMessage::new("open", "alice", "room", "/thinking high", "matrix", 1);
+                msg.explicitly_addressed = true;
+                process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new()).await;
+                let family = runtime_conversation_history_key(&ctx, &msg);
+                let port = session_history::open(ctx.clone(), &msg, &family)
+                    .await
+                    .expect("open")
+                    .expect("native port");
+                let explicit = ModelOverrideSelection::Set {
+                    provider_ref: "openai.primary".into(),
+                    model: "test-model".into(),
+                    thinking: Some("high".into()),
+                    route_mode: ModelRouteMode::Automatic,
+                };
+                port.observe_model_change(explicit.clone(), ModelChangeDisposition::Applied)
+                    .await
+                    .expect("explicit automatic base");
+                msg.id = "restore-before-reload".into();
+                msg.content = "/model".into();
+                process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new()).await;
+                let restored = ctx
+                    .route_overrides
+                    .lock()
+                    .unwrap()
+                    .get(&family)
+                    .cloned()
+                    .expect("an explicit selection remains explicit even when equal to defaults");
+                assert_eq!(restored.model, "test-model");
+                assert_eq!(
+                    restored.api_key.as_deref(),
+                    route_key.then_some("fixture-route-before")
+                );
+
+                config
+                    .providers
+                    .models
+                    .ensure("openai", "primary")
+                    .unwrap()
+                    .model = Some("updated-default-model".into());
+                config.model_routes[0].api_key = route_key.then(|| "fixture-route-after".into());
+                tokio::fs::write(
+                    directory.path().join("config.toml"),
+                    toml::to_string_pretty(&config).expect("config serialization"),
+                )
+                .await
+                .expect("publish config update");
+                msg.id = "turn-with-reload".into();
+                msg.content = "Use the selected model".into();
+                process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+                server.verify().await;
+                assert!(
+                    channel
+                        .sent_messages
+                        .lock()
+                        .await
+                        .last()
+                        .unwrap()
+                        .content
+                        .contains("route reply")
+                );
+                assert_eq!(
+                    runtime_defaults_snapshot(&ctx).defaults.model,
+                    "updated-default-model"
+                );
+                assert_eq!(port.restore_model_override().await.unwrap(), Some(explicit));
+                let restored = ctx
+                    .route_overrides
+                    .lock()
+                    .unwrap()
+                    .get(&family)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(restored.model, "test-model");
+                assert_eq!(
+                    restored.api_key.as_deref(),
+                    route_key.then_some("fixture-route-after")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_channel_model_auto_restores_mode_without_losing_thinking() {
+        use zeroclaw_api::session_events::capture::{
+            ContextSnapshot, EngineTurnFuture, EngineTurnInput, ModelChangeDisposition,
+            ModelOverrideSelection, ModelRouteMode, SessionExecutionPort, scope_session_execution,
+        };
+        use zeroclaw_api::session_events::{
+            EventCursor, EventData, ModelResolution, SessionEventStore,
+        };
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+
+        struct RejectReset {
+            inner: Arc<dyn SessionExecutionPort>,
+            fail_model: bool,
+        }
+        #[async_trait::async_trait]
+        impl SessionExecutionPort for RejectReset {
+            async fn restore_model_override(
+                &self,
+            ) -> anyhow::Result<Option<ModelOverrideSelection>> {
+                self.inner.restore_model_override().await
+            }
+            async fn record_control(&self, value: serde_json::Value) -> anyhow::Result<()> {
+                self.inner.record_control(value).await
+            }
+            async fn replace_context(
+                &self,
+                context: ContextSnapshot,
+                reason: &str,
+            ) -> anyhow::Result<()> {
+                if !self.fail_model {
+                    anyhow::bail!("fixture reset context commit failed");
+                }
+                self.inner.replace_context(context, reason).await
+            }
+            async fn observe_model_change(
+                &self,
+                _: ModelOverrideSelection,
+                _: ModelChangeDisposition,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("fixture reset selection commit failed")
+            }
+            async fn execute(
+                &self,
+                input: EngineTurnInput,
+                engine: EngineTurnFuture<'_>,
+            ) -> anyhow::Result<String> {
+                self.inner.execute(input, engine).await
+            }
+        }
+
+        for backend in ["sqlite", "jsonl"] {
+            let directory = tempfile::TempDir::new().expect("directory");
+            let mut config = Config {
+                data_dir: directory.path().to_owned(),
+                ..Default::default()
+            };
+            config.channels.session_backend = backend.into();
+            config.runtime_profiles.insert(
+                "effort".into(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    effort_routing: Some(EffortRoutingConfig {
+                        local_hint: "local".into(),
+                        cloud_hint: "cloud".into(),
+                        cloud_escalation: CloudEscalationPolicy::Auto,
+                    }),
+                    ..Default::default()
+                },
+            );
+            let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef("matrix".into())],
+                model_provider: "openrouter.local".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            };
+            config.agents.insert("test-agent".into(), agent.clone());
+            config
+                .peer_groups
+                .insert("fixture".into(), peer_group("matrix", &["alice"], false));
+            for hint in ["local", "cloud"] {
+                let entry = config
+                    .providers
+                    .models
+                    .ensure("openrouter", hint)
+                    .expect("provider");
+                entry.model = Some(format!("{hint}-model"));
+                entry.api_key = Some("fixture-key".into());
+                config
+                    .model_routes
+                    .push(zeroclaw_config::schema::ModelRouteConfig {
+                        hint: hint.into(),
+                        model_provider: format!("openrouter.{hint}"),
+                        model: format!("{hint}-model"),
+                        api_key: None,
+                    });
+            }
+            let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+            let mut ctx = test_runtime_ctx_with_observer_and_tools(
+                channel_impl.clone(),
+                Arc::new(ModelCaptureModelProvider::default()),
+                config,
+                agent,
+                "openrouter.local",
+                None,
+                Arc::new(NoopObserver),
+                vec![],
+            );
+            let inner = Arc::get_mut(&mut ctx).expect("unshared context");
+            inner.workspace_dir = Arc::new(directory.path().to_owned());
+            inner.ack_reactions = false;
+            inner.model = Arc::new("local-model".into());
+            inner.model_routes = Arc::new(inner.prompt_config.model_routes.clone());
+            let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                inner.live_config.clone(),
+            ));
+            inner.native_sessions = Some(source.clone());
+            let mut msg = ChannelMessage::new(
+                "thinking-command",
+                "alice",
+                "room",
+                "/thinking high",
+                "matrix",
+                1,
+            );
+            msg.explicitly_addressed = true;
+            let family = runtime_conversation_history_key(&ctx, &msg);
+            for (command, model, mode) in [
+                ("/thinking high", "local-model", ModelRouteMode::Automatic),
+                ("/model cloud", "cloud-model", ModelRouteMode::Manual),
+                ("/model auto", "local-model", ModelRouteMode::Automatic),
+            ] {
+                msg.id = format!("command-{command}");
+                msg.content = command.into();
+                process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new()).await;
+                let port = session_history::open(ctx.clone(), &msg, &family)
+                    .await
+                    .expect("open")
+                    .expect("native port");
+                assert_eq!(
+                    port.restore_model_override().await.expect("selection"),
+                    Some(if mode == ModelRouteMode::Manual {
+                        ModelOverrideSelection::Set {
+                            provider_ref: "openrouter.cloud".into(),
+                            model: model.into(),
+                            thinking: Some("high".into()),
+                            route_mode: mode,
+                        }
+                    } else {
+                        ModelOverrideSelection::Inherit {
+                            thinking: Some("high".into()),
+                        }
+                    }),
+                    "{backend}, {command}"
+                );
+                ctx.route_overrides.lock().unwrap().clear();
+                ctx.thinking_overrides.lock().unwrap().clear();
+                msg.id = format!("restore-{command}");
+                msg.content = "/model".into();
+                process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new()).await;
+                let restored =
+                    get_route_selection(&ctx, &msg, &family, &runtime_defaults_snapshot(&ctx));
+                assert_eq!(restored.automatic, mode == ModelRouteMode::Automatic);
+                assert_eq!(restored.model, model);
+                assert_eq!(
+                    ctx.thinking_overrides.lock().unwrap().get(&family),
+                    Some(&ThinkingLevel::High)
+                );
+                let mut updated_config = ctx.prompt_config.as_ref().clone();
+                updated_config
+                    .providers
+                    .models
+                    .ensure("openrouter", "local")
+                    .expect("updated provider")
+                    .model = Some("refreshed-local-model".into());
+                let defaults = runtime_defaults_from_config(&updated_config, "openrouter.local")
+                    .expect("updated defaults");
+                *ctx.runtime_defaults_override.lock().unwrap() =
+                    Some(Arc::new(ChannelRuntimeOverride {
+                        config: Arc::new(updated_config),
+                        defaults,
+                        generation: 1,
+                    }));
+                msg.id = format!("config-refresh-{command}");
+                process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new()).await;
+                let refreshed =
+                    get_route_selection(&ctx, &msg, &family, &runtime_defaults_snapshot(&ctx));
+                assert_eq!(
+                    refreshed.model,
+                    if mode == ModelRouteMode::Manual {
+                        "cloud-model"
+                    } else {
+                        "refreshed-local-model"
+                    },
+                    "{backend}, {command}: inherited selections must resolve live defaults"
+                );
+                if mode == ModelRouteMode::Automatic {
+                    assert!(!ctx.route_overrides.lock().unwrap().contains_key(&family));
+                }
+                *ctx.runtime_defaults_override.lock().unwrap() = None;
+            }
+            let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                directory.path(),
+                &family,
+            )
+            .expect("store");
+            let stream = source.stream_id(&family).await.expect("stream");
+            let events = store
+                .read_page(
+                    &stream,
+                    &EventCursor::beginning(stream.clone()),
+                    None,
+                    256,
+                    4 * 1024 * 1024,
+                )
+                .expect("events")
+                .events;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.body.data,
+                        EventData::SessionModelOverrideChanged {
+                            resolution: ModelResolution::Applied { .. }
+                        }
+                    ))
+                    .count(),
+                3
+            );
+            assert!(!events.iter().any(|event| matches!(
+                &event.body.data,
+                EventData::SessionModelOverrideChanged {
+                    resolution: ModelResolution::Rejected { .. }
+                }
+            )));
+            for (selection_command, provider_ref, model, mode) in [
+                (
+                    "/model cloud",
+                    "openrouter.cloud",
+                    "cloud-model",
+                    ModelRouteMode::Manual,
+                ),
+                (
+                    "/model auto",
+                    "openrouter.local",
+                    "local-model",
+                    ModelRouteMode::Automatic,
+                ),
+            ] {
+                for reset_command in ["/new", "/clear"] {
+                    for command in [selection_command, "/thinking high", reset_command] {
+                        msg.id = uuid::Uuid::new_v4().to_string();
+                        msg.content = command.into();
+                        process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new())
+                            .await;
+                    }
+                    let port = session_history::open(ctx.clone(), &msg, &family)
+                        .await
+                        .expect("open")
+                        .expect("port");
+                    assert_eq!(
+                        port.restore_model_override()
+                            .await
+                            .expect("reset selection"),
+                        Some(if mode == ModelRouteMode::Manual {
+                            ModelOverrideSelection::Set {
+                                provider_ref: provider_ref.into(),
+                                model: model.into(),
+                                thinking: None,
+                                route_mode: mode,
+                            }
+                        } else {
+                            ModelOverrideSelection::Inherit { thinking: None }
+                        }),
+                        "{backend}, {selection_command}, {reset_command}"
+                    );
+                    ctx.route_overrides.lock().unwrap().clear();
+                    ctx.thinking_overrides.lock().unwrap().clear();
+                    msg.id = uuid::Uuid::new_v4().to_string();
+                    msg.content = "/model".into();
+                    process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new())
+                        .await;
+                    let restored =
+                        get_route_selection(&ctx, &msg, &family, &runtime_defaults_snapshot(&ctx));
+                    assert_eq!(restored.automatic, mode == ModelRouteMode::Automatic);
+                    assert_eq!(restored.model, model);
+                    assert!(!ctx.thinking_overrides.lock().unwrap().contains_key(&family));
+
+                    msg.id = uuid::Uuid::new_v4().to_string();
+                    msg.content = "/thinking high".into();
+                    process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new())
+                        .await;
+                    take_pending_new_session(&ctx, &family);
+                    for fail_model in [false, true] {
+                        let before = channel_impl.sent_messages.lock().await.len();
+                        let target: Arc<dyn Channel> = channel_impl.clone();
+                        msg.id = uuid::Uuid::new_v4().to_string();
+                        msg.content = reset_command.into();
+                        assert!(
+                            scope_session_execution(
+                                Arc::new(RejectReset {
+                                    inner: port.clone(),
+                                    fail_model
+                                }),
+                                handle_runtime_command_if_needed(&ctx, &msg, Some(&target))
+                            )
+                            .await
+                        );
+                        assert_eq!(
+                            channel_impl.sent_messages.lock().await.len(),
+                            before,
+                            "failed reset must not acknowledge success"
+                        );
+                        assert!(!ctx.pending_new_sessions.lock().unwrap().contains(&family));
+                        assert_eq!(
+                            ctx.thinking_overrides.lock().unwrap().get(&family),
+                            Some(&ThinkingLevel::High)
+                        );
+                        assert_eq!(
+                            port.restore_model_override()
+                                .await
+                                .expect("retained selection"),
+                            Some(if mode == ModelRouteMode::Manual {
+                                ModelOverrideSelection::Set {
+                                    provider_ref: provider_ref.into(),
+                                    model: model.into(),
+                                    thinking: Some("high".into()),
+                                    route_mode: mode,
+                                }
+                            } else {
+                                ModelOverrideSelection::Inherit {
+                                    thinking: Some("high".into()),
+                                }
+                            })
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_channel_model_switch_preserves_thinking_and_records_rejection() {
+        use zeroclaw_api::session_events::capture::ModelOverrideSelection;
+        use zeroclaw_api::session_events::{
+            EventCursor, EventData, ModelResolution, SessionEventStore,
+        };
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+
+        for backend in ["sqlite", "jsonl"] {
+            for reject_switch in [false, true] {
+                for scoped in [false, true] {
+                    let directory = tempfile::TempDir::new().expect("directory");
+                    let mut config = Config {
+                        data_dir: directory.path().to_owned(),
+                        ..Default::default()
+                    };
+                    config.channels.session_backend = backend.into();
+                    let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                        channels: vec![zeroclaw_config::providers::ChannelRef("matrix".into())],
+                        model_provider: "openrouter.initial".into(),
+                        risk_profile: "fixture".into(),
+                        ..Default::default()
+                    };
+                    config.agents.insert("test-agent".into(), agent.clone());
+                    config.risk_profiles.insert(
+                        "fixture".into(),
+                        zeroclaw_config::schema::RiskProfileConfig {
+                            level: AutonomyLevel::Full,
+                            auto_approve: vec!["model_switch".into()],
+                            ..Default::default()
+                        },
+                    );
+                    config
+                        .peer_groups
+                        .insert("fixture".into(), peer_group("matrix", &["alice"], false));
+                    for (alias, model) in [("initial", "test-model"), ("default", "switched-model")]
+                    {
+                        let entry = config.providers.models.ensure("openrouter", alias).unwrap();
+                        entry.model = Some(model.into());
+                        entry.api_key = Some("fixture-key".into());
+                    }
+                    let switch_tool = zeroclaw_runtime::tools::ModelSwitchTool::new(
+                        Arc::new(SecurityPolicy {
+                            autonomy: AutonomyLevel::Full,
+                            ..Default::default()
+                        }),
+                        Arc::new(config.clone()),
+                    );
+                    if reject_switch {
+                        // The tool proposed a route before its runtime owner removed it.
+                        config.providers.models.openrouter.remove("default");
+                    }
+                    let provider = Arc::new(ModelSwitchRequestProvider::default());
+                    let switched = Arc::new(ModelCaptureModelProvider::default());
+                    let mut ctx = test_runtime_ctx_with_observer_and_tools(
+                        Arc::new(SendMessageRecordingChannel::matrix()),
+                        provider.clone(),
+                        config,
+                        agent,
+                        "openrouter.initial",
+                        None,
+                        Arc::new(NoopObserver),
+                        vec![Box::new(switch_tool)],
+                    );
+                    let inner = Arc::get_mut(&mut ctx).expect("unshared context");
+                    inner.workspace_dir = Arc::new(directory.path().to_owned());
+                    inner.ack_reactions = false;
+                    inner.provider_cache.lock().unwrap().insert(
+                        provider_cache_key("openrouter.default", None, 0, None),
+                        switched.clone(),
+                    );
+                    let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                        inner.live_config.clone(),
+                    ));
+                    inner.native_sessions = Some(source.clone());
+                    let mut msg = ChannelMessage::new(
+                        "thinking-command",
+                        "alice",
+                        "room",
+                        "/thinking high",
+                        "matrix",
+                        1,
+                    );
+                    // Reach the tool loop without consuming the fixture's switch
+                    // response in the separate reply-intent classifier request.
+                    msg.explicitly_addressed = true;
+                    let family = runtime_conversation_history_key(&ctx, &msg);
+                    if scoped {
+                        msg.id = "scoped-command".into();
+                        msg.content = "/model --user test-model".into();
+                        process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new())
+                            .await;
+                        msg.id = "thinking-command".into();
+                        msg.content = "/thinking high".into();
+                    }
+                    process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new())
+                        .await;
+                    assert_eq!(
+                        ctx.thinking_overrides.lock().unwrap().get(&family),
+                        Some(&ThinkingLevel::High),
+                    );
+                    msg.id = "switch-turn".into();
+                    msg.content = "switch the model".into();
+                    process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new())
+                        .await;
+                    let port = session_history::open(ctx.clone(), &msg, &family)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        port.restore_model_override().await.unwrap(),
+                        Some(if reject_switch || scoped {
+                            ModelOverrideSelection::Inherit {
+                                thinking: Some("high".into()),
+                            }
+                        } else {
+                            ModelOverrideSelection::Set {
+                                provider_ref: "openrouter.default".into(),
+                                model: "switched-model".into(),
+                                thinking: Some("high".into()),
+                                route_mode:
+                                    zeroclaw_api::session_events::capture::ModelRouteMode::Automatic,
+                            }
+                        }),
+                        "{backend}, rejected={reject_switch}, scoped={scoped}",
+                    );
+                    let switched_before = switched.call_count.load(Ordering::SeqCst);
+                    if scoped {
+                        clear_scope_override(&ctx, OverrideScope::User, &msg);
+                    }
+                    msg.id = "followup-turn".into();
+                    msg.content = "continue".into();
+                    process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+                    assert_eq!(
+                        ctx.thinking_overrides.lock().unwrap().get(&family),
+                        Some(&ThinkingLevel::High),
+                    );
+                    if reject_switch {
+                        assert_eq!(switched_before, 0);
+                    } else {
+                        assert!(switched_before > 0);
+                        if scoped {
+                            assert_eq!(switched.call_count.load(Ordering::SeqCst), switched_before);
+                            assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+                        } else {
+                            assert!(switched.call_count.load(Ordering::SeqCst) > switched_before);
+                        }
+                    }
+                    let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                        directory.path(),
+                        &family,
+                    )
+                    .unwrap();
+                    let stream = source.stream_id(&family).await.unwrap();
+                    let events = store
+                        .read_page(
+                            &stream,
+                            &EventCursor::beginning(stream.clone()),
+                            None,
+                            256,
+                            4 * 1024 * 1024,
+                        )
+                        .unwrap()
+                        .events;
+                    let rejected = events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                &event.body.data,
+                                EventData::SessionModelOverrideChanged {
+                                    resolution: ModelResolution::Rejected { reason_key, .. },
+                                } if reason_key == "channel_model_provider_resolution_failed"
+                            )
+                        })
+                        .count();
+                    assert_eq!(rejected, usize::from(reject_switch));
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(
+                                event.body.data,
+                                EventData::SessionModelOverrideChanged {
+                                    resolution: ModelResolution::AppliedForTurn
+                                }
+                            ))
+                            .count(),
+                        usize::from(scoped && !reject_switch)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn process_channel_message_preserves_trim_provenance_and_route_credential_across_model_switch()
      {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
@@ -32896,7 +34553,7 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::clone(&default_model_provider),
         );
         provider_cache_seed.insert(
-            provider_cache_key(switched_provider_ref, switched_key, 0),
+            provider_cache_key(switched_provider_ref, switched_key, 0, None),
             Arc::clone(&switched_model_provider),
         );
 
@@ -32910,7 +34567,10 @@ BTC is currently around $65,000 based on latest tool output."#
         // The prompt config owns the profile accepted by ModelSwitchTool and
         // later resolved by the channel switch handler.
         let prompt_config = {
-            let mut cfg = zeroclaw_config::schema::Config::default();
+            let mut cfg = zeroclaw_config::schema::Config {
+                model_routes: model_routes.clone(),
+                ..Default::default()
+            };
             cfg.runtime_profiles.insert(
                 "trim-switch".to_string(),
                 zeroclaw_config::schema::RuntimeProfileConfig {
@@ -33010,6 +34670,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     auto_approve: vec!["model_switch".to_string()],
@@ -33533,6 +35194,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -33655,6 +35317,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -33787,6 +35450,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -35277,6 +36941,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -35487,6 +37152,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -35658,6 +37324,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -35828,6 +37495,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -35983,6 +37651,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
@@ -36203,6 +37872,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -36445,6 +38115,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -36591,6 +38262,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -37274,6 +38946,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -37339,6 +39012,511 @@ BTC is currently around $65,000 based on latest tool output."#
     // silence, the early 👀 ack must be removed (not left dangling) and the
     // message must end carrying only the no-reply kind emoji. A regression that
     // strands the 👀 on this path falsely signals "still processing" forever.
+    #[test]
+    fn native_channel_recovery_preserves_route_identity_and_attachment_parts() {
+        use zeroclaw_api::channel::ChannelConversationScope;
+        use zeroclaw_api::media::{MarkerKind, MediaAttachment, RenderedMarker};
+
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::new(SendMessageRecordingChannel::matrix()),
+            Arc::new(DummyModelProvider),
+            Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        for alias in [None, Some(""), Some("fixture")] {
+            for platform_id in [None, Some("stable-sender-id")] {
+                let mut message = ChannelMessage::new(
+                    "original-id",
+                    "display-sender",
+                    "original-room",
+                    "original text",
+                    "matrix",
+                    42,
+                );
+                message.channel_alias = alias.map(str::to_owned);
+                message.platform_sender_id = platform_id.map(str::to_owned);
+                message.thread_ts = Some("original-thread".into());
+                message.interruption_scope_id = Some("original-scope".into());
+                message.subject = Some("original-subject".into());
+                message.references = vec!["original-reference".into()];
+                message.conversation_scope = ChannelConversationScope::ReplyTarget;
+                message.explicitly_addressed = true;
+                message.voice_origin = true;
+                message.attachments.push(MediaAttachment {
+                    file_name: "original.png".into(),
+                    data: vec![1, 2, 3],
+                    mime_type: Some("image/png".into()),
+                    marker: Some(RenderedMarker {
+                        target: "original-target".into(),
+                        kind: MarkerKind::Image,
+                    }),
+                });
+                let family = runtime_conversation_history_key(&ctx, &message);
+                let input = session_history::input(
+                    &ctx,
+                    &message,
+                    message.content.clone(),
+                    "test-provider".into(),
+                    "test-model".into(),
+                )
+                .unwrap();
+                let route = input.reply_route.as_ref().unwrap();
+                assert!(route.get("content").is_none());
+                assert!(route.get("attachments").is_none());
+                assert!(route.get("platform_sender_id").is_none());
+                let restored = session_history::recover_message(&ctx, &input, &family).unwrap();
+                assert_eq!(restored.id, message.id);
+                assert_eq!(restored.sender, message.sender);
+                assert_eq!(restored.platform_sender_id, message.platform_sender_id);
+                assert_eq!(restored.channel_alias, message.channel_alias);
+                assert_eq!(restored.reply_target, message.reply_target);
+                assert_eq!(restored.timestamp, 42);
+                assert_eq!(restored.thread_ts, message.thread_ts);
+                assert_eq!(
+                    restored.interruption_scope_id,
+                    message.interruption_scope_id
+                );
+                assert_eq!(restored.subject, message.subject);
+                assert_eq!(restored.references, message.references);
+                assert_eq!(
+                    restored.conversation_scope,
+                    ChannelConversationScope::ReplyTarget
+                );
+                assert!(restored.explicitly_addressed && restored.voice_origin);
+                assert_eq!(restored.content, "original text");
+                assert_eq!(restored.attachments.len(), 1);
+                assert_eq!(restored.attachments[0].data, [1, 2, 3]);
+                assert_eq!(restored.attachments[0].file_name, "original.png");
+                assert_eq!(
+                    restored.attachments[0].mime_type.as_deref(),
+                    Some("image/png")
+                );
+                assert_eq!(
+                    restored.attachments[0].marker,
+                    message.attachments[0].marker
+                );
+                assert!(session_history::recover_message(&ctx, &input, "another-family").is_err());
+                let mut changed = input;
+                changed.ingress.origin = zeroclaw_api::ingress::TurnOrigin::Interactive;
+                assert!(session_history::recover_message(&ctx, &changed, &family).is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_channel_dispatch_drains_old_inputs_with_original_sender_authority() {
+        use zeroclaw_api::principal::PrincipalId;
+        use zeroclaw_api::session_events::capture::{
+            ContextSnapshot, EngineTurnFuture, EngineTurnInput, SessionExecutionPort,
+        };
+        use zeroclaw_api::session_events::{BranchId, ContractError, SessionStreamId};
+        use zeroclaw_kernel::session::engine::{
+            EngineSessionAuthority, EngineSessionSource, FamilyDescriptor, FamilyQuery,
+        };
+        use zeroclaw_kernel::session::query::SessionAccessPolicy;
+
+        struct PendingSource {
+            pending: Vec<EngineTurnInput>,
+            executed: Arc<Mutex<Vec<String>>>,
+            rejected: Arc<Mutex<Vec<String>>>,
+        }
+        struct PendingPort {
+            pending: Vec<EngineTurnInput>,
+            executed: Arc<Mutex<Vec<String>>>,
+            rejected: Arc<Mutex<Vec<String>>>,
+            authority: Arc<dyn EngineSessionAuthority>,
+        }
+        #[async_trait::async_trait]
+        impl SessionExecutionPort for PendingPort {
+            async fn reject_pending_input(&self, turn_id: &str, _: &str) -> anyhow::Result<()> {
+                self.rejected.lock().unwrap().push(turn_id.to_owned());
+                Ok(())
+            }
+            async fn pending_inputs(
+                &self,
+                _: String,
+                _: String,
+            ) -> anyhow::Result<Vec<EngineTurnInput>> {
+                Ok(self.pending.clone())
+            }
+            async fn execute(
+                &self,
+                input: EngineTurnInput,
+                _engine: EngineTurnFuture<'_>,
+            ) -> anyhow::Result<String> {
+                self.authority.execution_binding(&input)?;
+                self.executed.lock().unwrap().push(input.turn_id);
+                Ok(String::new())
+            }
+        }
+        #[async_trait::async_trait]
+        impl EngineSessionSource for PendingSource {
+            async fn stream_id(&self, _: &str) -> Result<SessionStreamId, ContractError> {
+                SessionStreamId::parse("channel-recovery-fixture")
+            }
+            async fn describe(&self, _: String) -> anyhow::Result<Option<FamilyDescriptor>> {
+                Ok(None)
+            }
+            async fn families(&self) -> anyhow::Result<Vec<String>> {
+                Ok(vec![])
+            }
+            async fn open(
+                &self,
+                _: String,
+                _: String,
+                _: PrincipalId,
+                _: Arc<dyn EngineSessionAuthority>,
+                _: ContextSnapshot,
+            ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
+                anyhow::bail!("principal_open_not_expected")
+            }
+            async fn query(
+                &self,
+                _: String,
+                _: PrincipalId,
+                _: Arc<dyn SessionAccessPolicy>,
+            ) -> anyhow::Result<Option<FamilyQuery>> {
+                anyhow::bail!("query_not_expected")
+            }
+            async fn open_system(
+                &self,
+                family: String,
+                _: String,
+                _: String,
+                authority: Arc<dyn EngineSessionAuthority>,
+                _: ContextSnapshot,
+            ) -> anyhow::Result<Arc<dyn SessionExecutionPort>> {
+                authority.authorize_context(
+                    &self.stream_id(&family).await?,
+                    &BranchId::parse("fixture-branch")?,
+                )?;
+                Ok(Arc::new(PendingPort {
+                    pending: self.pending.clone(),
+                    executed: self.executed.clone(),
+                    rejected: self.rejected.clone(),
+                    authority,
+                }))
+            }
+        }
+
+        for original_sender_revoked in [false, true] {
+            let mut config = Config::default();
+            let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef("matrix".into())],
+                ..Default::default()
+            };
+            config.agents.insert("test-agent".into(), agent.clone());
+            config.peer_groups.insert(
+                "fixture".into(),
+                peer_group(
+                    "matrix",
+                    if original_sender_revoked {
+                        &["new-sender"]
+                    } else {
+                        &["new-sender", "old-sender"]
+                    },
+                    false,
+                ),
+            );
+            let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                Arc::new(SendMessageRecordingChannel::matrix()),
+                Arc::new(DummyModelProvider),
+                config,
+                agent,
+                "test-provider",
+                None,
+            );
+            let mut old = ChannelMessage::new(
+                "first",
+                "old-sender",
+                "shared-room",
+                "first input",
+                "matrix",
+                1,
+            );
+            old.conversation_scope = zeroclaw_api::channel::ChannelConversationScope::ReplyTarget;
+            let first = session_history::input(
+                &ctx,
+                &old,
+                old.content.clone(),
+                "test-provider".into(),
+                "test-model".into(),
+            )
+            .unwrap();
+            old.id = "second".into();
+            old.content = "second input".into();
+            let second = session_history::input(
+                &ctx,
+                &old,
+                old.content.clone(),
+                "test-provider".into(),
+                "test-model".into(),
+            )
+            .unwrap();
+            let mut current = old;
+            current.id = "current".into();
+            current.sender = "new-sender".into();
+            current.content = "current input".into();
+            let current_input = session_history::input(
+                &ctx,
+                &current,
+                current.content.clone(),
+                "test-provider".into(),
+                "test-model".into(),
+            )
+            .unwrap();
+            let expected = vec![
+                first.turn_id.clone(),
+                second.turn_id.clone(),
+                current_input.turn_id,
+            ];
+            let executed = Arc::new(Mutex::new(Vec::new()));
+            let rejected = Arc::new(Mutex::new(Vec::new()));
+            Arc::get_mut(&mut ctx).unwrap().native_sessions = Some(Arc::new(PendingSource {
+                pending: vec![first, second],
+                executed: executed.clone(),
+                rejected: rejected.clone(),
+            }));
+            process_channel_message(ctx, current, CancellationToken::new()).await;
+            let executed = executed.lock().unwrap();
+            if original_sender_revoked {
+                assert_eq!(
+                    *executed,
+                    expected[2..],
+                    "only the authorized current sender may execute"
+                );
+                assert_eq!(
+                    *rejected.lock().unwrap(),
+                    expected[..2],
+                    "revoked inputs must be explicitly settled before new work"
+                );
+            } else {
+                assert!(rejected.lock().unwrap().is_empty());
+                assert_eq!(
+                    *executed, expected,
+                    "pending inputs must reach execution before current input, in accepted order"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_channel_precheck_retry_and_timeout_preserve_durable_outcomes() {
+        use zeroclaw_api::session_events::{EventCursor, EventKind, SessionEventStore};
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+        for backend in ["sqlite", "jsonl"] {
+            for times_out in [false, true] {
+                let directory = tempfile::TempDir::new().expect("directory");
+                let channel = Arc::new(SendMessageRecordingChannel::matrix());
+                let provider = Arc::new(PrecheckProbeModelProvider {
+                    precheck_delay: times_out.then_some(Duration::from_secs(5)),
+                    ..Default::default()
+                });
+                let mut config = Config {
+                    data_dir: directory.path().to_owned(),
+                    ..Default::default()
+                };
+                config.channels.session_backend = backend.into();
+                let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+                    channels: vec![zeroclaw_config::providers::ChannelRef("matrix".into())],
+                    ..Default::default()
+                };
+                agent.precheck.enabled = true;
+                agent.precheck.timeout_secs = 1;
+                config.agents.insert("test-agent".into(), agent.clone());
+                config.peer_groups.insert(
+                    "fixture".into(),
+                    peer_group("matrix", &["fixture-sender"], false),
+                );
+                let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                    channel.clone(),
+                    provider.clone(),
+                    config,
+                    agent,
+                    "test-provider",
+                    None,
+                );
+                let inner = Arc::get_mut(&mut ctx).expect("unshared context");
+                inner.workspace_dir = Arc::new(directory.path().to_owned());
+                inner.ack_reactions = false;
+                let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                    inner.live_config.clone(),
+                ));
+                inner.native_sessions = Some(source.clone());
+                let msg = ChannelMessage::new(
+                    "native-fixture-message",
+                    "fixture-sender",
+                    "fixture-room",
+                    "background chatter",
+                    "matrix",
+                    1,
+                );
+                let family = runtime_conversation_history_key(&ctx, &msg);
+                process_channel_message(ctx.clone(), msg.clone(), CancellationToken::new()).await;
+                process_channel_message(ctx.clone(), msg, CancellationToken::new()).await;
+                assert_eq!(
+                    provider.precheck_calls.load(Ordering::SeqCst),
+                    1,
+                    "{backend}, timeout={times_out}"
+                );
+                assert_eq!(provider.main_calls.load(Ordering::SeqCst), 0);
+                assert!(channel.sent_messages.lock().await.is_empty());
+                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                    directory.path(),
+                    &family,
+                )
+                .expect("published family");
+                let stream = source.stream_id(&family).await.expect("stream");
+                let events = store
+                    .read_page(
+                        &stream,
+                        &EventCursor::beginning(stream.clone()),
+                        None,
+                        256,
+                        4 * 1024 * 1024,
+                    )
+                    .expect("events")
+                    .events;
+                let count = |kind| {
+                    events
+                        .iter()
+                        .filter(|event| event.body.kind() == kind)
+                        .count()
+                };
+                assert_eq!(count(EventKind::TurnAccepted), 1);
+                assert_eq!(count(EventKind::UserContentRecorded), 1);
+                assert_eq!(count(EventKind::TurnStarted), 1);
+                assert_eq!(count(EventKind::ProviderAttemptStarted), 1);
+                if times_out {
+                    assert_eq!(count(EventKind::InvocationOutcomeUnknown), 1);
+                    assert_eq!(count(EventKind::TurnOutcomeUnknown), 1);
+                    assert_eq!(count(EventKind::TurnCommitted), 0);
+                } else {
+                    assert_eq!(count(EventKind::ProviderAttemptCompleted), 1);
+                    assert_eq!(count(EventKind::TurnCommitted), 1);
+                    assert_eq!(count(EventKind::InvocationOutcomeUnknown), 0);
+                    assert!(count(EventKind::ContextProjectionCreated) >= 2);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_channel_draft_final_and_failed_delivery_are_distinct() {
+        use zeroclaw_api::session_events::{EventCursor, EventKind, SessionEventStore};
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+        for backend in ["sqlite", "jsonl"] {
+            for (finalize_fails, undelivered) in [(false, false), (true, false), (true, true)] {
+                let directory = tempfile::tempdir().expect("directory");
+                let mut channel_impl = DraftRecordingChannel::new(finalize_fails, false);
+                channel_impl.channel_name = "matrix";
+                channel_impl.finalize_undelivered = undelivered;
+                let channel = Arc::new(channel_impl);
+                let mut config = Config {
+                    data_dir: directory.path().into(),
+                    ..Default::default()
+                };
+                config.channels.session_backend = backend.into();
+                let mut agent = zeroclaw_config::schema::AliasedAgentConfig {
+                    channels: vec![zeroclaw_config::providers::ChannelRef("matrix".into())],
+                    ..Default::default()
+                };
+                agent.precheck.enabled = false;
+                config.agents.insert("test-agent".into(), agent.clone());
+                config.peer_groups.insert(
+                    "fixture".into(),
+                    peer_group("matrix", &["fixture-sender"], false),
+                );
+                let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+                    channel.clone(),
+                    Arc::new(DummyModelProvider),
+                    config,
+                    agent,
+                    "test-provider",
+                    None,
+                );
+                let inner = Arc::get_mut(&mut ctx).expect("unshared context");
+                inner.workspace_dir = Arc::new(directory.path().into());
+                inner.ack_reactions = false;
+                let source = Arc::new(zeroclaw_session_host::NativeSessionHub::new(
+                    inner.live_config.clone(),
+                ));
+                inner.native_sessions = Some(source.clone());
+                let message = ChannelMessage::new(
+                    "native-delivery-fixture",
+                    "fixture-sender",
+                    "fixture-room",
+                    "answer this",
+                    "matrix",
+                    1,
+                );
+                let family = runtime_conversation_history_key(&ctx, &message);
+                process_channel_message(ctx, message, CancellationToken::new()).await;
+                let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                    directory.path(),
+                    &family,
+                )
+                .expect("family");
+                let stream = source.stream_id(&family).await.expect("stream");
+                let events = store
+                    .read_page(
+                        &stream,
+                        &EventCursor::beginning(stream.clone()),
+                        None,
+                        256,
+                        4 * 1024 * 1024,
+                    )
+                    .expect("events")
+                    .events;
+                let count = |kind| {
+                    events
+                        .iter()
+                        .filter(|event| event.body.kind() == kind)
+                        .count()
+                };
+                assert_eq!(count(EventKind::ProviderAttemptCompleted), 1, "{backend}");
+                assert!(
+                    count(EventKind::DeliveryStarted) >= 2,
+                    "{backend}: {events:?}"
+                );
+                if finalize_fails {
+                    assert_eq!(
+                        count(EventKind::InvocationOutcomeUnknown),
+                        usize::from(!undelivered),
+                        "{backend}"
+                    );
+                    assert_eq!(
+                        count(EventKind::DeliveryFailed),
+                        usize::from(undelivered),
+                        "{backend}"
+                    );
+                    assert!(channel.finalized_messages.lock().await.is_empty());
+                    assert_eq!(
+                        channel.final_send_calls.load(Ordering::SeqCst),
+                        0,
+                        "unresolved or explicitly undelivered finalization prohibits fallback send"
+                    );
+                    assert_eq!(count(EventKind::TurnOutcomeUnknown), 0);
+                    assert_eq!(
+                        count(EventKind::TurnCommitted),
+                        1,
+                        "delivery uncertainty cannot rewrite settled execution"
+                    );
+                } else {
+                    assert_eq!(count(EventKind::InvocationOutcomeUnknown), 0);
+                    assert_eq!(count(EventKind::TurnCommitted), 1);
+                    assert!(!channel.finalized_messages.lock().await.is_empty());
+                    assert_eq!(
+                        count(EventKind::DeliveryStarted),
+                        count(EventKind::DeliveryCompleted)
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn process_channel_message_no_reply_clears_early_ack() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -37413,6 +39591,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -37556,6 +39735,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -37691,6 +39871,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -37826,6 +40007,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: false,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -38248,6 +40430,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -39780,6 +41963,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -46484,6 +48668,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -46672,6 +48857,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -47202,6 +49388,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -47703,6 +49890,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -47878,6 +50066,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -51895,6 +54084,7 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -52032,6 +54222,7 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -52206,6 +54397,7 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -52528,6 +54720,7 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -52693,6 +54886,7 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -52850,6 +55044,7 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -53027,6 +55222,7 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -54205,6 +56401,7 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            native_sessions: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),

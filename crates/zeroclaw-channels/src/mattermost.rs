@@ -9,7 +9,10 @@ use tokio::sync::OnceCell;
 use tokio::{io::AsyncRead, io::AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use zeroclaw_api::channel::{Channel, ChannelApprovalResponse, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{
+    ApprovalPromptOutcome, Channel, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    await_approval_prompt_send,
+};
 pub(crate) use zeroclaw_config::schema::MattermostListenMode;
 
 const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
@@ -29,6 +32,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// room. Without the destination an authorized user could answer a prompt from a
 /// channel it was never posted to.
 struct PendingApproval {
+    audit: crate::util::ApprovalAudit,
     /// Distinguishes this registration from any later one that happens to draw
     /// the same token. `new_approval_token` is random but only six characters,
     /// so token equality alone is not registration identity — without this, an
@@ -36,7 +40,7 @@ struct PendingApproval {
     generation: u64,
     /// Mattermost channel ID the prompt was posted into.
     channel_id: String,
-    sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ApprovalReplyResult>,
 }
 
 /// How many retired tokens to remember. A token only needs to outlive the
@@ -1263,7 +1267,7 @@ impl Channel for MattermostChannel {
         recipient: &str,
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
         // Allocation and registration are one critical section, and the token is
         // drawn so it collides with neither a live prompt nor one still inside
         // the retired window. Six random characters are not an identity: a
@@ -1281,6 +1285,7 @@ impl Channel for MattermostChannel {
             state.pending.insert(
                 token.clone(),
                 PendingApproval {
+                    audit: crate::util::ApprovalAudit::current(),
                     generation,
                     channel_id: recipient_channel_id(recipient).to_string(),
                     sender: tx,
@@ -1288,7 +1293,6 @@ impl Channel for MattermostChannel {
             );
             (token, generation)
         };
-
         let text = crate::util::build_yesno_approval_prompt(
             &token,
             &request.tool_name,
@@ -1301,49 +1305,52 @@ impl Channel for MattermostChannel {
         // one that drew the same token.
         let mut guard = ApprovalGuard::new(Arc::clone(&self.approvals), token.clone(), generation);
 
-        let post_id = self.create_post(&SendMessage::new(text, recipient)).await?;
+        let send = async {
+            let post_id = self.create_post(&SendMessage::new(text, recipient)).await?;
 
-        // Offer the one-tap path only when we would actually see the tap.
-        // Reactions reach us as `reaction_added` WebSocket events; the polling
-        // listener reads posts and never sees them, so seeding the emoji there
-        // would put two buttons on the prompt that silently do nothing.
-        if self.listen_mode == zeroclaw_config::schema::MattermostListenMode::Websocket
-            && !post_id.is_empty()
-        {
-            // `create_post` awaited, so confirm this registration still owns the
-            // token before binding its post. Binding unconditionally would let a
-            // reaction on this post resolve whichever request holds the token
-            // later, handing one prompt's decision to another.
-            let still_live = {
-                let mut state = self.approvals.lock();
-                if state.owns(&token, generation) {
-                    state
-                        .posts
-                        .insert(post_id.clone(), (token.clone(), generation));
-                    true
-                } else {
-                    false
+            // Polling never receives reaction events, so only seed emoji when
+            // the WebSocket listener can resolve them.
+            if self.listen_mode == zeroclaw_config::schema::MattermostListenMode::Websocket
+                && !post_id.is_empty()
+            {
+                // The send awaited; bind only the generation that still owns
+                // this token so a replacement cannot inherit this post.
+                let still_live = {
+                    let mut state = self.approvals.lock();
+                    if state.owns(&token, generation) {
+                        state
+                            .posts
+                            .insert(post_id.clone(), (token.clone(), generation));
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if still_live {
+                    self.seed_approval_reactions(&post_id).await;
                 }
-            };
-            if still_live {
-                self.seed_approval_reactions(&post_id).await;
             }
-        }
+            Ok(())
+        };
 
-        let attributed =
-            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(response)) => {
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+        let attributed = match await_approval_prompt_send(send, &mut rx).await? {
+            ApprovalPromptOutcome::Replied(response) => response,
+            ApprovalPromptOutcome::Sent(()) => {
+                match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx)
+                    .await
+                {
+                    Ok(Ok(response)) => response?,
+                    Ok(Err(_)) => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    ),
+                    Err(_) => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ),
                 }
-                Ok(Err(_)) => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                    ChannelApprovalResponse::Deny,
-                    zeroclaw_api::channel::ApprovalSource::Unreachable,
-                ),
-                Err(_) => zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                    ChannelApprovalResponse::Deny,
-                    zeroclaw_api::channel::ApprovalSource::TimedOut,
-                ),
-            };
+            }
+        };
         // One retirement for every outcome. The resolving path already removed
         // the pending entry, but the token still has to be remembered as retired
         // and any post binding dropped, so a tap arriving after the decision
@@ -1455,7 +1462,7 @@ impl MattermostChannel {
                         &mut last_create_at_by_channel,
                         &tx,
                     )
-                    .await
+                    .await?
                 {
                     return Ok(());
                 }
@@ -1654,7 +1661,7 @@ impl MattermostChannel {
                         // One-tap approvals. Reactions are never routed to the
                         // model, so this arm is terminal either way.
                         Some("reaction_added") => {
-                            self.try_resolve_approval_reaction(&event).await;
+                            self.try_resolve_approval_reaction(&event).await?;
                             continue;
                         }
                         // Channel metadata changed. Only the cached purpose is
@@ -1687,7 +1694,7 @@ impl MattermostChannel {
                             is_direct,
                             &tx,
                         )
-                        .await
+                        .await?
                     {
                         return Ok(());
                     }
@@ -1714,7 +1721,7 @@ impl MattermostChannel {
         channel_id: &str,
         is_direct: bool,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> bool {
+    ) -> Result<bool> {
         let effective_text = if post
             .get("message")
             .and_then(|message| message.as_str())
@@ -1740,10 +1747,10 @@ impl MattermostChannel {
         // other outcome — resolved, rejected, or arriving after the prompt was
         // already retired — is approval-protocol traffic, so a decision the
         // operator typed can never surface as a chat message.
-        if self.try_resolve_approval_reply(post, bot_user_id).await
+        if self.try_resolve_approval_reply(post, bot_user_id).await?
             == ApprovalReplyOutcome::Consumed
         {
-            return false;
+            return Ok(false);
         }
 
         let Some(message) = self.parse_mattermost_post(
@@ -1755,10 +1762,10 @@ impl MattermostChannel {
             effective_text.as_deref(),
             is_direct,
         ) else {
-            return false;
+            return Ok(false);
         };
 
-        tx.send(message).await.is_err()
+        Ok(tx.send(message).await.is_err())
     }
 
     /// Put the two decision emoji on the prompt post so the operator can tap
@@ -1853,16 +1860,16 @@ impl MattermostChannel {
     /// reply path there is nothing to keep away from the model — a reaction is
     /// never routed as a message — so the return value exists for tests and
     /// logging rather than for control flow.
-    async fn try_resolve_approval_reaction(&self, event: &serde_json::Value) -> bool {
+    async fn try_resolve_approval_reaction(&self, event: &serde_json::Value) -> Result<bool> {
         let Some(reaction) = Self::ws_reaction_from_event(event) else {
-            return false;
+            return Ok(false);
         };
         let emoji = reaction
             .get("emoji_name")
             .and_then(|emoji| emoji.as_str())
             .unwrap_or("");
         let Some(response) = approval_response_for_emoji(emoji) else {
-            return false;
+            return Ok(false);
         };
         let post_id = reaction
             .get("post_id")
@@ -1871,8 +1878,18 @@ impl MattermostChannel {
 
         // Cheap check first: a reaction on any other post is not ours, and
         // rejecting it here keeps unrelated chatter out of the auth logs.
-        let Some((token, generation)) = self.approvals.lock().posts.get(post_id).cloned() else {
-            return false;
+        let observed = {
+            let state = self.approvals.lock();
+            state.posts.get(post_id).and_then(|(token, generation)| {
+                state
+                    .pending
+                    .get(token)
+                    .filter(|pending| pending.generation == *generation)
+                    .map(|pending| (token.clone(), *generation, pending.audit.clone()))
+            })
+        };
+        let Some((token, generation, audit)) = observed else {
+            return Ok(false);
         };
 
         let user_id = reaction
@@ -1901,7 +1918,7 @@ impl MattermostChannel {
         } else if user_id == bot_user_id {
             // The bot's own seeded reaction: expected on every prompt, so this
             // is routine rather than a rejection worth logging.
-            return false;
+            return Ok(false);
         } else {
             None
         };
@@ -1913,7 +1930,13 @@ impl MattermostChannel {
                     .with_attrs(::serde_json::json!({"token": token, "reason": reason})),
                 "refusing to decide an approval without a trustworthy bot identity"
             );
-            return false;
+            audit
+                .record_rejection(
+                    reason,
+                    serde_json::json!({"user_id": user_id, "emoji": emoji}),
+                )
+                .await?;
+            return Ok(false);
         }
 
         if !self.is_user_allowed(user_id) {
@@ -1928,22 +1951,44 @@ impl MattermostChannel {
                     })),
                 "ignoring approval reaction from unauthorized user"
             );
+            audit
+                .record_rejection(
+                    "unauthorized_responder",
+                    serde_json::json!({"user_id": user_id, "emoji": emoji}),
+                )
+                .await?;
             // Leave the prompt pending so an authorized operator can still
             // answer it, by reaction or by reply.
-            return false;
+            return Ok(false);
         }
 
         // Retire by generation, not by token. This post belongs to one specific
         // registration; if a later request has since drawn the same token, a tap
         // on this older, still-visible prompt must not resolve it. Retiring also
         // drops the post binding, so a second tap finds nothing.
-        let Some(pending) = self.approvals.lock().retire_generation(&token, generation) else {
-            return false;
+        let pending = self.approvals.lock().retire_generation(&token, generation);
+        let Some(pending) = pending else {
+            audit
+                .record_rejection("stale_generation", serde_json::json!({"emoji": emoji}))
+                .await?;
+            return Ok(false);
         };
-        // A closed receiver means the waiter already timed out; the decision is
-        // simply dropped.
-        let _ = pending.sender.send(response);
-        true
+        if !pending
+            .audit
+            .deliver_reply(
+                pending.sender,
+                crate::util::approval_reply_actor(self, user_id),
+                response.clone(),
+                serde_json::json!({"surface": "reaction", "emoji": emoji}),
+            )
+            .await?
+        {
+            pending
+                .audit
+                .record_rejection("receiver_closed", serde_json::json!({"emoji": emoji}))
+                .await?;
+        }
+        Ok(true)
     }
 
     /// Consume `post` if it is an authorized reply to a pending approval
@@ -1957,13 +2002,13 @@ impl MattermostChannel {
         &self,
         post: &serde_json::Value,
         bot_user_id: &str,
-    ) -> ApprovalReplyOutcome {
+    ) -> Result<ApprovalReplyOutcome> {
         let text = post
             .get("message")
             .and_then(|message| message.as_str())
             .unwrap_or("");
         let Some((token, response)) = crate::util::parse_approval_reply(text) else {
-            return ApprovalReplyOutcome::NotFound;
+            return Ok(ApprovalReplyOutcome::NotFound);
         };
 
         let user_id = post
@@ -1979,18 +2024,17 @@ impl MattermostChannel {
         // has no claim on: with the identity checks ahead of this lookup, an
         // unresolved bot identity turned *every* six-character approval-shaped
         // message into `Consumed`, losing unrelated user text instead of
-        // forwarding it. Peeking here is safe even though the decision itself
-        // happens in a later critical section, because a token retired in
-        // between is still recognized through `was_retired`.
+        // forwarding it. Capture this registration so a timeout during the
+        // identity lookup cannot make a recognized reply ordinary chat.
         // The observed registration is captured here, not just the fact that the
         // token is ours. `get_bot_identity` below may await, and a request that
         // draws this token during that window must not receive this reply.
-        let observed_generation = {
+        let (observed_generation, audit) = {
             let state = self.approvals.lock();
             match state.pending.get(&token) {
-                Some(pending) => Some(pending.generation),
-                None if state.was_retired(&token) => None,
-                None => return ApprovalReplyOutcome::NotFound,
+                Some(pending) => (pending.generation, pending.audit.clone()),
+                None if state.was_retired(&token) => return Ok(ApprovalReplyOutcome::Consumed),
+                None => return Ok(ApprovalReplyOutcome::NotFound),
             }
         };
 
@@ -2038,34 +2082,34 @@ impl MattermostChannel {
                     .with_attrs(::serde_json::json!({"token": token, "reason": reason})),
                 "refusing to decide an approval without a trustworthy author identity"
             );
+            audit
+                .record_rejection(reason, serde_json::json!({"user_id": user_id}))
+                .await?;
             // Consumed, and the prompt stays pending: approval-shaped text must
             // never reach the model, and refusing here only defers the decision
             // to a reply made once identity can be established.
-            return ApprovalReplyOutcome::Consumed;
+            return Ok(ApprovalReplyOutcome::Consumed);
         }
 
         // One critical section for the whole decision. Recognition, destination,
         // and removal cannot be split: the reaction path shares this state, and
         // a token retired between two of those steps would otherwise look like
         // text that was never ours and be forwarded to the model.
-        let (outcome, resolved) = {
+        let resolution = 'resolution: {
             let mut state = self.approvals.lock();
 
             let Some(pending) = state.pending.get(&token) else {
-                // Already answered, cancelled, or timed out: still ours, so the
-                // losing reply is swallowed rather than delivered as chat.
-                return if state.was_retired(&token) {
-                    ApprovalReplyOutcome::Consumed
-                } else {
-                    ApprovalReplyOutcome::NotFound
-                };
+                break 'resolution Err((
+                    "unknown_or_expired_request",
+                    serde_json::json!({"reply_channel": reply_channel}),
+                ));
             };
 
             // A different registration holds the token than the one this reply
             // was recognized against — it was reused while the identity lookup
             // awaited. The reply is still approval traffic, so it is swallowed,
             // but it must not answer a prompt it was never shown.
-            if observed_generation != Some(pending.generation) {
+            if observed_generation != pending.generation {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -2073,7 +2117,10 @@ impl MattermostChannel {
                         .with_attrs(::serde_json::json!({"token": token})),
                     "ignoring approval reply whose prompt was replaced by a newer request"
                 );
-                return ApprovalReplyOutcome::Consumed;
+                break 'resolution Err((
+                    "stale_generation",
+                    serde_json::json!({"reply_channel": reply_channel}),
+                ));
             }
 
             // The reply has to come from the channel the prompt went to. The
@@ -2097,7 +2144,13 @@ impl MattermostChannel {
                 );
                 // Consumed, not resolved: the prompt stays answerable in the
                 // channel it actually belongs to.
-                return ApprovalReplyOutcome::Consumed;
+                break 'resolution Err((
+                    "wrong_destination",
+                    serde_json::json!({
+                        "reply_channel": reply_channel,
+                        "origin_channel": origin_channel,
+                    }),
+                ));
             }
 
             if !self.is_user_allowed(user_id) {
@@ -2110,23 +2163,46 @@ impl MattermostChannel {
                 );
                 // Leaves the prompt pending so an authorized operator can still
                 // answer, but never forwards the attempt to the model.
-                return ApprovalReplyOutcome::Consumed;
+                break 'resolution Err((
+                    "unauthorized_responder",
+                    serde_json::json!({"user_id": user_id}),
+                ));
             }
 
-            (
+            Ok((
                 ApprovalReplyOutcome::Consumed,
-                observed_generation
-                    .and_then(|generation| state.retire_generation(&token, generation))
-                    .map(|pending| pending.sender),
-            )
+                state.retire_generation(&token, observed_generation),
+            ))
         };
 
-        if let Some(sender) = resolved {
-            // A closed receiver means the waiter already gave up; the decision
-            // is dropped and the reply is still consumed.
-            let _ = sender.send(response);
+        let (outcome, resolved) = match resolution {
+            Ok(resolution) => resolution,
+            Err((classification, evidence)) => {
+                audit.record_rejection(classification, evidence).await?;
+                return Ok(ApprovalReplyOutcome::Consumed);
+            }
+        };
+
+        if let Some(pending) = resolved
+            && !pending
+                .audit
+                .deliver_reply(
+                    pending.sender,
+                    crate::util::approval_reply_actor(self, user_id),
+                    response.clone(),
+                    serde_json::json!({"surface": "text", "destination": reply_channel}),
+                )
+                .await?
+        {
+            pending
+                .audit
+                .record_rejection(
+                    "receiver_closed",
+                    serde_json::json!({"reply_channel": reply_channel}),
+                )
+                .await?;
         }
-        outcome
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2139,7 +2215,7 @@ impl MattermostChannel {
         bootstrap_ms: i64,
         cursors: &mut HashMap<String, i64>,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> bool {
+    ) -> Result<bool> {
         let cursor = *cursors.entry(target.id.clone()).or_insert(bootstrap_ms);
 
         let resp = match self
@@ -2166,7 +2242,7 @@ impl MattermostChannel {
                         })),
                     "Mattermost poll error"
                 );
-                return false;
+                return Ok(false);
             }
         };
 
@@ -2184,12 +2260,12 @@ impl MattermostChannel {
                         })),
                     "Mattermost parse error"
                 );
-                return false;
+                return Ok(false);
             }
         };
 
         let Some(posts) = data.get("posts").and_then(|p| p.as_object()) else {
-            return false;
+            return Ok(false);
         };
 
         let mut post_list: Vec<_> = posts.values().collect();
@@ -2214,13 +2290,13 @@ impl MattermostChannel {
                     target.is_direct,
                     tx,
                 )
-                .await
+                .await?
             {
-                return true;
+                return Ok(true);
             }
         }
         cursors.insert(target.id.clone(), new_cursor);
-        false
+        Ok(false)
     }
 
     fn parse_mattermost_post(
@@ -4528,11 +4604,12 @@ mod approval_tests {
     async fn pending_in_origin(
         ch: &MattermostChannel,
         token: &str,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         ch.approvals.lock().pending.insert(
             token.to_string(),
             PendingApproval {
+                audit: crate::util::ApprovalAudit::default(),
                 generation: 0,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
@@ -4566,7 +4643,7 @@ mod approval_tests {
         ch: &MattermostChannel,
         token: &str,
         post_id: &str,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult> {
         let rx = pending_in_origin(ch, token).await;
         ch.approvals
             .lock()
@@ -4575,8 +4652,94 @@ mod approval_tests {
         rx
     }
 
-    /// The point of the feature: a tap on the seeded checkmark answers the
-    /// prompt without the operator typing the token back.
+    #[tokio::test]
+    async fn approval_audits_stay_with_same_token_on_distinct_channels() {
+        use crate::util::approval_audit_test_support::ApprovalRecorder;
+
+        let first = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let second = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let first_recorder = Arc::new(ApprovalRecorder::default());
+        let second_recorder = Arc::new(ApprovalRecorder::default());
+        let _first_rx = pending_in_origin(&first, "abc123").await;
+        let _second_rx = pending_in_origin(&second, "abc123").await;
+        let first_audit = first_recorder.capture().await;
+        let second_audit = second_recorder.capture().await;
+        first
+            .approvals
+            .lock()
+            .pending
+            .get_mut("abc123")
+            .unwrap()
+            .audit = first_audit;
+        second
+            .approvals
+            .lock()
+            .pending
+            .get_mut("abc123")
+            .unwrap()
+            .audit = second_audit;
+
+        first
+            .try_resolve_approval_reply(&post_from("intruder", "abc123 yes"), BOT_USER)
+            .await
+            .unwrap();
+        assert_eq!(first_recorder.records.lock().unwrap().len(), 1);
+        assert!(second_recorder.records.lock().unwrap().is_empty());
+
+        let guard = ApprovalGuard::new(Arc::clone(&first.approvals), "abc123".to_string(), 0);
+        drop(guard);
+        assert_eq!(Arc::strong_count(&first_recorder), 1);
+        second
+            .try_resolve_approval_reply(&post_from("intruder", "abc123 yes"), BOT_USER)
+            .await
+            .unwrap();
+        assert_eq!(second_recorder.records.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_audit_failure_propagates_before_inbound_reply_is_consumed() {
+        use crate::util::approval_audit_test_support::ApprovalRecorder;
+        use std::sync::atomic::Ordering;
+
+        let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
+        let recorder = Arc::new(ApprovalRecorder::default());
+        recorder.fail.store(true, Ordering::SeqCst);
+        let mut receiver = pending_with_post(&ch, "abc123", "prompt").await;
+        let audit = recorder.capture().await;
+        ch.approvals.lock().pending.get_mut("abc123").unwrap().audit = audit;
+        let (tx, mut messages) = tokio::sync::mpsc::channel(1);
+
+        let error = ch
+            .process_inbound_post(
+                &post_from("intruder", "abc123 yes"),
+                BOT_USER,
+                "bot",
+                0,
+                ORIGIN_CHANNEL,
+                true,
+                &tx,
+            )
+            .await
+            .expect_err("durability failure must reach the listener");
+        assert!(error.to_string().contains("test_approval_append_failed"));
+        assert!(
+            ch.try_resolve_approval_reaction(&reaction_event(
+                "intruder",
+                "prompt",
+                APPROVAL_EMOJI_APPROVE
+            ))
+            .await
+            .is_err()
+        );
+        assert!(messages.try_recv().is_err());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(ch.approvals.lock().pending.contains_key("abc123"));
+        assert!(recorder.records.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn authorized_reaction_resolves_pending_approval() {
         let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
@@ -4588,10 +4751,14 @@ mod approval_tests {
                 "prompt_post",
                 APPROVAL_EMOJI_APPROVE,
             ))
-            .await;
+            .await
+            .unwrap();
 
         assert!(consumed, "a decision reaction must resolve the prompt");
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             ch.approvals.lock().pending.is_empty(),
             "resolving must retire the pending token"
@@ -4615,8 +4782,12 @@ mod approval_tests {
                 APPROVAL_EMOJI_DENY,
             ))
             .await
+            .unwrap()
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Deny
+        );
     }
 
     /// Reacting is as privileged as replying, so the same allowlist applies.
@@ -4633,7 +4804,8 @@ mod approval_tests {
                 "prompt_post",
                 APPROVAL_EMOJI_APPROVE,
             ))
-            .await;
+            .await
+            .unwrap();
 
         assert!(
             !consumed,
@@ -4667,7 +4839,8 @@ mod approval_tests {
                 "prompt_post",
                 APPROVAL_EMOJI_APPROVE,
             ))
-            .await;
+            .await
+            .unwrap();
 
         assert!(
             !consumed,
@@ -4694,6 +4867,7 @@ mod approval_tests {
                 "thumbsup",
             ))
             .await
+            .unwrap()
         );
         assert!(rx.try_recv().is_err());
         assert!(!ch.approvals.lock().pending.is_empty());
@@ -4712,6 +4886,7 @@ mod approval_tests {
                 APPROVAL_EMOJI_APPROVE,
             ))
             .await
+            .unwrap()
         );
         assert!(rx.try_recv().is_err());
         assert!(!ch.approvals.lock().pending.is_empty());
@@ -4727,9 +4902,13 @@ mod approval_tests {
         assert!(
             ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "abc123 yes"), BOT_USER)
                 .await
+                .unwrap()
                 == ApprovalReplyOutcome::Consumed
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
 
         // The reaction arrives afterwards — the operator tapped as well as typed.
         assert!(
@@ -4738,7 +4917,8 @@ mod approval_tests {
                 "prompt_post",
                 APPROVAL_EMOJI_DENY,
             ))
-            .await,
+            .await
+            .unwrap(),
             "a second answer must not resolve an already-retired prompt"
         );
     }
@@ -4752,14 +4932,18 @@ mod approval_tests {
 
         let consumed = ch
             .try_resolve_approval_reply(&post_from(ALLOWED_USER, "abc123 yes"), BOT_USER)
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             consumed,
             ApprovalReplyOutcome::Consumed,
             "an approval reply must not fall through to the model"
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(
             ch.approvals.lock().pending.is_empty(),
             "resolving must retire the pending token"
@@ -4775,7 +4959,8 @@ mod approval_tests {
 
         let consumed = ch
             .try_resolve_approval_reply(&post_from("intruder_user_id", "abc123 yes"), BOT_USER)
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             consumed,
@@ -4800,6 +4985,7 @@ mod approval_tests {
         assert!(
             ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "zzz999 yes"), BOT_USER)
                 .await
+                .unwrap()
                 == ApprovalReplyOutcome::NotFound
         );
     }
@@ -4828,7 +5014,8 @@ mod approval_tests {
             false,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             rx.try_recv().is_err(),
@@ -4853,9 +5040,13 @@ mod approval_tests {
             false,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
         assert!(ch.approvals.lock().pending.is_empty());
     }
 
@@ -5032,6 +5223,7 @@ mod approval_tests {
                 BOT_USER
             )
             .await
+            .unwrap()
                 == ApprovalReplyOutcome::NotFound
         );
         assert!(ch.approvals.lock().pending.contains_key("abc123"));
@@ -5050,9 +5242,10 @@ mod approval_tests {
             assert!(
                 ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, reply), BOT_USER)
                     .await
+                    .unwrap()
                     == ApprovalReplyOutcome::Consumed
             );
-            assert_eq!(rx.await.unwrap(), expected);
+            assert_eq!(rx.await.unwrap().unwrap().response, expected);
         }
     }
 
@@ -5140,11 +5333,12 @@ mod approval_lifecycle_tests {
     fn pending(
         ch: &MattermostChannel,
         token: &str,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         ch.approvals.lock().pending.insert(
             token.to_string(),
             PendingApproval {
+                audit: crate::util::ApprovalAudit::default(),
                 generation: 0,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
@@ -5180,8 +5374,15 @@ mod approval_lifecycle_tests {
             .lock()
             .retire_generation("abc123", generation)
             .expect("token was live");
-        let _ = resolved.sender.send(ChannelApprovalResponse::Approve);
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        let _ = resolved.sender.send(Ok(
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                ChannelApprovalResponse::Approve,
+            ),
+        ));
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
 
         // The operator's typed reply is already in flight and lands afterwards.
         ch.process_inbound_post(
@@ -5193,7 +5394,8 @@ mod approval_lifecycle_tests {
             false,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             inbound.try_recv().is_err(),
@@ -5208,7 +5410,8 @@ mod approval_lifecycle_tests {
         let ch = channel_with_peers(vec![ALLOWED_USER.to_string()]);
         assert_eq!(
             ch.try_resolve_approval_reply(&post_from(ALLOWED_USER, "zzz999 yes"), BOT_USER)
-                .await,
+                .await
+                .unwrap(),
             ApprovalReplyOutcome::NotFound,
             "only tokens this channel knows about may be swallowed"
         );
@@ -5294,7 +5497,8 @@ mod approval_lifecycle_tests {
 
         let outcome = ch
             .try_resolve_approval_reply(&post_from(BOT_USER, "abc123 yes"), BOT_USER)
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             outcome,
@@ -5328,7 +5532,8 @@ mod approval_lifecycle_tests {
                 }),
                 BOT_USER,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(outcome, ApprovalReplyOutcome::Consumed);
         assert!(
@@ -5360,7 +5565,7 @@ mod approval_lifecycle_tests {
         });
 
         assert!(
-            !ch.try_resolve_approval_reaction(&event).await,
+            !ch.try_resolve_approval_reaction(&event).await.unwrap(),
             "a reaction with no author must not resolve an approval"
         );
         assert!(rx.try_recv().is_err());
@@ -5406,11 +5611,12 @@ mod approval_identity_tests {
     fn pending(
         ch: &MattermostChannel,
         token: &str,
-    ) -> tokio::sync::oneshot::Receiver<ChannelApprovalResponse> {
+    ) -> tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         ch.approvals.lock().pending.insert(
             token.to_string(),
             PendingApproval {
+                audit: crate::util::ApprovalAudit::default(),
                 generation: 0,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
@@ -5442,7 +5648,8 @@ mod approval_identity_tests {
             false,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             rx.try_recv().is_err(),
@@ -5484,7 +5691,7 @@ mod approval_identity_tests {
         });
 
         assert!(
-            !ch.try_resolve_approval_reaction(&event).await,
+            !ch.try_resolve_approval_reaction(&event).await.unwrap(),
             "the bot's own seeded reaction must not approve while identity is unknown"
         );
         assert!(rx.try_recv().is_err());
@@ -5513,7 +5720,8 @@ mod approval_identity_tests {
                 }),
                 UNKNOWN_BOT,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             outcome,
@@ -5597,7 +5805,10 @@ mod approval_generation_tests {
         ch: &MattermostChannel,
         token: &str,
         post_id: &str,
-    ) -> (tokio::sync::oneshot::Receiver<ChannelApprovalResponse>, u64) {
+    ) -> (
+        tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult>,
+        u64,
+    ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut state = ch.approvals.lock();
         let generation = state.next_generation;
@@ -5605,6 +5816,7 @@ mod approval_generation_tests {
         state.pending.insert(
             token.to_string(),
             PendingApproval {
+                audit: crate::util::ApprovalAudit::default(),
                 generation,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
@@ -5729,7 +5941,8 @@ mod approval_generation_tests {
                 }),
                 &startup_id,
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(outcome, ApprovalReplyOutcome::Consumed);
         assert!(
@@ -5758,7 +5971,8 @@ mod approval_generation_tests {
                 }),
                 "",
             )
-            .await,
+            .await
+            .unwrap(),
             ApprovalReplyOutcome::NotFound,
             "a security refusal must not also lose unrelated user text"
         );
@@ -5803,7 +6017,10 @@ mod approval_registration_identity_tests {
         ch: &MattermostChannel,
         token: &str,
         post_id: Option<&str>,
-    ) -> (tokio::sync::oneshot::Receiver<ChannelApprovalResponse>, u64) {
+    ) -> (
+        tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult>,
+        u64,
+    ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut state = ch.approvals.lock();
         let generation = state.next_generation;
@@ -5811,6 +6028,7 @@ mod approval_registration_identity_tests {
         state.pending.insert(
             token.to_string(),
             PendingApproval {
+                audit: crate::util::ApprovalAudit::default(),
                 generation,
                 channel_id: ORIGIN_CHANNEL.to_string(),
                 sender: tx,
@@ -5850,7 +6068,7 @@ mod approval_registration_identity_tests {
         });
 
         assert!(
-            !ch.try_resolve_approval_reaction(&event).await,
+            !ch.try_resolve_approval_reaction(&event).await.unwrap(),
             "a reaction on A's post must not resolve B"
         );
         assert!(
@@ -5873,6 +6091,7 @@ mod approval_registration_identity_tests {
     /// hoped, which proves nothing under unusual scheduling.
     #[tokio::test]
     async fn typed_reply_cannot_resolve_a_registration_that_replaced_it() {
+        use crate::util::approval_audit_test_support::ApprovalRecorder;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -5881,7 +6100,10 @@ mod approval_registration_identity_tests {
         struct SwapDuringLookup {
             approvals: Arc<Mutex<ApprovalState>>,
             old_generation: u64,
-            replacement: Mutex<Option<tokio::sync::oneshot::Sender<ChannelApprovalResponse>>>,
+            replacement: Mutex<
+                Option<tokio::sync::oneshot::Sender<zeroclaw_api::channel::ApprovalReplyResult>>,
+            >,
+            replacement_audit: crate::util::ApprovalAudit,
         }
 
         impl Respond for SwapDuringLookup {
@@ -5898,6 +6120,7 @@ mod approval_registration_identity_tests {
                 state.pending.insert(
                     "abc123".to_string(),
                     PendingApproval {
+                        audit: self.replacement_audit.clone(),
                         generation,
                         channel_id: ORIGIN_CHANNEL.to_string(),
                         sender,
@@ -5930,6 +6153,10 @@ mod approval_registration_identity_tests {
         );
         let (_a_rx, a_generation) = register(&ch, "abc123", None);
         let (b_tx, mut b_rx) = tokio::sync::oneshot::channel();
+        let first_recorder = Arc::new(ApprovalRecorder::default());
+        let second_recorder = Arc::new(ApprovalRecorder::default());
+        let first_audit = first_recorder.capture().await;
+        ch.approvals.lock().pending.get_mut("abc123").unwrap().audit = first_audit;
 
         Mock::given(method("GET"))
             .and(path("/api/v4/users/me"))
@@ -5937,6 +6164,7 @@ mod approval_registration_identity_tests {
                 approvals: Arc::clone(&ch.approvals),
                 old_generation: a_generation,
                 replacement: Mutex::new(Some(b_tx)),
+                replacement_audit: second_recorder.capture().await,
             })
             .mount(&server)
             .await;
@@ -5952,13 +6180,19 @@ mod approval_registration_identity_tests {
                 }),
                 "",
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(
             outcome,
             ApprovalReplyOutcome::Consumed,
             "the reply is approval traffic and must not reach the model"
         );
+        assert_eq!(
+            first_recorder.records.lock().unwrap()[0].0,
+            "stale_generation"
+        );
+        assert!(second_recorder.records.lock().unwrap().is_empty());
         assert!(
             b_rx.try_recv().is_err(),
             "B must not receive a reply written in answer to A's prompt"
@@ -6069,7 +6303,8 @@ mod bot_identity_admission_tests {
             false,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             inbound.try_recv().is_err(),
@@ -6093,7 +6328,8 @@ mod bot_identity_admission_tests {
             false,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             inbound.try_recv().is_err(),
@@ -6118,7 +6354,8 @@ mod bot_identity_admission_tests {
             false,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
         let message = inbound
             .try_recv()
@@ -6142,7 +6379,8 @@ mod bot_identity_admission_tests {
             false,
             &tx,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(inbound.try_recv().is_err());
     }

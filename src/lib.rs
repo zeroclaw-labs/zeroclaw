@@ -94,6 +94,7 @@ pub mod verifiable_intent;
 pub mod plugins;
 
 pub use config::Config;
+pub mod session_events;
 
 /// Gateway management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

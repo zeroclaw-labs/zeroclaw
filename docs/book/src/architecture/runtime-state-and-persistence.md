@@ -22,8 +22,10 @@ move it). The current layout is:
 ├── .secret_key                 # key for encrypted secrets
 ├── data/                       # instance-wide runtime data
 │   ├── sessions/
-│   │   ├── sessions.db         # default chat/session backend
-│   │   └── acp-sessions.db     # ACP protocol sessions
+│   │   ├── session-events.db  # native SQLite session events
+│   │   ├── session-events-jsonl/ # native JSONL segments and manifest
+│   │   ├── session-format.json # installation backend, generation and upgrade phase
+│   │   └── *.backup           # archived legacy SQLite, JSONL and ACP sources
 │   ├── cron/jobs.db            # scheduled job state
 │   ├── sop/runs.db             # optional durable SOP run state
 │   ├── control_plane.db        # task supervision records
@@ -52,9 +54,10 @@ new runtime state should be described in terms of `<install>/data/`,
 | Agent filesystem identity | Per-agent workspace files | `<install>/agents/<alias>/workspace/` | effective `SecurityPolicy` and agent prompt construction | Created lazily when the agent starts; workspace access is evaluated from config | This is the filesystem sandbox, not the config source of truth for providers/channels/tools. |
 | Shared skill bundles | Configured skill bundle entries and resolved bundle dirs | `<install>/shared/skills/<bundle>/` by default | skill loading / prompt enrichment | Reload and new agent starts observe config and filesystem changes | Bundle aliases and directory resolution come from config; the files are the bundle content. |
 | Conversation memory | `zeroclaw-memory` backend selected per agent | SQLite/Postgres/Lucid/Qdrant/Markdown backend locations; SQLite shared store lives under `data/memory/` | `Arc<dyn Memory>` wrapped in agent-scoping adapters | Backend choice is locked once an agent has written data; same-backend cross-agent recall is opt-in | Memory rows are agent-scoped. Do not replace memory ownership with copied prompt/session caches. |
-| Chat and channel sessions | `[channels].session_backend` plus `SessionBackend` | Default `data/sessions/sessions.db`; legacy/explicit JSONL uses `data/sessions/*.jsonl` | `zeroclaw-infra` backend handles are currently constructed independently by channels, gateway, RPC, and session tools | SQLite backend uses WAL; `SessionActorQueue` serializes active turns per session; a gateway WebSocket is a viewer of its session's active turn, not its owner: a client disconnect detaches and the turn runs to completion, and only `POST /api/sessions/{id}/abort` cancels it, together with the agentic delegate children it started and the parallel children that run a tool loop (a parallel child making a plain model call ends with that call's own timeout; background delegate tasks outlive the turn and stop only through `cancel_task`); JSONL mutations share a process-local sessions-directory lock | Chat/Code sessions use the unified backend contract. ACP protocol sessions use a separate store. Process-level backend ownership is not yet single-sourced. |
-| ACP sessions | ACP protocol session store | `data/sessions/acp-sessions.db` | `AcpSessionStore` opened at daemon boot and in RPC context | WAL-backed SQLite store, separate from chat sessions | ACP `session/load` and `session/resume` operate on this protocol store, not the chat session backend. |
-| Live RPC/TUI sessions | RPC `SessionStore` | none by itself | `crates/zeroclaw-runtime/src/rpc/session.rs` in-memory map | Process-local; session history persists only through the chat or ACP backend | Live session handles, uploads, cancel tokens, owners, and overrides are runtime state. |
+| Native session history | Committed session events; installation manifest selects the backend | `data/sessions/session-events.db` or `data/sessions/session-events-jsonl/`; `session-format.json` fences upgrades and backend changes | kernel `SessionCoordinator`, injected through `NativeSessionHub` | Foreground execution lane, short stream commit gate, atomic backend append; current authority is resolved again at effect and read boundaries | Message/context/model-selection/search views derive from events. A disconnected viewer does not own or terminate execution. See [Append-only session events](./session-events.md). |
+| Legacy transcripts | Upgrade sources, retained as backups after verification | Old SQLite, JSONL and ACP files are renamed with `.backup` | installation importer | The installation fence rejects old writers throughout upgrade and after Ready | No per-session locator or dual writing remains after migration. |
+| ACP sessions | Standard session events and the same `Session` projection as RPC and CLI | Configured native session store; `acp_<id>` is only a family namespace | `SessionRepository` and the shared native execution source | Execution metadata uses the coordinator commit lock; queries resolve the fixed event prefix | Ownership, workspace, plans, usage, lifecycle and context have no separate ACP database or metadata table. |
+| Live RPC/TUI sessions | Runtime execution handles; durable model selection derives from native events | none for handles | `crates/zeroclaw-runtime/src/rpc/session.rs` in-memory map | Session incarnation guards stale work; uploads, cancel tokens and connected-client state are ephemeral | The live agent/provider box implements the committed selection; its map is not a second durable history owner. |
 | Cron jobs | Declarative config membership plus cron SQLite store | `data/cron/jobs.db` | `zeroclaw-runtime::cron` scheduler/store | Read paths do not create `jobs.db`; scheduler owns due/lock state | Declarative jobs are reconciled from config, while run metadata and locks live in the cron DB. |
 | SOP runs | `SopEngine` plus `SopRunStore` | None by default; `data/sop/runs.db` when durable SQLite initialization succeeds | SOP engine active/finished run caches | The durable store owns admission claims and persisted revisions; the engine restores active and terminal state on startup | Store initialization failure logs a warning and falls back to memory. Memory-backed audit records are not the run-lifecycle source of truth. |
 | Background task supervision | Durable task control plane | `data/control_plane.db` | observer/producer handles plus the daemon-only recovery owner and reaper | Owner PID plus process-start identity prevents recovery from reclaiming live work; heartbeat timeout applies only to producers that emit heartbeats | Background delegates require a task row and atomically settle status, output reference, and error there. A process-local supervisor retries failed terminal writes with capped backoff. Their originating agent alias scopes new-row result and cancellation access; terminal pre-route rows retain exact-ID read compatibility only. Subagent registration remains best-effort and leaves route absent. Background delegate rows record the launching tool-loop session key as principal and refresh a heartbeat while running, leaving only the parent field absent; subagent rows leave heartbeat, parent, and principal fields absent. Goal APIs exist, but end-to-end goal execution is not yet wired. |
@@ -68,6 +71,12 @@ new runtime state should be described in terms of `<install>/data/`,
 
 ## Reload and restart
 
+A gateway WebSocket is a viewer, not the owner of its active turn. Disconnecting
+detaches the viewer; explicit session abort cancels the turn and its agentic
+delegate children and parallel children running tool loops. A parallel child
+making a plain model call ends with that call's own timeout. Background delegate
+tasks outlive the turn and stop through `cancel_task`.
+
 `POST /admin/reload` sends an in-process reload signal to the daemon. The outer
 daemon loop re-reads config from disk and re-runs the daemon, creating fresh
 gateway, channel, heartbeat, scheduler, MQTT, session, memory, and cost wiring
@@ -79,13 +88,18 @@ Durable stores survive restart according to the table above.
 
 ## Session backend migration
 
-Selecting the SQLite session backend imports legacy `data/sessions/*.jsonl` files when a backend handle is constructed. The importer moves each source to a private `.jsonl.importing` generation while holding the process-local JSONL mutation lock, writes the messages, metadata, and a source-bound import receipt in one SQLite transaction, then retains the source as `.jsonl.migrated` for rollback.
+Session startup upgrades the whole installation into the configured SQLite or
+JSONL event format before opening execution. The installation manifest records
+the backend, generation and upgrade phase; session identity comes from events.
+All legacy SQLite, JSONL and ACP sessions are imported with resumable receipts,
+then their source files are renamed with `.backup` before Ready is published.
+Conflicting or unreadable sources fail closed. Opening a repository handle does
+not independently create an ACP database or trigger an implicit migration.
 
-The receipt binds the source filename, session key, SHA-256 digest, and byte length. Before the receipt transaction begins, the importer syncs the staged source file and, on Unix, the live-to-staged directory rename. Migration transactions use full SQLite synchronization for the import commit, then restore the normal runtime setting. Archive handoff likewise syncs directory metadata on Unix before removing the staged source. Backend construction restores the process-local inactive state from durable receipts before scanning source files. As soon as an import receipt is committed, JSONL mutations for that sessions directory remain inactive even if archive handoff or a later file fails. The next construction can verify the staged source against that receipt and finish the handoff without inserting duplicate messages. Empty and whitespace-only JSONL files are retained as zero-message SQLite sessions; a non-empty source with no valid messages still fails closed.
-
-Constructing the SQLite backend without importing a source does not deactivate JSONL mutations. An in-process reload can therefore switch back to JSONL when no durable import receipt exists.
-
-A receipt-less source is not merged over existing SQLite messages or metadata for the same session key. If that pre-commit check fails, the staged source is restored to its live JSONL path. An incompatible receipt, staged source, or archive causes backend construction to return an error. Each process entry point currently decides independently whether that error stops the subsystem or disables persistence; process-level ownership and startup policy are separate from the migration contract.
+Backend changes drain executors, transfer the verified event image, payloads,
+receipts and erasure relationships, and reject stale writer generations.
+Restoring an old transcript writer is not a rollback. See
+[Append-only session events](./session-events.md) for recovery and cutover details.
 
 ## Backup and restore
 
@@ -112,7 +126,8 @@ the instance.
 
 - Config, install-root, and data-dir resolution: `crates/zeroclaw-config/src/schema.rs`
 - Session backends: `crates/zeroclaw-infra/src/session_sqlite.rs`, `crates/zeroclaw-infra/src/session_store.rs`
-- ACP session store: `crates/zeroclaw-infra/src/acp_session_store.rs`
+- Standard session repository: `crates/zeroclaw-infra/src/session_repository.rs`
+- Installation upgrades: `crates/zeroclaw-infra/src/session_events/upgrade.rs`
 - RPC live sessions: `crates/zeroclaw-runtime/src/rpc/session.rs`
 - Cron persistence: `crates/zeroclaw-runtime/src/cron/store.rs`
 - SOP persistence: `crates/zeroclaw-runtime/src/sop/store/`

@@ -8,10 +8,8 @@ use std::sync::{Arc, OnceLock};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
-use zeroclaw_infra::acp_session_store::{
-    AcpSessionAccess, AcpSessionData, AcpSessionStore, AcpSessionSummary,
-};
 use zeroclaw_infra::session_backend::SessionBackend;
+use zeroclaw_infra::session_repository::{SessionOwnership, SessionRepository, SessionTranscript};
 
 static SESSIONS_SEND_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
@@ -25,7 +23,7 @@ static SESSIONS_SEND_DESCRIPTION: OnceLock<String> = OnceLock::new();
 /// retained transcript when it belongs to the same agent; this does not revive it.
 #[derive(Clone)]
 pub struct AcpSessionReadView {
-    store: Arc<AcpSessionStore>,
+    store: Arc<SessionRepository>,
     agent_alias: Arc<str>,
 }
 
@@ -37,7 +35,7 @@ enum AcpTargetAccess {
 }
 
 impl AcpSessionReadView {
-    pub fn new(store: Arc<AcpSessionStore>, agent_alias: impl Into<String>) -> Self {
+    pub fn new(store: Arc<SessionRepository>, agent_alias: impl Into<String>) -> Self {
         Self {
             store,
             agent_alias: Arc::from(agent_alias.into()),
@@ -52,7 +50,9 @@ impl AcpSessionReadView {
             .is_live_session_for_agent(&current_key, &self.agent_alias)
     }
 
-    fn active_summaries(&self) -> anyhow::Result<Option<Vec<AcpSessionSummary>>> {
+    fn active_summaries(
+        &self,
+    ) -> anyhow::Result<Option<Vec<zeroclaw_infra::session_repository::SessionListEntry>>> {
         let Some(current_key) = current_session_key() else {
             return Ok(None);
         };
@@ -76,14 +76,14 @@ impl AcpSessionReadView {
                 .store
                 .classify_session_for_agent(session_id, &self.agent_alias)?
             {
-                AcpSessionAccess::Owned => AcpTargetAccess::Owned,
-                AcpSessionAccess::Foreign => AcpTargetAccess::Foreign,
-                AcpSessionAccess::Missing => AcpTargetAccess::Missing,
+                SessionOwnership::Owned => AcpTargetAccess::Owned,
+                SessionOwnership::Foreign => AcpTargetAccess::Foreign,
+                SessionOwnership::Missing => AcpTargetAccess::Missing,
             },
         )
     }
 
-    fn load_owned(&self, session_id: &str) -> anyhow::Result<Option<AcpSessionData>> {
+    fn load_owned(&self, session_id: &str) -> anyhow::Result<Option<SessionTranscript>> {
         self.store
             .load_session_for_agent(session_id, &self.agent_alias)
     }
@@ -304,6 +304,24 @@ impl Tool for SessionsListTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(50, |v| v as usize);
 
+        if let Some(reader) = native_history_reader(self.backend.as_ref())? {
+            let summaries = reader.list(limit.min(1000)).await?;
+            let output = summaries
+                .iter()
+                .map(render_native_summary)
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(ToolResult {
+                success: true,
+                output: if output.is_empty() {
+                    tool_msg("tool-sessions-native-empty").into()
+                } else {
+                    output.into()
+                },
+                error: None,
+            });
+        }
+
         let mut metadata: Vec<SessionListEntry> = self
             .backend
             .list_sessions_with_metadata()
@@ -361,6 +379,46 @@ struct SessionListEntry {
     channel: String,
     last_activity: chrono::DateTime<chrono::Utc>,
     message_count: usize,
+}
+
+fn native_history_reader(
+    backend: &dyn SessionBackend,
+) -> anyhow::Result<Option<Arc<dyn zeroclaw_api::session_events::views::SessionHistoryReadPort>>> {
+    if let Some(execution) = zeroclaw_api::session_events::capture::current_session_execution() {
+        return execution.history_reader().map(Some).ok_or_else(|| {
+            anyhow::Error::msg(tool_msg("tool-sessions-native-reader-unavailable"))
+        });
+    }
+    backend.require_legacy_access()?;
+    Ok(None)
+}
+
+fn native_history_mutation_unsupported(tool: &str) -> ToolResult {
+    ToolResult {
+        success: false,
+        output: ToolOutput::default(),
+        error: Some(tool_msg_with_args(
+            "tool-sessions-native-mutation-unsupported",
+            &[("tool", tool)],
+        )),
+    }
+}
+
+fn render_native_summary(summary: &zeroclaw_api::session_events::views::SessionSummary) -> String {
+    tool_msg_with_args(
+        "tool-sessions-native-summary",
+        &[
+            (
+                "session_id",
+                summary
+                    .family_key()
+                    .unwrap_or(summary.head.stream_id.as_str()),
+            ),
+            ("channel", summary.channel_id().unwrap_or("")),
+            ("messages", &summary.message_count.to_string()),
+            ("last_activity", &summary.last_activity.to_string()),
+        ],
+    )
 }
 
 // ── SessionsHistoryTool ─────────────────────────────────────────────
@@ -457,6 +515,27 @@ impl Tool for SessionsHistoryTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(20, |v| v as usize);
 
+        if let Some(reader) = native_history_reader(self.backend.as_ref())? {
+            let Some(page) = reader.history(session_id, limit.clamp(1, 1000)).await? else {
+                return Ok(session_not_found(session_id));
+            };
+            let mut output = tool_msg_with_args(
+                "tool-sessions-native-history",
+                &[("session_id", session_id)],
+            );
+            for message in page.messages {
+                let _ = write!(output, "\n[{}] {}", message.role, message.text);
+                for file in message.files {
+                    let _ = write!(output, "\n{file}");
+                }
+            }
+            return Ok(ToolResult {
+                success: true,
+                output: output.into(),
+                error: None,
+            });
+        }
+
         let mut require_existing_chat_session = false;
         if let Some(view) = &self.acp_sessions {
             match view.classify_target(session_id)? {
@@ -481,7 +560,7 @@ impl Tool for SessionsHistoryTool {
         } else {
             session_id.to_string()
         };
-        let messages = self.backend.load(&resolved_session_id);
+        let messages = self.backend.try_load(&resolved_session_id)?;
 
         if messages.is_empty() {
             return Ok(ToolResult {
@@ -511,7 +590,7 @@ impl Tool for SessionsHistoryTool {
     }
 }
 
-fn render_acp_history(session: &AcpSessionData, limit: usize) -> ToolResult {
+fn render_acp_history(session: &SessionTranscript, limit: usize) -> ToolResult {
     let start = session.messages.len().saturating_sub(limit);
     let tail = &session.messages[start..];
     let mut output = format!(
@@ -629,6 +708,10 @@ impl Tool for SessionsSendTool {
                 output: ToolOutput::default(),
                 error: Some(error),
             });
+        }
+
+        if native_history_reader(self.backend.as_ref())?.is_some() {
+            return Ok(native_history_mutation_unsupported(self.name()));
         }
 
         let session_id = args
@@ -774,6 +857,13 @@ impl Tool for SessionsCurrentTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Some(reader) = native_history_reader(self.backend.as_ref())? {
+            return Ok(ToolResult {
+                success: true,
+                output: render_native_summary(&reader.current().await?).into(),
+                error: None,
+            });
+        }
         let session_key = current_session_key();
 
         let Some(key) = session_key else {
@@ -882,6 +972,10 @@ impl Tool for SessionResetTool {
                 output: ToolOutput::default(),
                 error: Some(error),
             });
+        }
+
+        if native_history_reader(self.backend.as_ref())?.is_some() {
+            return Ok(native_history_mutation_unsupported(self.name()));
         }
 
         let session_id = args
@@ -1005,6 +1099,10 @@ impl Tool for SessionDeleteTool {
             });
         }
 
+        if native_history_reader(self.backend.as_ref())?.is_some() {
+            return Ok(native_history_mutation_unsupported(self.name()));
+        }
+
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -1084,6 +1182,159 @@ mod tests {
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
+    }
+
+    struct NativeReader(std::sync::atomic::AtomicBool);
+    #[async_trait]
+    impl zeroclaw_api::session_events::views::SessionHistoryReadPort for NativeReader {
+        async fn current(
+            &self,
+        ) -> anyhow::Result<zeroclaw_api::session_events::views::SessionSummary> {
+            use zeroclaw_api::session_events::{
+                EventCursor, SessionStreamId, views::SessionSummary,
+            };
+            anyhow::ensure!(
+                self.0.load(std::sync::atomic::Ordering::SeqCst),
+                "native_read_revoked"
+            );
+            Ok(SessionSummary {
+                head: EventCursor::beginning(SessionStreamId::new()),
+                owning_agent: Some("fixture".into()),
+                fields: std::collections::BTreeMap::from([(
+                    "family_key".into(),
+                    serde_json::json!("native"),
+                )]),
+                created_at: 1,
+                last_activity: 2,
+                message_count: 1,
+                running: false,
+                closed: false,
+                deleted: false,
+            })
+        }
+        async fn list(
+            &self,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<zeroclaw_api::session_events::views::SessionSummary>> {
+            Ok(vec![self.current().await?])
+        }
+        async fn history(
+            &self,
+            _family: &str,
+            _limit: usize,
+        ) -> anyhow::Result<Option<zeroclaw_api::session_events::views::HistoricalMessagePage>>
+        {
+            self.current().await?;
+            Ok(Some(
+                zeroclaw_api::session_events::views::HistoricalMessagePage {
+                    messages: vec![zeroclaw_api::session_events::views::HistoricalMessage {
+                        message_id: zeroclaw_api::session_events::MessageId::new(),
+                        role: "user".into(),
+                        text: "native event history".into(),
+                        files: vec![],
+                        unresolved_parts: vec![],
+                        unavailable_parts: vec![],
+                        content_source: None,
+                    }],
+                    next_cursor: None,
+                },
+            ))
+        }
+    }
+    struct NativePort(Arc<NativeReader>);
+    #[async_trait]
+    impl zeroclaw_api::session_events::capture::SessionExecutionPort for NativePort {
+        fn history_reader(
+            &self,
+        ) -> Option<Arc<dyn zeroclaw_api::session_events::views::SessionHistoryReadPort>> {
+            Some(self.0.clone())
+        }
+        async fn execute(
+            &self,
+            _input: zeroclaw_api::session_events::capture::EngineTurnInput,
+            _engine: zeroclaw_api::session_events::capture::EngineTurnFuture<'_>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("reader fixture cannot execute")
+        }
+    }
+
+    #[tokio::test]
+    async fn native_session_tools_use_the_bound_reader_and_propagate_revocation() {
+        let (_directory, backend) = seeded_backend();
+        backend
+            .append("native", &ChatMessage::user("stale legacy history"))
+            .expect("legacy fixture");
+        let reader = Arc::new(NativeReader(std::sync::atomic::AtomicBool::new(true)));
+        let port = Arc::new(NativePort(reader.clone()));
+        zeroclaw_api::session_events::capture::scope_session_execution(port, async {
+            let list = SessionsListTool::new(backend.clone());
+            let current = SessionsCurrentTool::new(backend.clone());
+            let history = SessionsHistoryTool::new(backend.clone(), test_security());
+            let listed = list.execute(json!({})).await.expect("native list");
+            assert!(listed.output.as_str().contains("native"));
+            assert!(!listed.output.as_str().contains("telegram__alice"));
+            assert!(
+                current
+                    .execute(json!({}))
+                    .await
+                    .expect("current without legacy context key")
+                    .output
+                    .as_str()
+                    .contains("native")
+            );
+            let result = history
+                .execute(json!({"session_id":"native"}))
+                .await
+                .expect("native history");
+            assert!(result.output.as_str().contains("native event history"));
+            assert!(!result.output.as_str().contains("stale legacy history"));
+            for tool in [
+                Box::new(SessionsSendTool::new(backend.clone(), test_security())) as Box<dyn Tool>,
+                Box::new(SessionResetTool::new(backend.clone(), test_security())),
+                Box::new(SessionDeleteTool::new(backend.clone(), test_security())),
+            ] {
+                let result = tool
+                    .execute(json!({"session_id":"native","message":"late legacy write"}))
+                    .await
+                    .expect("explicit native rejection");
+                assert!(!result.success, "{}", tool.name());
+            }
+            reader.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(list.execute(json!({})).await.is_err());
+            assert!(current.execute(json!({})).await.is_err());
+            assert!(
+                history
+                    .execute(json!({"session_id":"native"}))
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_installation_without_bound_reader_never_reports_empty_legacy_history() {
+        let (directory, backend) = seeded_backend();
+        zeroclaw_infra::session_events::upgrade::upgrade_installation(
+            directory.path(),
+            zeroclaw_infra::session_events::installation::NativeBackend::Sqlite,
+            |_| "fixture".into(),
+        )
+        .expect("upgrade");
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(SessionsListTool::new(backend.clone())),
+            Box::new(SessionsCurrentTool::new(backend.clone())),
+            Box::new(SessionsHistoryTool::new(backend, test_security())),
+        ];
+        for tool in tools {
+            assert!(
+                tool.execute(json!({"session_id":"telegram__alice"}))
+                    .await
+                    .is_err(),
+                "{}",
+                tool.name()
+            );
+        }
     }
 
     fn test_backend() -> (TempDir, Arc<dyn SessionBackend>) {
@@ -2038,14 +2289,14 @@ mod tests {
 
     fn acp_fixture() -> (
         TempDir,
-        Arc<AcpSessionStore>,
+        Arc<SessionRepository>,
         AcpSessionReadView,
         String,
         String,
         String,
     ) {
         let tmp = TempDir::new().unwrap();
-        let store = Arc::new(AcpSessionStore::new(tmp.path()).unwrap());
+        let store = Arc::new(SessionRepository::legacy_fixture(tmp.path()).unwrap());
         let current = "11111111-1111-4111-8111-111111111111".to_string();
         let other = "22222222-2222-4222-8222-222222222222".to_string();
         let foreign = "foreign-acp-session".to_string();

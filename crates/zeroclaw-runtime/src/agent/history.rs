@@ -469,6 +469,7 @@ pub fn save_interactive_session_history_with_crumb(
     history: &[ChatMessage],
     has_crumb: bool,
 ) -> Result<()> {
+    let lease = zeroclaw_infra::session_events::cli_state::CliStateGuard::acquire_legacy(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -476,7 +477,7 @@ pub fn save_interactive_session_history_with_crumb(
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history_with_crumb(
         history, has_crumb,
     ))?;
-    std::fs::write(path, payload)?;
+    std::fs::write(lease.path(), payload)?;
     Ok(())
 }
 

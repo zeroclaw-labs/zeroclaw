@@ -45,7 +45,7 @@ Handshake. Returns server capabilities.
   }}
 ```
 
-`loadSession: true` and `sessionCapabilities: {"resume": {}, "close": {}}` indicate that session persistence is active. If the SQLite store could not be opened at startup, all three are absent or false and `session/load`, `session/resume`, and `session/close` will return `SESSION_NOT_FOUND` errors.
+`loadSession: true` and `sessionCapabilities: {"resume": {}, "close": {}}` indicate that session persistence is active. If a gateway connection has no standard repository, these capabilities are absent or false; standalone ACP instead rejects startup when standard storage cannot be initialized.
 
 `_meta.zeroclaw` carries ZeroClaw-specific extension fields not in the base ACP spec. Clients that only implement the base spec can ignore this object.
 
@@ -252,32 +252,32 @@ ZeroClaw also accepts inbound `session/update` (and the legacy `session/event` a
 
 ## Session persistence
 
-ZeroClaw automatically persists ACP sessions to SQLite. No configuration is required, the store opens at `<workspace_dir>/sessions/acp-sessions.db` whenever `zeroclaw acp` starts or a gateway WebSocket ACP connection is accepted. If the file cannot be created (read-only filesystem, bad permissions), the server falls back to in-memory-only sessions and `loadSession` reports `false` in the `initialize` response.
+ACP uses the same standard session event store as RPC and CLI, selected by `channels.session_backend` (SQLite or JSONL) under the installation data directory. Startup imports old session files, including `acp-sessions.db`, then renames them as backups. Standalone ACP fails startup if this storage cannot be initialized; a gateway without an available repository cannot advertise durable session loading.
 
 What is persisted:
 
-- Session metadata: `sessionId`, `workspaceDir`, `created_at`, `last_activity`
-- Finalized conversation history: the agent's post-turn `ConversationMessage` history, including partial output retained after cancellation or failure, written atomically after the turn reaches a terminal outcome
+- Session identity, ownership, workspace, interaction surface, timestamps, plans, usage and lifecycle
+- Accepted input, model output and reasoning, tool and approval events, child sessions, model changes, context transforms, and captured errors or partial progress
 
-Standalone `zeroclaw acp` and gateway WebSocket ACP persist terminal turn state. They do not write the in-progress checkpoints described below, so a process exit during a turn can retain only history that was finalized before the exit.
+Captured events are committed during execution. A process exit retains the committed prefix; unfinished effects remain distinguishable from confirmed success or failure. Replay does not rerun a tool to reconstruct missing observations.
 
-Sessions survive process restarts. A session created in one `zeroclaw acp` invocation can be loaded or resumed in a later one, as long as the same `workspace_dir` is in use (and therefore the same `acp-sessions.db` file).
+Sessions survive process restarts when the same installation data directory is used. The working directory is session metadata, not a separate database location.
 
 Sessions are not automatically deleted. `session/close` removes the live owner but retains ACP history so the session can be loaded or resumed.
 
-### ZeroCode / daemon RPC checkpoints
+### Interrupted execution and legacy checkpoints
 
-ZeroCode uses the separate [daemon RPC interface](../architecture/rpc-socket.md). For an ACP-mode RPC session, the daemon saves the accepted prompt, assistant text, tool calls, and tool results before sending their corresponding updates to the client. If the process stops during a turn, the next supported RPC resume recovers that checkpoint once and appends an interruption marker to the client-visible transcript.
+ZeroCode uses the [daemon RPC interface](../architecture/rpc-socket.md) with the same session store. Resume reads canonical retained context and committed model selection. Recorded failure or interruption facts do not authorize repeating an effect.
 
-Provider replay uses a separate safe projection: it keeps partial assistant text, omits the synthetic interruption marker and unmatched or ambiguous native tool exchanges, and limits each persisted tool-result payload to 16 KiB at a UTF-8 boundary plus a truncation marker. Thinking events and approval prompts are not checkpointed. Automatic trimming also stores the owner-selected retained provider context and its checkpoint frontier without deleting or renumbering the original visible transcript.
+Context trimming records a new projection with its source references and reason; it does not delete or renumber original observations. Reasoning, approvals and tool diagnostics remain part of the event history even when they are excluded from provider context.
 
-A completed turn finalizes the visible transcript and retained provider context atomically. If a cancelled or failed turn has no terminal message delta to finalize, the daemon keeps its checkpoint for recovery and removes the live owner rather than discarding the accepted prompt or earlier saved progress. A later supported resume can then recover that checkpoint normally.
+Old RPC checkpoints are imported as partial historical evidence. They are not converted into confirmed effect completions or replayed as a second transcript. See [Append-only session events](../architecture/session-events.md).
 
-Daemon RPC also provides `session/kill`, which records a durable tombstone so the session cannot be resumed, and `session/delete`, which removes the selected ACP history and checkpoint. Both methods first cancel an active turn and wait for its finalization before changing durable state. If the durable operation fails, the RPC returns an error, but cancellation is not undone. An idle live session remains available; hard cancellation can remove an active live owner, leaving its saved history and checkpoint available for recovery once storage is working. These two methods are not served by standalone or gateway WebSocket ACP.
+Daemon RPC also provides `session/kill`, which records a durable close reason so the session cannot be resumed, and `session/delete`, which logically deletes the selected session while retaining its audit events. Both methods first cancel an active turn and wait for its finalization before changing durable state. If the durable operation fails, the RPC returns an error, but cancellation is not undone. These two methods are not served by standalone or gateway WebSocket ACP.
 
 ### `session/load` _(ZeroClaw extension)_
 
-Restore a previously persisted session with **full history replay**. The server seeds the agent with the stored conversation history, then streams that history back to the client as a sequence of `session/update` notifications before returning. The client receives the same update stream it would have seen had the session never ended.
+Restore a previously persisted session with **retained context replay**. The server seeds the agent with the canonical retained messages, then replays those messages to the client as `session/update` notifications before returning. The complete audit history remains in the event store, including observations excluded by context trimming.
 
 ```json
 → {"jsonrpc":"2.0","id":5,"method":"session/load","params":{"sessionId":"s-ab12cd"}}
@@ -418,7 +418,7 @@ ACP sessions do not interact with the agent's persistent memory system. This is 
 - Automatic memory recall (the context preamble built from long-term memory at each turn) is disabled
 - Automatic conversation auto-save to the agent's memory store is disabled
 
-**Session context** comes from the persisted conversation history in `acp-sessions.db`. Sessions are persistent, resumable, and deleteable, the session history serves as the working context, not the agent's long-term memory.
+**Session context** comes from the persisted conversation history in the standard session event store. Sessions are persistent, resumable, and deleteable, the session history serves as the working context, not the agent's long-term memory.
 
 This separation ensures that ephemeral coding-assist conversations do not pollute the agent's long-term memory, and that unrelated knowledge from chat channels does not bleed into ACP sessions.
 
@@ -426,7 +426,7 @@ This separation ensures that ephemeral coding-assist conversations do not pollut
 
 - ACP server: `crates/zeroclaw-channels/src/orchestrator/acp_server.rs`
 - ACP back-channel: `crates/zeroclaw-channels/src/acp_channel.rs`
-- Session store (SQLite): `crates/zeroclaw-infra/src/acp_session_store.rs`
+- Session repository and event catalog: `crates/zeroclaw-infra/src/session_repository.rs`, `crates/zeroclaw-infra/src/session_events/`
 - Gateway ACP-over-WebSocket endpoint: `crates/zeroclaw-gateway/src/acp.rs`
 - Per-session path enforcement: `crates/zeroclaw-config/src/policy.rs` (`SecurityPolicy::from_config`), `crates/zeroclaw-runtime/src/agent/agent.rs` (`from_config_with_session_cwd_and_mcp`)
 - OS-level sandbox detection/backends: `crates/zeroclaw-runtime/src/security/detect.rs`, `landlock.rs`, `bubblewrap.rs`, `seatbelt.rs`

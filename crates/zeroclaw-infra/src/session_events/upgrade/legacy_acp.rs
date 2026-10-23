@@ -1,27 +1,42 @@
-//! ACP session persistence.
+//! Legacy ACP schema reader for installation upgrades and old-schema fixtures.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
+#[cfg(any(test, feature = "test-util"))]
+use rusqlite::{Transaction, TransactionBehavior};
 use std::path::Path;
-use zeroclaw_api::model_provider::{
-    ChatMessage, ConversationMessage, ToolCall, ToolResultMessage, projected_entry_count,
-};
+#[cfg(any(test, feature = "test-util"))]
+use zeroclaw_api::model_provider::projected_entry_count;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
+#[cfg(any(test, feature = "test-util"))]
 use zeroclaw_api::plan::PlanEntry;
+#[cfg(any(test, feature = "test-util"))]
+use zeroclaw_api::session_events::transcript::bounded_transcript_messages;
+use zeroclaw_api::session_events::transcript::provider_safe_history;
+#[cfg(any(test, feature = "test-util"))]
 use zeroclaw_log::{Action, EventOutcome};
 
-const MAX_PERSISTED_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
+use crate::session_repository::SessionTranscript as AcpSessionData;
+#[cfg(any(test, feature = "test-util"))]
+use crate::session_repository::{
+    SessionKillTransition as AcpSessionKillTransition, SessionListEntry as AcpSessionSummary,
+    SessionMessagePage as AcpSessionPage, SessionOwnership as AcpSessionAccess,
+    SessionRestore as AcpSessionRestore,
+};
 
 /// Internal discriminator for `acp_tool_calls.event_kind`. The 'in' row
 /// records the call args; the 'out' row records the result. Two append-only
 /// rows per call, correlated by the provider-issued `tool_call_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-util"))]
 enum ToolEventKind {
     In,
     Out,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl ToolEventKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -43,6 +58,7 @@ impl ToolEventKind {
 /// `in` opens one call; an `out` folds into an open call while the balance
 /// is positive and otherwise is an orphan entry that leaves the balance
 /// untouched, so an orphan cannot consume a later call that reuses the id.
+#[cfg(any(test, feature = "test-util"))]
 fn open_calls_after(events: impl IntoIterator<Item = ToolEventKind>) -> usize {
     let mut open = 0usize;
     for event in events {
@@ -67,68 +83,11 @@ struct RetainedContextRecord {
     messages: Vec<ConversationMessage>,
 }
 
-pub struct AcpSessionStore {
+pub struct LegacyAcpStore {
     conn: Mutex<Connection>,
-}
-
-pub struct AcpSessionData {
-    pub session_uuid: String,
-    /// Owning principal (RFC 7141 session isolation). `None` marks an
-    /// unscoped/legacy row, visible only to unscoped connections.
-    pub principal_id: Option<String>,
-    pub agent_alias: String,
-    pub workspace_dir: String,
-    pub interaction_surface: Option<String>,
-    pub token_count: u64,
-    pub created_at: DateTime<Utc>,
-    pub last_activity: DateTime<Utc>,
-    pub messages: Vec<ConversationMessage>,
-    /// Whether `messages`' first non-system entry is the synthetic
-    /// history-trim breadcrumb. Rows written after the `trim_breadcrumb`
-    /// column was added carry this as recorded by the owning turn loop,
-    /// never inferred from text. A row from before that column existed has
-    /// no recorded value (`NULL`); for that one-time legacy case only, it is
-    /// inferred from the first non-system message's text, matching the
-    /// interactive-session JSONL migration contract (see
-    /// `zeroclaw_runtime::agent::history::load_interactive_session_history_with_crumb`).
-    pub trim_breadcrumb: bool,
-    /// Provider-facing retained context written by native RPC trims. `None`
-    /// preserves the legacy provider-safe replay path.
-    pub retained_context: Option<Vec<ConversationMessage>>,
-}
-
-pub enum AcpSessionRestore {
-    Missing,
-    Killed,
-    Restorable(Box<AcpSessionData>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcpSessionKillTransition {
-    Marked,
-    AlreadyKilled,
-    Missing,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcpSessionAccess {
-    Owned,
-    Foreign,
-    Missing,
-}
-
-/// Lightweight summary for the ACP session picker. Avoids loading the full
-/// message history just to render a one-line label per session.
-pub struct AcpSessionSummary {
-    pub session_uuid: String,
-    /// Owning principal (RFC 7141). `None` = unscoped/legacy row.
-    pub principal_id: Option<String>,
-    pub agent_alias: String,
-    pub workspace_dir: String,
-    pub token_count: u64,
-    pub created_at: DateTime<Utc>,
-    pub last_activity: DateTime<Utc>,
-    pub message_count: usize,
+    // Resolve the installation's canonical format fence on each transcript write.
+    sessions_dir: std::path::PathBuf,
+    importing: bool,
 }
 
 /// The sessions one projected-count refresh pass may score: the scope of
@@ -136,6 +95,7 @@ pub struct AcpSessionSummary {
 /// stays scoped to the rows that listing returns, before any caller-side
 /// principal filter, so an agent-scoped listing never rescores the sessions
 /// of other agents.
+#[cfg(any(test, feature = "test-util"))]
 enum ProjectedCountScope<'a> {
     /// The live sessions of every agent (the unscoped picker listing).
     Live,
@@ -147,6 +107,7 @@ enum ProjectedCountScope<'a> {
     Session(&'a str),
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl ProjectedCountScope<'_> {
     /// The `acp_sessions` predicate that narrows a refresh pass to this
     /// scope, as a `WHERE` tail plus the one value it binds.
@@ -165,17 +126,8 @@ impl ProjectedCountScope<'_> {
 
 /// A bounded, store-owned page of the typed ACP transcript. The cursor is
 /// deliberately opaque to RPC clients; callers must hand it back unchanged.
-#[derive(Debug)]
-pub struct AcpSessionPage {
-    /// Owner read in the same transaction as the page, for RPC authorization
-    /// revalidation without loading the complete transcript.
-    pub principal_id: Option<String>,
-    pub messages: Vec<ConversationMessage>,
-    pub next_cursor: Option<String>,
-    pub has_older: bool,
-}
-
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[cfg(any(test, feature = "test-util"))]
 struct AcpSessionCursor {
     version: u8,
     session_id: i64,
@@ -184,13 +136,98 @@ struct AcpSessionCursor {
     next_entry_offset: Option<usize>,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 const ACP_SESSION_CURSOR_VERSION: u8 = 1;
+#[cfg(any(test, feature = "test-util"))]
 const ACP_SESSION_MAX_PAGE_SIZE: usize = 1_000;
 
-impl AcpSessionStore {
+impl LegacyAcpStore {
+    pub(crate) fn legacy_metadata(
+        &self,
+        session_uuid: &str,
+    ) -> Result<Vec<(String, serde_json::Value)>> {
+        let conn = self.legacy_connection()?;
+        let (workspace, surface, tokens, plan): (String, Option<String>, i64, Option<String>) = conn.query_row(
+            "SELECT workspace_dir, interaction_surface, token_count, plan_json FROM acp_sessions WHERE session_uuid=?1",
+            params![session_uuid], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let mut fields = vec![
+            ("workspace_dir".into(), serde_json::json!(workspace)),
+            ("interaction_surface".into(), serde_json::json!(surface)),
+            (
+                "token_count".into(),
+                serde_json::json!(tokens.max(0) as u64),
+            ),
+            (
+                "plan".into(),
+                match plan {
+                    Some(plan) => serde_json::from_str(&plan)?,
+                    None => serde_json::json!([]),
+                },
+            ),
+        ];
+        let mut statement = conn.prepare("SELECT e.action,e.outcome,e.payload,e.created_at FROM acp_session_events e JOIN acp_sessions s ON s.id=e.session_id WHERE s.session_uuid=?1 ORDER BY e.id")?;
+        for row in statement.query_map(params![session_uuid], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })? {
+            let (action, outcome, payload, created_at) = row?;
+            fields.push(("protocol_observation".into(), serde_json::json!({"action":action,"outcome":outcome,"payload":payload,"created_at":created_at})));
+        }
+        Ok(fields)
+    }
+
+    pub(crate) fn legacy_checkpoint(
+        &self,
+        session_uuid: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let conn = self.legacy_connection()?;
+        let checkpoint: Option<(i64, String, Option<i64>)> = conn.query_row(
+            "SELECT c.session_id,c.turn_id,s.retained_context_frontier FROM acp_turn_checkpoints c JOIN acp_sessions s ON s.id=c.session_id WHERE s.session_uuid=?1",
+            params![session_uuid], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        let Some((session, turn, frontier)) = checkpoint else {
+            return Ok(None);
+        };
+        let mut statement = conn.prepare(
+            "SELECT payload FROM acp_turn_checkpoint_events WHERE session_id=?1 ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![session], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let fragments = rows
+            .into_iter()
+            .map(|raw| serde_json::from_str::<ConversationMessage>(&raw))
+            .collect::<serde_json::Result<Vec<_>>>()?;
+        Ok(Some(
+            serde_json::json!({"turn_id":turn,"retained_context_frontier":frontier,"fragments":fragments}),
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
     pub fn new(workspace_dir: &Path) -> Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
+        let guard = crate::session_events::installation::InstallationGuard::acquire(&sessions_dir)?;
+        guard.require_legacy()?;
+        Self::open_legacy(&sessions_dir, false)
+    }
+
+    pub(crate) fn open_import(
+        guard: &crate::session_events::installation::InstallationGuard,
+    ) -> Result<Self> {
+        Self::open_legacy(guard.directory(), true)
+    }
+
+    fn legacy_connection(&self) -> Result<parking_lot::MutexGuard<'_, Connection>> {
+        Ok(self.conn.lock())
+    }
+
+    fn open_legacy(sessions_dir: &Path, importing: bool) -> Result<Self> {
+        std::fs::create_dir_all(sessions_dir).context("Failed to create sessions directory")?;
         let db_path = sessions_dir.join("acp-sessions.db");
 
         let conn = Connection::open(&db_path)
@@ -293,6 +330,8 @@ impl AcpSessionStore {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            sessions_dir: sessions_dir.into(),
+            importing,
         })
     }
 
@@ -655,6 +694,7 @@ impl AcpSessionStore {
     /// session isolation). `principal_id` is the caller's scope, or `None` for
     /// an unscoped/admin connection (NULL owner => visible only to unscoped
     /// connections). Returns the integer `id` assigned by SQLite.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn create_session(
         &self,
         session_uuid: &str,
@@ -673,6 +713,7 @@ impl AcpSessionStore {
 
     /// Record a session with an optional host-validated interaction surface,
     /// stamped with its owning principal (RFC 7141).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn create_session_with_interaction_surface(
         &self,
         session_uuid: &str,
@@ -681,8 +722,9 @@ impl AcpSessionStore {
         interaction_surface: Option<&str>,
         principal_id: Option<&str>,
     ) -> Result<i64> {
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         conn.execute(
             "INSERT INTO acp_sessions
                (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id)
@@ -703,12 +745,14 @@ impl AcpSessionStore {
     /// Delete a session ONLY if `owner_principal_id` matches the stored
     /// owner, in one predicated statement (RFC 7141 atomic ownership).
     /// Child-row cleanup follows the same cascade as [`Self::delete_session`].
+    #[cfg(any(test, feature = "test-util"))]
     pub fn delete_session_owned(
         &self,
         session_uuid: &str,
         owner_principal_id: &str,
     ) -> Result<bool> {
-        let conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
         let rows = conn
             .execute(
                 "DELETE FROM acp_sessions WHERE session_uuid = ?1 AND principal_id = ?2",
@@ -723,8 +767,9 @@ impl AcpSessionStore {
     /// `Ok(None)` when the session does not exist, `Ok(Some(None))` for a
     /// NULL-owner (unscoped/legacy) row, and `Ok(Some(Some(id)))` when owned.
     #[allow(clippy::option_option)]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn session_principal(&self, session_uuid: &str) -> Result<Option<Option<String>>> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         let row = conn.query_row(
             "SELECT principal_id FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
@@ -739,11 +784,12 @@ impl AcpSessionStore {
 
     /// Read the owner and interaction surface needed before checkpoint
     /// recovery without hydrating a potentially large transcript.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn session_owner_and_surface(
         &self,
         session_uuid: &str,
     ) -> Result<Option<(Option<String>, Option<String>)>> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         conn.query_row(
             "SELECT principal_id, interaction_surface FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
@@ -756,12 +802,14 @@ impl AcpSessionStore {
     /// Bind an unlabelled legacy session to a validated surface exactly once.
     /// Returns the durable value after the update so the caller can reject a
     /// concurrent or pre-existing mismatch.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn bind_interaction_surface_if_unset(
         &self,
         session_uuid: &str,
         interaction_surface: &str,
     ) -> Result<String> {
-        let conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
         conn.execute(
             "UPDATE acp_sessions
              SET interaction_surface = ?1
@@ -780,7 +828,12 @@ impl AcpSessionStore {
     /// Load session metadata and full message history for restore.
     /// Returns `None` if the session_uuid is not found.
     pub fn load_session(&self, session_uuid: &str) -> Result<Option<AcpSessionData>> {
-        let conn = self.conn.lock();
+        // Legacy reads may repair derived columns. Import already owns this
+        // lock; public reads must fence those writes against installation cutover.
+        let _installation = (!self.importing)
+            .then(|| crate::session_events::installation::legacy_guard(&self.sessions_dir))
+            .transpose()?;
+        let conn = self.legacy_connection()?;
 
         let row = conn.query_row(
             "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id
@@ -849,6 +902,7 @@ impl AcpSessionStore {
     /// Load one bounded page of the projected ACP transcript. Cursor reads
     /// hydrate only the durable groups needed for this page; the cursor's
     /// message bound makes later appends invisible to an established walk.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn load_message_page(
         &self,
         session_uuid: &str,
@@ -857,7 +911,7 @@ impl AcpSessionStore {
     ) -> Result<AcpSessionPage> {
         // Cursor validation and page hydration must share one snapshot so a
         // concurrent transcript replacement cannot create false exhaustion.
-        let mut conn = self.conn.lock();
+        let mut conn = self.legacy_connection()?;
         let conn = conn
             .transaction()
             .context("Failed to begin ACP session page read transaction")?;
@@ -1027,12 +1081,14 @@ impl AcpSessionStore {
     /// UUID owned by another agent indistinguishable to callers.
     /// Killed sessions remain readable as history; killing prevents runtime
     /// rehydration, not access to retained transcripts by their owner.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn load_session_for_agent(
         &self,
         session_uuid: &str,
         agent_alias: &str,
     ) -> Result<Option<AcpSessionData>> {
-        let conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
 
         let row = conn
             .query_row(
@@ -1103,12 +1159,13 @@ impl AcpSessionStore {
     /// Classify an exact ACP session key without exposing the foreign owner.
     /// Callers use `Foreign` and `Missing` to make the same fail-closed response
     /// while still avoiding an unsafe fallback to another session backend.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn classify_session_for_agent(
         &self,
         session_uuid: &str,
         agent_alias: &str,
     ) -> Result<AcpSessionAccess> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         let owner = conn
             .query_row(
                 "SELECT agent_alias FROM acp_sessions WHERE session_uuid = ?1",
@@ -1125,8 +1182,9 @@ impl AcpSessionStore {
     }
 
     /// Whether `session_uuid` is a live ACP session owned by `agent_alias`.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn is_live_session_for_agent(&self, session_uuid: &str, agent_alias: &str) -> Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         conn.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM acp_sessions
@@ -1141,7 +1199,7 @@ impl AcpSessionStore {
     /// Every durable ACP session key, used only to fail closed when a Chat key
     /// collides with the separate ACP namespace.
     pub fn list_session_ids(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         let mut stmt = conn
             .prepare("SELECT session_uuid FROM acp_sessions")
             .context("Failed to prepare ACP session key query")?;
@@ -1155,8 +1213,10 @@ impl AcpSessionStore {
     /// Load only durable ACP rows that are allowed to become live sessions.
     /// Killed rows keep their transcript for history/export but are terminal
     /// for runtime restore paths.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<AcpSessionRestore> {
-        let conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
 
         let row = conn.query_row(
             "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at, trim_breadcrumb, principal_id
@@ -1233,8 +1293,10 @@ impl AcpSessionStore {
     /// history/export data but are terminal and must not be offered for restore.
     /// Stale projected counts are rescored from the rows first, so the listing
     /// never reports a cache another writer left behind.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn list_sessions(&self) -> Result<Vec<AcpSessionSummary>> {
-        let mut conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let mut conn = self.legacy_connection()?;
         Self::refresh_stale_projected_counts(&mut conn, ProjectedCountScope::Live)?;
         let mut stmt = conn
             .prepare(
@@ -1297,8 +1359,10 @@ impl AcpSessionStore {
     /// activity. Killed rows are omitted from live discovery, but their retained
     /// transcripts remain readable through `load_session_for_agent` and they
     /// remain available to export through `list_sessions_by_agent`.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn list_live_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
-        let mut conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let mut conn = self.legacy_connection()?;
         Self::refresh_stale_projected_counts(
             &mut conn,
             ProjectedCountScope::LiveAgent(agent_alias),
@@ -1496,6 +1560,7 @@ impl AcpSessionStore {
     /// `load_session`, and never blocks the store, the other sessions, or
     /// the open. A genuine SQLite failure on the scoring UPDATE (busy, disk
     /// full) propagates.
+    #[cfg(any(test, feature = "test-util"))]
     fn refresh_stale_projected_counts(
         conn: &mut Connection,
         scope: ProjectedCountScope<'_>,
@@ -1590,7 +1655,7 @@ impl AcpSessionStore {
         };
         let record = serde_json::from_str::<RetainedContextRecord>(&payload)
             .context("Failed to deserialize ACP retained context")?;
-        Ok(Some(Self::provider_safe_history(&record.messages)))
+        Ok(Some(provider_safe_history(&record.messages)))
     }
 
     /// Insert messages into the durable, user-visible transcript. This path
@@ -1603,6 +1668,7 @@ impl AcpSessionStore {
     /// `replace_messages_inner` (whose prior rows the FK cascade already
     /// removed) sets the counter to it, which is the counting rule over the
     /// new transcript as a whole.
+    #[cfg(any(test, feature = "test-util"))]
     fn insert_messages(
         tx: &Transaction<'_>,
         session_id: i64,
@@ -1772,6 +1838,7 @@ impl AcpSessionStore {
     /// recovery) goes through here. The batch's score is added only while
     /// the session's watermark still matches its rows; a cache a writer
     /// without the columns left behind is recomputed from the rows instead.
+    #[cfg(any(test, feature = "test-util"))]
     fn append_messages(
         tx: &Transaction<'_>,
         session_uuid: &str,
@@ -1779,7 +1846,7 @@ impl AcpSessionStore {
         messages: &[ConversationMessage],
         now: &str,
     ) -> Result<()> {
-        let messages = Self::bounded_transcript_messages(messages);
+        let messages = bounded_transcript_messages(messages);
         // The persisted pair is a cache of the rows' projection, valid only
         // while the watermark matches the session's current MAX(id). Read
         // both before inserting: a mismatch means a writer this store did
@@ -1858,6 +1925,7 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn append_checkpoint_visible_messages(
         tx: &Transaction<'_>,
         session_uuid: &str,
@@ -1884,6 +1952,7 @@ impl AcpSessionStore {
         Self::append_messages(tx, session_uuid, session_id, &messages, now)
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn session_id(conn: &Connection, session_uuid: &str) -> Result<i64> {
         conn.query_row(
             "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
@@ -1893,8 +1962,9 @@ impl AcpSessionStore {
         .with_context(|| format!("unknown session_uuid: {session_uuid}"))
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn contains_session(&self, session_uuid: &str) -> Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM acp_sessions WHERE session_uuid = ?1)",
             params![session_uuid],
@@ -1904,12 +1974,14 @@ impl AcpSessionStore {
     }
 
     /// Append all ConversationMessages from one completed turn in one transaction.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn append_turn(&self, session_uuid: &str, messages: &[ConversationMessage]) -> Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         if messages.is_empty() {
             return Ok(());
         }
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
+        let mut conn = self.legacy_connection()?;
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
             .transaction()
@@ -1923,6 +1995,7 @@ impl AcpSessionStore {
     /// Replace a session's visible transcript while keeping message identity
     /// local to the transcript. Native retained provider context uses a
     /// separate projection and never calls this method for a trim.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn replace_messages(
         &self,
         session_uuid: &str,
@@ -1931,6 +2004,7 @@ impl AcpSessionStore {
         self.replace_messages_inner(session_uuid, messages, None)
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn replace_messages_and_breadcrumb(
         &self,
         session_uuid: &str,
@@ -1940,14 +2014,16 @@ impl AcpSessionStore {
         self.replace_messages_inner(session_uuid, messages, Some(breadcrumb_present))
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn replace_messages_inner(
         &self,
         session_uuid: &str,
         messages: &[ConversationMessage],
         breadcrumb_present: Option<bool>,
     ) -> Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
+        let mut conn = self.legacy_connection()?;
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
             .transaction()
@@ -1992,13 +2068,15 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn begin_turn_checkpoint(
         &self,
         session_uuid: &str,
         turn_id: &str,
         messages: &[ConversationMessage],
     ) -> Result<()> {
-        let mut conn = self.conn.lock();
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let mut conn = self.legacy_connection()?;
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
             .transaction()
@@ -2014,13 +2092,15 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn append_turn_checkpoint(
         &self,
         session_uuid: &str,
         turn_id: &str,
         messages: &[ConversationMessage],
     ) -> Result<i64> {
-        let mut conn = self.conn.lock();
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let mut conn = self.legacy_connection()?;
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
             .transaction()
@@ -2043,6 +2123,7 @@ impl AcpSessionStore {
         Ok(frontier)
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn append_checkpoint_events(
         tx: &Transaction<'_>,
         session_id: i64,
@@ -2055,7 +2136,7 @@ impl AcpSessionStore {
                 |row| row.get(0),
             )
             .context("Failed to read ACP checkpoint frontier")?;
-        for message in Self::bounded_transcript_messages(messages) {
+        for message in bounded_transcript_messages(messages) {
             let payload = serde_json::to_string(&message)
                 .context("Failed to serialize ACP turn checkpoint event")?;
             tx.execute(
@@ -2073,6 +2154,7 @@ impl AcpSessionStore {
     /// The visible transcript remains untouched; its journal rows stay
     /// durable for recovery and `session/messages`.
     #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     fn persist_retained_context(
         &self,
         session_uuid: &str,
@@ -2095,6 +2177,7 @@ impl AcpSessionStore {
     /// Persist an owner-observed checkpoint frontier. The frontier is supplied
     /// by the serial event consumer after its append transaction; it is never
     /// inferred by content comparison or by a delayed global MAX in this path.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn persist_retained_context_at_frontier(
         &self,
         session_uuid: &str,
@@ -2103,13 +2186,14 @@ impl AcpSessionStore {
         breadcrumb: bool,
         frontier: i64,
     ) -> Result<()> {
-        let mut conn = self.conn.lock();
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let mut conn = self.legacy_connection()?;
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin retained context transaction")?;
         Self::ensure_active_checkpoint(&tx, session_id, turn_id)?;
-        let retained = Self::bounded_transcript_messages(retained_messages);
+        let retained = bounded_transcript_messages(retained_messages);
         // This is the complete owner-selected projection, including partial
         // typed calls awaiting later results. Filtering belongs after recovery
         // composes the snapshot with uncovered journal events.
@@ -2142,20 +2226,22 @@ impl AcpSessionStore {
     /// Persist a seed-time trim projection. No turn checkpoint exists during
     /// restore, so this path verifies only the session identity and commits the
     /// owner-produced snapshot before its notification is forwarded.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn persist_retained_context_seed(
         &self,
         session_uuid: &str,
         retained_messages: &[ConversationMessage],
         breadcrumb: bool,
     ) -> Result<()> {
-        let mut conn = self.conn.lock();
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let mut conn = self.legacy_connection()?;
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin retained seed context transaction")?;
-        let retained = Self::bounded_transcript_messages(retained_messages);
+        let retained = bounded_transcript_messages(retained_messages);
         let record = RetainedContextRecord {
-            messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
+            messages: Self::without_hidden_reasoning(&provider_safe_history(&retained)),
         };
         let payload =
             serde_json::to_string(&record).context("Failed to serialize retained seed context")?;
@@ -2179,8 +2265,9 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn checkpoint_frontier(&self, session_uuid: &str, turn_id: &str) -> Result<i64> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         let session_id = Self::session_id(&conn, session_uuid)?;
         let active: Option<String> = conn
             .query_row(
@@ -2202,6 +2289,7 @@ impl AcpSessionStore {
         .context("Failed to read ACP checkpoint frontier")
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn ensure_active_checkpoint(
         tx: &Transaction<'_>,
         session_id: i64,
@@ -2222,6 +2310,7 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn without_hidden_reasoning(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
         messages
             .iter()
@@ -2243,6 +2332,7 @@ impl AcpSessionStore {
     /// Finalize a turn while atomically preserving visible journal fragments,
     /// the final provider projection, breadcrumb provenance and checkpoint
     /// deletion. Existing transcript rows are never replaced or re-identified.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn finalize_turn_checkpoint_with_context(
         &self,
         session_uuid: &str,
@@ -2264,6 +2354,7 @@ impl AcpSessionStore {
     /// Finalize only the durable row owned by the expected principal. The
     /// owner test and transcript, retained-context, and checkpoint changes
     /// occur in the same immediate transaction.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn finalize_turn_checkpoint_with_context_for_owner(
         &self,
         session_uuid: &str,
@@ -2273,8 +2364,9 @@ impl AcpSessionStore {
         breadcrumb: bool,
         owner_principal_id: Option<&str>,
     ) -> Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
+        let mut conn = self.legacy_connection()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin retained ACP turn finalization")?;
@@ -2312,12 +2404,12 @@ impl AcpSessionStore {
         let visible = if terminal_messages.is_empty() {
             Self::fold_checkpoint_fragments(fragments)
         } else {
-            Self::bounded_transcript_messages(terminal_messages)
+            bounded_transcript_messages(terminal_messages)
         };
         Self::append_checkpoint_visible_messages(&tx, session_uuid, session_id, &visible, &now)?;
-        let retained = Self::bounded_transcript_messages(retained_messages);
+        let retained = bounded_transcript_messages(retained_messages);
         let record = RetainedContextRecord {
-            messages: Self::without_hidden_reasoning(&Self::provider_safe_history(&retained)),
+            messages: Self::without_hidden_reasoning(&provider_safe_history(&retained)),
         };
         let payload = serde_json::to_string(&record)
             .context("Failed to serialize final retained ACP context")?;
@@ -2341,8 +2433,10 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn discard_turn_checkpoint(&self, session_uuid: &str, turn_id: &str) -> Result<()> {
-        let conn = self.conn.lock();
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
         let session_id = Self::session_id(&conn, session_uuid)?;
         let changed = conn
             .execute(
@@ -2354,14 +2448,16 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn finalize_turn_checkpoint(
         &self,
         session_uuid: &str,
         turn_id: &str,
         messages: &[ConversationMessage],
     ) -> Result<()> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
+        let mut conn = self.legacy_connection()?;
         let session_id = Self::session_id(&conn, session_uuid)?;
         let tx = conn
             .transaction()
@@ -2378,7 +2474,7 @@ impl AcpSessionStore {
             active_turn.as_deref() == Some(turn_id),
             "ACP turn checkpoint identity mismatch"
         );
-        let messages = Self::bounded_transcript_messages(messages);
+        let messages = bounded_transcript_messages(messages);
         Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
         tx.execute(
             "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
@@ -2390,6 +2486,7 @@ impl AcpSessionStore {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     pub fn recover_turn_checkpoint(
         &self,
         session_uuid: &str,
@@ -2402,14 +2499,16 @@ impl AcpSessionStore {
     /// to `owner_principal_id`. The owner lookup and all checkpoint changes
     /// share one immediate transaction, so a same-ID replacement cannot be
     /// recovered under a stale principal authorization.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn recover_turn_checkpoint_for_owner(
         &self,
         session_uuid: &str,
         interruption_marker: &str,
         owner_principal_id: Option<&str>,
     ) -> Result<bool> {
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
+        let mut conn = self.legacy_connection()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin ACP turn checkpoint recovery")?;
@@ -2474,8 +2573,7 @@ impl AcpSessionStore {
                     .context("Failed to deserialize ACP turn checkpoint event")
             })
             .collect::<Result<Vec<_>>>()?;
-        let visible =
-            Self::bounded_transcript_messages(&Self::fold_checkpoint_fragments(fragments));
+        let visible = bounded_transcript_messages(&Self::fold_checkpoint_fragments(fragments));
         Self::append_messages(&tx, session_uuid, session_id, &visible, &now)?;
         tx.execute(
             "INSERT INTO acp_messages
@@ -2508,8 +2606,7 @@ impl AcpSessionStore {
             // use serialized-content overlap to repair a boundary because
             // identical user text and differently typed tool fragments are
             // both legitimate progress.
-            record.messages =
-                Self::provider_safe_history(&Self::fold_checkpoint_fragments(projected));
+            record.messages = provider_safe_history(&Self::fold_checkpoint_fragments(projected));
             tx.execute(
                 "UPDATE acp_sessions SET retained_context_json = ?, retained_context_frontier = 0 WHERE id = ?",
                 params![serde_json::to_string(&record)?, session_id],
@@ -2528,6 +2625,7 @@ impl AcpSessionStore {
         Ok(true)
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn payloads_after_frontier(
         tx: &Transaction<'_>,
         session_id: i64,
@@ -2551,6 +2649,7 @@ impl AcpSessionStore {
             .collect()
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn fold_checkpoint_fragments(fragments: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
         let mut messages = Vec::new();
         for fragment in fragments {
@@ -2609,112 +2708,10 @@ impl AcpSessionStore {
 
     /// Apply the transcript's existing display/storage bound to native tool
     /// results before they enter a checkpoint or canonical ACP history.
-    pub fn bounded_transcript_messages(
-        messages: &[ConversationMessage],
-    ) -> Vec<ConversationMessage> {
-        messages
-            .iter()
-            .cloned()
-            .map(|message| match message {
-                ConversationMessage::ToolResults(mut results) => {
-                    for result in &mut results {
-                        result.content = Self::bounded_tool_output(&result.content);
-                    }
-                    ConversationMessage::ToolResults(results)
-                }
-                other => other,
-            })
-            .collect()
-    }
-
-    pub fn bounded_tool_output(output: &str) -> String {
-        if output.len() <= MAX_PERSISTED_TOOL_OUTPUT_BYTES {
-            return output.to_string();
-        }
-        let mut end = MAX_PERSISTED_TOOL_OUTPUT_BYTES;
-        while end > 0 && !output.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}…[truncated]", &output[..end])
-    }
-
-    /// Produce provider-safe ACP history while preserving client-visible text.
-    /// Only an immediately adjacent tool-call/result pair is retained, and one
-    /// result is kept for each unambiguous call id. Duplicate call or result IDs
-    /// within a batch are rejected; recovery markers stay transcript-only.
-    pub fn provider_safe_history(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
-        let mut repaired = Vec::new();
-        let mut index = 0;
-        while index < messages.len() {
-            match &messages[index] {
-                ConversationMessage::Chat(chat)
-                    if chat.role == "system" || chat.role == SYNTHETIC_INTERRUPTION_ROLE =>
-                {
-                    index += 1;
-                }
-                ConversationMessage::Chat(_) => {
-                    repaired.push(messages[index].clone());
-                    index += 1;
-                }
-                ConversationMessage::AssistantToolCalls {
-                    text,
-                    tool_calls,
-                    reasoning_content,
-                } => {
-                    let adjacent_results =
-                        messages.get(index + 1).and_then(|message| match message {
-                            ConversationMessage::ToolResults(results) => Some(results),
-                            _ => None,
-                        });
-                    let mut paired_calls = Vec::new();
-                    let mut paired_results = Vec::new();
-                    if let Some(results) = adjacent_results {
-                        let mut call_id_counts = std::collections::HashMap::new();
-                        for call in tool_calls {
-                            *call_id_counts.entry(call.id.as_str()).or_insert(0usize) += 1;
-                        }
-                        for call in tool_calls {
-                            // Reserving a result is insufficient: even with two
-                            // results, duplicated call IDs cannot identify a pair.
-                            if call_id_counts.get(call.id.as_str()) != Some(&1) {
-                                continue;
-                            }
-                            let mut matching_results = results
-                                .iter()
-                                .filter(|result| result.tool_call_id == call.id);
-                            if let Some(result) = matching_results.next()
-                                && matching_results.next().is_none()
-                            {
-                                paired_calls.push(call.clone());
-                                paired_results.push(result.clone());
-                            }
-                        }
-                    }
-
-                    if paired_calls.is_empty() {
-                        if let Some(text) = text.as_ref().filter(|text| !text.is_empty()) {
-                            repaired.push(ConversationMessage::Chat(ChatMessage::assistant(text)));
-                        }
-                    } else {
-                        repaired.push(ConversationMessage::AssistantToolCalls {
-                            text: text.clone(),
-                            tool_calls: paired_calls,
-                            reasoning_content: reasoning_content.clone(),
-                        });
-                        repaired.push(ConversationMessage::ToolResults(paired_results));
-                    }
-                    index += if adjacent_results.is_some() { 2 } else { 1 };
-                }
-                ConversationMessage::ToolResults(_) => {
-                    index += 1;
-                }
-            }
-        }
-        repaired
-    }
-
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_token_count(&self, session_uuid: &str, token_count: u64) -> Result<()> {
-        let conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
         let rows = conn
             .execute(
                 "UPDATE acp_sessions SET token_count = ?1 WHERE session_uuid = ?2",
@@ -2733,8 +2730,10 @@ impl AcpSessionStore {
     /// representation (0). Used when an accepted turn attempt serves a route
     /// without token usage: the prior snapshot must not survive, mirroring
     /// the client-side meter which clears on accepted usage-less events.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn clear_token_count(&self, session_uuid: &str) -> Result<()> {
-        let conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
         let rows = conn
             .execute(
                 "UPDATE acp_sessions SET token_count = 0 WHERE session_uuid = ?1",
@@ -2755,6 +2754,7 @@ impl AcpSessionStore {
     /// route's count; rejected billing telemetry never touches the store.
     /// Both durable consumers (ACP server, RPC dispatch) route through here
     /// so the accepted-gate cannot drift between paths.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn persist_usage_snapshot(
         &self,
         session_uuid: &str,
@@ -2776,8 +2776,10 @@ impl AcpSessionStore {
     /// `append_turn`'s tolerance for a session removed mid-turn) rather than
     /// erroring like `set_token_count`, since this is best-effort bookkeeping
     /// that must never fail a turn.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_trim_breadcrumb(&self, session_uuid: &str, present: bool) -> Result<()> {
-        let conn = self.conn.lock();
+        let _family_guard = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
         conn.execute(
             "UPDATE acp_sessions SET trim_breadcrumb = ?1 WHERE session_uuid = ?2",
             params![i64::from(present), session_uuid],
@@ -2789,10 +2791,12 @@ impl AcpSessionStore {
     /// Persist the session's latest TodoWrite plan as a JSON array of
     /// `PlanEntry` (whole-list replace). An empty slice stores an empty
     /// array (a cleared plan), distinct from SQL NULL (never had one).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_plan(&self, session_uuid: &str, entries: &[PlanEntry]) -> Result<()> {
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let plan_json =
             serde_json::to_string(entries).context("Failed to serialize plan entries")?;
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         let rows = conn
             .execute(
                 "UPDATE acp_sessions SET plan_json = ?1 WHERE session_uuid = ?2",
@@ -2811,8 +2815,9 @@ impl AcpSessionStore {
     /// session has no plan (NULL or absent). Malformed JSON is treated
     /// as an empty plan rather than a hard error, so a corrupt plan
     /// column never blocks session restore.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn get_plan(&self, session_uuid: &str) -> Result<Vec<PlanEntry>> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         let plan_json: Option<String> = conn
             .query_row(
                 "SELECT plan_json FROM acp_sessions WHERE session_uuid = ?1",
@@ -2830,6 +2835,7 @@ impl AcpSessionStore {
     /// Record a session-lifecycle event. Caller passes typed enums; the SQLite
     /// layer is the only place strings appear. Same `Action` / `EventOutcome`
     /// values are used at the matching `zeroclaw_log::record!` call site.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn append_event(
         &self,
         session_uuid: &str,
@@ -2837,8 +2843,9 @@ impl AcpSessionStore {
         outcome: EventOutcome,
         payload: Option<&str>,
     ) -> Result<()> {
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         let session_id: i64 = conn
             .query_row(
                 "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
@@ -2858,8 +2865,10 @@ impl AcpSessionStore {
 
     /// Delete a session and all its child rows (messages, tool calls, events
     /// cascade via FK). Returns `true` if the session existed.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn delete_session(&self, session_uuid: &str) -> Result<bool> {
-        let conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
         let rows = conn
             .execute(
                 "DELETE FROM acp_sessions WHERE session_uuid = ?1",
@@ -2874,8 +2883,9 @@ impl AcpSessionStore {
     /// Count *live* ACP sessions for `agent_alias` — rows not yet killed
     /// (`killed_at IS NULL`). A non-zero count is a HARD blocker for deleting the
     /// agent: the operator must end the sessions first.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn count_live_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM acp_sessions WHERE agent_alias = ?1 AND killed_at IS NULL",
@@ -2888,8 +2898,10 @@ impl AcpSessionStore {
 
     /// Summaries of every ACP session (live or killed) attributed to
     /// `agent_alias`, for the export-then-delete archive.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn list_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
-        let mut conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let mut conn = self.legacy_connection()?;
         Self::refresh_stale_projected_counts(&mut conn, ProjectedCountScope::Agent(agent_alias))?;
         let mut stmt = conn
             .prepare(
@@ -2954,8 +2966,10 @@ impl AcpSessionStore {
     /// performs just to re-derive the count; a cache another writer left
     /// stale is rescored from the session's rows here first. `None` when the
     /// session UUID is unknown.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn projected_message_count(&self, session_uuid: &str) -> Result<Option<usize>> {
-        let mut conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let mut conn = self.legacy_connection()?;
         Self::refresh_stale_projected_counts(
             &mut conn,
             ProjectedCountScope::Session(session_uuid),
@@ -2974,8 +2988,10 @@ impl AcpSessionStore {
     /// Delete every ACP session (live or killed) for `agent_alias`, returning the
     /// row count. Child tables (`acp_messages`/`acp_tool_calls`/`acp_session_events`)
     /// cascade via their `ON DELETE CASCADE` FKs (`foreign_keys = ON`).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn delete_sessions_by_agent(&self, agent_alias: &str) -> Result<usize> {
-        let conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
         let rows = conn
             .execute(
                 "DELETE FROM acp_sessions WHERE agent_alias = ?1",
@@ -2989,8 +3005,10 @@ impl AcpSessionStore {
     /// returning the row count. The agent-rename cascadekeeps the
     /// session and its transcript; only the owning alias moves. Unlike delete,
     /// a live session (`killed_at IS NULL`) is no obstacle to rename.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn rename_sessions_by_agent(&self, from: &str, to: &str) -> Result<usize> {
-        let conn = self.conn.lock();
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
+        let conn = self.legacy_connection()?;
         let rows = conn
             .execute(
                 "UPDATE acp_sessions SET agent_alias = ?2 WHERE agent_alias = ?1",
@@ -3003,6 +3021,7 @@ impl AcpSessionStore {
     /// Atomically persist that an admin intentionally killed this ACP session.
     /// The transcript and any checkpoint stay durable, but runtime rehydration
     /// must not revive it.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn mark_session_killed_atomic(
         &self,
         session_uuid: &str,
@@ -3012,13 +3031,15 @@ impl AcpSessionStore {
 
     /// Tombstone only the durable row still owned by this principal. The
     /// update predicate and transition inspection share one transaction.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn mark_session_killed_atomic_for_owner(
         &self,
         session_uuid: &str,
         owner_principal_id: Option<&str>,
     ) -> Result<AcpSessionKillTransition> {
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
+        let mut conn = self.legacy_connection()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin ACP session kill transition")?;
@@ -3062,6 +3083,7 @@ impl AcpSessionStore {
     /// This compatibility wrapper retains the original boolean contract for
     /// existing callers; use `mark_session_killed_atomic` when the distinction
     /// between marked, already-killed, and missing matters.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
         Ok(matches!(
             self.mark_session_killed_atomic(session_uuid)?,
@@ -3073,7 +3095,7 @@ impl AcpSessionStore {
     /// Missing rows are not killed; callers can then use normal load handling
     /// to distinguish SESSION_NOT_FOUND from a terminal killed session.
     pub fn is_session_killed(&self, session_uuid: &str) -> Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         let row = conn.query_row(
             "SELECT CASE WHEN killed_at IS NULL THEN 0 ELSE 1 END
              FROM acp_sessions WHERE session_uuid = ?1",
@@ -3088,9 +3110,11 @@ impl AcpSessionStore {
     }
 
     /// Update `last_activity` without appending messages.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn touch_session(&self, session_uuid: &str) -> Result<()> {
+        let _installation = crate::session_events::installation::legacy_guard(&self.sessions_dir)?;
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
+        let conn = self.legacy_connection()?;
         conn.execute(
             "UPDATE acp_sessions SET last_activity = ?1 WHERE session_uuid = ?2",
             params![now, session_uuid],
@@ -3100,6 +3124,7 @@ impl AcpSessionStore {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 struct ProjectedGroup {
     message_id: i64,
     role: String,
@@ -3110,7 +3135,9 @@ struct ProjectedGroup {
     unmatched_output_count: usize,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl ProjectedGroup {
+    #[cfg(any(test, feature = "test-util"))]
     fn len(&self) -> usize {
         if !self.has_tool_events {
             1
@@ -3119,6 +3146,7 @@ impl ProjectedGroup {
         }
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn ensure_well_formed(&self, conn: &Connection) -> Result<()> {
         let malformed: bool = conn.query_row(
             "SELECT EXISTS(
@@ -3137,6 +3165,7 @@ impl ProjectedGroup {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-util"))]
     fn entries_to_messages(
         &self,
         conn: &Connection,
@@ -3333,6 +3362,7 @@ impl ProjectedGroup {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 fn load_projected_group(
     conn: &Connection,
     message_id: i64,
@@ -3396,6 +3426,7 @@ fn load_projected_group(
     })
 }
 
+#[cfg(any(test, feature = "test-util"))]
 fn encode_cursor(cursor: AcpSessionCursor) -> Result<String> {
     let bytes = serde_json::to_vec(&cursor)?;
     let mut encoded = String::from("acp1.");
@@ -3406,6 +3437,7 @@ fn encode_cursor(cursor: AcpSessionCursor) -> Result<String> {
     Ok(encoded)
 }
 
+#[cfg(any(test, feature = "test-util"))]
 fn decode_cursor(encoded: &str) -> Result<AcpSessionCursor> {
     let hex = encoded
         .strip_prefix("acp1.")
@@ -3441,15 +3473,72 @@ fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const MAX_PERSISTED_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
     use tempfile::TempDir;
     use zeroclaw_api::model_provider::{
         ChatMessage, ToolCall, ToolResultMessage, projected_entry_count,
     };
 
-    fn open_store() -> (TempDir, AcpSessionStore) {
+    fn open_store() -> (TempDir, LegacyAcpStore) {
         let tmp = TempDir::new().unwrap();
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn native_acp_fence_blocks_old_transcript_handles_and_keeps_protocol_metadata_writable() {
+        use crate::session_events::installation::NativeBackend;
+        let (directory, store) = open_store();
+        store
+            .create_session("fixture", "agent", "/tmp", None)
+            .expect("protocol");
+        let user = ConversationMessage::Chat(ChatMessage::user("fixture"));
+        store
+            .begin_turn_checkpoint("fixture", "old-turn", std::slice::from_ref(&user))
+            .expect("legacy checkpoint");
+        crate::session_events::upgrade::upgrade_installation(
+            directory.path(),
+            NativeBackend::Sqlite,
+            |_| "agent".into(),
+        )
+        .expect("fence");
+        assert!(
+            store
+                .append_turn("fixture", std::slice::from_ref(&user))
+                .is_err()
+        );
+        assert!(
+            store
+                .replace_messages("fixture", std::slice::from_ref(&user))
+                .is_err()
+        );
+        assert!(
+            store
+                .append_turn_checkpoint("fixture", "old-turn", std::slice::from_ref(&user))
+                .is_err()
+        );
+        assert!(
+            store
+                .recover_turn_checkpoint("fixture", "interrupted")
+                .is_err()
+        );
+        assert!(
+            store
+                .persist_retained_context_seed("fixture", std::slice::from_ref(&user), false)
+                .is_err()
+        );
+        let store =
+            crate::session_repository::SessionRepository::for_namespace(directory.path(), "acp_")
+                .expect("standard repository");
+        store.touch_session("fixture").expect("protocol activity");
+        store.set_plan("fixture", &[]).expect("protocol plan");
+        store
+            .create_session("unrelated", "agent", "/tmp", None)
+            .expect("unrelated");
+        assert!(
+            store.append_turn("unrelated", &[user]).is_err(),
+            "all legacy transcript writers are fenced after installation upgrade"
+        );
     }
 
     #[test]
@@ -3460,8 +3549,8 @@ mod tests {
         let old = ConversationMessage::Chat(ChatMessage::user("archived request"));
         store.append_turn(sid, &[old]).unwrap();
         let original_id: i64 = store
-            .conn
-            .lock()
+            .legacy_connection()
+            .unwrap()
             .query_row("SELECT id FROM acp_messages", [], |row| row.get(0))
             .unwrap();
         store
@@ -3534,7 +3623,7 @@ mod tests {
             )
             .unwrap();
         drop(store);
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         assert!(store.recover_turn_checkpoint(sid, "interrupted").unwrap());
         let recovered = store.load_session(sid).unwrap().unwrap();
         let model = recovered.retained_context.unwrap();
@@ -3552,13 +3641,13 @@ mod tests {
         assert!(transcript.contains("archived request"));
         assert_eq!(transcript.matches("after snapshot").count(), 1);
         let preserved_id: i64 = store
-            .conn
-            .lock()
+            .legacy_connection()
+            .unwrap()
             .query_row("SELECT MIN(id) FROM acp_messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(original_id, preserved_id);
         drop(store);
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         assert!(!store.recover_turn_checkpoint(sid, "interrupted").unwrap());
         assert_eq!(
             serde_json::to_string(&store.load_session(sid).unwrap().unwrap().messages).unwrap(),
@@ -3631,10 +3720,10 @@ mod tests {
     /// Read the raw `trim_breadcrumb` column, bypassing the inference
     /// fallback, so a test can tell `NULL` (never recorded) apart from an
     /// explicit `0`/`1`.
-    fn raw_trim_breadcrumb_column(store: &AcpSessionStore, session_uuid: &str) -> Option<i64> {
+    fn raw_trim_breadcrumb_column(store: &LegacyAcpStore, session_uuid: &str) -> Option<i64> {
         store
-            .conn
-            .lock()
+            .legacy_connection()
+            .unwrap()
             .query_row(
                 "SELECT trim_breadcrumb FROM acp_sessions WHERE session_uuid = ?1",
                 params![session_uuid],
@@ -3646,7 +3735,7 @@ mod tests {
     #[test]
     fn new_creates_all_tables() {
         let (_tmp, store) = open_store();
-        let conn = store.conn.lock();
+        let conn = store.legacy_connection().unwrap();
         for table in [
             "acp_sessions",
             "acp_messages",
@@ -3684,7 +3773,7 @@ mod tests {
     #[test]
     fn opens_in_wal_mode_to_avoid_blocking_runtime_threads() {
         let (_tmp, store) = open_store();
-        let conn = store.conn.lock();
+        let conn = store.legacy_connection().unwrap();
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
@@ -3766,17 +3855,17 @@ mod tests {
         // no index. The migration must not treat "column present" as "done".
         let tmp = TempDir::new().unwrap();
         {
-            let store = AcpSessionStore::new(tmp.path()).unwrap();
+            let store = LegacyAcpStore::new(tmp.path()).unwrap();
             store
-                .conn
-                .lock()
+                .legacy_connection()
+                .unwrap()
                 .execute("DROP INDEX idx_acp_sessions_principal", [])
                 .unwrap();
         }
-        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        let reopened = LegacyAcpStore::new(tmp.path()).unwrap();
         let indexed: bool = reopened
-            .conn
-            .lock()
+            .legacy_connection()
+            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
                  AND name = 'idx_acp_sessions_principal'",
@@ -3797,12 +3886,12 @@ mod tests {
         // no-op when the column already exists and preserve stamped owners.
         let tmp = TempDir::new().unwrap();
         {
-            let store = AcpSessionStore::new(tmp.path()).unwrap();
+            let store = LegacyAcpStore::new(tmp.path()).unwrap();
             store
                 .create_session("s1", "alpha", "/ws", Some("alice"))
                 .unwrap();
         }
-        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        let reopened = LegacyAcpStore::new(tmp.path()).unwrap();
         assert_eq!(
             reopened.session_principal("s1").unwrap(),
             Some(Some("alice".to_string())),
@@ -4008,7 +4097,7 @@ mod tests {
             serde_json::to_value(&restored.messages[..2]).unwrap()
         );
         assert!(!older.has_older);
-        assert!(AcpSessionStore::provider_safe_history(&newest.messages).is_empty());
+        assert!(provider_safe_history(&newest.messages).is_empty());
     }
 
     #[test]
@@ -4122,7 +4211,7 @@ mod tests {
                 case.name
             );
 
-            let provider_history = AcpSessionStore::provider_safe_history(&restored.messages);
+            let provider_history = provider_safe_history(&restored.messages);
             assert!(
                 provider_history.iter().all(|message| !matches!(
                     message,
@@ -4326,7 +4415,7 @@ mod tests {
             }]),
         ];
 
-        let repaired = AcpSessionStore::provider_safe_history(&messages);
+        let repaired = provider_safe_history(&messages);
         assert_eq!(repaired.len(), 2);
         assert!(matches!(
             &repaired[0],
@@ -4401,8 +4490,7 @@ mod tests {
                 expected.extend(later);
                 let original = serde_json::to_value(&messages).unwrap();
                 assert_eq!(
-                    serde_json::to_value(AcpSessionStore::provider_safe_history(&messages))
-                        .unwrap(),
+                    serde_json::to_value(provider_safe_history(&messages)).unwrap(),
                     serde_json::to_value(expected).unwrap(),
                     "call count={call_count}, result count={result_count}, unique peer={keep_unique_peer}"
                 );
@@ -4430,7 +4518,7 @@ mod tests {
                 content: "x".repeat(MAX_PERSISTED_TOOL_OUTPUT_BYTES + 10),
             }]),
         ];
-        let bounded = AcpSessionStore::bounded_transcript_messages(&messages);
+        let bounded = bounded_transcript_messages(&messages);
         assert!(matches!(
             &bounded[1],
             ConversationMessage::ToolResults(results)
@@ -4707,7 +4795,7 @@ mod tests {
         // Simulate a row written before `insert_messages` filtered system
         // rows: insert one directly, bypassing every write path.
         {
-            let conn = store.conn.lock();
+            let conn = store.legacy_connection().unwrap();
             let session_id: i64 = conn
                 .query_row(
                     "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
@@ -4839,7 +4927,7 @@ mod tests {
             )
             .unwrap();
 
-        let conn = store.conn.lock();
+        let conn = store.legacy_connection().unwrap();
         let msg_content: String = conn
             .query_row(
                 "SELECT content FROM acp_messages WHERE role = 'assistant' LIMIT 1",
@@ -4936,7 +5024,7 @@ mod tests {
             &[ConversationMessage::Chat(ChatMessage::user("hello"))],
         );
         assert!(result.is_err());
-        let conn = store.conn.lock();
+        let conn = store.legacy_connection().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM acp_messages", [], |r| r.get(0))
             .unwrap();
@@ -4969,7 +5057,7 @@ mod tests {
                 .unwrap();
             {
                 // Bypass today's write filter to represent an existing database.
-                let conn = store.conn.lock();
+                let conn = store.legacy_connection().unwrap();
                 let session_id: i64 = conn
                     .query_row(
                         "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
@@ -5277,7 +5365,7 @@ mod tests {
                 ],
             )
             .unwrap();
-        let conn = store.conn.lock();
+        let conn = store.legacy_connection().unwrap();
         // Add an invalid event to the older row without affecting the newer
         // page; loading that row later must be where the error appears.
         let old_id: i64 = conn
@@ -5313,7 +5401,7 @@ mod tests {
         // `append_turn` persists nothing for a zero-entry tool-call batch, so
         // the empty assistant row a malformed-only group hangs off is written
         // directly, as an older binary or a damaged DB would leave it.
-        let conn = store.conn.lock();
+        let conn = store.legacy_connection().unwrap();
         conn.execute(
             "INSERT INTO acp_messages (session_id, role, content, created_at)
              VALUES ((SELECT id FROM acp_sessions WHERE session_uuid = 'bad-empty'),
@@ -5466,7 +5554,7 @@ mod tests {
 
         assert!(store.delete_session("sess-del").unwrap());
 
-        let conn = store.conn.lock();
+        let conn = store.legacy_connection().unwrap();
         for table in ["acp_messages", "acp_tool_calls", "acp_session_events"] {
             let count: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
@@ -5590,7 +5678,7 @@ mod tests {
         );
 
         drop(store);
-        let reopened = AcpSessionStore::new(tmp.path()).unwrap();
+        let reopened = LegacyAcpStore::new(tmp.path()).unwrap();
         assert!(
             reopened.is_session_killed("sess-kill").unwrap(),
             "kill marker must survive store reopen"
@@ -5786,7 +5874,7 @@ mod tests {
             )
             .unwrap();
 
-        let conn = store.conn.lock();
+        let conn = store.legacy_connection().unwrap();
         let (action, outcome, payload): (String, String, Option<String>) = conn
             .query_row(
                 "SELECT action, outcome, payload FROM acp_session_events LIMIT 1",
@@ -5869,11 +5957,7 @@ mod tests {
         }
     }
 
-    fn assert_list_matches_projection(
-        store: &AcpSessionStore,
-        session_uuid: &str,
-        expected: usize,
-    ) {
+    fn assert_list_matches_projection(store: &LegacyAcpStore, session_uuid: &str, expected: usize) {
         let summary = &store
             .list_sessions()
             .unwrap()
@@ -6151,7 +6235,7 @@ mod tests {
     }
 
     /// The schema as it was before the projected-count columns existed.
-    /// `AcpSessionStore::new` adds the rest of the current columns through
+    /// `LegacyAcpStore::new` adds the rest of the current columns through
     /// its idempotent migrations, so tests only hand-build what predates
     /// the change under test.
     fn legacy_schema_without_projected_count(conn: &Connection) {
@@ -6193,10 +6277,10 @@ mod tests {
     /// a session that was never scored (0, NULL) apart from one the store
     /// scored (count, watermark) and from a cache another writer left
     /// behind the rows.
-    fn raw_count_pair(store: &AcpSessionStore, session_uuid: &str) -> (i64, Option<i64>) {
+    fn raw_count_pair(store: &LegacyAcpStore, session_uuid: &str) -> (i64, Option<i64>) {
         store
-            .conn
-            .lock()
+            .legacy_connection()
+            .unwrap()
             .query_row(
                 "SELECT projected_message_count, projected_count_through
                   FROM acp_sessions WHERE session_uuid = ?1",
@@ -6211,7 +6295,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("sessions").join("acp-sessions.db");
         std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         store
             .create_session("self-heal-s", "alpha", "/tmp/s", None)
             .unwrap();
@@ -6270,7 +6354,7 @@ mod tests {
         drop(conn);
 
         // The next list self-heals both sessions from their rows.
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         assert_list_matches_projection(&store, "self-heal-s", 2);
         assert_list_matches_projection(&store, "old-binary-t", 2);
 
@@ -6295,7 +6379,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("sessions").join("acp-sessions.db");
         std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         store
             .create_session("emptied-s", "alpha", "/tmp/e", None)
             .unwrap();
@@ -6325,7 +6409,7 @@ mod tests {
 
         // The next read heals to the empty transcript: zero rows, zero
         // count, NULL watermark (valid at 0).
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         let list = store.list_sessions().unwrap();
         let emptied = list.iter().find(|s| s.session_uuid == "emptied-s").unwrap();
         assert_eq!(emptied.message_count, 0);
@@ -6416,7 +6500,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let store = AcpSessionStore::new(tmp.path())
+        let store = LegacyAcpStore::new(tmp.path())
             .expect("an unreadable session must not fail the store open");
         let list = store.list_sessions().unwrap();
         assert_eq!(list.len(), 2, "both sessions must list");
@@ -6539,7 +6623,7 @@ mod tests {
         // Opening the store adds the cache columns without scoring anyone:
         // the pre-column rows stay at the column default with a NULL
         // watermark until a read scores them.
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         assert_eq!(raw_count_pair(&store, "old-full"), (0, None));
         assert_eq!(raw_count_pair(&store, "old-orphan"), (0, None));
 
@@ -6563,7 +6647,7 @@ mod tests {
         // without moving the watermark pins the refresh to the watermark
         // and not to the list itself.
         {
-            let conn = store.conn.lock();
+            let conn = store.legacy_connection().unwrap();
             conn.execute(
                 "UPDATE acp_sessions SET projected_message_count = 99 WHERE session_uuid = 'old-full'",
                 [],
@@ -6646,7 +6730,7 @@ mod tests {
         drop(conn);
 
         // The open adds the cache columns without scoring anyone.
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         assert_eq!(raw_count_pair(&store, "session-a"), (0, None));
         assert_eq!(raw_count_pair(&store, "session-b"), (0, None));
 
@@ -6725,7 +6809,7 @@ mod tests {
         // Entries: call, fold, orphan duplicate, reused call, fold = 3. The
         // orphan duplicate must not consume the reused call. The open adds
         // the cache columns without scoring anyone; the first list scores.
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         assert_eq!(raw_count_pair(&store, "old-reuse"), (0, None));
         assert_list_matches_projection(&store, "old-reuse", 3);
     }
@@ -6774,7 +6858,7 @@ mod tests {
         // refresh scores the reloaded projection, so the callless parent
         // text and the orphan result must both reload for the scored count
         // to see all three entries.
-        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        let store = LegacyAcpStore::new(tmp.path()).unwrap();
         assert_eq!(raw_count_pair(&store, "old-callless"), (0, None));
         assert_list_matches_projection(&store, "old-callless", 3);
         let data = store.load_session("old-callless").unwrap().unwrap();
@@ -7033,8 +7117,8 @@ mod tests {
             .unwrap();
         // Force the column back to NULL to simulate a pre-migration row.
         store
-            .conn
-            .lock()
+            .legacy_connection()
+            .unwrap()
             .execute(
                 "UPDATE acp_sessions SET trim_breadcrumb = NULL WHERE session_uuid = ?1",
                 params!["sess-legacy-marker"],
@@ -7073,8 +7157,8 @@ mod tests {
             )
             .unwrap();
         store
-            .conn
-            .lock()
+            .legacy_connection()
+            .unwrap()
             .execute(
                 "UPDATE acp_sessions SET trim_breadcrumb = NULL WHERE session_uuid = ?1",
                 params!["sess-legacy-no-marker"],

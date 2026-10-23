@@ -49,6 +49,7 @@ fn mem_none(workspace: &Path) -> Arc<dyn Memory> {
 
 pub(super) fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(text.into()),
         tool_calls: vec![],
         usage: None,
@@ -67,6 +68,7 @@ pub(super) fn tool_call(id: &str, name: &str) -> ToolCall {
 
 pub(super) fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
     ChatResponse {
+        output_blocks: Vec::new(),
         text: Some(String::new()),
         tool_calls: calls,
         usage: None,

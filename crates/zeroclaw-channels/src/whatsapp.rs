@@ -5,13 +5,16 @@ use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    ApprovalPromptOutcome, Channel, ChannelApprovalRequest, ChannelApprovalResponse,
+    ChannelMessage, SendMessage, await_approval_prompt_send,
 };
 
 struct PendingApproval {
-    sender: oneshot::Sender<ChannelApprovalResponse>,
+    registration_id: Uuid,
+    sender: oneshot::Sender<zeroclaw_api::channel::ApprovalReplyResult>,
     alias: String,
     destination: String,
+    audit: crate::util::ApprovalAudit,
 }
 
 type PendingApprovalsMap = Mutex<HashMap<String, PendingApproval>>;
@@ -28,16 +31,18 @@ pub async fn register_pending_approval_for_test(
     token: &str,
     alias: &str,
     destination: &str,
-) -> oneshot::Receiver<ChannelApprovalResponse> {
+) -> oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult> {
     use std::collections::hash_map::Entry;
 
     let (sender, receiver) = oneshot::channel();
     match PENDING_APPROVALS.lock().await.entry(token.to_string()) {
         Entry::Vacant(entry) => {
             entry.insert(PendingApproval {
+                registration_id: Uuid::new_v4(),
                 sender,
                 alias: alias.to_string(),
                 destination: WhatsAppChannel::canonical_approval_destination(destination),
+                audit: crate::util::ApprovalAudit::current(),
             });
         }
         Entry::Occupied(_) => panic!("test approval token must not replace an existing request"),
@@ -48,8 +53,8 @@ pub async fn register_pending_approval_for_test(
 /// Removes a parked approval token when the requesting future goes away.
 ///
 /// `request_approval_attributed` registers a token in [`PENDING_APPROVALS`]
-/// before it does anything else, and the token is a bearer credential for a
-/// tool-call decision. The entry binds that token to its channel alias and
+/// before it does anything else. The token correlates a tool-call decision;
+/// the entry binds that token to its channel alias and
 /// destination, and an entry left behind stays resolvable by that approver for
 /// the lifetime of the process. The map is process-global, so it is not bounded
 /// by a channel instance either.
@@ -72,11 +77,15 @@ pub async fn register_pending_approval_for_test(
 /// disarm safe.
 struct PendingApprovalGuard {
     token: Option<String>,
+    registration_id: Uuid,
 }
 
 impl PendingApprovalGuard {
-    fn new(token: String) -> Self {
-        Self { token: Some(token) }
+    fn new(token: String, registration_id: Uuid) -> Self {
+        Self {
+            token: Some(token),
+            registration_id,
+        }
     }
 
     /// The decision was taken through a normal path; stop guarding.
@@ -98,9 +107,20 @@ impl Drop for PendingApprovalGuard {
         // the decision itself: a reply arriving inside that window still finds a
         // receiver whose sender was dropped with this future, so it cannot be
         // reported as an accepted decision.
+        let registration_id = self.registration_id;
         zeroclaw_spawn::spawn!(async move {
-            PENDING_APPROVALS.lock().await.remove(&token);
+            remove_pending_if_matches(&token, registration_id).await;
         });
+    }
+}
+
+async fn remove_pending_if_matches(token: &str, registration_id: Uuid) {
+    let mut map = PENDING_APPROVALS.lock().await;
+    if map
+        .get(token)
+        .is_some_and(|pending| pending.registration_id == registration_id)
+    {
+        map.remove(token);
     }
 }
 
@@ -118,8 +138,7 @@ impl Drop for PendingApprovalGuard {
 /// this same function rather than a copy of it, so the test covers the
 /// production path.
 async fn remove_pending_and_disarm(token: &str, guard: &mut PendingApprovalGuard) {
-    let mut map = PENDING_APPROVALS.lock().await;
-    map.remove(token);
+    remove_pending_if_matches(token, guard.registration_id).await;
     guard.disarm();
 }
 
@@ -147,25 +166,36 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    let (tx_approval, rx_approval) = oneshot::channel();
+    let (tx_approval, mut rx_approval) = oneshot::channel();
+    let registration_id = Uuid::new_v4();
     {
         let mut map = PENDING_APPROVALS.lock().await;
-        map.insert(
-            token.clone(),
-            PendingApproval {
-                sender: tx_approval,
-                alias: alias.to_string(),
-                destination: WhatsAppChannel::canonical_approval_destination(destination),
-            },
-        );
+        match map.entry(token.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(PendingApproval {
+                    registration_id,
+                    sender: tx_approval,
+                    alias: alias.to_string(),
+                    destination: WhatsAppChannel::canonical_approval_destination(destination),
+                    audit: crate::util::ApprovalAudit::current(),
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                anyhow::bail!("approval token is already registered");
+            }
+        }
     }
     // Armed immediately after registration rather than later, because the send
     // below is the first thing that can leave the function.
-    let mut guard = PendingApprovalGuard::new(token.clone());
+    let mut guard = PendingApprovalGuard::new(token.clone(), registration_id);
 
-    // The `?` here is what orphans a live token: it returns with the entry
-    // already registered, and no cleanup below it runs. The guard covers it.
-    send().await?;
+    match await_approval_prompt_send(send(), &mut rx_approval).await? {
+        ApprovalPromptOutcome::Sent(()) => {}
+        ApprovalPromptOutcome::Replied(response) => {
+            remove_pending_and_disarm(&token, &mut guard).await;
+            return Ok(response);
+        }
+    }
 
     let timeout = std::time::Duration::from_secs(approval_timeout_secs);
     // Only a real token-echo reply is an operator decision; the dropped-sender
@@ -177,7 +207,7 @@ where
             // Nothing awaits between here and the disarm, so there is no
             // cancellation window to cover.
             guard.disarm();
-            zeroclaw_api::channel::AttributedApprovalResponse::operator(response)
+            response?
         }
         Ok(Err(_)) => {
             remove_pending_and_disarm(&token, &mut guard).await;
@@ -311,27 +341,77 @@ impl WhatsAppChannel {
         response: ChannelApprovalResponse,
         responder: &str,
         reply_target: &str,
-    ) -> bool {
+    ) -> anyhow::Result<bool> {
         let responder = Self::canonical_approval_destination(responder);
         let reply_target = Self::canonical_approval_destination(reply_target);
         let mut approvals = PENDING_APPROVALS.lock().await;
         let Some(pending) = approvals.get(token) else {
-            return false;
+            return Ok(false);
         };
-        if pending.alias != self.alias
-            || pending.destination != responder
-            || pending.destination != reply_target
-            || !self.is_number_allowed(&responder)
-        {
-            return true;
+        let rejection = if pending.alias != self.alias {
+            Some(("wrong_alias", serde_json::json!({"alias": self.alias})))
+        } else if pending.destination != responder {
+            Some((
+                "unauthorized_responder",
+                serde_json::json!({"responder": responder}),
+            ))
+        } else if pending.destination != reply_target {
+            Some((
+                "wrong_destination",
+                serde_json::json!({"reply_target": reply_target}),
+            ))
+        } else if !self.is_number_allowed(&responder) {
+            Some((
+                "unauthorized_responder",
+                serde_json::json!({"responder": responder}),
+            ))
+        } else {
+            None
+        };
+        if let Some((classification, evidence)) = rejection {
+            let audit = pending.audit.clone();
+            drop(approvals);
+            audit.record_rejection(classification, evidence).await?;
+            return Ok(true);
+        }
+
+        if pending.sender.is_closed() {
+            let audit = pending.audit.clone();
+            let registration_id = pending.registration_id;
+            drop(approvals);
+            audit
+                .record_rejection(
+                    "receiver_closed",
+                    serde_json::json!({"destination": reply_target}),
+                )
+                .await?;
+            remove_pending_if_matches(token, registration_id).await;
+            return Ok(true);
         }
 
         let Some(pending) = approvals.remove(token) else {
-            return false;
+            return Ok(false);
         };
         drop(approvals);
-        let _ = pending.sender.send(response);
-        true
+        if !pending
+            .audit
+            .deliver_reply(
+                pending.sender,
+                crate::util::approval_reply_actor(self, &responder),
+                response.clone(),
+                serde_json::json!({"destination": reply_target}),
+            )
+            .await?
+        {
+            pending
+                .audit
+                .record_rejection(
+                    "receiver_closed",
+                    serde_json::json!({"destination": reply_target}),
+                )
+                .await?;
+        }
+        Ok(true)
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -3100,11 +3180,15 @@ mod tests {
     const TEST_APPROVAL_ALIAS: &str = "whatsapp_test_alias";
     const TEST_APPROVAL_DESTINATION: &str = "+1234567890";
 
-    fn test_pending_approval(sender: oneshot::Sender<ChannelApprovalResponse>) -> PendingApproval {
+    fn test_pending_approval(
+        sender: oneshot::Sender<zeroclaw_api::channel::ApprovalReplyResult>,
+    ) -> PendingApproval {
         PendingApproval {
+            registration_id: Uuid::new_v4(),
             sender,
             alias: TEST_APPROVAL_ALIAS.to_string(),
             destination: TEST_APPROVAL_DESTINATION.to_string(),
+            audit: crate::util::ApprovalAudit::current(),
         }
     }
 
@@ -3133,14 +3217,19 @@ mod tests {
         token: &str,
     ) -> (
         PendingApprovalGuard,
-        oneshot::Receiver<ChannelApprovalResponse>,
+        oneshot::Receiver<zeroclaw_api::channel::ApprovalReplyResult>,
     ) {
         let (tx, rx) = oneshot::channel();
+        let pending = test_pending_approval(tx);
+        let registration_id = pending.registration_id;
         PENDING_APPROVALS
             .lock()
             .await
-            .insert(token.to_string(), test_pending_approval(tx));
-        (PendingApprovalGuard::new(token.to_string()), rx)
+            .insert(token.to_string(), pending);
+        (
+            PendingApprovalGuard::new(token.to_string(), registration_id),
+            rx,
+        )
     }
 
     /// Wait for the guard's spawned removal rather than assuming it has landed.
@@ -3189,6 +3278,62 @@ mod tests {
 
         assert!(result.is_err(), "a failing send must propagate");
         assert_token_cleared(token).await;
+    }
+
+    #[tokio::test]
+    async fn approval_reply_during_send_preserves_receipt_and_capture_error() {
+        use zeroclaw_api::channel::AttributedApprovalResponse;
+        use zeroclaw_api::session_events::capture::{capture_stopped, is_capture_stopped};
+
+        for capture_fails in [false, true] {
+            for send_pending in [false, true] {
+                let token = format!("early-{capture_fails}-{send_pending}");
+                let reply_id = zeroclaw_api::session_events::EventId::new();
+                let mut reply =
+                    AttributedApprovalResponse::operator(ChannelApprovalResponse::AlwaysApprove)
+                        .with_decider("whatsapp.ops");
+                reply.reply_event_id = Some(reply_id);
+                let expected = reply.clone();
+                let result = tokio::time::timeout(
+                    APPROVAL_CLEANUP_HANG_GUARD,
+                    run_test_approval_lifecycle(token.clone(), 300, || async {
+                        let registration = PENDING_APPROVALS
+                            .lock()
+                            .await
+                            .remove(&token)
+                            .expect("registered before send");
+                        let response = if capture_fails {
+                            Err(capture_stopped(anyhow::Error::new(std::io::Error::other(
+                                "fixture durable reply failure",
+                            ))))
+                        } else {
+                            Ok(reply)
+                        };
+                        registration.sender.send(response).expect("original waiter");
+                        if send_pending {
+                            std::future::pending::<anyhow::Result<()>>().await
+                        } else {
+                            anyhow::bail!("fixture prompt send failure")
+                        }
+                    }),
+                )
+                .await
+                .expect("queued reply ends prompt send");
+                if capture_fails {
+                    let error = result.expect_err("capture failure wins over transport");
+                    assert!(is_capture_stopped(&error));
+                    assert!(
+                        error
+                            .chain()
+                            .any(|source| source.downcast_ref::<std::io::Error>().is_some())
+                    );
+                    assert!(format!("{error:#}").contains("fixture durable reply failure"));
+                } else {
+                    assert_eq!(result.expect("exact operator reply returned"), expected);
+                }
+                assert_token_cleared(&token).await;
+            }
+        }
     }
 
     /// Cancellation is the exit no in-body cleanup can cover, because none of
@@ -3299,7 +3444,11 @@ mod tests {
             .await
             .remove(token)
             .expect("the lifecycle must register before a reply can resolve it");
-        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+        let _ = pending.sender.send(Ok(
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                ChannelApprovalResponse::Approve,
+            ),
+        ));
 
         let attributed = task
             .await
@@ -3348,7 +3497,11 @@ mod tests {
         // The reply handler takes the sender out and resolves the request. The
         // success arm touches no lock, so the lifecycle still completes here.
         let pending = map.remove(token).expect("registered");
-        let _ = pending.sender.send(ChannelApprovalResponse::Approve);
+        let _ = pending.sender.send(Ok(
+            zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                ChannelApprovalResponse::Approve,
+            ),
+        ));
         let _ = task.await.expect("task").expect("lifecycle");
 
         // A later request reuses the same six-character token.
@@ -3437,7 +3590,7 @@ mod tests {
             Arc::new(|| vec!["+1234567890".into()]),
         );
 
-        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let (tx, _rx) = oneshot::channel::<zeroclaw_api::channel::ApprovalReplyResult>();
         {
             let mut map = PENDING_APPROVALS.lock().await;
             map.insert("test_share_tok".to_string(), test_pending_approval(tx));
@@ -3483,7 +3636,8 @@ mod tests {
         assert!(
             wrong_alias
                 .resolve_pending_approval(token, ChannelApprovalResponse::Approve, "+111", "+111",)
-                .await,
+                .await
+                .unwrap(),
             "a known token from the wrong alias must be suppressed"
         );
         assert!(PENDING_APPROVALS.lock().await.contains_key(token));
@@ -3491,7 +3645,8 @@ mod tests {
         assert!(
             correct
                 .resolve_pending_approval(token, ChannelApprovalResponse::Approve, "+222", "+222",)
-                .await,
+                .await
+                .unwrap(),
             "a known token from the wrong destination must be suppressed"
         );
         assert!(PENDING_APPROVALS.lock().await.contains_key(token));
@@ -3500,6 +3655,7 @@ mod tests {
             correct
                 .resolve_pending_approval(token, ChannelApprovalResponse::Approve, "111", "+111",)
                 .await
+                .unwrap()
         );
         let attributed = task.await.expect("task").expect("approval lifecycle");
         assert_eq!(attributed.response, ChannelApprovalResponse::Approve);
@@ -3508,6 +3664,138 @@ mod tests {
             zeroclaw_api::channel::ApprovalSource::Operator
         );
         assert!(!PENDING_APPROVALS.lock().await.contains_key(token));
+    }
+
+    #[tokio::test]
+    async fn approval_audit_errors_propagate_without_consuming_pending_request() {
+        use crate::util::approval_audit_test_support::ApprovalRecorder;
+        use std::sync::atomic::Ordering;
+
+        let token = "cloud-audit-failure";
+        let recorder = Arc::new(ApprovalRecorder::default());
+        let (sender, mut receiver) = oneshot::channel();
+        let mut pending = test_pending_approval(sender);
+        pending.audit = recorder.capture().await;
+        PENDING_APPROVALS.lock().await.insert(token.into(), pending);
+        let channel = make_channel();
+
+        recorder.fail.store(true, Ordering::SeqCst);
+        let error = channel
+            .resolve_pending_approval(
+                token,
+                ChannelApprovalResponse::Approve,
+                "+111",
+                TEST_APPROVAL_DESTINATION,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test_approval_append_failed"));
+        assert!(PENDING_APPROVALS.lock().await.contains_key(token));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        recorder.fail.store(false, Ordering::SeqCst);
+        assert!(
+            channel
+                .resolve_pending_approval(
+                    token,
+                    ChannelApprovalResponse::Approve,
+                    "+111",
+                    TEST_APPROVAL_DESTINATION,
+                )
+                .await
+                .unwrap()
+        );
+        drop(receiver);
+        recorder.fail.store(true, Ordering::SeqCst);
+        assert!(
+            channel
+                .resolve_pending_approval(
+                    token,
+                    ChannelApprovalResponse::Approve,
+                    TEST_APPROVAL_DESTINATION,
+                    TEST_APPROVAL_DESTINATION,
+                )
+                .await
+                .is_err()
+        );
+        assert!(PENDING_APPROVALS.lock().await.contains_key(token));
+        recorder.fail.store(false, Ordering::SeqCst);
+        assert!(
+            channel
+                .resolve_pending_approval(
+                    token,
+                    ChannelApprovalResponse::Approve,
+                    TEST_APPROVAL_DESTINATION,
+                    TEST_APPROVAL_DESTINATION,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(!PENDING_APPROVALS.lock().await.contains_key(token));
+        let records = recorder.records.lock().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, "unauthorized_responder");
+        assert_eq!(records[1].0, "receiver_closed");
+    }
+
+    #[tokio::test]
+    async fn duplicate_token_cannot_replace_an_existing_request() {
+        let token = "cloud-duplicate";
+        let (sender, mut receiver) = oneshot::channel();
+        let pending = test_pending_approval(sender);
+        let registration_id = pending.registration_id;
+        PENDING_APPROVALS.lock().await.insert(token.into(), pending);
+
+        let result = run_test_approval_lifecycle(token.into(), 0, || async {
+            panic!("a duplicate registration must fail before sending a prompt")
+        })
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already registered")
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            PENDING_APPROVALS
+                .lock()
+                .await
+                .get(token)
+                .unwrap()
+                .registration_id,
+            registration_id
+        );
+        PENDING_APPROVALS.lock().await.remove(token);
+    }
+
+    #[tokio::test]
+    async fn stale_guard_cleanup_cannot_remove_a_reused_token() {
+        let token = "cloud-reused-token";
+        let (mut old_guard, old_receiver) = park_guarded_token(token).await;
+        let (sender, _receiver) = oneshot::channel();
+        let pending = test_pending_approval(sender);
+        let current_id = pending.registration_id;
+        PENDING_APPROVALS.lock().await.insert(token.into(), pending);
+        drop(old_receiver);
+
+        remove_pending_and_disarm(token, &mut old_guard).await;
+        assert_eq!(
+            PENDING_APPROVALS
+                .lock()
+                .await
+                .get(token)
+                .unwrap()
+                .registration_id,
+            current_id
+        );
+        PENDING_APPROVALS.lock().await.remove(token);
     }
 
     // ══════════════════════════════════════════════════════════

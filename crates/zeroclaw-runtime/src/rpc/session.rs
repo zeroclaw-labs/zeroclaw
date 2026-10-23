@@ -158,7 +158,7 @@ pub enum DurableSession {
     /// A chat-backend row under this exact storage key (`rpc_<id>`,
     /// `gw_<id>`, or the raw id for channel sessions).
     Chat { key: String },
-    /// A row in the dedicated ACP session store, keyed by the session UUID.
+    /// The ACP family namespace in the standard session repository.
     Acp,
 }
 
@@ -2662,6 +2662,7 @@ mod tests {
             _: Option<f64>,
         ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
             Ok(zeroclaw_providers::ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("stub".into()),
                 tool_calls: vec![],
                 usage: None,

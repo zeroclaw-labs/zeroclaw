@@ -76,6 +76,14 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+// Keep classified protocol details available to capture without exposing child
+// free text through public error formatting, including the full source chain.
+pub(crate) fn protocol_failure<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a crate::dispatch::ProviderProtocolFailure> {
+    error.downcast_ref::<acp::AcpError>()?.protocol_failure()
+}
+
 #[cfg(windows)]
 use process_wrap::tokio::{ChildWrapper, CommandWrap, JobObject, KillOnDrop};
 #[cfg(not(windows))]
@@ -915,7 +923,7 @@ impl GrokCliModelProvider {
         };
         let stderr_drain = StderrDrain::start(stderr);
 
-        let request_result = timeout(
+        let request_result = acp::scope_deadline(
             self.timeout,
             acp::run_oneshot_prompt(
                 &mut stdin,
@@ -938,23 +946,23 @@ impl GrokCliModelProvider {
         let stderr_summary = stderr_drain.finish().await;
 
         match request_result {
-            Ok(Ok(text)) if reaped => Ok(text),
-            Ok(Ok(_)) => {
+            Ok(text) if reaped => Ok(text),
+            Ok(_) => {
                 log_acp_failure("reap", "grok_cli_reap_failed", stderr_summary);
                 Err(anyhow::Error::msg(
                     "Grok Build CLI ACP process could not be reaped after completion",
                 ))
             }
-            Ok(Err(error)) => {
-                log_acp_failure("protocol", error.error_key(), stderr_summary);
-                Err(anyhow::Error::new(error))
-            }
-            Err(_) => {
+            Err(error @ acp::AcpError::Timeout { .. }) => {
                 log_acp_failure("timeout", "grok_cli_timeout", stderr_summary);
-                Err(anyhow::Error::msg(format!(
+                Err(anyhow::Error::new(error).context(format!(
                     "Grok Build CLI ACP request timed out after {}s",
                     self.timeout.as_secs()
                 )))
+            }
+            Err(error) => {
+                log_acp_failure("protocol", error.error_key(), stderr_summary);
+                Err(anyhow::Error::new(error))
             }
         }
     }
@@ -1176,13 +1184,18 @@ impl ModelProvider for GrokCliModelProvider {
         let text = self
             .chat_with_history(request.messages, model, temperature)
             .await?;
-        Ok(ChatResponse {
+        let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(text),
             tool_calls: Vec::new(),
             // ACP one-shot path does not surface reliable token accounting.
             usage: None,
             reasoning_content: None,
-        })
+        };
+        // ACP frames were captured while reading. Mark this projection as
+        // observed so dispatch does not append the final display text again.
+        crate::dispatch::capture::observe_adapter_response(&response, true).await?;
+        Ok(response)
     }
 }
 

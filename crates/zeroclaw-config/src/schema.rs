@@ -117,6 +117,8 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyC
 
 struct RuntimeProxyCachedClient {
     generation: u64,
+    // Pooled connection tasks belong to the runtime that constructed this client.
+    runtime_id: tokio::runtime::Id,
     client: reqwest::Client,
 }
 
@@ -11827,21 +11829,26 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let runtime_id = tokio::runtime::Handle::try_current().ok()?.id();
     let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
         Ok(guard) => guard
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
     }
 }
 
 fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let runtime_id = runtime.id();
     if generation != runtime_proxy_current_generation() {
         return;
     }
@@ -11849,13 +11856,27 @@ fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: r
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
     }
@@ -39701,6 +39722,96 @@ api_token = "tok"
     }
 
     #[test]
+    async fn runtime_proxy_client_cache_is_bound_to_request_runtime() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let _env_guard = env_override_lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP fixture listener");
+        let url = format!(
+            "http://{}/",
+            listener.local_addr().expect("fixture address")
+        );
+        let server = zeroclaw_spawn::spawn!(async move {
+            let mut connection_id = 0;
+            loop {
+                let (socket, _) = listener.accept().await.expect("HTTP fixture connection");
+                let body = connection_id.to_string();
+                connection_id += 1;
+                zeroclaw_spawn::spawn!(async move {
+                    let mut socket = BufReader::new(socket);
+                    let mut line = String::new();
+                    loop {
+                        loop {
+                            line.clear();
+                            if socket.read_line(&mut line).await.expect("request header") == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                        }
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if socket
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let outcome = tokio::task::spawn_blocking(move || {
+            let new_runtime = || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("request runtime")
+            };
+            let first = new_runtime();
+            let second = new_runtime();
+            let service_key = format!("model_provider.runtime_scope.{}", uuid::Uuid::new_v4());
+            let request = |runtime: &tokio::runtime::Runtime| {
+                runtime.block_on(async {
+                    build_runtime_proxy_client_with_timeouts(&service_key, 5, 5)
+                        .get(&url)
+                        .send()
+                        .await
+                        .expect("request must use a live runtime")
+                        .text()
+                        .await
+                        .expect("connection identity")
+                })
+            };
+            assert_eq!(request(&first), "0");
+            assert_eq!(request(&first), "0", "same-runtime pooling must remain");
+            assert_eq!(
+                request(&second),
+                "1",
+                "another runtime cannot borrow the first runtime's connection"
+            );
+            drop(first);
+            assert_eq!(
+                request(&second),
+                "1",
+                "the second runtime's pool must survive the first runtime's shutdown"
+            );
+        })
+        .await;
+        server.abort();
+        assert!(server.await.expect_err("fixture is stopped").is_cancelled());
+        outcome.expect("cross-runtime requests must succeed");
+    }
+
+    #[test]
     async fn environment_proxy_detection_respects_scheme_and_no_proxy() {
         let values = HashMap::from([
             ("HTTP_PROXY", "http://http-proxy.example:3128"),
@@ -39805,6 +39916,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -39815,6 +39927,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );

@@ -182,20 +182,35 @@ runtime_profile = "default"
             .is_some_and(|text| text.ends_with("next text-only turn")),
         "the third request must be the next user turn, not another recovery attempt"
     );
-    let saved: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&session_file).expect("saved CLI session"))
-            .expect("session JSON");
+    let lease = zeroclaw_infra::session_events::cli_state::CliStateGuard::acquire(&session_file)
+        .expect("native CLI binding");
+    let binding = lease.binding().expect("published native family").clone();
+    drop(lease);
+    let mut config = zeroclaw_config::schema::Config::default();
+    config.agents.insert(
+        "default".into(),
+        zeroclaw_config::schema::AliasedAgentConfig::default(),
+    );
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
+    let session = zeroclaw::session_events::open_cli_session(
+        &binding.data_dir,
+        "sqlite",
+        "default",
+        authority.execution_capability(),
+        Some(&session_file),
+    )
+    .await
+    .expect("reopen canonical CLI history");
+    let saved = session
+        .restore_context()
+        .await
+        .expect("restore history")
+        .expect("canonical context");
     assert!(
-        saved["history"]
-            .as_array()
-            .expect("saved history")
+        saved
+            .chat_projection()
             .iter()
-            .any(|message| {
-                message["role"] == "user"
-                    && message["content"]
-                        .as_str()
-                        .is_some_and(|text| text.contains(&image_marker))
-            }),
+            .any(|message| { message.role == "user" && message.content.contains(&image_marker) }),
         "provider-only omission must preserve the original image in canonical session history"
     );
     eprintln!("CLI evidence (locale=en; request image counts={image_counts:?}):\n{stdout}");

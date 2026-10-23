@@ -8,8 +8,8 @@ each get their own top-level directory.
 ```text
 <install>/
 ├── data/                         — instance-wide state (not per-agent)
-│   ├── sessions/                 — chat session stores
-│   │   └── sessions.db, acp-sessions.db
+│   ├── sessions/                 — standard session events and archived legacy sources
+│   │   └── session-format.json, session-events.db or session-events-jsonl/, *.backup
 │   ├── state/                    — runtime state
 │   │   └── costs.jsonl, runtime-trace.jsonl
 │   ├── devices.db                — paired-device metadata

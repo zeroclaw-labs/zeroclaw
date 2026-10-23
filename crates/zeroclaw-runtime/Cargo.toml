@@ -10,8 +10,10 @@ publish = true
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-kernel.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
+zeroclaw-session-host.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tls.workspace = true
 zeroclaw-relay-proto.workspace = true
@@ -145,9 +147,10 @@ sandbox-bubblewrap = []
 # zeroclaw-channels and zeroclaw-gateway). Off by default and never enabled by
 # any production dependency edge, so these helpers are absent from shipped
 # builds.
-test-util = []
+test-util = ["zeroclaw-infra/test-util"]
 
 [dev-dependencies]
+zeroclaw-infra = { workspace = true, features = ["test-util"] }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs"] }
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

@@ -329,6 +329,18 @@ impl RpcOutbound {
         self.writer_tx.send(json).await.is_ok()
     }
 
+    /// Await transport capacity before checking a live authorization resolver.
+    pub async fn send_raw_if(&self, json: String, authorized: impl FnOnce() -> bool) -> bool {
+        let Ok(permit) = self.writer_tx.reserve().await else {
+            return false;
+        };
+        if !authorized() {
+            return false;
+        }
+        permit.send(json);
+        true
+    }
+
     /// Resolve when the writer end is closed (peer dropped). Useful for
     /// long-lived forwarders that need to exit on disconnect even when
     /// there is no payload to send.
@@ -352,7 +364,7 @@ impl RpcOutbound {
     ) -> std::result::Result<Value, JsonRpcError> {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = format!("{OUTBOUND_ID_PREFIX}{n}");
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             pending.insert(id.clone(), tx);
@@ -379,13 +391,24 @@ impl RpcOutbound {
                 data: None,
             });
         }
-        rx.await.unwrap_or_else(|_| {
-            Err(JsonRpcError {
-                code: error_codes::INTERNAL_ERROR,
-                message: "Outbound RPC dropped".to_string(),
-                data: None,
-            })
-        })
+        tokio::select! {
+            biased;
+            response = &mut rx => response.unwrap_or_else(|_| {
+                Err(JsonRpcError {
+                    code: error_codes::INTERNAL_ERROR,
+                    message: "Outbound RPC dropped".to_string(),
+                    data: None,
+                })
+            }),
+            () = self.writer_tx.closed() => {
+                // A response queued alongside disconnect is still valid.
+                rx.try_recv().unwrap_or_else(|_| Err(JsonRpcError {
+                    code: error_codes::INTERNAL_ERROR,
+                    message: "Writer task closed".to_string(),
+                    data: None,
+                }))
+            }
+        }
     }
 
     /// Route an already validated JSON-RPC response to its pending caller.
@@ -611,6 +634,85 @@ pub struct FsStatError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn outbound_request_disconnect_settles_and_clears_pending() {
+        let (writer, mut wire) = mpsc::channel(1);
+        let rpc = RpcOutbound::new(writer);
+        let mut request = Box::pin(rpc.request("elicitation/create", json!({"message":"Choose"})));
+        let frame = tokio::select! {
+            frame = wire.recv() => frame.expect("request sent"),
+            result = &mut request => panic!("request ended before a response: {result:?}"),
+        };
+        let frame: JsonRpcRequest = serde_json::from_str(&frame).expect("request frame");
+        assert_eq!(frame.method, "elicitation/create");
+        assert_eq!(rpc.pending_count(), 1);
+        drop(wire);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), &mut request)
+            .await
+            .expect("disconnect returns without the caller's question timeout")
+            .expect_err("closed writer is a transport failure");
+        assert_eq!(error.code, error_codes::INTERNAL_ERROR);
+        assert_eq!(error.message, "Writer task closed");
+        assert_eq!(rpc.pending_count(), 0);
+        assert!(
+            !rpc.dispatch_validated_response(
+                frame
+                    .id
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .expect("request ID"),
+                Ok(json!({"action":"accept"})),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_request_prefers_queued_response_over_writer_close() {
+        for rejected in [false, true] {
+            let (writer, mut wire) = mpsc::channel(1);
+            let rpc = RpcOutbound::new(writer);
+            let mut request = Box::pin(rpc.request("elicitation/create", json!({})));
+            let frame = tokio::select! {
+                frame = wire.recv() => frame.expect("request sent"),
+                result = &mut request => panic!("request ended before a response: {result:?}"),
+            };
+            let frame: JsonRpcRequest = serde_json::from_str(&frame).expect("request frame");
+            let response = if rejected {
+                Err(JsonRpcError {
+                    code: error_codes::INVALID_PARAMS,
+                    message: "fixture response error".into(),
+                    data: Some(json!({"field":"requestedSchema"})),
+                })
+            } else {
+                Ok(json!({"action":"accept","content":{"choice":"A"}}))
+            };
+            assert!(
+                rpc.dispatch_validated_response(
+                    frame
+                        .id
+                        .as_ref()
+                        .and_then(Value::as_str)
+                        .expect("request ID"),
+                    response,
+                )
+            );
+            drop(wire);
+            let result = request.await;
+            if rejected {
+                let error = result.expect_err("queued peer error wins");
+                assert_eq!(error.code, error_codes::INVALID_PARAMS);
+                assert_eq!(error.message, "fixture response error");
+                assert_eq!(error.data, Some(json!({"field":"requestedSchema"})));
+            } else {
+                assert_eq!(
+                    result.expect("queued reply wins"),
+                    json!({"action":"accept","content":{"choice":"A"}})
+                );
+            }
+            assert_eq!(rpc.pending_count(), 0);
+        }
+    }
 
     #[test]
     fn frame_parses_success_response() {

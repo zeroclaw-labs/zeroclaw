@@ -11,7 +11,8 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    ApprovalPromptOutcome, Channel, ChannelApprovalRequest, ChannelApprovalResponse,
+    ChannelMessage, SendMessage, await_approval_prompt_send,
 };
 
 const GROUP_TARGET_PREFIX: &str = "group:";
@@ -251,19 +252,21 @@ impl SignalChannel {
     async fn resolve_approval_reply(
         &self,
         message: &ChannelMessage,
-    ) -> Option<crate::util::PendingApprovalResolution> {
-        let (token, response) = crate::util::parse_approval_reply(&message.content)?;
+    ) -> anyhow::Result<Option<crate::util::PendingApprovalResolution>> {
+        let Some((token, response)) = crate::util::parse_approval_reply(&message.content) else {
+            return Ok(None);
+        };
         let destination = Self::canonical_destination(&message.reply_target);
-        Some(
+        Ok(Some(
             crate::util::resolve_pending_approval(
                 &self.pending_approvals,
                 &token,
-                response,
+                crate::util::ApprovalReply::authenticated(response, self, &message.sender),
                 self.is_sender_allowed(&message.sender),
                 &destination,
             )
-            .await,
-        )
+            .await?,
+        ))
     }
 
     fn build_reaction_params(
@@ -551,6 +554,47 @@ impl SignalChannel {
             })
             .collect()
     }
+    async fn process_incoming_envelope(
+        &self,
+        envelope: &Envelope,
+    ) -> anyhow::Result<Vec<ChannelMessage>> {
+        // Audit known approval replies before the sender filter drops them.
+        if !(self.ignore_stories && envelope.story_message.is_some())
+            && let Some(data) = envelope.data_message.as_ref()
+            && data.poll_answer.is_none()
+            && data.poll_vote.is_none()
+            && let Some(sender) = Self::sender(envelope)
+            && !self.is_sender_allowed(&sender)
+        {
+            if let Some((token, response)) = data
+                .message
+                .as_deref()
+                .and_then(crate::util::parse_approval_reply)
+            {
+                crate::util::resolve_pending_approval(
+                    &self.pending_approvals,
+                    &token,
+                    crate::util::ApprovalReply::authenticated(response, self, &sender),
+                    false,
+                    &Self::canonical_destination(&self.reply_target(data, &sender)),
+                )
+                .await?;
+            }
+            return Ok(Vec::new());
+        }
+
+        let mut messages = Vec::new();
+        for message in self.process_envelope(envelope) {
+            if let Some(resolution) = self.resolve_approval_reply(&message).await?
+                && !matches!(resolution, crate::util::PendingApprovalResolution::NotFound)
+            {
+                continue;
+            }
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
     fn random_id_suffix() -> String {
         use rand::RngExt;
         const CHARSET: &[u8] = b"0123456789abcdef";
@@ -801,26 +845,10 @@ impl Channel for SignalChannel {
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
                                     if let Some(ref envelope) = sse.envelope {
-                                        let mut consumed_as_approval = false;
-                                        let messages = self.process_envelope(envelope);
-                                        for msg in messages {
-                                            if let Some(resolution) =
-                                                self.resolve_approval_reply(&msg).await
-                                                && !matches!(
-                                                    resolution,
-                                                    crate::util::PendingApprovalResolution::NotFound
-                                                )
-                                            {
-                                                consumed_as_approval = true;
-                                                continue;
-                                            }
+                                        for msg in self.process_incoming_envelope(envelope).await? {
                                             if tx.send(msg).await.is_err() {
                                                 return Ok(());
                                             }
-                                        }
-                                        if consumed_as_approval {
-                                            current_data.clear();
-                                            continue;
                                         }
                                     }
                                 }
@@ -854,16 +882,10 @@ impl Channel for SignalChannel {
                 match serde_json::from_str::<SseEnvelope>(&current_data) {
                     Ok(sse) => {
                         if let Some(ref envelope) = sse.envelope {
-                            for msg in self.process_envelope(envelope) {
-                                if let Some(resolution) = self.resolve_approval_reply(&msg).await
-                                    && !matches!(
-                                        resolution,
-                                        crate::util::PendingApprovalResolution::NotFound
-                                    )
-                                {
-                                    continue;
+                            for msg in self.process_incoming_envelope(envelope).await? {
+                                if tx.send(msg).await.is_err() {
+                                    return Ok(());
                                 }
-                                let _ = tx.send(msg).await;
                             }
                         }
                     }
@@ -973,23 +995,30 @@ impl Channel for SignalChannel {
             request.position_counter(),
         );
 
-        let (tx, rx) = oneshot::channel();
-        self.pending_approvals.lock().await.insert(
-            token.clone(),
-            crate::util::PendingApproval {
-                sender: tx,
-                destination: Self::canonical_destination(recipient),
-                tool_name: request.tool_name.clone(),
-            },
-        );
-        let mut guard = crate::util::PendingApprovalGuard::new(
+        let (tx, mut rx) = oneshot::channel();
+        let mut guard = crate::util::register_pending_approval(
             Arc::clone(&self.pending_approvals),
             token.clone(),
-        );
+            tx,
+            Self::canonical_destination(recipient),
+            request.tool_name.clone(),
+        )
+        .await?;
 
-        if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
-            guard.remove().await;
-            return Err(err);
+        let prompt = SendMessage::new(text, recipient);
+        match await_approval_prompt_send(self.send(&prompt), &mut rx).await {
+            Ok(ApprovalPromptOutcome::Sent(())) => {}
+            Ok(ApprovalPromptOutcome::Replied(response)) => {
+                guard.remove().await;
+                return Ok(Some(response));
+            }
+            Err(err) if zeroclaw_api::session_events::capture::is_capture_stopped(&err) => {
+                return Err(err);
+            }
+            Err(err) => {
+                guard.remove().await;
+                return Err(err);
+            }
         }
 
         // Only a real token-echo reply is an operator decision; the
@@ -998,7 +1027,7 @@ impl Channel for SignalChannel {
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(resp)) => {
                     guard.disarm();
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                    resp?
                 }
                 Ok(Err(_)) => {
                     guard.remove().await;
@@ -1052,6 +1081,66 @@ mod tests {
             false,
             false,
         )
+    }
+
+    #[tokio::test]
+    async fn approval_capture_failure_during_prompt_send_does_not_wait_for_cleanup_lock() {
+        use zeroclaw_api::session_events::capture::{capture_stopped, is_capture_stopped};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let mut channel = make_channel();
+        channel.http_url = format!("http://{}", listener.local_addr().expect("address"));
+        let pending = Arc::clone(&channel.pending_approvals);
+        let mut waiter = zeroclaw_spawn::spawn!(async move {
+            channel
+                .request_approval_attributed(
+                    "+1111111111",
+                    &ChannelApprovalRequest {
+                        tool_name: "shell".into(),
+                        arguments_summary: "fixture".into(),
+                        raw_arguments: None,
+                        position: None,
+                    },
+                )
+                .await
+        });
+        let mut held = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let registrations = pending.lock().await;
+                if !registrations.is_empty() {
+                    break registrations;
+                }
+                drop(registrations);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approval registered before send");
+        let token = held.keys().next().expect("pending token").clone();
+        held.remove(&token)
+            .expect("pending registration")
+            .sender
+            .send(Err(capture_stopped(anyhow::Error::msg(
+                "fixture capture failure under cleanup contention",
+            ))))
+            .expect("original reply waiter");
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut waiter).await;
+        if result.is_err() {
+            waiter.abort();
+            drop(held);
+            let _ = waiter.await;
+            panic!("captured failure waited on the cleanup lock");
+        }
+        let error = result
+            .expect("capture failure returns while registry lock is held")
+            .expect("waiter task")
+            .expect_err("durable failure propagates");
+        assert!(is_capture_stopped(&error));
+        assert!(format!("{error:#}").contains("fixture capture failure"));
+        drop(held);
+        drop(listener);
     }
 
     #[test]
@@ -1996,6 +2085,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_ingress_audits_unauthorized_approvals_and_propagates_storage_errors() {
+        use crate::util::approval_audit_test_support::ApprovalRecorder;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for trailing in [false, true] {
+            for fail in [false, true] {
+                let server = MockServer::start().await;
+                let event = |token: &str| {
+                    serde_json::json!({"envelope": {
+                        "sourceNumber": "+2222222222",
+                        "dataMessage": {"message": format!("{token} deny"), "timestamp": 1_700_000_000_000u64}
+                    }})
+                };
+                let suffix = if trailing { "\n" } else { "\n\n" };
+                let body = format!(
+                    "data: {}\n\ndata: {}{suffix}",
+                    event("absent"),
+                    event("abc123")
+                );
+                Mock::given(method("GET"))
+                    .and(path("/api/v1/events"))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"),
+                    )
+                    .mount(&server)
+                    .await;
+                let mut channel = make_channel();
+                channel.http_url = server.uri();
+                let recorder = Arc::new(ApprovalRecorder::default());
+                recorder
+                    .fail
+                    .store(fail, std::sync::atomic::Ordering::SeqCst);
+                let (approval_tx, mut approval_rx) = oneshot::channel();
+                channel.pending_approvals.lock().await.insert(
+                    "abc123".into(),
+                    crate::util::PendingApproval {
+                        registration_id: uuid::Uuid::new_v4(),
+                        audit: recorder.capture().await,
+                        sender: approval_tx,
+                        destination: "+1111111111".into(),
+                        tool_name: "shell".into(),
+                    },
+                );
+                let pending = Arc::clone(&channel.pending_approvals);
+                let (tx, mut inbound_rx) = mpsc::channel(4);
+                let mut listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+                if fail {
+                    let result =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), &mut listener)
+                            .await;
+                    if result.is_err() {
+                        listener.abort();
+                        let _ = listener.await;
+                        panic!("SSE ingress must return the approval storage failure");
+                    }
+                    let error = result.unwrap().unwrap().unwrap_err();
+                    assert!(error.to_string().contains("test_approval_append_failed"));
+                } else {
+                    let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while recorder.records.lock().unwrap().is_empty() {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await;
+                    listener.abort();
+                    let _ = listener.await;
+                    observed.expect("the real SSE ingress must audit the denied approval");
+                    let records = recorder.records.lock().unwrap();
+                    assert_eq!(records.len(), 1, "unknown token must not create an event");
+                    assert_eq!(records[0].0, "unauthorized_responder");
+                    assert_eq!(records[0].1["responder_allowed"], false);
+                }
+                assert!(inbound_rx.try_recv().is_err());
+                assert!(pending.lock().await.contains_key("abc123"));
+                assert!(matches!(
+                    approval_rx.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn pending_approval_oneshot_delivers_response() {
         let dm_only = false;
         let ignore_attachments = false;
@@ -2014,6 +2187,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "abc123".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "+1111111111".to_string(),
                 tool_name: "tool".to_string(),
@@ -2026,9 +2201,13 @@ mod tests {
             true,
             "+1111111111",
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(resolution, crate::util::PendingApprovalResolution::Resolved);
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     #[tokio::test]
@@ -2042,6 +2221,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "abc123".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: approval_tx,
                 destination: "group:other-group".to_string(),
                 tool_name: "tool".to_string(),
@@ -2049,7 +2230,7 @@ mod tests {
         );
         let msg = ch.process_envelope(&group_envelope).pop().unwrap();
         assert_eq!(
-            ch.resolve_approval_reply(&msg).await,
+            ch.resolve_approval_reply(&msg).await.unwrap(),
             Some(crate::util::PendingApprovalResolution::Rejected)
         );
         assert!(ch.pending_approvals.lock().await.contains_key("abc123"));
@@ -2065,12 +2246,15 @@ mod tests {
         });
         let right_msg = ch.process_envelope(&right_envelope).pop().unwrap();
         assert_eq!(
-            ch.resolve_approval_reply(&right_msg).await,
+            ch.resolve_approval_reply(&right_msg).await.unwrap(),
             Some(crate::util::PendingApprovalResolution::Resolved)
         );
-        assert_eq!(approval_rx.await.unwrap(), ChannelApprovalResponse::Approve);
         assert_eq!(
-            ch.resolve_approval_reply(&right_msg).await,
+            approval_rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
+        assert_eq!(
+            ch.resolve_approval_reply(&right_msg).await.unwrap(),
             Some(crate::util::PendingApprovalResolution::NotFound)
         );
     }
@@ -2082,6 +2266,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "direct".to_string(),
             crate::util::PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
+                audit: crate::util::ApprovalAudit::current(),
                 sender: tx,
                 destination: "+1111111111".to_string(),
                 tool_name: "tool".to_string(),
@@ -2090,10 +2276,13 @@ mod tests {
         let envelope = make_envelope(Some("+1111111111"), Some("direct yes"));
         let msg = ch.process_envelope(&envelope).pop().unwrap();
         assert_eq!(
-            ch.resolve_approval_reply(&msg).await,
+            ch.resolve_approval_reply(&msg).await.unwrap(),
             Some(crate::util::PendingApprovalResolution::Resolved)
         );
-        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            rx.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
     }
 
     fn make_reaction_channel() -> SignalChannel {

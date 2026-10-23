@@ -178,6 +178,10 @@ pub struct TokenUsage {
 /// An LLM response that may contain text, tool calls, or both.
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
+    /// Original ordered, adapter-classified protocol content. This creates
+    /// the order/media fact absent from the legacy text/tool projections.
+    /// Empty means the adapter only supplied the legacy projections.
+    pub output_blocks: Vec<ProviderOutputBlock>,
     /// Text content of the response (may be empty if only tool calls).
     pub text: Option<String>,
     /// Tool calls requested by the LLM.
@@ -189,6 +193,53 @@ pub struct ChatResponse {
     /// sent back in subsequent API requests — some model_providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
+}
+
+/// Adapter-classified output content, excluding HTTP/authentication metadata.
+/// These blocks preserve bytes and references without fetching remote media.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderOutputBlock {
+    /// Adapter-observed protocol evidence; this is not conversation content.
+    /// `provider_item` and `content_metadata` retain supplemental fields with
+    /// an output/content position or call identity. Normalized bodies have
+    /// their own blocks and are never copied into that evidence.
+    ProtocolMetadata {
+        metadata: serde_json::Value,
+    },
+    Text {
+        text: String,
+    },
+    Reasoning {
+        representation: String,
+        bytes: Vec<u8>,
+        replay_requirement: String,
+    },
+    ToolCall {
+        call: ToolCall,
+    },
+    Media {
+        media_type: String,
+        format: Option<String>,
+        source: ProviderMediaSource,
+    },
+    /// Content fields classified by the adapter, never a full HTTP object.
+    Other {
+        type_name: String,
+        content: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderMediaSource {
+    Bytes {
+        bytes: Vec<u8>,
+    },
+    Reference {
+        locator: String,
+        expires_at: Option<i64>,
+    },
 }
 
 /// A transport-successful provider result that cannot complete a request.
@@ -225,7 +276,13 @@ impl ChatResponse {
     /// A response containing one or more tool calls remains valid even when
     /// its text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+        strip_think_tags(self.text_or_empty()).is_empty()
+            && self.tool_calls.is_empty()
+            && !self.output_blocks.iter().any(|block| match block {
+                ProviderOutputBlock::Media { .. } | ProviderOutputBlock::ToolCall { .. } => true,
+                ProviderOutputBlock::Text { text } => !strip_think_tags(text).is_empty(),
+                _ => false,
+            })
     }
 }
 
@@ -254,7 +311,8 @@ pub fn strip_think_tags(text: &str) -> String {
 }
 
 /// Requested tool-call cadence for one provider response.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolRoundPolicy {
     #[default]
     Batch,
@@ -426,6 +484,12 @@ impl StreamChunk {
 /// agent loops can preserve native tool semantics without parsing payload text.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// Protocol position of the immediately following semantic segment.
+    /// Offsets refer to the original content observed by capture.
+    ContentPosition(ProviderContentPosition),
+    /// A complete non-text/opaque content block. Text and tool
+    /// deltas retain their existing streaming variants; this is never flattened.
+    OutputBlock(ProviderOutputBlock),
     /// Text delta from the assistant.
     TextDelta(StreamChunk),
     /// Transient, human-readable thinking progress. Surfaced to the user
@@ -441,14 +505,33 @@ pub enum StreamEvent {
     ToolCall(ToolCall),
     /// A tool call that was already executed by the model_provider (e.g. Claude Code proxy).
     /// Emitted for observability only — not re-executed by the agent's dispatcher.
-    PreExecutedToolCall { name: String, args: String },
+    PreExecutedToolCall {
+        /// Actual provider identity; absence must not be replaced by a name.
+        provider_call_id: Option<String>,
+        name: String,
+        args: String,
+    },
     /// The result of a pre-executed tool call.
-    PreExecutedToolResult { name: String, output: String },
+    PreExecutedToolResult {
+        provider_call_id: Option<String>,
+        name: String,
+        output: String,
+    },
     /// Token usage reported by the provider, typically just before [`StreamEvent::Final`].
     /// Providers that do not surface usage in streaming responses simply omit this event.
     Usage(TokenUsage),
+    /// Adapter-classified protocol evidence, separate from message content.
+    /// Authentication headers and credentials must never enter this value.
+    ProtocolMetadata(serde_json::Value),
     /// Stream has completed.
     Final,
+}
+
+/// Native protocol coordinates, distinct from final response array indices.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProviderContentPosition {
+    pub output_index: u64,
+    pub content_index: Option<u64>,
 }
 
 impl StreamEvent {
@@ -536,6 +619,14 @@ pub enum StreamError {
     #[error("HTTP error: {0}")]
     ConnectFailed(String),
 
+    /// The transport observed a response/read deadline after dispatch.
+    #[error("HTTP error: {0}")]
+    ResponseTimeout(String),
+
+    /// EOF arrived without the adapter's required terminal protocol signal.
+    #[error("SSE stream closed before {0}: response truncated")]
+    MissingFinal(String),
+
     #[error("JSON parse error: {0}")]
     Json(serde_json::Error),
 
@@ -544,6 +635,11 @@ pub enum StreamError {
 
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
+
+    /// An explicit provider error frame. Preserve the classified cause and
+    /// codes while leaving retry policy with the dispatch owner.
+    #[error("ModelProvider error: {0}")]
+    ProtocolFailure(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
     /// A provider returned a non-success HTTP response before streaming began.
     #[error("ModelProvider HTTP {status}: {message}")]
@@ -561,6 +657,11 @@ pub enum StreamError {
     /// for the typed terminal cause beneath it.
     #[error("terminal provider error: {0}")]
     Terminal(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    /// Durable observation failed or the physical attempt became uncertain.
+    /// This is an execution fence, not exhausted provider retry policy.
+    #[error("session capture stopped: {0}")]
+    CaptureStopped(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -670,6 +771,18 @@ pub struct ModelInfo {
 
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
+    /// Configured dispatch identity. A decorator's logging attribution may
+    /// describe its inner provider; its requested route remains its own alias.
+    fn dispatch_reference(&self) -> &str {
+        self.alias()
+    }
+
+    /// A composition node dispatches its physical work through child
+    /// ProviderDispatch boundaries. Capture admission belongs to those leaves.
+    fn is_dispatch_composite(&self) -> bool {
+        false
+    }
+
     /// Whether repeated requests for `model` are dispatched to one stable
     /// provider/model identity.
     ///
@@ -895,6 +1008,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
                 .chat_with_history(&modified_messages, model, temperature)
                 .await?;
             let response = ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(text),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -909,6 +1023,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             .chat_with_history(request.messages, model, temperature)
             .await?;
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
@@ -945,6 +1060,7 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     ) -> anyhow::Result<ChatResponse> {
         let text = self.chat_with_history(messages, model, temperature).await?;
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some(text),
             tool_calls: Vec::new(),
             usage: None,
@@ -1050,6 +1166,14 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
             options,
             policy,
         )
+    }
+
+    fn dispatch_reference(&self) -> &str {
+        self.as_ref().dispatch_reference()
+    }
+
+    fn is_dispatch_composite(&self) -> bool {
+        self.as_ref().is_dispatch_composite()
     }
 
     fn has_stable_request_identity(&self, model: &str) -> bool {
@@ -1296,11 +1420,43 @@ mod capability_tests {
 
 #[cfg(test)]
 mod turn_order_tests {
-    use super::{ChatMessage, ChatResponse, ToolCall};
+    use super::{ChatMessage, ChatResponse, ProviderMediaSource, ProviderOutputBlock, ToolCall};
+
+    #[test]
+    fn structured_output_obeys_terminal_content_semantics() {
+        let mut response = ChatResponse {
+            text: None,
+            output_blocks: Vec::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+        for text in [
+            " \n\t",
+            "<think>private reasoning</think> ",
+            "<think>unfinished",
+        ] {
+            response.output_blocks = vec![ProviderOutputBlock::Text { text: text.into() }];
+            assert!(response.is_semantically_empty_terminal(), "{text}");
+        }
+        response.output_blocks = vec![ProviderOutputBlock::Text {
+            text: "answer".into(),
+        }];
+        assert!(!response.is_semantically_empty_terminal());
+        response.output_blocks = vec![ProviderOutputBlock::Media {
+            media_type: "image".into(),
+            format: Some("image/png".into()),
+            source: ProviderMediaSource::Bytes {
+                bytes: vec![1, 2, 3],
+            },
+        }];
+        assert!(!response.is_semantically_empty_terminal());
+    }
 
     #[test]
     fn semantic_empty_terminal_ignores_reasoning_content() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("  \n".to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -1313,6 +1469,7 @@ mod turn_order_tests {
     #[test]
     fn semantic_empty_terminal_uses_display_text_after_think_tag_stripping() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("<think>internal reasoning</think>".to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -1325,6 +1482,7 @@ mod turn_order_tests {
     #[test]
     fn semantic_empty_terminal_keeps_tool_only_response_valid() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
@@ -1342,6 +1500,7 @@ mod turn_order_tests {
     #[test]
     fn text_response_is_not_semantically_empty() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: Some("done".to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -1354,6 +1513,7 @@ mod turn_order_tests {
     #[test]
     fn tool_only_response_is_not_semantically_empty() {
         let response = ChatResponse {
+            output_blocks: Vec::new(),
             text: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),

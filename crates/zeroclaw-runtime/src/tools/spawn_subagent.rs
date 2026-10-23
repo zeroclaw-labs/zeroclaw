@@ -275,14 +275,30 @@ impl Tool for SpawnSubagentTool {
                 .await;
         }
 
-        let run_result = Box::pin(scope!(
+        let child = if let Some(parent) =
+            zeroclaw_api::session_events::capture::current_provider_admission()
+        {
+            parent
+                .begin_child(zeroclaw_api::session_events::capture::ChildDispatchIntent {
+                    relation: "spawn_subagent".into(),
+                    target_agent: self.parent_alias.clone(),
+                    prompt: prompt.clone(),
+                    execution_mode: zeroclaw_api::session_events::ChildExecutionMode::Sync,
+                    task_id: Some(cp_task_id.clone()),
+                })
+                .await
+                .map(Some)
+        } else {
+            Ok(None)
+        };
+        let engine = Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,
             =>
             crate::agent::run(
                 (*config).clone(),
                 &self.parent_alias,
-                Some(prompt),
+                Some(prompt.clone()),
                 None,
                 None,
                 temperature,
@@ -293,8 +309,13 @@ impl Tool for SpawnSubagentTool {
                 zeroclaw_api::ingress::TurnOrigin::SubTurn,
                 run_overrides,
             )
-        ))
-        .await;
+        ));
+
+        let run_result = match child {
+            Ok(Some(child)) => child.execute(engine).await,
+            Ok(None) => engine.await,
+            Err(error) => Err(error),
+        };
 
         // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
         if let Some(cp) = crate::control_plane::control_plane() {
@@ -326,6 +347,16 @@ impl Tool for SpawnSubagentTool {
                 },
                 error: None,
             }),
+            Err(error)
+                if zeroclaw_api::session_events::capture::is_capture_stopped(&error)
+                    || error.chain().any(|source| {
+                        source.is::<zeroclaw_kernel::session::SessionError>()
+                            || source.is::<zeroclaw_api::session_events::AppendError>()
+                            || source.is::<zeroclaw_api::session_events::ReadError>()
+                    }) =>
+            {
+                Err(error)
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -353,6 +384,309 @@ mod tests {
             },
         );
         config
+    }
+
+    #[tokio::test]
+    async fn native_subagent_capture_failure_stops_parent_without_fabricated_tool_failure() {
+        use crate::agent::dispatcher::NativeToolDispatcher;
+        use crate::live_config_authority::{AgentHistoryAuthority, LiveConfigAuthority};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_api::ingress::{IngressContext, TurnOrigin};
+        use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
+        use zeroclaw_api::session_events::capture::*;
+        use zeroclaw_api::session_events::*;
+        use zeroclaw_kernel::session::engine::EngineSessionSource;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Failure {
+            Capture,
+            Session,
+            Append,
+            Read,
+            Business,
+        }
+        impl Failure {
+            fn error(self) -> anyhow::Error {
+                let detail = "injected_subagent_history_failure".to_string();
+                let error: anyhow::Error = match self {
+                    Self::Capture => capture_stopped(anyhow::Error::msg(detail)),
+                    Self::Session => {
+                        zeroclaw_kernel::session::SessionError::StoreUnhealthy(detail).into()
+                    }
+                    Self::Append => AppendError::StorageUnavailable(detail).into(),
+                    Self::Read => ReadError::StorageUnavailable(detail).into(),
+                    Self::Business => anyhow::Error::msg("ordinary_subagent_failure"),
+                };
+                error.context("subagent failure boundary")
+            }
+        }
+
+        struct FailingChild(Failure);
+        #[async_trait]
+        impl ChildExecutionPort for FailingChild {
+            async fn execute(&self, _engine: EngineTurnFuture<'_>) -> Result<String> {
+                Err(self.0.error())
+            }
+        }
+        struct FaultBoundary {
+            inner: Arc<dyn ProviderAdmissionPort>,
+            failure: Failure,
+            at_begin: bool,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl ProviderAdmissionPort for FaultBoundary {
+            async fn admit(
+                &self,
+                intent: ProviderDispatchIntent,
+            ) -> Result<Arc<dyn ProviderObservationPort>> {
+                self.inner.admit(intent).await
+            }
+            async fn begin_child(
+                &self,
+                _intent: ChildDispatchIntent,
+            ) -> Result<Arc<dyn ChildExecutionPort>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.at_begin {
+                    Err(self.failure.error())
+                } else {
+                    Ok(Arc::new(FailingChild(self.failure)))
+                }
+            }
+            async fn begin_context_transform(
+                &self,
+                intent: ContextTransformIntent,
+            ) -> Result<Option<Arc<dyn ContextTransformPort>>> {
+                self.inner.begin_context_transform(intent).await
+            }
+        }
+
+        struct ParentProvider(Arc<AtomicUsize>);
+        #[async_trait]
+        impl ModelProvider for ParentProvider {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                anyhow::bail!("fixture requires structured parent requests")
+            }
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<ChatResponse> {
+                let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
+                Ok(ChatResponse {
+                    output_blocks: Vec::new(),
+                    text: (!first).then(|| "parent continues".into()),
+                    tool_calls: if first {
+                        vec![ToolCall {
+                            id: "subagent-call".into(),
+                            name: SpawnSubagentTool::NAME.into(),
+                            arguments: json!({"prompt":"focused child task"}).to_string(),
+                            extra_content: None,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for ParentProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "custom.parent"
+            }
+        }
+
+        for backend in ["sqlite", "jsonl"] {
+            for at_begin in [true, false] {
+                for failure in [
+                    Failure::Capture,
+                    Failure::Session,
+                    Failure::Append,
+                    Failure::Read,
+                    Failure::Business,
+                ] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut config = config_with_agent("alpha");
+                    config.config_path = directory.path().join("config.toml");
+                    config.data_dir = directory.path().to_path_buf();
+                    config.channels.session_backend = backend.into();
+                    config.agents.get_mut("alpha").unwrap().model_provider = "custom.parent".into();
+                    config
+                        .providers
+                        .models
+                        .ensure("custom", "parent")
+                        .unwrap()
+                        .model = Some("parent-model".into());
+                    let security = Arc::new(SecurityPolicy::default());
+                    let provider_calls = Arc::new(AtomicUsize::new(0));
+                    let child_calls = Arc::new(AtomicUsize::new(0));
+                    let mut agent = crate::agent::Agent::builder()
+                        .agent_alias("alpha".into())
+                        .model_provider_name("custom.parent".into())
+                        .model_name("parent-model".into())
+                        .model_provider(Box::new(ParentProvider(Arc::clone(&provider_calls))))
+                        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                            vec![Box::new(SpawnSubagentTool::new(
+                                Arc::new(config.clone()),
+                                "alpha",
+                                security,
+                            ))],
+                        ))
+                        .tool_dispatcher(Box::new(NativeToolDispatcher))
+                        .memory(Arc::new(zeroclaw_memory::NoneMemory::new("subagent-test")))
+                        .observer(Arc::new(crate::observability::NoopObserver))
+                        .workspace_dir(directory.path().to_path_buf())
+                        .config(config.resolved_agent_config("alpha").unwrap())
+                        .build()
+                        .unwrap();
+                    let authority = LiveConfigAuthority::new(config);
+                    let source =
+                        zeroclaw_session_host::NativeSessionHub::new(authority.live_handle());
+                    let family = "subagent-capture-failure";
+                    let stream = source.stream_id(family).await.unwrap();
+                    let principal = zeroclaw_api::principal::PrincipalId::shared_operator();
+                    let port = source
+                        .open(
+                            family.into(),
+                            "alpha".into(),
+                            principal.clone(),
+                            Arc::new(AgentHistoryAuthority {
+                                admission: authority.execution_capability().admit("alpha").unwrap(),
+                                actor: EventActor::Principal {
+                                    principal_id: principal.0,
+                                },
+                                stream: stream.clone(),
+                                origin: TurnOrigin::Interactive,
+                                parent_alias: None,
+                            }),
+                            ContextSnapshot {
+                                messages: vec![],
+                                history_has_trim_breadcrumb: Some(false),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let result = port
+                        .execute(
+                            EngineTurnInput {
+                                execution_workspace: None,
+                                turn_id: "parent-turn".into(),
+                                agent_alias: Some("alpha".into()),
+                                ingress: IngressContext::from_origin(TurnOrigin::Interactive),
+                                reply_route: None,
+                                parts: vec![EngineInputPart::Text("delegate this task".into())],
+                                provider_ref: "custom.parent".into(),
+                                model: "parent-model".into(),
+                            },
+                            Box::pin(async {
+                                let inner = current_provider_admission().unwrap();
+                                scope_provider_capture(
+                                    Arc::new(FaultBoundary {
+                                        inner,
+                                        failure,
+                                        at_begin,
+                                        calls: Arc::clone(&child_calls),
+                                    }),
+                                    agent.turn("delegate this task"),
+                                )
+                                .await
+                            }),
+                        )
+                        .await;
+                    let ordinary = failure == Failure::Business;
+                    assert_eq!(
+                        result.is_ok(),
+                        ordinary,
+                        "{backend}/{at_begin}/{failure:?}: {result:?}"
+                    );
+                    assert_eq!(child_calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        provider_calls.load(Ordering::SeqCst),
+                        if ordinary { 2 } else { 1 }
+                    );
+
+                    let store = zeroclaw_infra::session_events::family::FamilyEventStore::open(
+                        directory.path(),
+                        family,
+                    )
+                    .unwrap();
+                    let events = store
+                        .read_page(
+                            &stream,
+                            &EventCursor::beginning(stream.clone()),
+                            None,
+                            256,
+                            8 * 1024 * 1024,
+                        )
+                        .unwrap()
+                        .events;
+                    let started = events
+                        .iter()
+                        .find(|event| {
+                            matches!(event.body.data, EventData::ToolEffectStarted { .. })
+                        })
+                        .unwrap();
+                    let terminal = events
+                        .iter()
+                        .find(|event| {
+                            event.invocation_id == started.invocation_id
+                                && matches!(
+                                    event.body.data,
+                                    EventData::ToolEffectFailed { .. }
+                                        | EventData::InvocationOutcomeUnknown { .. }
+                                )
+                        })
+                        .unwrap();
+                    if ordinary {
+                        assert!(matches!(
+                            terminal.body.data,
+                            EventData::ToolEffectFailed { .. }
+                        ));
+                    } else {
+                        let EventData::InvocationOutcomeUnknown {
+                            error_ref: Some(error_ref),
+                            ..
+                        } = &terminal.body.data
+                        else {
+                            panic!(
+                                "capture failure must retain an uncertain tool outcome: {terminal:?}"
+                            );
+                        };
+                        let PayloadRead::Present(diagnostic) =
+                            store.read_payload(&error_ref.payload_id).unwrap()
+                        else {
+                            panic!("capture diagnostic missing");
+                        };
+                        assert!(
+                            String::from_utf8_lossy(&diagnostic.body)
+                                .contains("injected_subagent_history_failure")
+                        );
+                        assert!(events.iter().any(|event| matches!(
+                            event.body.data,
+                            EventData::TurnOutcomeUnknown { .. }
+                        )));
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -661,6 +661,8 @@ struct ConverseResponse {
     output: Option<ConverseOutput>,
     #[serde(default)]
     usage: Option<BedrockUsage>,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,20 +694,22 @@ enum ResponseContentBlock {
     Other(serde_json::Value),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReasoningContentWrapper {
     reasoning_content: ReasoningContentBlock,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReasoningContentBlock {
     #[serde(default)]
     reasoning_text: Option<ReasoningTextField>,
+    #[serde(flatten)]
+    extensions: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ReasoningTextField {
     #[serde(default)]
     text: Option<String>,
@@ -1457,6 +1461,8 @@ impl BedrockModelProvider {
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut output_blocks = Vec::new();
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
 
         let usage = response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
@@ -1471,12 +1477,22 @@ impl BedrockModelProvider {
             for block in message.content {
                 match block {
                     ResponseContentBlock::Text(tb) => {
+                        output_blocks.push(ProviderOutputBlock::Text {
+                            text: tb.text.clone(),
+                        });
                         let trimmed = tb.text.trim().to_string();
                         if !trimmed.is_empty() {
                             text_parts.push(trimmed);
                         }
                     }
                     ResponseContentBlock::ReasoningContent(wrapper) => {
+                        // Closed serializable content types plus JSON extension
+                        // values cannot fail encoding; no transport metadata.
+                        output_blocks.push(ProviderOutputBlock::Reasoning {
+                            representation: "bedrock.reasoningContent/v1".into(),
+                            bytes: serde_json::json!(&wrapper).to_string().into_bytes(),
+                            replay_requirement: "provider_defined".into(),
+                        });
                         if let Some(reasoning_text) = wrapper.reasoning_content.reasoning_text {
                             // Store as JSON with signature for round-tripping.
                             let block = serde_json::json!({
@@ -1488,19 +1504,34 @@ impl BedrockModelProvider {
                     }
                     ResponseContentBlock::ToolUse(wrapper) => {
                         if !wrapper.tool_use.name.is_empty() {
-                            tool_calls.push(ProviderToolCall {
+                            let call = ProviderToolCall {
                                 id: wrapper.tool_use.tool_use_id,
                                 name: wrapper.tool_use.name,
                                 arguments: wrapper.tool_use.input.to_string(),
                                 extra_content: None,
-                            });
+                            };
+                            output_blocks
+                                .push(ProviderOutputBlock::ToolCall { call: call.clone() });
+                            tool_calls.push(call);
                         }
                     }
-                    ResponseContentBlock::Other(value) => drop(value),
+                    ResponseContentBlock::Other(value) => {
+                        output_blocks.push(ProviderOutputBlock::Other {
+                            type_name: "bedrock.contentBlock".into(),
+                            content: value,
+                        })
+                    }
                 }
             }
         }
 
+        if let Some(stop_reason) = response.stop_reason {
+            output_blocks.push(ProviderOutputBlock::ProtocolMetadata {
+                metadata: serde_json::json!({
+                    "kind": "finish", "protocol": "bedrock_converse", "stop_reason": stop_reason,
+                }),
+            });
+        }
         let reasoning_content = if thinking_parts.is_empty() {
             None
         } else {
@@ -1508,6 +1539,7 @@ impl BedrockModelProvider {
         };
 
         ProviderChatResponse {
+            output_blocks,
             text: if text_parts.is_empty() {
                 None
             } else {
@@ -2612,6 +2644,37 @@ mod tests {
         let parsed = BedrockModelProvider::parse_converse_response(resp);
         assert_eq!(parsed.text.as_deref(), Some("Hello from Bedrock"));
         assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn converse_response_preserves_actual_stop_reason_without_inventing_one() {
+        use zeroclaw_api::model_provider::ProviderOutputBlock;
+        for reason in [
+            Some("end_turn"),
+            Some("max_tokens"),
+            Some("content_filtered"),
+            Some("guardrail_intervened"),
+            Some("tool_use"),
+            Some("future_reason"),
+            None,
+        ] {
+            let wire = serde_json::json!({
+                "output":{"message":{"content":[{"text":"answer"}]}},
+                "stopReason":reason,
+            });
+            let response = BedrockModelProvider::parse_converse_response(
+                serde_json::from_value(wire).unwrap(),
+            );
+            let finish = response.output_blocks.iter().find_map(|block| match block {
+                ProviderOutputBlock::ProtocolMetadata { metadata } => Some(metadata),
+                _ => None,
+            });
+            assert_eq!(
+                finish.map(|value| value["stop_reason"].as_str()),
+                reason.map(Some)
+            );
+            assert_eq!(response.text.as_deref(), Some("answer"));
+        }
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
+mod cli_output;
 pub mod compatible;
 pub mod copilot;
 pub mod dispatch;
@@ -13,6 +14,7 @@ pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
 pub mod grok_cli;
+mod output;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;
@@ -1118,11 +1120,11 @@ fn mentions_tools_token(message: &str) -> bool {
         let preceded_by_word_char = message[..start]
             .chars()
             .next_back()
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
         let followed_by_word_char = bytes
             .get(end)
             .map(|byte| *byte as char)
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
 
         if !preceded_by_word_char && !followed_by_word_char {
             return true;
@@ -1296,13 +1298,44 @@ pub(crate) fn stream_idle_error_message(
 }
 
 /// Build a sanitized model_provider error from a failed HTTP response.
+pub(crate) fn stream_read_error(
+    error: &reqwest::Error,
+    bound: StreamIdleBound,
+) -> traits::StreamError {
+    let message = stream_idle_error_message(error, bound);
+    if error.is_timeout() {
+        traits::StreamError::ResponseTimeout(message)
+    } else {
+        traits::StreamError::Http(message)
+    }
+}
+
 pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
+    let request_id = ["x-request-id", "request-id", "x-goog-request-id"]
+        .into_iter()
+        .find_map(|key| {
+            response
+                .headers()
+                .get(key)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        });
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let body = response
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
-    api_error_from_parts(model_provider, status, &body)
+    let mut error = api_error_from_parts(model_provider, status, &body);
+    if let Some(failure) = error.downcast_mut::<dispatch::ProviderHttpFailure>() {
+        failure.request_id = request_id;
+        failure.retry_after = retry_after;
+    }
+    error
 }
 
 /// Build a sanitized model_provider error after a caller has already consumed
@@ -1324,9 +1357,13 @@ pub(crate) fn api_error_from_parts(
             })),
         "providers: API error"
     );
-    anyhow::Error::msg(format!(
-        "{model_provider} API error ({status}): {sanitized}"
-    ))
+    anyhow::Error::new(dispatch::ProviderHttpFailure {
+        provider_ref: model_provider.into(),
+        status: status.as_u16(),
+        detail: sanitized,
+        request_id: None,
+        retry_after: None,
+    })
 }
 
 /// Resolve API key for a model_provider from the typed alias config/override.
@@ -1343,10 +1380,6 @@ fn resolve_model_provider_credential(
         .map(ToString::to_string)
 }
 
-/// Single source of truth for `(key_prefix, canonical_model_provider_family)`
-/// pairs used by `check_api_key_prefix`. Order matters: longer prefixes
-/// must come before shorter ones that share a head (`sk-ant-` and `sk-or-`
-/// must precede `sk-`).
 const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
     ("sk-ant-", "anthropic"),
     ("sk-or-", "openrouter"),
@@ -2024,7 +2057,9 @@ pub fn provider_runtime_options_for_bare_family(
     }
 }
 
-fn create_resilient_model_provider_from_ref_with_model_override(
+/// Build a profile's reliability chain with an explicit primary model pin.
+/// Fallback entries retain their own configured models and credentials.
+pub fn create_resilient_model_provider_from_ref_with_model_override(
     config: &zeroclaw_config::schema::Config,
     name: &str,
     api_key: Option<&str>,

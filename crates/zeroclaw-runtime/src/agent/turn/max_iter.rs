@@ -596,6 +596,7 @@ mod graceful_summary_metering_tests {
         ) -> anyhow::Result<ChatResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("wrap-up summary".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -642,6 +643,7 @@ mod graceful_summary_metering_tests {
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
                 text: Some("wrap-up summary".to_string()),
+                output_blocks: vec![],
                 tool_calls: Vec::new(),
                 usage: None,
                 reasoning_content: None,
@@ -868,6 +870,7 @@ mod graceful_summary_metering_tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("<think>internal reasoning</think>".to_string()),
                 tool_calls: Vec::new(),
                 usage: Some(TokenUsage {
@@ -974,6 +977,7 @@ mod graceful_summary_metering_tests {
                 .join("\n");
             self.seen.lock().unwrap().push(joined);
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some("wrap-up summary".to_string()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -2060,6 +2064,7 @@ mod graceful_summary_metering_tests {
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
             Ok(ChatResponse {
+                output_blocks: Vec::new(),
                 text: Some(self.text.clone()),
                 tool_calls: Vec::new(),
                 usage: None,

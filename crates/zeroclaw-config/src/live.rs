@@ -58,13 +58,21 @@ impl std::fmt::Display for ConfigEpoch {
     }
 }
 
+/// Read-only historical evidence. Deserialization intentionally cannot mint
+/// a live authority epoch or publication grant from a stored session event.
+impl serde::Serialize for ConfigEpoch {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
 /// Identity of one published config: authority epoch plus sequence.
 ///
 /// Copyable and comparable for equality only. Order-sensitive questions
 /// must go through [`ConfigRevision::same_epoch`] and
 /// [`ConfigRevision::succeeds_within_epoch`], which refuse to compare
 /// sequences across different epochs.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
 pub struct ConfigRevision {
     epoch: ConfigEpoch,
     sequence: u64,

@@ -1315,9 +1315,287 @@ impl From<zeroclaw_config::live::LiveConfigError> for ConfigCommitError {
     }
 }
 
+/// History adapter for a runtime-owned target admission. The admission and live
+/// config remain canonical; this handle binds only actor, stream and origin.
+pub struct AgentHistoryAuthority {
+    pub admission: AgentExecutionAdmission,
+    pub actor: zeroclaw_api::session_events::EventActor,
+    pub stream: zeroclaw_api::session_events::SessionStreamId,
+    pub origin: zeroclaw_api::ingress::TurnOrigin,
+    pub parent_alias: Option<String>,
+}
+impl AgentHistoryAuthority {
+    fn binding_evidence(
+        &self,
+        workspace: Option<&std::path::Path>,
+    ) -> Result<zeroclaw_api::session_events::PayloadRecord, zeroclaw_kernel::session::SessionError>
+    {
+        self.check_history()?;
+        let handle = self.admission.capability().config_handle();
+        let config = handle.read();
+        let context = zeroclaw_session_host::execution_context_evidence(
+            &config,
+            self.admission.alias(),
+            workspace,
+        )?;
+        zeroclaw_api::session_events::PayloadRecord::json("session.execution-binding/v1",&serde_json::json!({
+            "config_revision":config.revision(),"purpose":"runtime_owned_turn","execution_context":context,
+        })).map_err(zeroclaw_api::session_events::AppendError::from).map_err(Into::into)
+    }
+    fn check_history(&self) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        use zeroclaw_kernel::session::SessionError;
+        self.admission
+            .revalidate()
+            .map_err(|error| SessionError::PermissionDenied(error.to_string()))?;
+        let handle = self.admission.capability().config_handle();
+        let config = handle.read();
+        if config
+            .agent(self.admission.alias())
+            .is_none_or(|agent| !agent.enabled)
+            || self.parent_alias.as_ref().is_some_and(|parent| {
+                parent != self.admission.alias()
+                    && config
+                        .delegate_target_mode(parent, self.admission.alias())
+                        .is_none()
+            })
+        {
+            return Err(SessionError::PermissionDenied(
+                "runtime history target revoked".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn check_stream(
+        &self,
+        stream: &zeroclaw_api::session_events::SessionStreamId,
+    ) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        if stream != &self.stream {
+            return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
+                "runtime history scope mismatch".into(),
+            ));
+        }
+        self.check_history()
+    }
+}
+impl zeroclaw_kernel::session::query::SessionAccessPolicy for AgentHistoryAuthority {
+    fn authorize_reasoning(
+        &self,
+        actor: &zeroclaw_api::session_events::EventActor,
+        stream: &zeroclaw_api::session_events::SessionStreamId,
+    ) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        if !matches!(actor, zeroclaw_api::session_events::EventActor::Principal { principal_id } if *principal_id == zeroclaw_api::principal::PrincipalId::shared_operator().0)
+        {
+            return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
+                "reasoning disclosure requires operator authority".into(),
+            ));
+        }
+        self.authorize_actor(
+            actor,
+            stream,
+            zeroclaw_kernel::session::query::SessionAccess::Read,
+        )
+    }
+    fn authorize(
+        &self,
+        principal: &zeroclaw_api::principal::PrincipalId,
+        stream: &zeroclaw_api::session_events::SessionStreamId,
+        access: zeroclaw_kernel::session::query::SessionAccess,
+    ) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        self.authorize_actor(
+            &zeroclaw_api::session_events::EventActor::Principal {
+                principal_id: principal.0.clone(),
+            },
+            stream,
+            access,
+        )
+    }
+    fn authorize_actor(
+        &self,
+        actor: &zeroclaw_api::session_events::EventActor,
+        stream: &zeroclaw_api::session_events::SessionStreamId,
+        access: zeroclaw_kernel::session::query::SessionAccess,
+    ) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        if actor != &self.actor
+            || matches!(
+                access,
+                zeroclaw_kernel::session::query::SessionAccess::Erase
+            )
+        {
+            return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
+                "runtime history actor mismatch".into(),
+            ));
+        }
+        self.check_stream(stream)
+    }
+}
+impl zeroclaw_kernel::session::PermissionResolver for AgentHistoryAuthority {
+    fn tool_authority_evidence(
+        &self,
+        stream: &zeroclaw_api::session_events::SessionStreamId,
+        name: &str,
+    ) -> Result<serde_json::Value, zeroclaw_kernel::session::SessionError> {
+        self.check_stream(stream)?;
+        let handle = self.admission.capability().config_handle();
+        let config = handle.read();
+        let profile = config
+            .risk_profile_for_agent(self.admission.alias())
+            .ok_or_else(|| {
+                zeroclaw_kernel::session::SessionError::PermissionDenied(
+                    "agent risk profile missing".into(),
+                )
+            })?;
+        if profile
+            .effective_allowed_tools()
+            .is_some_and(|tools| !tools.iter().any(|tool| tool == name))
+        {
+            return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
+                "current tool policy denies action".into(),
+            ));
+        }
+        Ok(
+            serde_json::json!({"source":"live_tool_admission","config_revision":config.revision(),"matched_rules":{"allowed_tools":profile.effective_allowed_tools(),"auto_approve":profile.auto_approve.iter().filter(|tool|tool.as_str()==name).collect::<Vec<_>>(),"always_ask":profile.always_ask.iter().filter(|tool|tool.as_str()==name).collect::<Vec<_>>(),"autonomy_level":profile.level}}),
+        )
+    }
+
+    fn authorize_context(
+        &self,
+        stream: &zeroclaw_api::session_events::SessionStreamId,
+        _branch: &zeroclaw_api::session_events::BranchId,
+    ) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        self.check_stream(stream)
+    }
+    fn authorize(
+        &self,
+        intent: &zeroclaw_kernel::session::EffectIntent,
+    ) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        self.check_stream(&intent.stream_id)
+    }
+    fn authorize_tool(
+        &self,
+        intent: &zeroclaw_kernel::session::EffectIntent,
+        name: &str,
+        _arguments: &serde_json::Value,
+    ) -> Result<(), zeroclaw_kernel::session::SessionError> {
+        self.check_stream(&intent.stream_id)?;
+        let handle = self.admission.capability().config_handle();
+        let config = handle.read();
+        let profile = config
+            .risk_profile_for_agent(self.admission.alias())
+            .ok_or_else(|| {
+                zeroclaw_kernel::session::SessionError::PermissionDenied(
+                    "runtime tool profile missing".into(),
+                )
+            })?;
+        if profile
+            .effective_allowed_tools()
+            .is_some_and(|tools| !tools.iter().any(|tool| tool == name))
+        {
+            return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
+                "current runtime tool policy denies action".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn child_authority(
+        &self,
+        target: &str,
+        stream: &zeroclaw_api::session_events::SessionStreamId,
+    ) -> Result<
+        std::sync::Arc<dyn zeroclaw_kernel::session::engine::EngineSessionAuthority>,
+        zeroclaw_kernel::session::SessionError,
+    > {
+        self.check_history()?;
+        let child = Self {
+            admission: self.admission.capability().admit(target).map_err(|error| {
+                zeroclaw_kernel::session::SessionError::PermissionDenied(error.to_string())
+            })?,
+            actor: self.actor.clone(),
+            stream: stream.clone(),
+            origin: zeroclaw_api::ingress::TurnOrigin::SubTurn,
+            parent_alias: Some(self.admission.alias().into()),
+        };
+        child.check_history()?;
+        Ok(std::sync::Arc::new(child))
+    }
+}
+impl zeroclaw_kernel::session::engine::EngineSessionAuthority for AgentHistoryAuthority {
+    fn execution_binding(
+        &self,
+        input: &zeroclaw_api::session_events::capture::EngineTurnInput,
+    ) -> Result<zeroclaw_api::session_events::PayloadRecord, zeroclaw_kernel::session::SessionError>
+    {
+        if input.agent_alias.as_deref() != Some(self.admission.alias())
+            || input.ingress.origin != self.origin
+        {
+            return Err(zeroclaw_kernel::session::SessionError::PermissionDenied(
+                "runtime history ingress mismatch".into(),
+            ));
+        }
+        self.binding_evidence(input.execution_workspace.as_deref())
+    }
+    fn maintenance_binding(
+        &self,
+    ) -> Result<zeroclaw_api::session_events::PayloadRecord, zeroclaw_kernel::session::SessionError>
+    {
+        self.binding_evidence(None)
+    }
+    fn diagnostic(&self, error: &anyhow::Error) -> Option<String> {
+        Some(crate::agent::Agent::session_execution_diagnostic(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_binding_records_admitted_workspace_and_child_policy() {
+        let mut config = Config::default();
+        for alias in ["parent", "child"] {
+            config.agents.insert(
+                alias.into(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    risk_profile: "fixture-policy".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        config
+            .risk_profiles
+            .insert("fixture-policy".into(), Default::default());
+        let authority = LiveConfigAuthority::new(config);
+        let history = AgentHistoryAuthority {
+            admission: authority.execution_capability().admit("parent").unwrap(),
+            actor: zeroclaw_api::session_events::EventActor::System {
+                component: "fixture".into(),
+            },
+            stream: zeroclaw_api::session_events::SessionStreamId::new(),
+            origin: zeroclaw_api::ingress::TurnOrigin::Interactive,
+            parent_alias: None,
+        };
+        let record = history
+            .binding_evidence(Some(std::path::Path::new("/fixture/session")))
+            .unwrap();
+        let binding: serde_json::Value = serde_json::from_slice(&record.body).unwrap();
+        assert_eq!(binding["execution_context"]["cwd"], "/fixture/session");
+        let child = zeroclaw_kernel::session::PermissionResolver::child_authority(
+            &history,
+            "child",
+            &zeroclaw_api::session_events::SessionStreamId::new(),
+        )
+        .unwrap();
+        let record = child.maintenance_binding().unwrap();
+        let binding: serde_json::Value = serde_json::from_slice(&record.body).unwrap();
+        assert_eq!(
+            binding["execution_context"]["cwd"],
+            serde_json::json!(authority.snapshot_config().agent_workspace_dir("child"))
+        );
+        assert_eq!(
+            binding["execution_context"]["permission_profile"],
+            "fixture-policy"
+        );
+    }
 
     #[test]
     fn cloned_authority_preserves_storage_epoch_and_write_lock_identity() {
