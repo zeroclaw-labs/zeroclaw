@@ -88,7 +88,7 @@ jobs:
       - name: Preserve complete scan report
         id: report
         if: steps.scan.outputs.scan_result == 'outdated' || steps.scan.outputs.scan_result == 'failure'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: monthly-outdated-report
           path: |
