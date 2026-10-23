@@ -11250,12 +11250,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         // One-time pairing code gates enrollment. Print it AND the
                         // CA-bound short-auth-string so the operator reads both to
                         // the client out of band (no blind trust-on-first-use).
-                        let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
-                            true,
-                            &[],
-                            startup_pairing_code_policy,
-                        ));
-                        if let Some(code) = pairing.pairing_code() {
+                        // The code lives in the enrollment slot of the daemon's
+                        // canonical pairing authority: it enrolls but never
+                        // pairs a bearer, and it leaves the gateway's pending
+                        // code alone. Enrollment always requires a code, even
+                        // with gateway pairing disabled.
+                        let pairing = std::sync::Arc::clone(ctx.auth.pairing());
+                        {
+                            let code = pairing.enrollment_code(startup_pairing_code_policy);
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
                             let enroll_bind = enroll_cfg.bind.to_string();
                             let enroll_port = enroll_cfg.port.to_string();
