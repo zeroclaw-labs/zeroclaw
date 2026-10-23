@@ -34,7 +34,8 @@ const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 180;
 const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 
 /// Maximum automatic reconnect attempts when a request is known not to have
-/// been written. Outcome-unknown requests are never replayed.
+/// been written or not to have been executed (a Streamable HTTP stale-session
+/// rejection). Outcome-unknown requests are never replayed.
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
 
 /// Perform the MCP `initialize` + `notifications/initialized` handshake on a
@@ -703,14 +704,14 @@ impl McpServer {
                                 return Err(anyhow::Error::new(join_error)).with_context(|| {
                                     format!(
                                         "MCP server `{server_name}` recovery task failed before \
-                                         writing {operation}"
+                                         (re)sending {operation}"
                                     )
                                 });
                             }
                             Err(_) => {
                                 bail!(
                                     "MCP server `{server_name}` exhausted the {timeout_secs}s \
-                                     budget recovering before writing {operation}"
+                                     budget recovering before (re)sending {operation}"
                                 );
                             }
                         }
@@ -3022,23 +3023,41 @@ done
         }
     }
 
-    #[tokio::test]
-    async fn call_tool_recovers_stale_session_without_replaying_tool() {
-        use wiremock::matchers::{body_partial_json, method};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn assert_call_tool_replays_once_after_stale_session(stale_status: u16) {
+        use wiremock::matchers::{body_partial_json, header, method};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
         let server = MockServer::start().await;
 
-        // initialize → 200 + session header. Hit twice: initial connect plus the
-        // reconnect that follows the stale-session error.
+        // Both handshakes must start without a session id: the initial connect
+        // gets `sess-1`, the reconnect after the stale-session error gets
+        // `sess-2`. An initialize that still carries the expired id matches
+        // neither mock.
+        let no_session_header = |req: &Request| !req.headers.contains_key("Mcp-Session-Id");
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "initialize"})))
+            .and(no_session_header)
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Mcp-Session-Id", "sess-1")
                     .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
             )
-            .expect(2)
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .and(no_session_header)
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-2")
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+            )
+            .with_priority(2)
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -3061,15 +3080,106 @@ done
             .mount(&server)
             .await;
 
-        // tools/call → 404 (stale session). Even though the response indicates
-        // a stale session, the request crossed the write boundary, so the
-        // client recovers the connection but does not replay the tool.
+        // tools/call → `stale_status` (stale session). The transport reads it,
+        // on a request that carried a session id, as a terminated session that
+        // did not execute the call: the client re-establishes the session and
+        // replays the call once.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .and(header("Mcp-Session-Id", "sess-1"))
+            .respond_with(ResponseTemplate::new(stale_status))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The replayed call (next request id) succeeds only on the fresh
+        // session; a replay that still carries `sess-1` is rejected again.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call", "id": 4})))
+            .and(header("Mcp-Session-Id", "sess-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {"content": [{"type": "text", "text": "ok"}]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let srv = McpServer::connect(http_server_config(server.uri()))
+            .await
+            .expect("connect");
+        let result = srv
+            .call_tool("echo", json!({}))
+            .await
+            .expect("tool call is replayed on the re-established session");
+        assert_eq!(result["content"][0]["text"], "ok", "got: {result}");
+        assert_eq!(
+            *srv.epoch_gate.read().await,
+            1,
+            "session re-established once"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn call_tool_replays_once_after_stale_session() {
+        assert_call_tool_replays_once_after_stale_session(404).await;
+    }
+
+    /// 410 Gone is not part of the MCP session contract, but the transport
+    /// accepts it as the same stale-session signal, so it must take the same
+    /// replay path as 404.
+    #[tokio::test]
+    async fn call_tool_replays_once_after_gone_session() {
+        assert_call_tool_replays_once_after_stale_session(410).await;
+    }
+
+    #[tokio::test]
+    async fn call_tool_stale_session_replays_are_bounded() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Initial connect plus one re-handshake per replay
+        // (MAX_RECONNECT_ATTEMPTS = 2).
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+            )
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{"name": "echo", "description": "d", "inputSchema": {"type": "object"}}]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Every tools/call is rejected as a stale session: the first attempt
+        // plus two replays, then the error surfaces.
         Mock::given(method("POST"))
             .and(body_partial_json(json!({"method": "tools/call"})))
             .respond_with(ResponseTemplate::new(404))
-            .up_to_n_times(1)
-            .with_priority(1)
-            .expect(1)
+            .expect(3)
             .mount(&server)
             .await;
 
@@ -3079,21 +3189,11 @@ done
         let error = srv
             .call_tool("echo", json!({}))
             .await
-            .expect_err("outcome-unknown tool call must not be replayed");
+            .expect_err("a session the server keeps rejecting must surface an error");
         assert!(
-            error.to_string().contains("request was not replayed"),
+            format!("{error:#}").contains("MCP session is stale (HTTP 404)"),
             "got: {error:#}"
         );
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if *srv.epoch_gate.read().await == 1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("stale-session recovery did not complete");
         server.verify().await;
     }
 

@@ -226,7 +226,8 @@ fn build_remote_http_client(config: &McpServerConfig) -> Result<reqwest::Client>
 
 /// Transport-level failures that require reconnecting and re-running the MCP
 /// handshake. The client may retry only when the request is known not to have
-/// been written; failures after a possible write are surfaced without replay.
+/// been written or not to have been executed (a Streamable HTTP stale-session
+/// 404/410); other failures after a possible write are surfaced without replay.
 /// Distinct from a genuine tool/application error, which is always reported
 /// as-is and never retried.
 #[derive(Debug, thiserror::Error)]
@@ -253,8 +254,9 @@ const REQUEST_OUTCOME_UNKNOWN: u8 = 1;
 const REQUEST_COMPLETED: u8 = 2;
 
 /// Tracks whether a request can still be proved not to have reached the
-/// server. The client uses this state to recover cancelled post-write calls
-/// without replaying a possibly side-effecting operation.
+/// server, or to have been rejected by it unexecuted (a Streamable HTTP
+/// stale-session 404/410). The client uses this state to recover cancelled
+/// post-write calls without replaying a possibly side-effecting operation.
 pub(crate) struct McpRequestLifecycle {
     phase: AtomicU8,
     epoch: AtomicU64,
@@ -313,6 +315,14 @@ impl McpRequestLifecycle {
 
     fn mark_completed(&self) {
         self.phase.store(REQUEST_COMPLETED, Ordering::Release);
+    }
+
+    /// The server answered with a status proving it did not execute the
+    /// request. Return to the pre-write phase so the caller may recover and
+    /// retry; the stored epoch stays the one the request was written under, so
+    /// recovery resets exactly that session.
+    fn mark_rejected_unexecuted(&self) {
+        self.phase.store(REQUEST_PRE_WRITE, Ordering::Release);
     }
 
     pub(crate) fn outcome_unknown_epoch(&self) -> Option<u64> {
@@ -1265,6 +1275,15 @@ impl SharedMcpTransportConn for HttpTransport {
             if self.session_id.lock().is_some()
                 && (status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE)
             {
+                // A Streamable HTTP server that has terminated a session MUST
+                // answer every request carrying that session id with 404 (MCP
+                // spec, Session Management). The spec does not define 410 Gone;
+                // it is accepted for servers that report an expired session as
+                // Gone, on the assumption that such a server, like a 404 one,
+                // rejected the request without executing it. Either way the
+                // outcome is known and the caller may replay the request after
+                // re-establishing the session.
+                lifecycle.mark_rejected_unexecuted();
                 return Err(McpTransportError::StaleSession {
                     status: status.as_u16(),
                 }
@@ -3579,7 +3598,9 @@ mod tests {
         // A 404 only signals a stale session when the request carried a session id.
         *transport.session_id.lock() = Some("sess-1".into());
         let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
-        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        // A non-zero epoch, so the assertion below proves the write epoch is
+        // kept rather than reset.
+        let lifecycle = McpRequestLifecycle::uncoordinated(7);
         let err = transport
             .send_and_recv(&req, &lifecycle)
             .await
@@ -3588,6 +3609,10 @@ mod tests {
             Some(McpTransportError::StaleSession { status }) => assert_eq!(*status, 404),
             other => panic!("expected StaleSession, got {other:?}"),
         }
+        // The server rejected the request without executing it: the outcome is
+        // known, so the request is back in the retryable pre-write phase.
+        assert_eq!(lifecycle.outcome_unknown_epoch(), None);
+        assert_eq!(lifecycle.pre_write_epoch(), Some(7));
     }
 
     #[tokio::test]
