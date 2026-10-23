@@ -1602,14 +1602,18 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     p: ToolLoop<'a>,
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
+        run_tool_call_loop_impl(p, Some(subject), reported_usage),
+    )))
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
+    Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
+        run_tool_call_loop_impl(p, None, None),
+    )))
 }
 
 async fn run_tool_call_loop_impl<'a>(

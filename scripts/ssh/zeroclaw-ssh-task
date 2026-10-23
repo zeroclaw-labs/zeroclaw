@@ -1,0 +1,253 @@
+#!/usr/bin/python3
+"""Task-owned SSH multiplexing; credentials remain in the existing private agent."""
+import hashlib
+import concurrent.futures
+import json
+import os
+import pathlib
+import re
+import selectors
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tempfile
+import stat
+
+ROOT = pathlib.Path(os.environ['ZEROCLAW_SSH_STATE_DIR']) if 'ZEROCLAW_SSH_STATE_DIR' in os.environ else pathlib.Path(os.environ.get('XDG_RUNTIME_DIR', tempfile.gettempdir())) / ('zeroclaw-ssh-' + str(os.getuid()) if hasattr(os, 'getuid') else 'zeroclaw-ssh')
+SSH = '/usr/bin/ssh'
+IDLE_SECONDS = 1800
+SAFE_OPTIONS = {'batchmode', 'connecttimeout', 'loglevel'}
+
+
+def parse_args(args):
+    """Keep the service's identity, trust and multiplexing options authoritative."""
+    options = []
+    while args and args[0].startswith('-'):
+        flag = args.pop(0)
+        if flag == '--':
+            break
+        if flag not in ('-o', '-p', '-l') or not args:
+            raise ValueError('Unsupported SSH option; use configured host aliases')
+        value = args.pop(0)
+        if flag == '-o' and value.split('=', 1)[0].lower() not in SAFE_OPTIONS:
+            raise ValueError('SSH identity, trust and transport options cannot be overridden')
+        options.extend((flag, value))
+    if not args or not re.fullmatch(r'[a-zA-Z0-9_.:@\[\]-]+', args[0]):
+        raise ValueError('A configured SSH host alias is required')
+    host = args.pop(0)
+    if not args:
+        raise ValueError('An explicit noninteractive remote command is required')
+    return options, host, args
+
+
+def ssh_config(options, host):
+    p = subprocess.run([SSH, '-G', *options, host], check=True,
+                       capture_output=True, text=True, timeout=10)
+    config = {}
+    for line in p.stdout.splitlines():
+        if ' ' in line:
+            name, value = line.split(' ', 1)
+            config.setdefault(name, []).append(value)
+    # Aliases addressing the same login and endpoint share the same transport.
+    key = tuple(config.get(k, []) for k in
+                ('hostname', 'port', 'user', 'proxyjump', 'proxycommand',
+                 'identityagent', 'identityfile', 'certificatefile', 'identitiesonly',
+                 'hostkeyalias', 'bindaddress', 'bindinterface'))
+    return hashlib.sha256(json.dumps(key).encode()).hexdigest()[:24]
+
+
+class Pool:
+    def __init__(self, directory, idle=IDLE_SECONDS, ssh=SSH, clock=time.monotonic):
+        self.directory, self.idle, self.ssh, self.clock = directory, idle, ssh, clock
+        self.entries = {}
+        self.lock = threading.Lock()
+        self.closed = False
+        # Linux parent-death signals follow the creating thread, not only its
+        # process. Use a task-lifetime thread, never a short client handler.
+        self.spawner = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def acquire(self, key, options, host):
+        with self.lock:
+            if self.closed:
+                raise RuntimeError('SSH task has ended')
+            entry = self.entries.get(key)
+            if entry is None:
+                path = str(self.directory / key)
+                command = ['/usr/bin/setpriv', '--pdeathsig', 'TERM', self.ssh, '-M', '-N', '-S', path,
+                           '-o', 'ControlMaster=yes', '-o', 'ControlPersist=no',
+                           '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=12',
+                           '-o', 'ConnectionAttempts=1', '-o', 'ForwardAgent=no',
+                           '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3',
+                           *options, host]
+                log = (self.directory / (key + '.error')).open('w+b')
+                process = self.spawner.submit(subprocess.Popen, command,
+                                              stdin=subprocess.DEVNULL,
+                                              stdout=subprocess.DEVNULL, stderr=log).result()
+                entry = dict(process=process, path=path, host=host, log=log,
+                             active=0, last=self.clock(), failed=False)
+                # Keep failures for the task: subsequent calls must not reconnect blindly.
+                self.entries[key] = entry
+                deadline = time.monotonic() + 15
+                while not pathlib.Path(path).exists() and process.poll() is None:
+                    if time.monotonic() > deadline:
+                        process.terminate()
+                        break
+                    time.sleep(0.05)
+                if not pathlib.Path(path).exists() or process.poll() is not None:
+                    entry['failed'] = True
+                    log.seek(0)
+                    detail = log.read(2048).decode(errors='replace').strip()
+                    raise RuntimeError('SSH connection failed; not retried in this task: ' + detail)
+            if entry['failed'] or entry['process'].poll() is not None:
+                raise RuntimeError('SSH transport unavailable; diagnose before starting a new task')
+            entry['active'] += 1
+            entry['last'] = self.clock()
+            return entry['path']
+
+    def release(self, key):
+        with self.lock:
+            if key in self.entries:
+                entry = self.entries[key]
+                entry['active'] = max(0, entry['active'] - 1)
+                entry['last'] = self.clock()
+
+    @staticmethod
+    def stop(entry):
+        process = entry['process']
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+        entry['log'].close()
+        pathlib.Path(entry['path']).unlink(missing_ok=True)
+
+    def expire(self):
+        with self.lock:
+            for key, entry in list(self.entries.items()):
+                if not entry['active'] and self.clock() - entry['last'] >= self.idle:
+                    self.stop(entry)
+                    del self.entries[key]
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            for entry in self.entries.values():
+                self.stop(entry)
+            self.entries.clear()
+            self.spawner.shutdown(wait=True)
+
+
+def read_message(peer):
+    data = bytearray()
+    while not data.endswith(b'\n'):
+        part = peer.recv(4096)
+        if not part:
+            raise EOFError('SSH client disconnected')
+        data.extend(part)
+        if len(data) > 16384:
+            raise ValueError('SSH request too large')
+    return json.loads(data)
+
+
+def serve(directory):
+    os.umask(0o077)
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    info = ROOT.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError('SSH state directory must be private and owned by the service user')
+    directory.mkdir(mode=0o700)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(directory / 'broker'))
+    listener.listen(32)
+    idle = int(os.environ.get('ZEROCLAW_SSH_IDLE_TIMEOUT_SECS', str(IDLE_SECONDS)))
+    if not 1 <= idle <= 86400:
+        raise ValueError('SSH idle timeout must be between 1 and 86400 seconds')
+    pool = Pool(directory, idle=idle)
+    selector = selectors.DefaultSelector()
+    selector.register(listener, selectors.EVENT_READ)
+    # The turn owner holds stdin. EOF closes all transports even on cancellation,
+    # panic or daemon termination; this is independent of model-generated cleanup.
+    selector.register(sys.stdin.buffer, selectors.EVENT_READ)
+    (directory / 'ready').touch(mode=0o600)
+    print(json.dumps({'ready': True, 'state_dir': str(ROOT)}), flush=True)
+
+    def handle(peer):
+        key = None
+        acquired = False
+        try:
+            peer.settimeout(20)
+            request = read_message(peer)
+            options, host, _ = parse_args(list(request['argv']))
+            key = ssh_config(options, host)
+            path = pool.acquire(key, options, host)
+            acquired = True
+            peer.sendall(json.dumps({'path': path}).encode() + b'\n')
+            peer.settimeout(None)
+            # Hold the lease only while the command's client is alive.
+            while peer.recv(1):
+                pass
+        except Exception as exc:
+            try:
+                peer.sendall(json.dumps({'error': str(exc)}).encode() + b'\n')
+            except OSError:
+                pass
+        finally:
+            if acquired:
+                pool.release(key)
+            peer.close()
+
+    try:
+        while True:
+            for event, _ in selector.select(timeout=1):
+                if event.fileobj is listener:
+                    peer, _ = listener.accept()
+                    threading.Thread(target=handle, args=(peer,), daemon=True).start()
+                elif not os.read(sys.stdin.fileno(), 1):
+                    return
+            pool.expire()
+    finally:
+        listener.close()
+        pool.close()
+        selector.close()
+        for item in directory.iterdir():
+            item.unlink(missing_ok=True)
+        directory.rmdir()
+
+
+def client(args):
+    scope = os.environ.get('ZEROCLAW_SSH_TASK')
+    if not scope or not re.fullmatch('[a-f0-9]{32}', scope):
+        raise RuntimeError('SSH requires an active ZeroClaw task; no unmanaged fallback')
+    options, host, commands = parse_args(list(args))
+    with socket.socket(socket.AF_UNIX) as peer:
+        peer.settimeout(20)
+        peer.connect(str(ROOT / scope / 'broker'))
+        peer.sendall(json.dumps({'argv': args}).encode() + b'\n')
+        response = read_message(peer)
+        if 'error' in response:
+            raise RuntimeError(response['error'])
+        # Fail closed if the master disappears. Never fall back to a new TCP
+        # connection, another identity, password authentication or trust bypass.
+        return subprocess.call([SSH, '-S', response['path'],
+                                '-o', 'ControlMaster=no', '-o', 'ControlPersist=no',
+                                '-o', 'ProxyCommand=/usr/bin/false',
+                                '-o', 'BatchMode=yes', '-o', 'ForwardAgent=no',
+                                *options, host, *commands])
+
+
+if __name__ == '__main__':
+    try:
+        if len(sys.argv) == 3 and sys.argv[1] == '--serve':
+            if not re.fullmatch('[a-f0-9]{32}', sys.argv[2]):
+                raise ValueError('Invalid task identity')
+            serve(ROOT / sys.argv[2])
+        else:
+            sys.exit(client(sys.argv[1:]))
+    except Exception as exc:
+        print('zeroclaw-ssh: ' + str(exc), file=sys.stderr)
+        sys.exit(255)
