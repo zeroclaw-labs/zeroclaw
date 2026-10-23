@@ -1,10 +1,12 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
-use crate::tools::shell_env::{ForwardedEnvironment, SAFE_SHELL_ENV_VARS};
+use crate::tools::shell_env::{ForwardedEnvironment, apply_shell_environment};
+#[cfg(test)]
+use crate::tools::shell_env::{SAFE_SHELL_ENV_VARS, collect_allowed_shell_env_vars};
 use async_trait::async_trait;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,34 +144,6 @@ fn decode_truncated_output(bytes: &[u8]) -> String {
     super::shell_output::decode_truncated_shell_output(bytes)
 }
 
-fn is_valid_env_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
-        _ => return false,
-    }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for key in SAFE_SHELL_ENV_VARS
-        .iter()
-        .copied()
-        .chain(security.shell_env_passthrough.iter().map(|s| s.as_str()))
-    {
-        let candidate = key.trim();
-        if candidate.is_empty() || !is_valid_env_var_name(candidate) {
-            continue;
-        }
-        if seen.insert(candidate.to_string()) {
-            out.push(candidate.to_string());
-        }
-    }
-    out
-}
-
 /// Name of the environment variable that carries the in-flight session key
 /// into shell tools.
 pub(crate) const SESSION_ID_ENV_VAR: &str = "ZEROCLAW_SESSION_ID";
@@ -302,13 +276,7 @@ impl Tool for ShellTool {
                 anyhow::Error::msg(format!("Sandbox error: {e}"))
             })?;
 
-        cmd.env_clear();
-
-        for var in collect_allowed_shell_env_vars(&self.security) {
-            if let Ok(val) = std::env::var(&var) {
-                cmd.env(&var, val);
-            }
-        }
+        apply_shell_environment(&mut cmd, &self.security, self.runtime.as_ref());
 
         // Injected after env_clear so it survives; absent when the turn is unscoped.
         if let Some(session_id) = get_session_id() {
