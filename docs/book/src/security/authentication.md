@@ -24,6 +24,9 @@ importantly, what changes for existing remote connections.
    mutual-TLS client certificate that presents it, not by a principal.
    Fine-grained selectors compose on top:
    - config writes check `config_write_paths`;
+   - `plugin-webhook/dispatch` and `plugin-webhook/routes` check the
+     channel selector `allowed_channels` against the route's channel
+     instance;
    - `session/new` and `session/prompt` check the agent selector and hold
      the session's workspace to a directory that agent's policy lets it both
      read and write, whether the workspace was named by the request, stored
@@ -349,6 +352,18 @@ selector list grants no instances, and broad access requires the explicit
 cron jobs, attachments, personality files, per-agent cost queries, and SOP
 authoring, `allowed_agents = ["*"]` covers only the agents the
 configuration defines, not any alias a request names.
+
+The channel selector `allowed_channels` scopes the `channels` grant to named
+channel instances, written `<type>.<alias>` (for example `plugin.support`);
+every name must be a configured instance. The grant's consumers are the
+plugin webhook RPC methods, served only on the local socket:
+`channels = ["execute"]` lets a caller deliver a webhook request to the route
+of a named plugin channel and cancel its own deliveries, and
+`channels = ["read"]` lists those routes and their owners. Whatever the
+grants, `accept_injected_webhooks = false` on a `[channels.plugin.<alias>]`
+instance, or on an `[agents.<alias>]` that handles it, refuses such
+deliveries. See
+[RPC socket](../architecture/rpc-socket.md#plugin-webhook-dispatch).
 
 Tool selectors compose by intersection at agent assembly, on top of the
 coarse grant: model-facing tool execution is `tools = ["execute"]`, and a

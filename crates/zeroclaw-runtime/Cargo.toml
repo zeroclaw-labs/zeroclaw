@@ -15,6 +15,7 @@ zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tls.workspace = true
 zeroclaw-relay-proto.workspace = true
+zeroclaw-rpc-proto.workspace = true
 zeroclaw-commands.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
@@ -110,7 +111,12 @@ default = ["observability-prometheus", "schema-export"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 sandbox-landlock = ["dep:landlock"]
-schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-graph/schema-export"]
+schema-export = [
+    "dep:schemars",
+    "zeroclaw-config/schema-export",
+    "zeroclaw-rpc-proto/schema-export",
+    "zeroclaw-sop-graph/schema-export",
+]
 
 
 browser-native = []
