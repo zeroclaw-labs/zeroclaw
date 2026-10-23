@@ -778,6 +778,12 @@ rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
         pub set: bool,
+        /// A pre-existing validation error on an unrelated section that did not
+        /// block this write. Absent when the whole config validates after the
+        /// write or the remaining error is the expected empty companion of a
+        /// staged entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pre_existing_validation_error: Option<String>,
         /// Exact publication committed by this request, when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub revision: Option<crate::config_application::PublishedConfigRevision>,

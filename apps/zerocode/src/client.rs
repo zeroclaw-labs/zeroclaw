@@ -88,6 +88,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const CONFIG_LIST: &str = "config/list";
     pub const CONFIG_SET: &str = "config/set";
+    pub const CONFIG_VALIDATE: &str = "config/validate";
     pub const CONFIG_STATUS: &str = "config/status";
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
@@ -2371,18 +2372,25 @@ impl RpcClient {
         Ok(result.entries)
     }
 
-    pub async fn config_set(
-        &self,
-        prop: &str,
-        value: Value,
-    ) -> Result<Option<crate::wire::PublishedConfigRevision>> {
+    pub async fn config_set(&self, prop: &str, value: Value) -> Result<ConfigSetOutcome> {
         let result: ConfigSetResult = self
             .call(
                 method::CONFIG_SET,
                 serde_json::json!({ "prop": prop, "value": value }),
             )
             .await?;
-        Ok(result.revision)
+        Ok(ConfigSetOutcome {
+            revision: result.revision,
+            pre_existing_validation_error: result.pre_existing_validation_error,
+        })
+    }
+
+    pub async fn config_validate(&self, agent: Option<&str>) -> Result<ConfigValidateResult> {
+        self.call(
+            method::CONFIG_VALIDATE,
+            serde_json::json!({ "agent": agent }),
+        )
+        .await
     }
 
     pub async fn config_delete(
@@ -3247,6 +3255,20 @@ pub struct ConfigListResult {
 pub struct ConfigSetResult {
     #[serde(default)]
     pub revision: Option<crate::wire::PublishedConfigRevision>,
+    /// A pre-existing validation error on an unrelated section that did not
+    /// block this write; absent when the whole config validates after the
+    /// write.
+    #[serde(default)]
+    pub pre_existing_validation_error: Option<String>,
+}
+
+/// Outcome of one `config/set` write: the committed publication revision
+/// (when the daemon reports one) plus any pre-existing validation error on an
+/// unrelated section that did not block the write.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigSetOutcome {
+    pub revision: Option<crate::wire::PublishedConfigRevision>,
+    pub pre_existing_validation_error: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -3350,6 +3372,35 @@ mod initialize_version_tests {
 }
 
 #[cfg(test)]
+mod config_set_result_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_pre_existing_validation_error_alongside_revision() {
+        let parsed: ConfigSetResult = serde_json::from_value(json!({
+            "revision": {"epoch": "e", "sequence": 1},
+            "pre_existing_validation_error": "agents.other.model_provider: dangling reference"
+        }))
+        .unwrap();
+        assert!(parsed.revision.is_some());
+        assert_eq!(
+            parsed.pre_existing_validation_error.as_deref(),
+            Some("agents.other.model_provider: dangling reference")
+        );
+    }
+
+    #[test]
+    fn missing_pre_existing_validation_error_defaults_to_none() {
+        let parsed: ConfigSetResult = serde_json::from_value(json!({
+            "revision": {"epoch": "e", "sequence": 1}
+        }))
+        .unwrap();
+        assert!(parsed.pre_existing_validation_error.is_none());
+    }
+}
+
+#[cfg(test)]
 mod initialize_timeout_tests {
     use super::*;
 
@@ -3381,6 +3432,13 @@ pub struct ConfigDeleteResult {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigReloadResult {}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConfigValidateResult {
+    pub valid: bool,
+    pub error: Option<String>,
+}
 
 /// One selectable locale (`locales/list`).
 #[derive(Debug, Clone, serde::Deserialize)]

@@ -1034,6 +1034,7 @@ cli-config-legend = Leyenda: 💉 anulado por entorno  🔒 secreto
 cli-config-secret-set = {$path} está establecido (secreto cifrado — valor no mostrado)
 cli-config-secret-unset = {$path} no está establecido (secreto cifrado)
 cli-config-updated = {$path} actualizado.
+cli-config-pre-existing-validation-warning = advertencia: la configuración sigue teniendo un error de validación preexistente: {$error}
 cli-config-review-hint = Ejecuta `zeroclaw config list` para revisar y luego establece los campos requeridos.
 cli-config-catalog-unavailable-manual = {"  "}⚠ El catálogo de {$provider} no está disponible ({$error}); introduce manualmente el ID del modelo.
 model-switch-catalog-failed = No se pudo cargar el catálogo del perfil de proveedor configurado {$provider}: {$error}
