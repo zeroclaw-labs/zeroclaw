@@ -425,6 +425,8 @@ impl ToolSearchTool {
 /// Keep the existing function envelope while escaping descriptions as JSON
 /// and retaining any declared structured-output schema and parameter domains.
 fn write_schema(output: &mut String, spec: &ToolSpec) -> serde_json::Result<()> {
+    let current = crate::send_via::contextual_discovery_spec(spec);
+    let spec = current.as_ref().unwrap_or(spec);
     let _ = write!(
         output,
         "<function>{{\"name\": {}, \"description\": {}, \"parameters\": {}",
@@ -454,6 +456,50 @@ mod tests {
         DeferredMcpToolStub, build_deferred_tools_section, build_deferred_tools_section_filtered,
     };
     use crate::mcp_protocol::McpToolDef;
+
+    #[tokio::test]
+    async fn send_via_discovery_uses_current_turn_without_rewriting_shared_catalog() {
+        let state = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let cached = ToolSpec::new(
+            "send_via",
+            "cached metadata",
+            serde_json::json!({"type": "object"}),
+        );
+        state
+            .lock()
+            .unwrap()
+            .set_deferred_builtin_specs(vec![cached.clone()]);
+        let search = ToolSearchTool::for_builtin_schemas(Arc::clone(&state));
+        let query = serde_json::json!({"query": "select:send_via"});
+        let background = search.execute(query.clone()).await.unwrap();
+        assert!(
+            background
+                .output
+                .contains("\"required\":[\"target\",\"body\"]")
+        );
+
+        let routing = Arc::new(Mutex::new(Vec::new()));
+        let channel = crate::send_via::TURN_ROUTING
+            .scope(Some(routing), search.execute(query.clone()))
+            .await
+            .unwrap();
+        assert!(channel.output.contains("routing instruction"));
+        assert!(
+            !channel
+                .output
+                .contains("\"required\":[\"target\",\"body\"]")
+        );
+        let background_again = search.execute(query).await.unwrap();
+        assert!(
+            background_again
+                .output
+                .contains("\"required\":[\"target\",\"body\"]")
+        );
+        let guard = state.lock().unwrap();
+        let retained = guard.deferred_builtin_specs().next().unwrap();
+        assert_eq!(retained.description, cached.description);
+        assert_eq!(retained.parameters, cached.parameters);
+    }
 
     async fn make_deferred_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
         let registry = Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
