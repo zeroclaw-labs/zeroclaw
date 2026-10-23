@@ -571,10 +571,15 @@ OAuth-backed Qwen accounts use the same slot with `auth_mode = "o_auth"`.
 
 ```toml
 [providers.models.minimax.intl]
-model    = "MiniMax-M3"                       # or MiniMax-M2.7, MiniMax-M2.7-highspeed
+model    = "MiniMax-M3.1-Flash"               # or MiniMax-M3
 api_key  = "..."
 endpoint = "intl"                            # variants: cn, intl
 ```
+
+The direct MiniMax fallback catalog recommends `MiniMax-M3.1-Flash` first, then
+`MiniMax-M3`. Discovered MiniMax text choices use the same pair; gateway IDs and
+returned `:free` routes are preserved without adding unavailable routes. Existing
+saved or explicitly entered model IDs remain valid configuration choices.
 
 For MiniMax's Anthropic-compatible API, use `[providers.models.anthropic.minimax]` with `uri = "https://api.minimax.io/anthropic"` (Global) or `uri = "https://api.minimaxi.com/anthropic"` (China) instead.
 

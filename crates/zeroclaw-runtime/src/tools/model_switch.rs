@@ -363,7 +363,7 @@ impl ModelSwitchTool {
             .unwrap_or(model_provider.as_str());
         let provider_family = provider_family.to_lowercase();
 
-        let models: Vec<String> = match self.resolve_catalog(&model_provider).await {
+        let mut models: Vec<String> = match self.resolve_catalog(&model_provider).await {
             Ok(live) => live,
             Err(error) => {
                 let error = zeroclaw_providers::sanitize_api_error(&error.to_string());
@@ -395,6 +395,8 @@ impl ModelSwitchTool {
                 });
             }
         };
+
+        zeroclaw_providers::catalog::refresh_minimax_text_choices(&model_provider, &mut models);
 
         if models.is_empty() {
             return Ok(ToolResult {
@@ -929,6 +931,46 @@ mod tests {
             "unexpected error: {:?}",
             result.error
         );
+    }
+
+    #[tokio::test]
+    async fn minimax_list_models_refreshes_choices_but_explicit_legacy_selection_survives() {
+        let mut config = Config::default();
+        config.providers.models.ensure("minimax", "intl").unwrap();
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
+            .with_catalog_resolver(|provider_ref| async move {
+                assert_eq!(provider_ref, "minimax.intl");
+                Ok(vec![
+                    "MiniMax-M2.7".into(),
+                    "MiniMax-M3".into(),
+                    "speech-2.8-hd".into(),
+                    "MiniMax-M3.1-Flash".into(),
+                ])
+            });
+        let result = tool
+            .execute(json!({ "action": "list_models", "model_provider": "minimax.intl" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            output["models"],
+            json!(["MiniMax-M3.1-Flash", "speech-2.8-hd", "MiniMax-M3"])
+        );
+        with_switch_state(|state| {
+            let result = tool
+                .handle_set(&json!({
+                    "model_provider": "minimax.intl",
+                    "model": "MiniMax-M2.7"
+                }))
+                .unwrap();
+            assert!(result.success);
+            assert_eq!(
+                pending_switch(&state),
+                Some(("minimax.intl".into(), "MiniMax-M2.7".into()))
+            );
+        })
+        .await;
     }
 
     #[tokio::test]

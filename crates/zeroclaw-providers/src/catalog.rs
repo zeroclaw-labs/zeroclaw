@@ -8,6 +8,7 @@ use serde::Deserialize;
 const NEARAI_CATALOG_URL: &str = "https://cloud-api.near.ai/v1/model/list";
 const ATLASCLOUD_CATALOG_URL: &str = "https://api.atlascloud.ai/v1/models";
 const FETCH_TIMEOUT_SECS: u64 = 10;
+const MINIMAX_TEXT_MODELS: [&str; 2] = ["MiniMax-M3.1-Flash", "MiniMax-M3"];
 
 /// `(models.dev key, openrouter.ai vendor prefix)` for a family name.
 /// Either or both can be `None` for families with no public catalog
@@ -198,9 +199,16 @@ async fn list_atlascloud_models() -> Result<Vec<String>> {
 }
 
 /// Probe the catalog for `family` without constructing a live provider.
-/// Returns the union of every known public catalog source. Errors if
-/// `family` is unknown or has no public catalog source set.
+/// Returns direct MiniMax defaults or the first available public catalog.
+/// Errors if `family` is unknown or has no catalog source set.
 pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
+    if family == "minimax" {
+        // Direct API IDs come from MiniMax, not a gateway's route catalog.
+        return Ok(MINIMAX_TEXT_MODELS
+            .into_iter()
+            .map(str::to_string)
+            .collect());
+    }
     if family == "nearai" {
         return list_nearai_models().await;
     }
@@ -221,6 +229,70 @@ pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
         return crate::openrouter_catalog::list_models_for_vendor(p).await;
     }
     anyhow::bail!("no public catalog for family {family:?}")
+}
+
+fn minimax_text_slug(provider: &str, model: &str) -> Option<String> {
+    let lower = model.to_ascii_lowercase();
+    let family = provider.split('.').next().unwrap_or(provider);
+    let slug = if let Some(route) = lower.strip_prefix("minimax/") {
+        route
+    } else if let Some(route) = lower.strip_prefix("opencode/") {
+        route
+    } else if matches!(family, "minimax" | "opencode") {
+        lower.as_str()
+    } else {
+        return None;
+    };
+    let numbered_family = ["minimax-m", "abab"].iter().any(|prefix| {
+        slug.strip_prefix(prefix)
+            .and_then(|suffix| suffix.as_bytes().first())
+            .is_some_and(u8::is_ascii_digit)
+    });
+    (numbered_family
+        || ["minimax-text", "minimax-vl", "minimax-01"]
+            .iter()
+            .any(|prefix| slug.starts_with(prefix)))
+    .then(|| slug.to_string())
+}
+
+fn current_minimax_text_rank(provider: &str, model: &str) -> Option<usize> {
+    let slug = minimax_text_slug(provider, model)?;
+    let gateway = model.to_ascii_lowercase().starts_with("minimax/")
+        || provider.split('.').next() == Some("opencode");
+    let underlying = if gateway {
+        slug.strip_suffix(":free")
+            .or_else(|| slug.strip_suffix("-free"))
+            .unwrap_or(&slug)
+    } else {
+        &slug
+    };
+    MINIMAX_TEXT_MODELS
+        .iter()
+        .position(|id| underlying.eq_ignore_ascii_case(id))
+}
+
+/// Refresh discovered MiniMax text choices without rewriting IDs or adding routes.
+/// Bare IDs are interpreted only for MiniMax/OpenCode, preserving custom catalogs.
+pub fn refresh_minimax_text_choices(provider: &str, models: &mut Vec<String>) {
+    models.retain(|model| {
+        minimax_text_slug(provider, model).is_none()
+            || current_minimax_text_rank(provider, model).is_some()
+    });
+    let mut current: Vec<String> = models
+        .iter()
+        .filter(|model| current_minimax_text_rank(provider, model).is_some())
+        .cloned()
+        .collect();
+    current.sort_by_key(|model| current_minimax_text_rank(provider, model));
+    let mut current = current.into_iter();
+    // Keep other vendors in their existing slots while preferring Flash over M3.
+    for model in models.iter_mut() {
+        if current_minimax_text_rank(provider, model).is_some()
+            && let Some(preferred) = current.next()
+        {
+            *model = preferred;
+        }
+    }
 }
 
 #[must_use]
@@ -245,7 +317,13 @@ pub fn sort_model_catalog_for_chat(provider: &str, models: Vec<String>) -> Optio
             .then_with(|| a.1.cmp(&b.1))
             .then_with(|| a.2.cmp(&b.2))
     });
-    Some(ranked.into_iter().map(|(_, _, model)| model).collect())
+    let mut models = ranked.into_iter().map(|(_, _, model)| model).collect();
+    refresh_minimax_text_choices(provider, &mut models);
+    if models.is_empty() {
+        None
+    } else {
+        Some(models)
+    }
 }
 
 fn chat_model_rank_lower(provider: &str, model_l: &str) -> i32 {
@@ -611,6 +689,143 @@ mod tests {
         assert_eq!(sorted[0], "anthropic/claude-sonnet-4");
         assert_eq!(sorted[1], "openai/gpt-4.1");
         assert!(!sorted.iter().any(|m| m == "some/image-model"));
+    }
+
+    #[tokio::test]
+    async fn minimax_direct_catalog_uses_current_api_ids_without_network() {
+        assert_eq!(
+            list_models_for_family("minimax").await.unwrap(),
+            vec!["MiniMax-M3.1-Flash", "MiniMax-M3"]
+        );
+    }
+
+    #[tokio::test]
+    async fn minimax_gateway_catalog_filters_through_configured_http_provider() {
+        let app = axum::Router::new().route(
+            "/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "data": [
+                        {"id": "minimax/minimax-m2.7"},
+                        {"id": "minimax/minimax-m3"},
+                        {"id": "openai/gpt-5"},
+                        {"id": "minimax/minimax-m3.1-flash:free"}
+                    ]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = zeroclaw_config::schema::Config::default();
+        let profile = config.providers.models.ensure("openai", "gateway").unwrap();
+        profile.uri = Some(format!("http://{address}"));
+        profile.api_key = Some("catalog-test-key".into());
+        profile.model = Some("minimax/minimax-m2.7".into());
+        let (models, _, live) = model_catalog_with_config_result(Some(&config), "openai.gateway")
+            .await
+            .unwrap();
+        server.abort();
+        assert!(live);
+        assert_eq!(
+            models,
+            vec![
+                "minimax/minimax-m3.1-flash:free",
+                "minimax/minimax-m3",
+                "openai/gpt-5",
+            ]
+        );
+        assert_eq!(
+            config
+                .providers
+                .models
+                .find("openai", "gateway")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
+    }
+
+    #[test]
+    fn minimax_chat_choices_prefer_flash_and_remove_legacy_variants() {
+        let models = [
+            "MiniMax-M2.7",
+            "MiniMax-M3",
+            "MiniMax-M3.1-Flash",
+            "MiniMax-M2.7-highspeed",
+            "MiniMax-M1",
+            "abab6.5s-chat",
+            "MiniMax-Text-01",
+            "MiniMax-VL-01",
+            "minimax/minimax-01",
+            "MiniMax-M3-preview",
+        ];
+        assert_eq!(
+            sort_model_catalog_for_chat("minimax", models.map(String::from).to_vec()).unwrap(),
+            vec!["MiniMax-M3.1-Flash", "MiniMax-M3"]
+        );
+        assert!(sort_model_catalog_for_chat("minimax", vec!["MiniMax-M2.7".into()]).is_none());
+    }
+
+    #[test]
+    fn opencode_free_route_is_ranked_before_m3_and_legacy_free_is_removed() {
+        let models = vec![
+            "opencode/minimax-m3".into(),
+            "opencode/minimax-m2.1-free".into(),
+            "opencode/minimax-m3.1-flash-free".into(),
+            "custom/minimax-m2.1-free".into(),
+            "custom/model".into(),
+        ];
+        let models = sort_model_catalog_for_chat("opencode", models).unwrap();
+        assert_eq!(
+            models,
+            vec![
+                "opencode/minimax-m3.1-flash-free",
+                "opencode/minimax-m3",
+                "custom/minimax-m2.1-free",
+                "custom/model",
+            ]
+        );
+    }
+
+    #[test]
+    fn minimax_gateway_choices_preserve_routes_other_vendors_and_non_text_models() {
+        let mut models = [
+            "openai/gpt-5",
+            "minimax/minimax-m3",
+            "minimax/minimax-m2.7:free",
+            "minimax/speech-2.8-hd",
+            "minimax/minimax-m3.1-flash:free",
+            "minimax/video-01",
+            "minimax-music3",
+            "minimax-embedding-01",
+            "custom/model",
+            "minimax/minimax-m3-preview",
+        ]
+        .map(String::from)
+        .to_vec();
+        refresh_minimax_text_choices("minimax", &mut models);
+        assert_eq!(
+            models,
+            vec![
+                "openai/gpt-5",
+                "minimax/minimax-m3.1-flash:free",
+                "minimax/speech-2.8-hd",
+                "minimax/minimax-m3",
+                "minimax/video-01",
+                "minimax-music3",
+                "minimax-embedding-01",
+                "custom/model",
+            ]
+        );
+        // A catalog with only M3 must not gain an unadvertised Flash route.
+        let mut models = vec!["minimax/minimax-m3".into()];
+        refresh_minimax_text_choices("minimax", &mut models);
+        assert_eq!(models, vec!["minimax/minimax-m3"]);
+        refresh_minimax_text_choices("opencode", &mut Vec::new());
     }
 
     #[test]
