@@ -2974,6 +2974,12 @@ pub struct MigrateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
     pub schema_version: u32,
+    /// What the migration changed or assumed, one line each, as
+    /// `zeroclaw config migrate` reports them: a retired key removed, or a
+    /// missing `schema_version` read as V1 or V3. Key paths and reasons only,
+    /// never values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 pub async fn handle_migrate(
@@ -3003,7 +3009,7 @@ pub async fn handle_migrate(
         }
     };
 
-    let migrated = match zeroclaw_config::migration::migrate_file(&raw) {
+    let migrated = match zeroclaw_config::migration::migrate_file_with_notices(&raw) {
         Ok(out) => out,
         Err(e) => {
             return error_response(ConfigApiError::new(
@@ -3014,7 +3020,14 @@ pub async fn handle_migrate(
     };
 
     match migrated {
-        Some(new_content) => {
+        Some((new_content, notices)) => {
+            // The `.bak` written below is replaced by the next save. Keep the
+            // pre-upgrade original as well, once per version, as
+            // `config migrate` and the save paths do.
+            let from_version = toml::from_str::<toml::Value>(&raw)
+                .ok()
+                .and_then(|value| zeroclaw_config::migration::detect_version(&value).ok())
+                .filter(|version| *version < zeroclaw_config::migration::CURRENT_SCHEMA_VERSION);
             let backup_path = config_path.with_extension("toml.bak");
             let parent = match config_path.parent() {
                 Some(p) => p.to_path_buf(),
@@ -3121,6 +3134,19 @@ pub async fn handle_migrate(
                     }
 
                     // 2. Backup BEFORE replacing the original.
+                    if let Some(version) = from_version
+                        && let Err(e) = zeroclaw_config::schema::keep_pre_upgrade_backup(
+                            &replace_config_path,
+                            version,
+                        )
+                        .await
+                    {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return Err(ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!("{e:#}"),
+                        ));
+                    }
                     if let Err(e) = tokio::fs::copy(&replace_config_path, &backup_path).await {
                         let _ = tokio::fs::remove_file(&temp_path).await;
                         return Err(ConfigApiError::new(
@@ -3178,6 +3204,10 @@ pub async fn handle_migrate(
                 migrated: true,
                 backup_path: Some(response_backup_path),
                 schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+                notices: notices
+                    .iter()
+                    .map(zeroclaw_config::migration::MigrationNotice::message)
+                    .collect(),
             })
             .into_response()
         }
@@ -3185,6 +3215,7 @@ pub async fn handle_migrate(
             migrated: false,
             backup_path: None,
             schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+            notices: Vec::new(),
         })
         .into_response(),
     }
@@ -4041,6 +4072,36 @@ mod tests {
         }
     }
 
+    /// The dashboard's migrate reports what it changed, as `config migrate`
+    /// does, so an operator learns that a retired table was removed.
+    #[tokio::test]
+    async fn migration_reports_its_notices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            "schema_version = 3\n\n[security.nevis]\nenabled = true\n",
+        )
+        .await
+        .unwrap();
+        let state = test_state(zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        });
+
+        let (status, json) = response_json(handle_migrate(State(state), None).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let notices = json["notices"].as_array().expect("notices are returned");
+        assert!(
+            notices.iter().any(|notice| notice
+                .as_str()
+                .is_some_and(|n| n.contains("security.nevis"))),
+            "{json}"
+        );
+    }
+
     #[tokio::test]
     async fn migration_preserves_runtime_paths_and_publishes_schema_version() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4058,10 +4119,18 @@ mod tests {
             ..Default::default()
         });
 
+        let original = tokio::fs::read_to_string(&config_path).await.unwrap();
         let (status, json) = response_json(handle_migrate(State(state.clone()), None).await).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["migrated"], true);
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("selected-config.toml.v2.backup"))
+                .await
+                .unwrap(),
+            original,
+            "the pre-upgrade original is kept where the next save cannot replace it"
+        );
         assert_eq!(
             state.config.read().config_path,
             config_path,
@@ -4542,6 +4611,10 @@ mod tests {
         assert!(
             !config_path.with_extension("toml.bak").exists(),
             "no backup may be written before the candidate is accepted"
+        );
+        assert!(
+            !install.path().join("config.toml.v1.backup").exists(),
+            "nor the lasting pre-upgrade copy"
         );
         let residue: Vec<std::ffi::OsString> = std::fs::read_dir(install.path())
             .unwrap()

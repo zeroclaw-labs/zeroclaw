@@ -2167,7 +2167,14 @@ mod tests {
         config.save().await.unwrap();
 
         let current = std::fs::read_to_string(&cfg_path).unwrap();
-        let legacy = current.replacen("schema_version = 3", "schema_version = 2", 1);
+        let legacy = current.replacen(
+            &format!(
+                "schema_version = {}",
+                zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+            ),
+            "schema_version = 2",
+            1,
+        );
         assert_ne!(current, legacy, "fixture must downgrade the schema label");
         std::fs::write(&cfg_path, &legacy).unwrap();
 

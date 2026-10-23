@@ -334,12 +334,15 @@ impl V2Config {
         rename_route_provider_field(&mut passthrough, "model_routes");
         rename_route_provider_field(&mut passthrough, "embedding_routes");
 
-        // Promote V2 [tts.<type>] / [transcription.<family>] sub-blocks
-        // into V3 [<kind>_providers.<type>.default]. Global
-        // default_provider keys are dropped — V3 has no such concept;
-        // each agent declares its own provider.
+        // Promote V2 [tts.<type>] sub-blocks into V3
+        // [providers.tts.<type>.<alias>]; the global tts default_provider is
+        // dropped — V3 has no such concept; each agent declares its own
+        // provider. V2's [transcription] settings stay where they are: the
+        // current schema still reads them there, spelled as V2 spelled them,
+        // while its provider aliases spell some differently (`uri` for local
+        // Whisper's `url`, no endpoint for Groq). The transcription
+        // default-provider keys are retired by `RETIRED_KEYS`.
         fold_v2_tts_into_providers(&mut passthrough, &mut new_providers);
-        fold_v2_transcription_into_providers(&mut passthrough, &mut new_providers);
 
         // V3 collapses model/tts/transcription providers under a single
         // top-level `[providers]` table, with one sub-key per category.
@@ -860,6 +863,51 @@ fn normalize_provider_type(
 /// rewrite of a vision reference needs that provenance so it cannot infer
 /// source selection from the post-canonicalization alias count (variants such
 /// as `qwen-code` collapse onto the same `qwen.default` slot).
+/// Rewrite one V2 profile, keyed `provider_id`, in place into its V3 alias
+/// entry. Returns the canonical family and the alias it is filed under.
+fn rewrite_v2_profile(provider_id: &str, config: &mut toml::Value) -> (String, String) {
+    // Colon-URL form like `"anthropic-custom:https://..."`: split the URL
+    // out into `uri` and use only the prefix as the seed for normalization.
+    let (raw_type, url) = split_colon_url_provider(provider_id);
+    if let Some(url) = url
+        && let toml::Value::Table(t) = &mut *config
+    {
+        t.entry("uri".to_string())
+            .or_insert(toml::Value::String(url));
+    }
+
+    if let toml::Value::Table(t) = &mut *config {
+        fold_base_url_api_path_into_uri(t);
+    }
+
+    let (provider_type, alias, extras) = normalize_provider_type(&raw_type, "default");
+
+    // Inject family-specific extras (endpoint, auth_mode, wire_api,
+    // requires_openai_auth, uri) onto the alias entry table — overrides
+    // by the operator's own config win via .or_insert.
+    if let toml::Value::Table(t) = config {
+        for (field, value) in extras {
+            t.entry(field.to_string()).or_insert(value);
+        }
+    }
+    (provider_type, alias)
+}
+
+/// A V2 `[providers.models.<provider_id>]` profile as the V2 -> V3 step
+/// files it: the canonical family (`grok` is `xai`, a `custom:` URL is
+/// `custom`) and the fields of the alias it becomes.
+pub(crate) fn v2_profile_as_v3_entry(
+    provider_id: &str,
+    profile: &toml::Table,
+) -> (String, toml::Table) {
+    let mut config = toml::Value::Table(profile.clone());
+    let (family, _) = rewrite_v2_profile(provider_id, &mut config);
+    match config {
+        toml::Value::Table(entry) => (family, entry),
+        _ => (family, toml::Table::new()),
+    }
+}
+
 fn alias_provider_models(
     models: Option<toml::Value>,
 ) -> (
@@ -876,31 +924,7 @@ fn alias_provider_models(
         std::collections::BTreeSet<String>,
     > = std::collections::HashMap::new();
     for (provider_id, mut config) in flat {
-        // Colon-URL form like `"anthropic-custom:https://..."`: split the URL
-        // out into `uri` and use only the prefix as the seed for normalization.
-        let (raw_type, url) = split_colon_url_provider(&provider_id);
-        if let Some(url) = url
-            && let toml::Value::Table(t) = &mut config
-        {
-            t.entry("uri".to_string())
-                .or_insert(toml::Value::String(url));
-        }
-
-        if let toml::Value::Table(t) = &mut config {
-            fold_base_url_api_path_into_uri(t);
-        }
-
-        let (provider_type, alias, extras) = normalize_provider_type(&raw_type, "default");
-
-        // Inject family-specific extras (endpoint, auth_mode, wire_api,
-        // requires_openai_auth, uri) onto the alias entry table — overrides
-        // by the operator's own config win via .or_insert.
-        if let toml::Value::Table(t) = &mut config {
-            for (field, value) in extras {
-                t.entry(field.to_string()).or_insert(value);
-            }
-        }
-
+        let (provider_type, alias) = rewrite_v2_profile(&provider_id, &mut config);
         let entry = aliased
             .entry(provider_type.clone())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -2550,93 +2574,31 @@ fn fold_v2_tts_into_providers(passthrough: &mut toml::Table, new_providers: &mut
     }
 
     if !tts_aliased.is_empty() {
-        new_providers.insert("tts".to_string(), toml::Value::Table(tts_aliased));
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "[tts.<type>] sub-blocks promoted to [tts_providers.<type>.default]"
-        );
-    }
-}
-
-fn fold_v2_transcription_into_providers(
-    passthrough: &mut toml::Table,
-    new_providers: &mut toml::Table,
-) {
-    let Some(toml::Value::Table(transcription_table)) = passthrough.get_mut("transcription") else {
-        return;
-    };
-
-    let mut transcription_aliased = toml::Table::new();
-
-    // Per-family sub-blocks: move to transcription_providers.<family>.default.
-    const V3_TRANSCRIPTION_FAMILIES: &[&str] = &[
-        "openai",
-        "deepgram",
-        "assemblyai",
-        "google",
-        "local_whisper",
-    ];
-    for family in V3_TRANSCRIPTION_FAMILIES {
-        if let Some(value) = transcription_table.remove(*family) {
-            let mut wrapped = toml::Table::new();
-            wrapped.insert("default".to_string(), value);
-            transcription_aliased.insert((*family).to_string(), toml::Value::Table(wrapped));
-        }
-    }
-
-    let mut groq_entry = toml::Table::new();
-    for groq_field in &["api_key", "api_url", "model", "language", "initial_prompt"] {
-        if let Some(v) = transcription_table.remove(*groq_field) {
-            groq_entry.insert((*groq_field).to_string(), v);
-        }
-    }
-    if !groq_entry.is_empty() {
-        let mut wrapped = toml::Table::new();
-        wrapped.insert("default".to_string(), toml::Value::Table(groq_entry));
-        transcription_aliased.insert("groq".to_string(), toml::Value::Table(wrapped));
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "[transcription] Groq fields promoted to [transcription_providers.groq.default]"
-        );
-    }
-
-    // Drop legacy default-provider keys — V3 has no global default-provider
-    // field. Operators select transcription per agent
-    // (`agent.<X>.transcription_provider`).
-    for legacy_default in &[
-        "default_provider",
-        "default_model_provider",
-        "default_transcription_provider",
-    ] {
-        if transcription_table.remove(*legacy_default).is_some() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"legacy_default": legacy_default})),
-                &format!(
-                    "[transcription].{legacy_default} dropped (V3 has no global default-provider; set agent.<X>.transcription_provider instead)"
-                )
-            );
-        }
-    }
-
-    if !transcription_aliased.is_empty() {
-        // Merge into existing providers.transcription if any (operator may
-        // have written V3-style entries already).
-        let providers_transcription = new_providers
-            .entry("transcription".to_string())
+        // Into any `[providers.tts]` the file already holds, never over it:
+        // an alias already named `default` keeps its name, and the V2 block
+        // takes the next free one.
+        let providers_tts = new_providers
+            .entry("tts".to_string())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        if let Some(existing) = providers_transcription.as_table_mut() {
-            for (family, value) in transcription_aliased {
-                existing.entry(family).or_insert(value);
+        if let Some(existing) = providers_tts.as_table_mut() {
+            for (ty, wrapped) in tts_aliased {
+                let family = existing
+                    .entry(ty)
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let (Some(family), toml::Value::Table(wrapped)) =
+                    (family.as_table_mut(), wrapped)
+                {
+                    for (alias, value) in wrapped {
+                        let alias = ensure_unique_key(family, alias);
+                        family.insert(alias, value);
+                    }
+                }
             }
         }
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "[transcription.<family>] sub-blocks promoted to [transcription_providers.<family>.default]"
+            "[tts.<type>] sub-blocks promoted to [tts_providers.<type>.default]"
         );
     }
 }
@@ -4518,8 +4480,7 @@ mod fs_db_migration_tests {
             "refused, left in place"
         );
 
-        ::zeroclaw_log::try_install_capture_subscriber();
-        let mut events = ::zeroclaw_log::subscribe_or_install();
+        let mut events = crate::capture_log_events();
         let again = migrate_v2_to_v3_install_filesystem(install).expect("second run");
 
         assert!(again.backup_dir.is_none(), "{again:?}");
