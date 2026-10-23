@@ -73,25 +73,45 @@ impl MarkdownMemory {
     async fn append_to_file(&self, path: &Path, content: &str) -> anyhow::Result<()> {
         self.ensure_dirs().await?;
 
-        let existing = if path.exists() {
-            fs::read_to_string(path).await.unwrap_or_default()
+        let row = format!("\n{content}\n");
+        let header = if path == self.core_path() {
+            "# Long-Term Memory\n\n".to_string()
         } else {
-            String::new()
+            let date = Local::now().format("%Y-%m-%d").to_string();
+            format!("# Daily Log — {date}\n\n")
         };
+        let first_write = format!("{header}{content}\n");
+        let path = path.to_path_buf();
 
-        let updated = if existing.is_empty() {
-            let header = if path == self.core_path() {
-                "# Long-Term Memory\n\n"
-            } else {
-                let date = Local::now().format("%Y-%m-%d").to_string();
-                &format!("# Daily Log — {date}\n\n")
-            };
-            format!("{header}{content}\n")
-        } else {
-            format!("{existing}\n{content}\n")
-        };
+        // Never read-modify-write: another handle or process can add a row, or
+        // be mid-truncate, between our read and our write. One `write_all` on an
+        // append handle lets the kernel place the row at the current end.
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::fs::OpenOptions;
+            use std::io::Write;
 
-        fs::write(path, updated).await?;
+            match OpenOptions::new().append(true).open(&path) {
+                Ok(mut file) => return file.write_all(row.as_bytes()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            // `create_new` so exactly one creator wins and the file gets created
+            // with content on this attempt; the loser falls back to append below.
+            // Known limitation: the winner's `create_new` and its `write_all` are
+            // two separate syscalls, so a loser can append its row in between and
+            // land before the header. Cosmetic only — `parse_entries_from_file`
+            // below drops every line starting with `#` regardless of position, so
+            // no row is lost and no entry is misread; see PR description.
+            match OpenOptions::new().create_new(true).append(true).open(&path) {
+                Ok(mut file) => file.write_all(first_write.as_bytes()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
+                    .append(true)
+                    .open(&path)?
+                    .write_all(row.as_bytes()),
+                Err(e) => Err(e),
+            }
+        })
+        .await??;
         Ok(())
     }
 
@@ -591,5 +611,156 @@ mod tests {
             recent.iter().any(|e| e.content.contains("standup")),
             "today's daily entry must be included when since is in the past"
         );
+    }
+
+    #[tokio::test]
+    async fn store_keeps_the_established_file_format() {
+        let (tmp, mem) = temp_workspace();
+        mem.store("a", "1", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "2", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let raw = std::fs::read_to_string(tmp.path().join("MEMORY.md")).unwrap();
+        assert_eq!(raw, "# Long-Term Memory\n\n- **a**: 1\n\n- **b**: 2\n");
+    }
+
+    #[tokio::test]
+    async fn store_keeps_prior_bytes_when_existing_file_is_not_valid_utf8() {
+        let (tmp, mem) = temp_workspace();
+        let path = tmp.path().join("MEMORY.md");
+        std::fs::write(&path, [b'#', b' ', 0xFF, 0xFE, b'\n']).unwrap();
+
+        mem.store("new", "newly stored", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.starts_with(&[b'#', b' ', 0xFF, 0xFE, b'\n']),
+            "prior bytes must survive a store"
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("- **new**: newly stored"));
+    }
+
+    // Append never reads, so it cannot tell "existing but empty" from
+    // "missing"; deciding whether a header is owed would require reading.
+    #[tokio::test]
+    async fn store_adds_no_header_to_an_existing_but_empty_file() {
+        let (tmp, mem) = temp_workspace();
+        let path = tmp.path().join("MEMORY.md");
+        std::fs::write(&path, b"").unwrap();
+
+        mem.store("new", "newly stored", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("# Long-Term Memory"),
+            "an existing empty file must not retroactively gain a header: {raw:?}"
+        );
+        assert!(raw.contains("- **new**: newly stored"));
+    }
+
+    // `create_new` refuses a path that already exists as a symlink, dangling
+    // or not, so a dangling MEMORY.md symlink must now fail instead of
+    // silently creating a file at the link's target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_fails_on_a_dangling_symlink_instead_of_creating_its_target() {
+        let (tmp, mem) = temp_workspace();
+        let target = tmp.path().join("nowhere.md");
+        let link = tmp.path().join("MEMORY.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = mem
+            .store("new", "newly stored", MemoryCategory::Core, None)
+            .await
+            .expect_err("a dangling symlink must not be silently created through");
+
+        assert!(
+            !target.exists(),
+            "the link's target must not be created: {err}"
+        );
+    }
+
+    // Each task builds its own `MarkdownMemory`, as the memory factory does per
+    // call, so no per-instance lock can mask a lost update.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_stores_from_independent_instances_lose_no_row() {
+        let tmp = TempDir::new().unwrap();
+        for round in 0..20 {
+            let dir = tmp.path().join(format!("r{round}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut seed = String::from("# Long-Term Memory\n\n");
+            for p in 0..20 {
+                seed.push_str(&format!("- **prev{p}**: old\n"));
+            }
+            std::fs::write(dir.join("MEMORY.md"), seed).unwrap();
+
+            let mut tasks = tokio::task::JoinSet::new();
+            for i in 0..8 {
+                let dir = dir.clone();
+                tasks.spawn(async move {
+                    MarkdownMemory::new("markdown", &dir)
+                        .store(&format!("row{i}"), "v", MemoryCategory::Core, None)
+                        .await
+                });
+            }
+            while let Some(res) = tasks.join_next().await {
+                res.unwrap().unwrap();
+            }
+
+            let raw = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+            for p in 0..20 {
+                assert!(
+                    raw.contains(&format!("**prev{p}**")),
+                    "round {round}: prev{p} lost"
+                );
+            }
+            for i in 0..8 {
+                assert!(
+                    raw.contains(&format!("**row{i}**")),
+                    "round {round}: row{i} lost"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_stores_write_one_header_and_every_row() {
+        let tmp = TempDir::new().unwrap();
+        for round in 0..20 {
+            let dir = tmp.path().join(format!("n{round}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
+            for i in 0..16 {
+                let dir = dir.clone();
+                tasks.spawn(async move {
+                    MarkdownMemory::new("markdown", &dir)
+                        .store(&format!("row{i}"), "v", MemoryCategory::Core, None)
+                        .await
+                });
+            }
+            while let Some(res) = tasks.join_next().await {
+                res.unwrap().unwrap();
+            }
+
+            let raw = std::fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+            assert_eq!(
+                raw.matches("# Long-Term Memory").count(),
+                1,
+                "round {round}"
+            );
+            for i in 0..16 {
+                assert!(
+                    raw.contains(&format!("**row{i}**")),
+                    "round {round}: row{i} lost"
+                );
+            }
+        }
     }
 }
