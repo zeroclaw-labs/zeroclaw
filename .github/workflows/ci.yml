@@ -703,6 +703,14 @@ jobs:
             --target x86_64-pc-windows-msvc \
             control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-recovery.log"
           grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-recovery.log"
+          cargo test --locked -p zeroclaw-config --lib \
+            --target x86_64-pc-windows-msvc \
+            platform::job_object::tests::a_confined_parent_takes_its_tree_down_when_killed -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-process-tree.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-process-tree.log"
+          cargo test --locked -p zeroclaw-config --lib \
+            --target x86_64-pc-windows-msvc \
+            platform::job_object::tests::a_breakaway_child_survives_its_parent -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-process-tree-breakaway.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-process-tree-breakaway.log"
 
   check:
     name: Check (${{ matrix.name }})
