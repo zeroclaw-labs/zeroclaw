@@ -7,6 +7,7 @@ import type {
   DiagResult,
   MemoryEntry,
   CostSummary,
+  OpenRouterCredits,
   CliTool,
   HealthSnapshot,
   Session,
@@ -2123,6 +2124,14 @@ export function getCostForAgent(alias: string): Promise<CostSummary> {
   const url = `/api/cost?agent=${encodeURIComponent(alias)}`;
   return apiFetch<CostSummary | { cost: CostSummary }>(url).then((data) =>
     unwrapField(data, "cost"),
+  );
+}
+
+/** Account-level OpenRouter credits. Returns null when the integration is not
+ * active, lacks a management key, or cannot currently reach the credits API. */
+export function getOpenRouterCredits(): Promise<OpenRouterCredits | null> {
+  return apiFetch<OpenRouterCredits | undefined>("/api/openrouter/credits").then(
+    (credits) => credits ?? null,
   );
 }
 
