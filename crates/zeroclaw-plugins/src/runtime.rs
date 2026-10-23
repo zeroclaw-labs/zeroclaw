@@ -128,35 +128,29 @@ pub async fn create_plugin_with_egress(
 pub async fn call_tool_metadata(plugin: &mut Plugin) -> Result<ToolMetadata> {
     let name = call_plugin!(
         plugin,
+        "tool.name failed",
         async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
-            wt(
-                bindings.zeroclaw_plugin_tool().call_name(store).await,
-                "tool.name failed",
-            )
+            bindings.zeroclaw_plugin_tool().call_name(store).await
         }
     )?;
     let description = call_plugin!(
         plugin,
+        "tool.description failed",
         async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
-            wt(
-                bindings
-                    .zeroclaw_plugin_tool()
-                    .call_description(store)
-                    .await,
-                "tool.description failed",
-            )
+            bindings
+                .zeroclaw_plugin_tool()
+                .call_description(store)
+                .await
         }
     )?;
     let schema_json = call_plugin!(
         plugin,
+        "tool.parameters-schema failed",
         async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
-            wt(
-                bindings
-                    .zeroclaw_plugin_tool()
-                    .call_parameters_schema(store)
-                    .await,
-                "tool.parameters-schema failed",
-            )
+            bindings
+                .zeroclaw_plugin_tool()
+                .call_parameters_schema(store)
+                .await
         }
     )?;
     let parameters_schema =
@@ -172,20 +166,31 @@ pub async fn call_tool_metadata(plugin: &mut Plugin) -> Result<ToolMetadata> {
 pub async fn call_execute(plugin: &mut Plugin, args_json: &[u8]) -> Result<ToolResult> {
     call_tool_execute!(
         plugin,
+        "tool.execute trapped",
         async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
-            let config = store.data_mut().public_config()?;
-            let input = inject_config(args_json, &config)?;
-            let result = wt(
-                bindings
-                    .zeroclaw_plugin_tool()
-                    .call_execute(store, &input)
-                    .await,
-                "tool.execute trapped",
-            )?
-            .map_err(|e| anyhow::Error::msg(format!("plugin execute returned error: {e}")))?;
-            Ok(into_tool_result(result))
+            // Config resolves inside the call's frame. A failure there is the
+            // host's, not Wasmtime's, so it rides inside `Ok` with its own text.
+            let input = match store
+                .data_mut()
+                .public_config()
+                .map_err(anyhow::Error::from)
+                .and_then(|config| inject_config(args_json, &config))
+            {
+                Ok(input) => input,
+                Err(error) => return Ok(Err(error)),
+            };
+            bindings
+                .zeroclaw_plugin_tool()
+                .call_execute(store, &input)
+                .await
+                .map(|result| {
+                    result.map_err(|e| {
+                        anyhow::Error::msg(format!("plugin execute returned error: {e}"))
+                    })
+                })
         }
-    )
+    )?
+    .map(into_tool_result)
 }
 
 fn into_tool_result(result: WitToolResult) -> ToolResult {

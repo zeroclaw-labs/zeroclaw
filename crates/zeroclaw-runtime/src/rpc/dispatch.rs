@@ -4808,9 +4808,7 @@ impl RpcDispatcher {
         // built from the prior generation (or publish midway through Agent
         // construction). Persistence lookup above does not depend on config and
         // deliberately remains outside this boundary.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_generation_guard = self.ctx.config_authority.lock_config_writer().await;
         let config = self.ctx.config.read().clone();
 
         // The wait for the config-generation lock above is also unbounded, and
@@ -5980,9 +5978,7 @@ impl RpcDispatcher {
         // generation. This path cannot block on it: config mutation waits for
         // live-session refresh while holding the same gate. A contended build
         // is therefore published pending and reconciled before prompt dispatch.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .try_lock_owned()
-            .ok();
+        let config_generation_guard = self.ctx.config_authority.try_lock_config_writer();
         let config = Box::new(self.ctx.config.read().clone());
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
@@ -6244,9 +6240,7 @@ impl RpcDispatcher {
     ) -> bool {
         // Acquire the gate (blocking) so we are guaranteed to read a config at
         // least as new as whatever committed while the Agent was being built.
-        let _gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _gate = ctx.config_authority.lock_config_writer().await;
         // Take the per-session ordering boundary for the whole publication,
         // the same guard `prepare_live_sessions_refresh` holds. Without it this
         // repair would be the only live-provider writer in the file that does
@@ -7490,9 +7484,7 @@ impl RpcDispatcher {
         // gate, so parking here with the gate held would block the very
         // task that wait is waiting on (and stall every other config write
         // until the timeout).
-        let _config_write_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _config_write_guard = self.ctx.config_authority.lock_config_writer().await;
 
         // Capture the session generation /before/ acquiring the per-session
         // update lock. If the session is replaced while we wait for the lock,
@@ -10698,6 +10690,9 @@ impl RpcDispatcher {
                 AgentStatusEntry {
                     alias: alias.clone(),
                     enabled: agent_cfg.enabled,
+                    runtime_profile: config
+                        .runtime_profile_for_agent(alias)
+                        .map(|_| agent_cfg.runtime_profile.trim().to_string()),
                     live_sessions: rpc,
                     persisted_sessions: persisted,
                     channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
@@ -13815,6 +13810,16 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => SessionUpdateEvent::BudgetWarning {
+            session_id: session_id.to_string(),
+            current_usd: *current_usd,
+            limit_usd: *limit_usd,
+            period: *period,
+        },
         _ => return None,
     };
 
@@ -14150,7 +14155,11 @@ mod tests {
     #[tokio::test]
     async fn local_session_factory_populates_channels_and_resume_preserves_them() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
         dispatcher.local_session_channel_factory = Some(session_factory_stub());
         dispatcher.set_tui_id_for_test(Some("tui-local".into()));
@@ -14454,7 +14463,11 @@ mod tests {
     #[tokio::test]
     async fn local_acp_rehydration_restores_session_channels() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let data_dir = config.data_dir.clone();
         let (mut dispatcher, sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
@@ -18643,6 +18656,11 @@ mod tests {
         std::fs::write(&secret, "outside every agent root").unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, started_rx, _release_tx) = gated_provider();
+        // A live session holds the resolved workspace, as `session/new` and
+        // rehydration store it. The raw temp-dir spelling can be an alias
+        // (`/var` on macOS, an 8.3 short name on Windows), and a scoped prompt
+        // refuses a session held under one before it ever judges an attachment
+        // source.
         install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
@@ -18650,7 +18668,7 @@ mod tests {
             provider,
             None,
             Some("user:alice"),
-            &agent_workspace,
+            &agent_workspace.canonicalize().unwrap(),
         )
         .await;
         (ctx, agent_workspace, inside, secret, started_rx)
@@ -27432,6 +27450,23 @@ mod tests {
     }
 
     #[test]
+    fn budget_warning_notification() {
+        let event = TurnEvent::BudgetWarning {
+            current_usd: 8.25,
+            limit_usd: 10.0,
+            period: zeroclaw_api::agent::BudgetWarningPeriod::Day,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "budget_warning");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["current_usd"], 8.25);
+        assert_eq!(v["params"]["limit_usd"], 10.0);
+        assert_eq!(v["params"]["period"], "day");
+    }
+
+    #[test]
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
@@ -28718,6 +28753,19 @@ mod tests {
         risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
 
         zeroclaw_config::schema::Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: vec![
+                    "calculator",
+                    "delegate",
+                    "sessions_list",
+                    "sessions_history",
+                    "sessions_current",
+                    "sessions_send",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
             data_dir: workspace_dir,
             config_path: tmp.path().join("config.toml"),
             providers,
@@ -28725,6 +28773,39 @@ mod tests {
             risk_profiles,
             ..zeroclaw_config::schema::Config::default()
         }
+    }
+
+    #[tokio::test]
+    async fn agents_status_runtime_profile_resolves_config_and_omits_unresolved_profiles() {
+        use zeroclaw_config::schema::RuntimeProfileConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .runtime_profiles
+            .insert("coding".into(), RuntimeProfileConfig::default());
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = " coding ".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config.clone());
+
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert_eq!(agent["runtime_profile"], "coding");
+
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = "missing".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config);
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert!(agent.get("runtime_profile").is_none());
     }
 
     fn make_acp_test_dispatcher(
@@ -35337,11 +35418,18 @@ mod tests {
         dispatcher
     }
 
-    fn make_shared_sessions_dispatcher(
+    /// Another connection's dispatcher on `first`'s daemon: it shares the
+    /// session store and the config write lock, as every connection shares
+    /// the daemon's one context in production, so it queues behind a
+    /// transaction `first` holds open. Its config is its own, so a successor
+    /// it builds stays distinguishable from stale work built from `first`'s.
+    fn make_second_connection_dispatcher(
+        first: &RpcContext,
         config: zeroclaw_config::schema::Config,
-        sessions: Arc<crate::rpc::session::SessionStore>,
     ) -> RpcDispatcher {
-        let ctx = RpcContext::minimal(config, sessions);
+        let authority =
+            crate::LiveConfigAuthority::for_tests_sharing_writer(config, &first.config_authority);
+        let ctx = RpcContext::for_authority(&authority, Arc::clone(&first.sessions));
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         dispatcher.set_authenticated_for_test();
@@ -35362,7 +35450,7 @@ mod tests {
             }),
         )));
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = crate::LiveConfigAuthority::new(config);
+        let authority = crate::LiveConfigAuthority::for_tests(config);
         let data_dir = authority.live_handle().read().data_dir.clone();
         let acp_session_store = Some(Arc::new(
             zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir)
@@ -39375,6 +39463,49 @@ mod tests {
         serde_json::from_str(&frame).expect("response frame is valid JSON")
     }
 
+    /// `config/validate` checks an opt-in tool's own settings only in a build
+    /// that carries the tool. A build without project intelligence accepts an
+    /// enabled section whose templates directory does not exist here; a
+    /// build with it still reports the config invalid.
+    #[tokio::test]
+    async fn config_validate_checks_an_opt_in_tool_only_where_it_is_compiled() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "root-operator".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir =
+            Some(tmp.path().join("absent-templates").display().to_string());
+        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
+
+        let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/validate", json!({})).await;
+        let compiled = OptInTool::ProjectIntel.compiled();
+        assert_eq!(response["result"]["valid"], json!(!compiled), "{response}");
+        if compiled {
+            assert!(
+                response["result"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("project_intel.templates_dir")),
+                "{response}"
+            );
+        }
+    }
+
     fn alice_user_sets() -> Value {
         json!([
             {"prop": "users.alice.uid", "value": 1001},
@@ -40686,7 +40817,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -40739,7 +40870,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -40928,7 +41059,7 @@ mod tests {
         runner.register(Box::new(_hook));
 
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -41522,9 +41653,7 @@ mod tests {
     where
         F: std::future::Future<Output = RpcResult> + Send + 'static,
     {
-        let guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let guard = ctx.config_authority.lock_config_writer().await;
         let task = zeroclaw_spawn::spawn!(rpc_call);
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -42497,6 +42626,14 @@ mod tests {
     /// meant to reach has to carry that caller's id: an unstamped session is
     /// invisible to it, and the test would exercise the ownership denial
     /// instead of whatever it meant to check.
+    ///
+    /// The session holds `workspace` as given, but `session/new` and
+    /// rehydration hold the resolved path, and a scoped caller's prompt,
+    /// steer, or resume refuses a session held under any other spelling. A
+    /// test that needs one of those to reach the check under test passes the
+    /// canonicalized workspace. The temp dir is not spelled canonically on
+    /// every platform: on macOS it is under `/var`, a link to `/private/var`,
+    /// and on Windows it can go through an 8.3 short name.
     #[allow(clippy::too_many_arguments)]
     async fn install_state_test_session_owned_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
@@ -43987,6 +44124,7 @@ mod tests {
             "old-model"
         );
 
+        let first_ctx = Arc::clone(&dispatcher.ctx);
         let sessions = Arc::clone(&dispatcher.ctx.sessions);
         let (entered, release, done) = sessions.set_test_gated_op_pause();
         let sid = session_id.clone();
@@ -44017,10 +44155,8 @@ mod tests {
         // Explicitly end the old incarnation before recreating the same ID.
         // A live same-ID session/new must resume rather than replace it.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
-            make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
-        );
+        let dispatcher2 =
+            make_second_connection_dispatcher(&first_ctx, make_model_refresh_test_config(&tmp));
         let replace_sid = session_id.clone();
         let replace = zeroclaw_spawn::spawn!(async move {
             dispatcher2
@@ -44133,9 +44269,9 @@ mod tests {
 
         // Explicitly end the old incarnation before recreating the same ID.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
+        let dispatcher2 = make_second_connection_dispatcher(
+            &dispatcher.ctx,
             make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
         );
         let workspace = tmp.path().join("workspace");
         let replace_sid = session_id.clone();
@@ -44909,9 +45045,7 @@ mod tests {
         // agent route unresolvable before its queued reconciliation can read
         // config. The construction-time provider remains last-known-good, but
         // pending must prevent callers from observing it with the newer config.
-        let config_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         let rehydrated = dispatcher
             .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
             .await
@@ -44931,9 +45065,7 @@ mod tests {
         // settled before the assertion.
         tokio::task::yield_now().await;
         drop(config_gate);
-        let settled_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let settled_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         drop(settled_gate);
 
         assert!(matches!(

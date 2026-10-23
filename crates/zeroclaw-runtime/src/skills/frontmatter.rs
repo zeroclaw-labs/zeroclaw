@@ -85,6 +85,7 @@ impl SkillFrontmatter {
                 tab: zeroclaw_config::config::ConfigTab::None,
                 alias_source: None,
                 multiline: false,
+                setup: None,
                 application: Default::default(),
             },
             PropFieldInfo {
@@ -101,6 +102,7 @@ impl SkillFrontmatter {
                 tab: zeroclaw_config::config::ConfigTab::None,
                 alias_source: None,
                 multiline: false,
+                setup: None,
                 application: Default::default(),
             },
         ]
@@ -132,6 +134,7 @@ fn field(
         alias_source: None,
         application: Default::default(),
         multiline: false,
+        setup: None,
     }
 }
 

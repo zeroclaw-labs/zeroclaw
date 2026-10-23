@@ -142,6 +142,7 @@ pub enum CronJobClaim<'a> {
 /// Resolution order: `ZEROCLAW_CONFIG_DIR` env → `ZEROCLAW_WORKSPACE` env → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[field_metadata = "crate::setup::annotate_fields"]
 pub struct Config {
     /// Shared instance data directory (databases, hygiene state, cost
     /// records, daemon state files). Computed from `ZEROCLAW_CONFIG_DIR`
@@ -258,6 +259,14 @@ pub struct Config {
     #[nested]
     #[group = "Operations"]
     pub security: SecurityConfig,
+
+    /// Optional model-visible built-ins (`[tools]`). The default is full;
+    /// `optional = []` selects the eleven core tools. Selection never grants
+    /// execution permission. Reload after edits.
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub tools: crate::builtin_tools::BuiltinToolsConfig,
 
     /// Backup tool configuration (`[backup]`).
     #[serde(default)]
@@ -941,7 +950,7 @@ pub enum CacheTtl {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models"]
 pub struct ModelProviderConfig {
-    /// Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
+    /// Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored encrypted in config.toml, with the key in `.secret_key` beside it (plaintext if `secrets.encrypt = false`). Set it with `zeroclaw config set` rather than pasting it into the file, and keep `.secret_key` out of version control.
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
@@ -1125,10 +1134,11 @@ pub struct ModelProviderConfig {
     /// Override the provider's default for native tool calling.
     /// `None` (default) honors the provider's built-in choice. `Some(true)`
     /// forces native tool calls on, `Some(false)` forces text-fallback.
-    /// Currently consulted only by the Groq factory, which defaults to
-    /// text-fallback because llama-family Groq models reject native tool
-    /// calls with HTTP 400. Setting `native_tools = true` re-enables native
-    /// tool calling for Groq models that support it.
+    /// For OpenAI-compatible chat-completions families, native calls avoid
+    /// injecting the prompt-guided tool-use protocol into the system prompt.
+    /// Set this only after confirming the configured endpoint and model
+    /// accept the native tool schema. Providers routed through
+    /// `wire_api = "responses"` are inherently native and ignore this setting.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools: Option<bool>,
@@ -3872,6 +3882,7 @@ pub struct ResolvedRuntime {
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
     pub eval: crate::scattered_types::EvalConfig,
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
+    pub effort_routing: Option<crate::scattered_types::EffortRoutingConfig>,
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
     pub max_tool_result_chars: usize,
     pub keep_tool_context_turns: usize,
@@ -4065,6 +4076,7 @@ impl Default for ResolvedRuntime {
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
+            effort_routing: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
@@ -4976,6 +4988,7 @@ impl Config {
             resolved.history_pruning = profile.history_pruning.clone();
             resolved.eval = profile.eval.clone();
             resolved.auto_classify = profile.auto_classify.clone();
+            resolved.effort_routing = profile.effort_routing.clone();
             resolved.context_compression = profile.context_compression.clone();
             resolved.tool_receipts = profile.tool_receipts.clone();
             resolved.tool_filter_groups = profile.tool_filter_groups.clone();
@@ -14824,6 +14837,8 @@ pub struct RuntimeProfileConfig {
     #[nested]
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
     #[nested]
+    pub effort_routing: Option<crate::scattered_types::EffortRoutingConfig>,
+    #[nested]
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
     #[nested]
     pub tool_receipts: ToolReceiptsConfig,
@@ -14861,6 +14876,7 @@ impl Default for RuntimeProfileConfig {
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
+            effort_routing: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
             tool_receipts: ToolReceiptsConfig::default(),
             tool_filter_groups: Vec::new(),
@@ -21185,6 +21201,7 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             observability: ObservabilityConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
+            tools: crate::builtin_tools::BuiltinToolsConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -23398,6 +23415,7 @@ impl Config {
         self.collect_context_compression_ignored_warnings(&mut warnings);
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
+        self.collect_compiled_out_tool_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -23508,10 +23526,56 @@ impl Config {
         ));
     }
 
+    /// One warning per enabled section whose tool this build was compiled
+    /// without: the section has no effect, and `validate()` does not check
+    /// the tool's own settings, so this is the one place it is reported.
+    fn collect_compiled_out_tool_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !cfg!(feature = "tools-external") {
+            // Only a named adapter is reported. Full selects what this build
+            // carries, so the wildcard, and with it the default, stays quiet.
+            for name in crate::builtin_tools::EXTERNAL_TOOL_NAMES {
+                if self.tools.optional.iter().any(|entry| entry == name) {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::TOOL_COMPILED_OUT,
+                        format!(
+                            "{name} was selected in tools.optional, but this build lacks \
+                                 `tools-external`. Build from source with `tools-compat`; \
+                                 runtime config cannot add compiled-out code."
+                        ),
+                        "tools.optional".to_string(),
+                    ));
+                }
+            }
+        }
+        for tool in crate::opt_in_tools::OptInTool::ALL {
+            if tool.compiled() || !tool.enabled_in(self) {
+                continue;
+            }
+            let (section, feature) = (tool.section(), tool.feature());
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                format!(
+                    "[{section}] is enabled, but this build was compiled without the \
+                     `{feature}` feature, so the tool is unavailable and its settings are not \
+                     checked. Use a build that includes `{feature}`, or disable the section."
+                ),
+                format!("{section}.enabled"),
+            ));
+        }
+    }
+
     fn collect_codex_cli_extra_arg_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
     ) {
+        // The arguments reach no process in a build without the Codex tool,
+        // which `collect_compiled_out_tool_warnings` reports instead.
+        if !crate::opt_in_tools::OptInTool::CodexCli.compiled() {
+            return;
+        }
         for risky_match in risky_codex_cli_arg_matches(&self.codex_cli.extra_args) {
             warnings.push(crate::validation_warnings::ValidationWarning::new(
                 CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING,
@@ -24508,6 +24572,47 @@ impl Config {
                     "runtime_profiles.{profile_alias}.max_execution_tree_iterations must be greater than 0"
                 );
             }
+            if let Some(policy) = &profile.effort_routing {
+                if profile.auto_classify.is_some() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("runtime_profiles.{profile_alias}.effort_routing"),
+                        "runtime_profiles.{profile_alias}.effort_routing cannot be combined with runtime_profiles.{profile_alias}.auto_classify"
+                    );
+                }
+                let local_hint = policy.local_hint.trim();
+                let cloud_hint = policy.cloud_hint.trim();
+                if local_hint.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("runtime_profiles.{profile_alias}.effort_routing.local_hint"),
+                        "runtime_profiles.{profile_alias}.effort_routing.local_hint must not be empty"
+                    );
+                }
+                if cloud_hint.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("runtime_profiles.{profile_alias}.effort_routing.cloud_hint"),
+                        "runtime_profiles.{profile_alias}.effort_routing.cloud_hint must not be empty"
+                    );
+                }
+                if local_hint.eq_ignore_ascii_case(cloud_hint) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("runtime_profiles.{profile_alias}.effort_routing.cloud_hint"),
+                        "runtime_profiles.{profile_alias}.effort_routing local_hint and cloud_hint must name distinct model_routes"
+                    );
+                }
+                for (field, hint) in [("local_hint", local_hint), ("cloud_hint", cloud_hint)] {
+                    if !self.model_routes.iter().any(|route| route.hint == hint) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("runtime_profiles.{profile_alias}.effort_routing.{field}"),
+                            "runtime_profiles.{profile_alias}.effort_routing.{field} = {hint:?} but no model_routes entry has that hint"
+                        );
+                    }
+                }
+            }
         }
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
@@ -25136,7 +25241,12 @@ impl Config {
 
         // Model routes
         for (i, route) in self.model_routes.iter().enumerate() {
-            if route.hint.trim().is_empty() {
+            let required = crate::setup::route_required_fields(
+                &route.hint,
+                &route.model_provider,
+                &route.model,
+            );
+            if required.hint.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].hint"),
@@ -25144,7 +25254,7 @@ impl Config {
                 );
             }
             let mp = route.model_provider.trim();
-            if mp.is_empty() {
+            if required.model_provider.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model_provider"),
@@ -25171,7 +25281,7 @@ impl Config {
                     "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
-            if route.model.trim().is_empty() {
+            if required.model.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model"),
@@ -25182,7 +25292,12 @@ impl Config {
 
         // Embedding routes
         for (i, route) in self.embedding_routes.iter().enumerate() {
-            if route.hint.trim().is_empty() {
+            let required = crate::setup::route_required_fields(
+                &route.hint,
+                &route.model_provider,
+                &route.model,
+            );
+            if required.hint.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].hint"),
@@ -25190,7 +25305,7 @@ impl Config {
                 );
             }
             let mp = route.model_provider.trim();
-            if mp.is_empty() {
+            if required.model_provider.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model_provider"),
@@ -25215,7 +25330,7 @@ impl Config {
                     "embedding_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
-            if route.model.trim().is_empty() {
+            if required.model.missing {
                 validation_bail!(
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model"),
@@ -25356,8 +25471,13 @@ impl Config {
             }
         }
 
+        // An opt-in tool's own settings are checked only in a build that
+        // carries the tool. Its section still parses everywhere, and
+        // `collect_warnings` reports it as compiled out instead of this
+        // demanding credentials or resources for a tool that cannot run.
+        //
         // Microsoft 365
-        if self.microsoft365.enabled {
+        if crate::opt_in_tools::OptInTool::Microsoft365.runs_in(self) {
             let tenant = self
                 .microsoft365
                 .tenant_id
@@ -25399,47 +25519,6 @@ impl Config {
             }
         }
 
-        // Microsoft 365
-        if self.microsoft365.enabled {
-            let tenant = self
-                .microsoft365
-                .tenant_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if tenant.is_none() {
-                anyhow::bail!(
-                    "microsoft365.tenant_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let client = self
-                .microsoft365
-                .client_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            if client.is_none() {
-                anyhow::bail!(
-                    "microsoft365.client_id must not be empty when microsoft365 is enabled"
-                );
-            }
-            let flow = self.microsoft365.auth_flow.trim();
-            if flow != "client_credentials" && flow != "device_code" {
-                anyhow::bail!("microsoft365.auth_flow must be client_credentials or device_code");
-            }
-            if flow == "client_credentials"
-                && self
-                    .microsoft365
-                    .client_secret
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-            {
-                anyhow::bail!(
-                    "microsoft365.client_secret must not be empty when auth_flow is client_credentials"
-                );
-            }
-        }
-
         validate_plugin_entries(&self.plugins)?;
         validate_plugin_channel_instances(&self.channels)?;
 
@@ -25466,154 +25545,158 @@ impl Config {
             }
         }
 
-        // Google Workspace allowed_services validation
-        let mut seen_gws_services = std::collections::HashSet::new();
-        for (i, service) in self.google_workspace.allowed_services.iter().enumerate() {
-            let normalized = service.trim();
-            if normalized.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("google_workspace.allowed_services[{i}]"),
-                    "google_workspace.allowed_services[{i}] must not be empty"
-                );
-            }
-            if !normalized
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "google_workspace.allowed_services[{i}] contains invalid characters: {normalized}"
-                );
-            }
-            if !seen_gws_services.insert(normalized.to_string()) {
-                anyhow::bail!(
-                    "google_workspace.allowed_services contains duplicate entry: {normalized}"
-                );
-            }
-        }
-
-        // Build the effective allowed-services set for cross-validation.
-        // When the operator leaves allowed_services empty the tool falls back to
-        // DEFAULT_GWS_SERVICES; use the same constant here so validation is
-        // consistent in both cases.
-        let effective_services: std::collections::HashSet<&str> =
-            if self.google_workspace.allowed_services.is_empty() {
-                DEFAULT_GWS_SERVICES.iter().copied().collect()
-            } else {
-                self.google_workspace
-                    .allowed_services
-                    .iter()
-                    .map(|s| s.trim())
-                    .collect()
-            };
-
-        let mut seen_gws_operations = std::collections::HashSet::new();
-        for (i, operation) in self.google_workspace.allowed_operations.iter().enumerate() {
-            let service = operation.service.trim();
-            let resource = operation.resource.trim();
-
-            if service.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("google_workspace.allowed_operations[{i}].service"),
-                    "google_workspace.allowed_operations[{i}].service must not be empty"
-                );
-            }
-            if resource.is_empty() {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].resource must not be empty"
-                );
-            }
-
-            if !effective_services.contains(service) {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].service '{service}' is not in the \
-                     effective allowed_services; this entry can never match at runtime"
-                );
-            }
-            if !service
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
-                );
-            }
-            // Unlike service IDs, resource/sub_resource/method names are camelCase
-            // in the Google APIs (calendarList, quickAdd, batchUpdate), so
-            // uppercase must be accepted here and in the runtime tool check.
-            if !resource
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
-                );
-            }
-
-            if let Some(ref sub_resource) = operation.sub_resource {
-                let sub = sub_resource.trim();
-                if sub.is_empty() {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].sub_resource must not be empty when present"
-                    );
-                }
-                if !sub
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-                {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
-                    );
-                }
-            }
-
-            if operation.methods.is_empty() {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("google_workspace.allowed_operations[{i}].methods"),
-                    "google_workspace.allowed_operations[{i}].methods must not be empty"
-                );
-            }
-
-            let mut seen_methods = std::collections::HashSet::new();
-            for (j, method) in operation.methods.iter().enumerate() {
-                let normalized = method.trim();
+        // Google Workspace allowed_services / allowed_operations. Checked
+        // whenever the tool is compiled in, enabled or not, as before; a build
+        // without the tool does not check them, like the other opt-in tools.
+        if crate::opt_in_tools::OptInTool::GoogleWorkspace.compiled() {
+            let mut seen_gws_services = std::collections::HashSet::new();
+            for (i, service) in self.google_workspace.allowed_services.iter().enumerate() {
+                let normalized = service.trim();
                 if normalized.is_empty() {
-                    anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].methods[{j}] must not be empty"
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("google_workspace.allowed_services[{i}]"),
+                        "google_workspace.allowed_services[{i}] must not be empty"
                     );
                 }
                 if !normalized
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
                 {
                     anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
+                        "google_workspace.allowed_services[{i}] contains invalid characters: {normalized}"
                     );
                 }
-                if !seen_methods.insert(normalized.to_string()) {
+                if !seen_gws_services.insert(normalized.to_string()) {
                     anyhow::bail!(
-                        "google_workspace.allowed_operations[{i}].methods contains duplicate entry: {normalized}"
+                        "google_workspace.allowed_services contains duplicate entry: {normalized}"
                     );
                 }
             }
 
-            let sub_key = operation
-                .sub_resource
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("");
-            let operation_key = format!("{service}:{resource}:{sub_key}");
-            if !seen_gws_operations.insert(operation_key.clone()) {
-                anyhow::bail!(
-                    "google_workspace.allowed_operations contains duplicate service/resource/sub_resource entry: {operation_key}"
-                );
+            // Build the effective allowed-services set for cross-validation.
+            // When the operator leaves allowed_services empty the tool falls back to
+            // DEFAULT_GWS_SERVICES; use the same constant here so validation is
+            // consistent in both cases.
+            let effective_services: std::collections::HashSet<&str> =
+                if self.google_workspace.allowed_services.is_empty() {
+                    DEFAULT_GWS_SERVICES.iter().copied().collect()
+                } else {
+                    self.google_workspace
+                        .allowed_services
+                        .iter()
+                        .map(|s| s.trim())
+                        .collect()
+                };
+
+            let mut seen_gws_operations = std::collections::HashSet::new();
+            for (i, operation) in self.google_workspace.allowed_operations.iter().enumerate() {
+                let service = operation.service.trim();
+                let resource = operation.resource.trim();
+
+                if service.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("google_workspace.allowed_operations[{i}].service"),
+                        "google_workspace.allowed_operations[{i}].service must not be empty"
+                    );
+                }
+                if resource.is_empty() {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].resource must not be empty"
+                    );
+                }
+
+                if !effective_services.contains(service) {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].service '{service}' is not in the \
+                         effective allowed_services; this entry can never match at runtime"
+                    );
+                }
+                if !service
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
+                    );
+                }
+                // Unlike service IDs, resource/sub_resource/method names are camelCase
+                // in the Google APIs (calendarList, quickAdd, batchUpdate), so
+                // uppercase must be accepted here and in the runtime tool check.
+                if !resource
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
+                    );
+                }
+
+                if let Some(ref sub_resource) = operation.sub_resource {
+                    let sub = sub_resource.trim();
+                    if sub.is_empty() {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].sub_resource must not be empty when present"
+                        );
+                    }
+                    if !sub
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
+                        );
+                    }
+                }
+
+                if operation.methods.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("google_workspace.allowed_operations[{i}].methods"),
+                        "google_workspace.allowed_operations[{i}].methods must not be empty"
+                    );
+                }
+
+                let mut seen_methods = std::collections::HashSet::new();
+                for (j, method) in operation.methods.iter().enumerate() {
+                    let normalized = method.trim();
+                    if normalized.is_empty() {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].methods[{j}] must not be empty"
+                        );
+                    }
+                    if !normalized
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
+                        );
+                    }
+                    if !seen_methods.insert(normalized.to_string()) {
+                        anyhow::bail!(
+                            "google_workspace.allowed_operations[{i}].methods contains duplicate entry: {normalized}"
+                        );
+                    }
+                }
+
+                let sub_key = operation
+                    .sub_resource
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("");
+                let operation_key = format!("{service}:{resource}:{sub_key}");
+                if !seen_gws_operations.insert(operation_key.clone()) {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations contains duplicate service/resource/sub_resource entry: {operation_key}"
+                    );
+                }
             }
         }
 
         // Project intelligence
-        if self.project_intel.enabled {
+        if crate::opt_in_tools::OptInTool::ProjectIntel.runs_in(self) {
             let lang = &self.project_intel.default_language;
             if !["en", "de", "fr", "it"].contains(&lang.as_str()) {
                 anyhow::bail!(
@@ -25682,7 +25765,7 @@ impl Config {
         }
 
         // Notion
-        if self.notion.enabled {
+        if crate::opt_in_tools::OptInTool::Notion.runs_in(self) {
             if self.notion.database_id.trim().is_empty() {
                 anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
             }
@@ -25736,7 +25819,7 @@ impl Config {
         }
 
         // Jira
-        if self.jira.enabled {
+        if crate::opt_in_tools::OptInTool::Jira.runs_in(self) {
             if self.jira.base_url.trim().is_empty() {
                 anyhow::bail!("jira.base_url must not be empty when jira.enabled = true");
             }
@@ -27018,6 +27101,17 @@ impl Config {
             .and_then(|v| v.try_into().ok())
             .unwrap_or_default();
         prune_default_values(&mut new_table, &default_table);
+        // Keep the selection even when it is the full default. Pruning it would
+        // leave an omitted section that `config migrate` then has to normalize.
+        new_table
+            .entry("tools".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("serialized tools selector is not a TOML table")?
+            .insert(
+                "optional".to_string(),
+                builtin_tool_selection_value(&config_to_save),
+            );
         let new_toml = ensure_blank_line_before_sections(
             &toml::to_string_pretty(&new_table).context("Failed to serialize pruned config")?,
         );
@@ -27116,6 +27210,27 @@ impl Config {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
         }
 
+        let selector_dirty = self
+            .dirty_paths
+            .iter()
+            .any(|path| path == "tools" || path == "tools.optional");
+        if selector_dirty || !doc.as_table().contains_key("tools") {
+            // Use the masked canonical selection, not a transient env value.
+            // An unrelated edit leaves any existing malformed tools section
+            // untouched; an explicit selector edit cannot silently fail to save.
+            if let Some(tools) = doc.as_table().get("tools") {
+                anyhow::ensure!(
+                    tools.as_table_like().is_some(),
+                    "cannot persist tools.optional through a malformed tools section"
+                );
+            }
+            set_path_in_doc(
+                doc.as_table_mut(),
+                &["tools", "optional"],
+                &builtin_tool_selection_value(&config_to_save),
+            );
+        }
+
         // Retire the inert `[security.nevis]` table from the file. The shim
         // discards its content at load and `skip_serializing` keeps it out of
         // a full save, but an incremental save reparses the original file and
@@ -27157,6 +27272,18 @@ impl Config {
         self.clear_dirty();
         Ok(())
     }
+}
+
+fn builtin_tool_selection_value(config: &Config) -> toml::Value {
+    toml::Value::Array(
+        config
+            .tools
+            .optional
+            .iter()
+            .cloned()
+            .map(toml::Value::String)
+            .collect(),
+    )
 }
 
 fn collect_onepassword_reference_snapshots(
@@ -27447,8 +27574,7 @@ fn apply_dirty_path(
     // the per-field MCP editor's edits go nowhere on disk. See the
     // regression test `save_dirty_persists_mcp_server_field_via_natural_key`.
     if let Some(section) = find_natural_key_section_for_path(dotted) {
-        apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
-        return Ok(());
+        return apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
     }
 
     // `HashMap<String, T>` sections whose key is a `#[resource_key]`
@@ -27586,6 +27712,10 @@ fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> 
 /// the existing Table-shaped `set_path_in_doc` / `delete_path_in_doc`
 /// helpers against the located entry's table.
 ///
+/// A present-value write refused by the document-shape check fails the
+/// save; the caller must not clear dirty paths or publish unsaved state.
+/// Missing-value delete/no-op paths keep their existing behavior.
+///
 /// **Order-independence invariant.** `Config::dirty_paths` is a
 /// `HashSet<String>`, so the three shapes above can apply in any
 /// interleaving within a single `save_dirty` batch — in particular,
@@ -27606,7 +27736,7 @@ fn apply_dirty_natural_key_path(
     dotted: &str,
     full_table: &toml::Table,
     _default_table: &toml::Table,
-) {
+) -> Result<()> {
     // `dotted` is known to start with `<section_path>.` thanks to
     // `find_natural_key_section_for_path`; split the alias and inner
     // suffix off the tail.
@@ -27615,14 +27745,14 @@ fn apply_dirty_natural_key_path(
         .and_then(|s| s.strip_prefix('.'))
     {
         Some(r) => r,
-        None => return,
+        None => return Ok(()),
     };
     let (alias, inner_suffix) = match rest.split_once('.') {
         Some((a, i)) => (a, Some(i)),
         None => (rest, None),
     };
     if alias.is_empty() {
-        return;
+        return Ok(());
     }
 
     // Walk the in-memory serialized array at `section_path`. Each
@@ -27643,7 +27773,7 @@ fn apply_dirty_natural_key_path(
     // always at the deepest segment of `section_path`; the leading
     // segments are plain struct fields and therefore Tables on disk.
     let Some((array_key, parent_segs)) = section_segs.split_last() else {
-        return;
+        return Ok(());
     };
 
     // Inner-suffix path: per-field edit (case 1). Reconcile the inner
@@ -27697,10 +27827,13 @@ fn apply_dirty_natural_key_path(
                     array_key,
                     section.natural_key_field,
                     alias,
-                );
-                let Some(entry_table) = entry_table else {
-                    return;
-                };
+                )
+                .with_context(|| {
+                    format!(
+                        "Cannot persist natural-key section {}: incompatible document node",
+                        section.section_path
+                    )
+                })?;
                 let mut pruned = value.clone();
                 prune_empty_leaves(&mut pruned);
                 set_path_in_doc(entry_table, &inner_segs, &pruned);
@@ -27717,12 +27850,12 @@ fn apply_dirty_natural_key_path(
                     section.natural_key_field,
                     alias,
                 ) else {
-                    return;
+                    return Ok(());
                 };
                 delete_path_in_doc(entry_table, &inner_segs);
             }
         }
-        return;
+        return Ok(());
     }
 
     // Bare-alias path (cases 2 and 3). No inner suffix → reconcile the
@@ -27741,10 +27874,13 @@ fn apply_dirty_natural_key_path(
                 array_key,
                 section.natural_key_field,
                 alias,
-            );
-            let Some(entry_table) = entry_table else {
-                return;
-            };
+            )
+            .with_context(|| {
+                format!(
+                    "Cannot persist natural-key section {}: incompatible document node",
+                    section.section_path
+                )
+            })?;
             // Replace the table's contents wholesale so removed inner
             // fields actually disappear from disk.
             entry_table.clear();
@@ -27766,6 +27902,7 @@ fn apply_dirty_natural_key_path(
             );
         }
     }
+    Ok(())
 }
 
 /// Return the longest `MapKeyKind::Map` section whose path is a strict
@@ -27976,7 +28113,8 @@ fn warn_natural_key_doc_kind_mismatch(
 ///   * Parent Tables along `parent_segs` are auto-created if missing
 ///     (mirrors `set_path_in_doc`).
 ///   * The `array_key` slot may not yet exist; insert an
-///     `ArrayOfTables` if so.
+///     `ArrayOfTables` if so. An existing empty `[]` is also a valid
+///     empty Vec; convert it when creating the first keyed table.
 ///   * The array may not yet contain an entry whose natural-key field
 ///     matches `alias`; push a new table with `<natural_key_field> =
 ///     "<alias>"` seeded.
@@ -28022,6 +28160,31 @@ fn ensure_array_of_tables_entry<'a>(
             array_key,
             toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
         );
+    } else if let Some(array) = cursor.get(array_key).and_then(|item| item.as_array())
+        && array.is_empty()
+    {
+        // No existing rows can be lost. Carry the key's leading comments,
+        // comments inside the empty array, and its end-of-line comment onto
+        // the first table. insert() resets the key decor so later tables do
+        // not repeat those comments.
+        let leading = cursor
+            .key(array_key)
+            .and_then(|key| key.leaf_decor().prefix())
+            .and_then(|prefix| prefix.as_str())
+            .unwrap_or("");
+        let inner = array.trailing().as_str().unwrap_or("");
+        let trailing = array
+            .decor()
+            .suffix()
+            .and_then(|suffix| suffix.as_str())
+            .unwrap_or("");
+        let mut first = toml_edit::Table::new();
+        first.insert(natural_key_field, toml_edit::value(alias.to_string()));
+        first.decor_mut().set_prefix(format!("{leading}{inner}"));
+        first.decor_mut().set_suffix(trailing.to_owned());
+        let mut aot = toml_edit::ArrayOfTables::new();
+        aot.push(first);
+        cursor.insert(array_key, toml_edit::Item::ArrayOfTables(aot));
     }
     let aot = cursor
         .get_mut(array_key)
@@ -34782,6 +34945,7 @@ auto_save = true
             },
             decision_models: HashMap::new(),
             trust: crate::scattered_types::TrustConfig::default(),
+            tools: crate::builtin_tools::BuiltinToolsConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -35967,6 +36131,214 @@ default_temperature = 0.7
         let _ = fs::remove_dir_all(&dir).await;
     }
 
+    // Upgrade compatibility and durable selector persistence.
+    #[tokio::test]
+    async fn new_install_remains_full_after_repeated_load_and_save() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
+        for _ in 0..3 {
+            let config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(config.tools.optional, ["*"]);
+            config.save().await.unwrap();
+            let raw = fs::read_to_string(dir.path().join("config.toml"))
+                .await
+                .unwrap();
+            let value: toml::Value = toml::from_str(&raw).unwrap();
+            assert_eq!(
+                value["tools"]["optional"],
+                toml::Value::Array(vec![toml::Value::String("*".into())])
+            );
+            assert!(crate::migration::migrate_file(&raw).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_load_and_dirty_save_preserve_selector_intent() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "schema_version = 3\n# operator locale comment\nlocale = \"en\"\n",
+        )
+        .await
+        .unwrap();
+        let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+        assert_eq!(config.tools.optional, ["*"]);
+        config.set_prop("observability.backend", "log").unwrap();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&path).await.unwrap();
+        assert!(raw.contains("# operator locale comment"));
+        assert_eq!(
+            crate::migration::migrate_to_current(&raw)
+                .unwrap()
+                .tools
+                .optional,
+            ["*"]
+        );
+        let value: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            value["tools"]["optional"],
+            toml::Value::Array(vec![toml::Value::String("*".into())])
+        );
+        config.set_prop("tools.optional", "[]").unwrap();
+        config.mark_dirty("tools.optional");
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&path).await.unwrap();
+        let value: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(value["tools"]["optional"], toml::Value::Array(Vec::new()));
+        assert!(
+            Box::pin(Config::load_or_init())
+                .await
+                .unwrap()
+                .tools
+                .optional
+                .is_empty()
+        );
+        assert!(config.dirty_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_selections_survive_full_and_incremental_saves() {
+        let _env_guard = env_override_lock().await;
+        let _tools_guard = EnvValueGuard::remove("ZEROCLAW_tools__optional");
+        for selected in [
+            Vec::new(),
+            vec!["calculator".to_string()],
+            vec!["*".to_string()],
+        ] {
+            let dir = TempDir::new().unwrap();
+            let mut config = Config {
+                config_path: dir.path().join("config.toml"),
+                data_dir: dir.path().join("data"),
+                ..Config::default()
+            };
+            config.tools.optional = selected.clone();
+            config.save().await.unwrap();
+            config.set_prop("observability.backend", "log").unwrap();
+            config.mark_dirty("observability.backend");
+            config.save_dirty().await.unwrap();
+            let raw = fs::read_to_string(&config.config_path).await.unwrap();
+            assert_eq!(
+                crate::migration::migrate_to_current(&raw)
+                    .unwrap()
+                    .tools
+                    .optional,
+                selected
+            );
+            assert!(crate::migration::migrate_file(&raw).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn dirty_save_does_not_repair_an_unrelated_malformed_tools_section() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = "schema_version = 3\n[tools]\noptional = false # preserve invalid selector\n";
+        fs::write(&path, raw).await.unwrap();
+        let original: toml::Value = toml::from_str(raw).unwrap();
+        let load = crate::migration::migrate_to_current_salvaged(raw);
+        let mut config = load.config;
+        config.config_path = path.clone();
+        config.data_dir = dir.path().join("data");
+        config.degraded_sections = load.dropped;
+        config.set_prop("observability.backend", "log").unwrap();
+        config.mark_dirty("observability.backend");
+        config.save_dirty().await.unwrap();
+        let written = fs::read_to_string(path).await.unwrap();
+        let value: toml::Value = toml::from_str(&written).unwrap();
+        assert_eq!(value.get("tools"), original.get("tools"));
+        assert!(written.contains("# preserve invalid selector"));
+        assert!(crate::migration::migrate_to_current(&written).is_err());
+        assert_eq!(
+            crate::migration::migrate_to_current_resilient(&written)
+                .tools
+                .optional,
+            ["*"]
+        );
+    }
+
+    #[tokio::test]
+    async fn selector_dirty_save_refuses_a_malformed_parent_without_clobbering() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let raw = "schema_version = 3\ntools = false # malformed parent\n";
+        fs::write(&path, raw).await.unwrap();
+        let load = crate::migration::migrate_to_current_salvaged(raw);
+        let mut config = load.config;
+        config.config_path = path.clone();
+        config.data_dir = dir.path().join("data");
+        config.degraded_sections = load.dropped;
+        config.mark_dirty("tools.optional");
+        let error = config.save_dirty().await.unwrap_err();
+        assert!(error.to_string().contains("malformed tools section"));
+        assert_eq!(fs::read_to_string(path).await.unwrap(), raw);
+        assert!(config.dirty_paths.contains("tools.optional"));
+    }
+
+    #[tokio::test]
+    async fn selector_env_override_is_masked_for_fresh_and_legacy_saves() {
+        let _env_guard = env_override_lock().await;
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _tools_guard = EnvValueGuard::set("ZEROCLAW_tools__optional", "[\"calculator\"]");
+        for legacy in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+            let path = dir.path().join("config.toml");
+            if legacy {
+                fs::write(&path, "schema_version = 3\n").await.unwrap();
+            }
+            let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(config.tools.optional, ["calculator"]);
+            let expected = vec!["*".to_string()];
+            if legacy {
+                // The omitted selector must persist from the masked snapshot
+                // before a full save has materialized the tools section.
+                config.set_prop("observability.backend", "log").unwrap();
+                config.mark_dirty("observability.backend");
+                config.save_dirty().await.unwrap();
+                let raw = fs::read_to_string(&path).await.unwrap();
+                let value: toml::Value = toml::from_str(&raw).unwrap();
+                assert_eq!(
+                    value["tools"]["optional"],
+                    toml::Value::Array(vec![toml::Value::String("*".into())])
+                );
+                assert_eq!(config.tools.optional, ["calculator"]);
+            }
+            config.save().await.unwrap();
+            let raw = fs::read_to_string(&path).await.unwrap();
+            assert_eq!(
+                crate::migration::migrate_to_current(&raw)
+                    .unwrap()
+                    .tools
+                    .optional,
+                expected
+            );
+            config.set_prop("observability.backend", "log").unwrap();
+            config.mark_dirty("observability.backend");
+            config.save_dirty().await.unwrap();
+            let raw = fs::read_to_string(&path).await.unwrap();
+            assert_eq!(
+                crate::migration::migrate_to_current(&raw)
+                    .unwrap()
+                    .tools
+                    .optional,
+                expected
+            );
+            assert_eq!(config.tools.optional, ["calculator"]);
+        }
+    }
+
     #[tokio::test]
     async fn config_save_prunes_unchanged_default_blocks() {
         // Fresh-init config without any operator edits should write a
@@ -36089,6 +36461,7 @@ default_temperature = 0.7
             config_path: config_path.clone(),
             observability: ObservabilityConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
+            tools: crate::builtin_tools::BuiltinToolsConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -40003,6 +40376,7 @@ runtime_profile = "default"
         assert!(config.validate().is_ok());
     }
 
+    #[cfg(feature = "tool-jira")]
     #[test]
     async fn validate_rejects_unknown_jira_actions() {
         for action in ["delete_ticket", "drop_database", ""] {
@@ -40019,6 +40393,136 @@ runtime_profile = "default"
             assert!(
                 err.contains("jira.allowed_actions contains unknown action"),
                 "expected Jira allowed action error for {action:?}, got: {err}"
+            );
+        }
+    }
+
+    /// A config written for a full build validates in a build without its
+    /// opt-in tools. Each tool's own checks, which would demand credentials,
+    /// an endpoint, a database or an existing templates directory, run only
+    /// where the tool can, and each enabled section is reported once as
+    /// compiled out.
+    #[cfg(not(any(
+        feature = "tool-jira",
+        feature = "tool-notion",
+        feature = "tool-microsoft365",
+        feature = "tool-project-intel"
+    )))]
+    #[test]
+    async fn a_lean_build_validates_enabled_sections_for_tools_it_lacks() {
+        assert!(
+            !Config::default()
+                .collect_warnings()
+                .iter()
+                .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
+            "a disabled section is not reported"
+        );
+
+        let mut config = Config::default();
+        config.microsoft365.enabled = true;
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
+        config.notion.enabled = true;
+        config.jira.enabled = true;
+        config.jira.allowed_actions = vec!["drop_database".into()];
+        config
+            .validate()
+            .expect("a build without these tools does not check their settings");
+
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        assert_eq!(
+            compiled_out,
+            [
+                "jira.enabled",
+                "notion.enabled",
+                "microsoft365.enabled",
+                "project_intel.enabled"
+            ],
+            "one warning per enabled section this build lacks"
+        );
+    }
+
+    /// Google Workspace's allowlist checks run only where the tool is
+    /// compiled in. A build without it accepts an operation outside
+    /// `allowed_services` and reports the section once as compiled out; a
+    /// build with it still refuses the entry.
+    #[test]
+    async fn google_workspace_allowlist_is_checked_only_where_the_tool_is_compiled() {
+        use crate::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.google_workspace.enabled = true;
+        config.google_workspace.allowed_services = vec!["drive".into()];
+        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "calendar".into(),
+            resource: "events".into(),
+            sub_resource: None,
+            methods: vec!["list".into()],
+        }];
+
+        let result = config.validate();
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        if OptInTool::GoogleWorkspace.compiled() {
+            let err = result
+                .expect_err("a build with the tool checks its allowlist")
+                .to_string();
+            assert!(
+                err.contains("is not in the effective allowed_services"),
+                "{err}"
+            );
+            assert!(compiled_out.is_empty(), "{compiled_out:?}");
+        } else {
+            result.expect("a build without the tool does not check its allowlist");
+            assert_eq!(compiled_out, ["google_workspace.enabled"]);
+        }
+    }
+
+    /// The counterpart in a build that carries the tools: their settings are
+    /// still checked, and nothing is reported as compiled out.
+    #[cfg(all(
+        feature = "tool-jira",
+        feature = "tool-notion",
+        feature = "tool-microsoft365",
+        feature = "tool-project-intel"
+    ))]
+    #[test]
+    async fn a_build_with_the_tools_checks_their_settings() {
+        type Enable = fn(&mut Config);
+        let cases: [(&str, Enable); 4] = [
+            ("microsoft365.tenant_id", |c| c.microsoft365.enabled = true),
+            ("project_intel.templates_dir", |c| {
+                c.project_intel.enabled = true;
+                c.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
+            }),
+            ("notion.database_id", |c| c.notion.enabled = true),
+            ("jira.base_url", |c| c.jira.enabled = true),
+        ];
+        for (field, enable) in cases {
+            let mut config = Config::default();
+            enable(&mut config);
+            let err = config
+                .validate()
+                .expect_err("a build with the tool checks its settings")
+                .to_string();
+            assert!(
+                err.contains(field),
+                "expected an error on {field}, got: {err}"
+            );
+            assert!(
+                !config
+                    .collect_warnings()
+                    .iter()
+                    .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
+                "{field}: a compiled-in tool is not reported as compiled out"
             );
         }
     }
@@ -40289,6 +40793,7 @@ api_token = "tok"
         );
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn google_workspace_allowed_operations_require_methods() {
         let mut config = Config::default();
@@ -40303,6 +40808,7 @@ api_token = "tok"
         assert!(err.contains("google_workspace.allowed_operations[0].methods"));
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn google_workspace_allowed_operations_reject_duplicate_service_resource_sub_resource_entries()
      {
@@ -40347,6 +40853,7 @@ api_token = "tok"
         assert!(config.validate().is_ok());
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn google_workspace_allowed_operations_reject_duplicate_methods_within_entry() {
         let mut config = Config::default();
@@ -40414,6 +40921,7 @@ api_token = "tok"
         assert!(config.validate().is_ok());
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn google_workspace_allowed_operations_reject_invalid_sub_resource_characters() {
         let mut config = Config::default();
@@ -41983,6 +42491,301 @@ group_policy = "disabled"
         assert_eq!(gh.url.as_deref(), Some("https://mcp.example/"));
     }
 
+    #[test]
+    async fn save_dirty_persists_rows_from_loaded_empty_plugin_array() {
+        let _env_guard = env_override_lock().await;
+        let _backend_guard = EnvValueGuard::set("ZEROCLAW_observability__backend", "log");
+        for plugin_source in [
+            "[plugins]\nentries = []\n",
+            "[plugins]\n# entry list comment\nentries = [\n# empty array comment\n] # trailing entry comment\n",
+            "",
+            "[[plugins.entries]]\nname = \"existing\"\negress_hosts = [\"existing.example\"]\n",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", tmp.path());
+            let config_path = tmp.path().join("config.toml");
+            let seed = format!(
+                "schema_version = {}\n\n[observability]\n# operator comment\nbackend = \"none\"\n\n{plugin_source}",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            std::fs::write(&config_path, &seed).unwrap();
+            let strict = crate::migration::migrate_to_current(&seed).unwrap();
+            let previous_rows = strict.plugins.entries.len();
+            let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+            assert!(config.degraded_sections.is_empty());
+            assert!(config.degraded_security.is_empty());
+            assert_eq!(config.plugins.entries.len(), previous_rows);
+            assert_eq!(config.loaded_from.as_ref(), Some(&config_path));
+            assert_eq!(config.observability.backend, ObservabilityBackend::Log);
+            let loaded_from = config.loaded_from.clone();
+            let env_paths = config.env_overridden_paths.clone();
+            let env_snapshots = config.pre_override_snapshots.clone();
+
+            assert!(config.create_map_key("plugins.entries", "first").unwrap());
+            config.plugins.entries.last_mut().unwrap().egress_hosts = vec!["first.example".into()];
+            config.mark_dirty("plugins.entries.first");
+            config.save_dirty().await.unwrap();
+            assert!(config.dirty_paths.is_empty());
+            let first_saved = std::fs::read_to_string(&config_path).unwrap();
+            let first_disk = crate::migration::migrate_to_current(&first_saved).unwrap();
+            assert_eq!(first_disk.plugins.entries.len(), previous_rows + 1);
+            assert_eq!(
+                first_disk.plugins.entry_egress("first").0,
+                vec!["first.example"]
+            );
+            assert_eq!(first_disk.observability.backend, ObservabilityBackend::None);
+            assert!(first_saved.contains("# operator comment"));
+            for comment in [
+                "# entry list comment",
+                "# empty array comment",
+                "# trailing entry comment",
+            ] {
+                if seed.contains(comment) {
+                    assert_eq!(first_saved.matches(comment).count(), 1);
+                }
+            }
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.plugins.entries.len(), previous_rows + 1);
+            assert_eq!(
+                reloaded.plugins.entry_egress("first").0,
+                vec!["first.example"]
+            );
+
+            assert!(config.create_map_key("plugins.entries", "second").unwrap());
+            config.plugins.entries.last_mut().unwrap().egress_hosts = vec!["second.example".into()];
+            config.mark_dirty("plugins.entries.second");
+            let bad_path = "cost.rates.providers.models.openai.ghost-model.input_per_mtok";
+            config.mark_dirty(bad_path);
+            let dirty_before = config.dirty_paths.clone();
+            config
+                .save_dirty()
+                .await
+                .expect_err("invalid dirty path must fail");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), first_saved);
+            assert_eq!(config.dirty_paths, dirty_before);
+            assert_eq!(config.loaded_from, loaded_from);
+            assert_eq!(config.env_overridden_paths, env_paths);
+            assert_eq!(config.pre_override_snapshots, env_snapshots);
+            assert_eq!(config.plugins.entries.len(), previous_rows + 2);
+
+            config.dirty_paths.remove(bad_path);
+            config.save_dirty().await.unwrap();
+            assert!(config.dirty_paths.is_empty());
+            assert_eq!(config.loaded_from, loaded_from);
+            assert_eq!(config.env_overridden_paths, env_paths);
+            assert_eq!(config.pre_override_snapshots, env_snapshots);
+            assert_eq!(config.observability.backend, ObservabilityBackend::Log);
+            assert!(!config.create_map_key("plugins.entries", "second").unwrap());
+            let written = std::fs::read_to_string(&config_path).unwrap();
+            let disk = crate::migration::migrate_to_current(&written).unwrap();
+            assert_eq!(disk.plugins.entries.len(), previous_rows + 2);
+            assert_eq!(disk.plugins.entry_egress("first").0, vec!["first.example"]);
+            assert_eq!(
+                disk.plugins.entry_egress("second").0,
+                vec!["second.example"]
+            );
+            if previous_rows != 0 {
+                assert_eq!(
+                    disk.plugins.entry_egress("existing").0,
+                    vec!["existing.example"]
+                );
+            }
+            assert_eq!(disk.observability.backend, ObservabilityBackend::None);
+            assert!(written.contains("# operator comment"));
+            for comment in [
+                "# entry list comment",
+                "# empty array comment",
+                "# trailing entry comment",
+            ] {
+                if seed.contains(comment) {
+                    assert_eq!(written.matches(comment).count(), 1);
+                }
+            }
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.plugins.entries.len(), previous_rows + 2);
+            assert_eq!(
+                reloaded.plugins.entry_egress("second").0,
+                vec!["second.example"]
+            );
+        }
+    }
+
+    #[test]
+    async fn save_dirty_persists_inner_fields_from_loaded_empty_mcp_array() {
+        let _env_guard = env_override_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", tmp.path());
+        let config_path = tmp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n[mcp]\nservers = []\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+        crate::migration::migrate_to_current(&seed).unwrap();
+        let mut config = Box::pin(Config::load_or_init()).await.unwrap();
+        assert!(config.mcp.servers.is_empty());
+        assert!(config.degraded_sections.is_empty());
+        assert!(config.create_map_key("mcp.servers", "github").unwrap());
+        config
+            .set_prop_persistent("mcp.servers.github.transport", "http")
+            .unwrap();
+        config
+            .set_prop_persistent("mcp.servers.github.url", "https://mcp.example/")
+            .unwrap();
+        assert!(!config.dirty_paths.contains("mcp.servers.github"));
+        config.save_dirty().await.unwrap();
+        assert!(config.dirty_paths.is_empty());
+        let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+        assert_eq!(reloaded.mcp.servers.len(), 1);
+        assert_eq!(reloaded.mcp.servers[0].name, "github");
+        assert_eq!(reloaded.mcp.servers[0].transport, McpTransport::Http);
+        assert_eq!(
+            reloaded.mcp.servers[0].url.as_deref(),
+            Some("https://mcp.example/")
+        );
+    }
+
+    #[test]
+    async fn save_dirty_refuses_inline_plugin_writes_without_clearing_state() {
+        let _env_guard = env_override_lock().await;
+        let _backend_guard = EnvValueGuard::set("ZEROCLAW_observability__backend", "log");
+        for inner_field in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", tmp.path());
+            let config_path = tmp.path().join("config.toml");
+            let seed = format!(
+                "schema_version = {}\n\n\
+                 [observability]\n# operator comment\nbackend = \"none\"\n\n\
+                 [plugins]\n# inline entry comment\n\
+                 entries = [{{ name = \"operator_instance\", \
+                 config = {{ token = \"synthetic-private-value\" }}, \
+                 egress_hosts = [\"operator.example\"] }}] # trailing comment\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            let strict = crate::migration::migrate_to_current(&seed).unwrap();
+            assert_eq!(strict.plugins.entries.len(), 1);
+            std::fs::write(&config_path, &seed).unwrap();
+            let live = Box::pin(Config::load_or_init()).await.unwrap();
+            assert!(live.degraded_sections.is_empty());
+            assert!(live.degraded_security.is_empty());
+            assert_eq!(live.loaded_from.as_ref(), Some(&config_path));
+            assert_eq!(live.observability.backend, ObservabilityBackend::Log);
+            let live_before = toml::to_string(&live).unwrap();
+            let mut staged = live.clone();
+            if inner_field {
+                staged.plugins.entries[0].egress_hosts = vec!["replacement.example".into()];
+                staged.mark_dirty("plugins.entries.operator_instance.egress_hosts");
+            } else {
+                assert!(
+                    staged
+                        .create_map_key("plugins.entries", "new_instance")
+                        .unwrap()
+                );
+                staged.plugins.entries.last_mut().unwrap().egress_hosts =
+                    vec!["replacement.example".into()];
+                staged.mark_dirty("plugins.entries.new_instance");
+            }
+            let staged_before = toml::to_string(&staged).unwrap();
+            let dirty_before = staged.dirty_paths.clone();
+            let loaded_from = staged.loaded_from.clone();
+            let env_paths = staged.env_overridden_paths.clone();
+            let env_snapshots = staged.pre_override_snapshots.clone();
+            for _ in 0..2 {
+                let error = staged
+                    .save_dirty()
+                    .await
+                    .expect_err("a refused natural-key write must fail the save");
+                let message = format!("{error:#}");
+                assert!(message.contains("plugins.entries"));
+                for private_value in [
+                    "synthetic-private-value",
+                    "operator_instance",
+                    "new_instance",
+                    "operator.example",
+                    "replacement.example",
+                ] {
+                    assert!(!message.contains(private_value));
+                }
+                assert_eq!(std::fs::read_to_string(&config_path).unwrap(), seed);
+                assert_eq!(toml::to_string(&staged).unwrap(), staged_before);
+                assert_eq!(staged.dirty_paths, dirty_before);
+                assert_eq!(staged.loaded_from, loaded_from);
+                assert_eq!(staged.env_overridden_paths, env_paths);
+                assert_eq!(staged.pre_override_snapshots, env_snapshots);
+                assert_eq!(toml::to_string(&live).unwrap(), live_before);
+                assert!(live.dirty_paths.is_empty());
+                assert_eq!(live.loaded_from, loaded_from);
+                assert_eq!(live.env_overridden_paths, env_paths);
+                assert_eq!(live.pre_override_snapshots, env_snapshots);
+            }
+            let reloaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(reloaded.plugins.entries.len(), 1);
+            assert_eq!(
+                reloaded.plugins.entry_egress("operator_instance").0,
+                vec!["operator.example"]
+            );
+            assert_eq!(
+                reloaded
+                    .plugins
+                    .entry_config("operator_instance")
+                    .unwrap()
+                    .unwrap()
+                    .get("token")
+                    .map(String::as_str),
+                Some("synthetic-private-value")
+            );
+        }
+    }
+
+    #[test]
+    async fn natural_key_missing_write_and_delete_noops_preserve_inline_document() {
+        let source = format!(
+            "schema_version = {}\n\n[plugins]\n\
+             entries = [{{ name = \"operator_instance\", egress_hosts = [\"operator.example\"] }}]\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        let config = crate::migration::migrate_to_current(&source).unwrap();
+        let full_table = toml::Value::try_from(&config)
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .clone();
+        let default_table = toml::Table::new();
+        for path in [
+            "plugins.entries.missing_instance",
+            "plugins.entries.operator_instance.missing_field",
+        ] {
+            let mut doc: toml_edit::DocumentMut = source.parse().unwrap();
+            let before = doc.to_string();
+            apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table).unwrap();
+            assert_eq!(doc.to_string(), before);
+        }
+    }
+
+    #[test]
+    async fn natural_key_writer_preserves_unsupported_existing_nodes() {
+        for source in [
+            "[plugins]\nentries = [{ name = \"existing\", egress_hosts = [\"existing.example\"] }] # inline comment\n",
+            "[plugins]\nentries = \"operator value\" # scalar comment\n",
+            "[plugins.entries]\nname = \"operator value\" # table comment\n",
+            "plugins = \"operator value\" # parent comment\n",
+        ] {
+            let mut doc: toml_edit::DocumentMut = source.parse().unwrap();
+            let before = doc.to_string();
+            assert!(
+                ensure_array_of_tables_entry(
+                    doc.as_table_mut(),
+                    &["plugins"],
+                    "entries",
+                    "name",
+                    "new"
+                )
+                .is_none()
+            );
+            assert_eq!(doc.to_string(), before);
+        }
+    }
+
     /// `rename_map_key("mcp.servers", "fs", "filesystem")` rewrites the
     /// in-memory entry's `name` field in place and marks BOTH aliases
     /// dirty. The incremental writer must update the matching
@@ -42418,11 +43221,17 @@ group_policy = "disabled"
         });
         config.mark_dirty("mcp.servers.fs.command");
 
-        // The save itself must succeed — bail is a no-op for the
-        // wrong-kind node, not an error.
-        config.save_dirty().await.unwrap();
+        // A refused write fails the save without clearing its pending work.
+        let dirty_before = config.dirty_paths.clone();
+        let error = config
+            .save_dirty()
+            .await
+            .expect_err("wrong-kind MCP write must fail");
+        assert!(error.to_string().contains("mcp.servers"));
+        assert_eq!(config.dirty_paths, dirty_before);
 
         let written = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(written, seed);
         // The hand-edited scalar shape survives untouched: we'd
         // rather a load-time validation error the operator sees than
         // a silent overwrite of their (possibly intentional) file
@@ -43892,6 +44701,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         cfg.validate().unwrap();
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn config_validate_rejects_duplicate_google_workspace_allowed_operations() {
         let mut cfg = Config::default();
@@ -43916,6 +44726,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         assert!(err.contains("duplicate service/resource/sub_resource entry"));
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn config_validate_rejects_operation_service_not_in_allowed_services() {
         let mut cfg = Config::default();
@@ -43952,6 +44763,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         assert!(cfg.validate().is_ok());
     }
 
+    #[cfg(feature = "tool-google-workspace")]
     #[test]
     async fn config_validate_rejects_unknown_service_when_allowed_services_empty() {
         // Even with allowed_services empty (using defaults), an operation whose
@@ -44794,6 +45606,13 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         let email = crate::scattered_types::EmailConfig::default().prop_fields();
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
+
+        let model_provider = ModelProviderConfig::default().prop_fields();
+        assert_description(
+            &model_provider,
+            ".api_key",
+            "stored encrypted in config.toml",
+        );
     }
 
     #[test]
@@ -45875,6 +46694,50 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert_eq!(mcp_servers.value_type, "McpServerConfig");
     }
 
+    fn assert_map_key_sections_reuse_paths(
+        first: &[crate::traits::MapKeySection],
+        second: &[crate::traits::MapKeySection],
+    ) {
+        assert_eq!(first.len(), second.len());
+        for (first, second) in first.iter().zip(second) {
+            assert_eq!(
+                (
+                    first.path,
+                    first.kind,
+                    first.value_type,
+                    first.description,
+                    first.natural_key,
+                    first.resource_key,
+                ),
+                (
+                    second.path,
+                    second.kind,
+                    second.value_type,
+                    second.description,
+                    second.natural_key,
+                    second.resource_key,
+                ),
+            );
+            assert_eq!(
+                first.path.as_ptr(),
+                second.path.as_ptr(),
+                "schema path {} must reuse its static backing storage",
+                first.path,
+            );
+        }
+    }
+
+    #[test]
+    async fn map_key_sections_reuses_static_paths() {
+        let sections = Config::map_key_sections();
+        for path in ["agents", "model_routes", "mcp.servers", "cost.rates.tools"] {
+            assert!(sections.iter().any(|section| section.path == path));
+        }
+        for _ in 0..4 {
+            assert_map_key_sections_reuse_paths(&sections, &Config::map_key_sections());
+        }
+    }
+
     #[test]
     async fn create_map_key_inserts_default_mcp_server() {
         // Round-trip: `POST /api/config/map-key?path=mcp.servers&key=github`.
@@ -46124,6 +46987,22 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         #[nested]
         pub types: HashMap<String, HashMap<String, DoubleMapLeaf>>,
+    }
+
+    #[test]
+    async fn map_key_sections_double_map_reuses_static_paths() {
+        let sections = DoubleMapOuter::map_key_sections();
+        assert_eq!(sections.len(), 1);
+        let section = &sections[0];
+        assert_eq!(section.path, "dm.types");
+        assert_eq!(section.kind, crate::traits::MapKeyKind::Map);
+        assert_eq!(section.value_type, "DoubleMapLeaf");
+        assert_eq!(section.description, "");
+        assert_eq!(section.natural_key, None);
+        assert!(!section.resource_key);
+        for _ in 0..4 {
+            assert_map_key_sections_reuse_paths(&sections, &DoubleMapOuter::map_key_sections());
+        }
     }
 
     fn double_map_fixture() -> DoubleMapOuter {
@@ -50754,6 +51633,7 @@ group_policy = "all"
         }
     }
 
+    #[cfg(feature = "tool-codex-cli")]
     #[::core::prelude::v1::test]
     fn codex_cli_policy_config_source_warnings_are_non_blocking_and_redacted() {
         let selected_profile = "sensitive-production-profile";
@@ -50781,6 +51661,7 @@ group_policy = "all"
         );
     }
 
+    #[cfg(feature = "tool-codex-cli")]
     #[::core::prelude::v1::test]
     fn codex_cli_feature_toggle_warnings_are_non_blocking_and_redacted() {
         let selected_feature = "sensitive-future-capability";
@@ -50809,6 +51690,7 @@ group_policy = "all"
         );
     }
 
+    #[cfg(feature = "tool-codex-cli")]
     #[::core::prelude::v1::test]
     fn codex_cli_executable_integration_warnings_are_non_blocking_and_redacted() {
         let sensitive_server = "private-review-server";
@@ -50851,6 +51733,7 @@ group_policy = "all"
         );
     }
 
+    #[cfg(feature = "tool-codex-cli")]
     #[::core::prelude::v1::test]
     fn codex_cli_security_warnings_are_non_blocking_and_structured() {
         let mut config = Config::default();
@@ -50880,6 +51763,45 @@ group_policy = "all"
             .expect("unknown operator-controlled Codex arguments must remain allowed");
         assert!(
             warnings_with_code(&config, CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING,).is_empty()
+        );
+    }
+
+    /// With the Codex tool compiled out, an enabled `[codex_cli]` carrying a
+    /// risky argument yields one warning, that the tool is compiled out: the
+    /// argument reaches no process. With the tool compiled in, the argument
+    /// warning is raised and nothing else.
+    #[::core::prelude::v1::test]
+    fn codex_cli_warnings_follow_whether_the_tool_is_compiled() {
+        use crate::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.codex_cli.enabled = true;
+        config.codex_cli.extra_args = owned_codex_args(&["--sandbox", "danger-full-access"]);
+        config
+            .validate()
+            .expect("operator-controlled Codex arguments never block validation");
+
+        let codex: Vec<(String, String)> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.path.starts_with("codex_cli"))
+            .map(|warning| (warning.code, warning.path))
+            .collect();
+        let expected = if OptInTool::CodexCli.compiled() {
+            (
+                CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING,
+                "codex_cli.extra_args[0]",
+            )
+        } else {
+            (
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                "codex_cli.enabled",
+            )
+        };
+        assert_eq!(
+            codex,
+            [(expected.0.to_string(), expected.1.to_string())],
+            "one warning about [codex_cli]"
         );
     }
 
@@ -51958,5 +52880,111 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    fn effort_routing_config() -> super::Config {
+        let mut config = super::Config::default();
+        for alias in ["local", "cloud"] {
+            let entry = config
+                .providers
+                .models
+                .ensure("custom", alias)
+                .expect("custom provider entry");
+            entry.model = Some(format!("{alias}-model"));
+        }
+        config.model_routes = vec![
+            super::ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            super::ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".into(),
+            super::RuntimeProfileConfig {
+                effort_routing: Some(crate::scattered_types::EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: crate::scattered_types::CloudEscalationPolicy::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn effort_routing_requires_two_existing_distinct_hints() {
+        let config = effort_routing_config();
+        config.validate().expect("valid effort routing config");
+
+        let mut overlapping_classifier = config.clone();
+        overlapping_classifier
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .auto_classify = Some(crate::scattered_types::AutoClassifyConfig::default());
+        let error = overlapping_classifier
+            .validate()
+            .expect_err("effort routing and auto-classify must not compete on one profile");
+        assert!(error.to_string().contains("cannot be combined"));
+
+        let mut missing = config.clone();
+        missing
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .effort_routing
+            .as_mut()
+            .unwrap()
+            .cloud_hint = "missing".into();
+        let error = missing.validate().expect_err("missing route must fail");
+        assert!(error.to_string().contains("no model_routes entry"));
+
+        let mut wrong_case = config.clone();
+        wrong_case
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .effort_routing
+            .as_mut()
+            .unwrap()
+            .local_hint = "LOCAL".into();
+        let error = wrong_case
+            .validate()
+            .expect_err("route hints are case-sensitive");
+        assert!(error.to_string().contains("no model_routes entry"));
+
+        let mut duplicate = config;
+        duplicate
+            .runtime_profiles
+            .get_mut("effort")
+            .unwrap()
+            .effort_routing
+            .as_mut()
+            .unwrap()
+            .cloud_hint = "LOCAL".into();
+        let error = duplicate.validate().expect_err("duplicate hints must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must name distinct model_routes")
+        );
+
+        let mut duplicate_route = effort_routing_config();
+        let mut final_local_route = duplicate_route.model_routes[0].clone();
+        final_local_route.model_provider = "custom.cloud".into();
+        final_local_route.model = "final-local-model".into();
+        duplicate_route.model_routes.push(final_local_route);
+        duplicate_route
+            .validate()
+            .expect("legacy duplicate route hints remain valid");
     }
 }

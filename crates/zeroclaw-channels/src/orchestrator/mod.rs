@@ -337,9 +337,37 @@ fn channel_message_timeout_budget_secs_with_cap(
 struct ChannelRouteSelection {
     model_provider: String,
     model: String,
+    /// True when this selection came from config and remains eligible for
+    /// automatic classification. Operator `/model` overrides set it false;
+    /// model-issued switches preserve the current mode.
+    automatic: bool,
     /// Route-specific API key override. When set, this credential is passed
     /// directly to the requested provider instead of the alias entry's key.
     api_key: Option<String>,
+}
+
+fn configured_provider_allowed_for_turn(
+    attempt_allowlist: Option<&HashSet<String>>,
+    provider_ref: &str,
+) -> bool {
+    let provider_ref = provider_ref.trim();
+    provider_ref.is_empty()
+        || attempt_allowlist.is_none_or(|allowed| allowed.contains(provider_ref))
+}
+
+fn effort_routing_classification_content(message: &str) -> String {
+    static ATTACHMENT_MARKER_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"(?i)\[\s*(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|AUDIO|VOICE|LOCATION)\s*:[^\]]+\]",
+            )
+            .expect("attachment marker regex must compile")
+        });
+
+    ATTACHMENT_MARKER_RE
+        .replace_all(message, "")
+        .trim()
+        .to_string()
 }
 
 fn resolve_channel_context_limits(
@@ -797,6 +825,10 @@ impl ModelPickerDispatchOwnership {
     fn hold(_message_id: &str) -> Self {
         Self
     }
+
+    /// Nothing to settle. Mirrors the Telegram token's `release` so callers
+    /// never `drop()` this type, which has no drop glue.
+    fn release(self) {}
 }
 
 /// A turn waiting for its conversation lane.
@@ -2182,11 +2214,11 @@ fn build_channel_system_prompt(
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
-    // Date refresh stays in the system prompt: the heading is date-only
-    // (no seconds), so within a single day the rendered value is stable and
-    // cache hits; it only changes once per day at midnight. Acceptable for
-    // a 99%+ intra-session cache-hit rate.
-    refresh_channel_prompt_date_section(&mut prompt);
+    // Strip volatile date sections: the per-turn
+    // [turn-context] preamble already carries time/date/weekday/tz, and a
+    // ## Current Date value that changes at midnight busts the prompt cache
+    // for every live channel session.
+    strip_channel_prompt_volatile_date_sections(&mut prompt);
 
     if let Some(instructions) = channel_delivery_instructions(channel_name) {
         if prompt.is_empty() {
@@ -2267,29 +2299,74 @@ fn build_channel_system_prompt_for_message_with_signal(
     }
 }
 
-fn current_date_section() -> String {
-    let now = chrono::Local::now();
-    format!(
-        "{CURRENT_DATE_HEADING}{} ({})",
-        now.format("%Y-%m-%d"),
-        now.format("%:z")
-    )
-}
-
-fn refresh_channel_prompt_date_section(prompt: &mut String) {
-    let runtime_start = prompt
-        .find("\n## Runtime")
-        .map(|i| i + 1)
-        .unwrap_or(prompt.len());
-
-    if let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start) {
+fn strip_channel_prompt_volatile_date_sections(prompt: &mut String) {
+    // Walk repeatedly so both ## Current Date and ## Current Date & Time
+    // are removed even when both appear. Keep a ## Current Date section
+    // whose body is not a generated date line (e.g. a project note).
+    loop {
+        let runtime_start = prompt
+            .find("\n## Runtime")
+            .map(|i| i + 1)
+            .unwrap_or(prompt.len());
+        let Some((start, heading_len)) = find_latest_date_heading_before(prompt, runtime_start)
+        else {
+            break;
+        };
         let content_start = start + heading_len;
         let section_end = prompt[content_start..]
             .find("\n## ")
             .map(|i| content_start + i)
             .unwrap_or(prompt.len());
-        prompt.replace_range(start..section_end, &current_date_section());
+        let body = prompt[content_start..section_end].trim();
+        if !is_generated_date_line(body) {
+            // Non-date body under ## Current Date — leave it alone and stop
+            // scanning older headings so we do not remove project notes.
+            break;
+        }
+        // Remove the section with the newline that ends it, so the next
+        // heading keeps the blank line in front of it. A section at the end
+        // of the prompt takes the newlines before it instead. Only ASCII
+        // '\n' bytes are stepped over, so the range stays on char boundaries.
+        let (from, to) = if section_end < prompt.len() {
+            (start, section_end + 1)
+        } else {
+            let mut from = start;
+            while from > 0 && prompt.as_bytes()[from - 1] == b'\n' {
+                from -= 1;
+            }
+            (from, section_end)
+        };
+        prompt.replace_range(from..to, "");
     }
+}
+
+/// True when `body` is exactly one date line as the prompt builders used to
+/// emit it: `YYYY-MM-DD (+HH:MM)` or the legacy `YYYY-MM-DD HH:MM:SS (TZ)`.
+/// Anything else (e.g. a workspace note that merely starts with a date) is
+/// project context and must survive the strip.
+fn is_generated_date_line(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    if body.contains('\n') || bytes.len() < 10 {
+        return false;
+    }
+    let date_ok = bytes[..10].iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        _ => b.is_ascii_digit(),
+    });
+    if !date_ok {
+        return false;
+    }
+    let rest = &body[10..];
+    let Some(open) = rest.find(" (") else {
+        return false;
+    };
+    let time = &rest[..open];
+    let zone = &rest[open + 2..];
+    let time_ok = time.is_empty()
+        || (time.starts_with(' ')
+            && time.len() > 1
+            && time[1..].bytes().all(|b| b.is_ascii_digit() || b == b':'));
+    time_ok && zone.len() > 1 && zone.ends_with(')') && !zone[..zone.len() - 1].contains(['(', ')'])
 }
 
 fn find_latest_date_heading_before(prompt: &str, before: usize) -> Option<(usize, usize)> {
@@ -2467,7 +2544,14 @@ fn collapse_inline_image_payloads(turns: &mut [ChatMessage]) {
         return;
     }
     let last_idx = turns.len() - 1;
-    for turn in &mut turns[..last_idx] {
+    collapse_inline_image_payloads_in(&mut turns[..last_idx]);
+}
+
+/// Collapse inline `data:` image payloads in every one of `turns`. Callers
+/// whose slice ends with the turn being sent use
+/// [`collapse_inline_image_payloads`], which leaves that last turn intact.
+fn collapse_inline_image_payloads_in(turns: &mut [ChatMessage]) {
+    for turn in turns {
         if turn.role != "user" || !turn.content.contains("[IMAGE:data:") {
             continue;
         }
@@ -2537,6 +2621,35 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     }
 
     normalized
+}
+
+/// Cached conversation turns in the form a provider request carries them:
+/// alternation restored and internal markers stripped. Every reader that
+/// sends a sender's cached history to a model goes through this, so a channel
+/// turn and an internally initiated turn bound to the same conversation see
+/// the same thing. Inline image payloads are collapsed by the caller, which
+/// knows whether the last turn is the one being sent.
+fn provider_ready_cached_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut turns = normalize_cached_channel_turns(turns);
+
+    // Strip stale tool_result blocks from cached turns so the LLM never
+    // sees a `<tool_result>` without a preceding `<tool_call>`, which
+    // causes hallucinated output on subsequent heartbeat ticks or sessions.
+    for turn in &mut turns {
+        if turn.content.contains("<tool_result") {
+            turn.content = strip_tool_result_content(&turn.content);
+        }
+    }
+
+    // Strip [Used tools: ...] prefixes from cached assistant turns so the
+    // LLM never sees (and reproduces) this internal summary format.
+    for turn in &mut turns {
+        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
+            turn.content = strip_tool_summary_prefix(&turn.content);
+        }
+    }
+
+    turns
 }
 
 /// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
@@ -3074,6 +3187,7 @@ fn default_route_selection_from_snapshot(
     ChannelRouteSelection {
         model_provider: defaults.default_model_provider,
         model: defaults.model,
+        automatic: true,
         api_key: None,
     }
 }
@@ -3108,16 +3222,29 @@ fn get_route_selection(
     sender_key: &str,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> ChannelRouteSelection {
+    get_route_selection_with_scope(ctx, msg, sender_key, defaults_snapshot).0
+}
+
+fn get_route_selection_with_scope(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    sender_key: &str,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> (ChannelRouteSelection, bool) {
     // Precedence (most specific wins): user > agent scope override,
     // then the per-sender route override, then the config default.
-    scope_override_lookup(ctx, msg).unwrap_or_else(|| {
+    if let Some(route) = scope_override_lookup(ctx, msg) {
+        return (route, true);
+    }
+    (
         ctx.route_overrides
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(sender_key)
             .cloned()
-            .unwrap_or_else(|| default_route_selection_from_snapshot(defaults_snapshot))
-    })
+            .unwrap_or_else(|| default_route_selection_from_snapshot(defaults_snapshot)),
+        false,
+    )
 }
 
 fn set_route_selection(
@@ -3143,6 +3270,7 @@ fn apply_model_ref(
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
     model: &str,
 ) {
+    sel.automatic = false;
     if let Some(route) = model_routes
         .iter()
         .find(|r| r.model.eq_ignore_ascii_case(model) || r.hint.eq_ignore_ascii_case(model))
@@ -3153,6 +3281,17 @@ fn apply_model_ref(
     } else {
         sel.model = model.to_string();
     }
+}
+
+fn apply_model_issued_route_switch(
+    route: &mut ChannelRouteSelection,
+    model_provider: String,
+    model: String,
+    api_key: Option<String>,
+) {
+    route.model_provider = model_provider;
+    route.model = model;
+    route.api_key = api_key;
 }
 
 fn shadow_note(
@@ -3200,6 +3339,18 @@ fn set_scope_override(
     } else {
         overrides.insert(key, next);
     }
+}
+
+fn clear_scope_override(
+    ctx: &ChannelRuntimeContext,
+    scope: OverrideScope,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) {
+    let key = scope_override_key(scope, msg, ctx.agent_alias.as_str());
+    ctx.scope_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
 }
 
 /// Per-sender authorization for `/model --agent <model>`. Resolves live
@@ -3788,39 +3939,15 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
-/// Number of most-recent turns whose tool-result payloads are kept at full size
-/// when proactively trimming. The active exchange stays intact; only older
-/// tool results are shrunk to a bounded extract.
-///
-/// Returns `Some` with the resulting cached turns for `sender_key`, taken
-/// under the same lock that performed the append. A caller that needs to know
-/// exactly what its own turn observed (to reconcile a later wholesale
-/// replacement against concurrent same-sender writes, see
-/// `turns_appended_after`) must use this return value rather than a second,
-/// separately-locked read: a second read can observe another worker's write
-/// that raced in between, silently shifting what "this turn's own prefix"
-/// means.
-///
-/// Returns `None` when the durable transcript and its breadcrumb provenance
-/// could not both be verified (see `hydration_unavailable` below): the turn
-/// was deliberately NOT appended, persisted, or cached. A caller that treats
-/// `None` like a normal empty-history result would run the request with only
-/// this one message instead of the sender's real conversation; the caller
-/// must defer or refuse the turn instead.
-fn append_sender_turn(
-    ctx: &ChannelRuntimeContext,
-    sender_key: &str,
-    turn: ChatMessage,
-) -> Option<Vec<ChatMessage>> {
-    // Serialize per-sender persistence to prevent interleaving across concurrent
-    // workers that share the same conversation_history_key
-    let persist_lock = acquire_persist_lock(ctx, sender_key);
-    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
-
+/// Reload the durable transcript into the cache when it is missing, before
+/// anything is appended to it. Returns `false` when the transcript exists but
+/// cannot be verified, in which case nothing may be appended. The caller must
+/// hold the sender's persist lock.
+fn hydrate_sender_history_if_missing(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
     // A failed trim resync evicts the cache so the next turn does not build
     // on unreconciled state. Reload the durable transcript here, on the next
-    // cache miss, before appending: otherwise `get_or_insert_mut` below would
-    // seed an empty history and the next provider request would contain only
+    // cache miss, before appending: otherwise the caller's `get_or_insert_mut`
+    // would seed an empty history and the next provider request would contain only
     // the new message while prior durable turns still exist on disk.
     // `hydrate_session_transcript` is the canonical reload (cap, orphan
     // closure, breadcrumb provenance), matching startup hydration.
@@ -3936,9 +4063,44 @@ fn append_sender_turn(
                 // is neither discarded nor replaced from an unverified state,
                 // the next turn retries hydration, and the caller does not
                 // mistake this for a genuine empty-history turn.
-                return None;
+                return false;
             }
         }
+    }
+    true
+}
+
+/// Number of most-recent turns whose tool-result payloads are kept at full size
+/// when proactively trimming. The active exchange stays intact; only older
+/// tool results are shrunk to a bounded extract.
+///
+/// Returns `Some` with the resulting cached turns for `sender_key`, taken
+/// under the same lock that performed the append. A caller that needs to know
+/// exactly what its own turn observed (to reconcile a later wholesale
+/// replacement against concurrent same-sender writes, see
+/// `turns_appended_after`) must use this return value rather than a second,
+/// separately-locked read: a second read can observe another worker's write
+/// that raced in between, silently shifting what "this turn's own prefix"
+/// means.
+///
+/// Returns `None` when the durable transcript and its breadcrumb provenance
+/// could not both be verified (see `hydration_unavailable` below): the turn
+/// was deliberately NOT appended, persisted, or cached. A caller that treats
+/// `None` like a normal empty-history result would run the request with only
+/// this one message instead of the sender's real conversation; the caller
+/// must defer or refuse the turn instead.
+fn append_sender_turn(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    turn: ChatMessage,
+) -> Option<Vec<ChatMessage>> {
+    // Serialize per-sender persistence to prevent interleaving across concurrent
+    // workers that share the same conversation_history_key
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    if !hydrate_sender_history_if_missing(ctx, sender_key) {
+        return None;
     }
 
     // Persist to JSONL before adding to in-memory history.
@@ -3954,17 +4116,7 @@ fn append_sender_turn(
         );
     }
 
-    // Use the user-configured max_history_messages (fall back to
-    // MAX_CHANNEL_HISTORY when the config value is 0 or absent).
-    let max_history = {
-        let configured = ctx.agent_cfg.resolved.max_history_messages;
-        if configured > 0 {
-            configured
-        } else {
-            MAX_CHANNEL_HISTORY
-        }
-    };
-
+    let max_history = channel_history_cap(ctx);
     let mut histories = ctx
         .conversation_histories
         .lock()
@@ -3975,6 +4127,188 @@ fn append_sender_turn(
         turns.remove(0);
     }
     Some(turns.clone())
+}
+
+/// The user-configured max_history_messages, falling back to
+/// MAX_CHANNEL_HISTORY when the config value is 0 or absent.
+fn channel_history_cap(ctx: &ChannelRuntimeContext) -> usize {
+    let configured = ctx.agent_cfg.resolved.max_history_messages;
+    if configured > 0 {
+        configured
+    } else {
+        MAX_CHANNEL_HISTORY
+    }
+}
+
+/// Append an internally initiated exchange to a sender's history as one
+/// serialized write, so no concurrent turn lands between its messages.
+///
+/// Unlike [`append_sender_turn`], a failed durable write is an error: the
+/// caller records whether the exchange was persisted. The exchange lands
+/// whole or not at all: when the store rejects a message part-way, the
+/// messages it had already accepted are taken back, under the same lock,
+/// before anything reaches the cache. If even that fails, what the store
+/// kept is mirrored into the cache, so the two never disagree, and the error
+/// says how much of the exchange stayed behind.
+fn append_bound_exchange(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    messages: &[ChatMessage],
+) -> anyhow::Result<()> {
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    if !hydrate_sender_history_if_missing(ctx, sender_key) {
+        anyhow::bail!("conversation history exists but could not be verified");
+    }
+
+    let mut kept = messages.len();
+    let mut failure = None;
+    if let Some(ref store) = ctx.session_store {
+        kept = 0;
+        for message in messages {
+            if let Err(e) = store.append(sender_key, message) {
+                failure = Some(e);
+                break;
+            }
+            kept += 1;
+        }
+        if failure.is_some() {
+            // The persist lock is held, so the rows just written are still
+            // the last ones of this history.
+            while kept > 0 && matches!(store.remove_last(sender_key), Ok(true)) {
+                kept -= 1;
+            }
+        }
+    }
+
+    if kept > 0 {
+        let max_history = channel_history_cap(ctx);
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
+        turns.extend(messages[..kept].iter().cloned());
+        while turns.len() > max_history {
+            turns.remove(0);
+        }
+    }
+
+    match failure {
+        Some(e) if kept == 0 => {
+            Err(anyhow::Error::new(e).context("failed to persist bound exchange; nothing kept"))
+        }
+        Some(e) => Err(anyhow::Error::new(e).context(format!(
+            "failed to persist bound exchange; its first {kept} message(s) could not be taken back"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Serves an agent's channel conversations to internally initiated turns
+/// through the same cache, persist locks and store the channel turns use.
+struct ChannelConversationOwner {
+    ctx: Arc<ChannelRuntimeContext>,
+    /// Which agent serves each channel route: the map this instance's router
+    /// is built from. The session store is shared by every agent and its
+    /// keys name no agent, so the route recorded with a binding is what ties
+    /// a history to this owner.
+    owner_by_channel_key: Arc<HashMap<String, String>>,
+}
+
+impl ChannelConversationOwner {
+    /// The key of `binding`, once it is established that this agent serves
+    /// the route the conversation arrives on. A channel that has since been
+    /// handed to another agent is that agent's conversation now.
+    fn served_key<'a>(
+        &self,
+        binding: &'a zeroclaw_api::conversation_binding::ConversationBinding,
+    ) -> anyhow::Result<&'a str> {
+        if self.owner_by_channel_key.get(&binding.route) != Some(self.ctx.agent_alias.as_ref()) {
+            anyhow::bail!("this agent is not serving the conversation's channel");
+        }
+        Ok(&binding.key)
+    }
+}
+
+impl zeroclaw_api::conversation_binding::ConversationBindingOwner for ChannelConversationOwner {
+    fn load(
+        &self,
+        binding: &zeroclaw_api::conversation_binding::ConversationBinding,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        let key = self.served_key(binding)?;
+        // The lock every writer of this history takes, so the read is of one
+        // consistent state.
+        let persist_lock = acquire_persist_lock(&self.ctx, key);
+        let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        let cached = self
+            .ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(key)
+            .cloned();
+        let recorded = self
+            .ctx
+            .history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(key)
+            .copied();
+        // A trim breadcrumb is the history's own bookkeeping, recorded beside
+        // it rather than inferred from text. The reader receives no such
+        // record, so it must not receive the breadcrumb as if it were a turn.
+        // Both the record and the text must agree before anything is dropped.
+        let (mut turns, crumb_recorded) = match (cached, self.ctx.session_store.as_deref()) {
+            (Some(turns), store) => {
+                let crumb_recorded =
+                    recorded.unwrap_or_else(|| resolve_cold_crumb_provenance(store, key, &turns));
+                (turns, crumb_recorded)
+            }
+            // Not in the cache: read the durable transcript as it stands.
+            // Reloading it into the cache is a writer's job, because that
+            // reconciliation can itself write (it closes a transcript that
+            // ends unanswered, and persists a cap). A reader must leave the
+            // conversation exactly as it found it.
+            (None, Some(store)) => {
+                let mut turns = store
+                    .try_load(key)
+                    .map_err(|_| anyhow::Error::msg("conversation history could not be read"))?;
+                let crumb_recorded = resolve_cold_crumb_provenance_result(Some(store), key, &turns)
+                    .map_err(|()| {
+                        anyhow::Error::msg("conversation history could not be verified")
+                    })?;
+                let cap = channel_history_cap(&self.ctx);
+                if turns.len() > cap {
+                    turns.drain(..turns.len() - cap);
+                }
+                (turns, crumb_recorded)
+            }
+            (None, None) => (Vec::new(), false),
+        };
+        let leads_with_crumb = turns.first().is_some_and(|first| {
+            first.role == "user"
+                && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
+        });
+        if crumb_recorded && leads_with_crumb {
+            turns.remove(0);
+        }
+        // None of these turns is the one being sent, so every inline image
+        // payload is collapsed, where a channel turn spares its newest.
+        let mut turns = provider_ready_cached_turns(turns);
+        collapse_inline_image_payloads_in(&mut turns);
+        Ok(turns)
+    }
+
+    fn append(
+        &self,
+        binding: &zeroclaw_api::conversation_binding::ConversationBinding,
+        messages: &[ChatMessage],
+    ) -> anyhow::Result<()> {
+        append_bound_exchange(&self.ctx, self.served_key(binding)?, messages)
+    }
 }
 
 /// Return `retained_turns` with its last message's content replaced by
@@ -4927,6 +5261,10 @@ async fn handle_runtime_command_for_delivery(
     let sender_key = runtime_conversation_history_key(ctx, msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
+    let effort_auto_reset_enabled = defaults_snapshot
+        .config
+        .resolved_agent_config(ctx.agent_alias.as_str())
+        .is_some_and(|agent| agent.resolved.effort_routing.is_some());
 
     if command == ChannelRuntimeCommand::ShowModel && is_bare_model_picker_command(&msg.content) {
         let request = zeroclaw_api::channel::ChannelModelPickerRequest {
@@ -4978,15 +5316,14 @@ async fn handle_runtime_command_for_delivery(
                     match get_or_create_provider(ctx, &provider_ref, None, &defaults_snapshot).await
                     {
                         Ok(_) => {
-                            if provider_ref != current.model_provider {
-                                current.model_provider = provider_ref.clone();
-                                set_route_selection(
-                                    ctx,
-                                    &sender_key,
-                                    current.clone(),
-                                    &defaults_snapshot,
-                                );
-                            }
+                            current.model_provider = provider_ref.clone();
+                            current.automatic = false;
+                            set_route_selection(
+                                ctx,
+                                &sender_key,
+                                current.clone(),
+                                &defaults_snapshot,
+                            );
 
                             channel_runtime_cli_string_with_args(
                                 "channel-runtime-set-provider-switched",
@@ -5071,6 +5408,17 @@ async fn handle_runtime_command_for_delivery(
                         ("model", model.as_str()),
                     ],
                 )
+            } else if effort_auto_reset_enabled && model.eq_ignore_ascii_case("auto") {
+                clear_scope_override(ctx, scope, msg);
+                let current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
+                channel_runtime_cli_string_with_args(
+                    "channel-runtime-scoped-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.model_provider.as_str()),
+                        ("scope", channel_runtime_scope_label(scope).as_str()),
+                    ],
+                )
             } else {
                 // Resolve provider+model the same way bare `/model` does, then
                 // write it at the requested scope instead of the per-sender route.
@@ -5119,6 +5467,30 @@ async fn handle_runtime_command_for_delivery(
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 channel_runtime_cli_string("channel-runtime-model-empty")
+            } else if effort_auto_reset_enabled && model.eq_ignore_ascii_case("auto") {
+                #[cfg(feature = "channel-telegram")]
+                let picker_applied =
+                    crate::model_picker_delivery::apply_if_not_revoked(delivery_message_id, || {
+                        current = default_route_selection_from_snapshot(&defaults_snapshot);
+                        set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                    });
+                #[cfg(not(feature = "channel-telegram"))]
+                {
+                    current = default_route_selection_from_snapshot(&defaults_snapshot);
+                    set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                }
+                #[cfg(feature = "channel-telegram")]
+                if !picker_applied {
+                    return true;
+                }
+
+                channel_runtime_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.model_provider.as_str()),
+                    ],
+                )
             } else {
                 // Authoritative picker-revocation claim at the mutation
                 // point. The early dispatch gate in
@@ -9053,6 +9425,10 @@ async fn process_channel_message_body(
         msg.content = thinking.effective_content.clone();
     }
 
+    // Classify only the user's text. Media markers and later enrichment are
+    // transport context, not evidence that the request itself is complex.
+    let effort_routing_content = effort_routing_classification_content(&msg.content);
+
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
         let vision =
@@ -9136,9 +9512,68 @@ async fn process_channel_message_body(
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
+    let (mut route, route_is_scoped) =
+        get_route_selection_with_scope(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
+    let mut attempt_allowlist: Option<Arc<HashSet<String>>> = None;
 
-    if let Some(hint) =
+    let resolved_agent = runtime_defaults
+        .config
+        .resolved_agent_config(ctx.agent_alias.as_str());
+    let effort_policy = resolved_agent
+        .as_ref()
+        .and_then(|agent| agent.resolved.effort_routing.as_ref());
+
+    if let Some(policy) = effort_policy {
+        if route.automatic {
+            let Some(selection) = zeroclaw_runtime::agent::eval::resolve_effort_route(
+                policy,
+                &runtime_defaults.config.model_routes,
+                &effort_routing_content,
+            ) else {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "effort routing is enabled but its local/cloud hints are missing or ambiguous"
+                );
+                if let Some(channel) = target_channel.as_ref() {
+                    let _ = channel
+                        .send(
+                            &SendMessage::reply_to(
+                                &msg,
+                                channel_runtime_cli_string(
+                                    "channel-runtime-effort-routing-invalid",
+                                ),
+                            )
+                            .suppress_voice(),
+                        )
+                        .await;
+                }
+                reconcile_early_ack(
+                    ctx.as_ref(),
+                    &msg,
+                    target_channel.as_ref(),
+                    early_ack_task,
+                    Some("\u{26A0}\u{FE0F}"),
+                )
+                .await;
+                return;
+            };
+            attempt_allowlist = Some(Arc::new(selection.allowed_provider_refs.clone()));
+            route = ChannelRouteSelection {
+                model_provider: selection.route.model_provider.clone(),
+                model: selection.route.model.clone(),
+                automatic: true,
+                api_key: selection.route.api_key.clone(),
+            };
+            zeroclaw_runtime::agent::eval::log_effort_route_selection(
+                &selection,
+                effort_routing_content.len(),
+                "channel",
+            );
+        }
+    } else if let Some(hint) =
         zeroclaw_runtime::agent::classifier::classify(&ctx.query_classification, &msg.content)
         && let Some(matched_route) = ctx
             .model_routes
@@ -9149,6 +9584,7 @@ async fn process_channel_message_body(
         route = ChannelRouteSelection {
             model_provider: matched_route.model_provider.clone(),
             model: matched_route.model.clone(),
+            automatic: true,
             api_key: matched_route.api_key.clone(),
         };
     }
@@ -9282,24 +9718,7 @@ async fn process_channel_message_body(
     };
 
     // Build history from per-sender conversation cache.
-    let mut prior_turns = normalize_cached_channel_turns(known_prefix.clone());
-
-    // Strip stale tool_result blocks from cached turns so the LLM never
-    // sees a `<tool_result>` without a preceding `<tool_call>`, which
-    // causes hallucinated output on subsequent heartbeat ticks or sessions.
-    for turn in &mut prior_turns {
-        if turn.content.contains("<tool_result") {
-            turn.content = strip_tool_result_content(&turn.content);
-        }
-    }
-
-    // Strip [Used tools: ...] prefixes from cached assistant turns so the
-    // LLM never sees (and reproduces) this internal summary format.
-    for turn in &mut prior_turns {
-        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
-            turn.content = strip_tool_summary_prefix(&turn.content);
-        }
-    }
+    let mut prior_turns = provider_ready_cached_turns(known_prefix.clone());
 
     // Collapse only heavy inline `data:` image payloads in older cached turns.
     // Re-loadable `[IMAGE:<path>]` references survive so a later turn can
@@ -9467,17 +9886,36 @@ async fn process_channel_message_body(
                 );
                 AssistantChannelOutcome::Reply(String::new())
             } else {
+                let configured_classifier_allowed = configured_provider_allowed_for_turn(
+                    attempt_allowlist.as_deref(),
+                    ctx.agent_cfg.classifier_provider.as_str(),
+                );
+                if !configured_classifier_allowed {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                            .with_attrs(::serde_json::json!({
+                                "phase": "precheck",
+                                "reason": "effort_routing_policy",
+                            })),
+                        "configured classifier_provider skipped by turn routing policy"
+                    );
+                }
+                let configured_classifier = if configured_classifier_allowed {
+                    resolve_classifier_route(
+                        ctx.as_ref(),
+                        &ctx.agent_cfg.classifier_provider,
+                        &runtime_defaults,
+                    )
+                    .await
+                } else {
+                    None
+                };
                 let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
                     Arc<dyn ModelProvider>,
                     String,
                     Option<f64>,
-                ) = resolve_classifier_route(
-                    ctx.as_ref(),
-                    &ctx.agent_cfg.classifier_provider,
-                    &runtime_defaults,
-                )
-                .await
-                .unwrap_or_else(|| {
+                ) = configured_classifier.unwrap_or_else(|| {
                     (
                         Arc::clone(&active_model_provider),
                         route.model.clone(),
@@ -9486,12 +9924,16 @@ async fn process_channel_message_body(
                 });
 
                 let started = Instant::now();
-                let precheck_future = classify_channel_reply_intent(
-                    classifier_provider_arc.as_ref(),
-                    history[0].content.as_str(),
-                    &history,
-                    classifier_model_owned.as_str(),
-                    classifier_temperature.or(runtime_defaults.defaults.temperature),
+                let precheck_future =
+                    zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                        attempt_allowlist.clone(),
+                        classify_channel_reply_intent(
+                            classifier_provider_arc.as_ref(),
+                            history[0].content.as_str(),
+                            &history,
+                            classifier_model_owned.as_str(),
+                            classifier_temperature.or(runtime_defaults.defaults.temperature),
+                        ),
                 );
                 match tokio::time::timeout(Duration::from_secs(precheck.timeout_secs), precheck_future)
                     .await
@@ -9990,6 +10432,7 @@ async fn process_channel_message_body(
                 } else {
                     ctx.non_cli_excluded_tools.as_ref()
                 };
+            loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -10091,7 +10534,20 @@ async fn process_channel_message_body(
             let tool_loop = zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(cost_tracking_context.clone(), tool_loop);
             let tool_loop = scope_session_key(Some(history_key.clone()), tool_loop);
+            let tool_loop = zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION.scope(
+                Some(zeroclaw_api::conversation_binding::ActiveConversation {
+                    surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                    route: composite_channel_key(&msg.channel, msg.channel_alias.as_deref()),
+                    key: history_key.clone(),
+                    agent_alias: ctx.agent_alias.to_string(),
+                }),
+                tool_loop,
+            );
             let tool_loop = scope_thread_id(thread_scope_id, tool_loop);
+            let tool_loop = zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
+                attempt_allowlist.clone(),
+                tool_loop,
+            );
             let timed_tool_loop =
                 tokio::time::timeout(Duration::from_secs(timeout_budget_secs), tool_loop);
 
@@ -10156,27 +10612,28 @@ async fn process_channel_message_body(
                         // original provider/model pair instead of a
                         // half-switched state.
                         active_model_provider = new_prov;
-                        route.model_provider = resolved_model_provider;
-                        route.model = new_model;
-                        route.api_key = resolved_api_key;
+                        apply_model_issued_route_switch(
+                            &mut route,
+                            resolved_model_provider,
+                            new_model,
+                            resolved_api_key,
+                        );
                         context_limits = resolve_channel_context_limits(
                             runtime_defaults.config.as_ref(),
                             ctx.agent_alias.as_str(),
                             &route,
                             ctx.context_token_budget,
                         );
-                        // Persist the route override so subsequent messages
-                        // from this sender continue using the switched model.
-                        set_route_selection(
-                            ctx.as_ref(),
-                            &history_key,
-                            ChannelRouteSelection {
-                                model_provider: route.model_provider.clone(),
-                                model: route.model.clone(),
-                                api_key: route.api_key.clone(),
-                            },
-                            &runtime_defaults,
-                        );
+                        // A scoped switch belongs to this turn, not the
+                        // hidden sender choice exposed when the scope clears.
+                        if !route_is_scoped {
+                            set_route_selection(
+                                ctx.as_ref(),
+                                &history_key,
+                                route.clone(),
+                                &runtime_defaults,
+                            );
+                        }
 
                         let switched_native_tool_specs_present =
                             ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
@@ -10698,6 +11155,27 @@ async fn process_channel_message_body(
                                 );
                                 true
                             }
+                            Err(e)
+                                if e
+                                    .downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                                    .is_some() =>
+                            {
+                                // Nothing was delivered and the channel asked us
+                                // not to send again yet (e.g. a flood limit).
+                                // Resending would only extend the penalty, and
+                                // the reply must not be reported as sent.
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Final answer not delivered; not resending"
+                                );
+                                false
+                            }
                             Err(e) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -10852,8 +11330,13 @@ async fn process_channel_message_body(
                 } else {
                     zeroclaw_providers::sanitize_api_error(&e.to_string())
                 };
+                // `safe_error` is deliberately empty for a capacity failure, so
+                // the journal needs the typed breakdown instead: without it
+                // this line read "Turn error after Nms:" and nothing else.
+                let journal_error = context_window_exceeded
+                    .map_or_else(|| safe_error.clone(), |exceeded| exceeded.breakdown());
                 eprintln!(
-                    "  ❌ Turn error after {}ms: {safe_error}",
+                    "  ❌ Turn error after {}ms: {journal_error}",
                     started_at.elapsed().as_millis(),
                 );
 
@@ -10891,6 +11374,9 @@ async fn process_channel_message_body(
                     error_attributes["error_kind"] = "context_window_exceeded".into();
                     error_attributes["estimated_tokens"] = exceeded.estimated_tokens.into();
                     error_attributes["model_context_window"] = exceeded.model_context_window.into();
+                    error_attributes["raw_estimated_tokens"] = exceeded.raw_estimated_tokens.into();
+                    error_attributes["system_tokens"] = exceeded.system_tokens.into();
+                    error_attributes["tool_schema_tokens"] = exceeded.tool_schema_tokens.into();
                     error_attributes["provider_attempted"] = false.into();
                 } else {
                     error_attributes["error_kind"] = "provider_error".into();
@@ -11167,7 +11653,7 @@ async fn run_conversation_turn(
             Some(Arc::clone(&turn_lease)),
         )
         .await;
-        drop(dispatch_ownership);
+        dispatch_ownership.release();
         drop(execution_permit);
         drop(pending_work);
         return;
@@ -11177,7 +11663,7 @@ async fn run_conversation_turn(
     // still queued; the slot is released without running it.
     if registration.cancellation.is_cancelled() {
         drop(registration);
-        drop(dispatch_ownership);
+        dispatch_ownership.release();
         drop(execution_permit);
         drop(pending_work);
         return;
@@ -11192,7 +11678,7 @@ async fn run_conversation_turn(
     )
     .await;
     drop(registration);
-    drop(dispatch_ownership);
+    dispatch_ownership.release();
     drop(execution_permit);
     drop(pending_work);
 }
@@ -16746,7 +17232,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
             ));
         }
-        if config.composio.enabled {
+        if tools::composio_tool_available(&config) {
             tool_descs.push((
                 "composio",
                 "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
@@ -17255,6 +17741,21 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         }
     }
 
+    // One conversation owner per agent, over the routes that agent serves.
+    // Built here, while the contexts and the route map are still in hand, and
+    // published below together with the rest of this instance.
+    let routes = Arc::new(owner_by_channel_key.clone());
+    let conversation_owners: Vec<(String, Arc<ChannelConversationOwner>)> = agent_ctxs
+        .iter()
+        .map(|(alias, ctx)| {
+            let owner = ChannelConversationOwner {
+                ctx: Arc::clone(ctx),
+                owner_by_channel_key: Arc::clone(&routes),
+            };
+            (alias.clone(), Arc::new(owner))
+        })
+        .collect();
+
     let router = AgentRouter::multi(
         agent_ctxs,
         owner_by_channel_key,
@@ -17279,6 +17780,19 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         return Ok(());
     }
     let (_, cron_channel_registry_lease) = publish_cron_channel_registry(&prepared_channels);
+    // Published only now that this instance is committed: an instance that
+    // is cancelled before this point never replaces, and so never removes,
+    // the owners a still-serving predecessor published.
+    let conversation_owner_leases: Vec<_> = conversation_owners
+        .into_iter()
+        .map(|(alias, owner)| {
+            zeroclaw_infra::conversation_owners::publish_conversation_owner(
+                zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                &alias,
+                owner,
+            )
+        })
+        .collect();
     for cc in &prepared_channels {
         prepare_supervised_channel(&cc.channel, &cancel);
     }
@@ -17320,6 +17834,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         let _ = h.await;
     }
     drop(cron_channel_registry_lease);
+    drop(conversation_owner_leases);
 
     Ok(())
 }
@@ -19041,6 +19556,590 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn() {
     );
 }
 
+/// The route the channel fixtures arrive on (`test-channel`, no alias).
+#[cfg(test)]
+const TEST_BOUND_ROUTE: &str = "test-channel";
+
+#[cfg(test)]
+fn test_conversation_owner(ctx: &Arc<ChannelRuntimeContext>) -> ChannelConversationOwner {
+    ChannelConversationOwner {
+        ctx: Arc::clone(ctx),
+        owner_by_channel_key: Arc::new(HashMap::from([(
+            TEST_BOUND_ROUTE.to_string(),
+            ctx.agent_alias.to_string(),
+        )])),
+    }
+}
+
+#[cfg(test)]
+fn test_conversation_binding(key: &str) -> zeroclaw_api::conversation_binding::ConversationBinding {
+    zeroclaw_api::conversation_binding::ConversationBinding {
+        surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+        route: TEST_BOUND_ROUTE.to_string(),
+        key: key.to_string(),
+    }
+}
+
+/// An internally initiated exchange appended while a channel turn is in
+/// flight is a concurrent worker's turn like any other: the channel turn's
+/// post-trim resync must keep it, and the cache and durable transcript must
+/// agree afterwards.
+#[cfg(test)]
+#[test]
+fn bound_exchange_survives_a_concurrent_channel_turns_trim_resync() {
+    use tempfile::TempDir;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_exchange_resync_key".to_string();
+
+    let dropped_turn = ChatMessage::user("old turn the channel turn trims away");
+    let retained_turn = ChatMessage::user("channel turn's inbound message");
+    backend.append(&sender, &dropped_turn).expect("seed append");
+    backend
+        .append(&sender, &retained_turn)
+        .expect("seed append");
+
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(
+            sender.clone(),
+            vec![dropped_turn.clone(), retained_turn.clone()],
+        );
+    let known_prefix = [dropped_turn.clone(), retained_turn.clone()];
+
+    let job_prompt = ChatMessage::user("[cron:job-1 reminder] Remind me to call Sam");
+    let job_reply = ChatMessage::assistant("Reminder: call Sam.");
+    append_bound_exchange(
+        ctx.as_ref(),
+        &sender,
+        &[job_prompt.clone(), job_reply.clone()],
+    )
+    .expect("bound exchange persists");
+
+    let breadcrumb = ChatMessage::system("(earlier history was trimmed)");
+    let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
+    assert!(resync_sender_history_after_trim(
+        ctx.as_ref(),
+        &sender,
+        &trimmed_turns,
+        true,
+        &known_prefix,
+        false,
+    ));
+
+    let expected = [breadcrumb, retained_turn, job_prompt, job_reply];
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == expected.len() && cached.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the channel turn's resync must keep the bound exchange: got {cached:?}"
+    );
+    let reloaded = backend.load(&sender);
+    assert!(
+        reloaded.len() == expected.len() && reloaded.iter().zip(&expected).all(|(a, b)| same(a, b)),
+        "the durable transcript must agree with the cache: got {reloaded:?}"
+    );
+}
+
+/// The bound exchange lands as one contiguous pair between a channel turn's
+/// inbound message and its reply, and the next channel turn sees it.
+#[cfg(test)]
+#[test]
+fn bound_exchange_is_contiguous_and_visible_to_the_next_channel_turn() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_exchange_visibility_key".to_string();
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let owner = test_conversation_owner(&ctx);
+
+    append_sender_turn(ctx.as_ref(), &sender, ChatMessage::user("set a reminder"));
+    owner
+        .append(
+            &test_conversation_binding(&sender),
+            &[
+                ChatMessage::user("[cron:job-1 reminder] Remind me"),
+                ChatMessage::assistant("Reminder sent."),
+            ],
+        )
+        .expect("bound exchange persists");
+    append_sender_turn(ctx.as_ref(), &sender, ChatMessage::assistant("Scheduled."));
+
+    let expected = [
+        ("user", "set a reminder"),
+        ("user", "[cron:job-1 reminder] Remind me"),
+        ("assistant", "Reminder sent."),
+        ("assistant", "Scheduled."),
+    ];
+    let durable: Vec<_> = backend
+        .load(&sender)
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
+    assert_eq!(
+        durable,
+        expected
+            .iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect::<Vec<_>>()
+    );
+
+    let next_turn = append_sender_turn(
+        ctx.as_ref(),
+        &sender,
+        ChatMessage::user("did you remind me?"),
+    )
+    .expect("history available");
+    assert!(
+        next_turn
+            .iter()
+            .any(|m| m.role == "assistant" && m.content == "Reminder sent."),
+        "the next channel turn must see the bound reply: got {next_turn:?}"
+    );
+
+    // A fresh owner over an evicted cache reloads the same history from disk.
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop(&sender);
+    let loaded = owner
+        .load(&test_conversation_binding(&sender))
+        .expect("load");
+    assert!(loaded.iter().all(|m| m.role != "system"));
+    assert!(
+        loaded
+            .iter()
+            .any(|m| m.content.contains("[cron:job-1 reminder] Remind me")),
+        "load must hydrate from the store on a cache miss: got {loaded:?}"
+    );
+}
+
+/// A bound run is handed the conversation the way a channel turn would send
+/// it: no trim breadcrumb posing as a turn, no internal tool markers, no
+/// inline image payloads.
+#[cfg(test)]
+#[test]
+fn bound_load_returns_the_history_a_channel_turn_would_send() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_load_prepared_key".to_string();
+    let ctx = test_channel_ctx_with_backend(backend);
+    let owner = test_conversation_owner(&ctx);
+
+    let cached = vec![
+        zeroclaw_runtime::agent::history_trim::breadcrumb(),
+        ChatMessage::user("what is in this picture? [IMAGE:data:image/png;base64,QUJDRA==]"),
+        ChatMessage::assistant("[Used tools: shell]\nA cat."),
+        ChatMessage::user("thanks"),
+        ChatMessage::assistant("You're welcome."),
+    ];
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), cached);
+    ctx.history_crumb_flags
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), true);
+
+    let loaded: Vec<(String, String)> = owner
+        .load(&test_conversation_binding(&sender))
+        .expect("load")
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
+
+    assert_eq!(loaded.len(), 4, "the breadcrumb is not a turn: {loaded:?}");
+    assert_eq!(loaded[0].0, "user");
+    assert!(
+        loaded[0].1.starts_with("what is in this picture?") && !loaded[0].1.contains("base64"),
+        "inline image payloads are collapsed: {loaded:?}"
+    );
+    assert_eq!(loaded[1], ("assistant".to_string(), "A cat.".to_string()));
+    assert_eq!(loaded[3].1, "You're welcome.");
+}
+
+/// The session store is shared by every agent. An owner serves a binding
+/// only on a route its agent is serving, so a channel handed to another agent
+/// takes its conversations with it.
+#[cfg(test)]
+#[test]
+fn bound_conversation_on_a_route_this_agent_does_not_serve_is_refused() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_route_refusal_key".to_string();
+    // The transcript is in the shared store, written by whoever serves it.
+    backend
+        .append(&sender, &ChatMessage::user("a chat with another agent"))
+        .expect("seed append");
+    backend
+        .append(&sender, &ChatMessage::assistant("its reply"))
+        .expect("seed append");
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let owner = test_conversation_owner(&ctx);
+    let elsewhere = zeroclaw_api::conversation_binding::ConversationBinding {
+        route: "telegram.other".to_string(),
+        ..test_conversation_binding(&sender)
+    };
+
+    assert!(owner.load(&elsewhere).is_err());
+    assert!(
+        owner
+            .append(
+                &elsewhere,
+                &[ChatMessage::user("[cron:job-1 reminder] Remind me")]
+            )
+            .is_err()
+    );
+    assert_eq!(backend.load(&sender).len(), 2, "nothing was written");
+    assert!(
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .is_none(),
+        "the refused conversation was not pulled into this agent's cache"
+    );
+    // The same key on the served route is this agent's to read.
+    assert_eq!(
+        owner
+            .load(&test_conversation_binding(&sender))
+            .expect("load")
+            .len(),
+        2
+    );
+}
+
+/// Messages nobody has answered yet are part of the conversation: context a
+/// channel records without replying, or a turn still in progress. A bound
+/// run is handed them, and joins its own message to the last one.
+#[cfg(test)]
+#[test]
+fn bound_load_keeps_messages_that_have_no_reply_yet() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_load_unanswered_key".to_string();
+    let ctx = test_channel_ctx_with_backend(backend);
+    let owner = test_conversation_owner(&ctx);
+
+    append_sender_turn(
+        ctx.as_ref(),
+        &sender,
+        ChatMessage::user("summarise this room at six"),
+    );
+    append_sender_turn(ctx.as_ref(), &sender, ChatMessage::assistant("Scheduled."));
+    append_sender_turn(ctx.as_ref(), &sender, ChatMessage::user("lunch was good"));
+    append_sender_turn(
+        ctx.as_ref(),
+        &sender,
+        ChatMessage::user("the release is on Friday"),
+    );
+
+    let loaded: Vec<(String, String)> = owner
+        .load(&test_conversation_binding(&sender))
+        .expect("load")
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
+    assert_eq!(
+        loaded,
+        vec![
+            ("user".to_string(), "summarise this room at six".to_string()),
+            ("assistant".to_string(), "Scheduled.".to_string()),
+            (
+                "user".to_string(),
+                "lunch was good\n\nthe release is on Friday".to_string()
+            ),
+        ]
+    );
+}
+
+/// The breadcrumb is dropped only when the cache's own record says one is
+/// there and the first turn is it. A real first turn survives a stale record,
+/// and breadcrumb-like text survives the absence of one.
+#[cfg(test)]
+#[test]
+fn bound_load_drops_a_breadcrumb_only_when_record_and_text_agree() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let ctx = test_channel_ctx_with_backend(backend);
+    let owner = test_conversation_owner(&ctx);
+    let seed = |key: &str, first: ChatMessage, recorded: bool| {
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(
+                key.to_string(),
+                vec![first, ChatMessage::assistant("a reply")],
+            );
+        ctx.history_crumb_flags
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key.to_string(), recorded);
+    };
+    let first_loaded = |key: &str| {
+        owner
+            .load(&test_conversation_binding(key))
+            .expect("load")
+            .into_iter()
+            .map(|m| m.content)
+            .collect::<Vec<_>>()
+    };
+    let crumb = zeroclaw_runtime::agent::history_trim::breadcrumb();
+
+    // The record is stale: the breadcrumb it refers to has been evicted.
+    seed(
+        "bound_crumb_stale_record",
+        ChatMessage::user("a real question"),
+        true,
+    );
+    assert_eq!(
+        first_loaded("bound_crumb_stale_record"),
+        ["a real question", "a reply"]
+    );
+
+    // No breadcrumb is recorded: text that looks like one is the user's own.
+    seed("bound_crumb_unrecorded_text", crumb.clone(), false);
+    assert_eq!(
+        first_loaded("bound_crumb_unrecorded_text"),
+        [crumb.content.as_str(), "a reply"]
+    );
+}
+
+/// A history that exists on disk but cannot be verified is an error to the
+/// reader, never an empty conversation.
+#[cfg(test)]
+#[test]
+fn bound_load_reports_an_unverifiable_history() {
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    struct UnreadableTranscript;
+    impl SessionBackend for UnreadableTranscript {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            Vec::new()
+        }
+        fn try_load(&self, _key: &str) -> std::io::Result<Vec<ChatMessage>> {
+            Err(std::io::Error::other("simulated transcript read failure"))
+        }
+        fn append(&self, _key: &str, _msg: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    let ctx = test_channel_ctx_with_backend(Arc::new(UnreadableTranscript));
+    let owner = test_conversation_owner(&ctx);
+
+    let binding = test_conversation_binding("bound_load_unverifiable_key");
+    assert!(owner.load(&binding).is_err());
+    assert!(
+        owner
+            .append(
+                &binding,
+                &[ChatMessage::user("[cron:job-1 reminder] Remind me")],
+            )
+            .is_err(),
+        "nothing may be appended to a history that could not be verified"
+    );
+}
+
+/// An exchange lands whole or not at all. When the store rejects its second
+/// message, the first is taken back; when even that is impossible, the cache
+/// keeps exactly what the store kept. Either way the failure is reported.
+#[cfg(test)]
+#[test]
+fn bound_exchange_that_fails_part_way_is_taken_back() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+
+    struct SecondAppendFails {
+        messages: StdMutex<Vec<ChatMessage>>,
+        can_take_back: bool,
+    }
+    impl SessionBackend for SecondAppendFails {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            let mut messages = self.messages.lock().unwrap();
+            if messages.len() == 1 {
+                return Err(std::io::Error::other("simulated durable write failure"));
+            }
+            messages.push(msg.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            if !self.can_take_back {
+                return Err(std::io::Error::other("simulated durable delete failure"));
+            }
+            Ok(self.messages.lock().unwrap().pop().is_some())
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Ok(Some(false))
+        }
+    }
+
+    for (can_take_back, left_behind) in [(true, 0), (false, 1)] {
+        let backend = Arc::new(SecondAppendFails {
+            messages: StdMutex::new(Vec::new()),
+            can_take_back,
+        });
+        let ctx = test_channel_ctx_with_backend(backend.clone());
+        let sender = "bound_exchange_failure_key";
+
+        let result = append_bound_exchange(
+            ctx.as_ref(),
+            sender,
+            &[
+                ChatMessage::user("[cron:job-1 reminder] Remind me"),
+                ChatMessage::assistant("Reminder sent."),
+            ],
+        );
+        assert!(result.is_err(), "a failed durable write must be reported");
+
+        let durable = backend.load(sender);
+        let cached = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(sender)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(durable.len(), left_behind, "can_take_back={can_take_back}");
+        assert_eq!(cached.len(), left_behind, "can_take_back={can_take_back}");
+        assert_eq!(
+            cached.first().map(|m| m.content.as_str()),
+            durable.first().map(|m| m.content.as_str())
+        );
+    }
+}
+
+/// Reading a history that is not in the cache changes nothing: the durable
+/// transcript is not closed, capped or rewritten, and nothing is installed
+/// in the cache. An unanswered last message is handed over as it is.
+#[cfg(test)]
+#[test]
+fn bound_load_of_an_uncached_history_writes_nothing() {
+    use tempfile::TempDir;
+    use zeroclaw_api::conversation_binding::ConversationBindingOwner;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+    use zeroclaw_providers::ChatMessage;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+    let sender = "bound_load_cold_read_key".to_string();
+    for message in [
+        ChatMessage::user("summarise this room at six"),
+        ChatMessage::assistant("Scheduled."),
+        ChatMessage::user("the release is on Friday"),
+    ] {
+        backend.append(&sender, &message).expect("seed append");
+    }
+    let ctx = test_channel_ctx_with_backend(backend.clone());
+    let owner = test_conversation_owner(&ctx);
+
+    let loaded: Vec<(String, String)> = owner
+        .load(&test_conversation_binding(&sender))
+        .expect("load")
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
+
+    assert_eq!(
+        loaded,
+        vec![
+            ("user".to_string(), "summarise this room at six".to_string()),
+            ("assistant".to_string(), "Scheduled.".to_string()),
+            ("user".to_string(), "the release is on Friday".to_string()),
+        ]
+    );
+    let durable: Vec<String> = backend
+        .load(&sender)
+        .into_iter()
+        .map(|m| m.content)
+        .collect();
+    assert_eq!(
+        durable,
+        [
+            "summarise this room at six",
+            "Scheduled.",
+            "the release is on Friday"
+        ],
+        "a read must not close or rewrite the transcript"
+    );
+    assert!(
+        ctx.conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .peek(&sender)
+            .is_none(),
+        "a read must not install the history in the cache"
+    );
+}
+
 /// A bounded cache (`max_history_messages`) evicts from the front, so a
 /// concurrent worker's turns can rotate worker A's own observed prefix out of
 /// the cache without growing it past `known_prefix.len()` — the exact case a
@@ -19863,6 +20962,9 @@ pub(crate) mod tests {
         let error = anyhow::Error::new(zeroclaw_runtime::agent::ContextWindowExceeded {
             estimated_tokens: 65_537,
             model_context_window: 65_536,
+            raw_estimated_tokens: 65_537,
+            system_tokens: 0,
+            tool_schema_tokens: 0,
         })
         .context("maximum context length; private provider diagnostics");
         assert!(!is_context_window_overflow_error(&error));
@@ -20069,8 +21171,41 @@ pub(crate) mod tests {
 
     #[test]
     fn matrix_safe_policy_fields_match_active_standard_tool_schemas() {
+        use zeroclaw_config::builtin_tools::EXTERNAL_TOOL_NAMES;
+        use zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT;
+
         let temp = TempDir::new().expect("temporary workspace");
-        let config = Arc::new(Config::default());
+        let mut config = Config {
+            data_dir: temp.path().join("data"),
+            config_path: temp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.tools.optional = vec!["*".into()];
+
+        // Config owns compile availability; channels has no tools-external feature of its own.
+        // Only named adapters are reported as compiled out, so probe with every one by name.
+        let mut probe = config.clone();
+        probe.tools.optional = EXTERNAL_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).into())
+            .collect();
+        let compiled_out_external = probe
+            .collect_warnings()
+            .iter()
+            .filter(|warning| warning.code == TOOL_COMPILED_OUT && warning.path == "tools.optional")
+            .count();
+        assert!(
+            compiled_out_external == 0 || compiled_out_external == EXTERNAL_TOOL_NAMES.len(),
+            "naming every external adapter must report all of them or none as compiled out"
+        );
+        let mut expected_absent_required_tools: Vec<&str> = MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+            .iter()
+            .flat_map(|(tools, _)| tools.iter().copied())
+            .filter(|tool| compiled_out_external != 0 && EXTERNAL_TOOL_NAMES.contains(tool))
+            .collect();
+        expected_absent_required_tools.sort_unstable();
+
+        let config = Arc::new(config);
         let security = Arc::new(SecurityPolicy::default());
         let registry = tools::all_tools(
             Arc::clone(&config),
@@ -20139,9 +21274,10 @@ pub(crate) mod tests {
             checked_tools >= 20,
             "the standard registry unexpectedly exposed only {checked_tools} safe-policy tools"
         );
-        assert!(
-            absent_required_tools.is_empty(),
-            "required Matrix safe policy tools absent from the standard registry: {absent_required_tools:?}"
+        absent_required_tools.sort_unstable();
+        assert_eq!(
+            absent_required_tools, expected_absent_required_tools,
+            "required Matrix safe policy tool absences must exactly match this build's external adapters"
         );
     }
 
@@ -21179,6 +22315,187 @@ temperature = 0.3
             err.to_string()
                 .contains("[channels.wecom_ws.removed] not configured"),
             "delivery must fall back to the current empty config: {err:#}"
+        );
+    }
+
+    fn daemon_factory_agent(
+        bindings: &[&str],
+        enabled: bool,
+    ) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            enabled,
+            channels: bindings
+                .iter()
+                .map(|b| zeroclaw_config::providers::ChannelRef(b.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn daemon_factory_config(bindings: &[&str]) -> Config {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("sales".into(), daemon_factory_agent(bindings, true));
+        config
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_resolves_the_running_instances_for_the_agent() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let running = mock_channel("whatsapp");
+        let sibling = mock_channel("whatsapp");
+        let other = mock_channel("telegram");
+        let (_published, _lease) = publish_cron_channel_registry(&[
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("ventas".to_string()),
+                channel: Arc::clone(&running),
+            },
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("soporte".to_string()),
+                channel: Arc::clone(&sibling),
+            },
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("ops".to_string()),
+                channel: Arc::clone(&other),
+            },
+        ]);
+
+        let config = daemon_factory_config(&["whatsapp.ventas"]);
+        let map = live_channel_map_for_agent(&config, "sales");
+
+        assert!(
+            Arc::ptr_eq(map.get("whatsapp.ventas").unwrap(), &running),
+            "a daemon turn must get the instance the channel task is running"
+        );
+        assert!(
+            !map.contains_key("whatsapp.soporte"),
+            "an exact binding must not admit another alias of the same type"
+        );
+        // The bare key follows the agent's own bindings, so it stays
+        // unambiguous even though two WhatsApp aliases are running.
+        assert!(Arc::ptr_eq(map.get("whatsapp").unwrap(), &running));
+        assert!(
+            !map.contains_key("telegram.ops") && !map.contains_key("telegram"),
+            "channels the agent is not bound to stay out of its map"
+        );
+        assert!(live_channel_map_for_agent(&config, "unknown").is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_is_empty_until_a_channel_task_publishes() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+        let config = daemon_factory_config(&["whatsapp.ventas"]);
+
+        prepare_live_channel_registry(true);
+        assert!(live_channel_map_for_agent(&config, "sales").is_empty());
+
+        let running = mock_channel("whatsapp");
+        let (_published, lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WhatsApp",
+            alias: Some("ventas".to_string()),
+            channel: Arc::clone(&running),
+        }]);
+        assert!(Arc::ptr_eq(
+            live_channel_map_for_agent(&config, "sales")
+                .get("whatsapp.ventas")
+                .unwrap(),
+            &running
+        ));
+
+        drop(lease);
+        assert!(
+            live_channel_map_for_agent(&config, "sales").is_empty(),
+            "a retired channel task must not stay reachable from daemon turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_factory_applies_type_bindings_singleton_keys_and_fallbacks() {
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let ops = mock_channel("telegram");
+        let alerts = mock_channel("telegram");
+        let ventas = mock_channel("whatsapp");
+        let (_published, _lease) = publish_cron_channel_registry(&[
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("ops".to_string()),
+                channel: Arc::clone(&ops),
+            },
+            ConfiguredChannel {
+                display_name: "Telegram",
+                alias: Some("alerts".to_string()),
+                channel: Arc::clone(&alerts),
+            },
+            ConfiguredChannel {
+                display_name: "WhatsApp",
+                alias: Some("ventas".to_string()),
+                channel: Arc::clone(&ventas),
+            },
+        ]);
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("typed".into(), daemon_factory_agent(&["telegram"], true));
+        config.agents.insert(
+            "disabled".into(),
+            daemon_factory_agent(&["whatsapp.ventas"], false),
+        );
+
+        // A type-only binding takes every alias of that type, and two aliases
+        // leave no unambiguous bare key.
+        let map = live_channel_map_for_agent(&config, "typed");
+        assert!(Arc::ptr_eq(map.get("telegram.ops").unwrap(), &ops));
+        assert!(Arc::ptr_eq(map.get("telegram.alerts").unwrap(), &alerts));
+        assert!(
+            !map.contains_key("telegram"),
+            "a bare key would be ambiguous between two aliases"
+        );
+        assert!(!map.contains_key("whatsapp.ventas") && !map.contains_key("whatsapp"));
+
+        assert!(
+            live_channel_map_for_agent(&config, "disabled").is_empty(),
+            "a disabled agent gets no channels"
+        );
+
+        // When no agent binds any channel, an enabled agent sees all of them.
+        let mut unbound = Config::default();
+        unbound
+            .agents
+            .insert("any".into(), daemon_factory_agent(&[], true));
+        let mut keys: Vec<String> = live_channel_map_for_agent(&unbound, "any")
+            .into_keys()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "telegram.alerts",
+                "telegram.ops",
+                "whatsapp",
+                "whatsapp.ventas"
+            ]
         );
     }
 
@@ -27470,6 +28787,8 @@ BTC is currently around $65,000 based on latest tool output."#
     struct ModelCaptureModelProvider {
         call_count: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
+        attempt_allowlists: std::sync::Mutex<Vec<(bool, bool)>>,
+        supports_vision: bool,
     }
 
     #[async_trait::async_trait]
@@ -27495,7 +28814,18 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(model.to_string());
+            self.attempt_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((
+                    zeroclaw_providers::reliable::provider_ref_allowed_for_turn("custom.local"),
+                    zeroclaw_providers::reliable::provider_ref_allowed_for_turn("custom.cloud"),
+                ));
             Ok("ok".to_string())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.supports_vision
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for ModelCaptureModelProvider {
@@ -27793,6 +29123,7 @@ BTC is currently around $65,000 based on latest tool output."#
     fn channel_all_tools_result(tools: Vec<Box<dyn Tool>>) -> tools::AllToolsResult {
         tools::AllToolsResult {
             tools,
+            reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -28492,6 +29823,91 @@ BTC is currently around $65,000 based on latest tool output."#
             security: Arc::new(SecurityPolicy::default()),
             sop_driver_sink: None,
         })
+    }
+
+    /// Answers every request plainly and records the conversation the
+    /// surface declared around the turn it was called in.
+    #[derive(Default)]
+    struct DeclaredConversationProvider {
+        declared:
+            std::sync::Mutex<Vec<Option<zeroclaw_api::conversation_binding::ActiveConversation>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for DeclaredConversationProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.declared.lock().unwrap().push(
+                zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            );
+            Ok("ok".to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for DeclaredConversationProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "DeclaredConversationProvider"
+        }
+    }
+
+    /// A channel turn declares the conversation it is serving, under its own
+    /// history key and agent, for the whole tool loop.
+    #[tokio::test]
+    async fn channel_turn_declares_its_conversation_to_the_tool_loop() {
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_infra::session_store::SessionStore;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SessionStore::new(tmp.path()).expect("session store"));
+        let provider = Arc::new(DeclaredConversationProvider::default());
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let runtime_ctx = test_channel_ctx_with_backend_channel_and_provider(
+            backend,
+            channel,
+            provider.clone(),
+            0,
+        );
+        let msg = message_sent_hook_test_message();
+        let history_key = conversation_history_key(&msg);
+
+        process_channel_message(runtime_ctx.clone(), msg, CancellationToken::new()).await;
+
+        let declared = provider.declared.lock().unwrap().clone();
+        assert_eq!(
+            declared,
+            vec![Some(
+                zeroclaw_api::conversation_binding::ActiveConversation {
+                    surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                    route: TEST_BOUND_ROUTE.to_string(),
+                    key: history_key,
+                    agent_alias: runtime_ctx.agent_alias.to_string(),
+                }
+            )]
+        );
     }
 
     #[tokio::test]
@@ -30412,6 +31828,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ChannelRouteSelection {
                     model_provider: "no-such-provider".into(),
                     model: "route-model".to_string(),
+                    automatic: false,
                     api_key: None,
                 },
             );
@@ -31317,6 +32734,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "openrouter".into(),
                 model: "route-model".to_string(),
+                automatic: false,
                 api_key: None,
             },
         );
@@ -36899,10 +38317,13 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("## Project Context"),
             "missing Project Context"
         );
-        assert!(prompt.contains("## Current Date"), "missing Date section");
+        assert!(
+            !prompt.contains("## Current Date"),
+            "system prompt must not carry wall-clock date (#11704)"
+        );
         assert!(
             !prompt.contains("## Current Date & Time"),
-            "prompt should use date-only context"
+            "prompt should not use datetime context"
         );
         assert!(prompt.contains("## Runtime"), "missing Runtime section");
     }
@@ -40930,6 +42351,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let sel = |m: &str| ChannelRouteSelection {
             model_provider: "openrouter.default".into(),
             model: m.into(),
+            automatic: false,
             api_key: None,
         };
 
@@ -41015,6 +42437,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &ChannelRouteSelection {
                 model_provider: "custom.large".to_string(),
                 model: "large-model".to_string(),
+                automatic: true,
                 api_key: None,
             },
             0,
@@ -41025,6 +42448,7 @@ BTC is currently around $65,000 based on latest tool output."#
             &ChannelRouteSelection {
                 model_provider: "custom.small".to_string(),
                 model: "small-model".to_string(),
+                automatic: true,
                 api_key: None,
             },
             0,
@@ -41059,6 +42483,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "openrouter.default".into(),
                 model: "other".into(),
+                automatic: false,
                 api_key: None,
             },
             &snapshot,
@@ -41067,6 +42492,509 @@ BTC is currently around $65,000 based on latest tool output."#
         // Setting it back to the config default clears the entry.
         set_scope_override(&ctx, OverrideScope::User, &msg, default, &snapshot);
         assert!(ctx.scope_overrides.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_session_selection_survives_until_automatic_is_restored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        let msg = scope_test_msg("alice", "chan", None);
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        let automatic = default_route_selection_from_snapshot(&snapshot);
+        let mut manual = automatic.clone();
+        manual.automatic = false;
+
+        set_route_selection(&ctx, &sender_key, manual, &snapshot);
+        let selected = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        assert!(!selected.automatic);
+        assert_eq!(selected.model_provider, automatic.model_provider);
+        assert_eq!(selected.model, automatic.model);
+
+        set_route_selection(&ctx, &sender_key, automatic, &snapshot);
+        assert!(
+            get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
+            "restoring automatic selection should clear the session override"
+        );
+    }
+
+    #[test]
+    fn model_issued_switch_preserves_route_ownership_for_next_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        let msg = scope_test_msg("alice", "chan", None);
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+
+        let mut automatic = default_route_selection_from_snapshot(&snapshot);
+        apply_model_issued_route_switch(
+            &mut automatic,
+            "openrouter.default".into(),
+            "switched-model".into(),
+            None,
+        );
+        set_route_selection(&ctx, &sender_key, automatic, &snapshot);
+        assert!(
+            get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
+            "a model-issued switch during automatic routing must remain eligible for effort classification on the next turn"
+        );
+
+        let mut manual = default_route_selection_from_snapshot(&snapshot);
+        manual.automatic = false;
+        apply_model_issued_route_switch(
+            &mut manual,
+            "openrouter.default".into(),
+            "manual-switched-model".into(),
+            None,
+        );
+        set_route_selection(&ctx, &sender_key, manual, &snapshot);
+        assert!(
+            !get_route_selection(&ctx, &msg, &sender_key, &snapshot).automatic,
+            "a model-issued switch during an operator override must not restore automatic routing"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_session_auto_restores_automatic_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _provider, _channel) = effort_routing_channel_context(tmp.path(), true);
+        let mut msg = scope_test_msg("alice", "chan", None);
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        set_route_selection(
+            &ctx,
+            &sender_key,
+            ChannelRouteSelection {
+                model_provider: "anthropic.work".into(),
+                model: "claude-sonnet".into(),
+                automatic: false,
+                api_key: None,
+            },
+            &snapshot,
+        );
+        msg.content = "/model auto".into();
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        assert!(handle_runtime_command_if_needed(ctx.as_ref(), &msg, Some(&target)).await);
+
+        let restored = get_route_selection(ctx.as_ref(), &msg, &sender_key, &snapshot);
+        assert!(restored.automatic);
+        assert_eq!(restored.model_provider, "custom.local");
+        assert_eq!(restored.model, "local-model");
+        assert!(
+            !ctx.route_overrides
+                .lock()
+                .unwrap()
+                .contains_key(&sender_key),
+            "restoring automatic routing should remove the per-sender override"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_session_auto_preserves_legacy_route_without_effort_routing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "auto".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet".into(),
+            api_key: None,
+        }]);
+        let mut msg = scope_test_msg("alice", "chan", None);
+        msg.content = "/model auto".into();
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        assert!(handle_runtime_command_if_needed(&ctx, &msg, Some(&target)).await);
+
+        let selected = get_route_selection(&ctx, &msg, &sender_key, &snapshot);
+        assert!(!selected.automatic);
+        assert_eq!(selected.model_provider, "anthropic.work");
+        assert_eq!(selected.model, "claude-sonnet");
+    }
+
+    fn effort_routing_channel_context(
+        zeroclaw_dir: &std::path::Path,
+        include_cloud_route: bool,
+    ) -> (
+        Arc<ChannelRuntimeContext>,
+        Arc<ModelCaptureModelProvider>,
+        Arc<SendMessageRecordingChannel>,
+    ) {
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let mut ctx = channel_runtime_context_with_peer_groups(zeroclaw_dir, groups);
+        let channel_impl = Arc::new(SendMessageRecordingChannel {
+            channel_name: "discord",
+            ..Default::default()
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        ctx.channels_by_name = Arc::new(HashMap::from([(
+            channel.name().to_string(),
+            Arc::clone(&channel),
+        )]));
+
+        let mut routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "local".into(),
+            model_provider: "custom.local".into(),
+            model: "local-model".into(),
+            api_key: None,
+        }];
+        if include_cloud_route {
+            routes.push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            });
+        }
+        let mut config = ctx.prompt_config.as_ref().clone();
+        config.model_routes = routes.clone();
+        config.runtime_profiles.insert(
+            "effort".into(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "agentX".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        ctx.agent_cfg = Arc::new(
+            config
+                .resolved_agent_config("agentX")
+                .expect("effort agent must resolve"),
+        );
+        ctx.prompt_config = Arc::new(config.clone());
+        ctx.model_routes = Arc::new(routes);
+        ctx.model_provider_ref = Arc::new("custom.local".into());
+        ctx.model = Arc::new("local-model".into());
+
+        let provider_impl = Arc::new(ModelCaptureModelProvider {
+            supports_vision: true,
+            ..Default::default()
+        });
+        let provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        ctx.model_provider = Arc::clone(&provider);
+        ctx.provider_cache = Arc::new(Mutex::new(HashMap::from([
+            ("custom.local".into(), Arc::clone(&provider)),
+            ("custom.cloud".into(), provider),
+        ])));
+
+        (Arc::new(ctx), provider_impl, channel_impl)
+    }
+
+    #[tokio::test]
+    async fn scoped_model_auto_resets_restore_effort_routing_for_real_channel_turn() {
+        for (scope_flag, scope) in [
+            ("--user", OverrideScope::User),
+            ("--agent", OverrideScope::Agent),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, provider, channel_impl) = effort_routing_channel_context(tmp.path(), true);
+            let channel: Arc<dyn Channel> = channel_impl;
+            let mut command = scope_test_msg("alice", "chan-1", None);
+            command.id = format!("set-{scope_flag}");
+            command.content = format!("/model {scope_flag} cloud");
+            assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
+            assert!(
+                ctx.scope_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&scope_override_key(scope, &command, "agentX"))
+            );
+
+            let mut manual_turn = scope_test_msg("alice", "chan-1", None);
+            manual_turn.id = format!("manual-turn-{scope_flag}");
+            manual_turn.content = "hi".into();
+            process_channel_message(Arc::clone(&ctx), manual_turn, CancellationToken::new()).await;
+
+            command.id = format!("reset-{scope_flag}");
+            command.content = format!("/model {scope_flag} auto");
+            assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
+            assert!(
+                !ctx.scope_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&scope_override_key(scope, &command, "agentX"))
+            );
+
+            let mut turn = scope_test_msg("alice", "chan-1", None);
+            turn.id = format!("turn-{scope_flag}");
+            turn.content = "hi".into();
+            process_channel_message(Arc::clone(&ctx), turn, CancellationToken::new()).await;
+
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                provider
+                    .models
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &["cloud-model".to_string(), "local-model".to_string()]
+            );
+            assert_eq!(
+                provider
+                    .attempt_allowlists
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[(true, true), (true, false)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_model_auto_after_model_switch_restores_underlying_sender_route() {
+        for scope_flag in ["--user", "--agent"] {
+            for manual_sender in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let (ctx, provider, channel_impl) =
+                    effort_routing_channel_context(tmp.path(), true);
+                let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+                let mut config = ctx.prompt_config.as_ref().clone();
+                config
+                    .providers
+                    .models
+                    .ensure("openrouter", "default")
+                    .unwrap();
+                let config = Arc::new(config);
+                ctx.prompt_config = Arc::clone(&config);
+                ctx.tools_registry = Arc::new(
+                    zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                        Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
+                            Arc::clone(&ctx.security),
+                            config,
+                        )),
+                    ]),
+                );
+                ctx.approval_manager = Arc::new(ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig {
+                        auto_approve: vec!["model_switch".into()],
+                        ..Default::default()
+                    },
+                ));
+                let switching = Arc::new(ModelSwitchRequestProvider::default());
+                ctx.provider_cache
+                    .lock()
+                    .unwrap()
+                    .insert("custom.cloud".into(), switching.clone());
+                ctx.provider_cache
+                    .lock()
+                    .unwrap()
+                    .insert("openrouter.default".into(), provider.clone());
+                let ctx = Arc::new(ctx);
+                let channel: Arc<dyn Channel> = channel_impl;
+                let mut command = scope_test_msg("alice", "chan-1", None);
+                if manual_sender {
+                    command.content = "/model local".into();
+                    assert!(handle_runtime_command_if_needed(&ctx, &command, Some(&channel)).await);
+                }
+                let sender_key = conversation_history_key(&command);
+                let snapshot = runtime_defaults_snapshot(&ctx);
+                let underlying = get_route_selection(&ctx, &command, &sender_key, &snapshot);
+
+                command.content = format!("/model {scope_flag} cloud");
+                assert!(handle_runtime_command_if_needed(&ctx, &command, Some(&channel)).await);
+                let mut turn = scope_test_msg("alice", "chan-1", None);
+                turn.id = "scoped-switch-turn".into();
+                turn.content = "hi".into();
+                process_channel_message(Arc::clone(&ctx), turn, CancellationToken::new()).await;
+                assert_eq!(switching.call_count.load(Ordering::SeqCst), 1);
+                assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+
+                command.content = format!("/model {scope_flag} auto");
+                assert!(handle_runtime_command_if_needed(&ctx, &command, Some(&channel)).await);
+                assert_eq!(
+                    get_route_selection(&ctx, &command, &sender_key, &snapshot),
+                    underlying,
+                    "reset must expose the original sender choice, not the scoped switch: {scope_flag}, manual={manual_sender}"
+                );
+
+                let mut next = scope_test_msg("alice", "chan-1", None);
+                next.id = "after-scoped-switch-reset".into();
+                next.content = "hi".into();
+                process_channel_message(Arc::clone(&ctx), next, CancellationToken::new()).await;
+                assert_eq!(
+                    provider.models.lock().unwrap().as_slice(),
+                    &["switched-model".to_string(), "local-model".to_string()]
+                );
+                assert_eq!(
+                    provider.attempt_allowlists.lock().unwrap().as_slice(),
+                    &[(true, true), (true, manual_sender)]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn effort_routing_manual_channel_overrides_bypass_automatic_classification() {
+        for (hint, content, expected_model) in [
+            ("cloud", "hi".to_string(), "cloud-model"),
+            ("local", "a".repeat(201), "local-model"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (ctx, provider, channel_impl) = effort_routing_channel_context(tmp.path(), true);
+            let channel: Arc<dyn Channel> = channel_impl;
+            let mut command = scope_test_msg("alice", "chan-1", None);
+            command.id = format!("set-{hint}");
+            command.content = format!("/model {hint}");
+            assert!(handle_runtime_command_if_needed(ctx.as_ref(), &command, Some(&channel)).await);
+
+            let mut turn = scope_test_msg("alice", "chan-1", None);
+            turn.id = format!("manual-{hint}-turn");
+            turn.content = content;
+            process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                provider
+                    .models
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[expected_model.to_string()]
+            );
+            assert_eq!(
+                provider
+                    .attempt_allowlists
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_slice(),
+                &[(true, true)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn effort_routing_real_channel_turn_selects_cloud_for_complex_auto() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, provider, _channel) = effort_routing_channel_context(tmp.path(), true);
+        let mut turn = scope_test_msg("alice", "chan-1", None);
+        turn.id = "complex-auto-turn".into();
+        turn.content = "a".repeat(201);
+
+        process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["cloud-model".to_string()]
+        );
+        assert_eq!(
+            provider
+                .attempt_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[(true, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_routing_real_channel_turn_fails_closed_when_hint_is_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, provider, channel) = effort_routing_channel_context(tmp.path(), false);
+        let mut turn = scope_test_msg("alice", "chan-1", None);
+        turn.id = "missing-cloud-hint-turn".into();
+        turn.content = "hi".into();
+
+        process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
+        assert!(
+            provider
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        let sent = channel.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].content,
+            channel_runtime_cli_string("channel-runtime-effort-routing-invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_routing_channel_classification_ignores_media_marker_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, provider, _channel) = effort_routing_channel_context(tmp.path(), true);
+        let mut turn = scope_test_msg("alice", "chan-1", None);
+        turn.id = "media-marker-turn".into();
+        turn.content = format!(
+            "what [ is this?\n[IMAGE:data:image/png;base64,{}]\n\nhi",
+            "a".repeat(256)
+        );
+
+        process_channel_message(ctx, turn, CancellationToken::new()).await;
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["local-model".to_string()]
+        );
+        assert_eq!(
+            provider
+                .attempt_allowlists
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[(true, false)]
+        );
+    }
+
+    #[test]
+    fn effort_policy_excludes_cloud_reply_intent_classifier() {
+        let allowed = HashSet::from(["custom.local".to_string()]);
+        assert!(configured_provider_allowed_for_turn(
+            Some(&allowed),
+            "custom.local"
+        ));
+        assert!(!configured_provider_allowed_for_turn(
+            Some(&allowed),
+            "custom.cloud"
+        ));
+        assert!(configured_provider_allowed_for_turn(None, "custom.cloud"));
     }
 
     #[test]
@@ -41711,6 +43639,87 @@ BTC is currently around $65,000 based on latest tool output."#
             reply.suppress_voice,
             "a text-origin mirror reply is an explicit suppression, got {reply:?}"
         );
+    }
+
+    /// Debouncing combines a sender's messages into one turn owned by the
+    /// first of them, so a mixed batch is answered in the first message's
+    /// modality, whatever the later ones were.
+    #[tokio::test]
+    async fn matrix_mirror_debounced_batch_answers_in_the_first_messages_modality() {
+        for (first_voice, second_voice) in [(true, false), (false, true)] {
+            let channel_impl = Arc::new(SendMessageRecordingChannel::matrix());
+            let mut peer_groups = HashMap::new();
+            peer_groups.insert(
+                "family".to_string(),
+                mirror_peer_group("matrix.default", &["@alice:server"]),
+            );
+            let ctx = test_runtime_ctx_with_observer_and_tools(
+                channel_impl.clone(),
+                Arc::new(DummyModelProvider),
+                zeroclaw_config::schema::Config {
+                    peer_groups,
+                    channels: zeroclaw_config::schema::ChannelsConfig {
+                        debounce_ms: 60,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "test-provider",
+                None,
+                Arc::new(NoopObserver),
+                Vec::new(),
+            );
+
+            let first = zeroclaw_api::channel::ChannelMessage {
+                content: "first part".to_string(),
+                ..matrix_room_message("@alice:server", first_voice)
+            };
+            let second = zeroclaw_api::channel::ChannelMessage {
+                id: "$event-2:server".to_string(),
+                content: "second part".to_string(),
+                ..matrix_room_message("@alice:server", second_voice)
+            };
+            let history_key = conversation_history_key(&first);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+            let send_task = zeroclaw_spawn::spawn!(async move {
+                tx.send(first).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                tx.send(second).await.unwrap();
+            });
+
+            run_message_dispatch_loop(rx, AgentRouter::single(Arc::clone(&ctx)), 4).await;
+            send_task.await.unwrap();
+
+            let sent = channel_impl.sent_messages.lock().await;
+            assert_eq!(
+                sent.len(),
+                1,
+                "both messages must be answered as one combined turn: {sent:?}"
+            );
+            let reply = delivered_reply(sent.as_slice(), "!room:server");
+            assert_eq!(
+                (reply.force_voice, reply.suppress_voice),
+                (first_voice, !first_voice),
+                "a batch opened by a {} message must be answered in that modality, got {reply:?}",
+                if first_voice { "voice" } else { "text" }
+            );
+            drop(sent);
+
+            let mut histories = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let turns = histories
+                .get(&history_key)
+                .expect("the combined turn must create history");
+            assert!(
+                turns[0].content.contains("first part") && turns[0].content.contains("second part"),
+                "the batch must dispatch as one combined turn: {}",
+                turns[0].content
+            );
+        }
     }
 
     #[tokio::test]
@@ -42472,6 +44481,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "anthropic.work".into(),
                 model: "claude-sonnet-4-5".into(),
+                automatic: false,
                 api_key: None,
             },
         );
@@ -43112,7 +45122,6 @@ BTC is currently around $65,000 based on latest tool output."#
         // Serialize on the crate-wide registry test lock: the picker
         // delivery-ack registry is process-global (see
         // `model_picker_delivery::registry_test_lock`).
-        #[cfg(feature = "channel-telegram")]
         let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let mut ctx = channel_runtime_context_for_defaults_test(
@@ -43156,6 +45165,66 @@ BTC is currently around $65,000 based on latest tool output."#
             ctx.route_overrides.lock().unwrap().is_empty(),
             "late-revoked selection must not write a route override"
         );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "late-revoked selection must not produce a switch response"
+        );
+        assert!(
+            channel_impl.requests.lock().await.is_empty(),
+            "late-revoked selection must not re-open the picker"
+        );
+        // The authoritative check consumed the revoked marker exactly once.
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn runtime_command_late_revoked_model_picker_auto_does_not_mutate_route() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (ctx, _provider, _recording_channel) = effort_routing_channel_context(tmp.path(), true);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "telegram_model_picker_selection_revoked_past_gate".into(),
+            sender: "test_user".into(),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model auto".into(),
+            ..Default::default()
+        };
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let sender_key = conversation_history_key(&msg);
+        let snapshot = runtime_defaults_snapshot(ctx.as_ref());
+        let manual = ChannelRouteSelection {
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            automatic: false,
+            api_key: None,
+        };
+        set_route_selection(ctx.as_ref(), &sender_key, manual.clone(), &snapshot);
+
+        // Past the early gate still registered (the gate leaves
+        // non-revoked entries in place); the ack timeout then fires before
+        // the command handler runs.
+        let _delivery_ack = crate::model_picker_delivery::register(&msg.id);
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
+        crate::model_picker_delivery::revoke(&msg.id);
+
+        let handled = handle_runtime_command_if_needed(ctx.as_ref(), &msg, Some(&channel)).await;
+
+        assert!(
+            handled,
+            "revoked selection must be reported handled so it is not re-dispatched to the agent"
+        );
+        let retained = get_route_selection(ctx.as_ref(), &msg, &sender_key, &snapshot);
+        assert_eq!(retained, manual);
+        assert!(!retained.automatic);
         assert!(
             channel_impl.sent_messages.lock().await.is_empty(),
             "late-revoked selection must not produce a switch response"
@@ -43477,6 +45546,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ChannelRouteSelection {
                 model_provider: "openrouter.default".into(),
                 model: "original-session-model".into(),
+                automatic: false,
                 api_key: None,
             },
         );
@@ -43550,6 +45620,36 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             overrides.is_empty(),
             "unauthorized sender must NOT write a scope override, got {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_agent_scope_rejects_unauthorized_auto_reset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "discord_admins".into(),
+            peer_group("discord.clamps", &["alice"], true),
+        );
+        let ctx = Arc::new(channel_runtime_context_with_peer_groups(tmp.path(), groups));
+        let target: Arc<dyn Channel> = Arc::new(NamedMockChannel { name: "discord" });
+
+        assert!(
+            handle_runtime_command_if_needed(
+                ctx.as_ref(),
+                &scope_agent_msg("alice"),
+                Some(&target),
+            )
+            .await
+        );
+        let mut reset = scope_agent_msg("mallory");
+        reset.content = "/model --agent auto".into();
+        assert!(handle_runtime_command_if_needed(ctx.as_ref(), &reset, Some(&target)).await);
+
+        assert_eq!(
+            ctx.scope_overrides.lock().unwrap().len(),
+            1,
+            "an unauthorized sender must not clear the agent-scoped selection"
         );
     }
 
@@ -54701,7 +56801,7 @@ Done."#;
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_legacy_datetime_section_to_date_only() {
+    fn build_channel_system_prompt_strips_legacy_datetime_keeps_project_note() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\nProject note, not generated date context.\n\n## Current Date & Time\n\n2026-01-01 01:02:03 (UTC)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
@@ -54712,43 +56812,66 @@ Done."#;
         assert!(prompt.contains("Project note, not generated date context."));
         assert!(!prompt.contains("## Current Date & Time"));
         assert!(!prompt.contains("01:02:03"));
-        let generated_section = prompt
-            .split("## Runtime")
-            .next()
-            .expect("prompt should contain runtime section before generated date assertion");
-        let date_line = generated_section
-            .rsplit("## Current Date\n\n")
-            .next()
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
-        );
         assert!(
-            date_line[10..].starts_with(" ("),
-            "date line should contain only date plus UTC offset: {date_line}"
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 
     #[test]
-    fn build_channel_system_prompt_refreshes_current_date_section() {
+    fn build_channel_system_prompt_strips_date_after_multibyte_text() {
+        let prompt = build_channel_system_prompt(
+            "\u{e9}\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.starts_with('\u{e9}'));
+        assert!(!prompt.contains("## Current Date"));
+        assert!(!prompt.contains("2026-01-01 (+00:00)"));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_keeps_dated_project_note() {
+        let prompt = build_channel_system_prompt(
+            "Base.\n\n## Current Date\n\n2026-10-16 is the project launch date.\n\n## Runtime\n\nHost: old\n",
+            "mattermost",
+            None,
+        );
+
+        assert!(prompt.contains("## Current Date\n\n2026-10-16 is the project launch date."));
+    }
+
+    #[test]
+    fn generated_date_line_matches_only_builder_output() {
+        assert!(is_generated_date_line("2026-01-01 (+00:00)"));
+        assert!(is_generated_date_line("2026-01-01 01:02:03 (UTC)"));
+        assert!(!is_generated_date_line(
+            "2026-10-16 is the project launch date."
+        ));
+        assert!(!is_generated_date_line("2026-01-01 (+00:00)\nmore notes"));
+        assert!(!is_generated_date_line(
+            "Project note, not generated date context."
+        ));
+    }
+
+    #[test]
+    fn build_channel_system_prompt_strips_generated_current_date_section() {
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
             None,
         );
 
-        assert!(prompt.contains("## Current Date\n\n"));
+        assert!(!prompt.contains("## Current Date"));
         assert!(!prompt.contains("2026-01-01 (+00:00)"));
-        let date_line = prompt
-            .split("## Current Date\n\n")
-            .nth(1)
-            .and_then(|rest| rest.lines().next())
-            .expect("current date section should have a date line");
-        assert_eq!(
-            &date_line[..10],
-            &chrono::Local::now().format("%Y-%m-%d").to_string()
+        assert!(
+            prompt.starts_with("Base.\n\n## Runtime\n"),
+            "next heading keeps its blank line: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains(&chrono::Local::now().format("%Y-%m-%d").to_string()),
+            "system prompt must not inject today's date (#11704): {prompt}"
         );
     }
 

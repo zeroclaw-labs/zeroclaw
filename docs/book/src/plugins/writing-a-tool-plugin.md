@@ -16,19 +16,23 @@ repository. You never need a ZeroClaw checkout to build one, only the `wit/`
 contract files (fetched in step 1) and an installed `zeroclaw` binary with
 the plugin host compiled in to run it.
 
-> **The release binary is not that binary.** The prebuilt binaries the
-> installer ships do not include the plugin host (`zeroclaw plugin …` is an
-> unrecognized subcommand), and `plugins-wasm` is not in the crate's default
-> feature set. Build the host side from source with an execution backend;
-> every backend feature carries the `plugins-wasm` umbrella itself, so one
-> flag is enough:
+> **Check which binary you have.** The release archives for the 64-bit
+> desktop and server targets carry the plugin host and the compiler that
+> loads `.wasm` components, and every release executes a plugin from each of
+> them before it publishes. The 32-bit ARM archives and the experimental Android archive do
+> not (`zeroclaw plugin ...` is an unrecognized subcommand there), and
+> `plugins-wasm` is not in the crate's default feature set, so a source build
+> with Cargo defaults has no host either. For those, build the host side from
+> source with an execution backend; every backend feature carries the
+> `plugins-wasm` umbrella itself, so one flag is enough:
 >
 > ```bash
 > cargo build --release --features plugins-wasm-cranelift
 > ```
 >
 > The [protocol page](../developing/plugin-protocol.md#build-features)
-> documents the backend choices.
+> documents the backend choices and
+> [lists plugin support per artifact](../developing/plugin-protocol.md#plugin-support-per-release-artifact).
 
 ## How a tool call flows
 
@@ -470,12 +474,15 @@ Two operational constraints worth repeating from the
   A `name` export that contains `__` is never registered either: MCP tools use
   that separator (`<server>__<tool>`), and the `error_key` is
   `plugin_tool_name_reserved`.
-  The names checked are the tools that registry build has already registered,
-  including plugin tools accepted before yours, plus `execute_pipeline` when
-  `[pipeline] enabled = true`. That is not a fixed list of every built-in
-  name: a built-in the operator's config leaves unregistered is not reserved
-  in that build, so a name that loads on one host can be refused on another.
-  Pick names that are unique outright. See
+  The names checked are the host's built-in tools, including ones the
+  current tool selection leaves out, plus plugin tools accepted before yours.
+  `mcp_resources` and `mcp_prompts` are always reserved, and
+  `execute_pipeline` is reserved when `[pipeline] enabled = true`. The set
+  depends on the host's build and config, so a name that loads on one host
+  can be refused on another. A tool named like one a connected peripheral or
+  a skill contributes is dropped later, when the agent's tools are assembled,
+  with the same `plugin_tool_name_conflict` `error_key`. Pick names that are
+  unique outright. See
   [Tool name conflicts](../developing/how-plugins-work.md#tool-name-conflicts)
   for the operator view.
 - **One tool per component.** The `tool-plugin` world exports a single `tool`

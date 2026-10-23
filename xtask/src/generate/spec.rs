@@ -561,6 +561,19 @@ pub fn dist_extra_features(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<
     required_registry_list(pkg, "dist_extra_features")
 }
 
+/// Selections published across the canonical release workflow target matrix.
+/// On-demand selections remain available without adding release artifacts.
+pub fn release_distributions(pkg: &cargo_metadata::Package) -> anyhow::Result<Vec<String>> {
+    let selections = required_registry_list(pkg, "release_distributions")?;
+    for id in &selections {
+        anyhow::ensure!(
+            matches!(Selection::from_id(id), Some(Selection::Dist)),
+            "release_distributions supports the standard `dist` selection; `{id}` is on-demand only"
+        );
+    }
+    Ok(selections)
+}
+
 /// Target-specific compatibility exclusions for standard distribution builds.
 /// Release workflows provide a target triple and never duplicate this policy.
 pub fn dist_target_exclusions(
@@ -820,7 +833,7 @@ pub(crate) fn features_outside_dist(manifest_dir: &Path) -> anyhow::Result<Vec<S
         .collect())
 }
 
-fn workspace_root_package(
+pub(super) fn workspace_root_package(
     meta: &cargo_metadata::Metadata,
 ) -> anyhow::Result<&cargo_metadata::Package> {
     meta.root_package()
@@ -865,7 +878,10 @@ pub fn resolve_feature_list_for_target(
     };
     anyhow::ensure!(!target.is_empty(), "target must not be empty");
     anyhow::ensure!(
-        matches!(selection, Selection::Dist | Selection::DistBroad),
+        matches!(
+            selection,
+            Selection::Dist | Selection::DistBroad | Selection::DistCompat
+        ),
         "target-specific exclusions are only defined for distribution selections"
     );
 
@@ -968,14 +984,16 @@ pub enum Selection {
     Full,
     /// Kernel only (`--no-default-features`).
     Minimal,
-    /// Standard binary distribution: lean Cargo defaults plus the explicit
-    /// registry-owned distribution additions. The set a single-artifact
-    /// package manager ships.
+    /// Standard binary distribution: Cargo defaults plus registry-owned
+    /// channels, plugin hosts and native adapters. Runtime tool selection
+    /// defaults to minimal; full uses the same artifact.
     Dist,
     /// Measurement-only broad distribution: `Dist` plus the canonical
     /// `channels-full` aggregate. Not offered by installer menus until a
     /// stable broad artifact lifecycle exists.
     DistBroad,
+    /// Compatibility alias for the standard distribution.
+    DistCompat,
     /// Every selectable feature (all − non_row − pure-alias). The docker
     /// `:all-features` kitchen sink.
     All,
@@ -992,6 +1010,7 @@ impl Selection {
             Selection::Minimal => "minimal",
             Selection::Dist => "dist",
             Selection::DistBroad => "dist-broad",
+            Selection::DistCompat => "dist-compat",
             Selection::All => "all",
             Selection::Features(_) => "custom",
         }
@@ -1003,8 +1022,9 @@ impl Selection {
         match self {
             Selection::Full => "default feature set",
             Selection::Minimal => "core only, no default features",
-            Selection::Dist => "lean standard distribution (recommended)",
+            Selection::Dist => "standard distribution, minimal/full tools (recommended)",
             Selection::DistBroad => "broad-channel distribution measurement build",
+            Selection::DistCompat => "standard distribution compatibility alias",
             Selection::All => "every feature including hardware and browser",
             Selection::Features(_) => "custom feature selection",
         }
@@ -1016,6 +1036,7 @@ impl Selection {
             Selection::Minimal,
             Selection::Dist,
             Selection::DistBroad,
+            Selection::DistCompat,
             Selection::Full,
             Selection::All,
         ]
@@ -1025,7 +1046,7 @@ impl Selection {
     pub fn menu() -> Vec<Selection> {
         Self::named()
             .into_iter()
-            .filter(|selection| !matches!(selection, Selection::DistBroad))
+            .filter(|selection| !matches!(selection, Selection::DistBroad | Selection::DistCompat))
             .collect()
     }
 
@@ -1051,14 +1072,18 @@ impl Selection {
         let mut set = match self {
             Selection::Minimal => Vec::new(),
             Selection::Full => ctx.expand("default"),
-            Selection::Dist | Selection::DistBroad => {
+            Selection::Dist | Selection::DistBroad | Selection::DistCompat => {
                 let mut s = ctx.expand("default");
                 for feature in ctx.dist_extra {
                     anyhow::ensure!(
                         ctx.all.contains(feature),
                         "unknown dist_extra_features entry `{feature}` (not in [features])"
                     );
-                    s.push(feature.clone());
+                    if ctx.non_row.contains(feature) {
+                        s.extend(ctx.expand(feature));
+                    } else {
+                        s.push(feature.clone());
+                    }
                 }
                 if matches!(self, Selection::DistBroad) {
                     s.extend(ctx.expand("channels-full"));
@@ -1336,6 +1361,87 @@ mod tests {
     }
 
     #[test]
+    fn standard_distribution_carries_full_adapters_and_compat_is_an_alias() {
+        let dist = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        let compat = resolve_feature_list(&root(), &Selection::DistCompat).unwrap();
+        let optional =
+            resolve_feature_list(&root(), &Selection::Features(vec!["tools-compat".into()]))
+                .unwrap();
+        assert!(
+            resolve_feature_list(&root(), &Selection::Full)
+                .unwrap()
+                .iter()
+                .all(|feature| !feature.starts_with("tool-") && feature != "tools-external")
+        );
+        for tool in zeroclaw_config::opt_in_tools::OptInTool::ALL {
+            assert!(compat.iter().any(|candidate| candidate == tool.feature()));
+        }
+        assert!(compat.contains(&"tools-external".to_string()));
+        assert_eq!(dist, compat);
+        assert!(optional.contains(&"tools-compat".to_string()));
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert!(
+                !resolve_feature_list_for_target(&root(), &Selection::DistCompat, Some(target))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let desktop =
+            std::fs::read_to_string(root().join("scripts/desktop/prepare-kernel.sh")).unwrap();
+        assert!(desktop.contains("--selection \"$DISTRIBUTION\" --target \"$triple\""));
+        assert!(desktop.contains("--no-default-features"));
+    }
+
+    #[test]
+    fn distributions_keep_supported_portable_plugin_hosts_without_default_activation() {
+        let defaults = resolve_feature_list(&root(), &Selection::Full).unwrap();
+        assert!(
+            !defaults
+                .iter()
+                .any(|feature| feature.starts_with("plugins-wasm"))
+        );
+        let config = zeroclaw_config::schema::Config::default();
+        assert!(!config.plugins.enabled);
+        assert!(!config.plugins.auto_discover);
+
+        for selection in [Selection::Dist, Selection::DistCompat] {
+            for target in [
+                "x86_64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "aarch64-unknown-linux-gnu",
+                "aarch64-unknown-linux-musl",
+                "aarch64-apple-darwin",
+                "x86_64-apple-darwin",
+                "x86_64-pc-windows-msvc",
+            ] {
+                let features =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert!(features.contains(&"agent-runtime".into()));
+                assert!(
+                    features.contains(&"plugins-wasm-cranelift".into()),
+                    "{target}"
+                );
+            }
+            for target in [
+                "arm-unknown-linux-gnueabihf",
+                "armv7-unknown-linux-gnueabihf",
+                "aarch64-linux-android",
+            ] {
+                let features =
+                    resolve_feature_list_for_target(&root(), &selection, Some(target)).unwrap();
+                assert!(
+                    !features.contains(&"plugins-wasm-cranelift".into()),
+                    "{target}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn install_route_contract_rejects_duplicate_platforms() {
         let routes = install_routes().unwrap();
         let fast = route(&routes, RouteId::UnixFast);
@@ -1422,12 +1528,12 @@ mod tests {
         );
     }
 
-    /// Pins the lean contract by name on purpose: widening `dist` must be a
+    /// Pins the shipping contract by name on purpose: widening `dist` must be a
     /// deliberate, reviewed edit here, not a silent consequence of a registry
     /// change. The generator suites derive their expectations from the
     /// registry; this one stays the policy tripwire.
     #[test]
-    fn dist_matches_lean_release_contract() {
+    fn dist_matches_minimal_full_release_contract() {
         let features = resolve_feature_list(&root(), &Selection::Dist).unwrap();
         assert!(features.contains(&"channel-git".to_string()));
         let mut expected = resolve_feature_list(&root(), &Selection::Full).unwrap();
@@ -1437,9 +1543,14 @@ mod tests {
                 "channel-lark",
                 "channel-git",
                 "whatsapp-web",
+                "plugins-wasm-cranelift",
             ]
             .map(str::to_owned),
         );
+        expected.extend(
+            zeroclaw_config::opt_in_tools::OptInTool::ALL.map(|tool| tool.feature().to_string()),
+        );
+        expected.push("tools-external".into());
         expected.sort();
         expected.dedup();
         assert_eq!(features, expected);
@@ -1495,7 +1606,7 @@ mod tests {
     fn all_is_superset_of_dist() {
         let dist = resolve(&root(), &Selection::Dist).unwrap();
         let all = resolve(&root(), &Selection::All).unwrap();
-        // All includes optional features outside the lean distribution.
+        // All includes optional features outside the standard distribution.
         assert!(
             all.cargo_flags.contains("hardware"),
             "all is the kitchen sink"
@@ -1562,7 +1673,7 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        for selection in [Selection::Dist, Selection::DistBroad] {
+        for selection in [Selection::Dist, Selection::DistBroad, Selection::DistCompat] {
             let unfiltered = resolve_feature_list(&root(), &selection).unwrap();
             for (target, excluded) in &exclusions {
                 let resolved =
@@ -1604,14 +1715,17 @@ mod tests {
             .unwrap();
         let exclusions = dist_target_exclusions(workspace_root_package(&meta).unwrap()).unwrap();
 
-        assert_eq!(exclusions["aarch64-linux-android"], vec!["whatsapp-web"]);
+        assert_eq!(
+            exclusions["aarch64-linux-android"],
+            vec!["whatsapp-web", "plugins-wasm-cranelift"]
+        );
         assert_eq!(
             exclusions["arm-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
         assert_eq!(
             exclusions["armv7-unknown-linux-gnueabihf"],
-            vec!["observability-prometheus"]
+            vec!["observability-prometheus", "plugins-wasm-cranelift"]
         );
     }
 
@@ -1626,7 +1740,12 @@ mod tests {
         let release =
             std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
                 .unwrap();
-        assert!(release.contains("features --selection dist --target \"${{ matrix.target }}\""));
+        let shared = std::fs::read_to_string(
+            root().join(".github/actions/build-release-payloads/action.yml"),
+        )
+        .unwrap();
+        assert!(shared.contains("RELEASE_TARGET: ${{ inputs.target }}"));
+        assert!(shared.contains("features --selection dist --target \"$RELEASE_TARGET\""));
         assert!(!release.contains("excluded_features"));
         // The stable release build MUST pin --no-default-features against the
         // generator's explicit per-target list, exactly like the manual workflow.
@@ -1636,8 +1755,8 @@ mod tests {
         // string checks below do NOT catch that, since the leaked feature never
         // appears as a literal in the workflow.
         assert!(
-            release.contains(
-                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
+            shared.contains(
+                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target \"$RELEASE_TARGET\""
             ),
             "the stable release build must pin --no-default-features so target-excluded default features cannot leak back in"
         );
@@ -1667,68 +1786,264 @@ mod tests {
                 "default: dist\n        options:\n          - dist\n          - dist-broad"
             )
         );
-        assert!(
-            manual.contains(
-                "timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}"
-            )
-        );
-        assert!(manual.contains("--selection \"${{ inputs.distribution }}\""));
-        assert!(manual.contains("echo \"- Binary bytes: $bytes\""));
-        assert!(manual.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
-        assert!(manual.contains("echo \"- SHA-256: $sha256\""));
+        for (document, job, emit) in [
+            (&release, "  build:\n", "false"),
+            (&manual, "  stable-gnu-build:\n", "true"),
+        ] {
+            let caller = job_block(job_block(document, job), "      - name: Build release\n");
+            assert!(caller.contains("uses: ./.github/actions/build-release-payloads"));
+            for binding in [
+                "target: ${{ matrix.target }}",
+                "linker_env: ${{ matrix.linker_env || '' }}",
+                "linker: ${{ matrix.linker || '' }}",
+                "use_cross: ${{ matrix.use_cross || 'false' }}",
+            ] {
+                assert!(
+                    caller.contains(binding),
+                    "missing shared-recipe binding: {binding}"
+                );
+            }
+            assert!(caller.contains(&format!("emit_features: '{emit}'")));
+            assert!(!caller.contains("run:") && !caller.contains("shell:"));
+        }
+        let normal = job_block(&manual, "  build:\n");
+        assert!(normal.contains(
+            "\n    timeout-minutes: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin') && 180 || 90 }}\n"
+        ));
+        assert!(normal.contains("--selection \"${{ inputs.distribution }}\""));
+        assert!(normal.contains("echo \"- Binary bytes: $bytes\""));
+        assert!(normal.contains("echo \"- Resolved features: \\`$FEATURES\\`\""));
+        assert!(normal.contains("echo \"- SHA-256: $sha256\""));
         for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
-            assert!(manual.contains(&format!(
+            assert!(normal.contains(&format!(
                 "- os: ubuntu-latest\n            target: {target}\n            use_cross: true"
             )));
         }
-        assert!(manual.contains(cross_install));
-        assert!(!manual.contains("cargo install cross"));
-        assert!(manual.contains(
-            "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build\""
+        assert!(normal.contains(cross_install));
+        assert!(!normal.contains("cargo install cross"));
+        assert!(normal.contains(
+            "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build${dist_build_jobs}\""
         ));
-        assert!(manual.contains("echo \"BUILD_CMD=cargo build\""));
-        assert!(manual.contains(
+        assert!(normal.contains("echo \"BUILD_CMD=cargo build${dist_build_jobs}\""));
+        assert!(normal.contains(
             "prefix-key: ${{ matrix.os }}-${{ matrix.target }}\n          cache-targets: false\n          save-if: ${{ github.ref == 'refs/heads/master' }}"
         ));
-        assert!(manual.contains(
+        assert!(normal.contains(
             "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
         ));
-        assert!(manual.contains(
+        assert!(normal.contains(
             "run: $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}"
         ));
-        assert!(manual.contains(
+        assert!(normal.contains(
             "run: $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}"
         ));
         assert_eq!(
-            manual
+            normal
                 .matches("if: matrix.target != 'aarch64-linux-android'")
                 .count(),
             4,
             "the ZeroCode and ZeroRelay builds and uploads must all skip Android"
         );
-        assert!(!manual.contains("excluded_features"));
+        assert!(!normal.contains("excluded_features"));
 
-        let target_env = manual.find("- name: Configure target environment").unwrap();
-        let release_step = manual.find("- name: Build release").unwrap();
-        let zeroclaw_upload = manual
+        let target_env = normal.find("- name: Configure target environment").unwrap();
+        let release_step = normal.find("- name: Build release").unwrap();
+        let zeroclaw_upload = normal
             .find("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
             .unwrap();
-        let companion = manual.find("- name: Build ZeroCode companion").unwrap();
+        let companion = normal.find("- name: Build ZeroCode companion").unwrap();
         assert!(
             target_env < release_step
                 && release_step < zeroclaw_upload
                 && zeroclaw_upload < companion
         );
         assert!(
-            manual[target_env..release_step]
+            normal[target_env..release_step]
                 .contains("echo \"${{ matrix.linker_env }}=${{ matrix.linker }}\"")
         );
-        assert!(manual[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
-        assert!(!manual[release_step..companion].contains("matrix.linker_env"));
+        assert!(normal[target_env..release_step].contains(">> \"$GITHUB_ENV\""));
+        assert!(!normal[release_step..companion].contains("matrix.linker_env"));
+
+        let stable_build = job_block(&release, "  build:\n");
+        assert_eq!(
+            stable_build
+                .matches("run: bash scripts/ci/package_release_archive.sh")
+                .count(),
+            2,
+            "both Stable platform steps must consume the one shared archive writer"
+        );
+        assert!(!stable_build.contains("mkdir -p staging/web"));
+        let manual_build = job_block(&manual, "  build:\n");
+        assert!(manual_build.contains("BINARY_SIZE_HARD_LIMIT: \"83886080\""));
+        assert!(
+            manual_build.contains(
+                "bash scripts/ci/package_release_archive.sh \"$target\" \"$main\" \"$ext\" \"$RUNNER_OS\""
+            )
+        );
+        assert!(
+            manual_build
+                .contains("--web-dist web/dist --source \"$GITHUB_SHA\" --target \"$target\"")
+        );
+        assert!(manual_build.contains("--output archive-evidence/input-manifest.json"));
+        assert!(
+            manual_build.contains("--run \"$GITHUB_RUN_ID\" --attempt \"$GITHUB_RUN_ATTEMPT\"")
+        );
+        assert!(manual_build.contains("if [ \"$target\" != aarch64-linux-android ]; then"));
+        let native_smoke = job_block(&manual, "  plugin-smoke:\n");
+        assert!(native_smoke.contains("if: inputs.distribution != 'dist'"));
+        assert!(
+            native_smoke
+                .contains("name: zeroclaw-manual-${{ inputs.distribution }}-${{ matrix.target }}")
+        );
+        assert!(native_smoke.contains("name: zeroclaw-manual-archive-dist-${{ matrix.target }}"));
+        assert!(
+            native_smoke
+                .contains("--expected-source \"$GITHUB_SHA\" --expected-target \"$target\"")
+        );
+        assert!(native_smoke.contains(
+            "--expected-run \"$GITHUB_RUN_ID\" --expected-attempt \"$GITHUB_RUN_ATTEMPT\""
+        ));
+        assert!(native_smoke.contains("archive_args=(--archive \"$SMOKE_ARCHIVE\")"));
+        assert!(native_smoke.contains("SMOKE_ARCHIVE: ${{ steps.archive.outputs.archive }}"));
+        assert!(native_smoke.contains("${archive_args[@]+\"${archive_args[@]}\"}"));
+        assert!(
+            native_smoke.find("Run scripted provider tests").unwrap()
+                < native_smoke
+                    .find("Run the plugin smoke against the built binary")
+                    .unwrap()
+        );
 
         for feature in exclusions.values().flatten() {
             assert!(!release.contains(feature));
             assert!(!manual.contains(feature));
+            assert!(!shared.contains(feature));
+        }
+    }
+
+    /// One job's YAML block: from its header line to the next line at the
+    /// same or a shallower indent.
+    fn job_block<'a>(document: &'a str, header: &str) -> &'a str {
+        let header_indent = header.len() - header.trim_start().len();
+        let start = document
+            .match_indices(header)
+            .find_map(|(offset, _)| {
+                (offset == 0 || document.as_bytes().get(offset - 1) == Some(&b'\n'))
+                    .then_some(offset)
+            })
+            .unwrap_or_else(|| panic!("workflow is missing YAML block: {header}"));
+        let remainder = &document[start + header.len()..];
+        let mut offset = 0;
+        for line in remainder.split_inclusive('\n') {
+            let trimmed = line.trim();
+            let indent = line.len() - line.trim_start().len();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') && indent <= header_indent {
+                return &remainder[..offset];
+            }
+            offset += line.len();
+        }
+        remainder
+    }
+
+    #[test]
+    fn workflow_job_block_retains_outdented_comments_until_the_next_job() {
+        let release =
+            std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
+                .unwrap();
+        assert!(release.contains("\n# >>> end generated:release-distributions <<<\n"));
+        let build = job_block(&release, "  build:\n");
+        assert!(build.contains("uses: ./.github/actions/build-release-payloads"));
+        assert_eq!(matrix_targets(build).len(), 10);
+        assert!(!build.contains("  build-desktop:\n"));
+        let annotated = release.replacen(
+            "\n  build-desktop:\n",
+            "\n# comment before the next real job\n  build-desktop:\n",
+            1,
+        );
+        assert_ne!(annotated, release);
+        let retained = job_block(&annotated, "  build:\n");
+        assert!(retained.contains("# comment before the next real job"));
+        assert_eq!(matrix_targets(retained), matrix_targets(build));
+        assert!(retained.contains("uses: ./.github/actions/build-release-payloads"));
+        assert!(!retained.contains("  build-desktop:\n"));
+    }
+
+    /// The `target:` entries of one job's matrix, whether an entry starts
+    /// with the target or lists it after another field.
+    fn matrix_targets(job: &str) -> Vec<String> {
+        job_block(job_block(job, "    strategy:\n"), "      matrix:\n")
+            .lines()
+            .map(|line| line.trim())
+            .map(|line| line.strip_prefix("- ").unwrap_or(line))
+            .filter_map(|line| line.strip_prefix("target: "))
+            .filter(|target| !target.trim_start().starts_with('['))
+            .map(|target| target.trim().to_owned())
+            .collect()
+    }
+
+    /// A release target carries a plugin backend exactly when the stable
+    /// release executes a plugin from that target's archive. A target cannot
+    /// claim plugin support without that proof, and a smoke leg cannot be
+    /// dropped while the artifact still carries the host. The manual
+    /// cross-platform workflow rehearses the same legs.
+    #[test]
+    fn release_targets_carry_a_plugin_backend_only_with_a_smoke_leg() {
+        let release =
+            std::fs::read_to_string(root().join(".github/workflows/release-stable-manual.yml"))
+                .unwrap();
+        let manual = std::fs::read_to_string(
+            root().join(".github/workflows/cross-platform-build-manual.yml"),
+        )
+        .unwrap();
+        let build_targets = matrix_targets(job_block(&release, "  build:\n"));
+        let smoke_targets = matrix_targets(job_block(&release, "  plugin-smoke:\n"));
+        assert!(!build_targets.is_empty(), "no release build legs parsed");
+        assert!(!smoke_targets.is_empty(), "no plugin smoke legs parsed");
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  plugin-smoke:\n")),
+            smoke_targets,
+            "the manual workflow must rehearse exactly the release smoke legs"
+        );
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  stable-gnu-build:\n")),
+            [
+                "x86_64-unknown-linux-gnu",
+                "aarch64-unknown-linux-gnu",
+                "armv7-unknown-linux-gnueabihf",
+                "arm-unknown-linux-gnueabihf",
+            ]
+        );
+        assert_eq!(
+            matrix_targets(job_block(&manual, "  stable-gnu-plugin-smoke:\n")),
+            ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+        );
+        let release_build = job_block(&release, "  build:\n");
+        for outside in ["outside-matrix", "x86_64-unknown-linux-gnu"] {
+            let contaminated = release_build.replacen(
+                "target: ${{ matrix.target }}",
+                &format!("target: {outside}"),
+                1,
+            );
+            assert_ne!(contaminated, release_build);
+            assert_eq!(matrix_targets(&contaminated), build_targets);
+        }
+        for target in &smoke_targets {
+            assert!(
+                build_targets.contains(target),
+                "plugin smoke leg {target} has no release build leg"
+            );
+        }
+        for target in &build_targets {
+            let features =
+                resolve_feature_list_for_target(&root(), &Selection::Dist, Some(target)).unwrap();
+            let carries_backend = features
+                .iter()
+                .any(|feature| feature.starts_with("plugins-wasm"));
+            assert_eq!(
+                carries_backend,
+                smoke_targets.contains(target),
+                "{target}: a plugin backend in the distribution set ({carries_backend}) must \
+                 come with a release smoke leg, and only then"
+            );
         }
     }
 

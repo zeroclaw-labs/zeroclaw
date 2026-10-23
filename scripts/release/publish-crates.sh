@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage:
 #   scripts/release/publish-crates.sh                 # dry run (default, safe)
 #   scripts/release/publish-crates.sh --execute       # real publish
-#   scripts/release/publish-crates.sh --execute 0.8.5 # real publish, assert version
+#   scripts/release/publish-crates.sh --execute 0.8.6 # real publish, assert version
 #
 # Publishing is IRREVERSIBLE: a crates.io version can be yanked but never
 # replaced or deleted. The default is therefore a dry run; the real publish

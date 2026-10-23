@@ -710,11 +710,62 @@ if [ -n "$archive" ]; then
     archive_sha256="$(sha256_of "$archive")" || fatal "could not hash $archive"
 fi
 
+# Startup failures precede every named control. Only the provider's fixed
+# milestones enter diagnostics; request logs and traceback source stay private.
+provider_startup_excerpt() {
+    py -c 'import re, sys
+with open(sys.argv[1], "rb") as handle:
+    text = handle.read(4096).decode("utf-8", errors="replace")
+milestone = re.compile(r"PROVIDER_STARTUP monotonic=[0-9]+\.[0-9]{6} elapsed=[0-9]+\.[0-9]{6} stage=(serve-entry|server-construction-start|server-construction-done|log-touched|port-published|worker-started)")
+startup_error = re.compile(r"PROVIDER_STARTUP_ERROR monotonic=[0-9]+\.[0-9]{6} elapsed=[0-9]+\.[0-9]{6} phase=(serve-entry|server-construction|log-touch|port-publication|worker-start) type=[A-Za-z0-9_]{1,80} errno=-?[0-9]+")
+lines = []
+found = False
+for line in text.splitlines()[:40]:
+    if milestone.fullmatch(line) or startup_error.fullmatch(line):
+        lines.append(line[:256])
+        found = True
+    else:
+        lines.append("[non-milestone provider output omitted]")
+if not found:
+    lines = ["[startup phase unknown; no whitelisted diagnostics]"]
+print("\n".join(lines)[:4095])' "$(native_path "$work/provider.startup.log")"
+}
+
+provider_startup_failed() {
+    local reason="$1" pid_state="exited" port_state="absent" excerpt rendered
+    if kill -0 "$provider_pid" 2>/dev/null; then
+        pid_state="alive"
+    fi
+    if [ -s "$work/provider.port" ]; then
+        port_state="nonempty"
+    elif [ -e "$work/provider.port" ]; then
+        port_state="empty"
+    fi
+    if ! excerpt="$(provider_startup_excerpt 2>/dev/null)"; then
+        excerpt="[startup excerpt unavailable]"
+    fi
+    rendered="$(printf '%s\n' \
+        '### Plugin artifact smoke: SETUP FAILED (exit 2)' \
+        "- Reason: $reason" \
+        '- Named controls judged: 0' \
+        "- Provider PID: $provider_pid ($pid_state)" \
+        "- Port file: $port_state; readiness polls completed: $attempt" \
+        '- Startup excerpt: first 4096 bytes / 40 lines; fixed diagnostics only' \
+        '' '```text' "$excerpt" '```')"
+    printf '%s\n' "$rendered" >&2
+    if [ -n "$evidence" ]; then
+        if ! printf '%s\n' "$rendered" >"$evidence"; then
+            echo 'startup failure evidence could not be written' >&2
+        fi
+    fi
+    fatal "$reason"
+}
+
 "$python" "$provider" serve \
     --port-file "$work/provider.port" \
     --log "$work/provider.log" \
     --script "$work/provider.script" \
-    --stop-file "$work/provider.stop" &
+    --stop-file "$work/provider.stop" >"$work/provider.startup.log" 2>&1 &
 provider_pid=$!
 provider_port=""
 attempt=0
@@ -723,11 +774,11 @@ while [ "$attempt" -lt 100 ]; do
         provider_port="$(tr -d '[:space:]' <"$work/provider.port")"
         break
     fi
-    kill -0 "$provider_pid" 2>/dev/null || fatal "the scripted provider exited at startup"
+    kill -0 "$provider_pid" 2>/dev/null || provider_startup_failed "the scripted provider exited at startup"
     sleep 0.1
     attempt=$((attempt + 1))
 done
-[ -n "$provider_port" ] || fatal "the scripted provider did not publish a port"
+[ -n "$provider_port" ] || provider_startup_failed "the scripted provider did not publish a port"
 
 if [ "$expect" = "no-host" ]; then
     run_case "the binary has no plugin command" binary_has_no_plugin_command

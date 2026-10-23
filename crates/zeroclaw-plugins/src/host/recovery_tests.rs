@@ -981,6 +981,127 @@ fn an_install_that_published_but_could_not_clear_its_stage_succeeds() {
     );
 }
 
+/// `race` loaded from `legacy-dir`, a directory not named after it.
+fn loaded_elsewhere(root: &Path) {
+    std::fs::create_dir(root.join("legacy-dir")).unwrap();
+    tests::write_tool_source(&root.join("legacy-dir"), "race", b"\0asm loaded");
+}
+
+/// A remove of a loaded package stopped after its claim leaves the package in
+/// the claim. The claim records only the name, so the next remove puts it back
+/// at the name, not in the directory it was loaded from. Back at the name,
+/// that remove refuses it as a package admission accepts, since this host did
+/// not load it, and the remove after that deletes it.
+#[test]
+fn a_loaded_remove_stopped_after_its_claim_is_put_back_at_the_name() {
+    let root = tempfile::tempdir().unwrap();
+    loaded_elsewhere(root.path());
+    Paused::start(root.path(), "loaded-after-claim", "remove").crash();
+    assert!(!root.path().join("legacy-dir").exists());
+
+    let retried = PluginHost::from_plugins_dir(root.path())
+        .unwrap()
+        .remove("race");
+    assert!(
+        matches!(&retried, Err(PluginError::UnadmittedPackage { reason, .. }) if reason == "admission accepts this package"),
+        "{retried:?}"
+    );
+    assert!(root.path().join("race/manifest.toml").is_file());
+    assert!(!root.path().join("legacy-dir").exists());
+
+    PluginHost::from_plugins_dir(root.path())
+        .unwrap()
+        .remove("race")
+        .unwrap();
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [".zeroclaw-package-lock-v1"]
+    );
+}
+
+/// While something occupies the name, the claim a stopped remove of a loaded
+/// package left cannot be put back there, so every remove refuses and keeps
+/// both. Moving the occupant aside lets the next remove put the package back
+/// at the name and refuse it, and the one after that delete it.
+#[test]
+fn a_loaded_remove_stopped_after_its_claim_waits_for_the_name_to_be_free() {
+    let root = tempfile::tempdir().unwrap();
+    loaded_elsewhere(root.path());
+    std::fs::create_dir(root.path().join("race")).unwrap();
+    std::fs::write(root.path().join("race/notes.txt"), b"keep").unwrap();
+    Paused::start(root.path(), "loaded-after-claim", "remove").crash();
+
+    for _ in 0..2 {
+        let retried = PluginHost::from_plugins_dir(root.path())
+            .unwrap()
+            .remove("race");
+        assert!(
+            matches!(&retried, Err(PluginError::RecoveryRetained { .. })),
+            "{retried:?}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("race/notes.txt")).unwrap(),
+            b"keep"
+        );
+    }
+
+    std::fs::rename(root.path().join("race"), root.path().join("race-notes")).unwrap();
+    let restored = PluginHost::from_plugins_dir(root.path())
+        .unwrap()
+        .remove("race");
+    assert!(
+        matches!(&restored, Err(PluginError::UnadmittedPackage { reason, .. }) if reason == "admission accepts this package"),
+        "{restored:?}"
+    );
+    PluginHost::from_plugins_dir(root.path())
+        .unwrap()
+        .remove("race")
+        .unwrap();
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [".zeroclaw-package-lock-v1", "race-notes"]
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("race-notes/notes.txt")).unwrap(),
+        b"keep"
+    );
+}
+
+/// A claimed generation that is not the loaded one, and cannot go back
+/// because something took its directory meanwhile, stays in the claim and is
+/// reported there. Nothing is deleted.
+#[test]
+fn a_loaded_remove_that_cannot_put_back_a_changed_generation_reports_the_claim() {
+    let root = tempfile::tempdir().unwrap();
+    loaded_elsewhere(root.path());
+    let paused = Paused::start(root.path(), "loaded-after-claim", "remove");
+    let claim = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|p| p.contains("recovering-v1"))
+        .unwrap();
+    std::fs::write(
+        root.path().join(&claim).join("package/plugin.wasm"),
+        b"\0asm changed",
+    )
+    .unwrap();
+    std::fs::create_dir(root.path().join("legacy-dir")).unwrap();
+    std::fs::write(root.path().join("legacy-dir/notes.txt"), b"keep").unwrap();
+
+    let output = paused.resume();
+    assert!(
+        output.contains("RecoveryRetained") && output.contains(&claim),
+        "{output}"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("legacy-dir/notes.txt")).unwrap(),
+        b"keep"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join(&claim).join("package/plugin.wasm")).unwrap(),
+        b"\0asm changed"
+    );
+}
+
 #[test]
 fn crash_after_claim_restores_then_recovers_on_retry() {
     let root = tempfile::tempdir().unwrap();

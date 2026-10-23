@@ -796,6 +796,10 @@ fn terminal_status_for_connection<'a>(
 
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
+/// Slice of the input wait between checks for pending transport events.
+/// Bounds live-update latency and the redraw rate (~60 fps) while sessions
+/// stream, without spinning when nothing arrives.
+const TRANSPORT_WAKE_SLICE: Duration = Duration::from_millis(16);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
 const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
@@ -1228,6 +1232,33 @@ where
     Ok((input_event, PostPollDispatchState::new(connection_state())))
 }
 
+/// Wait up to `timeout` for terminal input, returning early (as a timeout)
+/// once transport events are pending so the loop redraws them.
+///
+/// Input is always polled for at least one slice first: events that arrived
+/// during the previous draw must not make the loop redraw back-to-back.
+fn poll_input_or_transport<P, T>(
+    timeout: Duration,
+    slice: Duration,
+    mut poll: P,
+    mut transport_pending: T,
+) -> Result<bool>
+where
+    P: FnMut(Duration) -> Result<bool>,
+    T: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if poll(remaining.min(slice))? {
+            return Ok(true);
+        }
+        if remaining <= slice || transport_pending() {
+            return Ok(false);
+        }
+    }
+}
+
 /// Ephemeral interaction state for the keybinding overlay. Keybinding
 /// metadata itself stays in the action/help registry and is resolved on draw.
 #[derive(Debug, Default)]
@@ -1434,9 +1465,8 @@ impl ChromeStatus {
                 if let Some(status) = snapshot.status {
                     self.status = Some(status);
                 }
-                if let Some(health) = snapshot.health {
-                    self.health = Some(health);
-                }
+                // A failed poll must not keep an old healthy result visible.
+                self.health = snapshot.health;
                 self.refresh_in_flight = false;
                 self.refresh_rx = None;
             }
@@ -2028,6 +2058,9 @@ pub async fn run(
                             chrome_status.health.as_ref(),
                             acp_pane.current_cwd(),
                             chat_pane.current_cwd(),
+                            acp_pane.focused_runtime_context(),
+                            chat_pane.focused_runtime_context(),
+                            &terminal_candidates,
                         ),
                         Mode::Config => config_app.draw_into(frame, content_area),
                         Mode::Doctor => doctor_pane.draw(frame, content_area),
@@ -2276,7 +2309,17 @@ pub async fn run(
         // assembly and drag coalescing finish, or after a genuine timeout.
         let (input_event, dispatch_state) = poll_input_event_and_snapshot(
             &mut input_decoder,
-            |timeout| Ok(event::poll(timeout)?),
+            |timeout| {
+                poll_input_or_transport(
+                    timeout,
+                    TRANSPORT_WAKE_SLICE,
+                    |slice| Ok(event::poll(slice)?),
+                    || {
+                        chat_pane.has_pending_transport_events()
+                            || acp_pane.has_pending_transport_events()
+                    },
+                )
+            },
             || Ok(event::read()?),
             || rpc.connection_state(),
         )?;
@@ -5090,6 +5133,32 @@ mod tests {
         assert_eq!(request["method"], crate::client::method::STATUS);
     }
 
+    #[test]
+    fn chrome_status_failed_health_refresh_clears_previous_snapshot() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut chrome_status = ChromeStatus {
+            health: Some(serde_json::json!({
+                "components": {"daemon": {"status": "ok"}}
+            })),
+            refresh_in_flight: true,
+            refresh_rx: Some(rx),
+            ..Default::default()
+        };
+        assert!(
+            tx.send(ChromeStatusSnapshot {
+                status: None,
+                health: None,
+            })
+            .is_ok()
+        );
+
+        chrome_status.drain_completed_refresh();
+
+        assert!(chrome_status.health.is_none());
+        assert!(!chrome_status.refresh_in_flight);
+        assert!(chrome_status.refresh_rx.is_none());
+    }
+
     #[tokio::test]
     async fn mode_switch_to_sop_returns_before_a_withheld_list_response() {
         let (tx, mut rx) = mpsc::channel::<String>(1);
@@ -5918,6 +5987,53 @@ mod tests {
                 state.rpc_allowed()
             ),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn input_wait_returns_early_for_pending_transport_events() {
+        // Pending transport work ends the wait after one slice, not the tick.
+        let polls = std::cell::RefCell::new(Vec::new());
+        let woke = poll_input_or_transport(
+            TICK,
+            TRANSPORT_WAKE_SLICE,
+            |slice| {
+                polls.borrow_mut().push(slice);
+                Ok(false)
+            },
+            || true,
+        )
+        .expect("poll");
+        assert!(!woke, "a transport wake is reported as an input timeout");
+        assert_eq!(polls.borrow().as_slice(), &[TRANSPORT_WAKE_SLICE]);
+
+        // Input wins over pending transport work in the same slice.
+        let woke = poll_input_or_transport(TICK, TRANSPORT_WAKE_SLICE, |_| Ok(true), || true)
+            .expect("poll");
+        assert!(woke);
+
+        // Idle: keep slicing until the full timeout, never polling past it.
+        let polls = std::cell::RefCell::new(Vec::new());
+        let started = Instant::now();
+        let woke = poll_input_or_transport(
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+            |slice| {
+                polls.borrow_mut().push(slice);
+                std::thread::sleep(slice);
+                Ok(false)
+            },
+            || false,
+        )
+        .expect("poll");
+        assert!(!woke);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        let polls = polls.borrow();
+        assert!(polls.len() >= 4);
+        assert!(
+            polls
+                .iter()
+                .all(|slice| *slice <= Duration::from_millis(10))
         );
     }
 

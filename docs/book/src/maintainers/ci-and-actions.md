@@ -23,6 +23,7 @@ Composite job with multiple matrix legs:
 - **check-plugin-backends**: selected by `scripts/ci/plugin_backend_change_filter.sh`. Compiles `zeroclaw-plugins` under each execution backend and runs the component, runtime admission, and root CLI plugin tests under `plugins-wasm-cranelift`. A separate `plugin artifact smoke` leg builds the `zeroclaw` binary with the same feature and runs `scripts/ci/plugin_artifact_smoke.sh` against it, with packages from `scripts/ci/build_plugin_smoke_packages.sh`. The smoke takes any `zeroclaw` binary, uses a throwaway configuration directory and the scripted local provider in `scripts/ci/plugin_smoke_provider.py`, and drives the operator's own commands: `plugin install`, `config set`, and an agent turn that executes the tool. It checks that an installed plugin stays unused until the operator enables the plugin system, turns discovery on, and approves the tool; that values configured for a package that does not request them are not delivered; that a payload with the wrong digest, a payload that is not a component, and a component for another WIT world are refused; and that strict signature mode refuses an unsigned, untrusted, or edited package while it runs a trusted one. The leg's last step runs the smoke with the opposite expectation and requires the exit status reserved for a failed check. The agent turn also depends on crates the path filter does not select, such as `zeroclaw-providers`, `zeroclaw-tools`, `zeroclaw-memory`, and `zeroclaw-api`, so a break there first shows on merge-queue and `master` runs, where the job always runs
 - **bench**: benchmarks compile check; runs on `master` pushes, merge-queue runs, and manual dispatch only. PRs skip it (the gate treats the skip as non-fatal), so benchmark bitrot is still caught before a release without spending the compile on every PR
 - **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux, including the config-write isolation and Fluent coverage (no bare user-facing strings) architecture guards. A final informational step replays the gateway golden-frame scenarios (`crates/zeroclaw-gateway/tests/golden_frames.rs`: WebSocket chat, webhook JSON and SSE, `/api/events`, and ACP) against their recorded fixtures with `--run-ignored only`. It reuses the job's build, writes any drift to the step summary with a warning, and never fails the job; it stays informational until the gateway reaches the core over RPC
+- **test-tool-features**: the tests of the opt-in SaaS, coding-CLI and external adapters, which Cargo `default` no longer builds: `cargo nextest run` over the root, config, tools, runtime, channels and gateway library tests plus the root report-template integration tests, with `--features tools-compat`. `lint` compiles the same code under `ci-all` but runs no test
 - **memory-postgres-test**: `cargo nextest run --locked -p zeroclaw-memory --features memory-postgres`, followed by the crate's serial ignored acceptance tests against an ephemeral PostgreSQL 17 service
 - **parallel-runtime-test**: repeated same-process runtime/channel tests from `scripts/ci/parallel_runtime_test_gate.sh`, run in parallel with the main test job for relevant PR paths and unconditionally on `master` pushes and merge queue runs
 - **security**: `cargo deny check`
@@ -73,7 +74,7 @@ The Linux selector checks formatting, compares the PR base SHA with the checked-
 
 `skip` means no changed path affects Rust compilation or tests covered by the current workspace suite. `scoped` maps Rust source, test, benchmark, example, and package-local manifest paths to package roots from Cargo metadata, closes that set over workspace reverse dependents, maps root `src/` and `tests/` to the root package, deduplicates package names, and excludes `zeroclaw-desktop` like the existing workspace suite. `full` is selected for workspace manifests or dependency resolution, `.cargo`, the Rust toolchain, CI or test infrastructure, the selector or workflow, unknown paths, ambiguous metadata, and other changes that cannot be mapped safely. Every `Cargo.lock` change selects `full` because workspace-wide dependency resolution can affect packages beyond the directly changed manifests. Direct changes to the root, gateway, or provider packages, plus changes to plugin, runtime, plugin config, WIT, root plugin activation, plugin backend filter, dependency, selector, selector-contract, `ci.yml`, or `windows-tests.yml` paths, set `needs_plugin_host=true`. The controlling-file cases make workflow revisions exercise the plugin-host path they own. Malformed or unavailable changed-path input selects baseline `full` and true. Missing or malformed Cargo metadata also selects baseline `full` with `needs_plugin_host=true` because the dependency closure cannot be established safely.
 
-For `scoped`, the Windows job passes explicit `-p` arguments to `cargo nextest`; for `full`, it runs `cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop`. When `needs_plugin_host=true`, it installs `wasm32-wasip2` and appends the feature-enabled `zeroclaw-plugins` component targets (`channel_plugin_e2e`, `tool_plugin_timeout_e2e`, `reference_plugin`, `reference_plugin_e2e`, and `tool_plugin_e2e`), plugin library tests, runtime live-config and admission regressions, gateway library tests, the root CLI plugin tests (the plugin registry client, the `plugins::` modules including the egress ceremony's Windows shell proofs, and the CLI egress ceremony tests), and the root `plugin_channel_runtime_e2e` and `channel_egress_e2e` targets. Every appended invocation runs even when an earlier one fails, and the summary preserves each phase status plus the failure inventory. The job reports separate baseline, plugin-host, and total durations. Ordinary `scoped` and `full` selections do not pay the plugin-host compilation cost. This PR workflow restores compatible `platform-test` cache entries but never saves them. It checks out the frozen PR merge SHA and does not persist checkout credentials. A skipped Windows job is intentional and visible beside the selector result.
+For `scoped`, the Windows job passes explicit `-p` arguments to `cargo nextest`; for `full`, it runs `cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop`. When `needs_plugin_host=true`, it installs `wasm32-wasip2` and appends the feature-enabled `zeroclaw-plugins` component targets (`channel_plugin_e2e`, `tool_plugin_timeout_e2e`, `reference_plugin`, `reference_plugin_e2e`, and `tool_plugin_e2e`), plugin library tests, runtime live-config and admission regressions, gateway library tests, the root CLI plugin tests (the plugin registry client, the `plugins::` modules including the egress ceremony's Windows shell proofs, the CLI egress ceremony tests, and the `plugin update` tests in the root binary), the `plugin_update_cli` and `plugin_info_cli` component tests, which run the real binary, and the root `plugin_channel_runtime_e2e` and `channel_egress_e2e` targets. Every appended invocation runs even when an earlier one fails, and the summary preserves each phase status plus the failure inventory. The job reports separate baseline, plugin-host, and total durations. Ordinary `scoped` and `full` selections do not pay the plugin-host compilation cost. This PR workflow restores compatible `platform-test` cache entries but never saves them. It checks out the frozen PR merge SHA and does not persist checkout credentials. A skipped Windows job is intentional and visible beside the selector result.
 
 ### Scheduled Platform Tests (`platform-tests.yml`)
 
@@ -202,6 +203,61 @@ Every dispatch also runs a small release-tool smoke matrix independently of the 
 
 MUSL build legs also install `cross` through `scripts/ci/install_release_tool.sh`, which downloads the exact pinned upstream release asset and verifies its SHA-256 before installing it. The required Repository Structure job tests the supported runner-to-asset mapping and the smoke workflow contract without making network calls.
 
+The default `qualification_profile: normal` retains the full matrix, the
+`dist-broad` raw-binary smoke route, the standard `dist` archive route, the
+normal cache policies, and the existing ARM64 memory lifecycle and macOS
+180-minute ceiling. Its five jobs keep `CARGO_INCREMENTAL=0` at job scope.
+The release-tool smoke validates the dispatch inputs before installing tools;
+normal product jobs retain their independent scheduling.
+
+Select `qualification_profile: stable-gnu-ubuntu22` with `distribution: dist`
+and `release_tools_only: false` for a finite, nonpublishing qualification.
+Empty, unknown, malformed, broad-distribution, or tools-only combinations are
+refused. Four GNU build rows run on Ubuntu22: x86_64, aarch64, armv7, and arm.
+They call the same local `build-release-payloads` action as Stable, with its
+existing linker and ARMv6 bindings, Rust1.98, locked release profile, explicit
+canonical features, ordinary Cargo jobs, three payloads per row, 90-minute
+ceiling, and inclusive 83,886,080-byte main-binary cap. Only the qualifier
+enables the action's features output; its manifest consumes that single
+resolution. Stable leaves the evidence switch off.
+
+Separate web and fixture producers use the existing entrypoints and Stable
+toolchain setup. These three build roles call the pinned Swatinem action
+directly with the original `web`, `plugin-smoke-packages`, and `build` shared
+keys. The fixture prefix and each Ubuntu22 target prefix match Stable, and
+default target restoration remains enabled. Every qualifier cache uses
+`save-if: false`, even on master. These roles omit the workflow/job
+`CARGO_INCREMENTAL` declaration, matching Stable. The pinned cache action
+exports `CARGO_INCREMENTAL=0` before constructing its cache configuration
+and leaves that value in subsequent steps. Producer receipts require and
+record the effective string `"0"`; completeness checks the same value.
+The action-exported value is retained. The normal web cache policy is unchanged.
+Action logs must supply the actual primary key, restore keys, hit, and cache
+source before cache parity can be accepted. These inputs guarantee neither a
+warm cache nor a later Stable build duration.
+
+The two native consumers run x86 GNU on Ubuntu22 and ARM64 GNU on Ubuntu24-arm,
+with 30-minute ceilings. Each verifies and extracts its same-run archive,
+runs the full verbose scripted-provider suite within five minutes, and
+unconditionally invokes the archive-aware plugin smoke. There is no raw
+fallback. The selected completeness job runs even after an upstream failure
+and rejects every missing, skipped, failed, or cancelled role. It checks four
+archives with the unchanged verifier, twelve input hashes and their saved
+ELF, compiler/sysroot and resource observations, and two native evidence
+carriers. Source commit, tree, run, attempt, profile, web and fixture hashes
+bind the receipts to one dispatch.
+
+Before accepting this route, retain the actual cache receipts, interpret all
+twelve ABI observations, and inspect each native carrier's named thirteen
+provider tests and eighteen archive controls. A successful job or carrier
+inventory alone does not replace those results or maintainer review. Missing
+or uninterpretable evidence holds acceptance; it does not authorize an
+automatic budget, resource, feature, or ABI-policy change. Ubuntu24 ARM64
+execution is not Ubuntu22 ARM64 runtime proof. ARM32, companion execution,
+Darwin, MUSL, Android, Windows, Stable's full matrix, and release
+readiness require their own evidence. A source change alone proves none of
+these runtime results.
+
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
 Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows x86_64 targets. It mirrors the required PR lint command with `--target` set for each platform, but intentionally does not run on PRs and is not part of `CI Required Gate`.
@@ -216,6 +272,22 @@ Downloadable assets use GitHub-hosted Build Level 2 attestations. Offline
 bundles and trusted-root material ship inside one verification archive, and
 both SBOM formats are checksummed and attested before the release is created.
 Cosign remains limited to GHCR image signing.
+
+Every 64-bit archive except the experimental Android one carries the WASM
+plugin host, and a dispatched release proves it before the GitHub Release and
+its own image pushes: `plugin-smoke-packages` builds the fixture plugin
+packages once on Linux, and `plugin-smoke` downloads each archive on a runner
+of its own platform and runs `scripts/ci/plugin_artifact_smoke.sh` against the
+packaged binary (the same script the `check-plugin-backends` smoke leg runs on
+pull requests). `publish` and `docker` wait for every leg. An xtask test keeps
+the leg list equal to the registry's per-target plugin policy, so a target
+cannot carry the host without a leg or lose its leg while it still carries the
+host. The build legs fail any binary over the 80 MiB cap set on the size
+check step. The manual Cross-Platform Build workflow rehearses the same legs
+against the binaries it builds, so a distribution change is measured and proven
+from one dispatch before a release runs. A release started by a tag push also
+triggers Docker Publish on its own `v*` tag trigger, and that run does not wait
+for the smoke.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
 
