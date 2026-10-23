@@ -3887,12 +3887,14 @@ mod outbound {
         Ok(())
     }
 
+    /// Redact this bot's logged reaction. Returns `false` when no reaction
+    /// was logged for the key, so callers can tell a no-op from a removal.
     pub(super) async fn unreact(
         outbox: &Outbox<'_>,
         room_id: &str,
         event_id: &OwnedEventId,
         emoji: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let room = resolve_joined_room(outbox.client, outbox.alias_cache, room_id).await?;
         let key = (
             room.room_id().to_owned(),
@@ -3900,10 +3902,11 @@ mod outbound {
             emoji.to_string(),
         );
         let reaction_event_id = outbox.reaction_log.lock().await.remove(&key);
-        if let Some(rid) = reaction_event_id {
-            room.redact(&rid, Some("removing reaction"), None).await?;
-        }
-        Ok(())
+        let Some(rid) = reaction_event_id else {
+            return Ok(false);
+        };
+        room.redact(&rid, Some("removing reaction"), None).await?;
+        Ok(true)
     }
 
     pub(super) async fn resolve_joined_room(
@@ -5424,7 +5427,35 @@ impl Channel for MatrixChannel {
         }
         let client = self.ensure_client().await?;
         let event_id: OwnedEventId = message_id.parse()?;
-        outbound::unreact(&self.outbox(client), channel_id, &event_id, emoji).await
+        outbound::unreact(&self.outbox(client), channel_id, &event_id, emoji)
+            .await
+            .map(|_| ())
+    }
+
+    /// `ack_reactions` governs automatic acknowledgements only, so an
+    /// agent-requested reaction is always sent. A removal with no logged
+    /// reaction to redact fails instead of reporting success.
+    async fn set_explicit_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        add: bool,
+    ) -> Result<()> {
+        let event_id: OwnedEventId = message_id.parse()?;
+        let client = self.ensure_client().await?;
+        let outbox = self.outbox(client);
+        if add {
+            return outbound::react(&outbox, channel_id, &event_id, emoji).await;
+        }
+        if outbound::unreact(&outbox, channel_id, &event_id, emoji).await? {
+            Ok(())
+        } else {
+            Err(crate::util::reaction_error(
+                "channel-reaction-remove-untracked",
+                &[("message_id", message_id), ("emoji", emoji)],
+            ))
+        }
     }
 
     async fn redact_message(
@@ -8341,6 +8372,37 @@ mod tests {
                 .remove_reaction("bad-room", "bad-event", "✅")
                 .await
                 .expect("ack-disabled reaction removal should be a no-op");
+        }
+
+        /// `ack_reactions = false` only silences automatic acknowledgements.
+        /// An agent-requested reaction must still be attempted, so a bad
+        /// target surfaces as an error instead of a fabricated success.
+        #[tokio::test]
+        async fn matrix_explicit_reaction_is_attempted_when_ack_disabled() {
+            let config = MatrixConfig {
+                homeserver: "https://matrix.example.com".to_string(),
+                access_token: Some("token".to_string()),
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            for add in [true, false] {
+                assert!(
+                    channel
+                        .set_explicit_reaction("bad-room", "bad-event", "✅", add)
+                        .await
+                        .is_err(),
+                    "explicit reaction (add={add}) must not report success unsent"
+                );
+            }
         }
     }
 

@@ -1,3 +1,4 @@
+use crate::util::reaction_error;
 use aes::Aes256;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -2877,6 +2878,281 @@ impl ::zeroclaw_api::attribution::Attributable for LarkChannel {
     }
 }
 
+impl LarkChannel {
+    /// Add a reaction. `explicit` marks an agent-driven (tool) write: the
+    /// skips that are harmless for automatic acknowledgements become errors,
+    /// so the reaction tool never reports a reaction that was not sent.
+    async fn write_reaction_add(
+        &self,
+        message_id: &str,
+        emoji: &str,
+        explicit: bool,
+    ) -> anyhow::Result<()> {
+        // When the per-channel or global `[channels].ack_reactions` is
+        // `false`, the automatic reaction paths (Lark-local fast-ack spawns
+        // in `listen_ws` / `listen_http` and the generic orchestrator
+        // add_reaction / remove_reaction calls) become no-ops. The setting
+        // governs acknowledgements only, so agent-requested reactions still
+        // go through.
+        if !self.ack_reactions && !explicit {
+            return Ok(());
+        }
+
+        if message_id.is_empty() {
+            if explicit {
+                return Err(reaction_error(
+                    "channel-reaction-invalid-message-id",
+                    &[("message_id", message_id)],
+                ));
+            }
+            return Ok(());
+        }
+
+        {
+            let cache = self.reaction_ids.lock().await;
+            if cache.contains_key(&(message_id.to_string(), emoji.to_string())) {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "emoji": emoji,
+                            "error_key": "lark.add_reaction.cache_hit_dedupe",
+                        })),
+                    "Lark add_reaction: cache hit, skipping duplicate POST"
+                );
+                return Ok(());
+            }
+        }
+
+        let emoji_type = match unicode_to_lark_emoji_type(emoji) {
+            Some(t) => t,
+            None => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "emoji": emoji,
+                            "error_key": "lark.add_reaction.no_emoji_mapping",
+                        })),
+                    "Lark add_reaction: no emoji_type mapping for unicode, skipping"
+                );
+                if explicit {
+                    return Err(reaction_error(
+                        "channel-reaction-unsupported-emoji",
+                        &[("emoji", emoji)],
+                    ));
+                }
+                return Ok(());
+            }
+        };
+
+        let mut token = self.get_tenant_access_token().await?;
+
+        let mut retried = false;
+        loop {
+            let response = self
+                .post_message_reaction_with_token(message_id, &token, emoji_type)
+                .await?;
+
+            if response.status().as_u16() == 401 && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Lark add_reaction failed for {message_id}: status={status}, body={err_body}"
+                );
+            }
+
+            let payload: serde_json::Value = response.json().await?;
+            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if code != 0 {
+                let msg = payload
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "code": code,
+                            "message_id": message_id,
+                            "msg": msg,
+                            "error_key": "lark.add_reaction.non_zero_code",
+                        })),
+                    "Lark add_reaction returned non-zero code"
+                );
+                if explicit {
+                    return Err(reaction_error(
+                        "channel-reaction-rejected",
+                        &[("detail", msg)],
+                    ));
+                }
+            } else if let Some(reaction_id) = payload
+                .pointer("/data/reaction_id")
+                .and_then(|v| v.as_str())
+            {
+                self.reaction_ids.lock().await.insert(
+                    (message_id.to_string(), emoji.to_string()),
+                    reaction_id.to_string(),
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    /// Remove a reaction this bot added. `explicit` marks an agent-driven
+    /// (tool) removal, which fails instead of silently skipping when the
+    /// removal cannot be carried out or verified.
+    async fn write_reaction_remove(
+        &self,
+        message_id: &str,
+        emoji: &str,
+        explicit: bool,
+    ) -> anyhow::Result<()> {
+        // `[channels].ack_reactions = false` turns off automatic reaction
+        // paths only; agent-requested removals still go through.
+        if !self.ack_reactions && !explicit {
+            return Ok(());
+        }
+
+        if message_id.is_empty() {
+            if explicit {
+                return Err(reaction_error(
+                    "channel-reaction-invalid-message-id",
+                    &[("message_id", message_id)],
+                ));
+            }
+            return Ok(());
+        }
+
+        let reaction_id = {
+            let mut cache = self.reaction_ids.lock().await;
+            cache.remove(&(message_id.to_string(), emoji.to_string()))
+        };
+        let Some(reaction_id) = reaction_id else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "emoji": emoji,
+                    })),
+                "Lark remove_reaction: cache miss, skipping"
+            );
+            if explicit {
+                return Err(reaction_error(
+                    "channel-reaction-remove-untracked",
+                    &[("message_id", message_id), ("emoji", emoji)],
+                ));
+            }
+            return Ok(());
+        };
+
+        let mut token = self.get_tenant_access_token().await?;
+        let url = self.delete_message_reaction_url(message_id, &reaction_id);
+
+        let mut retried = false;
+        loop {
+            let response = self
+                .http_client()
+                .delete(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await?;
+
+            if response.status().as_u16() == 401 && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "reaction_id": reaction_id,
+                            "status": status.as_u16(),
+                            "body": err_body,
+                            "error_key": "lark.remove_reaction.http_failure",
+                        })),
+                    "Lark remove_reaction failed"
+                );
+                if explicit {
+                    let status = status.to_string();
+                    return Err(reaction_error(
+                        "channel-reaction-rejected",
+                        &[("detail", status.as_str())],
+                    ));
+                }
+                return Ok(());
+            }
+
+            let payload: serde_json::Value = response.json().await?;
+            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            match code {
+                0 => {}
+                231_003 | 231_007 | 231_010 | 231_011 => {
+                    let msg = payload
+                        .get("msg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "code": code,
+                                "msg": msg,
+                                "message_id": message_id,
+                            })),
+                        "Lark remove_reaction: server-side stale state"
+                    );
+                }
+                _ => {
+                    let msg = payload
+                        .get("msg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "code": code,
+                                "message_id": message_id,
+                                "msg": msg,
+                                "error_key": "lark.remove_reaction.non_zero_code",
+                            })),
+                        "Lark remove_reaction returned non-zero code"
+                    );
+                    if explicit {
+                        return Err(reaction_error(
+                            "channel-reaction-rejected",
+                            &[("detail", msg)],
+                        ));
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+}
+
 #[async_trait]
 impl Channel for LarkChannel {
     fn name(&self) -> &str {
@@ -2944,106 +3220,7 @@ impl Channel for LarkChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
-        // When the per-channel or global `[channels].ack_reactions` is
-        // `false`, all reaction paths (Lark-local fast-ack spawns in
-        // `listen_ws` / `listen_http` and the generic orchestrator
-        // add_reaction / remove_reaction calls) become no-ops.
-        if !self.ack_reactions {
-            return Ok(());
-        }
-
-        if message_id.is_empty() {
-            return Ok(());
-        }
-
-        {
-            let cache = self.reaction_ids.lock().await;
-            if cache.contains_key(&(message_id.to_string(), emoji.to_string())) {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({
-                            "message_id": message_id,
-                            "emoji": emoji,
-                            "error_key": "lark.add_reaction.cache_hit_dedupe",
-                        })),
-                    "Lark add_reaction: cache hit, skipping duplicate POST"
-                );
-                return Ok(());
-            }
-        }
-
-        let emoji_type = match unicode_to_lark_emoji_type(emoji) {
-            Some(t) => t,
-            None => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "message_id": message_id,
-                            "emoji": emoji,
-                            "error_key": "lark.add_reaction.no_emoji_mapping",
-                        })),
-                    "Lark add_reaction: no emoji_type mapping for unicode, skipping"
-                );
-                return Ok(());
-            }
-        };
-
-        let mut token = self.get_tenant_access_token().await?;
-
-        let mut retried = false;
-        loop {
-            let response = self
-                .post_message_reaction_with_token(message_id, &token, emoji_type)
-                .await?;
-
-            if response.status().as_u16() == 401 && !retried {
-                self.invalidate_token().await;
-                token = self.get_tenant_access_token().await?;
-                retried = true;
-                continue;
-            }
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let err_body = response.text().await.unwrap_or_default();
-                anyhow::bail!(
-                    "Lark add_reaction failed for {message_id}: status={status}, body={err_body}"
-                );
-            }
-
-            let payload: serde_json::Value = response.json().await?;
-            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-            if code != 0 {
-                let msg = payload
-                    .get("msg")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown error");
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "code": code,
-                            "message_id": message_id,
-                            "msg": msg,
-                            "error_key": "lark.add_reaction.non_zero_code",
-                        })),
-                    "Lark add_reaction returned non-zero code"
-                );
-            } else if let Some(reaction_id) = payload
-                .pointer("/data/reaction_id")
-                .and_then(|v| v.as_str())
-            {
-                self.reaction_ids.lock().await.insert(
-                    (message_id.to_string(), emoji.to_string()),
-                    reaction_id.to_string(),
-                );
-            }
-            return Ok(());
-        }
+        self.write_reaction_add(message_id, emoji, false).await
     }
 
     async fn remove_reaction(
@@ -3052,111 +3229,20 @@ impl Channel for LarkChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
-        // When the per-channel or global `[channels].ack_reactions` is
-        // `false`, all reaction paths become no-ops.
-        if !self.ack_reactions {
-            return Ok(());
-        }
+        self.write_reaction_remove(message_id, emoji, false).await
+    }
 
-        if message_id.is_empty() {
-            return Ok(());
-        }
-
-        let reaction_id = {
-            let mut cache = self.reaction_ids.lock().await;
-            cache.remove(&(message_id.to_string(), emoji.to_string()))
-        };
-        let Some(reaction_id) = reaction_id else {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({
-                        "message_id": message_id,
-                        "emoji": emoji,
-                    })),
-                "Lark remove_reaction: cache miss, skipping"
-            );
-            return Ok(());
-        };
-
-        let mut token = self.get_tenant_access_token().await?;
-        let url = self.delete_message_reaction_url(message_id, &reaction_id);
-
-        let mut retried = false;
-        loop {
-            let response = self
-                .http_client()
-                .delete(&url)
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
-                .await?;
-
-            if response.status().as_u16() == 401 && !retried {
-                self.invalidate_token().await;
-                token = self.get_tenant_access_token().await?;
-                retried = true;
-                continue;
-            }
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let err_body = response.text().await.unwrap_or_default();
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "message_id": message_id,
-                            "reaction_id": reaction_id,
-                            "status": status.as_u16(),
-                            "body": err_body,
-                            "error_key": "lark.remove_reaction.http_failure",
-                        })),
-                    "Lark remove_reaction failed"
-                );
-                return Ok(());
-            }
-
-            let payload: serde_json::Value = response.json().await?;
-            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-            match code {
-                0 => {}
-                231_003 | 231_007 | 231_010 | 231_011 => {
-                    let msg = payload
-                        .get("msg")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error");
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "code": code,
-                                "msg": msg,
-                                "message_id": message_id,
-                            })),
-                        "Lark remove_reaction: server-side stale state"
-                    );
-                }
-                _ => {
-                    let msg = payload
-                        .get("msg")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error");
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "code": code,
-                                "message_id": message_id,
-                                "msg": msg,
-                                "error_key": "lark.remove_reaction.non_zero_code",
-                            })),
-                        "Lark remove_reaction returned non-zero code"
-                    );
-                }
-            }
-            return Ok(());
+    async fn set_explicit_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+        add: bool,
+    ) -> anyhow::Result<()> {
+        if add {
+            self.write_reaction_add(message_id, emoji, true).await
+        } else {
+            self.write_reaction_remove(message_id, emoji, true).await
         }
     }
 
@@ -7672,6 +7758,37 @@ mod tests {
             .expect("cache miss must not error");
 
         drop(delete_mock);
+    }
+
+    /// An agent-requested removal with no cached reaction id cannot be
+    /// carried out, so it must fail instead of reporting success.
+    #[tokio::test]
+    async fn explicit_remove_reaction_fails_on_cache_miss() {
+        use zeroclaw_api::channel::Channel;
+
+        let ch = make_channel();
+        let err = ch
+            .set_explicit_reaction("oc_chat", "om_never_added", "\u{1F440}", false)
+            .await
+            .expect_err("explicit removal on a cache miss must not report success");
+        assert!(
+            err.to_string().contains("cannot verify removal"),
+            "rendered: {err}"
+        );
+    }
+
+    /// An emoji Lark has no mapping for is never sent; an agent-requested
+    /// add must say so instead of reporting success.
+    #[tokio::test]
+    async fn explicit_add_reaction_fails_on_unmapped_emoji() {
+        use zeroclaw_api::channel::Channel;
+
+        let ch = make_channel();
+        let err = ch
+            .set_explicit_reaction("oc_chat", "om_test", "\u{1F9FF}", true)
+            .await
+            .expect_err("explicit add of an unmapped emoji must not report success");
+        assert!(err.to_string().contains("\u{1F9FF}"), "rendered: {err}");
     }
 
     #[tokio::test]
