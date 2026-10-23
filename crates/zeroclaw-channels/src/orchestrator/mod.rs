@@ -9079,6 +9079,14 @@ fn resolve_channel_ack_reactions(
             .get(alias)
             .and_then(|c| c.ack_reactions)
             .unwrap_or(ctx.ack_reactions),
+        // Nostr acks are opt-in per channel and do not inherit the global
+        // default; see `NostrConfig::ack_reactions`.
+        "nostr" => ctx
+            .prompt_config
+            .channels
+            .nostr
+            .get(alias)
+            .is_some_and(|c| c.effective_ack_reactions()),
         _ => ctx.ack_reactions,
     }
 }
@@ -16350,11 +16358,25 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
             };
+            let ack_reactions: Arc<dyn Fn() -> bool + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    cfg_arc
+                        .read()
+                        .channels
+                        .nostr
+                        .get(&alias)
+                        .is_some_and(|ns| ns.effective_ack_reactions())
+                })
+            };
             channels.push(ConfiguredChannel {
                 display_name: "Nostr",
                 alias: Some(alias.clone()),
                 channel: Arc::new(
-                    NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
+                    NostrChannel::new(&private_key, relays, alias, peer_resolver)
+                        .await?
+                        .with_ack_reactions(ack_reactions),
                 ),
             });
         }
@@ -17396,11 +17418,25 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                         let alias = alias.clone();
                         Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
                     };
+                    let ack_reactions: Arc<dyn Fn() -> bool + Send + Sync> = {
+                        let cfg_arc = config_arc.clone();
+                        let alias = alias.clone();
+                        Arc::new(move || {
+                            cfg_arc
+                                .read()
+                                .channels
+                                .nostr
+                                .get(&alias)
+                                .is_some_and(|ns| ns.effective_ack_reactions())
+                        })
+                    };
                     configured_channels.push(ConfiguredChannel {
                         display_name: "Nostr",
                         alias: Some(alias.clone()),
                         channel: Arc::new(
-                            NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
+                            NostrChannel::new(&private_key, relays, alias, peer_resolver)
+                                .await?
+                                .with_ack_reactions(ack_reactions),
                         ),
                     });
                 }
@@ -49159,6 +49195,39 @@ This is an example JSON object for profile settings."#;
             "Nostr channel with only a disabled owner must not pass the gate (#8013): got {:?}",
             active
         );
+    }
+
+    #[test]
+    fn nostr_ack_reactions_are_opt_in_and_ignore_global_default() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        for (alias, ack_reactions) in [("unset", None), ("on", Some(true)), ("off", Some(false))] {
+            config.channels.nostr.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::NostrConfig {
+                    enabled: true,
+                    ack_reactions,
+                    ..Default::default()
+                },
+            );
+        }
+        let ctx = ChannelRuntimeContext {
+            ack_reactions: true,
+            prompt_config: Arc::new(config),
+            ..(*router_test_ctx()).clone()
+        };
+        let resolve = |alias: &str| {
+            let msg = zeroclaw_api::channel::ChannelMessage {
+                channel: "nostr".to_string(),
+                channel_alias: Some(alias.to_string()),
+                ..Default::default()
+            };
+            resolve_channel_ack_reactions(&ctx, &msg)
+        };
+        // `[channels].ack_reactions = true` must not switch Nostr acks on.
+        assert!(!resolve("unset"));
+        assert!(!resolve("missing"));
+        assert!(resolve("on"));
+        assert!(!resolve("off"));
     }
 
     #[cfg(feature = "channel-nostr")]

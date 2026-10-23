@@ -20742,11 +20742,26 @@ pub struct NostrConfig {
     #[serde(default = "default_nostr_relays")]
     pub relays: Vec<String>,
 
+    /// React to each NIP-17 DM on receipt with one gift-wrapped NIP-25
+    /// reaction picked at random, like Telegram's ack. NIP-04 DMs get none.
+    ///
+    /// Unset does not fall back to `[channels].ack_reactions`: not every
+    /// client renders gift-wrapped reactions. Default: off.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub ack_reactions: Option<bool>,
+
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+}
+
+impl NostrConfig {
+    pub fn effective_ack_reactions(&self) -> bool {
+        self.ack_reactions.unwrap_or(false)
+    }
 }
 
 impl ChannelConfig for NostrConfig {
@@ -43372,6 +43387,27 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         "#;
         let cfg: TelegramConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.ack_reactions, None);
+    }
+
+    #[test]
+    async fn nostr_config_ack_reactions_missing_is_off() {
+        let toml_str = r#"
+            private_key = "nsec1test"
+        "#;
+        let cfg: NostrConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, None);
+        assert!(!cfg.effective_ack_reactions());
+    }
+
+    #[test]
+    async fn nostr_config_ack_reactions_true_deserializes() {
+        let toml_str = r#"
+            private_key = "nsec1test"
+            ack_reactions = true
+        "#;
+        let cfg: NostrConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.ack_reactions, Some(true));
+        assert!(cfg.effective_ack_reactions());
     }
 
     #[test]
