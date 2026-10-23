@@ -45,9 +45,9 @@ pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub use outcome::{
-    ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
-    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
-    terminal_completion_error_message,
+    ContextWindowExceeded, SystemPromptFloorExceedsBudget, append_safeguard_fallback_notice,
+    context_window_exceeded_from_error, is_semantic_empty_terminal_completion,
+    semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,
@@ -1067,6 +1067,41 @@ fn context_window_exceeded_error(
         tool_schema_tokens,
     }
     .into()
+}
+
+/// Refuse a request whose non-droppable system floor already meets or exceeds
+/// the operator's context budget. The warning event keeps its historical
+/// `context_floor_exceeds_budget` key — dashboards and the incident trace
+/// match on it — but the turn now fails closed instead of dispatching.
+fn context_floor_budget_exceeded_error(
+    (provider_name, model): (&str, &str),
+    system_floor: usize,
+    budget: usize,
+) -> anyhow::Error {
+    let span = ::zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        model = %model,
+        model_provider = %provider_name,
+    );
+    let _guard = span.entered();
+    let error = SystemPromptFloorExceedsBudget {
+        system_floor_tokens: system_floor,
+        context_token_budget: budget,
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "system_floor": system_floor,
+                "budget": budget,
+                "error_key": "context_floor_exceeds_budget",
+            })),
+        error.remediation()
+    );
+    error.into()
 }
 
 struct PreDispatchTrimResult {
@@ -2301,29 +2336,32 @@ async fn run_tool_call_loop_impl<'a>(
         if context_token_budget > 0 {
             let system_floor =
                 crate::agent::history::estimate_system_floor_tokens(&provider_request_messages);
-            if system_floor >= context_token_budget {
-                let __zc_floor_span = ::zeroclaw_log::info_span!(
-                    target: "zeroclaw_log_internal_scope",
-                    "zeroclaw_scope",
-                    model = %provider_request_model,
-                    model_provider = %active_model_provider_name,
-                );
-                let _zc_floor_guard = __zc_floor_span.entered();
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "system_floor": system_floor,
-                            "budget": context_token_budget,
-                            "error_key": "context_floor_exceeds_budget",
-                        })),
-                    crate::agent::history::context_floor_remediation(
-                        system_floor,
-                        context_token_budget,
-                    )
-                );
+            // Hard stop: when the system floor alone meets or exceeds the
+            // context budget, no history trim can bring the request under it,
+            // so the request must not reach the provider (the warning-only
+            // predecessor of this gate sent a 563K-char system prompt to a
+            // live conversation on 2026-10-20). The refusal is a typed turn
+            // error, not a panic, so callers can deliver the remediation.
+            //
+            // The refusal is raised only when the operator budget is the
+            // binding constraint (`budget < model capacity`): when the budget
+            // reaches model capacity (an explicit budget clamped by the
+            // route's window, or the legacy default clamped the same way),
+            // the capacity check below refuses the identical request with
+            // `ContextWindowExceeded`, which names the remediation that
+            // actually helps — raising the budget cannot substitute for a
+            // larger model window.
+            if context_token_budget < model_context_window
+                && !crate::agent::history::system_floor_within_budget(
+                    system_floor,
+                    context_token_budget,
+                )
+            {
+                return Err(context_floor_budget_exceeded_error(
+                    (active_model_provider_name, provider_request_model),
+                    system_floor,
+                    context_token_budget,
+                ));
             }
         }
 
@@ -10044,7 +10082,17 @@ mod tool_lifecycle_abandonment_tests {
         // still present when the pre-dispatch gate below runs. The hook's
         // large insertion is what pushes the actual dispatched population
         // over this budget, forcing that gate to drop a whole turn.
-        let budget = crate::agent::history::estimate_history_tokens(&history) + 10;
+        //
+        // The fail-closed system-floor gate measures the post-hook request,
+        // so the budget must also clear the hook-inflated system floor —
+        // otherwise the turn fails with the budget refusal before the
+        // pre-dispatch gate runs and the structural-mutation check below is
+        // never reached.
+        let post_hook_system_floor = crate::agent::history::estimate_system_floor_tokens(&[
+            ChatMessage::system("system"),
+            ChatMessage::system("z".repeat(2000)),
+        ]);
+        let budget = post_hook_system_floor + 14;
 
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![text_response()]),
@@ -10075,6 +10123,53 @@ mod tool_lifecycle_abandonment_tests {
         assert_eq!(
             error.to_string(),
             crate::i18n::get_required_cli_string("turn-context-hook-mutation-unsafe-error")
+        );
+    }
+
+    #[tokio::test]
+    async fn system_floor_refusal_fails_closed_when_operator_budget_is_binding() {
+        // The non-droppable system floor (~1,007 tokens) meets the operator
+        // budget while staying far under model capacity, so the turn must be
+        // refused before any provider call with the typed budget error — the
+        // model-capacity floor path below cannot produce that refusal because
+        // the request fits the window.
+        let mut history = vec![
+            ChatMessage::system(format!("text prompt {}", "s".repeat(4000))),
+            ChatMessage::user("x".repeat(20_000)),
+        ];
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![]),
+        };
+        let registry = registry_with(Vec::new());
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+
+        let result = run_scripted_loop_with_budget(
+            &provider,
+            &registry,
+            &observer,
+            None,
+            &pacing,
+            "floor-budget-refusal",
+            false,
+            None,
+            &mut history,
+            1_000,
+            None,
+        )
+        .await;
+
+        let error = result
+            .expect_err("a system floor at the operator budget must fail closed before dispatch");
+        let refusal = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<SystemPromptFloorExceedsBudget>())
+            .expect("the refusal must keep its typed budget cause");
+        assert_eq!(refusal.context_token_budget, 1_000);
+        assert!(
+            refusal.system_floor_tokens >= 1_000,
+            "the refusal must report the measured floor, got {}",
+            refusal.system_floor_tokens
         );
     }
 

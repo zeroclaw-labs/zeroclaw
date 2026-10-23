@@ -22759,10 +22759,14 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn soft_context_floor_dispatches_the_complete_latest_turn() {
-        assert_context_floor_dispatch(100, 32_768, context_floor_history(), true, false).await;
+        // The budget stays above the non-droppable system floor (~1,007
+        // tokens) so the fail-closed floor gate does not refuse the turn
+        // outright; the newest turn alone still exceeds it, so the
+        // pre-dispatch gate cannot trim the turn away either.
+        assert_context_floor_dispatch(2_000, 32_768, context_floor_history(), true, false).await;
         let history = context_floor_history();
         let exact_capacity = estimate_history_tokens(&history);
-        assert_context_floor_dispatch(100, exact_capacity, history, true, false).await;
+        assert_context_floor_dispatch(2_000, exact_capacity, history, true, false).await;
     }
 
     #[tokio::test]
@@ -22800,7 +22804,9 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn streaming_context_floor_uses_model_capacity_not_the_soft_budget() {
-        assert_context_floor_dispatch(100, 32_768, context_floor_history(), true, true).await;
+        // 2_000 stays above the system floor (~1,007 tokens), so the
+        // fail-closed floor gate leaves the turn to the capacity check.
+        assert_context_floor_dispatch(2_000, 32_768, context_floor_history(), true, true).await;
         assert_context_floor_dispatch(100, 100, context_floor_history(), false, true).await;
         assert_context_floor_dispatch(0, 100, context_floor_history(), false, true).await;
     }

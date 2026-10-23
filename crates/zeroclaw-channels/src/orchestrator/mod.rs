@@ -27366,11 +27366,18 @@ api_key = "anthropic-key"
         let history_key = conversation_history_key(&msg);
 
         let backend = Arc::new(FailingRewriteAndProvenanceBackend::default());
-        // A whole old turn (user + assistant), so a tiny `context_token_budget`
-        // forces the pre-dispatch gate to drop it before the (erroring)
-        // provider call, giving the resync below something real to detect.
-        let old_user_turn =
-            ChatMessage::user("pre-existing turn that must survive a failed resync");
+        // A whole old turn (user + assistant), so a `context_token_budget`
+        // below the request size forces the pre-dispatch gate to drop it
+        // before the (erroring) provider call, giving the resync below
+        // something real to detect. The old user message is padded so the
+        // request still exceeds the budget; the budget itself (1_000) stays
+        // above the non-droppable channel system-prompt floor, because the
+        // fail-closed floor gate would otherwise refuse the turn before any
+        // trim and this failed-resync path would never run.
+        let old_user_turn = ChatMessage::user(format!(
+            "pre-existing turn that must survive a failed resync {}",
+            "x".repeat(50_000)
+        ));
         let old_assistant_turn = ChatMessage::assistant("pre-existing reply".to_string());
         for turn in [&old_user_turn, &old_assistant_turn] {
             backend
@@ -27384,7 +27391,7 @@ api_key = "anthropic-key"
             backend.clone() as Arc<dyn SessionBackend>,
             channel,
             Arc::new(FormatErrorModelProvider),
-            1, // context_token_budget: force a whole-turn drop pre-dispatch
+            1_000, // context_token_budget: below the padded request, above the system floor
         );
         runtime_ctx
             .conversation_histories
