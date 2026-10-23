@@ -58,6 +58,10 @@ The recovery tests run in their own `windows-task-owner-recovery` job on `blacks
 
 Recovery calls the pinned `Swatinem/rust-cache` action directly with `shared-key: windows-recovery-blacksmith`, rather than assuming the GitHub build runner's cache has a compatible Rust environment hash. Only successful `push` runs on `refs/heads/master` save this dedicated dependency cache; PR and merge-queue runs only restore it. A miss builds normally and does not skip either test. Default workspace-artifact cleanup remains enabled, so the runtime harness still compiles. This adds a cache namespace that consumes repository storage; compilation and service smoke keep their existing runners and caches.
 
+### Code Analysis (`ci-code-analysis.yml`)
+
+Runs Semgrep on pull requests to `master` and pushes to `master`, then uploads SARIF. The job configures Docker to check Google's public `mirror.gcr.io` cache first, preserving existing daemon settings and other mirrors. The Semgrep image keeps its canonical Docker Hub name and pinned digest; Docker falls back to Docker Hub on a cache miss. No registry credentials or Google account are required, including for fork PRs. A cache miss can still encounter Docker Hub's pull limits.
+
 ### Label-gated Advisory Windows Tests (`windows-tests.yml`)
 
 Use `ci:windows` when executing tests on Windows can close a material gap left by compilation. Typical cases include process or service lifecycle changes, PowerShell execution, filesystem and path handling, encoding, native dependencies, and changes to Windows CI selection or execution. It is not a default label for every Rust PR, a docs-only change, or an unrelated Linux test failure.
