@@ -1635,8 +1635,8 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard))
 }
 
 /// Non-streamed Agent turns own the guard without steering ingress.
@@ -1644,8 +1644,8 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
 pub(crate) fn run_tool_call_loop_with_guard<'a>(
     p: ToolLoop<'a>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, None, None, repetition_guard)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(run_tool_call_loop_impl(p, None, None, repetition_guard))
 }
 
 /// Recovery evidence owned by one logical turn, including model switches.
@@ -1657,14 +1657,14 @@ pub struct ToolLoopRecovery(std::sync::Mutex<repetition::RepetitionGuard>);
 pub fn run_tool_call_loop_with_recovery<'a>(
     p: ToolLoop<'a>,
     recovery: &'a ToolLoopRecovery,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
     run_tool_call_loop_with_guard(p, Some(&recovery.0))
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None, None)
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
+    Box::pin(run_tool_call_loop_impl(p, None, None, None))
 }
 
 async fn run_tool_call_loop_impl<'a>(
