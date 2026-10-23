@@ -1359,3 +1359,7 @@ tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在
 
 turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
 cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。
+
+# Generated with the official Fluent fill workflow for channel turn progress.
+channel-runtime-task-deadline = ⚠️ 任务已达到处理时限。部分操作可能已完成；重试前请先核实其状态。
+channel-runtime-still-working = 仍在处理你的请求（已耗时 { $seconds } 秒）。尚无最终结果。

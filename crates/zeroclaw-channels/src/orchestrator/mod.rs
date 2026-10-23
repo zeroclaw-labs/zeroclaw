@@ -7,6 +7,7 @@ pub mod acp_server;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
+mod turn_progress;
 
 // Channel types imported directly from source crates (no shim files)
 #[cfg(feature = "channel-amqp")]
@@ -10683,7 +10684,46 @@ async fn process_channel_message_body(
         let safeguard = take_last_safeguard_fallback();
         (llm_result, fb, safeguard)
     }));
-    let (llm_result, fallback_info, safeguard_notice) = scope_safeguard_fallback(scoped_turn).await;
+    let progress_secs = ctx
+        .live_config
+        .read()
+        .channels
+        .message_progress_interval_secs;
+    let progress_secs = if progress_secs == 0 {
+        0
+    } else {
+        progress_secs.clamp(15, 3600)
+    };
+    let progress_ctx = &ctx;
+    let progress_msg = &msg;
+    let progress_channel = &target_channel;
+    let (llm_result, fallback_info, safeguard_notice) = turn_progress::with_progress(
+        scope_safeguard_fallback(scoped_turn),
+        std::time::Duration::from_secs(progress_secs),
+        |elapsed| async move {
+            if let Some(channel) = progress_channel.as_ref() {
+                let text = channel_runtime_cli_string_with_args(
+                    "channel-runtime-still-working",
+                    &[("seconds", &elapsed.as_secs().to_string())],
+                );
+                if let Some(guarded) = apply_multi_message_narration_policy(
+                    progress_ctx.hooks.as_deref(),
+                    &progress_ctx.prompt_config.security.leak_detection,
+                    &progress_msg.channel,
+                    &progress_msg.reply_target,
+                    "",
+                    text,
+                )
+                .await
+                {
+                    let _ = channel
+                        .send(&SendMessage::reply_to(progress_msg, guarded).suppress_voice())
+                        .await;
+                }
+            }
+        },
+    )
+    .await;
 
     if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
         && let Some(tx) = delta_tx.as_ref()
@@ -11471,7 +11511,7 @@ async fn process_channel_message_body(
                 // (RFCerror-path fix): cancel the draft, then send as
                 // text so a timeout notice is never read aloud on a voice peer.
                 let error_text = zeroclaw_runtime::i18n::get_required_cli_string(
-                    "channel-runtime-request-timeout",
+                    "channel-runtime-task-deadline",
                 );
                 if let Some(draft_id) = draft_message_id.as_deref() {
                     let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
