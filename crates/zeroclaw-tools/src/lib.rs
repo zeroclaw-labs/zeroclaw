@@ -106,6 +106,7 @@ pub mod report_templates;
 #[cfg(feature = "tools-external")]
 pub mod screenshot;
 pub mod send_via;
+pub mod session_memory;
 pub mod sessions;
 #[cfg(feature = "tools-external")]
 pub mod text_browser;
