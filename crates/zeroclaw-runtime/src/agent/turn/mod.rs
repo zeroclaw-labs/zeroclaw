@@ -5465,7 +5465,12 @@ mod reported_budget_tests {
                 .await
                 .expect("preparation must succeed for the regression");
         let prepared_estimated = crate::agent::history::estimate_history_tokens(&prepared.messages);
-        let raw_estimated = crate::agent::history::estimate_history_tokens(&history);
+        // Preparation also notes on the text-only follow-ups that no new image
+        // is attached, so compare against the prepared messages with only the
+        // image turn left raw: that isolates the per-image pricing.
+        let mut raw_image_turn = prepared.messages.clone();
+        raw_image_turn[1] = history[1].clone();
+        let raw_estimated = crate::agent::history::estimate_history_tokens(&raw_image_turn);
         assert_eq!(
             prepared_estimated, raw_estimated,
             "per-image pricing must stay identical between the raw marker and its prepared payload"
