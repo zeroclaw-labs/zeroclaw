@@ -5,6 +5,7 @@ pub mod attribution;
     feature = "tool-claude-code",
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
+    feature = "tool-agy-cli",
     feature = "tool-opencode-cli"
 ))]
 pub(crate) mod coding_cli_executor;
@@ -47,6 +48,8 @@ pub mod verifiable_intent;
 pub use zeroclaw_tools::a2a_client::{
     A2aCancelTool, A2aDiscoverTool, A2aGetTaskTool, A2aHttpClient, A2aSendTool,
 };
+#[cfg(feature = "tool-agy-cli")]
+pub use zeroclaw_tools::agy_cli::AgyCliTool;
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
@@ -289,6 +292,7 @@ fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
     (cfg!(feature = "tool-claude-code") && root_config.claude_code.enabled)
         || (cfg!(feature = "tool-codex-cli") && root_config.codex_cli.enabled)
         || (cfg!(feature = "tool-gemini-cli") && root_config.gemini_cli.enabled)
+        || (cfg!(feature = "tool-agy-cli") && root_config.agy_cli.enabled)
         || (cfg!(feature = "tool-opencode-cli") && root_config.opencode_cli.enabled)
 }
 
@@ -317,6 +321,7 @@ pub fn composio_tool_available(config: &Config) -> bool {
     feature = "tool-claude-code-runner",
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
+    feature = "tool-agy-cli",
     feature = "tool-opencode-cli"
 )))]
 fn warn_tool_compiled_out(root_config: &Config, tool: zeroclaw_config::opt_in_tools::OptInTool) {
@@ -1587,6 +1592,7 @@ fn all_tools_with_runtime_on_thread(
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
         feature = "tool-gemini-cli",
+        feature = "tool-agy-cli",
         feature = "tool-opencode-cli"
     ))]
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
@@ -2484,6 +2490,27 @@ fn all_tools_with_runtime_on_thread(
                 GeminiCliTool::new_with_executor(
                     security.clone(),
                     root_config.gemini_cli.clone(),
+                    coding_cli_executor.clone(),
+                ),
+                security.clone(),
+            ))
+        );
+    }
+
+    // Antigravity CLI delegation tool
+    #[cfg(not(feature = "tool-agy-cli"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::AgyCli,
+    );
+    #[cfg(feature = "tool-agy-cli")]
+    if root_config.agy_cli.enabled && register_coding_cli_tools && select_tool!("agy_cli") {
+        register_tool!(
+            "agy_cli",
+            Arc::new(RateLimitedTool::new(
+                AgyCliTool::new_with_executor(
+                    security.clone(),
+                    root_config.agy_cli.clone(),
                     coding_cli_executor.clone(),
                 ),
                 security.clone(),
@@ -5466,6 +5493,7 @@ permissions = ["http_client"]
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
         feature = "tool-gemini-cli",
+        feature = "tool-agy-cli",
         feature = "tool-opencode-cli"
     ))]
     struct CapturingRuntime {
@@ -5477,6 +5505,7 @@ permissions = ["http_client"]
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
         feature = "tool-gemini-cli",
+        feature = "tool-agy-cli",
         feature = "tool-opencode-cli"
     ))]
     impl RuntimeAdapter for CapturingRuntime {
@@ -5523,13 +5552,14 @@ permissions = ["http_client"]
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
         feature = "tool-gemini-cli",
+        feature = "tool-agy-cli",
         feature = "tool-opencode-cli"
     ))]
     #[tokio::test]
     async fn registered_coding_cli_tools_use_configured_runtime_executor() {
         type EnableCodingCli = fn(&mut Config);
 
-        let cases: [(&str, &str, EnableCodingCli); 4] = [
+        let cases: [(&str, &str, EnableCodingCli); 5] = [
             ("claude_code", "claude -p", |cfg: &mut Config| {
                 cfg.claude_code.enabled = true;
                 cfg.claude_code.timeout_secs = 5;
@@ -5541,6 +5571,10 @@ permissions = ["http_client"]
             ("gemini_cli", "gemini -p", |cfg: &mut Config| {
                 cfg.gemini_cli.enabled = true;
                 cfg.gemini_cli.timeout_secs = 5;
+            }),
+            ("agy_cli", "agy ", |cfg: &mut Config| {
+                cfg.agy_cli.enabled = true;
+                cfg.agy_cli.timeout_secs = 5;
             }),
             ("opencode_cli", "opencode run", |cfg: &mut Config| {
                 cfg.opencode_cli.enabled = true;
@@ -5570,6 +5604,7 @@ permissions = ["http_client"]
             cfg.claude_code.enabled = false;
             cfg.codex_cli.enabled = false;
             cfg.gemini_cli.enabled = false;
+            cfg.agy_cli.enabled = false;
             cfg.opencode_cli.enabled = false;
             enable(&mut cfg);
             let risk = zeroclaw_config::schema::RiskProfileConfig {
@@ -5617,11 +5652,26 @@ permissions = ["http_client"]
                 .await
                 .unwrap_or_else(|error| panic!("{tool_name} should return a tool result: {error}"));
 
-            assert!(
-                result.success,
-                "{tool_name} unexpected error: {:?}",
-                result.error
-            );
+            if tool_name == "agy_cli" {
+                // agy_cli only trusts agy's JSON result, so the runtime's
+                // plain-text probe must fail closed while still proving the
+                // command was routed through the configured runtime.
+                assert!(!result.success, "agy_cli must reject non-JSON output");
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("did not return a JSON result")),
+                    "agy_cli unexpected error: {:?}",
+                    result.error
+                );
+            } else {
+                assert!(
+                    result.success,
+                    "{tool_name} unexpected error: {:?}",
+                    result.error
+                );
+            }
             assert_eq!(result.output.trim(), "zc-runtime");
             let command = seen_command
                 .lock()
@@ -5643,6 +5693,7 @@ permissions = ["http_client"]
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
         feature = "tool-gemini-cli",
+        feature = "tool-agy-cli",
         feature = "tool-opencode-cli"
     ))]
     #[tokio::test]
@@ -5669,6 +5720,7 @@ permissions = ["http_client"]
         cfg.claude_code.enabled = true;
         cfg.codex_cli.enabled = true;
         cfg.gemini_cli.enabled = true;
+        cfg.agy_cli.enabled = true;
         cfg.opencode_cli.enabled = true;
         let risk = zeroclaw_config::schema::RiskProfileConfig {
             sandbox_enabled: Some(false),
@@ -5705,7 +5757,13 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
 
-        for tool_name in ["claude_code", "codex_cli", "gemini_cli", "opencode_cli"] {
+        for tool_name in [
+            "claude_code",
+            "codex_cli",
+            "gemini_cli",
+            "agy_cli",
+            "opencode_cli",
+        ] {
             assert!(
                 !names.contains(&tool_name),
                 "{tool_name} must not register without runtime filesystem access"
@@ -7676,6 +7734,7 @@ permissions = ["http_client"]
         cfg.claude_code.enabled = true;
         cfg.codex_cli.enabled = true;
         cfg.gemini_cli.enabled = true;
+        cfg.agy_cli.enabled = true;
         cfg.opencode_cli.enabled = true;
         cfg.claude_code_runner.enabled = true;
         cfg.linkedin.enabled = true;
