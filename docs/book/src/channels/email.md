@@ -53,6 +53,10 @@ Outbound sends still go via SMTP: configure an IMAP+SMTP `[channels.email.<alias
 
 Both email channels thread replies using `In-Reply-To` and `References` headers so conversations stay grouped in whatever client the sender uses.
 
+### Quoting the original
+
+Set `quote_original = true` on an IMAP+SMTP channel to have each reply quote the message it answers below the agent's text, the way mail clients do: an "On <date>, <sender> wrote:" line, then the original as `>` lines in the plain-text part and a blockquote in the HTML part. The channel remembers the last 256 messages it received since it started (each quoted up to 20,000 characters), so a reply to a message from before a restart, or to one it never received, goes out without a quote. Off by default.
+
 ## Outbound body format
 
 Agent replies are sent as `multipart/alternative` with both a plain-text and an HTML part by default. The HTML part is the Markdown-rendered body; the plain-text part is the raw body text. Mail clients that prefer plain text will select the plain-text alternative automatically.
