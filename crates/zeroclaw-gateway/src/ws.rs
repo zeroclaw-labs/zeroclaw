@@ -2924,7 +2924,9 @@ data: {\"type\":\"message_stop\"}\n\n",
                     .build()
                     .expect("test runtime")
                     .block_on(
-                        websocket_connect_persists_a_restore_time_trim_before_going_live_inner(),
+                        websocket_connect_persists_a_restore_time_trim_before_going_live_inner(
+                            false,
+                        ),
                     );
             })
             .expect("spawn WebSocket regression thread")
@@ -2932,7 +2934,18 @@ data: {\"type\":\"message_stop\"}\n\n",
             .expect("WebSocket regression thread must not panic");
     }
 
-    async fn websocket_connect_persists_a_restore_time_trim_before_going_live_inner() {
+    #[test]
+    fn websocket_restore_time_trim_keeps_created_at_of_retained_sqlite_rows() {
+        // The restore-time trim replaces the stored transcript. With
+        // the SQLite backend the retained rows must keep the time they were
+        // first persisted, which only holds when the agent's breadcrumb flag
+        // reaches the backend together with the replacement.
+        run_ws_regression("ws-restore-trim-sqlite-times", || {
+            websocket_connect_persists_a_restore_time_trim_before_going_live_inner(true)
+        });
+    }
+
+    async fn websocket_connect_persists_a_restore_time_trim_before_going_live_inner(sqlite: bool) {
         use zeroclaw_infra::session_backend::SessionBackend;
 
         let tmp = tempfile::tempdir().expect("temporary gateway workspace");
@@ -2984,8 +2997,11 @@ data: {\"type\":\"message_stop\"}\n\n",
             },
         );
 
-        let backend: Arc<dyn SessionBackend> =
-            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        let backend: Arc<dyn SessionBackend> = if sqlite {
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap())
+        } else {
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap())
+        };
         let session_id = "restore-trim-session";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
         let over_cap = vec![
@@ -2996,9 +3012,20 @@ data: {\"type\":\"message_stop\"}\n\n",
             zeroclaw_providers::ChatMessage::user("turn three request"),
             zeroclaw_providers::ChatMessage::assistant("turn three answer"),
         ];
-        backend
-            .replace_conversation_state(&session_key, &over_cap, false)
-            .unwrap();
+        if sqlite {
+            // One prefix at a time, so every seeded row has its own time.
+            for end in 1..=over_cap.len() {
+                backend
+                    .replace_conversation_state(&session_key, &over_cap[..end], false)
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        } else {
+            backend
+                .replace_conversation_state(&session_key, &over_cap, false)
+                .unwrap();
+        }
+        let seeded = backend.load_with_timestamps(&session_key);
 
         let mut state = crate::api::tests::test_state(config);
         state.session_backend = Some(backend.clone());
@@ -3078,6 +3105,32 @@ data: {\"type\":\"message_stop\"}\n\n",
             "restore-time trim must persist the corrected breadcrumb"
         );
 
+        if sqlite {
+            let stored = backend.load_with_timestamps(&session_key);
+            let newest_seeded = seeded.iter().filter_map(|m| m.created_at).max().unwrap();
+            let mut retained = 0;
+            for (i, row) in stored.iter().enumerate() {
+                let original = seeded
+                    .iter()
+                    .find(|m| m.message.content == row.message.content);
+                match original {
+                    Some(original) => {
+                        retained += 1;
+                        assert_eq!(
+                            row.created_at, original.created_at,
+                            "retained row {:?} must keep its original time",
+                            row.message.content
+                        );
+                    }
+                    None => assert!(
+                        i == 0 && row.created_at.unwrap() > newest_seeded,
+                        "only the breadcrumb is new: {row:?}"
+                    ),
+                }
+            }
+            assert!(retained > 0, "the trim must retain some rows: {stored:?}");
+        }
+
         gateway_server.abort();
     }
 
@@ -3149,6 +3202,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
 
     impl ParkedTurnFixture {
         async fn spawn() -> Self {
+            Self::spawn_with_history_cap(None).await
+        }
+
+        async fn spawn_with_history_cap(max_history_messages: Option<usize>) -> Self {
             let (request_seen_tx, request_seen) =
                 tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
             let (released, released_rx) = tokio::sync::watch::channel(0usize);
@@ -3220,7 +3277,10 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             );
             config.runtime_profiles.insert(
                 "fixture".to_string(),
-                zeroclaw_config::schema::RuntimeProfileConfig::default(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_history_messages,
+                    ..Default::default()
+                },
             );
             config.agents.insert(
                 "web".to_string(),
@@ -3316,6 +3376,20 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 .get_session_state(session_key)
                 .expect("session state")
                 .map(|state| state.state)
+        }
+
+        /// Run one turn to completion and return the stored transcript with
+        /// the time each row was persisted.
+        async fn complete_turn(
+            &mut self,
+            client: &mut WsClient,
+            session_key: &str,
+            prompt: &str,
+        ) -> Vec<zeroclaw_infra::session_backend::TimestampedMessage> {
+            self.start_parked_turn(client, prompt).await;
+            self.release_next();
+            self.wait_for_turn_to_settle(session_key).await;
+            self.backend.load_with_timestamps(session_key)
         }
 
         /// Let the next parked completion finish with `PARKED_TURN_RESPONSE`.
@@ -3472,6 +3546,108 @@ data: {{\"type\":\"message_stop\"}}\n\n"
         let (client, session_start) = fixture.connect(session_id).await;
         assert_eq!(session_start["resumed"], true);
         assert_eq!(session_start["message_count"], transcript.len());
+        drop(client);
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn websocket_turn_end_keeps_created_at_of_earlier_turns_in_sqlite() {
+        run_ws_regression(
+            "ws-turn-end-times",
+            websocket_turn_end_keeps_created_at_of_earlier_turns_in_sqlite_inner,
+        );
+    }
+
+    async fn websocket_turn_end_keeps_created_at_of_earlier_turns_in_sqlite_inner() {
+        // Every turn ends by replacing the stored transcript with the agent's
+        // own history. The rows of earlier turns must keep the time they were
+        // first persisted, and only the new turn's rows take a later time.
+        let mut fixture = ParkedTurnFixture::spawn().await;
+        let session_id = "turn-end-times";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+
+        let first = fixture
+            .complete_turn(&mut client, &session_key, "first prompt")
+            .await;
+        assert_eq!(first.len(), 2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = fixture
+            .complete_turn(&mut client, &session_key, "second prompt")
+            .await;
+        assert_eq!(second.len(), 4);
+
+        for (index, row) in first.iter().enumerate() {
+            assert_eq!(
+                second[index].created_at, row.created_at,
+                "row {index} of the first turn must keep the time it was first persisted"
+            );
+        }
+        assert!(
+            second[2].created_at > first[1].created_at
+                && second[3].created_at >= second[2].created_at,
+            "the second turn's rows take later times: {second:?}"
+        );
+        drop(client);
+        fixture.shutdown();
+    }
+
+    #[test]
+    fn websocket_turn_end_trim_keeps_created_at_of_retained_sqlite_rows() {
+        run_ws_regression(
+            "ws-turn-end-trim-times",
+            websocket_turn_end_trim_keeps_created_at_of_retained_sqlite_rows_inner,
+        );
+    }
+
+    async fn websocket_turn_end_trim_keeps_created_at_of_retained_sqlite_rows_inner() {
+        // With a history cap the agent trims older turns while a turn runs,
+        // so the transcript written at the end of the turn both drops its
+        // start and gains the new turn. A user prompt that is still stored
+        // keeps the time it was first seen with.
+        let mut fixture = ParkedTurnFixture::spawn_with_history_cap(Some(2)).await;
+        let session_id = "turn-end-trim-times";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let (mut client, _) = fixture.connect(session_id).await;
+
+        let mut first_seen = std::collections::HashMap::new();
+        let mut compared = 0;
+        let mut last_len = 0;
+        for turn in 1..=5 {
+            let prompt = format!("prompt number {turn}");
+            let rows = fixture
+                .complete_turn(&mut client, &session_key, &prompt)
+                .await;
+            last_len = rows.len();
+            for row in rows.iter().filter(|row| {
+                row.message.role == "user" && row.message.content.contains("prompt number")
+            }) {
+                let time = row.created_at.expect("RFC 3339 created_at");
+                match first_seen.entry(row.message.content.clone()) {
+                    std::collections::hash_map::Entry::Occupied(seen) => {
+                        compared += 1;
+                        assert_eq!(
+                            *seen.get(),
+                            time,
+                            "turn {turn}: {:?} must keep the time it was first persisted",
+                            row.message.content
+                        );
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(time);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            last_len < 10,
+            "the history cap trimmed the stored transcript"
+        );
+        assert!(
+            compared > 0,
+            "some prompt must survive a trim and be compared with its first time"
+        );
         drop(client);
         fixture.shutdown();
     }
