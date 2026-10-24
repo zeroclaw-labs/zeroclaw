@@ -1563,6 +1563,38 @@ fn apply_factory_leaf_metadata(
     ))
 }
 
+/// Reject configuration that would let a persisted Anthropic OAuth alias
+/// bypass its typed stored-profile implementation. Config loading records
+/// validation failures but continues, so every alias-aware construction path
+/// must preserve the schema's presence-based admission rules.
+fn reject_anthropic_oauth_config_conflicts(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+) -> anyhow::Result<()> {
+    if canonicalize_v2_model_provider_name(family) != "anthropic" {
+        return Ok(());
+    }
+
+    let Some(entry) = config.providers.models.anthropic.get(alias) else {
+        return Ok(());
+    };
+    if entry.auth_mode != Some(zeroclaw_config::schema::AnthropicAuthMode::OAuth) {
+        return Ok(());
+    }
+    if entry.base.api_key.is_some() {
+        anyhow::bail!(
+            "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with api_key"
+        );
+    }
+    if entry.base.kind.is_some() {
+        anyhow::bail!(
+            "providers.models.anthropic.{alias}: auth_mode = \"oauth\" must not be combined with kind"
+        );
+    }
+    Ok(())
+}
+
 /// Factory: create model_provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
 fn create_model_provider_inner(
@@ -1596,6 +1628,22 @@ fn create_model_provider_inner(
         .filter(|value| !value.is_empty())
         .map(canonicalize_v2_model_provider_name)
         .unwrap_or(name);
+
+    if let Some(config) = config {
+        reject_anthropic_oauth_config_conflicts(config, name, alias)?;
+    }
+
+    // `kind` chooses an implementation, not a different alias's credential
+    // owner. Preserve the established cross-family native-Anthropic path as a
+    // static-key route even when an Anthropic alias with the same name opted
+    // into OAuth. Do not route that slot through the Anthropic config map;
+    // a broader config-ownership refactor can replace this narrow boundary
+    // when all typed-family `kind` behavior is unified.
+    let factory_config = if name != "anthropic" && provider_kind == "anthropic" {
+        None
+    } else {
+        config
+    };
 
     // V2 spelled OpenAI Codex as `openai-codex` / `openai_codex` / `codex`.
     // V3 dispatches via `requires_openai_auth = true` on the typed alias, but
@@ -1662,8 +1710,15 @@ fn create_model_provider_inner(
         ));
     }
 
-    factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
-        .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
+    factory::dispatch_family_factory(
+        factory_config,
+        provider_kind,
+        alias,
+        key,
+        resolved_url,
+        options,
+    )
+    .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
 }
 
 pub fn create_resilient_model_provider_with_options(
@@ -4188,6 +4243,115 @@ mod tests {
         );
         // Same fail-closed behavior as the legacy factory the vision route used.
         assert!(create_model_provider("llamacpp.typo", None).is_err());
+    }
+
+    #[test]
+    fn alias_construction_rejects_blank_anthropic_oauth_inline_keys_before_normalization() {
+        use zeroclaw_config::schema::{
+            AnthropicAuthMode, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+        };
+
+        for api_key in ["", "   "] {
+            let mut config = Config::default();
+            config.providers.models.anthropic.insert(
+                "subscription".to_string(),
+                AnthropicModelProviderConfig {
+                    base: ModelProviderConfig {
+                        api_key: Some(api_key.to_string()),
+                        ..Default::default()
+                    },
+                    auth_mode: Some(AnthropicAuthMode::OAuth),
+                    ..Default::default()
+                },
+            );
+
+            let error = match create_model_provider_from_ref(&config, "anthropic.subscription") {
+                Ok(_) => panic!("an explicitly present inline OAuth key must fail before trimming"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not be combined with api_key"),
+                "unexpected error for {api_key:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_construction_rejects_anthropic_oauth_kind_overrides() {
+        use zeroclaw_config::schema::{
+            AnthropicAuthMode, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+
+        let error = match create_model_provider_from_ref(&config, "anthropic.subscription") {
+            Ok(_) => panic!("invalid loaded OAuth configuration must not dispatch through kind"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("must not be combined with kind"),
+            "unexpected construction error: {error}"
+        );
+    }
+
+    #[test]
+    fn cross_family_anthropic_kind_keeps_static_credentials_and_readiness() {
+        use zeroclaw_config::schema::{
+            AnthropicAuthMode, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "shared".to_string(),
+            AnthropicModelProviderConfig {
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "shared".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("anthropic".to_string()),
+                    uri: Some("https://static-proxy.example/v1".to_string()),
+                    api_key: Some("cross-family-static-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        create_model_provider_from_ref(&config, "openai.shared")
+            .expect("a non-Anthropic slot selecting Anthropic must retain its static path");
+
+        let options = provider_runtime_options_for_alias(&config, "openai", "shared");
+        assert!(
+            !factory::fallback_auth_ready_for_alias(&config, "openai", "shared", None, &options,),
+            "a cross-family alias without its own key must not inherit the Anthropic OAuth profile"
+        );
+        assert!(
+            factory::fallback_auth_ready_for_alias(
+                &config,
+                "openai",
+                "shared",
+                Some("cross-family-static-key"),
+                &options,
+            ),
+            "a cross-family alias remains ready through its own static key"
+        );
     }
 
     #[test]
