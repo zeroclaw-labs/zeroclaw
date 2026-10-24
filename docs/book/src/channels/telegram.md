@@ -263,6 +263,24 @@ Telegram.
   route, `/model --user <hint>` / `/model --agent <hint>` for the broader
   scopes (if permitted), and `/models <provider>` to list models of a provider.
 
+## Streaming and reasoning
+
+Telegram streams replies via the `stream_mode` setting: `off` (default) posts the
+whole reply once the agent finishes, `partial` posts a draft and edits it in place,
+and `multi_message` posts each paragraph as its own message. `draft_update_interval_ms`
+paces the edits; raise it if Telegram rate-limits them.
+
+`stream_reasoning` controls what that draft shows while the model is generating:
+
+- **`off`** (default): the draft is unchanged.
+- **`status`**: the draft shows a liveness-only thinking line, with no reasoning text.
+- **`full`**: the draft shows the model's raw reasoning as a collapsed blockquote above
+  the in-progress answer.
+
+It is only effective with `stream_mode = "partial"`: the other modes have no editable
+draft to carry it, so the setting is inert. Reasoning is draft-only chrome: the
+finalized reply is rewritten from the answer alone and never contains it.
+
 ## Logs and troubleshooting
 
 For an installed service:
