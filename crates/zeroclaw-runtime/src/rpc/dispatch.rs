@@ -35,8 +35,11 @@ use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, T
 use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
-/// Wire protocol version. Bump on breaking changes.
-pub const RPC_PROTOCOL_VERSION: u64 = 1;
+// The method table, wire types, notification names and protocol version are
+// the client-facing contract and live in `zeroclaw-rpc-proto`; the runtime
+// re-exports them here so existing `crate::rpc::dispatch::Method` paths keep
+// resolving. Authorization classification stays below: it names runtime grants.
+pub use zeroclaw_rpc_proto::{Method, RPC_PROTOCOL_VERSION, notification};
 
 pub type LocalRpcSessionChannelFactory = Arc<
     dyn Fn(LiveConfigHandle, String) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
@@ -48,13 +51,6 @@ pub type LocalRpcSessionChannelFactory = Arc<
 pub enum RpcAccessPolicy {
     TrustedLocal,
     RemoteSessionOwner,
-}
-
-mod notification {
-    pub const SESSION_UPDATE: &str = "session/update";
-    pub const LOGS_EVENT: &str = "logs/event";
-    pub const EVENTS_EVENT: &str = "events/event";
-    pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 }
 
 #[derive(Debug)]
@@ -91,297 +87,14 @@ fn status_runtime_context(
     })
 }
 
-// ── Method registry ──────────────────────────────────────────────
+// ── Method authorization ─────────────────────────────────────────
 //
-// Single source of truth. Every variant maps to exactly one wire
-// string. `from_wire` is a table scan — no hand-written string
-// matching anywhere in this file.
+// `Method` and its wire-name table are defined in `zeroclaw-rpc-proto`. The
+// authorization classification is an extension trait here because it names
+// runtime grants; it keeps the same `method.authz()` call shape.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {
-    // Core
-    Initialize,
-    Status,
-    Health,
-    DoctorRun,
-
-    // Sessions (agent chat lives here — session/prompt + session/update
-    // notifications is the RPC equivalent of the gateway's ws/chat)
-    SessionNew,
-    SessionClose,
-    SessionPrompt,
-    SessionConfigure,
-    SessionCancel,
-    SessionGitBranch,
-    SessionList,
-    SessionListAcp,
-    SessionMessages,
-    SessionState,
-    SessionDelete,
-    SessionApprove,
-    SessionKill,
-    SessionSteer,
-    SessionAbort,
-    SessionAppend,
-    SessionRename,
-    SessionRunOnce,
-
-    // Memory
-    MemoryList,
-    MemorySearch,
-    MemoryGet,
-    MemoryStore,
-    MemoryDelete,
-
-    // Cron
-    CronList,
-    CronGet,
-    CronAdd,
-    CronPatch,
-    CronDelete,
-    CronRuns,
-    CronTrigger,
-    CronSettings,
-
-    // Config
-    ConfigGet,
-    ConfigSet,
-    ConfigSetMany,
-    ConfigValidate,
-    ConfigReload,
-    ConfigList,
-    ConfigDelete,
-    ConfigMapKeys,
-    ConfigResolveAliasSource,
-    ConfigMapKeyCreate,
-    ConfigMapKeyDelete,
-    ConfigMapKeyRename,
-    ConfigTemplates,
-
-    // Agents
-    AgentsList,
-    AgentsStatus,
-    AgentDeletePreview,
-    AgentDelete,
-
-    // Cost
-    CostQuery,
-    CostOrg,
-
-    // Skills
-    SkillsBundles,
-    SkillsList,
-    SkillsRead,
-    SkillsWrite,
-    SkillsDelete,
-
-    // Personality
-    PersonalityList,
-    PersonalityGet,
-    PersonalityPut,
-    PersonalityTemplates,
-
-    // Config introspection (sections, catalog, status)
-    ConfigSections,
-    ConfigStatus,
-    ConfigCatalog,
-    ConfigCatalogModels,
-
-    // Logs / Events
-    LogsSubscribe,
-    LogsQuery,
-    LogsGet,
-    EventsHistory,
-    EventsSubscribe,
-    SubscriptionCancel,
-
-    // TUI
-    TuiList,
-
-    // Files
-    FileAttach,
-    FileUploadBegin,
-    FileUploadChunk,
-    FileUploadCommit,
-    FsListDir,
-
-    // Locales
-    LocalesList,
-    LocalesFetch,
-
-    // Quickstart (TUI mirror of `/api/quickstart/*` HTTP routes)
-    QuickstartState,
-    QuickstartFields,
-    QuickstartValidate,
-    QuickstartApply,
-    QuickstartDismiss,
-
-    // Certificates (mTLS client-cert lifecycle)
-    CertRenew,
-
-    SopsList,
-    SopsGet,
-    SopsGraph,
-    SopsRun,
-    SopsRuns,
-    SopsRunDetail,
-    SopsRunOverlay,
-    SopsValidate,
-    SopsSave,
-    SopsCreate,
-    SopsDelete,
-    SopsRename,
-    SopsDecide,
-    SopsWireDraft,
-    SopsGraphDraft,
-    SopsTriggerSources,
-    ToolsParamOptions,
-}
-
-impl Method {
-    /// The single table. Wire name ↔ variant, defined once.
-    pub const ALL: &[(Method, &str)] = &[
-        (Method::Initialize, "initialize"),
-        (Method::Status, "status"),
-        (Method::Health, "health"),
-        (Method::DoctorRun, "doctor/run"),
-        // Sessions
-        (Method::SessionNew, "session/new"),
-        (Method::SessionClose, "session/close"),
-        (Method::SessionPrompt, "session/prompt"),
-        (Method::SessionConfigure, "session/configure"),
-        (Method::SessionCancel, "session/cancel"),
-        (Method::SessionGitBranch, "session/git_branch"),
-        (Method::SessionList, "session/list"),
-        (Method::SessionListAcp, "session/list-acp"),
-        (Method::SessionMessages, "session/messages"),
-        (Method::SessionState, "session/state"),
-        (Method::SessionDelete, "session/delete"),
-        (Method::SessionApprove, "session/approve"),
-        (Method::SessionKill, "session/kill"),
-        (Method::SessionSteer, "session/steer"),
-        (Method::SessionAbort, "session/abort"),
-        (Method::SessionAppend, "session/append"),
-        (Method::SessionRename, "session/rename"),
-        (Method::SessionRunOnce, "session/run-once"),
-        // Memory
-        (Method::MemoryList, "memory/list"),
-        (Method::MemorySearch, "memory/search"),
-        (Method::MemoryGet, "memory/get"),
-        (Method::MemoryStore, "memory/store"),
-        (Method::MemoryDelete, "memory/delete"),
-        // Cron
-        (Method::CronList, "cron/list"),
-        (Method::CronGet, "cron/get"),
-        (Method::CronAdd, "cron/add"),
-        (Method::CronPatch, "cron/patch"),
-        (Method::CronDelete, "cron/delete"),
-        (Method::CronRuns, "cron/runs"),
-        (Method::CronTrigger, "cron/trigger"),
-        (Method::CronSettings, "cron/settings"),
-        // Config
-        (Method::ConfigGet, "config/get"),
-        (Method::ConfigSet, "config/set"),
-        (Method::ConfigSetMany, "config/set-many"),
-        (Method::ConfigValidate, "config/validate"),
-        (Method::ConfigReload, "config/reload"),
-        (Method::ConfigList, "config/list"),
-        (Method::ConfigDelete, "config/delete"),
-        (Method::ConfigMapKeys, "config/map-keys"),
-        (
-            Method::ConfigResolveAliasSource,
-            "config/resolve-alias-source",
-        ),
-        (Method::ConfigMapKeyCreate, "config/map-key-create"),
-        (Method::ConfigMapKeyDelete, "config/map-key-delete"),
-        (Method::ConfigMapKeyRename, "config/map-key-rename"),
-        (Method::ConfigTemplates, "config/templates"),
-        // Agents
-        (Method::AgentsList, "agents/list"),
-        (Method::AgentsStatus, "agents/status"),
-        (Method::AgentDeletePreview, "agents/delete-preview"),
-        (Method::AgentDelete, "agents/delete"),
-        // Cost
-        (Method::CostQuery, "cost/query"),
-        (Method::CostOrg, "cost/org"),
-        // Skills
-        (Method::SkillsBundles, "skills/bundles"),
-        (Method::SkillsList, "skills/list"),
-        (Method::SkillsRead, "skills/read"),
-        (Method::SkillsWrite, "skills/write"),
-        (Method::SkillsDelete, "skills/delete"),
-        // Personality
-        (Method::PersonalityList, "personality/list"),
-        (Method::PersonalityGet, "personality/get"),
-        (Method::PersonalityPut, "personality/put"),
-        (Method::PersonalityTemplates, "personality/templates"),
-        // Config introspection
-        (Method::ConfigSections, "config/sections"),
-        (Method::ConfigStatus, "config/status"),
-        (Method::ConfigCatalog, "config/catalog"),
-        (Method::ConfigCatalogModels, "config/catalog-models"),
-        // Logs
-        (Method::LogsSubscribe, "logs/subscribe"),
-        (Method::LogsQuery, "logs/query"),
-        (Method::EventsHistory, "events/history"),
-        (Method::EventsSubscribe, "events/subscribe"),
-        (Method::SubscriptionCancel, "subscription/cancel"),
-        (Method::LogsGet, "logs/get"),
-        // TUI
-        (Method::TuiList, "tui/list"),
-        // Files
-        (Method::FileAttach, "file/attach"),
-        (Method::FileUploadBegin, "file/upload/begin"),
-        (Method::FileUploadChunk, "file/upload/chunk"),
-        (Method::FileUploadCommit, "file/upload/commit"),
-        (Method::FsListDir, "fs/list_dir"),
-        // Locales
-        (Method::LocalesList, "locales/list"),
-        (Method::LocalesFetch, "locales/fetch"),
-        // Quickstart
-        (Method::QuickstartState, "quickstart/state"),
-        (Method::QuickstartFields, "quickstart/fields"),
-        (Method::QuickstartValidate, "quickstart/validate"),
-        (Method::QuickstartApply, "quickstart/apply"),
-        (Method::QuickstartDismiss, "quickstart/dismiss"),
-        (Method::CertRenew, "cert/renew"),
-        (Method::SopsList, "sops/list"),
-        (Method::SopsGet, "sops/get"),
-        (Method::SopsGraph, "sops/graph"),
-        (Method::SopsRun, "sops/run"),
-        (Method::SopsRuns, "sops/runs"),
-        (Method::SopsRunDetail, "sops/run-detail"),
-        (Method::SopsRunOverlay, "sops/run-overlay"),
-        (Method::SopsValidate, "sops/validate"),
-        (Method::SopsSave, "sops/save"),
-        (Method::SopsCreate, "sops/create"),
-        (Method::SopsDelete, "sops/delete"),
-        (Method::SopsRename, "sops/rename"),
-        (Method::SopsDecide, "sops/decide"),
-        (Method::SopsWireDraft, "sops/wire-draft"),
-        (Method::SopsGraphDraft, "sops/graph-draft"),
-        (Method::SopsTriggerSources, "sops/trigger-sources"),
-        (Method::ToolsParamOptions, "tools/param-options"),
-    ];
-
-    /// Resolve a wire method name to a variant. Table scan, no hand-written
-    /// string matching.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .find(|(_, wire)| *wire == s)
-            .map(|(m, _)| *m)
-    }
-
-    /// Wire name for this variant.
-    pub fn wire_name(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|(m, _)| *m == self)
-            .map(|(_, wire)| *wire)
-            .expect("every variant is in ALL")
-    }
-
+/// Authorization classification for every RPC [`Method`].
+pub trait MethodAuthzExt {
     /// Authorization classification (RFC 7141 gate-by-construction). The
     /// match is arm-complete over the closed `Method` enum, so adding a
     /// variant without classifying it is a COMPILE ERROR — a new method
@@ -389,7 +102,11 @@ impl Method {
     /// [`MethodAuthz::Handshake`] sentinel (rather than an `Option`) keeps
     /// every ungated method greppable and deliberate; initialize and mTLS
     /// certificate renewal are the only transport-authenticated ones.
-    pub fn authz(self) -> MethodAuthz {
+    fn authz(self) -> MethodAuthz;
+}
+
+impl MethodAuthzExt for Method {
+    fn authz(self) -> MethodAuthz {
         use Method as M;
         use zeroclaw_api::grants::{Resource, Verb};
         let (resource, verb) = match self {
@@ -520,7 +237,7 @@ impl Method {
 }
 
 /// How a method relates to authorization: the handshake itself, or a
-/// required resource-verb grant. See [`Method::authz`].
+/// required resource-verb grant. See [`MethodAuthzExt::authz`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodAuthz {
     /// Runs before a principal is bound. Only the handshake qualifies.
@@ -2277,6 +1994,14 @@ impl RpcDispatcher {
             "forwarded client environment is not retained for this connection"
         );
         std::collections::HashMap::new()
+    }
+
+    /// A caller that is not this host's local IPC: the WSS listener, or the
+    /// in-process seam, which relays a remote browser. Local-only behaviour
+    /// that keys on the peer keys on this, never on the peer label alone.
+    fn is_remote_caller(&self) -> bool {
+        self.peer_label.starts_with("wss:")
+            || self.transport_kind == crate::rpc::transport::TransportKind::Inproc
     }
 
     fn may_use_forwarded_environment(
@@ -6570,12 +6295,13 @@ impl RpcDispatcher {
                 .agent_workspace_dir(&agent_alias)
                 .to_string_lossy()
                 .to_string();
-            let is_wss = self.peer_label.starts_with("wss:");
+            let is_remote = self.is_remote_caller();
             // Resolve + authorize attachment sources once; the returned slots
             // are index-aligned with req.attachments and carry the exact
-            // canonical target each read must bind to. On WSS, path sources are
-            // rejected inside process_file_entry, so no resolution is needed.
-            let attachment_sources = if is_wss {
+            // canonical target each read must bind to. For a remote caller,
+            // path sources are rejected inside process_file_entry, so no
+            // resolution is needed.
+            let attachment_sources = if is_remote {
                 Vec::new()
             } else {
                 match self.authorize_attachment_sources(
@@ -6609,7 +6335,7 @@ impl RpcDispatcher {
                         entry,
                         sid,
                         &upload_root,
-                        is_wss,
+                        is_remote,
                         source,
                         &self.ctx.sessions,
                     ) => result?,
@@ -7225,7 +6951,7 @@ impl RpcDispatcher {
                 let usage = usage_fold.lock().totals(final_context_limits);
                 let safeguard_wire = safeguard_fallback
                     .as_ref()
-                    .map(crate::rpc::types::SafeguardFallbackWire::from);
+                    .map(crate::rpc::types::safeguard_fallback_wire);
                 let text = crate::agent::append_safeguard_fallback_notice(
                     text,
                     safeguard_fallback.as_ref(),
@@ -11675,11 +11401,11 @@ impl RpcDispatcher {
             .upload_target(Method::FileAttach, &req.session_id)
             .await?;
 
-        let is_wss = self.peer_label.starts_with("wss:");
+        let is_remote = self.is_remote_caller();
         // Resolve + authorize once; the returned slots are index-aligned with
-        // req.files and carry the exact canonical target each read binds to. On
-        // WSS, path sources are rejected in load_file_entry.
-        let attachment_sources = if is_wss {
+        // req.files and carry the exact canonical target each read binds to.
+        // For a remote caller, path sources are rejected in load_file_entry.
+        let attachment_sources = if is_remote {
             Vec::new()
         } else {
             self.authorize_attachment_sources(
@@ -11695,7 +11421,7 @@ impl RpcDispatcher {
 
         for (idx, entry) in req.files.iter().enumerate() {
             let source = attachment_sources.get(idx).and_then(|s| s.as_ref());
-            let (bytes, filename) = load_file_entry(entry, is_wss, source).await?;
+            let (bytes, filename) = load_file_entry(entry, is_remote, source).await?;
             total_bytes += bytes.len() as u64;
             if total_bytes > MAX_REQUEST_BYTES {
                 return Err(rpc_err(
@@ -12353,7 +12079,7 @@ impl RpcDispatcher {
         // itself, which is the entitlement this method relies on. Lift the
         // refusal once there is a principal to authorize run contents against,
         // and replace it with that check rather than simply removing it.
-        if self.peer_label.starts_with("wss:") {
+        if self.is_remote_caller() {
             return Err(rpc_err(
                 AUTH_REQUIRED,
                 "sops/run-detail is not served over remote WSS: the transport has no \
@@ -12649,7 +12375,7 @@ impl RpcDispatcher {
         // socket itself. Checked before the params are parsed so a refused
         // caller learns nothing about which SOPs exist. Replace this with a
         // principal check once there is one, rather than removing it.
-        if self.peer_label.starts_with("wss:") {
+        if self.is_remote_caller() {
             return Err(rpc_err(
                 AUTH_REQUIRED,
                 "sops/rename is not served over remote WSS: the transport has no \
@@ -42757,6 +42483,94 @@ mod tests {
         assert!(
             idle.turn_id.is_none(),
             "connection shutdown must clear the durable turn id"
+        );
+    }
+
+    /// The request form of `session/prompt` answers `{}` after the turn ends,
+    /// and the turn's text travels on `turn_complete`. The contract declares
+    /// that reply as `SessionPromptAck`, not the internal `SessionPromptResult`.
+    #[tokio::test]
+    async fn session_prompt_request_reply_is_the_declared_empty_ack() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let sid = "rpc-prompt-ack";
+        install_state_test_session_with_owner(
+            &sessions,
+            &chat_backend,
+            sid,
+            GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            },
+            None,
+        )
+        .await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-prompt-ack:pid=1".into());
+        dispatcher.set_authenticated_for_test();
+
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "session/prompt",
+                    "params": { "session_id": sid, "prompt": "hello" },
+                })
+                .to_string(),
+            )
+            .await;
+        started_rx
+            .recv()
+            .await
+            .expect("the prompt must reach its gated provider");
+        release_tx
+            .send(())
+            .expect("the provider must still be waiting for release");
+
+        let (response, notifications) = response_and_notifications(&mut rx, 7).await;
+        assert_eq!(response["result"], json!({}), "{response}");
+        let turn_complete = notifications
+            .iter()
+            .find(|frame| {
+                frame["method"] == notification::SESSION_UPDATE
+                    && frame["params"]["type"] == "turn_complete"
+            })
+            .unwrap_or_else(|| panic!("the turn must end with turn_complete: {notifications:?}"));
+        assert!(
+            turn_complete["params"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("turn finished")),
+            "{turn_complete}"
+        );
+
+        assert_eq!(
+            Method::SessionPrompt.contract().result,
+            zeroclaw_rpc_proto::Shape::Typed("SessionPromptAck")
+        );
+        serde_json::from_value::<crate::rpc::types::SessionPromptAck>(response["result"].clone())
+            .expect("the reply is the declared acknowledgement");
+        assert!(
+            serde_json::from_value::<crate::rpc::types::SessionPromptResult>(
+                response["result"].clone()
+            )
+            .is_err(),
+            "the reply carries none of SessionPromptResult's required fields"
         );
     }
 
