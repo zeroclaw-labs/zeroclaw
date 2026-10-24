@@ -17079,7 +17079,10 @@ command = "rm independent-delegate-marker"
                 level: AutonomyLevel::Supervised,
                 allowed_commands: vec!["rm".to_string()],
                 allowed_tools: vec!["shell".to_string()],
-                block_high_risk_commands: true,
+                // The hard block is off so the skill command reaches the
+                // approval gate this test exercises; with it on the command
+                // would fail at the high-risk block instead of the prompt.
+                block_high_risk_commands: false,
                 require_approval_for_medium_risk: true,
                 ..RiskProfileConfig::default()
             }),
@@ -17228,6 +17231,10 @@ command = "rm independent-delegate-marker"
             level: AutonomyLevel::Supervised,
             allowed_commands: vec!["rm".into()],
             allowed_tools: vec!["shell".into()],
+            // The hard block is off so the allowlisted command reaches the
+            // approval route this fixture exercises; with it on the command
+            // stops at the high-risk block instead of the prompt.
+            block_high_risk_commands: false,
             always_ask: if always_ask {
                 vec!["shell".into()]
             } else {
