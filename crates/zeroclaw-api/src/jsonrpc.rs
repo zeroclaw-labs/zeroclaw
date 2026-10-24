@@ -329,6 +329,12 @@ impl RpcOutbound {
         self.writer_tx.send(json).await.is_ok()
     }
 
+    /// Reserve frame capacity before a caller performs its final authorization.
+    /// Sending through the returned permit is synchronous.
+    pub async fn reserve_frame(&self) -> Option<mpsc::OwnedPermit<String>> {
+        self.writer_tx.clone().reserve_owned().await.ok()
+    }
+
     /// Resolve when the writer end is closed (peer dropped). Useful for
     /// long-lived forwarders that need to exit on disconnect even when
     /// there is no payload to send.
