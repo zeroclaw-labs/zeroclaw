@@ -37,6 +37,10 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 /// are not checked; see [`crate::opt_in_tools`].
 pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
 
+/// Stable code for an invalid configuration diagnostic that predates and is
+/// demonstrably unrelated to the current editor mutation.
+pub const PRE_EXISTING_VALIDATION_ERROR: &str = "pre_existing_validation_error";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
@@ -98,6 +102,9 @@ pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
 /// - `tool_compiled_out`: a `[<tool>]` section is enabled, but this build was
 ///   compiled without the tool's `tool-*` feature, so the section has no
 ///   effect and its settings are not validated.
+/// - `pre_existing_validation_error`: the editor retained a structured
+///   validation error that existed before the edit, is outside the mutation
+///   set, and can be skipped without bypassing a related check.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
