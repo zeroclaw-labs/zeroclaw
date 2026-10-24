@@ -1043,6 +1043,14 @@ enum QuoteState {
     Double,
 }
 
+/// Remediation hint appended to allowlist refusals for compound commands
+/// (unquoted `&&`, `||`, `;`, `|`, or `&` chaining several commands).
+fn compound_command_hint() -> String {
+    "reason: compound command; hint: one command per invocation - run them \
+     separately (e.g. 'git -C <path> <subcmd>' instead of 'cd <path> && git ...')"
+        .to_string()
+}
+
 fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -3328,7 +3336,13 @@ impl SecurityPolicy {
         }
 
         if !self.is_command_allowed_for_shell(command, dialect) {
-            return Err(format!("Command not allowed by security policy: {command}"));
+            let hint_suffix = self
+                .refusal_reason_hint(command, dialect)
+                .map(|hint| format!(" | {hint}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "Command not allowed by security policy: {command}{hint_suffix}"
+            ));
         }
 
         let risk = self.command_risk_level_for_shell(command, dialect);
@@ -3358,6 +3372,101 @@ impl SecurityPolicy {
         }
 
         Ok(risk)
+    }
+
+    /// Explain an allowlist refusal with a classification and remediation
+    /// hint so the caller can correct course instead of retrying reworded
+    /// variants of the blocked command.
+    ///
+    /// Returns `None` when no confident classification applies (for example
+    /// when every segment base is allowlisted and the refusal came from
+    /// argument-safety rules instead).
+    fn refusal_reason_hint(&self, command: &str, dialect: ShellDialect) -> Option<String> {
+        let unknown_base_hint = |base: &str| {
+            format!(
+                "reason: '{base}' is not in the allowed command list; \
+                 hint: use an allowed tool (file_read/glob_search/content_search) \
+                 or ask the operator to allowlist '{base}'"
+            )
+        };
+
+        match dialect {
+            ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                let segments = split_unquoted_segments(command, dialect);
+                if segments.len() > 1 {
+                    return Some(compound_command_hint());
+                }
+                let base = self.first_unknown_segment_base(&segments, dialect)?;
+                Some(unknown_base_hint(&base))
+            }
+            ShellDialect::PowerShell => {
+                let Some(segments) = split_simple_powershell_pipeline(command) else {
+                    return None;
+                };
+                if segments.len() > 1 {
+                    return Some(compound_command_hint());
+                }
+                let base = self.first_unknown_segment_base(&segments, dialect)?;
+                Some(unknown_base_hint(&base))
+            }
+            ShellDialect::None => None,
+        }
+    }
+
+    /// Return the base name of the first command segment whose executable is
+    /// not matched by any allowlist entry, reusing the same per-segment
+    /// normalization as the allowlist check.
+    fn first_unknown_segment_base(
+        &self,
+        segments: &[String],
+        dialect: ShellDialect,
+    ) -> Option<String> {
+        for segment in segments {
+            match dialect {
+                ShellDialect::Posix | ShellDialect::WindowsCmd => {
+                    let normalized = normalized_shell_command(segment, dialect);
+                    let executable = normalized
+                        .words
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    let base_owned =
+                        command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+                    let base = strip_windows_exe_suffix_for_shell(&base_owned, dialect);
+                    if base.is_empty() {
+                        continue;
+                    }
+                    if !self
+                        .allowed_commands
+                        .iter()
+                        .any(|allowed| is_allowlist_entry_match(allowed, executable, base, dialect))
+                    {
+                        return Some(base.to_string());
+                    }
+                }
+                ShellDialect::PowerShell => {
+                    let mut words = segment.split_whitespace();
+                    let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+                    if raw_executable.is_empty() {
+                        continue;
+                    }
+                    let base_owned =
+                        command_basename_for_shell(raw_executable, ShellDialect::PowerShell)
+                            .to_ascii_lowercase();
+                    let base = strip_powershell_executable_suffix(&base_owned);
+                    if base.is_empty() {
+                        continue;
+                    }
+                    if !self.allowed_commands.iter().any(|allowed| {
+                        is_powershell_allowlist_entry_match(allowed, raw_executable, base)
+                    }) {
+                        return Some(base.to_string());
+                    }
+                }
+                ShellDialect::None => return None,
+            }
+        }
+        None
     }
 
     fn is_command_explicitly_allowed_for_shell(
@@ -6626,6 +6735,68 @@ mod tests {
             err.contains("Command not allowed by security policy"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn refusal_hint_explains_compound_commands() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "cd /tmp && ls",
+            "frobnicator x | wc -l",
+            "cd /tmp; ls /var",
+            "cd /tmp || ls",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("compound commands must stay blocked");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+            assert!(err.contains("compound"), "{command}: {err}");
+            assert!(err.contains("one command"), "{command}: {err}");
+        }
+    }
+
+    #[test]
+    fn refusal_hint_names_unknown_command() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("frobnicator -x", false)
+            .expect_err("unknown commands must stay blocked");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
+        assert!(err.contains("frobnicator"), "{err}");
+        assert!(err.contains("allowed command list"), "{err}");
+    }
+
+    #[test]
+    fn refusal_hint_skipped_when_all_bases_allowlisted() {
+        // `git -c alias.zcprobe=... zcprobe` is refused by argument-safety
+        // rules, not the allowlist, so no misleading command name is hinted.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("git -c alias.zcprobe=x zcprobe", false)
+            .expect_err("unsafe git arguments must stay blocked");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
+        assert!(!err.contains("reason:"), "{err}");
     }
 
     #[cfg(target_os = "windows")]
