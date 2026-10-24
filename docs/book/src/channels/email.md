@@ -24,6 +24,19 @@ The general-purpose email channel. Polls IMAP for new messages, sends via SMTP. 
 
 ### Outlook / Office 365
 
+Office 365 accepts SMTP submissions on `smtp.office365.com:587` with STARTTLS only, not on port 465. Set:
+
+```toml
+[channels.email.<alias>]
+imap_host = "outlook.office365.com"
+imap_port = 993
+smtp_host = "smtp.office365.com"
+smtp_port = 587
+smtp_starttls = true
+```
+
+With `smtp_starttls = true` the connection starts in plain text and must be upgraded with STARTTLS before any credentials are sent; if the server refuses the upgrade, the send fails. It takes precedence over `smtp_tls`. SMTP signs in with the password (or `smtp_username` / `smtp_password`), so SMTP AUTH must be enabled for the mailbox; the `oauth2` block applies to IMAP only.
+
 `password` (and `smtp_password`) are secrets:
 
 {{#secret-config channels.email.<alias>.password}}
