@@ -300,6 +300,12 @@ pub enum MemoryPolicyDecision {
 }
 
 /// Core memory trait — implement for any persistence backend
+///
+/// Some wrappers forward every method to another `Memory`, such as the
+/// runtime's native memory binding, which routes a session's memory tools to
+/// its owner's private plane. A new method with a default body that does not
+/// call another method must be forwarded there too, or calls to it skip the
+/// wrapper's routing.
 #[async_trait]
 pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Backend name

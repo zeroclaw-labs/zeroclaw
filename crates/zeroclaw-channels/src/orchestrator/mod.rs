@@ -10518,8 +10518,13 @@ async fn process_channel_message_body(
                 // with that agent's own gated tools/policy/MCP scope rather than
                 // this turn's.
                 served_route_sink: None,
+                // The channels orchestrator builds its turns from config.
+                capability_binding: None,
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
+                    // The channels orchestrator builds its turns from config;
+                    // it binds capabilities once it moves onto the contract.
+                    capabilities: None,
                     live_config: Some(ctx.live_config.clone()),
                 }),
             }));
@@ -29121,17 +29126,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     fn channel_all_tools_result(tools: Vec<Box<dyn Tool>>) -> tools::AllToolsResult {
-        tools::AllToolsResult {
-            tools,
-            reserved_host_names: std::collections::HashSet::new(),
-            delegate_handle: None,
-            ask_user_handle: None,
-            reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            poll_handle: None,
-            escalate_handle: None,
-            channel_room_handle: None,
-            unfiltered_tool_arcs: Vec::new(),
-        }
+        tools::AllToolsResult::from_prebuilt_tools(tools)
     }
 
     /// A mock HTTP MCP server that advertises `resources` support and serves one
