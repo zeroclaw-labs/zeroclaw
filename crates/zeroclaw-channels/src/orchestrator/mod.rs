@@ -3887,6 +3887,53 @@ fn refresh_channel_history_skills(
     );
 }
 
+/// The restriction a channel instance places on a turn arriving through it:
+/// its own `excluded_tools`, plus the tools that start work the restriction
+/// cannot follow (later, as another agent, or through another tool runner)
+/// unless `channels.restricted_channels_allow_detached_work` allows them.
+/// Empty when the instance excludes nothing. It applies at every autonomy
+/// level: it is an explicit restriction on that channel, not part of the risk
+/// profile.
+fn channel_tool_restriction(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Vec<String> {
+    let channels = &ctx.prompt_config.channels;
+    let mut restriction = channels
+        .excluded_tools_for(msg.channel.as_str(), msg.channel_alias.as_deref())
+        .unwrap_or_default();
+    if !restriction.is_empty() && !channels.restricted_channels_allow_detached_work {
+        restriction.extend(
+            zeroclaw_runtime::security::channel_restriction::DETACHED_WORK_TOOLS
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+    }
+    restriction.sort();
+    restriction.dedup();
+    restriction
+}
+
+/// Tools a channel turn may not use: the risk profile's exclusions (lifted
+/// for CLI turns and `Full` autonomy, as before) plus the channel instance's
+/// restriction ([`channel_tool_restriction`]).
+fn channel_turn_excluded_tools(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    restriction: &[String],
+) -> Vec<String> {
+    let mut excluded: Vec<String> =
+        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
+            Vec::new()
+        } else {
+            ctx.non_cli_excluded_tools.as_ref().clone()
+        };
+    excluded.extend(restriction.iter().cloned());
+    excluded.sort();
+    excluded.dedup();
+    excluded
+}
+
 fn effective_non_cli_tool_names<'a>(
     tools_registry: &'a [Box<dyn Tool>],
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
@@ -9735,12 +9782,13 @@ async fn process_channel_message_body(
         memory_sessions.push(Some(history_key.clone()));
     }
 
-    let per_turn_excluded_tools: &[String] =
-        if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-            &[]
-        } else {
-            ctx.non_cli_excluded_tools.as_ref()
-        };
+    let channel_restriction = channel_tool_restriction(ctx.as_ref(), &msg);
+    let per_turn_excluded = channel_turn_excluded_tools(ctx.as_ref(), &msg, &channel_restriction);
+    // Carried on the task so the loops this turn starts (delegates,
+    // sub-agents, inline cron runs) keep it.
+    let channel_restriction: Option<std::sync::Arc<[String]>> =
+        (!channel_restriction.is_empty()).then(|| channel_restriction.into());
+    let per_turn_excluded_tools: &[String] = per_turn_excluded.as_slice();
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
@@ -10426,12 +10474,7 @@ async fn process_channel_message_body(
                 .clone()
                 .or_else(|| msg.thread_ts.clone())
                 .or_else(|| Some(msg.id.clone()));
-            let excluded_tools: &[String] =
-                if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                };
+            let excluded_tools: &[String] = per_turn_excluded_tools;
             loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
@@ -10527,6 +10570,11 @@ async fn process_channel_message_body(
             // which share one SendViaTool, never read each other's routes.
             let tool_loop =
                 tools::TURN_ROUTING.scope(Some(std::sync::Arc::clone(&turn_routing)), tool_loop);
+            let tool_loop =
+                zeroclaw_runtime::security::channel_restriction::with_inherited_channel_tool_restriction(
+                    channel_restriction.clone(),
+                    tool_loop,
+                );
             let tool_loop = zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .scope(thinking.params.native_thinking, tool_loop);
             let tool_loop = zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
@@ -43066,6 +43114,155 @@ BTC is currently around $65,000 based on latest tool output."#
             content: "/model --agent gpt-4o".into(),
             ..Default::default()
         }
+    }
+
+    fn excluded_tools_ctx(
+        zeroclaw_dir: &std::path::Path,
+        email_excluded: &[&str],
+        profile_excluded: &[&str],
+        level: AutonomyLevel,
+    ) -> ChannelRuntimeContext {
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        let email = zeroclaw_config::scattered_types::EmailConfig {
+            excluded_tools: email_excluded.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
+        };
+        prompt_config
+            .channels
+            .email
+            .insert("assistant".into(), email);
+        prompt_config
+            .channels
+            .email
+            .insert("other".into(), Default::default());
+        prompt_config
+            .channels
+            .restricted_channels_allow_detached_work = true;
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            zeroclaw_dir,
+            "agentX",
+            "openrouter.default",
+            "config-default-model",
+        );
+        ctx.prompt_config = Arc::new(prompt_config);
+        ctx.non_cli_excluded_tools =
+            Arc::new(profile_excluded.iter().map(|t| t.to_string()).collect());
+        ctx.autonomy_level = level;
+        ctx
+    }
+
+    fn turn_excluded(
+        ctx: &ChannelRuntimeContext,
+        msg: &zeroclaw_api::channel::ChannelMessage,
+    ) -> Vec<String> {
+        let restriction = channel_tool_restriction(ctx, msg);
+        channel_turn_excluded_tools(ctx, msg, &restriction)
+    }
+
+    fn turn_from(channel: &str, alias: Option<&str>) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: "someone@example.invalid".into(),
+            reply_target: "someone@example.invalid".into(),
+            channel: channel.into(),
+            channel_alias: alias.map(str::to_string),
+            content: "hello".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_channel_turn_drops_the_tools_its_channel_excludes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = excluded_tools_ctx(
+            tmp.path(),
+            &["http_request", "shell"],
+            &["browser"],
+            AutonomyLevel::Supervised,
+        );
+        assert_eq!(
+            turn_excluded(&ctx, &turn_from("email", Some("assistant"))),
+            vec!["browser", "http_request", "shell"],
+        );
+        // Another instance of the same channel type keeps only the profile's list.
+        assert_eq!(
+            turn_excluded(&ctx, &turn_from("email", Some("other"))),
+            vec!["browser"],
+        );
+        // A different channel type is not affected by email's setting.
+        assert_eq!(
+            turn_excluded(&ctx, &turn_from("telegram", Some("assistant"))),
+            vec!["browser"],
+        );
+    }
+
+    #[test]
+    fn a_channel_exclusion_holds_at_full_autonomy_and_without_an_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = excluded_tools_ctx(
+            tmp.path(),
+            &["http_request"],
+            &["browser"],
+            AutonomyLevel::Full,
+        );
+        // Full autonomy lifts the risk profile's list, not the channel's own.
+        assert_eq!(
+            turn_excluded(&ctx, &turn_from("email", Some("assistant"))),
+            vec!["http_request"],
+        );
+        // A message that does not name its instance gets every instance's exclusions.
+        assert_eq!(
+            turn_excluded(&ctx, &turn_from("email", None)),
+            vec!["http_request"],
+        );
+    }
+
+    #[test]
+    fn a_restricted_channel_refuses_detached_work_unless_allowed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = excluded_tools_ctx(tmp.path(), &["shell"], &[], AutonomyLevel::Supervised);
+        let mut config = (*ctx.prompt_config).clone();
+        config.channels.restricted_channels_allow_detached_work = false;
+        ctx.prompt_config = Arc::new(config);
+
+        let restricted = turn_excluded(&ctx, &turn_from("email", Some("assistant")));
+        for tool in [
+            "shell",
+            "cron_add",
+            "schedule",
+            "send_message_to_peer",
+            "execute_pipeline",
+        ] {
+            assert!(
+                restricted.iter().any(|t| t == tool),
+                "{tool} missing: {restricted:?}"
+            );
+        }
+        // Delegation is carried, not refused: the restriction follows it.
+        assert!(
+            !restricted
+                .iter()
+                .any(|t| t == "delegate" || t == "spawn_subagent")
+        );
+        // An instance that restricts nothing keeps every tool.
+        assert!(turn_excluded(&ctx, &turn_from("email", Some("other"))).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_loop_started_from_a_restricted_turn_inherits_the_restriction() {
+        use zeroclaw_runtime::security::channel_restriction::{
+            merge_active_channel_restriction, with_inherited_channel_tool_restriction,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = excluded_tools_ctx(tmp.path(), &["shell"], &[], AutonomyLevel::Full);
+        let restriction = channel_tool_restriction(&ctx, &turn_from("email", Some("assistant")));
+        let carried: Option<Arc<[String]>> = Some(restriction.into());
+        // A nested loop (a delegate's child loop) merges the carried list into
+        // its own exclusions, whatever tool set it assembled.
+        let child = with_inherited_channel_tool_restriction(carried, async {
+            merge_active_channel_restriction(&[])
+        })
+        .await;
+        assert_eq!(child, Some(vec!["shell".to_string()]));
     }
 
     fn user_scope_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {

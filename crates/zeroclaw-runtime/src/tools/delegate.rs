@@ -3375,6 +3375,8 @@ impl DelegateTool {
         // leaves the caller's task, and with it the SOP step scope this call was
         // made under. Backgrounding the work must not widen what it may do.
         let parent_step_scope = crate::sop::active_scope::active_headless_step_scope();
+        let parent_channel_restriction =
+            crate::security::channel_restriction::active_channel_tool_restriction();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         // Build the target's cost-tracking context BEFORE the detached spawn
@@ -3413,7 +3415,9 @@ impl DelegateTool {
                 parent_thread_id,
                 scope_delegate_session_key(
                     parent_session_key,
-                    crate::sop::active_scope::with_inherited_headless_step_scope(
+                    crate::security::channel_restriction::with_inherited_channel_tool_restriction(
+                        parent_channel_restriction,
+                        crate::sop::active_scope::with_inherited_headless_step_scope(
                         parent_step_scope,
                         // Detached receipt scope: the launching turn's generator with a
                         // fresh per-task collector; nothing appends to the launching
@@ -3545,7 +3549,7 @@ impl DelegateTool {
                 drop(target_execution_admission);
                             },
                         ),
-                    ),
+                    )),
                 ),
             )
             .instrument(::zeroclaw_log::attribution_span!(
@@ -3715,6 +3719,8 @@ impl DelegateTool {
         // step scope this call was made under. Fanning work out must not widen
         // it any more than backgrounding it does.
         let parent_step_scope = crate::sop::active_scope::active_headless_step_scope();
+        let parent_channel_restriction =
+            crate::security::channel_restriction::active_channel_tool_restriction();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -3774,6 +3780,7 @@ impl DelegateTool {
             let inherited_budget = parent_budget.clone();
             let thread_scope = parent_thread_id.clone();
             let step_scope = parent_step_scope.clone();
+            let channel_restriction = parent_channel_restriction.clone();
             let memory = self.memory.clone();
             let task_control_plane = Arc::clone(&self.task_control_plane);
             let __zc_delegate_alias = agent_name.clone();
@@ -3834,7 +3841,9 @@ impl DelegateTool {
                         inherited_budget,
                         TOOL_LOOP_THREAD_ID.scope(
                             thread_scope,
-                            crate::sop::active_scope::with_inherited_headless_step_scope(
+                            crate::security::channel_restriction::with_inherited_channel_tool_restriction(
+                                channel_restriction,
+                                crate::sop::active_scope::with_inherited_headless_step_scope(
                                 step_scope,
                                 scope_delegate_session_key(session_key, async move {
                                     crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
@@ -3857,7 +3866,7 @@ impl DelegateTool {
                                         })
                                         .await
                                 }),
-                            ),
+                            )),
                         ),
                     )
                     .await;

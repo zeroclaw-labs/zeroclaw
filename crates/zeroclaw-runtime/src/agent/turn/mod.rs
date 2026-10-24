@@ -1904,6 +1904,14 @@ async fn run_tool_call_loop_impl<'a>(
                 merged
             });
         let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
+        // The channel restriction travels the same way: a delegate, sub-agent
+        // or inline cron run started from a restricted channel turn builds its
+        // own tool set, and must not regain what that channel excludes.
+        let channel_restricted_excluded =
+            crate::security::channel_restriction::merge_active_channel_restriction(excluded_tools);
+        let excluded_tools: &[String] = channel_restricted_excluded
+            .as_deref()
+            .unwrap_or(excluded_tools);
 
         if knobs.yield_to_steering {
             // The caller judges steering; this loop only hands control back
