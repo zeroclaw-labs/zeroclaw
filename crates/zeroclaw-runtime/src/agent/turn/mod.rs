@@ -1820,6 +1820,7 @@ async fn run_tool_call_loop_impl<'a>(
             window_size: pacing.loop_detection_window_size,
             max_repeats: pacing.loop_detection_max_repeats,
             no_progress_min_calls: pacing.loop_detection_no_progress_min_calls,
+            ping_pong_min_cycles: pacing.loop_detection_ping_pong_min_cycles,
         },
     );
 
