@@ -4481,6 +4481,11 @@ impl Chat {
                     self.note_session_replaced(&old_sid);
                     return false;
                 }
+                InputBarAction::ReloadContext => {
+                    let rpc = self.rpc.clone();
+                    Self::reload_session_context(&rpc, state).await;
+                    return false;
+                }
                 InputBarAction::ChangeDirectory => {
                     self.begin_change_directory();
                     return false;
@@ -4911,6 +4916,26 @@ impl Chat {
                 )));
             }
         }
+        state.mark_dirty_full();
+    }
+
+    /// `/reload-context`: the daemon re-reads this session's personality
+    /// files. A change alters the prompt prefix, so say which happened.
+    async fn reload_session_context(rpc: &RpcClient, state: &mut ChatState) {
+        let message = match rpc.session_reload_context(&state.session_id).await {
+            Ok(result) if result.changed => {
+                crate::widgets::InfoMessage::note(crate::i18n::t("zc-reload-context-changed"))
+            }
+            Ok(result) if result.live => {
+                crate::widgets::InfoMessage::note(crate::i18n::t("zc-reload-context-unchanged"))
+            }
+            Ok(_) => crate::widgets::InfoMessage::note(crate::i18n::t("zc-reload-context-idle")),
+            Err(e) => crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                "zc-reload-context-failed",
+                &[("error", &e.to_string())],
+            )),
+        };
+        state.info_message = Some(message);
         state.mark_dirty_full();
     }
 
@@ -22840,6 +22865,78 @@ mod tests {
     #[test]
     fn app_frame_code_non_utf8_sibling_capture_refusal_is_rendered() {
         assert_sibling_capture_refusal_is_rendered(PaneKind::Acp, non_utf8_launch_dir);
+    }
+
+    /// `/reload-context` typed and submitted in the Code pane, answered by
+    /// the daemon, and drawn through the app frame: each outcome lands on
+    /// the notice row users see.
+    #[tokio::test]
+    async fn app_frame_shows_each_reload_context_outcome() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _lock = env_test_lock_async().await;
+        let busy = "a turn is running; reload the context after it finishes";
+        let cases: [(&str, Result<serde_json::Value, &str>, String); 4] = [
+            (
+                "changed",
+                Ok(serde_json::json!({"session_id": "sess-code", "live": true, "changed": true})),
+                crate::i18n::t("zc-reload-context-changed"),
+            ),
+            (
+                "unchanged",
+                Ok(serde_json::json!({"session_id": "sess-code", "live": true, "changed": false})),
+                crate::i18n::t("zc-reload-context-unchanged"),
+            ),
+            (
+                "idle",
+                Ok(serde_json::json!({"session_id": "sess-code", "live": false, "changed": false})),
+                crate::i18n::t("zc-reload-context-idle"),
+            ),
+            ("busy", Err(busy), busy.to_string()),
+        ];
+        for (label, reply, expected) in cases {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let mut code = local_code_chat_with_session(&rpc, "sess-code", "/code/project");
+            let mut chat = local_code_chat_with_session(&rpc, "sess-chat", "/chat/project");
+            chat.pane_kind = PaneKind::Chat;
+            active_state(&mut code)
+                .input_bar
+                .insert_text("/reload-context");
+            let mut term = key_term();
+            let answer = async {
+                let request = next_rpc_request(&mut rx, "reload request expected").await;
+                assert_eq!(request["method"], "session/reload_context", "{label}");
+                assert_eq!(request["params"]["session_id"], "sess-code", "{label}");
+                match &reply {
+                    Ok(result) => respond_ok(&rpc, &request, result.clone()),
+                    Err(message) => respond_err(
+                        &rpc,
+                        &request,
+                        crate::jsonrpc::error_codes::SESSION_BUSY,
+                        message,
+                    ),
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(
+                    code.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term),
+                    answer,
+                )
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{label}: the reload completes"));
+
+            let mut code = crate::acp::Acp::from_chat_for_test(code);
+            let (rows, content) =
+                draw_app_notice_frame(crate::app::Mode::Acp, &mut chat, &mut code);
+            assert_eq!(content.bottom(), 48, "{label}: the notice has its own row");
+            assert!(
+                rows[48].contains(&expected),
+                "{label}: notice row shows {expected:?}: {:?}",
+                rows[48]
+            );
+        }
     }
 
     #[tokio::test]

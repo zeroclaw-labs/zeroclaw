@@ -393,6 +393,22 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// `session/reload_context` result. A live session keeps the personality
+    /// files (`AGENTS.md`, `SOUL.md`, ...) it read on its first turn, so edits
+    /// don't invalidate the provider prompt cache mid-conversation. This call
+    /// re-reads them for one session.
+    pub struct SessionReloadContextResult {
+        pub session_id: String,
+        /// False when the session has no live agent; its next turn rebuilds
+        /// from the files on disk anyway.
+        pub live: bool,
+        /// True when the re-read text differs from what the session had. The
+        /// next request then misses the prompt cache once.
+        pub changed: bool,
+    }
+}
+
+rpc_type! {
     pub struct SessionGitBranchResult {
         pub session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

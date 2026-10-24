@@ -551,6 +551,14 @@ pub struct Agent {
     /// advertises persistent-memory isolation. Set from the same builder value
     /// that installs `NoneMemory` and forces `auto_save` off.
     inject_memory: bool,
+    /// The `## Project Context` block rendered from the agent workspace's
+    /// personality files, captured on the first system-prompt build of this
+    /// session and reused for every later turn. Re-reading the files every
+    /// turn made any `AGENTS.md`/`SOUL.md`/... edit change the system prompt,
+    /// which invalidated the provider prompt cache for the whole conversation
+    /// of every live session of the agent. Cleared by
+    /// [`Agent::reload_personality`].
+    identity_snapshot: std::sync::OnceLock<String>,
     /// The shell this agent's runtime adapter will spawn, so the system
     /// prompt reports the dialect the agent actually executes under.
     /// `None` for a shell-less runtime.
@@ -1353,6 +1361,7 @@ impl AgentBuilder {
             // memory tools and installs `NoneMemory` also withholds MEMORY.md
             // from the prompt.
             inject_memory: !exclude_memory,
+            identity_snapshot: std::sync::OnceLock::new(),
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             tool_search: None,
@@ -1744,6 +1753,34 @@ impl Agent {
             || self.config.resolved.context_limits(),
             |resolve| resolve(provider_name, model),
         )
+    }
+
+    /// Re-read the workspace personality files (`AGENTS.md`, `SOUL.md`, ...)
+    /// and rebuild the system prompt from them. A session otherwise keeps the
+    /// text it captured on its first build, so edits reach new sessions only.
+    /// Returns whether the rendered text replaced a different one; a change
+    /// alters the system prompt, which heads the cached prefix, so the next
+    /// request may reuse less of the provider's cache.
+    pub fn reload_personality(&mut self) -> Result<bool> {
+        let previous = self.identity_snapshot.take();
+        let fresh = crate::agent::prompt::render_identity_section(
+            Some(&self.identity_config),
+            &self.agent_workspace_dir,
+            self.inject_memory,
+        );
+        // No previous snapshot means no prompt was built yet; the first build
+        // reads the files anyway, so nothing cached is being replaced.
+        let changed = previous.is_some_and(|previous| previous != fresh);
+        let _ = self.identity_snapshot.set(fresh);
+        if changed {
+            let dispatcher = tool_dispatcher_for_provider(
+                &self.config,
+                self.model_provider.as_ref(),
+                &self.model_name,
+            );
+            self.rebuild_system_prompt_for_dispatcher(dispatcher.as_ref())?;
+        }
+        Ok(changed)
     }
 
     pub fn clear_history(&mut self) {
@@ -3469,7 +3506,15 @@ impl Agent {
             Some(mgr) => (mgr.autonomy_level(), mgr.always_ask_tools()),
             None => (self.autonomy_level, Vec::new()),
         };
+        let identity_snapshot = self.identity_snapshot.get_or_init(|| {
+            crate::agent::prompt::render_identity_section(
+                Some(&self.identity_config),
+                &self.agent_workspace_dir,
+                self.inject_memory,
+            )
+        });
         let ctx = PromptContext {
+            identity_snapshot: Some(identity_snapshot.as_str()),
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
             model_name: &self.model_name,
@@ -10107,6 +10152,86 @@ mod tests {
                 prompt.contains("SOUL_MD_CONTROL_9341"),
                 "SOUL.md must still reach the Chat system prompt"
             );
+        }
+
+        /// The system prompt heads the provider's cached prefix, so a
+        /// personality-file edit between turns must not change it for a live
+        /// session. Before the fix every turn re-read `AGENTS.md`, and the
+        /// second request below carried the edited text.
+        #[tokio::test]
+        async fn personality_edit_mid_session_keeps_system_prompt_byte_stable() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let agents_md = workspace.path().join("AGENTS.md");
+            std::fs::write(&agents_md, "RULES_V1_11696").expect("write AGENTS.md");
+            let (provider, captured) = capturing_provider(true);
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let mut agent = Agent::builder()
+                .model_provider(provider)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .agent_workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+
+            let system_of = |request: &Vec<ChatMessage>| {
+                request
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .expect("provider-visible system prompt")
+                    .content
+                    .clone()
+            };
+
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+            agent
+                .turn_streamed("first", event_tx, None)
+                .await
+                .expect("first turn");
+            std::fs::write(&agents_md, "RULES_V2_11696").expect("edit AGENTS.md");
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+            agent
+                .turn_streamed("second", event_tx, None)
+                .await
+                .expect("second turn");
+
+            let (first, second) = {
+                let captured = captured.lock();
+                assert_eq!(captured.len(), 2, "one provider request per turn");
+                (system_of(&captured[0]), system_of(&captured[1]))
+            };
+            assert!(first.contains("RULES_V1_11696"), "turn 1 reads the file");
+            assert_eq!(
+                first, second,
+                "a mid-session AGENTS.md edit must not change the cached system prompt"
+            );
+
+            // The explicit reload picks the edit up, and says it did.
+            assert!(agent.reload_personality().expect("reload"), "edit detected");
+            assert!(
+                !agent.reload_personality().expect("second reload"),
+                "an unchanged file reports no change"
+            );
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+            agent
+                .turn_streamed("third", event_tx, None)
+                .await
+                .expect("third turn");
+            let third = system_of(&captured.lock()[2]);
+            assert!(third.contains("RULES_V2_11696"), "reload applies the edit");
+            assert!(!third.contains("RULES_V1_11696"));
         }
 
         #[tokio::test]
