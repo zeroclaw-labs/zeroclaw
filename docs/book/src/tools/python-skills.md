@@ -64,6 +64,21 @@ This is appropriate for local development, a single-user workstation, or a home 
 
 Do not use this pattern for unreviewed third-party skills or multi-tenant deployments.
 
+### Optional resident-memory watchdog
+
+Native shell and skill shell tools can opt into a resident-memory threshold through the agent's runtime profile. The default is `0`, which disables monitoring. For example:
+
+```toml
+[runtime_profiles.native_skills]
+shell_max_memory_mb = 1024
+```
+
+Select this runtime profile on the agent that runs the tools. Linux, macOS, and Windows sample the aggregate resident memory of the command and its visible descendants while the command's root process runs. Crossing the threshold stops the owned command group or Windows Job Object and returns a tool failure. Output capture remains capped at 1 MiB per stream. A monitoring failure also stops the command rather than silently dropping the configured watchdog.
+
+This watchdog is not a hard allocation ceiling or a guarantee against host OOM. Memory use can overshoot between samples, shared resident pages may count more than once, and detached or reparented processes may escape sampling. Virtual-address reservations alone do not count toward the threshold. The watchdog does not set `RLIMIT_AS`. With monitoring enabled on Windows, closing the command's Job Object at root completion also stops any remaining job descendants.
+
+An enabled watchdog refuses non-native runtimes, Docker sandboxes, and unsupported operating systems before spawning. Use `runtime.docker.memory_limit_mb` for Docker runtime limits instead. Bounded delegates keep the parent's tool policy and threshold; an explicit child policy cannot raise or disable a finite parent threshold.
+
 ## Pattern B: Custom Docker Runtime Image
 
 Use Docker when you want Python dependencies to live in a repeatable container image and you still want a runtime boundary around built-in shell execution.

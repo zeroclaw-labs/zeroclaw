@@ -1524,7 +1524,7 @@ async fn supervise_desktop_child(
 /// a failed assignment is returned and the child cannot have spawned descendants.
 #[cfg(windows)]
 #[derive(Debug)]
-struct WindowsSpawnFailureGuard;
+pub(crate) struct WindowsSpawnFailureGuard;
 
 #[cfg(windows)]
 impl CommandWrapper for WindowsSpawnFailureGuard {
