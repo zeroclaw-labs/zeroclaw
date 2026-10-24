@@ -13787,6 +13787,10 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        TurnEvent::DelegateActivity(activity) => SessionUpdateEvent::DelegateActivity {
+            session_id: session_id.to_string(),
+            activity: activity.clone(),
+        },
         TurnEvent::BudgetWarning {
             current_usd,
             limit_usd,
@@ -27213,6 +27217,38 @@ mod tests {
 
         assert_eq!(ctx.agent, "ZeroClaw");
         assert!(!ctx.include_memory);
+    }
+
+    #[test]
+    fn delegate_activity_notification_is_flat_and_round_trips() {
+        let activity = zeroclaw_api::agent::DelegateActivity {
+            parent_tool_call_id: "parent-call".into(),
+            agent: "researcher".into(),
+            depth: 0,
+            tool_call_id: "c1".into(),
+            tool_name: "shell".into(),
+            phase: zeroclaw_api::agent::DelegateActivityPhase::Finished {
+                success: true,
+                output_preview: "ok".into(),
+            },
+        };
+        let json =
+            notification_for_turn_event("s1", &TurnEvent::DelegateActivity(activity.clone()))
+                .unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "delegate_activity");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["parent_tool_call_id"], "parent-call");
+        assert_eq!(v["params"]["phase"], "finished");
+        assert_eq!(v["params"]["success"], true);
+        let round: SessionUpdateEvent = serde_json::from_value(v["params"].clone()).unwrap();
+        let SessionUpdateEvent::DelegateActivity {
+            activity: round, ..
+        } = round
+        else {
+            panic!("expected delegate activity");
+        };
+        assert_eq!(round, activity);
     }
 
     #[test]
