@@ -21,6 +21,7 @@ mod degraded_config_remediation;
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
+#[cfg(feature = "gateway")]
 mod gateway;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
@@ -37,6 +38,7 @@ mod security;
 mod skills_bundle_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
+#[cfg(feature = "gateway")]
 mod whatsapp_webhook_security;
 
 #[cfg(feature = "plugins-wasm")]

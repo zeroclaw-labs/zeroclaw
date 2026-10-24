@@ -16527,7 +16527,7 @@ async fn run_gateway_if_enabled(
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -16536,7 +16536,7 @@ fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
     host == default_host && port == default_port
 }
@@ -16550,7 +16550,7 @@ fn gateway_browser_host(host: &str) -> &str {
     }
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn gateway_addr_in_use_message(
     host: &str,
     port: u16,
@@ -16594,7 +16594,7 @@ fn gateway_addr_in_use_message(
     lines.join("\n")
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -> String {
     let mut command = format!("    zeroclaw gateway start --port {port}");
     if host != default_host {
@@ -16603,7 +16603,7 @@ fn gateway_restart_recovery_command(host: &str, port: u16, default_host: &str) -
     command
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn gateway_paircode_recovery_command(
     host: &str,
     port: u16,
@@ -16621,7 +16621,7 @@ fn gateway_paircode_recovery_command(
     command
 }
 
-#[cfg(any(feature = "agent-runtime", test))]
+#[cfg(any(feature = "gateway", test))]
 fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     const SCAN_LIMIT: u16 = 20;
 
