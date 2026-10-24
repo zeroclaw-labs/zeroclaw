@@ -869,6 +869,17 @@ zc-config-application-scope-unavailable = Change scope unavailable
 zc-config-application-retired = Target retired
 zc-config-application-whole-config = Whole configuration; individual changed paths are unavailable
 
+# Config field details use schema-owned descriptions and values.
+zc-config-footer-action-field-details = field details
+zc-config-field-path = Path: { $path }
+zc-config-field-current-value = Current value:
+zc-config-field-unset = <unset>
+zc-config-field-secret-set = Set (hidden)
+zc-config-field-value-unavailable = Unavailable
+zc-config-field-environment-override = Environment override is active.
+zc-config-field-precheck-timeout-secs-label = Precheck timeout (seconds)
+zc-config-field-max-cost-per-day-cents-label = Maximum cost per day (cents)
+
 # Config setup guidance. Requirements arrive from the daemon's typed schema.
 zc-config-setup-model-providers = A model profile stores connection and model settings. Authentication may use an API key, an external login, or a local server.
 zc-config-setup-tts-providers = Text-to-speech is optional. Add an alias to use spoken output. Cloud backends require credentials; local backends need their executable or server.
