@@ -162,7 +162,11 @@ tool-knowledge = Manage a knowledge graph of architecture decisions, solution pa
 
 tool-linkedin = Manage LinkedIn: create posts, list your posts, comment, react, delete posts, view engagement, get profile info, and read the configured content strategy. Requires LINKEDIN_* credentials in .env file.
 
-tool-discord-search = Search Discord message history stored in discord.db. Use to find past messages, summarize channel activity, or look up what users said. Supports keyword search and optional filters: channel_id, since, until.
+tool-discord-search = Search Discord message history from this agent's configured Discord channels. Returns messages matching a keyword query, optionally filtered by channel_id or time range.
+
+tool-sessions-list = List this agent's active conversation sessions with their channel, last activity time, and message count.
+
+tool-sessions-history = Read the message history of a specific session by its session ID. Returns the last N messages. Only sessions this agent owns are readable.
 
 tool-memory-forget = Remove a memory by key. Use to delete outdated facts or sensitive data. Returns whether the memory was found and removed.
 
@@ -192,7 +196,7 @@ tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_T
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
 tool-sessions-history-header = Session '{ $session_id }': showing { $shown }/{ $total } messages
-tool-sessions-send = Deprecated legacy compatibility tool. Appends content to an existing Chat session's conversation history as an ordinary 'user' message. This does not notify or run the session and is not live message delivery. Use send_message_to_peer for agent-to-agent messaging.
+tool-sessions-send = Deprecated legacy compatibility tool. Appends content to an existing Chat session's conversation history as an ordinary 'user' message. This does not notify or run the session and is not live message delivery. Use send_message_to_peer for agent-to-agent messaging. Only sessions this agent owns are writable.
 tool-sessions-send-param-session-id = The existing Chat session ID whose legacy history should be appended (for example, telegram__user123). Gateway dashboard sessions may be addressed by their dashboard ID or by gw_<id>.
 tool-sessions-send-param-message = Legacy content to append as an ordinary 'user' message; this does not notify or run the session.
 tool-sessions-send-output-appended = Legacy content appended to session '{ $session_id }' as an ordinary 'user' message. No notification, live delivery, or agent execution occurred. Use send_message_to_peer for agent-to-agent messaging.

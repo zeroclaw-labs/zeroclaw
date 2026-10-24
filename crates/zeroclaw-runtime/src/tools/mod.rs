@@ -73,7 +73,7 @@ pub use zeroclaw_tools::codex_cli::CodexCliTool;
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
-pub use zeroclaw_tools::discord_search::DiscordSearchTool;
+pub use zeroclaw_tools::discord_search::{DiscordArchiveScope, DiscordSearchTool};
 #[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::email_read::EmailReadTool;
 #[cfg(feature = "tools-external")]
@@ -141,8 +141,8 @@ pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
-    AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
-    SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+    AcpSessionReadView, SessionDeleteTool, SessionOwnershipScope, SessionResetTool,
+    SessionsCurrentTool, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
 #[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
@@ -1824,16 +1824,63 @@ fn all_tools_with_runtime_on_thread(
     );
     register_tool!("TodoWrite", Arc::new(TodoWriteTool::new()));
 
-    // Register discord_search if any configured Discord alias has
-    // archive enabled. Multiple Discord aliases are supported (one per
-    // bot/server set); the search tool reads from a shared archive DB
-    // so it's enabled when at least one alias archives.
-    if root_config.channels.discord.values().any(|d| d.archive) && select_tool!("discord_search") {
+    // Register discord_search when the calling agent owns at least one
+    // Discord alias with archive enabled. The archive DB is shared across
+    // aliases, so the tool is bound to the agent's own channel refs and
+    // reads are ownership-filtered; agents without an archiving Discord
+    // binding don't get the tool at all.
+    let owned_discord_refs: Vec<String> = root_config
+        .channel_refs_owned_by_agent(agent_alias)
+        .into_iter()
+        .filter(|r| r.starts_with("discord."))
+        .collect();
+    let owns_archiving_alias = owned_discord_refs.iter().any(|r| {
+        r.strip_prefix("discord.")
+            .and_then(|alias| root_config.channels.discord.get(alias))
+            .is_some_and(|d| d.archive)
+    });
+    if owns_archiving_alias && select_tool!("discord_search") {
         match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
             Ok(discord_mem) => {
+                // Legacy pre-provenance archive rows fail closed in
+                // multi-agent installs; a sole enabled agent owns them.
+                // Availability is a catalog decision made once, above; the
+                // GRANT is re-resolved on every search. A binding revoked or
+                // reassigned after this tool was built must stop answering
+                // for the old owner, which a snapshot here would not do.
+                let archive_scope = match live_config.as_ref() {
+                    Some(live) => {
+                        let live = live.clone();
+                        let alias = agent_alias.to_string();
+                        DiscordArchiveScope::live(Arc::new(move |effect| {
+                            // The publish path holds the config write lock only
+                            // while it installs the next pair, never across
+                            // storage, so this wait is bounded and cannot
+                            // deadlock against a config writer.
+                            let cfg = live.read();
+                            let mut namespaces: Vec<String> = cfg
+                                .channel_refs_owned_by_agent(&alias)
+                                .into_iter()
+                                .filter(|r| r.starts_with("discord."))
+                                .collect();
+                            if cfg.is_sole_enabled_agent(&alias) {
+                                namespaces.push("default".to_string());
+                            }
+                            effect(&namespaces);
+                        }))
+                    }
+                    None => DiscordArchiveScope::new(
+                        owned_discord_refs,
+                        root_config.is_sole_enabled_agent(agent_alias),
+                    ),
+                };
                 register_tool!(
                     "discord_search",
-                    Arc::new(DiscordSearchTool::new(Arc::new(discord_mem)))
+                    Arc::new(DiscordSearchTool::for_agent(
+                        Arc::new(discord_mem),
+                        security.clone(),
+                        archive_scope,
+                    ))
                 );
             }
             Err(e) => {
@@ -2539,55 +2586,75 @@ fn all_tools_with_runtime_on_thread(
         && let Ok(backend) =
             zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
-        if let Some(acp_sessions) = acp_sessions {
-            register_tool!(
-                "sessions_current",
-                Arc::new(SessionsCurrentTool::with_acp_sessions(
-                    backend.clone(),
-                    acp_sessions.clone(),
-                ))
-            );
-            register_tool!(
-                "sessions_list",
-                Arc::new(SessionsListTool::with_acp_sessions(
-                    backend.clone(),
-                    acp_sessions.clone(),
-                ))
-            );
-            register_tool!(
-                "sessions_history",
-                Arc::new(SessionsHistoryTool::with_acp_sessions(
+        // Bind the caller's identity from trusted registration context so
+        // list/history/send are ownership-scoped: own-agent sessions, plus
+        // the channel-ownership fallback for channel sessions that carry
+        // only a channel_id stamp (ADR-011 channel reachability boundary).
+        // When an ACP session read view is present it is attached on top of
+        // the ownership scope so protocol sessions remain visible without
+        // widening the trusted per-agent boundary.
+        // The channel arm is a live fact for the same reason: reassigning a
+        // channel must stop admitting the previous owner to its sessions.
+        let ownership_scope = match live_config.as_ref() {
+            Some(live) => {
+                let live = live.clone();
+                let alias = agent_alias.to_string();
+                SessionOwnershipScope::with_live_channels(
+                    agent_alias,
+                    Arc::new(move |effect| {
+                        // The publish path holds the config write lock only while it
+                        // installs the next pair, never across storage, so this wait
+                        // is bounded and cannot deadlock against a config writer.
+                        let config = live.read();
+                        let channels = config
+                            .channel_refs_owned_by_agent(&alias)
+                            .into_iter()
+                            .collect();
+                        effect(&channels);
+                    }),
+                )
+            }
+            None => SessionOwnershipScope::with_channels(
+                agent_alias,
+                root_config.channel_refs_owned_by_agent(agent_alias),
+            ),
+        };
+        register_tool!(
+            "sessions_current",
+            Arc::new(
+                SessionsCurrentTool::new(backend.clone())
+                    .with_optional_acp_sessions(acp_sessions.clone()),
+            )
+        );
+        register_tool!(
+            "sessions_list",
+            Arc::new(
+                SessionsListTool::for_agent(
                     backend.clone(),
                     security.clone(),
-                    acp_sessions.clone(),
-                ))
-            );
-            register_tool!(
-                "sessions_send",
-                Arc::new(SessionsSendTool::with_acp_sessions(
-                    backend,
+                    ownership_scope.clone(),
+                )
+                .with_optional_acp_sessions(acp_sessions.clone()),
+            )
+        );
+        register_tool!(
+            "sessions_history",
+            Arc::new(
+                SessionsHistoryTool::for_agent(
+                    backend.clone(),
                     security.clone(),
-                    acp_sessions,
-                ))
-            );
-        } else {
-            register_tool!(
-                "sessions_current",
-                Arc::new(SessionsCurrentTool::new(backend.clone()))
-            );
-            register_tool!(
-                "sessions_list",
-                Arc::new(SessionsListTool::new(backend.clone()))
-            );
-            register_tool!(
-                "sessions_history",
-                Arc::new(SessionsHistoryTool::new(backend.clone(), security.clone(),))
-            );
-            register_tool!(
-                "sessions_send",
-                Arc::new(SessionsSendTool::new(backend, security.clone()))
-            );
-        }
+                    ownership_scope.clone(),
+                )
+                .with_optional_acp_sessions(acp_sessions.clone()),
+            )
+        );
+        register_tool!(
+            "sessions_send",
+            Arc::new(
+                SessionsSendTool::for_agent(backend, security.clone(), ownership_scope)
+                    .with_optional_acp_sessions(acp_sessions),
+            )
+        );
     }
 
     // LinkedIn integration (config-gated)
@@ -6111,14 +6178,23 @@ permissions = ["http_client"]
         let web = zeroclaw_config::schema::WebFetchConfig::default();
         let risk = zeroclaw_config::schema::RiskProfileConfig::default();
 
-        // root_config: shared data_dir + a Discord alias that archives (this is
-        // what gates discord_search registration).
+        // root_config: shared data_dir + a Discord alias that archives and is
+        // owned by the calling agent (ownership of an archiving alias is what
+        // gates discord_search registration).
         let mut root_config = test_config(&tmp);
         root_config.data_dir = data_dir.clone();
         root_config.channels.discord.insert(
             "oracle".to_string(),
             zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
                 archive: true,
+                ..Default::default()
+            },
+        );
+        root_config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.oracle".into()],
                 ..Default::default()
             },
         );
@@ -6177,6 +6253,543 @@ permissions = ["http_client"]
             !workspace_dir.join("sessions").exists(),
             "session tools must not open/create a store under the per-agent workspace_dir"
         );
+    }
+
+    /// discord_search hands an agent read access to the shared archive DB,
+    /// so registration is gated on the agent owning an archiving Discord
+    /// alias — not on any alias anywhere archiving.
+    #[test]
+    fn discord_search_registers_only_for_agent_owning_archiving_alias() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+
+        let mut root_config = test_config(&tmp);
+        root_config.channels.discord.insert(
+            "oracle".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                archive: true,
+                ..Default::default()
+            },
+        );
+        root_config.channels.discord.insert(
+            "disabled".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: false,
+                archive: true,
+                ..Default::default()
+            },
+        );
+        root_config.agents.insert(
+            "owner".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.oracle".into()],
+                ..Default::default()
+            },
+        );
+        root_config.agents.insert(
+            "bystander".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.main".into()],
+                ..Default::default()
+            },
+        );
+        root_config.agents.insert(
+            "disabled_only".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.disabled".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            root_config.channel_refs_owned_by_agent("owner"),
+            vec!["discord.oracle"],
+            "the shared ownership resolver must expose the enabled archive alias; aliases={:?}",
+            root_config.channels_by_alias()
+        );
+
+        let build = |agent_alias: &str| {
+            all_tools_with_runtime(
+                Arc::new(Config {
+                    data_dir: tmp.path().to_path_buf(),
+                    ..Config::default()
+                }),
+                &security,
+                &risk,
+                agent_alias,
+                Arc::new(NativeRuntime::new()),
+                mem.clone(),
+                None,
+                None,
+                &browser,
+                &http,
+                &web,
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &root_config,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("tool registry builds")
+            .tools
+        };
+
+        let owner_names: Vec<String> = build("owner")
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        let bystander_names: Vec<String> = build("bystander")
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        let disabled_names: Vec<String> = build("disabled_only")
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+
+        assert!(
+            owner_names.iter().any(|n| n == "discord_search"),
+            "the agent owning the archiving alias must get discord_search"
+        );
+        assert!(
+            !bystander_names.iter().any(|n| n == "discord_search"),
+            "an agent without an archiving Discord binding must not get discord_search"
+        );
+        assert!(
+            !disabled_names.iter().any(|n| n == "discord_search"),
+            "an agent bound only to a disabled Discord alias must not get discord_search"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_session_and_archive_tools_follow_live_channel_reassignment() {
+        use zeroclaw_infra::session_backend::SessionContext;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.agents.clear();
+        config.agents.insert(
+            "owner".into(),
+            AliasedAgentConfig {
+                channels: vec!["discord.archive".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "peer".into(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "archive".into(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                archive: true,
+                ..Default::default()
+            },
+        );
+        let backend = zeroclaw_infra::make_session_backend(&config.data_dir, "sqlite").unwrap();
+        for (key, owner) in [
+            ("legacy-channel", None),
+            ("explicit-owner", Some("owner")),
+            ("foreign-owner", Some("peer")),
+        ] {
+            backend
+                .append(key, &zeroclaw_api::model_provider::ChatMessage::user(key))
+                .unwrap();
+            backend
+                .set_session_context(
+                    key,
+                    SessionContext {
+                        channel_id: Some("discord.archive"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            if let Some(owner) = owner {
+                backend.set_session_agent_alias(key, owner).unwrap();
+            }
+        }
+        let archive =
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord")
+                .unwrap();
+        for (key, namespace) in [
+            ("scopedmarker", Some("discord.archive")),
+            ("legacymarker", None),
+        ] {
+            archive
+                .store_with_metadata(
+                    key,
+                    key,
+                    zeroclaw_memory::MemoryCategory::Custom("discord".into()),
+                    Some("123"),
+                    namespace,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone());
+        let publish = |mutate: &dyn Fn(&mut zeroclaw_config::schema::Config)| {
+            let mut cfg = live.snapshot();
+            mutate(&mut cfg);
+            live.publish(live.next_revision().unwrap(), cfg).unwrap();
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..Default::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let tools = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &Default::default(),
+            "owner",
+            Arc::new(NativeRuntime::new()),
+            Arc::clone(&mem),
+            None,
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live.handle()),
+        )
+        .unwrap()
+        .tools;
+        let tool = |name: &str| tools.iter().find(|tool| tool.name() == name).unwrap();
+        for key in ["legacy-channel", "explicit-owner"] {
+            assert!(
+                tool("sessions_history")
+                    .execute(serde_json::json!({"session_id": key}))
+                    .await
+                    .unwrap()
+                    .success
+            );
+        }
+        assert!(
+            !tool("sessions_history")
+                .execute(serde_json::json!({"session_id": "foreign-owner"}))
+                .await
+                .unwrap()
+                .success
+        );
+        for marker in ["scopedmarker", "legacymarker"] {
+            let result = tool("discord_search")
+                .execute(serde_json::json!({"query": marker}))
+                .await
+                .unwrap();
+            assert!(
+                result.success && result.output.contains(marker),
+                "{}",
+                result.output
+            );
+        }
+
+        // Reuse the actual factory-built tools after the canonical policy changes.
+        publish(&|cfg| {
+            cfg.agents.get_mut("owner").unwrap().channels.clear();
+            let peer = cfg.agents.get_mut("peer").unwrap();
+            peer.enabled = true;
+            peer.channels = vec!["discord.archive".into()];
+        });
+        let list = tool("sessions_list")
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(list.success && list.output.contains("explicit-owner"));
+        assert!(!list.output.contains("legacy-channel") && !list.output.contains("foreign-owner"));
+        assert!(
+            !tool("sessions_history")
+                .execute(serde_json::json!({"session_id": "legacy-channel"}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert!(
+            !tool("sessions_send")
+                .execute(serde_json::json!({"session_id": "legacy-channel", "message": "refused"}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(backend.load("legacy-channel").len(), 1);
+        assert!(
+            tool("sessions_history")
+                .execute(serde_json::json!({"session_id": "explicit-owner"}))
+                .await
+                .unwrap()
+                .success
+        );
+        for marker in ["scopedmarker", "legacymarker"] {
+            let result = tool("discord_search")
+                .execute(serde_json::json!({"query": marker}))
+                .await
+                .unwrap();
+            assert!(
+                result.success && !result.output.contains(marker),
+                "{}",
+                result.output
+            );
+        }
+
+        // Restoring a grant revives scoped access, while two enabled agents still
+        // exclude archive rows with no provenance.
+        publish(&|cfg| {
+            cfg.agents.get_mut("peer").unwrap().channels.clear();
+            cfg.agents.get_mut("owner").unwrap().channels = vec!["discord.archive".into()];
+        });
+        assert!(
+            tool("sessions_history")
+                .execute(serde_json::json!({"session_id": "legacy-channel"}))
+                .await
+                .unwrap()
+                .success
+        );
+        let scoped = tool("discord_search")
+            .execute(serde_json::json!({"query": "scopedmarker"}))
+            .await
+            .unwrap();
+        assert!(scoped.success && scoped.output.contains("scopedmarker"));
+        let legacy = tool("discord_search")
+            .execute(serde_json::json!({"query": "legacymarker"}))
+            .await
+            .unwrap();
+        assert!(legacy.success && !legacy.output.contains("legacymarker"));
+        // A retained disabled/removed caller must not inherit the sole *other*
+        // enabled agent's exception. Exercise the actual factory for that peer.
+        publish(&|cfg| {
+            cfg.agents.get_mut("owner").unwrap().enabled = false;
+            cfg.agents.get_mut("peer").unwrap().channels = vec!["discord.archive".into()];
+        });
+        let peer_config = live.snapshot();
+        let peer_tools = all_tools_with_runtime(
+            Arc::new(peer_config.clone()),
+            &security,
+            &Default::default(),
+            "peer",
+            Arc::new(NativeRuntime::new()),
+            Arc::clone(&mem),
+            None,
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &peer_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live.handle()),
+        )
+        .unwrap()
+        .tools;
+        let peer_search = peer_tools
+            .iter()
+            .find(|tool| tool.name() == "discord_search")
+            .unwrap();
+        let result = peer_search
+            .execute(serde_json::json!({"query":"legacymarker"}))
+            .await
+            .unwrap();
+        assert!(result.success && result.output.contains("legacymarker"));
+        for state in ["disabled", "removed", "zero-enabled"] {
+            if state == "removed" {
+                publish(&|cfg| {
+                    cfg.agents.remove("owner");
+                });
+            }
+            if state == "zero-enabled" {
+                publish(&|cfg| cfg.agents.get_mut("peer").unwrap().enabled = false);
+            }
+            let result = tool("discord_search")
+                .execute(serde_json::json!({"query":"legacymarker"}))
+                .await
+                .unwrap();
+            assert!(
+                !result.output.contains("legacymarker"),
+                "{state}: {}",
+                result.output
+            );
+        }
+        let result = peer_search
+            .execute(serde_json::json!({"query":"legacymarker"}))
+            .await
+            .unwrap();
+        assert!(!result.output.contains("legacymarker"));
+        publish(&|cfg| {
+            cfg.agents
+                .insert("owner".into(), config.agents["owner"].clone());
+        });
+        let restored = tool("discord_search")
+            .execute(serde_json::json!({"query":"legacymarker"}))
+            .await
+            .unwrap();
+        assert!(restored.success && restored.output.contains("legacymarker"));
+    }
+
+    /// End-to-end wiring check for the cross-agent session repro: session
+    /// tools built for one agent must not read or write another agent's
+    /// sessions, and sessions_list must not enumerate them.
+    #[tokio::test]
+    async fn session_tools_are_ownership_scoped_per_registered_agent() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Seed the shared session store: one session per agent.
+        let backend = zeroclaw_infra::make_session_backend(&data_dir, "sqlite").unwrap();
+        backend
+            .append(
+                "gw_rowan-chat",
+                &zeroclaw_api::model_provider::ChatMessage::user("rowan private turn"),
+            )
+            .unwrap();
+        backend
+            .set_session_agent_alias("gw_rowan-chat", "rowan")
+            .unwrap();
+        backend
+            .append(
+                "gw_sable-chat",
+                &zeroclaw_api::model_provider::ChatMessage::user("sable private turn"),
+            )
+            .unwrap();
+        backend
+            .set_session_agent_alias("gw_sable-chat", "sable")
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+
+        let mut root_config = test_config(&tmp);
+        root_config
+            .agents
+            .insert("rowan".to_string(), AliasedAgentConfig::default());
+        root_config
+            .agents
+            .insert("sable".to_string(), AliasedAgentConfig::default());
+        // Declare one binding so ownership stays in declared mode (no
+        // legacy fallback owner) for both agents.
+        root_config.agents.get_mut("sable").unwrap().channels = vec!["telegram.main".into()];
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config {
+                data_dir: data_dir.clone(),
+                ..Config::default()
+            }),
+            &security,
+            &risk,
+            "rowan",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("tool registry builds")
+        .tools;
+
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name() == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"))
+        };
+
+        let list = tool("sessions_list")
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(list.success);
+        assert!(list.output.contains("gw_rowan-chat"));
+        assert!(
+            !list.output.contains("gw_sable-chat"),
+            "sessions_list must not enumerate another agent's sessions: {}",
+            list.output
+        );
+
+        let history = tool("sessions_history")
+            .execute(serde_json::json!({"session_id": "gw_sable-chat"}))
+            .await
+            .unwrap();
+        assert!(!history.success);
+        assert!(
+            !history.output.contains("sable private turn"),
+            "sessions_history must not leak another agent's history"
+        );
+
+        let send = tool("sessions_send")
+            .execute(serde_json::json!({
+                "session_id": "gw_sable-chat",
+                "message": "injected"
+            }))
+            .await
+            .unwrap();
+        assert!(!send.success);
+        assert_eq!(
+            backend.load("gw_sable-chat").len(),
+            1,
+            "sessions_send must not append into another agent's session"
+        );
+
+        let own_history = tool("sessions_history")
+            .execute(serde_json::json!({"session_id": "gw_rowan-chat"}))
+            .await
+            .unwrap();
+        assert!(own_history.success);
+        assert!(own_history.output.contains("rowan private turn"));
     }
 
     #[tokio::test]
@@ -7702,9 +8315,13 @@ permissions = ["http_client"]
                 ..Default::default()
             },
         );
+        // `discord_search` registers only for the agent that owns an enabled,
+        // archiving Discord alias. With no agent bindings declared, the sole
+        // enabled agent owns every enabled channel, so the alias must be on.
         cfg.channels.discord.insert(
             "inventory".into(),
             DiscordConfig {
+                enabled: true,
                 archive: true,
                 ..Default::default()
             },
