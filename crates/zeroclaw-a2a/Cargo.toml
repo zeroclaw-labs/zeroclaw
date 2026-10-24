@@ -1,0 +1,33 @@
+[package]
+name = "zeroclaw-a2a"
+version.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A2A protocol core (wire, client, server executor) for ZeroClaw."
+repository.workspace = true
+homepage.workspace = true
+publish = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "macros"] }
+anyhow = "1.0"
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "stream"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "std", "rc"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+schemars = { version = "1.2", optional = true }
+parking_lot = "0.12"
+thiserror = "2.0"
+tokio = { version = "1.50", default-features = false, features = ["sync", "process", "macros", "rt"] }
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+zeroclaw-infra = { workspace = true }
+
+[features]
+default = ["schema-export"]
+schema-export = ["dep:schemars"]
+
+[dev-dependencies]
+serial_test = "3"
+wiremock = "0.6"
