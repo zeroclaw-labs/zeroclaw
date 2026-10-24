@@ -259,6 +259,9 @@ explicitly stopped.
 - Unix socket directory: `0o700` (owner only)
 - Unix socket file: `0o600` (owner only)
 - Windows named pipe: default ACL grants the creating user and `SYSTEM`
+- A `zeroclaw config` authorization edit is written over a pipe only after
+  the CLI has checked, with the kernel, that the server process is the one
+  the daemon heartbeat names and runs as this account or `SYSTEM`
 - `SO_PEERCRED` on Linux provides the connecting process PID and UID for
   audit logging; Windows logs `pipe:local` as the peer label
 

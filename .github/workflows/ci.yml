@@ -666,7 +666,9 @@ jobs:
   # Split out of the Windows build leg so the recovery harness compiles in
   # parallel with `cargo check` and voice-wake instead of after them. The three
   # compiles share nothing (check metadata cannot feed a test-profile build), so
-  # running them serially made the Windows leg the most common pacing job.
+  # running them serially made the Windows leg the most common pacing job. The
+  # same test build also runs the named-pipe server identity checks, which only
+  # Windows can exercise.
   # Recovery-filter invariant and retirement condition: README.md bespoke CI gate registry.
   windows-task-owner-recovery:
     name: Test Windows task-owner recovery
@@ -691,7 +693,7 @@ jobs:
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Test Windows task-owner recovery
+      - name: Test Windows task-owner recovery and pipe-server identity
         shell: bash
         run: |
           set -euo pipefail
@@ -703,6 +705,14 @@ jobs:
             --target x86_64-pc-windows-msvc \
             control_plane::boot::tests::recovery_retains_live_foreign_process_then_reclaims_after_exit -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-owner-recovery.log"
           grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-owner-recovery.log"
+          cargo test --locked -p zeroclaw-config --lib \
+            --target x86_64-pc-windows-msvc \
+            platform::pipe_server::tests::the_server_of_a_pipe_this_process_serves_is_this_process -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-pipe-server-pid.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-pipe-server-pid.log"
+          cargo test --locked -p zeroclaw-config --lib \
+            --target x86_64-pc-windows-msvc \
+            platform::pipe_server::tests::this_process_runs_as_this_user -- --exact 2>&1 | tee "$RUNNER_TEMP/windows-pipe-server-account.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/windows-pipe-server-account.log"
 
   check:
     name: Check (${{ matrix.name }})

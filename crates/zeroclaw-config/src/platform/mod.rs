@@ -1,6 +1,7 @@
 pub mod docker;
 pub mod executable;
 pub mod native;
+pub mod pipe_server;
 
 pub use docker::DockerRuntime;
 pub use executable::{resolve_executable, resolve_executable_with_path};

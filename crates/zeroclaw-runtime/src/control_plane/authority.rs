@@ -117,8 +117,11 @@ fn process_state(pid: u32, expected_started_at: Option<u64>) -> ProcessState {
     }
 }
 
+/// Whether no process has `pid` any more. `Some(true)`: none does.
+/// `Some(false)`: one does, or one exists that this process may not inspect.
+/// `None`: the probe itself failed, so nothing is known.
 #[cfg(unix)]
-fn pid_is_definitely_absent(pid: u32) -> Option<bool> {
+pub fn pid_is_definitely_absent(pid: u32) -> Option<bool> {
     // SAFETY: signal 0 performs an existence/permission check without sending a signal.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if result == 0 {
@@ -131,8 +134,11 @@ fn pid_is_definitely_absent(pid: u32) -> Option<bool> {
     }
 }
 
+/// Whether no process has `pid` any more. `Some(true)`: none does.
+/// `Some(false)`: one does, or one exists that this process may not inspect.
+/// `None`: the probe itself failed, so nothing is known.
 #[cfg(windows)]
-fn pid_is_definitely_absent(pid: u32) -> Option<bool> {
+pub fn pid_is_definitely_absent(pid: u32) -> Option<bool> {
     use windows::Win32::Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
@@ -165,8 +171,11 @@ fn pid_is_definitely_absent(pid: u32) -> Option<bool> {
     }
 }
 
+/// Whether no process has `pid` any more. `Some(true)`: none does.
+/// `Some(false)`: one does, or one exists that this process may not inspect.
+/// `None`: the probe itself failed, so nothing is known.
 #[cfg(not(any(unix, windows)))]
-fn pid_is_definitely_absent(_pid: u32) -> Option<bool> {
+pub fn pid_is_definitely_absent(_pid: u32) -> Option<bool> {
     None
 }
 
@@ -331,5 +340,12 @@ mod tests {
             "Windows must report exit while the child handle remains open"
         );
         assert!(is_authoritative(&live));
+    }
+
+    /// Pid 0 is the idle process, which cannot be opened: no daemon has it.
+    #[cfg(windows)]
+    #[test]
+    fn pid_zero_is_definitely_absent() {
+        assert_eq!(pid_is_definitely_absent(0), Some(true));
     }
 }
