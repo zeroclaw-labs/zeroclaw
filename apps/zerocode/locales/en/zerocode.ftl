@@ -869,6 +869,31 @@ zc-config-application-scope-unavailable = Change scope unavailable
 zc-config-application-retired = Target retired
 zc-config-application-whole-config = Whole configuration; individual changed paths are unavailable
 
+zc-zerocode-bindings-title = Keybindings
+zc-zerocode-locale-title = Locale
+zc-zerocode-binding-query = Search: { $query } ({ $matched }/{ $total })
+zc-zerocode-binding-no-results = No matching actions
+zc-zerocode-binding-unbound = (unbound)
+zc-zerocode-hint-browse-matches = browse matches
+zc-zerocode-hint-back = back
+zc-zerocode-hint-apply-theme = apply theme
+zc-zerocode-hint-assign-theme = assign theme
+zc-zerocode-hint-pick-theme = choose theme
+zc-zerocode-hint-clear-theme = clear override
+zc-zerocode-hint-apply-preset = apply preset
+zc-zerocode-hint-rebind = rebind
+zc-zerocode-hint-search = search
+zc-zerocode-hint-locale = select/download
+zc-zerocode-hint-connection = edit/toggle
+zc-zerocode-hint-toggle = toggle
+zc-zerocode-hint-section = section
+
+zc-zerocode-connection-panel-title = Connection ([wss])
+zc-zerocode-tracker-panel-title = Todo tracker ([todotracker])
+zc-zerocode-footer-context = ZeroCode { $level }/{ $page }
+zc-zerocode-context-sections = Sections
+zc-zerocode-context-detail = Detail
+
 # Config setup guidance. Requirements arrive from the daemon's typed schema.
 zc-config-setup-model-providers = A model profile stores connection and model settings. Authentication may use an API key, an external login, or a local server.
 zc-config-setup-tts-providers = Text-to-speech is optional. Add an alias to use spoken output. Cloud backends require credentials; local backends need their executable or server.
