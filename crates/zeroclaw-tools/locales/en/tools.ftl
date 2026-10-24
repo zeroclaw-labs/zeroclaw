@@ -28,6 +28,7 @@ tool-channel-room-param-encryption = Whether to request room encryption during c
 tool-channel-room-param-room-id = Existing room ID for invite_user.
 tool-channel-room-param-user-id = User ID to invite for invite_user.
 tool-channel-room-error-security = Action blocked: { $err }
+tool-channel-room-error-approval-required = This channel will not create rooms or invite users unless an operator approves each call: add "channel_room" to always_ask in the agent's risk profile.
 tool-channel-room-error-invalid-action = Invalid action '{ $action }': must be 'create_room' or 'invite_user'.
 tool-channel-room-error-not-initialized = No channels available yet (channels not initialized).
 tool-channel-room-error-channel-not-found = Channel '{ $channel }' not found. Available channels: { $available }
