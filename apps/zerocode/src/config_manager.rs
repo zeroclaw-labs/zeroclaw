@@ -19,7 +19,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span, Text},
-    widgets::{List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -180,6 +180,39 @@ struct DetailOrigin {
     alias_tab: usize,
     cost_cursor: usize,
     field_cursor: usize,
+}
+
+enum ConfigMutation {
+    Delete {
+        path: String,
+        key: String,
+        costs: bool,
+    },
+    Reset {
+        prop: String,
+        prefix: String,
+        tab: Option<ConfigTab>,
+    },
+}
+
+impl ConfigMutation {
+    fn target(&self) -> String {
+        match self {
+            Self::Delete { path, key, .. } => format!("{path}.{key}"),
+            Self::Reset { prop, .. } => prop.clone(),
+        }
+    }
+}
+
+struct PendingConfigMutation {
+    action: ConfigMutation,
+    preview: Option<crate::client::ConfigDeletePlan>,
+    scroll: u16,
+}
+
+enum ConfigMutationDialog {
+    Confirm(PendingConfigMutation),
+    Outcome { message: String, scroll: u16 },
 }
 
 enum FilterEditAction {
@@ -486,6 +519,9 @@ pub(crate) struct App {
     select_cursor: usize,
     select_items: Vec<String>,
     status_msg: Option<String>,
+    mutation_dialog: Option<ConfigMutationDialog>,
+    /// Furthest the dialog text can scroll, measured at the last draw.
+    mutation_scroll_max: std::cell::Cell<u16>,
     application_feedback: crate::config_application::ApplicationFeedback,
     // Filter state: None = inactive, Some(buf) = active filter
     filter: Option<String>,
@@ -563,6 +599,8 @@ impl App {
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
+            mutation_dialog: None,
+            mutation_scroll_max: std::cell::Cell::new(0),
             application_feedback: crate::config_application::ApplicationFeedback::new(),
             filter: None,
             filter_cursor: 0,
@@ -688,6 +726,10 @@ impl App {
         self.draw_sections_pane(frame, left, on_sections);
         self.last_section_pane_area = left;
 
+        if self.has_mutation_dialog() {
+            self.draw_mutation_confirmation(frame, right);
+            return;
+        }
         if self.section_filter_has_no_matches() {
             self.last_main_area = Rect::default();
             self.last_tab_area = None;
@@ -773,6 +815,10 @@ impl App {
     fn bottom_hint(&self) -> String {
         use crate::keymap::{ConfigEditorAction as E, ConfigTabAction as T};
 
+        if self.has_mutation_dialog() {
+            return String::new();
+        }
+
         if self.application_feedback.details_open() {
             return format!(
                 "{}={}",
@@ -794,16 +840,41 @@ impl App {
                 )
             }
             Screen::AliasList { .. }
-                if self.zeroclaw_pane == ZeroclawPane::Detail
-                    && self.provider_alias_rename_available()
-                    && self.detail_filter().is_none() =>
+                if self.zeroclaw_pane == ZeroclawPane::Detail && self.detail_filter().is_none() =>
             {
-                format!(
-                    " {}={}  ?={}",
-                    tab_key(T::RenameAlias),
-                    crate::i18n::t("zc-config-footer-action-rename"),
-                    crate::i18n::t("zc-config-footer-action-help"),
-                )
+                let existing_row = if self.alias_list_has_tabs() && self.alias_tab == 1 {
+                    self.cost_cursor < self.cost_resources.len()
+                } else {
+                    self.alias_cursor < self.aliases.len()
+                };
+                let mut actions = Vec::new();
+                if self.provider_alias_rename_available() {
+                    let rename_key = tab_key(T::RenameAlias);
+                    if !rename_key.is_empty() {
+                        actions.push(format!(
+                            "{}={}",
+                            rename_key,
+                            crate::i18n::t("zc-config-footer-action-rename")
+                        ));
+                    }
+                }
+                let delete_key = tab_key(T::Delete);
+                if existing_row && !delete_key.is_empty() {
+                    actions.push(format!(
+                        "{}={}",
+                        delete_key,
+                        crate::i18n::t("zc-config-footer-action-delete")
+                    ));
+                }
+                if actions.is_empty() {
+                    default()
+                } else {
+                    format!(
+                        " {}  ?={}",
+                        actions.join("  "),
+                        crate::i18n::t("zc-config-footer-action-help"),
+                    )
+                }
             }
             Screen::FieldList { .. } if self.zeroclaw_pane == ZeroclawPane::Detail => {
                 if self.detail_filter().is_some() {
@@ -854,7 +925,7 @@ impl App {
                         " {}={}  {}={}{}  ?={}",
                         tab_key(T::Enter),
                         crate::i18n::t("zc-config-footer-action-edit"),
-                        tab_key(T::DeleteRow),
+                        tab_key(T::Reset),
                         crate::i18n::t("zc-config-footer-action-reset"),
                         rename,
                         help,
@@ -1009,6 +1080,10 @@ impl App {
     }
 
     async fn handle_key_inner(&mut self, key: KeyEvent, term: &mut Term) -> Result<bool> {
+        if self.has_mutation_dialog() {
+            self.handle_mutation_confirmation(key).await?;
+            return Ok(false);
+        }
         if self.section == ConfigSection::Zeroclaw {
             if self.application_feedback.handle_key(key) {
                 return Ok(false);
@@ -1133,6 +1208,16 @@ impl App {
     ) -> Result<()> {
         use crate::mouse;
         if self.application_feedback.details_open() {
+            return Ok(());
+        }
+
+        if self.has_mutation_dialog() {
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) {
+                self.cancel_mutation_dialog();
+            }
             return Ok(());
         }
 
@@ -2579,32 +2664,11 @@ impl App {
             _ if into => {
                 self.activate_alias_list().await?;
             }
-            Some(ConfigTabAction::ToggleSecret) if self.alias_cursor < self.aliases.len() => {
+            Some(ConfigTabAction::Delete) if self.alias_cursor < self.aliases.len() => {
                 if let Screen::AliasList { map_path, .. } = &self.screen {
                     let alias = self.aliases[self.alias_cursor].clone();
                     let map_path = map_path.clone();
-                    match self.rpc.config_map_key_delete(&map_path, &alias).await {
-                        Ok(result) => {
-                            if result.changed {
-                                self.application_feedback
-                                    .record_saved(format!("{map_path}.{alias}"), result.revision);
-                            }
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-alias-deleted",
-                                &[("alias", &alias)],
-                            ));
-                            self.load_aliases(&map_path).await?;
-                            if self.alias_cursor > 0 && self.alias_cursor >= self.aliases.len() {
-                                self.alias_cursor = self.aliases.len().saturating_sub(1);
-                            }
-                        }
-                        Err(e) => {
-                            self.status_msg = Some(crate::i18n::t_args(
-                                "zc-config-status-delete-failed",
-                                &[("err", &e.to_string())],
-                            ));
-                        }
-                    }
+                    self.begin_delete_confirmation(map_path, alias, false).await;
                 }
             }
             _ => {}
@@ -2700,32 +2764,9 @@ impl App {
             Some(ConfigTabAction::Enter) => {
                 self.activate_alias_list().await?;
             }
-            Some(ConfigTabAction::DeleteRow | ConfigTabAction::ToggleSecret)
-                if self.cost_cursor < self.cost_resources.len() =>
-            {
+            Some(ConfigTabAction::Delete) if self.cost_cursor < self.cost_resources.len() => {
                 let resource = self.cost_resources[self.cost_cursor].clone();
-                match self.rpc.config_map_key_delete(&base, &resource).await {
-                    Ok(result) => {
-                        if result.changed {
-                            self.application_feedback
-                                .record_saved(format!("{base}.{resource}"), result.revision);
-                        }
-                        self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-status-alias-deleted",
-                            &[("alias", &resource)],
-                        ));
-                        self.load_cost_resources().await?;
-                        if self.cost_cursor > 0 && self.cost_cursor >= self.cost_resources.len() {
-                            self.cost_cursor = self.cost_resources.len().saturating_sub(1);
-                        }
-                    }
-                    Err(e) => {
-                        self.status_msg = Some(crate::i18n::t_args(
-                            "zc-config-status-delete-failed",
-                            &[("err", &e.to_string())],
-                        ));
-                    }
-                }
+                self.begin_delete_confirmation(base, resource, true).await;
             }
             _ => {}
         }
@@ -3239,41 +3280,32 @@ impl App {
             Some(ConfigTabAction::Enter) if visible.contains(&self.field_cursor) => {
                 self.enter_field_edit(self.field_cursor, term).await;
             }
-            Some(ConfigTabAction::DeleteRow)
-                if self
-                    .fields
-                    .get(self.field_cursor)
-                    .is_some_and(|field| field.kind == PropKind::SecretMap) =>
+            Some(ConfigTabAction::Reset)
+                if visible.contains(&self.field_cursor)
+                    && self
+                        .fields
+                        .get(self.field_cursor)
+                        .is_some_and(|field| field.kind == PropKind::SecretMap) =>
             {
                 // The container row is not itself a value; entries are
                 // removed from their own `<path>.<KEY>` rows.
                 self.status_msg = Some(crate::i18n::t("zc-config-secret-map-delete-hint"));
             }
-            Some(ConfigTabAction::DeleteRow) => {
+            Some(ConfigTabAction::Reset) if visible.contains(&self.field_cursor) => {
                 if let Some(field) = self.fields.get(self.field_cursor) {
                     let prop = field.path.clone();
-                    let saved_cursor = self.field_cursor;
                     if let Screen::FieldList { prefix, .. } = &self.screen {
                         let prefix = prefix.clone();
-                        match self.rpc.config_delete(&prop).await {
-                            Ok(revision) => {
-                                self.application_feedback
-                                    .record_saved(prop.clone(), revision);
-                                self.status_msg = Some(crate::i18n::t_args(
-                                    "zc-config-status-field-reset",
-                                    &[("prop", &prop)],
-                                ));
-                                self.load_fields(&prefix).await?;
-                                self.field_cursor =
-                                    saved_cursor.min(self.fields.len().saturating_sub(1));
-                            }
-                            Err(e) => {
-                                self.status_msg = Some(crate::i18n::t_args(
-                                    "zc-config-status-delete-failed",
-                                    &[("err", &e.to_string())],
-                                ));
-                            }
-                        }
+                        self.mutation_dialog =
+                            Some(ConfigMutationDialog::Confirm(PendingConfigMutation {
+                                action: ConfigMutation::Reset {
+                                    prop,
+                                    prefix,
+                                    tab: self.tab_names.get(self.active_tab).copied(),
+                                },
+                                preview: None,
+                                scroll: 0,
+                            }));
                     }
                 }
             }
@@ -3283,6 +3315,374 @@ impl App {
     }
 
     // ── Composite tab helpers ──────────────────────────────────────
+
+    /// Record how far the dialog text can scroll at this size and clamp the
+    /// requested offset, so Down never scrolls the last line out of view.
+    fn clamp_mutation_scroll(&self, text: &Paragraph<'_>, area: Rect, scroll: u16) -> u16 {
+        let lines = u16::try_from(text.line_count(area.width)).unwrap_or(u16::MAX);
+        let max = lines.saturating_sub(area.height);
+        self.mutation_scroll_max.set(max);
+        scroll.min(max)
+    }
+
+    /// A reconnect rebuilds the Config pane. Carry a mutation result into the
+    /// replacement so an error or cleanup warning stays until dismissed; a
+    /// pending confirmation is dropped, since its preview came from the old
+    /// connection.
+    pub(crate) fn hand_off_mutation_outcome(&self, next: &mut App) {
+        if let Some(ConfigMutationDialog::Outcome { message, .. }) = self.mutation_dialog.as_ref() {
+            next.show_mutation_outcome(message.clone());
+        }
+    }
+
+    pub(crate) fn has_mutation_dialog(&self) -> bool {
+        self.mutation_dialog.is_some()
+    }
+
+    pub(crate) fn has_pending_mutation(&self) -> bool {
+        self.pending_mutation().is_some()
+    }
+
+    pub(crate) fn cancel_mutation_dialog(&mut self) {
+        self.mutation_dialog = None;
+    }
+
+    fn pending_mutation(&self) -> Option<&PendingConfigMutation> {
+        match self.mutation_dialog.as_ref() {
+            Some(ConfigMutationDialog::Confirm(pending)) => Some(pending),
+            _ => None,
+        }
+    }
+
+    fn show_mutation_outcome(&mut self, message: String) {
+        self.mutation_dialog = Some(ConfigMutationDialog::Outcome { message, scroll: 0 });
+    }
+
+    async fn begin_delete_confirmation(&mut self, path: String, key: String, costs: bool) {
+        match self.rpc.config_delete_plan(&path, &key).await {
+            Ok(preview)
+                if preview
+                    .as_ref()
+                    .is_none_or(|plan| plan.path == path && plan.key == key) =>
+            {
+                self.mutation_dialog = Some(ConfigMutationDialog::Confirm(PendingConfigMutation {
+                    action: ConfigMutation::Delete { path, key, costs },
+                    preview,
+                    scroll: 0,
+                }));
+            }
+            Ok(_) => {
+                self.show_mutation_outcome(crate::i18n::t("zc-config-confirm-target-mismatch"))
+            }
+            Err(error) => self.show_mutation_outcome(crate::i18n::t_args(
+                "zc-config-confirm-preview-failed",
+                &[("err", &error.to_string())],
+            )),
+        }
+    }
+
+    async fn handle_mutation_confirmation(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::keymap::{ConfigEditorAction as E, ConfigTabAction as T, GlobalAction as G};
+        if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+        if E::from_chord(&key) == Some(E::Cancel)
+            || matches!(
+                T::from_chord(&key),
+                Some(T::Back | T::SectionNext | T::SectionPrev)
+            )
+            || matches!(
+                G::from_chord(&key),
+                Some(G::PaneNavLeft | G::PaneNavRight | G::Quit)
+            )
+        {
+            self.cancel_mutation_dialog();
+            return Ok(());
+        }
+        if matches!(
+            self.mutation_dialog,
+            Some(ConfigMutationDialog::Outcome { .. })
+        ) && E::from_chord(&key) == Some(E::Confirm)
+        {
+            self.cancel_mutation_dialog();
+            return Ok(());
+        }
+        if E::from_chord(&key) != Some(E::Confirm) {
+            if let Some(dialog) = self.mutation_dialog.as_mut() {
+                let scroll = match dialog {
+                    ConfigMutationDialog::Confirm(pending) => &mut pending.scroll,
+                    ConfigMutationDialog::Outcome { scroll, .. } => scroll,
+                };
+                match T::from_chord(&key) {
+                    Some(T::Up) => *scroll = scroll.saturating_sub(1),
+                    Some(T::Down) => {
+                        *scroll = scroll.saturating_add(1).min(self.mutation_scroll_max.get())
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+        if self
+            .pending_mutation()
+            .is_some_and(|pending| pending.preview.as_ref().is_some_and(|plan| !plan.allowed))
+        {
+            return Ok(());
+        }
+        // Consume intent before any await. A transport or refresh failure cannot
+        // turn a second Enter into an automatic retry of an uncertain mutation.
+        let Some(ConfigMutationDialog::Confirm(pending)) = self.mutation_dialog.take() else {
+            return Ok(());
+        };
+        let target = pending.action.target();
+        match pending.action {
+            ConfigMutation::Delete { path, key, costs } => {
+                match self.rpc.config_map_key_delete(&path, &key).await {
+                    Ok(result) => {
+                        if result.deleted {
+                            self.application_feedback.record_saved(
+                                format!("{}.{}", result.path, result.key),
+                                result.revision,
+                            );
+                        }
+                        let mut status = if result.path != path || result.key != key {
+                            crate::i18n::t("zc-config-confirm-target-mismatch")
+                        } else if !result.deleted {
+                            crate::i18n::t_args(
+                                "zc-config-confirm-not-applied",
+                                &[("target", &target)],
+                            )
+                        } else {
+                            let refresh = if costs {
+                                self.rpc.config_map_keys(&path).await.map(|resources| {
+                                    self.cost_resources = resources;
+                                    self.cost_cursor = 0;
+                                })
+                            } else {
+                                self.load_aliases(&path).await
+                            };
+                            match refresh {
+                                Ok(()) => {
+                                    if costs {
+                                        self.cost_cursor = self
+                                            .cost_cursor
+                                            .min(self.cost_resources.len().saturating_sub(1));
+                                    } else {
+                                        self.alias_cursor = self
+                                            .alias_cursor
+                                            .min(self.aliases.len().saturating_sub(1));
+                                    }
+                                    crate::i18n::t_args(
+                                        "zc-config-confirm-deleted",
+                                        &[("target", &target)],
+                                    )
+                                }
+                                Err(error) => {
+                                    if costs {
+                                        self.cost_resources.clear();
+                                        self.cost_cursor = 0;
+                                    } else {
+                                        self.aliases.clear();
+                                        self.alias_enabled.clear();
+                                        self.alias_cursor = 0;
+                                    }
+                                    self.loaded_section = None;
+                                    crate::i18n::t_args(
+                                        "zc-config-confirm-deleted-refresh-failed",
+                                        &[("target", &target), ("err", &error.to_string())],
+                                    )
+                                }
+                            }
+                        };
+                        if let Some(warnings) =
+                            result.warnings.filter(|warnings| !warnings.is_empty())
+                        {
+                            status.push('\n');
+                            status.push_str(&crate::i18n::t_args(
+                                "zc-config-confirm-warnings",
+                                &[("warnings", &warnings.join("; "))],
+                            ));
+                        }
+                        self.status_msg = Some(status);
+                    }
+                    Err(error) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-delete-failed",
+                            &[("err", &error.to_string())],
+                        ))
+                    }
+                }
+            }
+            ConfigMutation::Reset { prop, prefix, tab } => {
+                match self.rpc.config_delete(&prop).await {
+                    Ok(result) if result.prop != prop => {
+                        self.status_msg = Some(crate::i18n::t("zc-config-confirm-target-mismatch"))
+                    }
+                    Ok(result) if !result.deleted => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-confirm-not-applied",
+                            &[("target", &target)],
+                        ))
+                    }
+                    Ok(result) => {
+                        self.application_feedback
+                            .record_saved(prop.clone(), result.revision);
+                        self.status_msg = Some(match self.load_fields(&prefix).await {
+                            Ok(()) => {
+                                self.active_tab = tab
+                                    .and_then(|tab| {
+                                        self.tab_names
+                                            .iter()
+                                            .position(|candidate| *candidate == tab)
+                                    })
+                                    .unwrap_or(0);
+                                self.field_cursor = self
+                                    .fields
+                                    .iter()
+                                    .position(|field| field.path == prop)
+                                    .filter(|idx| self.tab_field_indices().contains(idx))
+                                    .or_else(|| self.tab_field_indices().first().copied())
+                                    .unwrap_or(0);
+                                crate::i18n::t_args(
+                                    "zc-config-status-field-reset",
+                                    &[("prop", &prop)],
+                                )
+                            }
+                            Err(error) => {
+                                self.fields.clear();
+                                self.tab_names.clear();
+                                self.active_tab = 0;
+                                self.field_cursor = 0;
+                                self.loaded_section = None;
+                                crate::i18n::t_args(
+                                    "zc-config-confirm-reset-refresh-failed",
+                                    &[("target", &target), ("err", &error.to_string())],
+                                )
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-delete-failed",
+                            &[("err", &error.to_string())],
+                        ))
+                    }
+                }
+            }
+        }
+        if let Some(message) = self.status_msg.take() {
+            self.show_mutation_outcome(message);
+        }
+        Ok(())
+    }
+
+    fn draw_mutation_confirmation(&self, frame: &mut Frame, area: Rect) {
+        if let Some(ConfigMutationDialog::Outcome { message, scroll }) =
+            self.mutation_dialog.as_ref()
+        {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(crate::i18n::t("zc-config-confirm-result-title"));
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(2)])
+                .split(inner);
+            let text = Paragraph::new(message.as_str()).wrap(Wrap { trim: false });
+            let scroll = self.clamp_mutation_scroll(&text, chunks[0], *scroll);
+            frame.render_widget(text.scroll((scroll, 0)), chunks[0]);
+            let hint = crate::i18n::t_args(
+                "zc-config-confirm-result-hint",
+                &[
+                    (
+                        "confirm",
+                        &editor_key(crate::keymap::ConfigEditorAction::Confirm),
+                    ),
+                    (
+                        "cancel",
+                        &editor_key(crate::keymap::ConfigEditorAction::Cancel),
+                    ),
+                    ("navigate", &nav_keys()),
+                ],
+            );
+            frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), chunks[1]);
+            return;
+        }
+        let Some(pending) = self.pending_mutation() else {
+            return;
+        };
+        let deleting = matches!(pending.action, ConfigMutation::Delete { .. });
+        let title = crate::i18n::t(if deleting {
+            "zc-config-confirm-delete-title"
+        } else {
+            "zc-config-confirm-reset-title"
+        });
+        let block = Block::default().borders(Borders::ALL).title(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(2)])
+            .split(inner);
+        let mut lines = vec![Line::from(pending.action.target()), Line::default()];
+        if deleting {
+            if let Some(plan) = pending.preview.as_ref() {
+                if !plan.allowed {
+                    lines.push(Line::from(crate::i18n::t("zc-config-confirm-blocked")));
+                }
+                for site in &plan.blockers {
+                    lines.push(Line::from(crate::i18n::t_args(
+                        "zc-config-confirm-blocker",
+                        &[("path", &site.path)],
+                    )));
+                }
+                for site in &plan.scrubs {
+                    lines.push(Line::from(crate::i18n::t_args(
+                        "zc-config-confirm-scrub",
+                        &[("path", &site.path)],
+                    )));
+                }
+                if let Some(count) = plan.live_acp_sessions.filter(|count| *count > 0) {
+                    lines.push(Line::from(crate::i18n::t_args(
+                        "zc-config-confirm-live-sessions",
+                        &[("count", &count.to_string())],
+                    )));
+                }
+                if plan.cascades_owned_state {
+                    lines.push(Line::from(crate::i18n::t("zc-config-confirm-owned-state")));
+                }
+                lines.push(Line::from(crate::i18n::t("zc-config-confirm-rechecked")));
+            } else {
+                lines.push(Line::from(crate::i18n::t(
+                    "zc-config-confirm-preview-unavailable",
+                )));
+            }
+        } else {
+            lines.push(Line::from(crate::i18n::t("zc-config-confirm-reset-effect")));
+        }
+        let text = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let scroll = self.clamp_mutation_scroll(&text, chunks[0], pending.scroll);
+        frame.render_widget(text.scroll((scroll, 0)), chunks[0]);
+        let confirm = editor_key(crate::keymap::ConfigEditorAction::Confirm);
+        let cancel = editor_key(crate::keymap::ConfigEditorAction::Cancel);
+        let hint = if pending.preview.as_ref().is_some_and(|plan| !plan.allowed) {
+            crate::i18n::t_args(
+                "zc-config-confirm-cancel-hint",
+                &[("cancel", &cancel), ("navigate", &nav_keys())],
+            )
+        } else {
+            crate::i18n::t_args(
+                "zc-config-confirm-action-hint",
+                &[
+                    ("confirm", &confirm),
+                    ("cancel", &cancel),
+                    ("navigate", &nav_keys()),
+                ],
+            )
+        };
+        frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), chunks[1]);
+    }
 
     /// Drop the cached composite-tab data for a section prefix, without
     /// issuing any request. A save inside a composite section can retarget
@@ -3729,7 +4129,7 @@ impl App {
                     }
                 }
             }
-            Some(ConfigTabAction::ToggleSecret) => {
+            Some(ConfigTabAction::Delete) => {
                 if let Some(skill) = self.skills_list.get(self.skills_cursor) {
                     let name = skill.name.clone();
                     let bundle = self.skills_bundle.clone();
@@ -5328,7 +5728,7 @@ impl App {
                             ),
                             (
                                 "archive_chord",
-                                &tab_key(crate::keymap::ConfigTabAction::ToggleSecret),
+                                &tab_key(crate::keymap::ConfigTabAction::Delete),
                             ),
                         ],
                     ),
@@ -5552,7 +5952,7 @@ impl App {
     /// create/rename, personality/skills editor). Filters out the bracket-paste
     /// terminator bytes and normalises CRLF.
     pub(crate) async fn handle_paste(&mut self, text: &str) {
-        if self.application_feedback.details_open() {
+        if self.has_mutation_dialog() || self.application_feedback.details_open() {
             return;
         }
         // Normalise line endings — bracketed paste can deliver \r, \r\n,
@@ -5806,7 +6206,7 @@ impl App {
                             crate::i18n::t("zc-config-help-switch-tabs"),
                         ),
                         k(A::Enter, "zc-config-help-open-alias"),
-                        k(A::ToggleSecret, "zc-config-help-delete-alias"),
+                        k(A::Delete, "zc-config-help-delete-alias"),
                         back(),
                         help(),
                         E::spacer(),
@@ -5821,7 +6221,7 @@ impl App {
                     let mut entries = vec![
                         nav(),
                         E::new(open, crate::i18n::t("zc-config-help-open-alias")),
-                        k(A::ToggleSecret, "zc-config-help-delete-alias"),
+                        k(A::Delete, "zc-config-help-delete-alias"),
                         filter(),
                         back(),
                         help(),
@@ -5920,7 +6320,7 @@ impl App {
                                     ),
                                     nav(),
                                     k(A::Enter, "zc-config-help-edit-skill"),
-                                    k(A::ToggleSecret, "zc-config-help-archive-skill"),
+                                    k(A::Delete, "zc-config-help-archive-skill"),
                                     back(),
                                     help(),
                                     E::spacer(),
@@ -6020,7 +6420,7 @@ impl App {
             ));
         }
         entries.push(E::new(
-            tab_keys(A::DeleteRow),
+            tab_keys(A::Reset),
             crate::i18n::t("zc-config-help-reset-default"),
         ));
         entries.push(E::new(
@@ -8920,6 +9320,490 @@ mod tests {
             }
         });
         (manager, calls)
+    }
+
+    fn confirmation_manager(
+        respond: impl Fn(
+            &serde_json::Value,
+        )
+            -> std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError>
+        + Send
+        + 'static,
+    ) -> (App, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let manager = App::new(
+            Arc::new(RpcClient::with_rpc(Arc::clone(&outbound))),
+            std::path::Path::new("/tmp"),
+        );
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Some(raw) = rx.recv().await {
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                recorded.lock().unwrap().push(request.clone());
+                let id = request["id"].as_str().unwrap();
+                match respond(&request) {
+                    Ok(value) => outbound.dispatch_response(id, Some(value), None),
+                    Err(error) => outbound.dispatch_response(id, None, Some(error)),
+                }
+            }
+        });
+        (manager, requests)
+    }
+
+    fn confirmation_response(
+        request: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, crate::jsonrpc::JsonRpcError> {
+        use serde_json::json;
+        match request["method"].as_str().unwrap() {
+            "config/delete-plan" => Err(crate::jsonrpc::JsonRpcError {
+                code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                message: "unavailable".into(),
+                data: None,
+            }),
+            "config/map-key-delete" => Ok(
+                json!({"path": request["params"]["path"], "key": request["params"]["key"], "deleted": true}),
+            ),
+            "config/delete" => Ok(json!({"prop": request["params"]["prop"], "deleted": true})),
+            "config/map-keys" => Ok(json!({"keys": []})),
+            "config/list" => {
+                let mut first = field("a.first");
+                first.tab = ConfigTab::Connection;
+                let mut second = field("a.second");
+                second.tab = ConfigTab::Advanced;
+                Ok(json!({"entries": [first, second]}))
+            }
+            other => panic!("unexpected request: {other}"),
+        }
+    }
+
+    fn confirmation_term() -> Term {
+        ratatui::Terminal::with_options(
+            WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap()
+    }
+
+    fn prepare_alias_confirmation(manager: &mut App) {
+        manager.sections = vec![entry_with_cost("providers.models", "models")];
+        manager.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: "providers.models.test".into(),
+            breadcrumb: vec!["providers.models".into(), "test".into()],
+        };
+        manager.aliases = vec!["first".into(), "second".into()];
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+    }
+
+    #[tokio::test]
+    async fn config_delete_footer_tracks_available_action_and_resolved_binding() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        crate::keymap::overrides::set_row(
+            "config_tab",
+            "toggle_secret",
+            vec![crate::keymap::Chord::char('z')],
+        );
+        let mut manager = test_manager();
+        prepare_alias_confirmation(&mut manager);
+        let delete_hint = format!("z={}", crate::i18n::t("zc-config-footer-action-delete"));
+        // A provider alias also offers rename; both actions must be listed.
+        let rename_hint = format!(
+            "{}={}",
+            tab_key(crate::keymap::ConfigTabAction::RenameAlias),
+            crate::i18n::t("zc-config-footer-action-rename")
+        );
+        assert!(manager.bottom_hint().contains(&delete_hint));
+        assert!(manager.bottom_hint().contains(&rename_hint));
+
+        manager.alias_cursor = manager.aliases.len();
+        assert!(!manager.bottom_hint().contains(&delete_hint));
+        manager.alias_tab = 1;
+        manager.cost_resources = vec!["priced-model".into()];
+        assert!(manager.bottom_hint().contains(&delete_hint));
+        manager.cost_cursor = manager.cost_resources.len();
+        manager.alias_cursor = 0;
+        assert!(!manager.bottom_hint().contains(&delete_hint));
+
+        manager.alias_tab = 0;
+        manager.filter = Some(String::new());
+        manager.filter_origin = Some(FilterOrigin {
+            pane: ZeroclawPane::Detail,
+            section_cursor: 0,
+            active_tab: 0,
+            detail: None,
+        });
+        assert!(!manager.bottom_hint().contains(&delete_hint));
+        manager.filter = None;
+        manager.filter_origin = None;
+        manager.zeroclaw_pane = ZeroclawPane::Sections;
+        assert!(!manager.bottom_hint().contains(&delete_hint));
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        crate::keymap::overrides::set_row("config_tab", "toggle_secret", vec![]);
+        assert!(
+            !manager
+                .bottom_hint()
+                .contains(&crate::i18n::t("zc-config-footer-action-delete"))
+        );
+        crate::keymap::overrides::reset();
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides during asynchronous handler tests"
+    )]
+    async fn config_confirmation_cancels_without_mutation_and_confirms_captured_target_once() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, requests) = confirmation_manager(confirmation_response);
+        prepare_alias_confirmation(&mut manager);
+        let mut term = confirmation_term();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for cancel in [KeyCode::Esc, KeyCode::Tab] {
+            manager
+                .handle_key(key(KeyCode::Char('x')), &mut term)
+                .await
+                .unwrap();
+            assert!(manager.pending_mutation().is_some());
+            assert!(manager.pending_mutation().unwrap().preview.is_none());
+            manager.handle_key(key(cancel), &mut term).await.unwrap();
+            assert!(!manager.has_mutation_dialog());
+        }
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request["method"] == "config/delete-plan")
+        );
+        manager
+            .handle_key(key(KeyCode::Char('x')), &mut term)
+            .await
+            .unwrap();
+        manager
+            .handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 1,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+                Rect::new(0, 0, 100, 30),
+                &mut term,
+            )
+            .await
+            .unwrap();
+        assert!(!manager.has_mutation_dialog());
+        assert!(matches!(manager.screen, Screen::AliasList { .. }));
+        manager
+            .handle_key(key(KeyCode::Char('x')), &mut term)
+            .await
+            .unwrap();
+        manager.alias_cursor = 1;
+        manager.filter = Some("unchanged".into());
+        manager.handle_paste("unsafe\n").await;
+        assert_eq!(manager.filter.as_deref(), Some("unchanged"));
+        let mut repeat = key(KeyCode::Enter);
+        repeat.kind = KeyEventKind::Repeat;
+        manager.handle_key(repeat, &mut term).await.unwrap();
+        assert!(manager.pending_mutation().is_some());
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        assert!(manager.pending_mutation().is_none());
+        let mutations: Vec<_> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "config/map-key-delete")
+            .cloned()
+            .collect();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(
+            mutations[0]["params"],
+            serde_json::json!({"path": "providers.models.test", "key": "first"})
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides during asynchronous handler tests"
+    )]
+    async fn config_confirmation_reset_keeps_tab_and_cost_delete_uses_the_cost_map() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, requests) = confirmation_manager(confirmation_response);
+        let mut term = confirmation_term();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        prepare_alias_confirmation(&mut manager);
+        manager.alias_tab = 1;
+        manager.cost_resources = vec!["priced-model".into()];
+        manager
+            .handle_key(key(KeyCode::Char('d')), &mut term)
+            .await
+            .unwrap();
+        assert!(!manager.has_mutation_dialog());
+        manager
+            .handle_key(key(KeyCode::Char('x')), &mut term)
+            .await
+            .unwrap();
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(
+            requests.lock().unwrap()[1]["params"],
+            serde_json::json!({"path": "cost.rates.providers.models.test", "key": "priced-model"})
+        );
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+        };
+        let before = requests.lock().unwrap().len();
+        let field_kind = manager.fields[1].kind;
+        manager.fields[1].kind = PropKind::SecretMap;
+        manager
+            .handle_key(key(KeyCode::Char('d')), &mut term)
+            .await
+            .unwrap();
+        assert!(!manager.has_mutation_dialog());
+        assert_eq!(requests.lock().unwrap().len(), before);
+        manager.fields[1].kind = field_kind;
+        manager
+            .handle_key(key(KeyCode::Char('d')), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), before);
+        manager
+            .handle_key(key(KeyCode::Esc), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), before);
+        manager
+            .handle_key(key(KeyCode::Char('d')), &mut term)
+            .await
+            .unwrap();
+        manager
+            .handle_key(key(KeyCode::Enter), &mut term)
+            .await
+            .unwrap();
+        assert_eq!(manager.active_tab, 1);
+        assert_eq!(manager.field_cursor, 1);
+        assert_eq!(
+            requests.lock().unwrap()[before]["params"],
+            serde_json::json!({"prop": "a.second"})
+        );
+        assert_eq!(requests.lock().unwrap().len(), before + 2);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides during asynchronous handler tests"
+    )]
+    async fn config_confirmation_blockers_and_preview_errors_never_mutate() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        for denied_preview in [false, true] {
+            let (mut manager, requests) = confirmation_manager(move |request| {
+                assert_eq!(request["method"], "config/delete-plan");
+                if denied_preview {
+                    Err(crate::jsonrpc::JsonRpcError {
+                        code: -32001,
+                        message: "permission denied".into(),
+                        data: None,
+                    })
+                } else {
+                    Ok(
+                        serde_json::json!({"path": request["params"]["path"], "key": request["params"]["key"], "allowed": false,
+                        "blockers": [{"path": "agents.example.model_provider", "raw_value": "redacted"}], "scrubs": [], "cascades_owned_state": false}),
+                    )
+                }
+            });
+            prepare_alias_confirmation(&mut manager);
+            let mut term = confirmation_term();
+            manager
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                    &mut term,
+                )
+                .await
+                .unwrap();
+            if denied_preview {
+                assert!(manager.pending_mutation().is_none());
+                assert!(
+                    matches!(&manager.mutation_dialog, Some(ConfigMutationDialog::Outcome { message, .. }) if message.contains("permission denied"))
+                );
+            } else {
+                manager
+                    .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+                    .await
+                    .unwrap();
+                assert!(manager.pending_mutation().is_some());
+            }
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "serialize process-wide keymap overrides during asynchronous handler tests"
+    )]
+    async fn config_confirmation_reports_warnings_and_committed_refresh_failure_without_retry() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+        let (mut manager, requests) = confirmation_manager(|request| {
+            match request["method"].as_str().unwrap() {
+                "config/map-key-delete" => Ok(
+                    serde_json::json!({"path": request["params"]["path"], "key": request["params"]["key"], "deleted": true, "warnings": ["workspace cleanup incomplete"]}),
+                ),
+                "config/map-keys" => Err(crate::jsonrpc::JsonRpcError {
+                    code: -32603,
+                    message: "refresh unavailable".into(),
+                    data: None,
+                }),
+                _ => confirmation_response(request),
+            }
+        });
+        prepare_alias_confirmation(&mut manager);
+        let mut term = confirmation_term();
+        for code in [KeyCode::Char('x'), KeyCode::Enter] {
+            manager
+                .handle_key(KeyEvent::new(code, KeyModifiers::NONE), &mut term)
+                .await
+                .unwrap();
+        }
+        assert!(manager.pending_mutation().is_none());
+        let Some(ConfigMutationDialog::Outcome {
+            message: status, ..
+        }) = manager.mutation_dialog.as_ref()
+        else {
+            panic!("expected readable outcome");
+        };
+        assert!(status.contains("Deleted"));
+        assert!(status.contains("refresh unavailable"));
+        assert!(status.contains("workspace cleanup incomplete"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Config mutation result"));
+        assert!(rendered.contains("workspace cleanup incomplete"));
+        assert!(manager.aliases.is_empty());
+        assert!(manager.loaded_section.is_none());
+        manager
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await
+            .unwrap();
+        assert!(!manager.has_mutation_dialog());
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "config/map-key-delete")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn config_mutation_result_scroll_stops_at_the_last_line() {
+        let mut manager = test_manager();
+        manager.show_mutation_outcome("first\nsecond\nlast line".into());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| manager.draw_mutation_confirmation(frame, frame.area()))
+            .unwrap();
+        let mut term = confirmation_term();
+        for _ in 0..40 {
+            manager
+                .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+                .await
+                .unwrap();
+        }
+        terminal
+            .draw(|frame| manager.draw_mutation_confirmation(frame, frame.area()))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("last line"));
+        // The stored offset is clamped too, so one Up scrolls back at once.
+        assert!(matches!(
+            manager.mutation_dialog,
+            Some(ConfigMutationDialog::Outcome { scroll: 0, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_reconnect_keeps_a_mutation_result_and_drops_a_pending_confirmation() {
+        let mut old = test_manager();
+        old.show_mutation_outcome("cleanup incomplete".into());
+        let mut next = test_manager();
+        old.hand_off_mutation_outcome(&mut next);
+        assert!(matches!(
+            next.mutation_dialog.as_ref(),
+            Some(ConfigMutationDialog::Outcome { message, .. }) if message == "cleanup incomplete"
+        ));
+
+        let mut old = test_manager();
+        old.mutation_dialog = Some(ConfigMutationDialog::Confirm(PendingConfigMutation {
+            action: ConfigMutation::Reset {
+                prop: "cost.daily_limit_usd".into(),
+                prefix: "cost".into(),
+                tab: None,
+            },
+            preview: None,
+            scroll: 0,
+        }));
+        let mut next = test_manager();
+        old.hand_off_mutation_outcome(&mut next);
+        assert!(!next.has_mutation_dialog());
     }
 
     #[tokio::test]

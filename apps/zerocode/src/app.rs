@@ -1916,6 +1916,7 @@ pub async fn run(
                             chat_pane.commit_reconnect_handoff();
                             acp_pane.commit_reconnect_handoff();
                             let previous_flushed = inbound_router.cancel_pending().await;
+                            config_app.hand_off_mutation_outcome(&mut panes.1);
                             // Assigned as one tuple: every pane the builder
                             // produces is adopted, and a later pane addition
                             // cannot stay bound to the old client silently.
@@ -2354,6 +2355,31 @@ pub async fn run(
         if confirmation_modal_owns_event(&input_event, reload_confirm, quit_confirm) {
             // The visible confirmation modal is the authoritative input
             // owner; discard paste instead of forwarding it underneath.
+            continue;
+        }
+
+        // Config confirmation owns input before global pane/sidebar navigation.
+        // Paste cannot fall through and edit or confirm the underlying row.
+        if mode == Mode::Config
+            && config_app.has_mutation_dialog()
+            && matches!(
+                input_event,
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_)
+            )
+        {
+            if dispatch_state.rpc_allowed() || !config_app.has_pending_mutation() {
+                match input_event {
+                    Event::Key(key) => {
+                        config_app.handle_key(key, term).await?;
+                    }
+                    Event::Mouse(mouse) => {
+                        config_app.handle_mouse(mouse, content_area, term).await?;
+                    }
+                    _ => {}
+                }
+            } else {
+                config_app.cancel_mutation_dialog();
+            }
             continue;
         }
 
