@@ -20623,7 +20623,9 @@ pub(crate) mod tests {
             );
             let redacted =
                 append_provider_fallback_footer("answer".into(), Some(&fallback), None, Redacted);
-            assert!(redacted.contains("fallback model"));
+            assert!(redacted.contains(&channel_runtime_cli_string(
+                "channel-runtime-model-fallback-redacted"
+            )));
             for identifier in [requested_provider, "custom.private", "model-a", "model-b"] {
                 assert!(!redacted.contains(identifier));
             }
@@ -28444,7 +28446,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 match mode {
                     Off => assert_eq!(delivered, "test-room:accepted answer"),
                     Redacted => {
-                        assert!(delivered.contains("fallback model"));
+                        assert!(delivered.contains(&channel_runtime_cli_string(
+                            "channel-runtime-model-fallback-redacted"
+                        )));
                         for identifier in ["custom.notice", "model-a", "model-b"] {
                             assert!(!delivered.contains(identifier));
                         }
