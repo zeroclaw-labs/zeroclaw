@@ -16839,6 +16839,14 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Send replies with Bot API rich messages (native tables, headings, lists, and quotes).
+    ///
+    /// Some Telegram clients still show rich messages as unsupported, so this
+    /// stays off until every client in use can render them. With it off, tables
+    /// are delivered as preformatted text.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub rich_messages: bool,
     /// When `true` (default), group-chat sessions key on the sender, so
     /// distinct members of the same group (or forum topic) each get an
     /// isolated conversation context (matches the existing behavior). When
@@ -16922,6 +16930,7 @@ impl Default for TelegramConfig {
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            rich_messages: false,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -33792,6 +33801,8 @@ auto_save = true
                         excluded_tools: vec![],
                         reply_min_interval_secs: 0,
                         reply_queue_depth_max: 0,
+
+                        rich_messages: false,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -35832,6 +35843,8 @@ default_temperature = 0.7
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             debounce_ms: None,
+
+            rich_messages: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -35868,6 +35881,15 @@ stream_mode = "single_message"
     async fn telegram_config_passive_group_context_defaults_off() {
         let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
         assert!(!parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn telegram_config_rich_messages_defaults_off_and_parses_true() {
+        let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(!parsed.rich_messages);
+        let enabled: TelegramConfig =
+            serde_json::from_str(r#"{"bot_token":"t","rich_messages":true}"#).unwrap();
+        assert!(enabled.rich_messages);
     }
 
     #[test]
@@ -42596,6 +42618,8 @@ high_entropy_tokens = false
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+
+                rich_messages: false,
             },
         );
 
