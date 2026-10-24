@@ -1659,6 +1659,11 @@ peer-delivery-control-plane-unavailable = in-process peer delivery requires an a
 peer-delivery-registration-failed = peer delivery rejected: {$error}
 peer-delivery-accepted = accepted for in-process delivery to peer agent "{$recipient}" (task_id={$task_id})
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
+tool-spawn-subagent-error-model-hint-invalid = spawn_subagent: model_hint must be a non-empty string naming a configured route; omit it to run on this agent’s own model.
+tool-spawn-subagent-error-model-hint-unknown = spawn_subagent: unknown model_hint "{ $hint }"; configured hints: { $hints }
+tool-spawn-subagent-error-model-hint-no-routes = spawn_subagent: unknown model_hint "{ $hint }"; no [[model_routes]] are configured, so subagents run on this agent’s own model.
+tool-spawn-subagent-error-model-hint-not-permitted = spawn_subagent: model_hint chooses the subagent’s model, and this agent’s risk profile does not allow it to switch models (model_switch); omit model_hint to run on this agent’s own model.
+tool-spawn-subagent-error-model-hint-needs-approval = spawn_subagent: model_hint chooses the subagent’s model, and switching models requires approval for this agent (model_switch), which a subagent spawn cannot grant; omit model_hint to run on this agent’s own model.
 
 # ── RPC inbound authentication ──
 rpc-auth-required-token = Authentication required: present auth_token in initialize, or connect from a mapped local uid
