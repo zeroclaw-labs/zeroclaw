@@ -45,6 +45,12 @@ importantly, what changes for existing remote connections.
      read. A fleet cost summary lists only the principal's agents in its
      per-agent breakdown, but its totals and its per-model usage still cover
      every agent;
+   - the daemon-wide log and event reads (`logs/subscribe`,
+     `events/subscribe`, `events/history`, `logs/query`, and `logs/get`)
+     serve only administrators and the shared operator. Their records come
+     from every principal's work, other principals' authorization denials
+     among them, and many name no owner, so a scoped principal is refused
+     even with `Logs:Read` and the `*` agent selector;
    - `fs/list_dir` lists only absolute paths that the policy of an enabled
      agent the principal may use lets that agent read. It refuses relative
      paths, `..` components, and, on Windows, network and device paths.
@@ -518,9 +524,10 @@ layer in follow-ups.
   revalidation deadline; past it, the next operation is refused until the
   client re-initializes (which re-verifies against the IdP).
 - **Pairing revocation** applies before the connection's next operation.
-- **Log subscriptions**: an open `logs/subscribe` stream is rechecked on
-  every delivery and ends at the first one after its credential expires,
-  its pairing is revoked, or its principal loses `Logs:Read`.
+- **Log subscriptions**: an open `logs/subscribe` or `events/subscribe`
+  stream is rechecked on every delivery and ends at the first one after its
+  credential expires, its pairing is revoked, or its principal loses
+  `Logs:Read` or administrator rights.
 - **Policy changes**: a config save that leaves `[oidc]`, `[users]`,
   `[permission_profiles]`, and `security.trust_daemon_uid` unchanged keeps
   every binding as it is. A change to any of them publishes a new policy.
