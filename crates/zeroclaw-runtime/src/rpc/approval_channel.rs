@@ -25,6 +25,42 @@ use super::context::ApprovalPendingMap;
 
 const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Sends `approval_withdrawn` for a prompt the client is still showing
+/// when its request ends without an operator answer.
+struct WithdrawOnDrop {
+    rpc: Arc<RpcOutbound>,
+    session_id: String,
+    request_id: String,
+    armed: bool,
+}
+
+impl Drop for WithdrawOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let unsent = self.rpc.try_notify(
+            "session/update",
+            json!({
+                "type": "approval_withdrawn",
+                "session_id": self.session_id,
+                "request_id": self.request_id,
+            }),
+        );
+        // A full writer queue must not lose the withdrawal: the client would
+        // keep a blocking prompt up for a turn that already moved on. Wait
+        // for room on a task instead of dropping it.
+        if let Some(line) = unsent
+            && tokio::runtime::Handle::try_current().is_ok()
+        {
+            let rpc = Arc::clone(&self.rpc);
+            zeroclaw_spawn::spawn!(async move {
+                rpc.send_raw(line).await;
+            });
+        }
+    }
+}
+
 pub struct RpcApprovalChannel {
     name: String,
     session_id: String,
@@ -112,6 +148,22 @@ impl Channel for RpcApprovalChannel {
             .await
     }
 
+    /// Honour the caller's budget on the pending entry itself. The trait
+    /// default would wrap `request_approval_attributed`, whose own 120 s
+    /// deadline fires first, so a caller asking for longer (the budget
+    /// override prompt) would be cut short.
+    async fn request_approval_attributed_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        RpcApprovalChannel::request_approval_attributed_with_timeout(
+            self, recipient, request, timeout,
+        )
+        .await
+    }
+
     async fn request_choice(
         &self,
         question: &str,
@@ -193,11 +245,22 @@ impl RpcApprovalChannel {
             )
             .await;
 
+        // Until the operator answers, leaving this function for any reason
+        // (timeout, or the caller dropping the future because the decision
+        // came from elsewhere) tells the client to take the prompt down.
+        let mut withdraw = WithdrawOnDrop {
+            rpc: Arc::clone(&self.rpc),
+            session_id: self.session_id.clone(),
+            request_id: request_id.clone(),
+            armed: true,
+        };
+
         // Only the answered arm is an operator decision. The other two deny
         // because the client went away or never answered, and say so.
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => {
                 pending_request.disarm();
+                withdraw.armed = false;
                 Ok(Some(
                     zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
                 ))
@@ -373,6 +436,39 @@ mod tests {
         assert_eq!(result, Some(ChannelApprovalResponse::Approve));
     }
 
+    /// Through `dyn Channel`, the caller's budget must reach the pending
+    /// entry and the client frame. The trait default would wrap the 120 s
+    /// inner deadline, so a longer budget was silently cut short.
+    #[tokio::test]
+    async fn trait_with_timeout_uses_caller_budget() {
+        let (rpc, mut write_rx) = make_rpc();
+        let pending = make_pending();
+        let ch: Arc<dyn Channel> =
+            Arc::new(make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending)));
+        let request = ChannelApprovalRequest {
+            tool_name: zeroclaw_api::channel::COST_LIMIT_OVERRIDE_APPROVAL.to_string(),
+            arguments_summary: "limit reached".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_approval_attributed_with_timeout(
+                "",
+                &request,
+                std::time::Duration::from_secs(600),
+            )
+            .await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["params"]["timeout_secs"], 600);
+        let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
+        assert!(pending.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve));
+        let result = task.await.unwrap().unwrap().expect("an operator answer");
+        assert_eq!(result.response, ChannelApprovalResponse::Approve);
+    }
+
     #[tokio::test]
     async fn times_out_and_auto_denies() {
         let (rpc, mut write_rx) = make_rpc();
@@ -432,6 +528,74 @@ mod tests {
         assert!(
             !pending.contains(&request_id),
             "dropping the approval future must remove the pending request"
+        );
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["params"]["type"], "approval_withdrawn");
+        assert_eq!(v["params"]["request_id"], request_id.as_str());
+        assert_eq!(v["params"]["session_id"], "sess-1");
+    }
+
+    /// The withdrawal still reaches the client when the shared writer queue
+    /// is full at the moment the request ends.
+    #[tokio::test]
+    async fn withdrawal_survives_a_full_writer_queue() {
+        let (tx, mut write_rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let pending = make_pending();
+        let ch = make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending));
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "sleep 60".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_approval_with_timeout("", &request, std::time::Duration::from_secs(60))
+                .await
+        });
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
+
+        // Another session's output fills the only slot.
+        assert!(rpc.send_raw("other".to_string()).await);
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(write_rx.recv().await.unwrap(), "other");
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), write_rx.recv())
+            .await
+            .expect("the withdrawal must be delivered once the queue drains")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["params"]["type"], "approval_withdrawn");
+        assert_eq!(v["params"]["request_id"], request_id.as_str());
+    }
+
+    #[tokio::test]
+    async fn answered_request_is_not_withdrawn() {
+        let (rpc, mut write_rx) = make_rpc();
+        let pending = make_pending();
+        let ch = make_channel_no_caps(Arc::clone(&rpc), Arc::clone(&pending));
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_approval_with_timeout("", &request, std::time::Duration::from_secs(60))
+                .await
+        });
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
+        assert!(pending.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve));
+        task.await.unwrap().unwrap();
+        assert!(
+            write_rx.try_recv().is_err(),
+            "an answered prompt must not be withdrawn"
         );
     }
 

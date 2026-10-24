@@ -172,7 +172,12 @@ events:
 ```
 
 Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
-`tool_result`, `approval_request`.
+`tool_result`, `approval_request`, `approval_withdrawn`.
+
+`approval_withdrawn` (`request_id`) means the daemon stopped waiting on an
+`approval_request` it sent without an answer from this client: the request
+timed out, or the same decision was made in another session. Clients take
+that prompt down; answering it afterwards is a no-op.
 
 ### ACP durable lifecycle
 
