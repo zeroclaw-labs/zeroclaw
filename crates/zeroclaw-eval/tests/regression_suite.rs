@@ -45,6 +45,7 @@ async fn missing_argument_fixture_fails_when_the_dispatch_is_silently_repaired()
     let observed = run_case(&trace, &RunDeps::replay())
         .await
         .expect("the fixture must replay");
+    let observed = observed.record;
     let graded = evaluate_expects(&trace.expects, &observed);
     assert!(
         graded.iter().all(|grade| grade.passed),

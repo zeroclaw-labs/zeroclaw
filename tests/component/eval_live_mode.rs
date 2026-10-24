@@ -104,6 +104,8 @@ case_timeout_secs = 30
         "the live case must grade green: {report}"
     );
     assert_eq!(report["cases"][0]["name"], "live-cli-echo");
+    assert_eq!(report["cases"][0]["grades"][0]["category"], "response");
+    assert_eq!(report["cases"][0]["grades"][1]["category"], "tool");
 
     // The request that actually left the process must carry the configured
     // model. A regression that drops the resolved metadata sends

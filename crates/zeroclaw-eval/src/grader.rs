@@ -2,7 +2,19 @@
 
 use crate::case::{ToolPayloadExpect, TraceExpects};
 use crate::record::RunRecord;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// Which dimension of a run a check scores. Surfaced in the JSON report so
+/// per-category totals and (later) regression classification are possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GradeCategory {
+    Response,
+    Tool,
+    SideEffect,
+    Budget,
+    Judge,
+}
 
 /// The outcome of a single check.
 #[derive(Debug, Clone, Serialize)]
@@ -13,23 +25,40 @@ pub struct GradeResult {
     pub passed: bool,
     /// Human-readable detail (especially useful on failure).
     pub detail: String,
+    /// Which run dimension this check scores.
+    pub category: GradeCategory,
 }
 
 impl GradeResult {
-    fn new(check: String, passed: bool, detail: impl Into<String>) -> Self {
+    /// Construct a grade. Public because [`Grader`] is a public trait: an
+    /// out-of-crate grader (including the live-path integration tests) needs a
+    /// way to produce results without depending on field order.
+    pub fn new(
+        check: String,
+        passed: bool,
+        detail: impl Into<String>,
+        category: GradeCategory,
+    ) -> Self {
         Self {
             check,
             passed,
             detail: detail.into(),
+            category,
         }
     }
 }
 
-/// A scorer over a completed run. Phase 0 has a single implementation
-/// ([`ExpectationsGrader`]); the trait exists so later phases can add more.
+/// Context available to graders while the case's workspace still exists.
+pub struct GradeContext<'a> {
+    pub workspace: &'a std::path::Path,
+}
+
+/// A scorer over a completed run. The trait is async and workspace-aware so
+/// later graders can inspect the case's temp workspace before it is torn down.
+#[async_trait::async_trait]
 pub trait Grader: Send + Sync {
     fn name(&self) -> &str;
-    fn grade(&self, run: &RunRecord) -> Vec<GradeResult>;
+    async fn grade(&self, run: &RunRecord, ctx: &GradeContext<'_>) -> Vec<GradeResult>;
 }
 
 /// Grades a run against declarative [`TraceExpects`].
@@ -37,12 +66,13 @@ pub struct ExpectationsGrader {
     pub expects: TraceExpects,
 }
 
+#[async_trait::async_trait]
 impl Grader for ExpectationsGrader {
     fn name(&self) -> &str {
         "expectations"
     }
 
-    fn grade(&self, run: &RunRecord) -> Vec<GradeResult> {
+    async fn grade(&self, run: &RunRecord, _ctx: &GradeContext<'_>) -> Vec<GradeResult> {
         evaluate_expects(&self.expects, run)
     }
 }
@@ -99,6 +129,7 @@ fn grade_payload(expect: &ToolPayloadExpect, run: &RunRecord, kind: PayloadKind)
                     } else {
                         format!("call {idx} payload was {payload:?}")
                     },
+                    GradeCategory::Tool,
                 )
             }
             None => GradeResult::new(
@@ -108,6 +139,7 @@ fn grade_payload(expect: &ToolPayloadExpect, run: &RunRecord, kind: PayloadKind)
                     "no call {idx} to {tool:?}; only {} call(s) observed: {matching:?}",
                     matching.len()
                 ),
+                GradeCategory::Tool,
             ),
         },
         None => {
@@ -119,6 +151,7 @@ fn grade_payload(expect: &ToolPayloadExpect, run: &RunRecord, kind: PayloadKind)
                         "{tool:?} was never called; tools called: {:?}",
                         run.tool_names()
                     ),
+                    GradeCategory::Tool,
                 )
             } else {
                 let passed = matching.iter().any(|p| p.contains(needle));
@@ -130,6 +163,7 @@ fn grade_payload(expect: &ToolPayloadExpect, run: &RunRecord, kind: PayloadKind)
                     } else {
                         format!("not found; observed payloads: {matching:?}")
                     },
+                    GradeCategory::Tool,
                 )
             }
         }
@@ -152,6 +186,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
             } else {
                 format!("not found in response: {resp:?}")
             },
+            GradeCategory::Response,
         ));
     }
 
@@ -165,6 +200,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
             } else {
                 format!("unexpectedly present in response: {resp:?}")
             },
+            GradeCategory::Response,
         ));
     }
 
@@ -178,6 +214,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
             } else {
                 format!("not called; tools called: {tool_names:?}")
             },
+            GradeCategory::Tool,
         ));
     }
 
@@ -191,6 +228,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
             } else {
                 "unexpectedly called".to_string()
             },
+            GradeCategory::Tool,
         ));
     }
 
@@ -201,6 +239,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
             format!("max_tool_calls({max})"),
             passed,
             format!("{actual} tool call(s)"),
+            GradeCategory::Tool,
         ));
     }
 
@@ -211,6 +250,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
             format!("min_tool_calls({min})"),
             passed,
             format!("{actual} tool call(s)"),
+            GradeCategory::Tool,
         ));
     }
 
@@ -221,6 +261,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
             format!("exact_tool_calls({exact})"),
             passed,
             format!("{actual} tool call(s): {tool_names:?}"),
+            GradeCategory::Tool,
         ));
     }
 
@@ -239,6 +280,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
             format!("all_tools_succeeded({expected})"),
             passed,
             format!("actual all_tools_succeeded = {actual}"),
+            GradeCategory::Tool,
         ));
     }
 
@@ -254,17 +296,44 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
                     } else {
                         format!("no match in response: {resp:?}")
                     },
+                    GradeCategory::Response,
                 ));
             }
             Err(e) => out.push(GradeResult::new(
                 format!("response_matches({pattern:?})"),
                 false,
                 format!("invalid regex: {e}"),
+                GradeCategory::Response,
             )),
         }
     }
 
     out
+}
+
+/// Build the production grader catalog for a case.
+///
+/// Keeping construction separate lets the runner accept a test-supplied
+/// catalog while production still has one canonical default.
+pub fn default_graders(trace: &crate::case::LlmTrace) -> Vec<Box<dyn Grader>> {
+    vec![Box::new(ExpectationsGrader {
+        expects: trace.expects.clone(),
+    })]
+}
+
+/// Run a supplied grader catalog while the workspace is alive, returning all
+/// grades in catalog order.
+pub async fn grade_with(
+    graders: &[Box<dyn Grader>],
+    record: &RunRecord,
+    workspace: &std::path::Path,
+) -> Vec<GradeResult> {
+    let ctx = GradeContext { workspace };
+    let mut grades = Vec::new();
+    for grader in graders {
+        grades.extend(grader.grade(record, &ctx).await);
+    }
+    grades
 }
 
 #[cfg(test)]
@@ -273,6 +342,48 @@ mod tests {
     use crate::case::{ToolPayloadExpect, TraceExpects};
     use crate::observer::RecordedCall;
     use crate::record::RunRecord;
+
+    #[tokio::test]
+    async fn grades_run_while_workspace_alive() {
+        // Control for the two runner-path regressions in `runner.rs` and
+        // `live.rs`: those assert the runner still has the workspace alive when
+        // it awaits grading, and this proves that exists() check is meaningful
+        // rather than tautological, because the same probe on the same path
+        // flips to false once the directory is dropped.
+        struct Probe;
+        #[async_trait::async_trait]
+        impl Grader for Probe {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            async fn grade(&self, _run: &RunRecord, ctx: &GradeContext<'_>) -> Vec<GradeResult> {
+                vec![GradeResult::new(
+                    "workspace_alive".to_string(),
+                    ctx.workspace.exists(),
+                    "",
+                    GradeCategory::SideEffect,
+                )]
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_path_buf();
+        let record = run("hi", &[], true);
+        let grades = Probe
+            .grade(&record, &GradeContext { workspace: &path })
+            .await;
+        assert!(grades[0].passed, "workspace must exist during grading");
+
+        // Control: once the workspace drops, the same probe fails on the same path,
+        // so the assertion above is not vacuously true.
+        drop(tmp);
+        let after = Probe
+            .grade(&record, &GradeContext { workspace: &path })
+            .await;
+        assert!(
+            !after[0].passed,
+            "probe must fail once the workspace is torn down"
+        );
+    }
 
     fn run(resp: &str, tools: &[&str], all_ok: bool) -> RunRecord {
         RunRecord {
@@ -480,6 +591,7 @@ mod tests {
             "mutated argument must fail the grade: {arg_grade:?}"
         );
         assert!(arg_grade.detail.contains("naive cafe"));
+        assert_eq!(arg_grade.category, GradeCategory::Tool);
     }
 
     #[test]
