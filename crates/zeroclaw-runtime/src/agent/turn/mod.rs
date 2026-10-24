@@ -2729,7 +2729,7 @@ async fn run_tool_call_loop_impl<'a>(
 
         let ProviderCallOutcome {
             chat_result,
-            attempts,
+            mut accounting,
             accepted_route,
             streamed_live_deltas,
             streamed_protocol_suppressed,
@@ -2888,12 +2888,12 @@ async fn run_tool_call_loop_impl<'a>(
                 )
             }
             Err(e) => {
-                crate::agent::cost::settle_provider_attempts(&attempts, None);
+                accounting.settle_all_rejected();
                 // This iteration's attempts never reach an accepted response
                 // (recovery continues with a fresh attempt vec, otherwise the
                 // turn fails) — project them now so the gateway ledger stays
                 // complete.
-                emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
+                emit_rejected_attempt_usage(ctx.event_tx, accounting.attempts()).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     injected_memory_preamble,
@@ -2962,11 +2962,11 @@ async fn run_tool_call_loop_impl<'a>(
         // Any parser or stream-protocol guard finding rejects the transport
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
-            crate::agent::cost::settle_provider_attempts(&attempts, None);
+            accounting.settle_all_rejected();
             // Same contract as the error branch: this iteration's attempts
             // are settled but never accepted — project them before retrying
             // with a fresh vec or returning the fallback.
-            emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
+            emit_rejected_attempt_usage(ctx.event_tx, accounting.attempts()).await;
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -3059,16 +3059,16 @@ async fn run_tool_call_loop_impl<'a>(
         // Earlier physical leaves are rejected routing/retry work. The final
         // accepted response remains settled by `record_accepted_chat_response`
         // so only it updates context-window telemetry.
-        crate::agent::cost::settle_provider_attempts(
-            &attempts[..attempts.len().saturating_sub(1)],
-            None,
-        );
+        accounting.settle_rejected_prefix();
         // Emit TurnEvent::Usage for each billable rejected attempt so the
         // gateway's usage_by_provider breakdown includes all billable attempts
         // (accepted + rejected). This makes the breakdown the single source of
         // truth that the done-frame cost_usd can be derived from.
-        emit_rejected_attempt_usage(ctx.event_tx, &attempts[..attempts.len().saturating_sub(1)])
-            .await;
+        emit_rejected_attempt_usage(
+            ctx.event_tx,
+            &accounting.attempts()[..accounting.attempts().len().saturating_sub(1)],
+        )
+        .await;
         record_accepted_chat_response(
             &ctx,
             &served_provider,
@@ -3081,6 +3081,7 @@ async fn run_tool_call_loop_impl<'a>(
             llm_started_at,
             iteration,
             accepted_route.as_ref(),
+            &mut accounting,
         )
         .await;
 
@@ -6406,6 +6407,7 @@ mod active_route_context_tests {
             Instant::now(),
             0,
             None,
+            &mut crate::agent::turn::provider_call::ProviderCallAccounting::new(),
         )
         .await;
 

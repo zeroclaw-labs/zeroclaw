@@ -40,15 +40,14 @@ pub(crate) struct TurnCtx<'a> {
     /// Per-iteration override for the provider that served the current LLM
     /// call when vision routing resolved a different provider. Owned `String`
     /// because the vision-resolved name's lifetime is the iteration scope.
-    /// This is only used for vision routing without Reliable wrapping;
-    /// when Reliable produces an AcceptedRoute, the AcceptedRoute tuple is
-    /// the authoritative identity and this field is ignored.
+    /// Used when no AcceptedRoute is available. Any AcceptedRoute supersedes
+    /// the configured tuple; its fallback flag controls observability, not
+    /// whether its physical provider/model identity is authoritative.
     pub(crate) serving_provider_name: Option<String>,
     /// Per-iteration override for the model that served the current LLM call
     /// when vision routing selected a different model. This is only used for
-    /// vision routing without Reliable wrapping; when Reliable produces an
-    /// AcceptedRoute, the AcceptedRoute tuple is the authoritative identity
-    /// and this field is ignored.
+    /// vision routing without an AcceptedRoute; every accepted route carries
+    /// the authoritative physical model, including a primary success.
     pub(crate) serving_model: Option<String>,
 }
 

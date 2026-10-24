@@ -1,15 +1,162 @@
 //! Regression coverage for direct `zeroclaw agent` terminal-failure delivery.
 //!
-//! This launches the production binary against a local OpenAI-compatible mock.
-//! It proves the single-shot CLI boundary renders the Fluent message instead of
-//! returning the stable provider diagnostic after Reliable exhausts an empty
-//! completion.
+//! Local compatible and Anthropic fixtures launch the production binary and
+//! verify final localized error delivery, process status, and request counts.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn anthropic_incomplete_reasons_reach_final_cli_output() {
+    for (reason, expected) in [
+        (
+            "max_tokens",
+            "The provider reached its output token limit before completing the response.",
+        ),
+        (
+            "model_context_window_exceeded",
+            "The provider reached its context window before completing the response.",
+        ),
+        (
+            "pause_turn",
+            "The provider paused the turn before completing the response.",
+        ),
+        (
+            "unknown-terminal",
+            "The provider ended with an invalid terminal response state.",
+        ),
+        (
+            "refusal",
+            "The model's safety system declined this request.",
+        ),
+    ] {
+        for interactive in [false, true] {
+            let server = MockServer::start().await;
+            let response = if interactive {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!(
+                        concat!(
+                            "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":10}}}}}}\n\n",
+                            "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n",
+                            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"unfinished provider text\"}}}}\n\n",
+                            "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
+                            "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{}\"}},\"usage\":{{\"output_tokens\":2}}}}\n\n",
+                            "event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+                        ), reason
+                    ))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content": [{"type": "text", "text": "unfinished provider text"}],
+                    "stop_reason": reason,
+                    "usage": {"input_tokens": 10, "output_tokens": 2},
+                }))
+            };
+            let request = Mock::given(method("POST")).and(path("/v1/messages"));
+            let request = if interactive {
+                request.and(body_partial_json(serde_json::json!({"stream": true})))
+            } else {
+                request
+            };
+            request.respond_with(response).mount(&server).await;
+            let config_dir = tempfile::tempdir().expect("isolated CLI configuration");
+            std::fs::write(
+                config_dir.path().join("config.toml"),
+                format!(
+                    r#"schema_version = 3
+locale = "en"
+
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0
+
+[risk_profiles.default]
+
+[runtime_profiles.default]
+
+[providers.models.anthropic.mock]
+api_key = "test-key"
+uri = "{}"
+model = "test-model"
+
+[agents.default]
+model_provider = "anthropic.mock"
+risk_profile = "default"
+runtime_profile = "default"
+"#,
+                    server.uri()
+                ),
+            )
+            .expect("write isolated CLI fixture");
+            let config_path = config_dir.path().to_path_buf();
+            let output = std::thread::spawn(move || {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_zeroclaw"));
+                command.env("RUST_LOG", "off").args([
+                    "--config-dir",
+                    config_path.to_str().expect("UTF-8 fixture path"),
+                    "agent",
+                    "--agent",
+                    "default",
+                ]);
+                if !interactive {
+                    return command
+                        .args(["--message", "test prompt"])
+                        .output()
+                        .expect("run one-shot CLI");
+                }
+                let mut child = command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("run interactive CLI");
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("piped input")
+                    .write_all(b"test prompt\n/quit\n")
+                    .expect("send prompt and exit command");
+                child
+                    .wait_with_output()
+                    .expect("collect interactive CLI output")
+            })
+            .join()
+            .expect("CLI fixture thread completes");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), interactive, "{reason}: {stderr}");
+            assert!(
+                stderr.contains(expected),
+                "{reason}: expected {expected:?}, received {stderr:?}"
+            );
+            assert!(
+                !stderr.contains("unfinished provider text"),
+                "incomplete text must not become final output"
+            );
+            if !interactive {
+                assert!(
+                    !String::from_utf8_lossy(&output.stdout).contains("unfinished provider text")
+                );
+            }
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("recorded requests")
+                    .len(),
+                1,
+                "{reason}: an incomplete visible response must not replay"
+            );
+            println!(
+                "CLI_TERMINAL reason={reason} interactive={interactive} locale=en status={} stdout={:?} stderr={stderr:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+}
 
 #[tokio::test]
 async fn interactive_agent_renders_image_recovery_and_next_text_turn() {
