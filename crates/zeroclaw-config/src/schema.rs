@@ -12854,15 +12854,27 @@ pub struct MemoryConfig {
 
     // ── Conflict Resolution ─────────────────────────────────────
     /// Cosine similarity threshold for conflict detection (0.0–1.0).
+    /// Automatic supersession requires raw vector evidence; keyword-only
+    /// recall leaves existing Core facts visible regardless of search rank.
+    /// Cosine similarity is model-dependent and does not prove contradiction:
+    /// complementary facts can exceed this threshold. Validate it with your
+    /// embedding model and data; no threshold guarantees safe replacement.
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
     /// Enable reversible supersede soft-hide machinery when wired.
+    /// Agent- and principal-scoped memory handles currently leave automatic
+    /// supersession disabled, even when this setting is true. They must not
+    /// forward unscoped candidate selection or row updates to their backend.
+    /// Set false to prevent automatic soft-hiding where loss of complementary
+    /// facts is unacceptable; raw cosine alone cannot distinguish them.
+    /// Disabling this does not restore previously superseded rows.
     #[serde(default = "default_conflict_supersede_enabled")]
     pub conflict_supersede_enabled: bool,
     /// Enable write-time near-duplicate detection.
     #[serde(default)]
     pub dedup_on_write: bool,
     /// Jaccard threshold for text-only duplicate detection.
+    /// Token overlap does not reliably detect paraphrased duplicates.
     #[serde(default = "default_dedup_jaccard_threshold")]
     pub dedup_jaccard_threshold: f64,
     /// Action to take when a duplicate is detected.
