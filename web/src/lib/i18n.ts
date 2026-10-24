@@ -1611,6 +1611,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.compact_mode': 'Compact',
     'agent.tool_activity_show': 'Show tool activity',
     'agent.tool_activity_hide': 'Hide tool activity',
+    'agent.thinking_keep_collapsed': 'Keep thinking collapsed',
     'agent.running': 'Running…',
     // Supervised-mode tool approval (#6522)
     'agent.approval_title': 'Tool approval required',
