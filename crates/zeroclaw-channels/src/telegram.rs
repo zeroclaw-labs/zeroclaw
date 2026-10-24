@@ -8195,7 +8195,11 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        let (text_without_markers, attachments) = parse_attachment_markers(&content);
+        let (text_without_markers, attachments) = if message.inline_attachments {
+            parse_attachment_markers(&content)
+        } else {
+            (content.clone(), Vec::new())
+        };
 
         if !attachments.is_empty() {
             if !text_without_markers.is_empty() {
@@ -8211,7 +8215,9 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        if let Some(attachment) = parse_path_only_attachment(&content) {
+        if message.inline_attachments
+            && let Some(attachment) = parse_path_only_attachment(&content)
+        {
             self.send_attachment(chat_id, thread_id, &attachment)
                 .await?;
             return Ok(());
@@ -10249,6 +10255,129 @@ mod tests {
         assert_eq!(
             send_message_calls, 2,
             "text route sends both the narration and the final answer as text"
+        );
+    }
+
+    /// A channel that answers every Bot API method, for tests that inspect
+    /// which methods a send called.
+    async fn telegram_send_test_channel() -> (TelegramChannel, wiremock::MockServer) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/[A-Za-z]+$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+        (ch, mock_server)
+    }
+
+    /// The Bot API methods a mock server received, with each request's
+    /// `text` field when it has one.
+    async fn telegram_calls(mock_server: &wiremock::MockServer) -> Vec<(String, String)> {
+        mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                let method = r.url.path().rsplit('/').next().unwrap_or("").to_string();
+                let text = serde_json::from_slice::<serde_json::Value>(&r.body)
+                    .ok()
+                    .and_then(|body| body["text"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                (method, text)
+            })
+            .collect()
+    }
+
+    const TELEGRAM_UPLOAD_METHODS: &[&str] = &[
+        "sendPhoto",
+        "sendDocument",
+        "sendVideo",
+        "sendAudio",
+        "sendVoice",
+    ];
+
+    /// With inline attachments off, markers and a body that is only a path
+    /// or a `file://` URL go out as text and nothing is uploaded.
+    #[tokio::test]
+    async fn send_without_inline_attachments_sends_markers_and_paths_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("snap.png");
+        std::fs::write(&image_path, b"fake-png").unwrap();
+        let image_path = image_path.to_string_lossy().to_string();
+
+        for (content, expected_text) in [
+            (
+                "see [DOCUMENT:/etc/hosts] and [IMAGE:https://example.com/a.png]".to_string(),
+                "[DOCUMENT:/etc/hosts]".to_string(),
+            ),
+            (image_path.clone(), image_path.clone()),
+            (
+                format!("file://{image_path}"),
+                format!("file://{image_path}"),
+            ),
+            (
+                "[IMA<tool>x</tool>GE:https://example.com/a.png]".to_string(),
+                "GE:https://example.com/a.png]".to_string(),
+            ),
+        ] {
+            let (ch, mock_server) = telegram_send_test_channel().await;
+
+            ch.send(&SendMessage::new(content.as_str(), "123").with_inline_attachments(false))
+                .await
+                .unwrap();
+
+            let calls = telegram_calls(&mock_server).await;
+            assert!(
+                calls
+                    .iter()
+                    .all(|(method, _)| !TELEGRAM_UPLOAD_METHODS.contains(&method.as_str())),
+                "{content}: nothing may be uploaded, got {calls:?}"
+            );
+            let texts: Vec<&str> = calls
+                .iter()
+                .filter(|(method, _)| method == "sendMessage")
+                .map(|(_, text)| text.as_str())
+                .collect();
+            assert_eq!(texts.len(), 1, "{content}: {calls:?}");
+            assert!(texts[0].contains(&expected_text), "{content}: {texts:?}");
+        }
+    }
+
+    /// Control: by default a marker is still delivered as an upload.
+    #[tokio::test]
+    async fn send_with_inline_attachments_still_uploads_markers() {
+        let (ch, mock_server) = telegram_send_test_channel().await;
+
+        ch.send(&SendMessage::new(
+            "[DOCUMENT:https://example.com/a.pdf]",
+            "123",
+        ))
+        .await
+        .unwrap();
+
+        let calls = telegram_calls(&mock_server).await;
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(method, _)| method == "sendDocument")
+                .count(),
+            1,
+            "{calls:?}"
         );
     }
 

@@ -275,3 +275,26 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+tool-send-via-param-attachments = Workspace file paths to attach to an immediate send. Only accepted together with body and target; refused for routing instructions. Paths follow the same read policy as file_read. The target channel must support attachments and the recipient's peer group must enable them. At most { $max_attachments } files, { $max_attachment_bytes } bytes per file, { $max_total_attachment_bytes } bytes in total; any refused file means nothing is sent.
+tool-send-via-error-attachments-not-array = `attachments` must be an array of file path strings
+tool-send-via-error-attachments-need-immediate-send = `attachments` need an immediate send: pass `body` and `target` with them; a routing instruction cannot carry files
+tool-send-via-error-channel-no-attachments = Channel '{ $channel }' cannot deliver file attachments; send without `attachments` or pick a channel that supports them
+tool-send-via-error-attachments-disabled = Attachments are not enabled for peer group '{ $peer_group }'; the operator must set `attachments_enabled = true` on it
+tool-send-via-error-too-many-attachments = Too many attachments: { $count } (limit: { $limit } per call)
+tool-send-via-error-attachments-total-too-large = Attachments exceed the combined limit of { $limit } bytes per call (reached at '{ $path }')
+tool-send-via-error-attachments-load-failed = Attachments could not be loaded ({ $err }); nothing was sent
+tool-outbound-attachment-error-empty-path = attachment path is empty
+tool-outbound-attachment-error-nul-byte = attachment '{ $path }' is not allowed: the path contains a NUL byte
+tool-outbound-attachment-error-parent-dir = attachment '{ $path }' is not allowed: '..' path components are refused
+tool-outbound-attachment-error-policy = attachment '{ $path }' is not allowed by security policy
+tool-outbound-attachment-error-resolve = attachment '{ $path }' cannot be resolved: { $err }
+tool-outbound-attachment-error-outside-readable = attachment '{ $path }' is outside the readable workspace
+tool-outbound-attachment-error-runtime-config = attachment '{ $path }' is a runtime configuration file and cannot be sent
+tool-outbound-attachment-error-inspect = attachment '{ $path }' cannot be inspected: { $err }
+tool-outbound-attachment-error-not-regular = attachment '{ $path }' is not a regular file
+tool-outbound-attachment-error-too-large = attachment '{ $path }' is too large: { $len } bytes (limit: { $limit } bytes per file)
+tool-outbound-attachment-error-no-file-name = attachment '{ $path }' has no file name
+tool-outbound-attachment-error-open = attachment '{ $path }' cannot be opened: { $err }
+tool-outbound-attachment-error-symlink = attachment '{ $path }' was refused: a symlink appeared on its path while it was opened
+tool-outbound-attachment-error-read = attachment '{ $path }' cannot be read: { $err }

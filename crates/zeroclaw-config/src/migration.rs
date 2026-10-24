@@ -359,6 +359,7 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
     prune_bad_channel_aliases(&mut salvaged, &mut dropped);
     prune_bad_channel_types(&mut salvaged, &mut dropped);
     prune_bad_provider_aliases(&mut salvaged, &mut dropped);
+    prune_bad_tools_subsections(&mut salvaged, &mut dropped);
     prune_bad_top_level_sections(&mut salvaged, &mut dropped);
 
     let mut whole_config_lost = false;
@@ -473,6 +474,38 @@ fn prune_bad_top_level_sections(value: &mut toml::Value, dropped: &mut Vec<Strin
             dropped.push(key);
         }
     }
+}
+
+/// Drop per-tool `[tools.<name>]` tables that fail to deserialize (each →
+/// `Default`), so one malformed tool limit does not take the whole `[tools]`
+/// table, and with it the `optional` selection, down to its default.
+fn prune_bad_tools_subsections(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    let Some(tools) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("tools"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+
+    let invalid: Vec<String> = tools
+        .iter()
+        .filter(|(name, section)| section.is_table() && tools_subsection_is_invalid(name, section))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in invalid {
+        tools.remove(&name);
+        dropped.push(format!("tools.{name}"));
+    }
+}
+
+/// True when `[tools.<name>]`, wrapped alone, fails to deserialize.
+fn tools_subsection_is_invalid(name: &str, section: &toml::Value) -> bool {
+    let mut tools = toml::value::Table::new();
+    tools.insert(name.to_string(), section.clone());
+    let mut root = toml::value::Table::new();
+    root.insert("tools".to_string(), toml::Value::Table(tools));
+    toml::Value::Table(root).try_into::<Config>().is_err()
 }
 
 /// True when top-level `[<key>]`, wrapped alone, fails to deserialize.
@@ -1018,6 +1051,27 @@ mod tests {
                 assert_eq!(salvaged.config.tools.optional, ["*"]);
                 assert!(salvaged.dropped.iter().any(|path| path == "tools"));
             }
+        }
+    }
+
+    #[test]
+    fn malformed_tool_limits_are_salvaged_without_losing_the_selection() {
+        for limits in [
+            "max_attachments = \"x\"\n",
+            "max_attachment_bytes = \"10MiB\"\n",
+            "max_total_attachment_bytes = -1\n",
+        ] {
+            let raw =
+                format!("schema_version = 3\n[tools]\noptional = []\n[tools.send_via]\n{limits}");
+            assert!(migrate_to_current(&raw).is_err(), "{raw}");
+            let salvaged = migrate_to_current_salvaged(&raw);
+            assert!(salvaged.config.tools.optional.is_empty(), "{raw}");
+            assert_eq!(salvaged.dropped, ["tools.send_via"], "{raw}");
+            assert!(salvaged.dropped_security.is_empty(), "{raw}");
+            assert_eq!(
+                salvaged.config.tools.send_via.max_attachments,
+                crate::schema::SendViaToolConfig::default().max_attachments
+            );
         }
     }
 
