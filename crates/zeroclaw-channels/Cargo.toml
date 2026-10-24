@@ -278,7 +278,7 @@ channel-wechat = [
   "dep:qrcode",
 ]
 channel-wecom = []
-channel-wecom-ws = ["dep:aes", "dep:cbc", "ws-transport"]
+channel-wecom-ws = ["dep:aes", "dep:cbc", "dep:md5", "ws-transport"]
 channel-clawdtalk = []
 channel-webhook = ["dep:axum"]
 channel-whatsapp-cloud = []
