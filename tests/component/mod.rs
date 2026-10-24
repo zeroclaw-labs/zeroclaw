@@ -5,6 +5,8 @@ mod acp_retry_stop_notice_stdio;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
 mod agents_export_cli;
+#[cfg(all(feature = "agent-runtime", unix))]
+mod config_auth_publication_cli;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;
@@ -35,6 +37,8 @@ mod reply_target_field_regression;
 mod schema_export_feature_graph;
 mod security;
 mod skills_bundle_cli;
+#[cfg(feature = "agent-runtime")]
+mod user_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
 mod whatsapp_webhook_security;
