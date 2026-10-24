@@ -43,6 +43,7 @@ mod keymap;
 mod logs;
 mod mouse;
 mod oidc_enroll;
+mod open_sessions;
 mod osc_status;
 mod quickstart_pane;
 mod relay_proto;
@@ -116,6 +117,12 @@ struct Cli {
     /// Path to the ZeroClaw config directory
     #[arg(long)]
     config_dir: Option<PathBuf>,
+
+    /// Start with an empty sidebar instead of reopening the sessions that
+    /// were open when zerocode last quit. The list this launch opens is still
+    /// saved for next time.
+    #[arg(long)]
+    fresh: bool,
 
     /// Start in chat mode with this agent alias.
     /// If omitted, opens the config manager.
@@ -1210,6 +1217,8 @@ async fn run() -> anyhow::Result<()> {
     let mut term = config_manager::init_terminal()?;
     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
 
+    let open_sessions =
+        app::OpenSessionsLaunch::new(loaded_config.sidebar.restore_sessions, cli.fresh);
     let result = run_until_exit(
         Arc::new(rpc),
         &mut term,
@@ -1217,6 +1226,7 @@ async fn run() -> anyhow::Result<()> {
         &local_config_dir,
         owned_daemon_pid,
         initial_leg,
+        open_sessions,
         #[cfg(unix)]
         shutdown_signals
             .as_mut()
@@ -1240,6 +1250,7 @@ async fn run_until_exit(
     config_dir: &std::path::Path,
     owned_daemon_pid: Option<u32>,
     initial_leg: ActiveLeg,
+    open_sessions: app::OpenSessionsLaunch,
     #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
@@ -1254,7 +1265,7 @@ async fn run_until_exit(
     #[cfg(unix)]
     {
         tokio::select! {
-            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owned_daemon_pid, initial_leg) => r.map(|_| ()),
+            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owned_daemon_pid, initial_leg, open_sessions) => r.map(|_| ()),
             _ = shutdown_signals.recv() => Ok(()),
         }
     }
@@ -1270,6 +1281,7 @@ async fn run_until_exit(
             target,
             owned_daemon_pid,
             initial_leg,
+            open_sessions,
         )
         .await
         .map(|_| ())

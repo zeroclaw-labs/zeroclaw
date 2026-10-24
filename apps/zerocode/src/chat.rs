@@ -458,6 +458,24 @@ pub(crate) struct ResumeEntry {
     turn_failed: bool,
 }
 
+impl ResumeEntry {
+    /// An entry read back from the saved open-session list at launch. Only
+    /// identity, order and focus survive a zerocode restart; the queue and
+    /// draft were never written, and no turn of this process was in flight.
+    pub(crate) fn saved(session_id: String, agent_alias: String, was_focused: bool) -> Self {
+        Self {
+            session_id,
+            agent_alias,
+            message_count: 0,
+            was_focused,
+            queue: ReconnectQueueState::default(),
+            interrupted: false,
+            recovery_required: false,
+            turn_failed: false,
+        }
+    }
+}
+
 /// Client-owned queue and composer state that cannot be reconstructed from the
 /// daemon's durable transcript. This is the live `ChatState` data carried
 /// across a transport rebuild; transcript and turn state are reloaded from the
@@ -497,7 +515,7 @@ fn classify_turn_failure(content: &str) -> SessionError {
 
 /// Upper bound on sessions one chat-like pane tracks (focused + background).
 /// Two panes keep the TUI comfortably under the daemon's 64-session cap.
-const MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
+pub(crate) const MAX_TRACKED_SESSIONS_PER_PANE: usize = 8;
 
 pub(crate) struct Chat {
     rpc: Arc<RpcClient>,
@@ -1630,6 +1648,7 @@ impl Chat {
         // rebuild and its agent is still present, reattach to it automatically
         // rather than forcing the user back through the picker and minting a
         // fresh session. The resume id is consumed by `start_session`.
+        self.promote_resumable_background(&agents);
         if let Some(prior) = self
             .resume_focused
             .as_ref()
@@ -1678,6 +1697,32 @@ impl Chat {
 
         self.show_agent_picker(agents);
         Ok(ChatInitOutcome::Other)
+    }
+
+    /// When the focused resume's agent is no longer enabled, focus the first
+    /// retained background whose agent still is, so one disabled agent does
+    /// not hold back the rest of the pane. The unmatched entry stays retained
+    /// for a later retry.
+    fn promote_resumable_background(&mut self, agents: &[String]) {
+        let Some(focused) = self.resume_focused.as_ref() else {
+            return;
+        };
+        if agents.iter().any(|a| a == &focused.agent_alias) {
+            return;
+        }
+        let Some(idx) = self
+            .resume_backgrounds
+            .iter()
+            .position(|entry| agents.iter().any(|a| a == &entry.agent_alias))
+        else {
+            return;
+        };
+        let mut promoted = self.resume_backgrounds.remove(idx);
+        promoted.was_focused = true;
+        if let Some(mut previous) = self.resume_focused.replace(promoted) {
+            previous.was_focused = false;
+            self.resume_backgrounds.insert(0, previous);
+        }
     }
 
     fn show_agent_picker(&mut self, agents: Vec<String>) {
@@ -17328,6 +17373,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_disabled_focused_agent_does_not_block_the_other_resumes() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.set_resume_sessions(vec![
+            resume_entry("sess-ghost", "ghost", true),
+            resume_entry("sess-alpha", "alpha", false),
+        ]);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "ghost", "enabled": false, "live_sessions": 0, "persisted_sessions": 1},
+                    {"alias": "alpha", "enabled": true, "live_sessions": 1, "persisted_sessions": 1},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        // Fail every later request; record which sessions init tries.
+        let mut attached = Vec::new();
+        let chat = loop {
+            if init.is_finished() {
+                break init.await.unwrap();
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(line)) => {
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if request["method"] == method::SESSION_NEW {
+                        attached.push(
+                            request["params"]["session_id"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                    }
+                    respond_err(&rpc, &request, -32000, "stop here");
+                }
+                _ => {
+                    if !init.is_finished() {
+                        panic!("init stalled; attached so far: {attached:?}");
+                    }
+                }
+            }
+        };
+        assert_eq!(
+            attached.first().map(String::as_str),
+            Some("sess-alpha"),
+            "the enabled background is resumed first"
+        );
+        let retained: Vec<_> = chat
+            .resume_focused
+            .iter()
+            .chain(chat.resume_backgrounds.iter())
+            .map(|entry| entry.session_id.as_str())
+            .collect();
+        assert!(
+            retained.contains(&"sess-ghost"),
+            "the disabled agent's session stays retained for a later retry"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_focused_resume_is_retained_for_reconnect_retry() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
@@ -23099,6 +23216,45 @@ mod tests {
         // it to wherever this zerocode process was launched.
         assert!(request["params"]["cwd"].is_null());
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn saved_open_sessions_reattach_by_id_at_launch() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            Arc::clone(&rpc),
+            crate::client::Transport::Local,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.launch_dir = || panic!("a restored session must not read the launch directory");
+        chat.set_resume_sessions(vec![
+            ResumeEntry::saved("sess-a".into(), "alpha".into(), false),
+            ResumeEntry::saved("sess-b".into(), "alpha".into(), true),
+        ]);
+        let task = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "agents": [
+                {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 2},
+                {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+            ]}),
+        );
+        // The focused saved session reattaches first, by id, with no cwd and
+        // no session picker in between.
+        let request = next_rpc_request(&mut rx, "the focused saved session reattaches").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["session_id"], "sess-b");
+        assert!(request["params"]["cwd"].is_null());
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
