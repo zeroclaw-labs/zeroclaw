@@ -48,11 +48,52 @@ Cross-backend cross-agent memory is not supported: the schema validator at confi
 
 Use the gateway dashboard's agent controls or the dedicated `zeroclaw agents` CLI for rename and delete. In the standard build with `gateway` and `agent-runtime` enabled, both surfaces run the reference and owned-state cascades; directly removing or re-keying `agents.<alias>` in TOML or through a generic config setter does not. A reduced-feature CLI still updates config references but warns that owned state was not cascaded, so use a build with both features enabled for lifecycle operations.
 
-Both operations make the config change durable before running owned-state side effects. Rename rewrites config references first, then moves the default per-alias workspace and re-points memory, cron, ACP, and session state. Delete first refuses hard references and live ACP sessions, then removes the config entry and soft references before attempting workspace archival, owned-state export and cleanup, and session-attribution clearing.
+Rename runs the same recoverable sequence on every surface: the `zeroclaw agents rename` CLI, the gateway dashboard and API, and the daemon RPC that zerocode uses.
 
-The post-persist side effects are best-effort and report surfaced failures, but archive-file write failures may appear only in gateway logs. Rename warnings call for retrying the same gateway API rename to converge residue left under the old alias. After deletion, verify the archive contents and logs before relying on the archive for recovery. Automated restore is not supported.
+1. Validate both aliases and resolve the agent being renamed.
+2. Write a durable recovery record.
+3. Commit the config rename, which rewrites references from the old alias to the new one.
+4. Move the owned state that follows the alias.
+5. Re-check that state and confirm nothing is left under the old alias.
+6. Clear the recovery record.
 
-See [Multi-agent setup walkthrough](./multi-agent-setup.md#rename-an-agent) for the current controls, blockers, archive layout, and operator checks.
+The owned state that follows a rename is:
+
+- the default per-alias workspace, moved from `<install>/agents/<old>/workspace/` to `<install>/agents/<new>/workspace/` (a custom `workspace.path` never moves, even one that names this default location);
+- memory attribution;
+- cron jobs and their run-history ownership;
+- ACP sessions: their owner alias, and their persisted working directory when it was the old default workspace; and
+- session attribution.
+
+The record lives at `<data_dir>/agent-lifecycle-recovery.json` with a sidecar `.lock` file, and agent file tools cannot modify it. Because it is cleared only in the last step, an interrupted or partial rename leaves it open. A store that exists but cannot be read counts as unfinished work, not as empty: the rename reports it and keeps the record. Removing leftover state by hand outside the rename does not clear the record; re-running the same rename does, once it verifies that nothing is left.
+
+Every move is made durable before the record is cleared: the SQLite memory, ACP, and session stores commit their moves with full sync, and once the old default workspace is gone, every run of the rename, including a re-run with nothing left to move, syncs the directories a workspace move or cleanup changes (`<install>/agents/<new>/`, `<install>/agents/`, and `<install>/agents/<old>/` while it exists). The rename stays open until every changed directory is synced, and a re-run retries the syncs. A power loss after a rename converges therefore cannot leave state under the old alias with nothing retiring it. The directory syncs apply on Unix; other platforms do not sync directory entries, so on those platforms the guarantee covers the SQLite stores but not the workspace move.
+
+A recovery journal that cannot be read, because the file is corrupt or declares a `schema_version` this build does not support, may hold an unfinished rename, so every agent creation, rename, and delete is refused until it is repaired. To repair it:
+
+1. Stop the daemon.
+2. Move `<data_dir>/agent-lifecycle-recovery.json` aside.
+3. Inspect the moved file for records of renames that have not finished.
+4. If any rename is unfinished, re-create the journal at the same path as `{"schema_version": 1, "records": [...]}`, holding the records you can still read. Leave it removed only if no rename is unfinished.
+5. Restart the daemon, then re-run each unfinished rename to finish it.
+
+To finish a rename that reported unfinished work, re-run it with the same aliases: `zeroclaw agents rename <old> <new>`, or the same gateway API or daemon RPC request. The CLI exits non-zero until the rename has fully converged, and while a record is open it never reports the old alias as not configured. The gateway API and daemon RPC keep returning `renamed: true` with a `warnings` list while any owned state is unfinished; an empty `warnings` list means the rename has converged. A request whose old alias is not configured, has no open record, and has no leftover state is still reported as not configured.
+
+Two conflicts need an operator and keep the record open: the destination workspace already exists and is not empty, or the destination alias already owns memory rows. Resolve them by moving or merging that state by hand, then re-run the same rename.
+
+A rename never finishes while `<install>/agents/<old>/workspace/` still exists, whatever `<new>`'s workspace configuration is, because an agent re-created as `<old>` would adopt that directory. When `<new>` has a custom `workspace.path`, the rename removes the old directory if it is empty and otherwise reports it until its contents are moved by hand. If `<new>`'s `workspace.path` is the old default workspace, lies inside it, or contains it (such as `<install>/agents/<old>/`), point it elsewhere first, then re-run the rename; this holds whether or not either directory exists yet.
+
+If `[agents.<old>]` is back in the config while the record is open (a hand edit, say), re-running the rename is refused and moves nothing, since that entry would take over the state the rename still owes `<new>`. Remove `[agents.<old>]` by hand and re-run the rename, or abandon it.
+
+If a rename cannot be finished, `zeroclaw agents rename <old> <new> --abandon` drops its recovery record without moving anything. `<old>` can then be created again, and the new agent adopts whatever state is still kept under that alias, so check the warnings the command prints first. Abandoning needs exclusive ownership of the configuration, so stop the daemon first; the command refuses while the daemon or another command owns it.
+
+An alias retired by an unfinished rename cannot be reused until that rename converges, so a re-created agent never inherits the previous holder's workspace, memory, cron, ACP, or session state. While a record for `<old>` to `<new>` is open, creating an agent named `<old>` is refused by the CLI (including `zeroclaw config set agents.<old>.<field>` and `zeroclaw config patch`), the gateway and dashboard, the daemon RPC, `zeroclaw quickstart`, and the agent-facing config tool. An agent added through an environment override or a hand edit of `config.toml` is not refused; config load logs a warning for it instead. Renaming another agent onto `<old>` is refused too, and so is renaming or deleting `<new>` until the pending rename converges. Any other alias can still be created.
+
+Delete makes the config change durable before running owned-state side effects. It first refuses hard references and live ACP sessions, then removes the config entry and soft references before attempting workspace archival, owned-state export and cleanup, and session-attribution clearing.
+
+These post-persist side effects are best-effort and report surfaced failures, but archive-file write failures may appear only in gateway logs. After deletion, verify the archive contents and logs before relying on the archive for recovery. Automated restore is not supported.
+
+See [Multi-agent setup walkthrough](./multi-agent-setup.md#rename-an-agent) for the current controls, rename recovery steps, blockers, archive layout, and operator checks.
 
 ## Not supported today
 

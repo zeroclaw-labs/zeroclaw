@@ -909,24 +909,64 @@ fn rename_error_to_rpc(
     rpc_err(code, format!("{path}.{from}: {err}"))
 }
 
-async fn move_renamed_agent_workspace(
-    old_workspace: &std::path::Path,
-    new_workspace: &std::path::Path,
-) -> Option<String> {
-    if old_workspace == new_workspace || !old_workspace.exists() {
+/// The RPC error for an agent lifecycle step the shared rename recovery
+/// contract refused or could not complete. An agent with nothing to rename
+/// keeps the `alias not found` wording the config rename reports. A store,
+/// journal, or lock fault is an internal error: whether state is left behind
+/// is unknown, so the same request stays retryable rather than reporting the
+/// alias missing.
+fn agent_recovery_error_to_rpc(
+    path: &str,
+    alias: &str,
+    err: &crate::agent_rename_recovery::RenameRecoveryError,
+) -> JsonRpcError {
+    use crate::agent_rename_recovery::RenameRecoveryError;
+    match err {
+        RenameRecoveryError::NotConfigured { .. } => rename_error_to_rpc(
+            path,
+            alias,
+            zeroclaw_config::alias_refs::RenameError::NotFound(format!("{path}.{alias}")),
+        ),
+        RenameRecoveryError::InvalidAlias { .. }
+        | RenameRecoveryError::ReservedAlias { .. }
+        | RenameRecoveryError::AliasRetired { .. }
+        | RenameRecoveryError::RecoveryPending { .. }
+        | RenameRecoveryError::SourceReconfigured { .. } => {
+            rpc_err(INVALID_PARAMS, format!("{path}.{alias}: {err}"))
+        }
+        RenameRecoveryError::Unreadable { .. }
+        | RenameRecoveryError::Busy { .. }
+        | RenameRecoveryError::Persist { .. } => {
+            rpc_err(INTERNAL_ERROR, format!("{path}.{alias}: {err}"))
+        }
+    }
+}
+
+/// Why an unfinished rename refuses deleting `alias`, if it does. The rename
+/// still owes state moves into its target and out of its retired alias, and
+/// deleting either agent now would strand that state. A journal that cannot
+/// be read may hold such a rename, so that refuses too. Only a configured
+/// alias is checked: the delete preflight reports one that is not configured.
+/// The delete and its preview both report this refusal.
+async fn agent_delete_recovery_refusal(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+) -> Option<crate::agent_rename_recovery::RenameRecoveryError> {
+    if !config.agents.contains_key(alias) {
         return None;
     }
-    if let Some(parent) = new_workspace.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+    if let Err(e) = Box::pin(crate::agent_rename_recovery::ensure_not_pending_target(
+        config, alias,
+    ))
+    .await
+    {
+        return Some(e);
     }
-    match tokio::fs::rename(old_workspace, new_workspace).await {
-        Ok(()) => None,
-        Err(err) => Some(format!(
-            "workspace move {} -> {} failed: {err}",
-            old_workspace.display(),
-            new_workspace.display()
-        )),
-    }
+    Box::pin(crate::agent_rename_recovery::ensure_alias_not_retired(
+        config, alias,
+    ))
+    .await
+    .err()
 }
 
 fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> bool {
@@ -3301,41 +3341,6 @@ impl RpcDispatcher {
         }));
         task.await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config commit task failed: {e}")))?
-    }
-
-    async fn agent_rename_residue_exists(
-        &self,
-        config: &zeroclaw_config::schema::Config,
-        from: &str,
-    ) -> bool {
-        if config.agent_workspace_dir(from).exists() {
-            return true;
-        }
-        if crate::cron::list_jobs_by_agent(config, from)
-            .map(|jobs| !jobs.is_empty())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        if let Some(store) = self.ctx.acp_session_store.as_ref()
-            && store
-                .list_sessions_by_agent(from)
-                .map(|sessions| !sessions.is_empty())
-                .unwrap_or(false)
-        {
-            return true;
-        }
-        if let Some(mem) = self.ctx.memory.as_ref()
-            && mem.count_agent(from).await.unwrap_or(0) > 0
-        {
-            return true;
-        }
-        if let Some(backend) = self.ctx.session_backend.as_ref()
-            && backend.count_agent_attribution(from).unwrap_or(0) > 0
-        {
-            return true;
-        }
-        false
     }
 
     fn log_prompt_task_failure(result: Result<(), tokio::task::JoinError>) {
@@ -9502,13 +9507,16 @@ impl RpcDispatcher {
         prop: &str,
         value: &Value,
     ) -> Result<(), JsonRpcError> {
-        if config.ensure_map_key_for_path(prop) {
-            // Refused to vivify the reserved `default` agent: return a
-            // reserved error rather than a downstream "Unknown property".
-            return Err(rpc_err(
-                INVALID_PARAMS,
-                "alias `default` is reserved and cannot be created",
-            ));
+        if let Err(refusal) = config.ensure_map_key_for_path_checked(prop) {
+            // Refused to vivify the entry: return that refusal rather than a
+            // downstream "Unknown property". Only an unreadable recovery
+            // journal is a server fault.
+            let code = match refusal {
+                zeroclaw_config::schema::VivifyRefusal::RecoveryUnreadable(_) => INTERNAL_ERROR,
+                zeroclaw_config::schema::VivifyRefusal::Reserved
+                | zeroclaw_config::schema::VivifyRefusal::Retired { .. } => INVALID_PARAMS,
+            };
+            return Err(rpc_err(code, refusal.to_string()));
         }
         let info = config.prop_fields().into_iter().find(|f| f.name == prop);
         // Polymorphic value: strings pass through, everything else coerced.
@@ -10092,7 +10100,15 @@ impl RpcDispatcher {
             // path cannot author an `agents.default` the rename guard then traps.
             let created =
                 zeroclaw_config::alias_refs::create_map_key_checked(config, &req.path, &req.key)
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                    .map_err(|e| {
+                        let code = match e {
+                            zeroclaw_config::alias_refs::CreateError::RecoveryUnreadable(_) => {
+                                INTERNAL_ERROR
+                            }
+                            _ => INVALID_PARAMS,
+                        };
+                        rpc_err(code, e.to_string())
+                    })?;
             if created {
                 config.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
@@ -10418,11 +10434,21 @@ impl RpcDispatcher {
         req: ConfigMapKeyRenameParams,
         kind: zeroclaw_config::alias_refs::AliasKind,
         config_commit: crate::live_config_authority::ConfigCommit,
-        mut agent_lifecycle_leases: Vec<crate::live_config_authority::AgentDeleteLease>,
+        agent_lifecycle_leases: Vec<crate::live_config_authority::AgentDeleteLease>,
         channel_generation_revocation: Option<PreparedChannelGenerationMutation>,
     ) -> BoxRpcFuture<'a> {
+        // An agent rename runs in its own future: it follows the recovery
+        // contract every rename surface shares, and keeping it out of this
+        // one keeps the provider path's config temporaries off its stack.
+        if matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent) {
+            return self.rename_agent_alias(
+                req,
+                config_commit,
+                agent_lifecycle_leases,
+                channel_generation_revocation,
+            );
+        }
         Box::pin(async move {
-            let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
             // A model-provider alias rename is a route-affecting live
             // configuration surface: sessions whose provider ref pointed at
             // `from` must be rebuilt against `to` on the same generation as
@@ -10435,170 +10461,312 @@ impl RpcDispatcher {
                 } => Some(family.clone()),
                 _ => None,
             };
-            if is_agent {
-                // Live RPC sessions hold the selected agent alias in memory; refuse
-                // rather than letting them recreate old-alias state after the rename.
-                let active = self
-                    .ctx
-                    .sessions
-                    .count_by_agent()
-                    .await
-                    .get(&req.from)
-                    .copied()
-                    .unwrap_or(0);
-                if active > 0 {
-                    return Err(rpc_err(
-                        INVALID_PARAMS,
-                        format!(
-                            "{}.{}: cannot rename agent with {active} active RPC session(s); close those sessions first",
-                            req.path, req.from
-                        ),
-                    ));
-                }
-            }
 
             let mut working = config_commit.current_config();
-            let old_workspace = is_agent.then(|| working.agent_workspace_dir(&req.from));
-            // If a prior call saved config as `to` but crashed before side effects,
-            // re-running `from -> to` should converge lagging owned state instead
-            // of failing because `from` is no longer a config key.
-            let resume_committed_to = is_agent
-                && working.agent(&req.from).is_none()
-                && working.agent(&req.to).is_some()
-                && self.agent_rename_residue_exists(&working, &req.from).await;
+            let report = zeroclaw_config::alias_refs::rename_with_cascade(
+                &mut working,
+                &kind,
+                &req.from,
+                &req.to,
+            )
+            .map_err(|e| rename_error_to_rpc(&req.path, &req.from, e))?;
+            for path in &report.dirty_paths {
+                working.mark_dirty(path);
+            }
+            let rewritten = report.dirty_paths.len();
+            // Non-agent alias renames retire the channel generation inside
+            // the retained commit, still serialized with every other writer.
+            let effects = RpcConfigCommitEffects {
+                channel_generation: channel_generation_revocation,
+                ..RpcConfigCommitEffects::default()
+            };
+            if let Some(family) = model_provider_family {
+                let scope = LiveSessionRefreshScope::ProviderAliasRename {
+                    old_ref: format!("{family}.{}", req.from),
+                    new_ref: format!("{family}.{}", req.to),
+                };
+                Box::pin(self.commit_config_with_live_session_refresh(
+                    working,
+                    config_commit,
+                    &scope,
+                    effects,
+                ))
+                .await?;
+            } else {
+                self.save_and_publish_config(config_commit, working, effects)
+                    .await?;
+            }
 
-            // Cascade the prepared config WITHOUT persisting: the save moves
-            // into the retained transaction task below so request cancellation
-            // cannot land between the atomic config replacement and the
-            // generation commit.
-            let rewritten = if !resume_committed_to {
+            to_result(ConfigMapKeyRenameResult {
+                path: req.path,
+                from: req.from,
+                to: req.to,
+                renamed: true,
+                rewritten,
+                warnings: Vec::new(),
+            })
+        })
+    }
+
+    /// Rename an agent through the recovery contract every rename surface
+    /// shares. A fresh rename commits the config cascade under an armed
+    /// recovery record; a rename whose commit already landed resumes without
+    /// writing the config again. Either way the state kept under the old
+    /// alias then converges with the config write lock released, and the
+    /// record closes only once nothing is left behind. State that has not
+    /// followed yet, or a converge that failed outright, comes back as
+    /// warnings on a successful result: the config commit stands, the old
+    /// alias stays retired, and re-issuing the same rename finishes the move.
+    fn rename_agent_alias(
+        &self,
+        req: ConfigMapKeyRenameParams,
+        config_commit: crate::live_config_authority::ConfigCommit,
+        mut agent_lifecycle_leases: Vec<crate::live_config_authority::AgentDeleteLease>,
+        channel_generation_revocation: Option<PreparedChannelGenerationMutation>,
+    ) -> BoxRpcFuture<'_> {
+        Box::pin(async move {
+            use crate::agent_rename_recovery::{self as recovery, Disposition, SurfaceStores};
+
+            // Live RPC sessions hold the selected agent alias in memory; refuse
+            // rather than letting them recreate old-alias state after the rename.
+            let active = self
+                .ctx
+                .sessions
+                .count_by_agent()
+                .await
+                .get(&req.from)
+                .copied()
+                .unwrap_or(0);
+            if active > 0 {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    format!(
+                        "{}.{}: cannot rename agent with {active} active RPC session(s); close those sessions first",
+                        req.path, req.from
+                    ),
+                ));
+            }
+
+            let stores = SurfaceStores {
+                memory: self.ctx.memory.as_ref(),
+                session_backend: self.ctx.session_backend.as_ref(),
+                acp: self.ctx.acp_session_store.as_ref(),
+            };
+            let (path, from, to) = (req.path.as_str(), req.from.as_str(), req.to.as_str());
+
+            // `Config` is a large aggregate; the snapshots kept across the
+            // awaits below are boxed, as in `handle_config_set`, so they live on
+            // the heap rather than in this future.
+            let mut working = Box::new(config_commit.current_config());
+            let disposition = Box::pin(recovery::resolve(&working, from, to, &stores))
+                .await
+                .map_err(|e| agent_recovery_error_to_rpc(path, from, &e))?;
+            // A fresh rename cascades the prepared config WITHOUT persisting,
+            // then arms the recovery record: the save moves into the retained
+            // transaction task below so request cancellation cannot land
+            // between the atomic config replacement and the generation
+            // commit. A resume commits nothing.
+            let (rewritten, commit) = if disposition == Disposition::Resume {
+                (0, None)
+            } else {
+                // The config as it stands before the commit, which the record
+                // is armed from.
+                let before = working.clone();
                 let report = zeroclaw_config::alias_refs::rename_with_cascade(
                     &mut working,
-                    &kind,
-                    &req.from,
-                    &req.to,
+                    &zeroclaw_config::alias_refs::AliasKind::Agent,
+                    from,
+                    to,
                 )
-                .map_err(|e| rename_error_to_rpc(&req.path, &req.from, e))?;
-                for path in &report.dirty_paths {
-                    working.mark_dirty(path);
+                .map_err(|e| rename_error_to_rpc(path, from, e))?;
+                for dirty in &report.dirty_paths {
+                    working.mark_dirty(dirty);
                 }
-                report.dirty_paths.len()
-            } else {
-                0
+                // Armed only once the rename is known to be valid, so a
+                // refused request never writes the recovery journal.
+                let armed = Box::pin(recovery::arm(&before, from, to))
+                    .await
+                    .map_err(|e| agent_recovery_error_to_rpc(path, from, &e))?;
+                (report.dirty_paths.len(), Some((before, armed)))
             };
-            let new_workspace = is_agent.then(|| working.agent_workspace_dir(&req.to));
 
-            let warnings = if is_agent {
-                // Agent rename: spawn the retained transaction before the
-                // first persistence await. The config commit (writer guard
-                // plus config-write lease), both uncommitted reservations, the
-                // prepared config, and the prepared channel-generation
-                // control all live in a task that request cancellation
-                // cannot abort.
-                let cleanup_sessions = Arc::clone(&self.ctx.sessions);
-                let cleanup_reload_tx = self.ctx.reload_tx.clone();
-                let cleanup_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
-                let from = req.from.clone();
-                let to = req.to.clone();
-                let memory = self.ctx.memory.clone();
-                let session_backend = self.ctx.session_backend.clone();
-                // Same ownership-boundary boxing as the delete transaction:
-                // the rename future carries the same capture shape (prepared
-                // config, channel maps, commit, both leases) and is
-                // constructed directly into its heap allocation off the 2 MiB
-                // worker's dispatcher frame.
-                let cleanup =
-                    crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
-                        // Save the prepared config and publish it under the
-                        // commit's allocated revision; a true pre-commit save
-                        // error ends the task with the reservations
-                        // uncommitted, both generations unchanged, and the
-                        // previously published pair still visible. A resume
-                        // run (config already committed `from -> to` by a
-                        // prior crashed attempt) skips straight to the commit
-                        // below — its publication already landed.
-                        if !resume_committed_to {
-                            let revision = config_commit.next_revision().map_err(|e| {
-                                rpc_err(INTERNAL_ERROR, format!("Config revision unavailable: {e}"))
-                            })?;
-                            save_and_publish_config_detached(
-                                &config_commit,
-                                revision,
-                                working.clone(),
-                            )
-                            .await?;
-                        }
-                        // Committed: advance both alias generations exactly
-                        // once — synchronous, no await since the publication.
-                        for lease in &mut agent_lifecycle_leases {
-                            lease.commit_destructive_mutation();
-                        }
-                        // Retire and await the channel generation while still
-                        // holding the commit's serialization, then schedule
-                        // reload.
-                        drain_channel_generation_without_dispatcher(
-                            cleanup_sessions,
-                            channel_generation_revocation,
-                            cleanup_reload_tx,
-                            cleanup_gateway_shutdown_tx,
-                        )
-                        .await;
-                        // Release the commit's serialization (writer guard
-                        // and config-write lease) before slow cleanup.
-                        config_commit.release_serialization();
-                        let mut warnings: Vec<String> =
-                            if let (Some(old_ws), Some(new_ws)) = (old_workspace, new_workspace) {
-                                move_renamed_agent_workspace(&old_ws, &new_ws)
+            // Spawn the retained transaction before the first persistence
+            // await. The config commit (writer guard plus config-write
+            // lease), both uncommitted reservations, the armed recovery
+            // record, the prepared config, and the prepared
+            // channel-generation control all live in a task that request
+            // cancellation cannot abort.
+            let job_sessions = Arc::clone(&self.ctx.sessions);
+            let job_reload_tx = self.ctx.reload_tx.clone();
+            let job_gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
+            let job_from = req.from.clone();
+            let job_to = req.to.clone();
+            let memory = self.ctx.memory.clone();
+            let session_backend = self.ctx.session_backend.clone();
+            let acp = self.ctx.acp_session_store.clone();
+            // Same ownership-boundary boxing as the delete transaction: the
+            // rename future carries the same capture shape (prepared config,
+            // channel maps, commit, both leases) and is constructed directly
+            // into its heap allocation off the 2 MiB worker's dispatcher
+            // frame.
+            let job =
+                crate::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+                    // Save the prepared config and publish it under the
+                    // commit's allocated revision; a true pre-commit save
+                    // error drops the prepared recovery record and ends the
+                    // task with the reservations uncommitted, both
+                    // generations unchanged, and the previously published
+                    // pair still visible. A resume (config already committed
+                    // `from -> to` by an earlier run) skips straight to the
+                    // commit below.
+                    match commit {
+                        Some((before, armed)) => {
+                            let persisted = match config_commit.next_revision() {
+                                Ok(revision) => {
+                                    save_and_publish_config_detached(
+                                        &config_commit,
+                                        revision,
+                                        (*working).clone(),
+                                    )
                                     .await
-                                    .into_iter()
-                                    .collect()
-                            } else {
-                                Vec::new()
+                                }
+                                Err(e) => Err(rpc_err(
+                                    INTERNAL_ERROR,
+                                    format!("Config revision unavailable: {e}"),
+                                )),
                             };
-                        let owned = crate::agent_lifecycle::cascade_rename_agent(
-                            &working,
-                            memory.as_ref(),
-                            session_backend.as_ref(),
-                            &from,
-                            &to,
-                        )
-                        .await;
-                        warnings.extend(owned.warnings);
-                        // Both committed leases release only when this future
-                        // completes.
-                        Ok(warnings)
-                    }));
-
-                cleanup.await.map_err(|error| {
-                    rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Agent rename cleanup task failed: {error}"),
-                    )
-                })??
-            } else {
-                let effects = RpcConfigCommitEffects {
-                    channel_generation: channel_generation_revocation,
-                    ..RpcConfigCommitEffects::default()
-                };
-                if !resume_committed_to {
-                    if let Some(family) = model_provider_family {
-                        let scope = LiveSessionRefreshScope::ProviderAliasRename {
-                            old_ref: format!("{family}.{}", req.from),
-                            new_ref: format!("{family}.{}", req.to),
-                        };
-                        Box::pin(self.commit_config_with_live_session_refresh(
-                            working,
-                            config_commit,
-                            &scope,
-                            effects,
-                        ))
-                        .await?;
-                    } else {
-                        self.save_and_publish_config(config_commit, working, effects)
-                            .await?;
+                            if let Err(error) = persisted {
+                                // Nothing was published, so the live config
+                                // still names `from`, but the save may have
+                                // landed before the publication failed.
+                                // Abandoning checks the config file: it keeps
+                                // the record, marked committed, when the save
+                                // wrote the rename there, and drops it only
+                                // when the file still has `from` or lacks
+                                // `to`.
+                                recovery::abandon(&before, armed).await;
+                                return Err(error);
+                            }
+                            // Committed: advance both alias generations
+                            // exactly once — synchronous, no await since the
+                            // publication.
+                            for lease in &mut agent_lifecycle_leases {
+                                lease.commit_destructive_mutation();
+                            }
+                            recovery::acknowledge_commit(&working, armed).await;
+                        }
+                        None => {
+                            for lease in &mut agent_lifecycle_leases {
+                                lease.commit_destructive_mutation();
+                            }
+                        }
                     }
+                    // Retire and await the channel generation while still
+                    // holding the commit's serialization, then schedule
+                    // reload.
+                    drain_channel_generation_without_dispatcher(
+                        job_sessions,
+                        channel_generation_revocation,
+                        job_reload_tx,
+                        job_gateway_shutdown_tx,
+                    )
+                    .await;
+                    // The config is committed, now or by an earlier run.
+                    // Release the commit's serialization (writer guard and
+                    // config-write lease) before the followers converge:
+                    // moving the workspace and re-pointing memory, cron, ACP,
+                    // and session rows can be slow or wedge.
+                    config_commit.release_serialization();
+                    let job_stores = SurfaceStores {
+                        memory: memory.as_ref(),
+                        session_backend: session_backend.as_ref(),
+                        acp: acp.as_ref(),
+                    };
+                    let outcome = Box::pin(recovery::converge(
+                        &working,
+                        &job_from,
+                        &job_to,
+                        &job_stores,
+                    ))
+                    .await;
+                    // Both committed leases release only when this future
+                    // completes.
+                    Ok(outcome)
+                }));
+
+            let converged = job.await.map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Agent rename cleanup task failed: {error}"),
+                )
+            })??;
+            let warnings = match converged {
+                Ok(outcome) => {
+                    let report = outcome.report();
+                    let warnings = outcome.warnings();
+                    if outcome.is_converged() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({
+                                "from": from,
+                                "to": to,
+                                "memory_rows": report.memory_rows,
+                                "cron_jobs": report.cron_jobs,
+                                "acp_sessions": report.acp_sessions,
+                                "acp_workspaces": report.acp_workspaces,
+                                "sessions_repointed": report.sessions_repointed,
+                                "workspace_moved": report.workspace_moved,
+                            })),
+                            "agent renamed over RPC; its owned state converged onto the new alias"
+                        );
+                    } else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "from": from,
+                                "to": to,
+                                "memory_rows": report.memory_rows,
+                                "cron_jobs": report.cron_jobs,
+                                "acp_sessions": report.acp_sessions,
+                                "acp_workspaces": report.acp_workspaces,
+                                "sessions_repointed": report.sessions_repointed,
+                                "workspace_moved": report.workspace_moved,
+                                "warnings": warnings,
+                            })),
+                            "agent rename over RPC committed but some owned state has not followed; re-issue the same rename to converge"
+                        );
+                    }
+                    warnings
                 }
-                Vec::new()
+                // The config commit stands, now or from an earlier run, so
+                // the rename happened: only its followers could not
+                // converge. The failure is reported as the rename's warning,
+                // and re-issuing the same rename resumes it.
+                Err(e) => {
+                    let warning = e.to_string();
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "from": from,
+                                "to": to,
+                                "error": warning,
+                            })),
+                        "agent rename over RPC committed but its owned state could not converge; re-issue the same rename to converge"
+                    );
+                    vec![warning]
+                }
             };
 
             to_result(ConfigMapKeyRenameResult {
@@ -10681,7 +10849,12 @@ impl RpcDispatcher {
 
     async fn handle_agent_delete_preview(&self, params: &Value) -> RpcResult {
         let req: AgentDeleteParams = parse_params(params)?;
-        let config = self.ctx.config.read().clone();
+        // Boxed: this handler runs inline in `process_line`, and the snapshot
+        // is held across the recovery check's await.
+        let config = Box::new(self.ctx.config.read().clone());
+        // The same refusal the delete makes for an agent an unfinished rename
+        // still owes state to or from.
+        let recovery_refusal = agent_delete_recovery_refusal(&config, &req.alias).await;
         let store = self.ctx.acp_session_store.clone();
         let alias = req.alias;
         let lifecycle_alias = alias.clone();
@@ -10706,6 +10879,10 @@ impl RpcDispatcher {
         if let Some(blocker) = self.ctx.agent_lifecycle.delete_blocker(&lifecycle_alias) {
             preview.allowed = false;
             preview.blockers.push(blocker.to_string());
+        }
+        if let Some(refusal) = recovery_refusal {
+            preview.allowed = false;
+            preview.blockers.push(refusal.to_string());
         }
         to_result(AgentDeletePreviewResult {
             alias: preview.alias,
@@ -10749,6 +10926,12 @@ impl RpcDispatcher {
             .await
             .map_err(config_commit_admission_error)?;
         let mut working = config_commit.current_config();
+        // Checked inside the admitted config commit, whose serialization a
+        // rename holds while it records and commits, and before any side
+        // effect.
+        if let Some(e) = agent_delete_recovery_refusal(&working, &alias).await {
+            return Err(agent_recovery_error_to_rpc("agents", &alias, &e));
+        }
         let channel_generation_revocation =
             self.prepare_channel_generation_revocation(self.ctx.reload_tx.is_some(), &working)?;
         let preflight =
@@ -35845,6 +36028,144 @@ mod tests {
                 .reserve_turn_at("rename_from", from_generation)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn agent_rename_converge_failure_after_the_commit_is_a_warning() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("four-megabyte-stack Tokio runtime");
+
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_secret_test_config(&tmp);
+            config.create_map_key("agents", "converge_from").unwrap();
+            config.save().await.unwrap();
+            let journal =
+                zeroclaw_config::agent_recovery_journal::AgentRecoveryJournal::for_config(&config);
+            let save_gate = zeroclaw_config::schema::test_post_replace_pause_gate::arm(
+                config.config_path.clone(),
+            );
+            let dispatcher = make_config_set_test_dispatcher(config);
+            let handle = dispatcher.spawn_handle();
+            let rename = zeroclaw_spawn::spawn!(async move {
+                let params = json!({
+                    "path": "agents",
+                    "from": "converge_from",
+                    "to": "converge_to",
+                });
+                handle.handle_config_map_key_rename(&params).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), save_gate.wait_paused())
+                .await
+                .expect("the rename pauses inside its config save with the record armed");
+            // The commit is about to land; a journal that can no longer be
+            // read fails the converge that follows it.
+            std::fs::write(journal.path(), b"not a recovery journal").unwrap();
+            save_gate.release();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), rename)
+                .await
+                .expect("the rename finishes")
+                .expect("the rename task joins")
+                .expect("a committed rename is not a request failure");
+
+            assert_eq!(result["renamed"], true, "{result}");
+            let warnings = result["warnings"]
+                .as_array()
+                .expect("the converge failure is reported as a warning");
+            assert!(
+                warnings.iter().any(|warning| warning
+                    .as_str()
+                    .is_some_and(|w| w.contains("could not be read"))),
+                "{result}"
+            );
+            let live = dispatcher.ctx.config.read().clone();
+            assert!(live.agents.contains_key("converge_to"));
+            assert!(!live.agents.contains_key("converge_from"));
+        });
+    }
+
+    #[test]
+    fn config_map_key_rename_keeps_its_record_when_publication_fails_after_the_save() {
+        use zeroclaw_config::agent_recovery_journal::{
+            AgentRecoveryJournal, RecoveryPhase, retired_alias,
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_stack_size(4 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .expect("four-megabyte-stack Tokio runtime");
+
+        runtime.block_on(async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = make_secret_test_config(&tmp);
+            config.create_map_key("agents", "landed_from").unwrap();
+            config.save().await.unwrap();
+            let config_path = config.config_path.clone();
+            let save_gate =
+                zeroclaw_config::schema::test_post_replace_pause_gate::arm(config_path.clone());
+            let dispatcher = make_config_set_test_dispatcher(config);
+            let handle = dispatcher.spawn_handle();
+            let rename = zeroclaw_spawn::spawn!(async move {
+                let params = json!({
+                    "path": "agents",
+                    "from": "landed_from",
+                    "to": "landed_to",
+                });
+                handle.handle_config_map_key_rename(&params).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), save_gate.wait_paused())
+                .await
+                .expect("the rename pauses after its save replaced the config file");
+            // The rename allocated its revision before saving. Another
+            // publication takes that revision now, so the rename's own
+            // publication is refused after its save has landed.
+            publish_test_config(&dispatcher.ctx, |_| {});
+            save_gate.release();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), rename)
+                .await
+                .expect("the rename finishes")
+                .expect("the rename task joins")
+                .expect_err("a refused publication fails the rename");
+            assert!(
+                error.message.contains("Config publication failed"),
+                "{}",
+                error.message
+            );
+
+            // The live config never took the rename; the config file did.
+            let live = dispatcher.ctx.config.read().clone();
+            assert!(live.agents.contains_key("landed_from"));
+            assert!(!live.agents.contains_key("landed_to"));
+            let on_disk: toml::Table = std::fs::read_to_string(&config_path)
+                .unwrap()
+                .parse()
+                .unwrap();
+            let agents = on_disk["agents"].as_table().unwrap();
+            assert!(
+                !agents.contains_key("landed_from") && agents.contains_key("landed_to"),
+                "{agents:?}"
+            );
+
+            // So the record survives, committed: the old alias stays retired
+            // once the file is loaded again, and the rename can be finished.
+            let records = AgentRecoveryJournal::for_config(&live).load().unwrap();
+            assert_eq!(records.len(), 1, "{records:?}");
+            assert_eq!(
+                (
+                    records[0].from.as_str(),
+                    records[0].to.as_str(),
+                    records[0].phase
+                ),
+                ("landed_from", "landed_to", RecoveryPhase::Committed)
+            );
+            assert!(retired_alias(&live, "landed_from").unwrap().is_some());
+        });
     }
 
     #[tokio::test]

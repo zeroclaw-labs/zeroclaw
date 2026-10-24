@@ -7,6 +7,7 @@
 #![allow(clippy::useless_format)]
 
 pub mod agent_bundle;
+pub mod agent_recovery_journal;
 pub mod alias_refs;
 pub mod api_error;
 pub mod autonomy;
