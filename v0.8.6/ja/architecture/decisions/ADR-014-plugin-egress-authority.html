@@ -1,0 +1,486 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ADR-014: プラグインのエグレス権限 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="id: ADR-014 title: プラグインインスタンスは、ホストが所有する単一のエグレス権限を通じてのみネットワークに到達する date: 2026-08-20 status: 提案中 relates-to:">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../../toc-2149462c.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/ja/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="ADR-014: プラグインのエグレス権限 - ZeroClaw Docs">
+        <meta property="og:description" content="id: ADR-014 title: プラグインインスタンスは、ホストが所有する単一のエグレス権限を通じてのみネットワークに到達する date: 2026-08-20 status: 提案中 relates-to:">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/ja/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="ADR-014: プラグインのエグレス権限 - ZeroClaw Docs">
+        <meta name="twitter:description" content="id: ADR-014 title: プラグインインスタンスは、ホストが所有する単一のエグレス権限を通じてのみネットワークに到達する date: 2026-08-20 status: 提案中 relates-to:">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <hr>
+<p>id: ADR-014 title: プラグインインスタンスは、ホストが所有する単一のエグレス権限を通じてのみネットワークに到達する date: 2026-08-20 status: 提案中 relates-to:</p>
+<ul>
+<li>ADR-006</li>
+<li>ADR-009</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/9395</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/8850</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/8398</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9580</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9137</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9582</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9584</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/11098</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/10996</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9126</li>
+<li>crates/zeroclaw-infra/src/net_guard.rs</li>
+<li>crates/zeroclaw-plugins/src/egress.rs</li>
+<li>crates/zeroclaw-plugins/src/component.rs</li>
+<li>crates/zeroclaw-config/src/schema.rs</li>
+<li>crates/zeroclaw-tools/src/helpers/domain_guard.rs</li>
+</ul>
+<hr>
+<h1 id="adr-014-プラグインインスタンスがネットワークに到達できるのはホストが管理する単一の送信アクセス権限経由のみ"><a class="header" href="#adr-014-プラグインインスタンスがネットワークに到達できるのはホストが管理する単一の送信アクセス権限経由のみ">ADR-014: プラグインインスタンスがネットワークに到達できるのは、ホストが管理する単一の送信アクセス権限経由のみ</a></h1>
+<h2 id="コンテキスト"><a class="header" href="#コンテキスト">コンテキスト</a></h2>
+<p>#9582 で強制機能が導入される前、ZeroClaw は、プラグインのマニフェストが <code>http_client</code> パーミッションを要求した場合に、<code>wasi:http</code> インポートをプラグインストアにリンクしていました。このストアは wasmtime のデフォルトのリクエストフックをインストールしていた(<code>crates/zeroclaw-plugins/src/component.rs</code>)ため、ゲストが接続できる先を ZeroClaw 側で決定する仕組みはありませんでした。宛先の許可リスト、アドレス種別のガード、オペレーター向けの設定はいずれも存在しませんでした。マニフェストのパーミッションは要求にすぎず、ホストはすべての要求をそのまま許可していました(<code>crates/zeroclaw-plugins/src/instance.rs</code>)。一方で <code>plugins.security.signature_mode</code> のデフォルトは <code>disabled</code> でした。そのため、署名のないコンポーネントでも <code>http_client</code> を宣言して受け取ることができ、ループバックのサービス、ローカルゲートウェイ、クラウドのメタデータアドレスへフィルタなしで到達する踏み台になり得ました。バグ <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/9395">#9395</a> は、この過去の影響を記録したものです。現在出荷されている強制機能は、ホストが管理する宛先ポリシーを適用します。</p>
+<p>ホスト側の姉妹実装はすでにフェイルクローズで動作しています。<code>http_request</code> ツールは、<code>allowed_domains</code> リストが空の場合にすべての呼び出しを拒否し、<code>crates/zeroclaw-tools/src/helpers/domain_guard.rs</code> および <code>crates/zeroclaw-infra/src/net_guard.rs</code> を通じて、宛先と解決されたすべてのアドレスをメタデータ、ループバック、プライベート範囲に対して検証します。1つのプロセス内にある2つの送信経路が、互いに正反対の保証を持っていました。</p>
+<p>ADR-006 により、オプションのチャネルの対象がランタイムプラグインになり、すべてのメッセージングチャネルが egress consumer となるため、この境界にかかる圧力は高まっている。現在、<code>wit/v0/inbound.wit</code> はチャネルプラグインがネットワークもソケットもなしで実行されることを明示しており、公式プラグインリポジトリには、ホストが公開していないトランスポート向けのソケットインターフェース草案が <code>wit/unstable/sockets.wit</code> として存在する。次に導入されるトランスポートが何であれ、「このインスタンスはそのアドレスに到達してよいか」という問いに対して、新たな第三の答えではなく、既存の答えが必要である。</p>
+<p>この方向性の一部はすでに出荷されています。<a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9580">#9580</a> では組み込みの HTTP egress を共有ネットワークガードへ移行し、<a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9137">#9137</a> ではプラグイン側の egress ポリシーの基盤を追加しました。<a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9582">#9582</a> では <code>wasi:http</code> 境界でポリシーを適用し、<a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9126">#9126</a> では型付きインスタンス設定を追加しました。オペレーターによる権限付与の手続きは、インストールと一覧表示について <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/11098">#11098</a> で導入され、これは <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9584">#9584</a> を置き換えました。チャネルバインディングについては、<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/10996">#10996</a> の下で <code>zeroclaw plugin bind</code> を通じて導入されています。本記録は、これらの分割された実装が実現し、完成させる決定事項を述べたものです。RFC <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8398">#8398</a> は包括的/置き換え済みの RFC としてクローズされています。本 ADR は、その分割後も残った、ネットワーク egress に関する個別の決定を記録するものです。すなわち、ネットワーク権限に関する Q1 と、ユーザーによる宛先権限の拡張に関する Q4 です。</p>
+<p>代替案は3つあります。マニフェストの宣言そのものを許可として扱う方法、インストール済みのすべてのプラグインに単一のグローバル許可リストを適用する方法、そしてトランスポートごとに宛先ポリシーを個別に設定する方法です。マニフェストを許可とみなす方式は、署名のないパッケージに対する#9395の自己付与の経路を残し、デフォルト・クローズドの原則に反し、マニフェストが稼働中の権限に関する第二の正本になってしまいます。グローバル許可リストは、インスタンスごとの分離を損ないます。インストール済みの任意のプラグインが、他のどのプラグインが必要とするホストにも到達できてしまうためです。トランスポートごとのポリシーは、1つの判断に3つの設定項目を設けることになり、設定のずれを招きます。宛先の判断はトランスポートに依存しないはずだからです。</p>
+<h2 id="決定"><a class="header" href="#決定">決定</a></h2>
+<h3 id="one-egress-authority-with-shared-policy-machinery-and-default-deny-共通のポリシー機構を備えた単一のエグレス権限を持ちデフォルトで拒否する"><a class="header" href="#one-egress-authority-with-shared-policy-machinery-and-default-deny-共通のポリシー機構を備えた単一のエグレス権限を持ちデフォルトで拒否する">One egress authority with shared policy machinery and default deny 共通のポリシー機構を備えた単一のエグレス権限を持ち、デフォルトで拒否する</a></h3>
+<p>プラグインによるすべての外向きネットワークアクセスは、現在の <code>wasi:http</code> も、将来追加される任意のソケット、WebSocket、TLS プロファイルのインポートも含めて、ホストが管理する単一の egress 権限によって仲介されます。宛先マッチング、アドレス分類、NAT64 変換、名前解決後の判定は <code>zeroclaw-infra::net_guard</code> にあり、組み込みツールもこれを利用しています。<code>crates/zeroclaw-plugins/src/egress.rs</code> には、これらのプリミティブを利用するインスタンス単位のサービスがありますが、それらを再実装することはありません。また、この用途で <code>zeroclaw-plugins</code> が <code>zeroclaw-tools</code> に依存することもありません。プラグインと組み込みツールの間で、ある宛先に到達可能かどうかの判断が食い違ってはなりません。</p>
+<p>許可された接続先を持たないプラグインインスタンスは、ネットワークに到達できません。<code>http_client</code> 単独で無制限の HTTP アクセスが与えられる互換モードは存在しません。権限は機能の範囲を付与し、接続先は運用者のリストによって付与されます。</p>
+<p>サービスは、リンカーが承認済みインスタンスに付与されたインポートのみを公開している場合でも、操作の境界でトランスポートに必要な権限を再度チェックします。この重複したチェックは意図的な多層防御です。トランスポートアダプターが、リンクされているものの付与されていないインポートを通じてネットワーク到達性を得られてはなりません。</p>
+<h3 id="wasihttp-境界で固定された送信パスを使って強制する"><a class="header" href="#wasihttp-境界で固定された送信パスを使って強制する"><code>wasi:http</code> 境界で、固定された送信パスを使って強制する</a></h3>
+<p>強制は転送境界で行われます。プラグインストアごとに保存された ZeroClaw のフック実装が wasmtime のデフォルトフックを置き換え、そのリクエストフックはゲストが発行するすべてのリクエストに対してポリシーを評価します。送信経路はホストが所有し、固定されています。宛先を一度だけ解決し、解決されたアドレスを共有ガードで検証したうえで、その正確なアドレスにのみ接続します。接続時には SNI と証明書検証にホスト名を使用します。再解決が行われないため、DNS の応答が確認と接続の間にクラスを変えることはありません。<code>ResolvedDestination</code> は、この性質を構造的に保証するために存在します。検証済みのアドレスを保持し、新たな名前解決へ戻る経路を提供しません。</p>
+<p>ホストがゲストに代わってリダイレクトをたどることはありません。ゲストがリダイレクトをたどることを選択した場合は新しいリクエストを発行し、各ホップはそれぞれ独立に完全なポリシーを通過します。</p>
+<p>A denial returns a masked error to the guest that names the policy rather than host internals, and emits a structured host-side log event attributing the attempt to the exact instance.</p>
+<p>Wait — this is a translation request, and the content is a sentence to translate into Japanese. Here is the translation:</p>
+<p>拒否された場合、ゲストには、ホスト内部ではなくポリシー名を示す、マスクされたエラーが返され、そのインスタンスを正確に特定して試行を帰属させる構造化されたホスト側のログイベントが出力されます。</p>
+<p>この seam は <code>wasi:http</code> 向けに #9582 で出荷済みです。残りのゲートは、交差部分、フィクスチャのカバレッジ、フリートへのロールアウトを対象としています。</p>
+<h3 id="manifest-で宣言しオペレーターの設定で許可する"><a class="header" href="#manifest-で宣言しオペレーターの設定で許可する">Manifest で宣言し、オペレーターの設定で許可する</a></h3>
+<p>プラグインマニフェストは、パッケージが必要とする送信先を <code>[egress]</code> セクションで宣言できます。宣言できるのは、完全一致のホスト名か、明示的なサフィックスパターンです。この宣言は署名の対象となる要求であり、パッケージに付随する意図の表明です。リクエスト時に許可として参照されることは決してありません。</p>
+<p>許可設定は、オペレーターの正規の設定ファイルに置かれます。インスタンスの <code>[[plugins.entries]]</code> 行に平文のフィールドとして記述し、接続先には <code>egress_hosts</code>、アドレスクラスの例外指定には <code>egress_allow_private</code> を使います。両者は <code>#[secret]</code> の <code>config</code> マップと意図的に並列に配置されており、その内側に置かれることはありません。許可リストはオペレーターが監査する対象であるため、監査するファイル内で読める状態を保つ必要があるからです。</p>
+<p>インスタンスの実効的な権限範囲は、そのマニフェストが要求する内容と、オペレーターが付与した内容の共通部分です。宣言だけでは何の権限も与えられず、またオペレーターによる付与は、パッケージが必要だと宣言した範囲を超えることはできません。付与の経路は次の2つが正式にサポートされています:</p>
+<ol>
+<li>以下の授与式での宣言からシードされました。</li>
+<li>オペレーターが直接作成するものであり、宛先自体がインスタンス設定となるプラグイン（セルフホスト型のGitea、Matrixホームサーバー、LAN内のNextcloudなど）にとっては、これが唯一取りうる経路です。作成者はホストを知り得ないため、設定を行うオペレーターがそれを許可します。</li>
+</ol>
+<p>ポリシーは、インスタンスの状態にスナップショットとして保持するのではなく、リクエストごとに正規の設定から読み取られます。そのため、オペレーターによる編集は再起動ではなく次の接続から適用されます。ADR-012(まだ提案中)は、関連する世代単位の適用モードについて記述しています。ここでは参考情報であり、権威ある根拠ではありません。</p>
+<p>オペレーターのフィールド、リクエストごとの読み取り、マニフェストの <code>[egress]</code> 宣言はマージ済みです。積集合はまだ実装されていないため、このリリースではオペレーターの許可のみが適用されます。この点はゲートG1でカバーされています。</p>
+<h3 id="移行先の文法に全許可形式を含めないでください"><a class="header" href="#移行先の文法に全許可形式を含めないでください">移行先の文法に全許可形式を含めないでください</a></h3>
+<p>エントリは、完全一致のホスト、または明示的な <code>*.suffix</code> パターンのいずれかです。素のドメインがそのサブドメインを暗黙的に含むことはなく、サフィックスパターンが apex（ドメインそのもの）に一致することもありません。エントリなしは「どこでも」を意味します。検証では素の <code>*</code> は拒否されます。検証されていないエントリは、文字どおり <code>*</code> という名前のホストにしか一致しないため、検証をすり抜けたリストであってもフェイルクローズ（安全側に失敗）します。IP リテラルのホストは、完全に一致するエントリによってのみ照合され、サフィックスパターンによって照合されることは決してありません。アドレスにはサブドメインの構造がなく、ドット区切りの名前として扱うと <code>*.0.0.1</code> が <code>127.0.0.1</code> に一致してしまうためです。空のリストはどれにも一致しません。ポートはエントリの一部ではありません。ホストを許可すると、そのホストのすべてのポートが許可されます。</p>
+<h3 id="アドレスクラスをallowlistより上でブロックする"><a class="header" href="#アドレスクラスをallowlistより上でブロックする">アドレスクラスをallowlistより上でブロックする</a></h3>
+<p>クラウドのメタデータアドレスは、両方のアクセスモードで無条件に拒否されます。そのため、プライベート宛先に対するオペレーターの明示的な許可によって、これらが再び許可されることはありません。ループバック、リンクローカル、プライベートレンジの宛先は、パターンに一致する場合でも、エントリが <code>egress_allow_private</code> にそのホストを指定していない限り拒否されます。この例外規定が緩和するのはアドレスクラスの制限のみです。<code>egress_hosts</code> に含まれていないホストは、<code>egress_allow_private</code> に記載されていても引き続き拒否されます。この挙動は、組み込みツールがすでに使用している <code>allowed_private_hosts</code> のセマンティクスを踏襲しており、両方の利用側が同じ用語体系を保てるようになっています。</p>
+<p>An answer set that spans both trust zones is rejected rather than collapsed to one of them, even when private access is authorized. Otherwise resolver ordering or connection fallback silently decides which zone the connection lands in.</p>
+<p>Wait, I need to translate this into Japanese. Here is the translation:</p>
+<p>両方の信頼ゾーンにまたがる応答セットは、プライベートアクセスが許可されている場合でも、どちらか一方に寄せられることなく拒否されます。そうしないと、リゾルバの順序や接続フォールバックによって、接続がどのゾーンに入るかが黙って決まってしまいます。</p>
+<h3 id="運用者に-nat64-プレフィックスの宣言を必須とし不正な形式のリストはフェイルクローズで失敗させる"><a class="header" href="#運用者に-nat64-プレフィックスの宣言を必須とし不正な形式のリストはフェイルクローズで失敗させる">運用者に NAT64 プレフィックスの宣言を必須とし、不正な形式のリストはフェイルクローズで失敗させる</a></h3>
+<p><code>security.nat64_prefixes</code> は、運用者がネットワークで実際に使用している変換を宣言する場所です。NAT64 トランスレータは、設定されたプレフィックス内にあるすべての IPv6 宛先を、その宛先に埋め込まれた IPv4 アドレスへ配送します。プレフィックスはデプロイ時に選択されるものであり、アドレス自体からそれを判別する手段はありません。そのため、ホスト名の DNS 応答を制御できる攻撃者は、一見グローバルな IPv6 アドレスを返すことで、ローカルのトランスレータが <code>10.0.0.1</code> や <code>169.254.169.254</code> へ配送するよう仕向けることができます。エントリは、RFC 6052 セクション 2.2 で定められたプレフィックス長 6 種類すべてを用い、<code>&lt;ipv6&gt;/&lt;length&gt;</code> の形式で記述します。プレフィックス長より後ろのビットは設定しないでください。</p>
+<p>以下の2つのルールは、一般的な実装よりも厳格です。第一に、不正なエントリが1つでもあればリスト全体を拒否し、整形式のサブセットに縮小することはしません。解析の結果「プレフィックスなし」となったリストは、トランスレータを使用しないデプロイメントと全く同じに見えてしまい、シグナルなしにネットワーク固有の分類を無効化してしまうためです。第二に、宣言されたプレフィックスは重複することがあり、その場合1つのアドレスが各プレフィックスの下で異なるIPv4宛先にデコードされます。それらの宛先はすべて到達可能であるため、アドレスは、一致するすべての宣言済み変換先が許容可能な場所に行き着く場合にのみ受け入れられます。たまたま最初に許容可能と判定された変換だけで判断するのではありません。</p>
+<h3 id="権限付与を明示的な手順にする"><a class="header" href="#権限付与を明示的な手順にする">権限付与を明示的な手順にする</a></h3>
+<p><code>zeroclaw plugin install</code> は、パッケージが宣言している送信先を表示し、すでに作成されているエントリにそれらを初期値として登録します。チャンネルエイリアスのように後から作成されるバインディングを持つインスタンスは、そのバインディングが作成される時点で、同じ宣言から、同じ表示内容とともに送信エグレスのエントリを受け取ります。インストールとバインディングの作成は、オペレーターによる明示的な操作であり、表示され永続化された許可リストがその記録となります。<code>zeroclaw plugin list</code> は各インスタンスに付与された送信先を表示するため、設定ファイルを読まなくても到達範囲を監査できます。</p>
+<p>A package upgrade whose declaration adds destinations does not extend an existing entry.</p>
+<p>Translation: パッケージのアップグレードで宣言に送信先を追加しても、既存のエントリは拡張されません。CLIが差分を表示し、オペレーターが意図的に適用します。エントリが存在しない場合、egressは拒否されます。</p>
+<p>Note on the last sentence: “egress” is kept as a technical term, as is standard in ja networking docs.</p>
+<p>インストール時のシーディング、アップグレード時の差分、そして対応する <code>zeroclaw plugin list</code> のレポートは #11098 で実装され、#9584 を置き換えました。バインド時のシーディングは #10996 で zeroclaw plugin bind とともに実装されており、zeroclaw plugin install –channel-alias はインストール中に同じ手順を実行します。オペレーターがその時点で –channel-alias のエイリアスを指定するため、バインドの手順では付与内容を明示的な選択として扱います。<code>--egress declared</code> を指定すると、インストール時と同じ出力を伴って宣言がシードされ、<code>--egress none</code> を指定すると付与が空のエントリが作成されます。どちらのフラグも指定しない場合、空でない宣言からエントリを作成するバインドは拒否されます。どちらのコマンドも既存のエントリを拡張することはありません。</p>
+<h3 id="future-transport-のすべてに同じポリシーオブジェクトをバインドする"><a class="header" href="#future-transport-のすべてに同じポリシーオブジェクトをバインドする">Future transport のすべてに同じポリシーオブジェクトをバインドする</a></h3>
+<p>Socket、WebSocket、TLS プロファイルのインポートは、ホストが採用する場合、同じインスタンス単位のポリシーを利用します。ホストとポートへのソケット接続または WebSocket アップグレードは、同じ許可リストと同じアドレスクラスのルールを通過します。TLS プロファイルは信頼素材を選択しますが、宛先ポリシーを迂回することは決してありません。宛先の判断をこのサービスを経由させられないトランスポートのインポートは取り込まれません。</p>
+<p>このレコードでは、ホストにWASIソケット機能が存在するまで、Raw-TCPチャネルは対象外です。それまでの間、プロトコルがHTTPではないチャネルにはプラグイン側の経路がなく、ADR-006のcapability-exceptionルールに基づきネイティブのまま残ります。Matrixはそのような例外の一つですが、本レコードではこれを廃止しません。不足しているホスト機能として明記されているのはエンドツーエンド暗号化であり、プラグイン境界がそれを扱えるようになるまで、ネイティブ実装は残ります。これはADR-006におけるcapabilityの同等性（パリティ）に関する問題であり、本レコードはそれを変更するものではありません。</p>
+<p>グラントはプロトコルに依存しません。ホストにグラントを付与するオペレーターは、そのインスタンスの権限で許可されている任意のトランスポートに対してグラントを付与するため、別個の平文の軸は存在せず、<code>egress_allow_plaintext</code> フィールドもありません。機密性は、宛先リストの二つ目ではなく、トランスポートと通信相手との間の契約です。プロトコルがインバンドで TLS をネゴシエートする場合、フェーズの移行はホストが管理し、アップグレードが開始された後は平文へのフォールバックを一切許可しません。</p>
+<p>Per-instance の接続バジェットは、各トランスポートではなく基盤に属します。<code>plugins.limits.max_connections_per_instance</code> は、1 つの論理インスタンスに属するすべてのトランスポートおよびすべてのストアで共有され、認可されたリクエストは接続のライフタイムの間そのリースを保持します。</p>
+<h3 id="信頼されていないマニフェスト入力を同じ境界で制限する"><a class="header" href="#信頼されていないマニフェスト入力を同じ境界で制限する">信頼されていないマニフェスト入力を、同じ境界で制限する</a></h3>
+<p>マニフェストは攻撃者が制御しうる入力であり、egress の宛先と同じ信頼境界に位置します。そのため、マニフェストのわずかなバイト数によって高コストなホスト側の処理が引き起こされてはなりません。型付きインスタンス設定の作業は #9126 で提供されており、これに従ってマニフェストで指定されたスキーマのパターン検証に上限を設けています。パターンは線形時間エンジン上でコンパイルされ、明示的な 256 KiB のコンパイル済みプログラム上限と 1 MiB の DFA 上限が適用されます。いずれかを超えるパターンはコンパイルされず、無効なマニフェストとして拒否されます。パッケージを拒否する方が安全な方向です。そこまで高コストなパターンが必要なプラグイン作者は、より小さいパターンを書けます。一方、コンパイルを開始してしまったホストは、スケジューラを取り戻せなくなるおそれがあります。本書に記録するのは、本 ADR が管理する境界を強化するものだからであり、egress の経路上にあるからではありません。</p>
+<h3 id="受け入れゲート"><a class="header" href="#受け入れゲート">受け入れゲート</a></h3>
+<p>この ADR は、以下の条件をすべて満たすまで提案中のままです：</p>
+<ul>
+<li>
+<p>ここで翻訳するのは技術文書の文字列で、<code>zeroclaw-infra::net_guard</code> と <code>[egress]</code> はそのまま保持します。</p>
+<p>共有ガード・プリミティブは <code>zeroclaw-infra::net_guard</code> にあり、両方の利用側がそれを使用しています。プラグインストア向けにストアごとのフックとピン留めされた送信パスが提供されており、マニフェストの <code>[egress]</code> 宣言は、解析、検証、署名の対象範囲まで含めて実装済みです。有効な許可は、この宣言と運用者のエントリの積集合です。インストール時およびバインディング時のシーディング、ならびにアップグレード差分の確認手続き（G1）も動作しています。</p>
+</li>
+<li>
+<p>required CI proves the boundary with a real component fixture: denied by default with no entry, allowed through a seeded entry, metadata and private-address refusal over a matching allowlist, and a component that chases a redirect from an allowed host toward a blocked class has its second request denied (G2); 必須のCIは、実際のコンポーネント・フィクスチャで境界を検証する: エントリがない場合はデフォルトで拒否され、シードされたエントリを通じて許可され、一致する許可リストに対してメタデータおよびプライベートアドレスが拒否され、許可されたホストからブロック対象のクラスへのリダイレクトをたどるコンポーネントでは2回目のリクエストが拒否される (G2);</p>
+</li>
+<li>
+<p><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8850">#8850</a> で選定された最初のチャネルプラグインは、そのAPIホストのシード済みエントリ（G3）の下で実行されます。また、</p>
+</li>
+<li>
+<p>既存のフリートへのロールアウトは完了しています。ホストでの強制が有効になる前に、公式レジストリの<code>http_client</code>パッケージは再公開されたバージョンで<code>[egress]</code>宣言を含むようになりました。アップグレード時の診断では、インストール済みの各インスタンスについて拒否された宛先と正確なシーディングコマンドが一覧表示されます。強制を有効にするリリースでは、変更履歴に今回の破壊的変更が明記されます。#9395 は強制適用のスライス（G4）によって既にクローズされています。</p>
+</li>
+</ul>
+<p>共有ガード、平文のオペレーターフィールド、リクエストごとのポリシー読み取り、厳格な宛先文法、NAT64 境界、接続バジェット、マニフェストの <code>[egress]</code> 宣言、アップグレード差分を伴うインストール時およびバインディング時のシーディングは実装済みです。G1 の残り（その宣言とオペレーターのエントリの交差部分）と G2 から G4 は未実装です。</p>
+<h2 id="結果"><a class="header" href="#結果">結果</a></h2>
+<p>肯定的な結果:</p>
+<ul>
+<li>#9395のピボットは、署名ポリシーのみに頼るのではなく、設計上の仕組みによって閉じられています。署名のない、または悪意のあるコンポーネントは、マニフェストの自己要求をネットワーク到達性へと変換できないためです。</li>
+<li>Operatorは、インスタンスごとに監査可能なプレーンテキストの設定項目を1つ持ち、変更は再インスタンス化せずに次の接続から適用されます。</li>
+<li>パッケージのアップグレードによって、外部への通信許可範囲が暗黙のうちに広がることはありません。</li>
+<li>Built-in tools and plugins converge on one guard vocabulary instead of drifting apart. 組み込みツールとプラグインは、互いに乖離するのではなく、単一のガード用語に収束している。</li>
+<li>新しいトランスポートは、送信先の決定を再検討せず、それを引き継ぎます。</li>
+</ul>
+<p>否定的な結果:</p>
+<ul>
+<li>これは、インストール済みのすべての<code>http_client</code>プラグインに対する破壊的変更です。そのエントリがシードまたは作成されるまで、egressは許可されません。G4はこの理由から存在しており、この変更は移行診断と再公開された宣言が揃って初めて提供されます。</li>
+<li>セレモニーには、インストール時のステップとバインディング時のステップが追加されるほか、エントリごとのポリシー状態も加わります。</li>
+<li>ユーザー指定の URL など、動的な送信先を必要とするプラグインには、ワイルドカードの egress は許可されません。そうしたプラグインは、オペレーターが受け入れるサフィックスパターンを宣言するか、オペレーターが作成したエントリに依存するか、ホストが仲介するフェッチサービスの提供を待つことになります。これは #8398 の Q4 への回答に伴う、意図的なトレードオフです。</li>
+<li>NAT64 変換器の背後にあるデプロイメントでは、境界を正確に保つためにプレフィックスを宣言する必要があり、重複するプレフィックスの保守的な評価によって、オペレーターが正当と見なす宛先が拒否される場合があります。</li>
+<li>ポリシーの読み込みはインスタンス化ごとではなくリクエストごとに行われるため、設定リゾルバは接続の経路上にあります。</li>
+</ul>
+<h2 id="参照"><a class="header" href="#参照">参照</a></h2>
+<ul>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/9395">バグ #9395: プラグインの <code>wasi:http</code> 送信に宛先ポリシーも設定項目もない</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8850">Migration tracker #8850</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8398">RFC #8398: プラグインの権限、設定、シークレットモデル</a> (クローズ済み/置き換え済みの文脈)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9580">PR #9580: 共有ネットワークガードにおける組み込み HTTP 送信の強化</a>（マージ済み）</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9137">PR #9137: 共有 egress ポリシーの基盤</a> (マージ済み)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9582">PR #9582: プラグインの<code>wasi:http</code>にホスト管理の egress ポリシーを適用</a>（マージ済み）</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9584">PR #9584: plugin の install と list における egress 許可の手続き</a> (クローズ済み、#11098 に置き換え)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/11098">PR #11098: インストール時に egress を許可し、プラグインが読み込まれるかどうかを報告</a> (マージ済み)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/10996">Issue #10996: チャネルインスタンスの設定と権限付与の初期投入</a> (バインディング時の初期投入)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9126">PR #9126: 型付きインスタンス設定の検証</a> (マージ済み)</li>
+<li><a href="./ADR-006-runtime-channel-plugins.html">ADR-006: ランタイムチャネルプラグイン</a></li>
+<li><a href="./ADR-009-wit-wasmtime-plugin-execution.html">ADR-009: WIT と wasmtime プラグインの実行</a></li>
+<li><a href="./ADR-012-generation-scoped-live-config-apply.html">ADR-012: 世代スコープのライブ設定適用</a></li>
+<li><a href="../../security/model.html">セキュリティモデル</a></li>
+<li><code>crates/zeroclaw-infra/src/net_guard.rs</code></li>
+<li><code>crates/zeroclaw-plugins/src/egress.rs</code></li>
+<li><code>crates/zeroclaw-plugins/src/component.rs</code></li>
+<li><code>crates/zeroclaw-config/src/schema.rs</code></li>
+<li>crates/zeroclaw-tools/src/helpers/domain_guard.rs</li>
+<li><code>crates/zeroclaw-tools/src/http_request.rs</code></li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../../architecture/decisions/ADR-013-key-source-authority.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../../architecture/decisions/ADR-015-unified-capability-catalog.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../../architecture/decisions/ADR-013-key-source-authority.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../../architecture/decisions/ADR-015-unified-capability-catalog.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../../clipboard-1626706a.min.js"></script>
+        <script src="../../highlight-abc7f01d.js"></script>
+        <script src="../../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../../_shared/mermaid.min.js"></script>
+        <script src="../../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

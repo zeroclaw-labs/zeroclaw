@@ -1,0 +1,521 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ADR-018：运行时安全与溯源 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="id: ADR-018 title: 运行时安全与溯源采用运行时自有的决策边界 date: 2026-08-17 status: 提议中 relates-to:">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../../toc-be837aa1.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/architecture/decisions/ADR-018-runtime-security-and-provenance.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/architecture/decisions/ADR-018-runtime-security-and-provenance.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/architecture/decisions/ADR-018-runtime-security-and-provenance.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/architecture/decisions/ADR-018-runtime-security-and-provenance.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/architecture/decisions/ADR-018-runtime-security-and-provenance.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/architecture/decisions/ADR-018-runtime-security-and-provenance.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/architecture/decisions/ADR-018-runtime-security-and-provenance.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="ADR-018：运行时安全与溯源 - ZeroClaw Docs">
+        <meta property="og:description" content="id: ADR-018 title: 运行时安全与溯源采用运行时自有的决策边界 date: 2026-08-17 status: 提议中 relates-to:">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/zh-CN/architecture/decisions/ADR-018-runtime-security-and-provenance.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="ADR-018：运行时安全与溯源 - ZeroClaw Docs">
+        <meta name="twitter:description" content="id: ADR-018 title: 运行时安全与溯源采用运行时自有的决策边界 date: 2026-08-17 status: 提议中 relates-to:">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <hr>
+<p>id: ADR-018 title: 运行时安全与溯源采用运行时自有的决策边界 date: 2026-08-17 status: 提议中 relates-to:</p>
+<ul>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/7142</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/6971</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/6954</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/7432</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/7141</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/7155</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/6996</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/6909</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/3767</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/6105</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/8583</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/8289</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/8290</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/10425</li>
+<li>docs/book/src/architecture/request-lifecycle.md</li>
+<li>docs/book/src/architecture/background-work-lifecycle.md</li>
+<li>docs/book/src/architecture/tool-execution-lifecycle.md</li>
+<li>docs/book/src/security/model.md</li>
+<li>crates/zeroclaw-api/src/ingress.rs</li>
+<li>crates/zeroclaw-runtime/src/agent/turn/mod.rs</li>
+<li>crates/zeroclaw-runtime/src/security/ingress.rs</li>
+<li>crates/zeroclaw-runtime/src/security/audit.rs</li>
+<li>crates/zeroclaw-runtime/src/approval/mod.rs</li>
+<li>crates/zeroclaw-runtime/src/cron/scheduler.rs</li>
+<li>crates/zeroclaw-runtime/src/tools/send_message_to_peer.rs</li>
+<li>crates/zeroclaw-runtime/src/tools/spawn_subagent.rs</li>
+</ul>
+<hr>
+<h1 id="adr-018-运行时安全与溯源-采用运行时持有的决策边界"><a class="header" href="#adr-018-运行时安全与溯源-采用运行时持有的决策边界">ADR-018: 运行时安全与溯源 采用运行时持有的决策边界</a></h1>
+<h2 id="上下文"><a class="header" href="#上下文">上下文</a></h2>
+<p>ZeroClaw 的多个安全敏感路径都需要对三个问题给出统一的答案：是谁或什么引发了这项工作，哪项策略允许了它，以及什么证据能证明在效果发生之前已经应用了边界。工具调用、Shell 命令、网关和 RPC 变更、定时任务、SOP 步骤、转向消息以及对等代理分发，过去都在不同的位置回答这些问题。</p>
+<p>这种拆分会带来两种失效模式。新的动作路径可能遗漏某个步骤，例如审批、来源标记、最终目标校验或审计证据。新的扩展点也可能权限过大：如果它能够决定策略、屏蔽权威证据，并把事件响应整体交由一个可替换的提供方处理，就会变得过于强大。</p>
+<p>三个已接受的 RFC 描述了在运行时边界解决此问题的架构：</p>
+<ul>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/7142">#7142</a> 接受了一条由运行时掌控的安全决策流水线，用于受保护的操作。该流水线综合了内置策略、规范化的主体授权、审批要求、沙箱约束、限制性叠加层、操作指纹、一次性运行时许可、规范化审计事件以及结果记录。</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6971">#6971</a> 接受凭据面权限、安全状态报告，以及一条由运行时负责的模型准入路径。凭据形态的配置字段需要明确的处理分类，受保护的值不得进入保存和属性回读路径，运行时凭据边界图需要标明明文凭据可能流经的位置。每个面向模型的轮次和转向注入在模型看到之前都会收到可信入口信封，而传输边缘的身份验证和滥用控制则保留在该共享模型准入层之外。</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6954">#6954</a> 接受由运行时持有的、用于内部发起轮次的溯源信息。Cron、daemon、SOP、子代理和对等代理的工作必须携带内部主体、会话绑定、回复溯源、明确的上下文缺失处理方式，并区分执行、投递和持久化的结果。</li>
+</ul>
+<p>这些决定与<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/7141">#7141</a>中的规范主体（canonical principal）决定、<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/7155">#7155</a>中的命令/工具确认决定、<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6996">#6996</a>中的文件系统沙箱决定，以及<a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6909">#6909</a>等特定消费者目标验证相关，但并不能取代它们。</p>
+<p>当前代码库已包含重要的基础工作，但尚未达到完整的目标。<code>IngressContext</code>、<code>TurnOrigin</code> 和 <code>IngressDecision</code> 已经存在；turn 引擎会在循环入口和 steering 排空时调用入口策略；默认策略返回 <code>Loop</code>；<code>AuditLogger</code> 是可复用的哈希链脚手架；规范主体（canonical-principal）的基础工作也已开始。内部主体与分离结果（separated-outcome）这一部分仍在 <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/10425">#10425</a> 中审查。本 ADR 记录目标架构，在满足下列门禁之前仍处于提议（proposed）状态。</p>
+<h2 id="决策"><a class="header" href="#决策">决策</a></h2>
+<h3 id="保持运行时作为强制性的安全权威"><a class="header" href="#保持运行时作为强制性的安全权威">保持运行时作为强制性的安全权威</a></h3>
+<p>受保护的操作在执行或修改之前，都会经过一个由运行时统一掌控的安全决策流水线。该流水线基于可信的运行时上下文构造类型化请求，解析内置策略与规范主体授权，施加禁止权限提升和沙箱约束，叠加限制性覆盖层，在需要时收集可信审批，并在产生效果前立即重新校验时效性，生成规范化的审计证据，签发一次性运行时许可，并在受控的执行边界处消费该许可。</p>
+<p>许可是决策与执行之间的交接凭证。它与规范化后的操作、主体、策略版本、运行时纪元、目标身份、审批有效期以及指纹模式绑定。它不能被序列化，不能根据参数重新构造，不能为同级操作复制，也不能被消费超过一次。</p>
+<p>安全敏感的操作在运行时无法对其分类时会被拒绝。新的受保护边界必须登记到操作清单（action inventory）中，或登记到机械等效的结构中，且该结构需明确列出负责人（owner）、请求构造器（request constructor）、执行边界（execution boundary）、必需的策略层（mandatory policy layers）以及审计分类（audit classification）。</p>
+<h3 id="扩展只能收紧策略而不能替代底线"><a class="header" href="#扩展只能收紧策略而不能替代底线">扩展只能收紧策略，而不能替代底线</a></h3>
+<p>限制性覆盖层可以拒绝某项操作、收窄其资源范围，或要求更强或更新的审批。它们不得将拒绝转为允许，不得扩大主体授权，不得削弱沙箱或风险配置限制，不得从不可信的请求数据中自行选择，不得抑制规范审计事件，也不得将基线事件响应标记为已完成。</p>
+<p>可选的审计接收端（sink）和响应器（responder）是相互独立的扩展点。它们可以接收经过脱敏的投影数据，或添加遏制与通知行为，但不能删除、改写、延迟或替换运行时创建的规范事件（canonical event）以及基线运行时钩子（baseline runtime hooks）。</p>
+<p>未来公开的插件、WIT、远程策略、动态库或事件响应器 API 需要各自独立的实现与信任审查。本 ADR 仅确立权限边界，并不构想一个推测性的第三方安全提供方 ABI。</p>
+<h3 id="保持凭证相关界面的分类与保护"><a class="header" href="#保持凭证相关界面的分类与保护">保持凭证相关界面的分类与保护</a></h3>
+<p>凭据形态的配置字段必须有明确的处理分类，例如加密机密、仅路径引用、公开值、外部认证存储、兼容性环境路径或需要后续跟进。新的凭据形态字段在没有分类测试、审计或机械等效的棘轮（ratchet）机制之前，不得进入 schema。</p>
+<p>受保护的凭据值必须排除在保存路径和属性回读路径之外。分类层说明的是值如何存储或暴露；它本身并不能决定每个运行时组件是否可能接收明文。</p>
+<p>一份独立的运行时凭证边界图谱列出了明文可能流经的位置，涵盖提供方和渠道客户端、工具、MCP 服务器、委派任务、CLI 包装器、网关处理程序、日志、回执、事件和错误路径。本 ADR 将该图谱记录为必须满足的实现门槛，并允许基于它进行有针对性的加固，但不接受完整的凭证代理（credential broker），也不接受新的默认隔离配置文件。</p>
+<h3 id="使用统一的模型准入路径处理入站内容"><a class="header" href="#使用统一的模型准入路径处理入站内容">使用统一的模型准入路径处理入站内容</a></h3>
+<p>每个面向模型的回合在模型执行之前都会经过共享的入口策略。每次转向注入都会获得并基于其自身的可信入口信封进行评估，而不是沿用原始回合中过时的发送者、消息、传输或信任信息。</p>
+<p>入口策略会产生 <code>Loop</code>、<code>Annotate</code>、<code>Gate</code> 或 <code>Drop</code>。默认值 <code>Loop</code> 保留当前行为，且不分配托管的 SOP 工作。<code>Annotate</code> 在继续处理之前，将内容标记为不可信数据。<code>Gate</code> 将该轮对话移交给托管的人工或 SOP 决策路径。<code>Drop</code> 拒绝该轮对话，并记录拒绝原因。</p>
+<p>传输层边缘控制仍然是强制性的，且彼此独立。信道配对、发送方白名单、签名校验、载荷校验、速率限制、协议特定过滤以及资源滥用控制，都会在共享的模型准入层之前运行。共享层决定规范化后的内容是否可以进入模型；它不负责对传输进行身份验证。</p>
+<p>在可配置的非 <code>Loop</code> 策略可达之前，尚未实现的非 <code>Loop</code> 处置必须采用失败即关闭（fail closed）的方式处理。一旦配置可以选择 <code>Gate</code>，将 <code>Gate</code> 分支回落为 <code>Loop</code> 的做法就与本决定不兼容。</p>
+<h3 id="基于运行时事实标记溯源信息"><a class="header" href="#基于运行时事实标记溯源信息">基于运行时事实标记溯源信息</a></h3>
+<p>来源信息由受信任的运行时入口代码标记，绝不由消息内容或工具参数标记。来源（origin）与信任（trust）是两个独立的事实。内部、定时、委派或转发的工作可能源自外部内容，不会仅因直接调用方是内部的而变得可信。</p>
+<p>来自 #7141 的规范主体（canonical principals）在存在外部或已认证的执行者时，提供已认证的执行者身份和授权（grants）。来自 #6954 的内部主体（internal principals）用于标识由运行时拥有的发起者，例如 cron 任务、守护进程任务、SOP 步骤、对等代理（peer-agent）分发以及嵌套子轮次（nested sub-turns）。这些内部主体是来源（provenance）事实，而不是外部对等方，它们从不会像传输层用户一样出现在对等组或授权表中。</p>
+<p>子回合需保留父级来源信息，或记录父级链路，以确保委派的工作不会丢失引发它的身份与信任信息。SOP 和守护进程发起的回合必须使用能够区分其具体任务来源的名称，以便在追踪记录和运行记录中加以辨别。</p>
+<h3 id="将内部工作绑定到对话同时不转移权限"><a class="header" href="#将内部工作绑定到对话同时不转移权限">将内部工作绑定到对话，同时不转移权限</a></h3>
+<p>内部发起的轮次可以携带一个运行时内部会话绑定。该绑定指明历史记录从何处加载，以及已完成的轮次应追加到何处，并受常规的修剪和持久化规则约束。Cron 的 <code>session_target = "main"</code> 会绑定到智能体的主交互式会话；<code>isolated</code> 则有意不携带任何绑定。</p>
+<p>绑定不等于投递，也不等于记忆召回。绑定决定由哪个会话持有上下文并负责追加内容；投递决定用户在何处看到通知或回复；记忆召回仍由记忆注入策略控制。</p>
+<p>对等代理的回复使用不透明的回复溯源信息，而非共享会话。发送方的轮次在派发前会捕获关联 ID、发送方身份以及发送方会话绑定。接收方作为其自身代理执行，无法读取或解引用发送方的会话句柄。完成后，运行时沿该溯源信息追加或投递接收方的最终文本。</p>
+<p>V1 中对等回复的来源信息（provenance）仅限于进程内。已完成的存活进程接收方轮次必须沿来源信息完成投递，或记录投递失败的结果；而尚在途中、未绑定的 <code>degrade</code> 分发可能会在崩溃时丢失。持久化的分发记录或持久化队列属于单独的后续工作，不在本次 V1 决策范围内。</p>
+<p>缺失的上下文必须显式声明。<code>isolated</code> 表示不期望任何绑定，<code>require</code> 在无法推导所需回复溯源信息时拒绝分发，<code>degrade</code> 在没有绑定的情况下运行，并记录降级情况。接收方或消息内容不能将 <code>require</code> 削弱为 <code>degrade</code>。</p>
+<h3 id="保持结果与状态证据分离"><a class="header" href="#保持结果与状态证据分离">保持结果与状态证据分离</a></h3>
+<p>执行、交付、持久化和审计持久性是彼此独立的结果。兼容性状态可以对它们进行汇总，但它必须由各个独立维度推导得出，而不能作为一个相互竞争的事实来源直接写入。</p>
+<p>安全态势报告区分三类内容：已配置的意图、已解析或已探测的能力，以及经运行时验证的强制执行。<code>active</code> 和 <code>enforced</code> 这两个词仅保留给与实际应用该边界的运行时实例相关的证据。可选的投影、日志、观察者事件和回执可以展示有用的证据，但它们不会成为另一个安全权威。</p>
+<p>当启用规范的持久化审计接收端时，执行前事件会在受保护的变更操作之前提交。如果该提交失败，则拒绝此变更操作，并且安全状态会报告降级或不可用状态。在操作产生效果后写入结果失败时，会记录明确的未知或降级审计状态，因为已经执行的操作不能因审计持久化而撤销。</p>
+<h3 id="keep-rollout-sliced-and-reversible--保持发布分批进行且可回滚"><a class="header" href="#keep-rollout-sliced-and-reversible--保持发布分批进行且可回滚">Keep rollout sliced and reversible → 保持发布分批进行且可回滚</a></h3>
+<p>实现遵循 <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/7432">#7432</a> 中的路由跟踪器，以及源 RFC 中链接的各个实现问题和 PR。运行时安全管道、规范审计接收器、凭证表面分类、运行时凭证边界映射、入口标记、非 <code>Loop</code> 策略、内部主体信封、会话绑定、对等回复溯源以及持久化分发后续工作，必须以可独立评审的切片形式落地。</p>
+<p>没有任何单个 PR 应试图一次性将所有操作、所有传输方式、所有审计接收端以及所有内部轮次消费者都路由到完整目标中。每个切片都必须保持现有的默认行为，除非该切片明确负责某项兼容性变更。</p>
+<h3 id="验收关卡"><a class="header" href="#验收关卡">验收关卡</a></h3>
+<p>此 ADR 在满足以下所有条件之前仍处于提议状态：</p>
+<ul>
+<li>运行时动作流水线具有类型化的请求与决策词汇表、用于受保护边界的动作清单（或等效的棘轮机制）、一次性使用且不可伪造的许可凭证（permit）、代际与运行时纪元的新鲜度检查，以及在所属执行或变更边界处的最终目标重新验证；</li>
+<li>direct、nested、scheduled、delegated、SOP、gateway、RPC 及安全敏感的工具路径不得绕过已注册的流水线边界，且未知或未分类的受保护操作一律采取失败关闭（fail closed）策略。</li>
+<li>内置策略、#7141 主体授权、禁止提权、#7155 审批溯源、#6996 沙箱约束，以及 #6909 等特定使用方的重新验证，仍是不受限制性覆盖层控制的强制层。</li>
+<li>凭据形态的配置字段均有明确的处理分类，并配有模式审计、测试或同等的约束机制，用于拦截任何新增的未分类字段。</li>
+<li>受保护的凭据值在保存和属性回读路径中始终不会出现，并在适用的情况下提供未泄露的测试覆盖。</li>
+<li>运行时凭证边界图涵盖提供方与渠道客户端、工具、MCP 服务器、委派工作、CLI 封装器、网关处理程序、日志、回执、事件以及错误路径，由此产生的加固缺口将分流至专项后续任务，而非被视为已接受的凭证代理。</li>
+<li>规范化的最小化安全事件由运行时创建，包含策略决策和结果证据，但不包含机密负载；启用的持久化接收端会在执行变更之前提交执行前事件，若持久化失败则拒绝该变更。</li>
+<li>可选的审计接收器和事件响应人员可以添加投影或响应，但不能抑制、替换、延迟或改写规范证据或基线运行时钩子；</li>
+<li>every 模型绑定轮次和引导注入都会收到各自的可信入口信封，其中包含传输方式、发送者或主体、可用时的消息标识、来源以及由入口代码而非消息内容标记的信任信息；</li>
+<li>可配置的 <code>Annotate</code>、<code>Gate</code> 和 <code>Drop</code> 行为，只有在未实现的非 <code>Loop</code> 处置方式改为以审计证据失败关闭并通过测试之后，才能启用。</li>
+<li>传输边缘的身份验证、配对、允许列表、签名校验、载荷验证、速率限制、自身/机器人过滤以及滥用控制,均在标准化模型准入之前强制执行;</li>
+<li>internal principals 已为 cron、daemon/SOP、peer-agent 和 subturn 入口点实现，并通过测试证明它们是来源（provenance）事实，而不是 peer 成员资格授予；</li>
+<li>conversation binding 通过串行化的每会话所有者加载并追加历史记录，cron 中的 <code>session_target = "main"</code> 会在下一次交互式轮次中可见，而 <code>isolated</code> 则刻意保持未绑定。</li>
+<li>peer reply provenance 会投递或记录已完成的、运行中进程的接收方输出，同时不向接收方暴露发送方的会话句柄；并且 <code>require</code> 不能被接收方或消息内容削弱；</li>
+<li>执行、投递和持久化的结果各自独立存储或输出，任何兼容性汇总均由这些维度推导得出；</li>
+<li>安全态势、发布和常设文档应准确使用“已配置”“已解析/已探测”和“运行时已验证”等证据用语，包括更正先前仅属于第一阶段脚手架的主动执行声明；以及</li>
+<li>#7432 和专门的实现跟踪项明确了剩余的切分任务、负责人、测试，以及发布或回滚说明，然后才能将本 ADR 标记为已接受。</li>
+</ul>
+<h2 id="后果"><a class="header" href="#后果">后果</a></h2>
+<p>积极后果：</p>
+<ul>
+<li>
+<p>Reviewers 针对受保护的效果,只需由运行时负责回答一个问题:该操作是否获得了当前决策,并在其边界处消费了一个有效的许可(permit)?</p>
+</li>
+<li>
+<p>Security extensions become less dangerous because they can narrow or project, but not replace the mandatory floor.</p>
+<p>Wait, I need to correct myself: the system instructions say to translate to zh-CN and return only the translated string. Here is the translation:</p>
+<p>安全扩展之所以危害性降低，是因为它们只能收窄或投射策略，而无法替换强制性的底线。</p>
+</li>
+<li>
+<p>Inbound 内容决策、转向消息、定时任务和对等代理回复共享同一套来源溯源术语，而不是各自编造本地信任逻辑。</p>
+</li>
+<li>
+<p>运营人员能够区分已配置的策略、已解析的能力与运行时已验证的强制执行，而不是将所有状态输出都视为同等可靠。</p>
+</li>
+<li>
+<p>内部工作可以参与对话历史与回复路由，但不会将定时任务、SOP 步骤或对等智能体伪装成外部渠道的对等方。</p>
+</li>
+</ul>
+<p>负面后果：</p>
+<ul>
+<li>
+<p>The运行时必须在动作和回合边界之间传递更多结构化上下文。</p>
+<p>Wait, let me correct the spacing to be clean:</p>
+<p>运行时必须在动作和回合边界之间传递更多结构化上下文。</p>
+</li>
+<li>
+<p>当前仍有用的代码路径只是部分得到验证，需等到其实现切片补充上述的棘轮机制和测试之后，才能完全证明其正确性。</p>
+</li>
+<li>
+<p>默认保留的分阶段推出，比一次性大范围的安全重写要慢。</p>
+</li>
+<li>
+<p>非 <code>Loop</code> 入口行为和持久化的对等节点分发不能随意发布；在发布前，必须先提供故障、溯源和兼容性方面的证据。</p>
+</li>
+<li>
+<p>审计持久化在启用后会引入文件 I/O 和失败即关闭（fail-closed）行为，因此必须明确兼容性与回滚方案。</p>
+</li>
+</ul>
+<h2 id="参考文献"><a class="header" href="#参考文献">参考文献</a></h2>
+<ul>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/7142">RFC #7142：运行时持有的安全决策流水线与限制性覆盖层</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6971">RFC #6971：安全态势、凭据边界与通用入口策略</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6954">RFC #6954：内部发起的智能体轮次的来源溯源、会话绑定与回复约定</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/7432">追踪 #7432：v0.9.0 认证、安全、网关与破坏性变更队列</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/7141">RFC #7141：可插拔的入站认证与规范主体</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/7155">RFC #7155：按执行划分的确认等级与命令模式策略</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6996">RFC #6996：细粒度沙箱策略</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6909">Issue #6909：面向消费者的桌面目标验证</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6105">问题 #6105：智能体不了解其运行的 cron 任务上下文</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8289">跟踪器 #8289：OIDC 里程碑：规范主体与入站认证</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8290">追踪 #8290：多用户里程碑——按主体隔离与按发送者授权</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/10425">PR #10425：internal-principal 信封与分离的 cron 运行结果</a></li>
+<li><a href="../request-lifecycle.html">请求生命周期</a></li>
+<li><a href="../background-work-lifecycle.html">后台工作生命周期</a></li>
+<li><a href="../tool-execution-lifecycle.html">工具执行生命周期</a></li>
+<li><a href="../../security/model.html">安全模型</a></li>
+<li><code>crates/zeroclaw-api/src/ingress.rs</code></li>
+<li><code>crates/zeroclaw-runtime/src/agent/turn/mod.rs</code></li>
+<li><code>crates/zeroclaw-runtime/src/security/ingress.rs</code></li>
+<li><code>crates/zeroclaw-runtime/src/security/audit.rs</code></li>
+<li><code>crates/zeroclaw-runtime/src/approval/mod.rs</code></li>
+<li><code>crates/zeroclaw-runtime/src/cron/scheduler.rs</code></li>
+<li><code>crates/zeroclaw-runtime/src/tools/send_message_to_peer.rs</code></li>
+<li>crates/zeroclaw-runtime/src/tools/spawn_subagent.rs</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../../architecture/decisions/ADR-017-inbound-authentication-and-principals.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../../architecture/logging.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../../architecture/decisions/ADR-017-inbound-authentication-and-principals.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../../architecture/logging.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../../clipboard-1626706a.min.js"></script>
+        <script src="../../highlight-abc7f01d.js"></script>
+        <script src="../../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../../_shared/mermaid.min.js"></script>
+        <script src="../../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

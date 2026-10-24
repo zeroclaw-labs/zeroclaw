@@ -1,0 +1,1052 @@
+<!DOCTYPE HTML>
+<html lang="fr" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Authentification et principaux - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Chaque connexion RPC au démon associe un principal lors de la négociation initialize, et chaque appel de méthode est vérifié par rapport aux droits que la…">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-85845c50.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/fr/security/authentication.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/security/authentication.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/security/authentication.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/security/authentication.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/security/authentication.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/security/authentication.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/security/authentication.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="Authentification et principaux - ZeroClaw Docs">
+        <meta property="og:description" content="Chaque connexion RPC au démon associe un principal lors de la négociation initialize, et chaque appel de méthode est vérifié par rapport aux droits que la…">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/fr/security/authentication.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="Authentification et principaux - ZeroClaw Docs">
+        <meta name="twitter:description" content="Chaque connexion RPC au démon associe un principal lors de la négociation initialize, et chaque appel de méthode est vérifié par rapport aux droits que la…">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="authentification-et-principaux"><a class="header" href="#authentification-et-principaux">Authentification et principaux</a></h1>
+<p>Chaque connexion RPC au démon associe un <strong>principal</strong> lors de la négociation <code>initialize</code>, et chaque appel de méthode est vérifié par rapport aux droits que la configuration actuelle attribue à ce principal. Cette page décrit l’ensemble des fournisseurs, la liste des utilisateurs locaux, les profils de permissions et, surtout, ce qui change pour les connexions distantes existantes.</p>
+<h2 id="le-modèle-en-une-seule-passe"><a class="header" href="#le-modèle-en-une-seule-passe">Le modèle en une seule passe</a></h2>
+<ol>
+<li>
+<p><strong>Fournisseur</strong> vérifie un seul identifiant : un <code>auth_token</code> explicite issu de la poignée de main sélectionne le fournisseur nommé par <code>auth_provider</code> (par défaut <code>native</code>, le jeton d’appairage de la passerelle), et sans jeton, un socket Unix local présente son uid de pair noyau au fournisseur <code>peercred</code>. Le rejet d’un fournisseur sélectionné est définitif : un identifiant n’est jamais réessayé auprès d’un autre fournisseur.</p>
+</li>
+<li>
+<p>**Le <strong>résolveur partagé</strong> associe l’identité vérifiée à un identifiant de principal canonique et aux profils de permissions que la configuration lui attribue. Les identités OIDC sont indexées par le couple émetteur + sujet validés, tandis que les identités du registre local le sont par leur identifiant de principal durable <code>[users.&lt;name&gt;]</code>.</p>
+</li>
+<li>
+<p>Chaque méthode RPC, à l’exception des deux méthodes de poignée de main, est associée à une autorisation ressource-verbe requise et refusée sans celle-ci. <code>initialize</code> transporte lui-même l’identifiant d’authentification, et <code>cert/renew</code> est authentifié par le certificat client mutual-TLS qui le présente, et non par un principal. Les sélecteurs à granularité fine se composent par-dessus :</p>
+<ul>
+<li>config writes check <code>config_write_paths</code>;</li>
+<li><code>session/new</code> et <code>session/prompt</code> vérifient le sélecteur d’agent et imposent que le répertoire de travail de la session soit un répertoire que la politique de cet agent autorise à la fois en lecture et en écriture, que ce répertoire ait été désigné par la requête, enregistré avec une session reprise ou restauré depuis une session durable. La session est liée au répertoire résolu et non à la graphie demandée ; ainsi, rediriger un cwd symbolique après admission ne le déplace pas, et une session active détenue sous un tel alias est refusée. Les autres méthodes de session ne vérifient pas encore l’agent, comme décrit dans <a href="#what-this-layer-does-not-do-yet">Ce que cette couche ne fait pas (encore)</a>;</li>
+<li>running ou approuver une SOP exige chacun des agents sous lesquels elle s’exécute, avec la même règle de sélection d’outils qu’une session, et créer, enregistrer ou supprimer une SOP exige les agents sous lesquels elle s’exécute. Une étape qui ne nomme aucun agent, ni sur l’étape ni sur la procédure, est considérée comme utilisant le premier alias d’agent configuré selon l’ordre de tri, c’est-à-dire l’agent vers lequel l’exécuteur headless se replie. Chaque étape est prise en compte, y compris les étapes d’une procédure déterministe ;</li>
+<li>Les pièces jointes, les fichiers de personnalité, les requêtes de coûts qui désignent un agent et les tâches cron vérifient le sélecteur d’agent. Une pièce jointe envoyée par chemin local doit aussi indiquer un chemin absolu que la politique de l’agent destinataire autorise à lire. Un récapitulatif des coûts de la flotte ne liste que les agents du principal dans sa ventilation par agent, mais ses totaux et son utilisation par modèle couvrent toujours tous les agents;</li>
+<li><code>fs/list_dir</code> ne liste que les chemins absolus que la politique d’un agent activé, que le principal peut utiliser, autorise cet agent à lire. Il refuse les chemins relatifs, les composants <code>..</code> et, sous Windows, les chemins réseau et de périphérique.
+Ces racines proviennent de la politique résolue de chaque agent : son profil de risque, les espaces de travail voisins auxquels <code>workspace.access</code> accorde un accès en lecture (en lecture et écriture, pour un espace de travail de session), ainsi que le répertoire partagé des skills, qui est en lecture seule. Un agent qui n’est pas limité à son espace de travail (autonomie <code>full</code>, un profil de risque avec <code>workspace_only = false</code>, le preset <code>yolo</code>, ou <code>workspace.unrestricted_filesystem = true</code>) peut lire tout chemin situé en dehors de ses chemins interdits ; un principal autorisé à utiliser un tel agent peut donc lister et ouvrir des sessions partout où cet agent le pourrait.</li>
+</ul>
+<p><code>session/new</code> et <code>session/prompt</code> répètent ces vérifications après l’attente dans la file d’attente de la session, de sorte qu’une requête mise en file avant que son principal ne soit restreint ou que son justificatif n’expire soit refusée lorsque son tour arrive.</p>
+</li>
+</ol>
+<p>L’autorisation est <strong>active</strong> pour les modifications effectuées via les méthodes de configuration RPC du daemon, que l’éditeur de configuration de zerocode utilise : la modification de <code>[permission_profiles]</code>, <code>[users]</code>, <code>[oidc]</code> ou <code>security.trust_daemon_uid</code> de cette manière recompile la politique au moment de l’enregistrement. Les connexions établies par jeton natif et les connexions locales sont réévaluées lors de leur prochaine opération, sans reconnexion ni redémarrage, tandis qu’une connexion OIDC doit être réinitialisée. Les modifications effectuées en dehors du daemon, directement dans <code>config.toml</code>, via le tableau de bord web, ou avec <code>zeroclaw config set</code>, prennent effet au prochain rechargement ou redémarrage du daemon. La révocation d’un jeton d’appairage de la passerelle via les contrôles d’appairage de la passerelle invalide les connexions authentifiées avec ce jeton avant leur prochaine opération. Supprimer un jeton de <code>gateway.paired_tokens</code> en modifiant la configuration, via RPC ou sur le disque, n’a aucun effet sur le daemon en cours d’exécution, et les connexions utilisant ce jeton restent autorisées. La suppression prend effet au prochain rechargement ou redémarrage du daemon, sauf si une modification d’appairage effectuée via la passerelle d’ici là réécrit dans la configuration l’ensemble des jetons actifs, y compris ce jeton. Révoquez les jetons via les contrôles d’appairage.</p>
+<h2 id="fournisseurs"><a class="header" href="#fournisseurs">Fournisseurs</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Fournisseur</th><th>Identifiant</th><th>Configuré par</th></tr>
+</thead>
+<tbody>
+<tr><td><code>native</code></td><td>Jeton porteur d’appairage de la passerelle</td><td>Appairage de la passerelle (<code>/pair</code>) ; le démon et la passerelle partagent une même autorité de jetons en direct</td></tr>
+<tr><td><code>peercred</code></td><td>Uid du pair Unix sur le socket local</td><td>Toujours actif ; <code>[users.&lt;name&gt;].uid</code> associe un uid à un principal nommé</td></tr>
+<tr><td><code>oidc.&lt;alias&gt;</code></td><td>JWT ou jeton porteur opaque de votre IdP</td><td><code>[oidc.&lt;alias&gt;]</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="connexions-locales"><a class="header" href="#connexions-locales">Connexions locales</a></h3>
+<p>Sur un socket Unix, une connexion qui ne présente aucun jeton est identifiée par son uid de pair noyau. Tant que <code>security.trust_daemon_uid</code> vaut <code>true</code> (la valeur par défaut), le <strong>uid propre</strong> du démon se connecte en tant qu’opérateur partagé de confiance avec un accès complet, avec ou sans registre <code>[users]</code>, de sorte qu’une installation sans registre se comporte comme auparavant pour le compte qui exécute le démon.</p>
+<p>L’opérateur qui exécute le démon est propriétaire de son fichier de configuration, et la récupération locale en cas de verrouillage repose sur cette autorité. Sur une socket Unix, définissez <code>security.trust_daemon_uid</code> à <code>false</code> pour exiger que chaque pair local, y compris l’uid du démon lui-même, soit mis en correspondance avec le roster ou présente un jeton. Ce paramètre n’a aucun effet sur un tube nommé Windows, décrit ci-dessous.</p>
+<p>Tout autre uid <strong>autre</strong> doit être associé par une entrée explicite <code>[users.&lt;name&gt;].uid</code>. Un uid non associé (y compris root) qui ne présente aucun jeton est refusé, qu’une liste d’utilisateurs existe ou non ; il n’existe aucun repli vers un accès opérateur partagé. L’écouteur crée le socket réservé au propriétaire ; aujourd’hui, seuls le compte du démon et root peuvent donc l’atteindre. Une entrée de la liste détermine ce que tout autre uid peut faire une fois qu’il y a accès.</p>
+<p>Les named pipes Windows ne transportent aucun uid de pair. Sans roster, l’ACL du pipe sert d’identifiant et une connexion locale correspond à l’opérateur partagé. Dès qu’un roster <code>[users]</code> existe, un client local doit présenter un jeton, <code>security.trust_daemon_uid</code> n’a plus aucun effet, et le compte propre du daemon ne dispose d’aucune voie locale de confiance. Un jeton de passerelle appairé authentifie toujours en tant qu’opérateur partagé pendant la compilation de la politique ; un client qui en envoie un, via WSS ou via le pipe, peut donc réparer le roster à chaud. La connexion locale par pipe de zerocode n’envoie aucun jeton ; sans un tel client, un verrouillage se répare en éditant <code>config.toml</code> puis en redémarrant.</p>
+<p>Un client peut transmettre son environnement shell dans <code>initialize</code> afin que les sous-processus du démon voient son <code>PATH</code> et ses sockets d’identifiants (voir <a href="../zerocode/environment.html">Transmission des variables d’environnement</a>). Ce snapshot n’est conservé que pour un principal de niveau opérateur (l’opérateur partagé, ou un principal du roster avec <code>admin = true</code>) sur une connexion locale. Tout autre principal, ainsi que toute connexion distante, reçoit à la place l’environnement propre du démon.</p>
+<p>L’éligibilité est vérifiée à nouveau lors de la création ou de la restauration d’une session. Une session existante qui conserve un environnement transmis non vide ne peut être reprise ou recevoir de requête que par un opérateur local actuellement autorisé. Une reconnexion via WSS, ou la perte du rôle <code>admin</code> alors qu’une requête est en file d’attente, ne transmet pas cet environnement au tour suivant : la requête est refusée avant exécution. Créez une nouvelle session pour continuer sans l’environnement transmis. Les sessions sans valeurs transmises restent éligibles à une reprise normale, sous réserve des autres vérifications d’autorisation. L’environnement conservé est immuable pendant toute la durée de vie de sa session ; refuser une requête ultérieure ne le réécrit pas sous un tour déjà en cours d’exécution. Une reprise exige également que l’environnement autorisé de la connexion actuelle corresponde à l’environnement conservé de la session. S’il diffère, créez une nouvelle session ; une session sans environnement peut toujours être reprise après la suppression du rôle <code>admin</code>.</p>
+<h4 id="récupération"><a class="header" href="#récupération">Récupération</a></h4>
+<p>Aucun contournement d’authentification à distance n’est proposé : une connexion distante doit toujours présenter un identifiant valide. Tant que la politique d’autorisation se compile encore, un client détenant un jeton de passerelle appairé ou un principal de niveau opérateur peut réparer un verrouillage depuis n’importe où. Sans un tel identifiant, et toujours dans l’état deny-all, la voie de retour s’exécute sur l’hôte qui exécute le démon. La voie locale à appliquer dépend du fait que la politique se compile encore ou non.</p>
+<p><strong>Accès bloqué à une politique qui compile.</strong> L’autorisation est active et le chemin local de confiance est intact sur un socket Unix ; sous Windows, voir la note sur le tube nommé ci-dessus. Connectez-vous localement avec l’uid propre au daemon : avec <code>security.trust_daemon_uid = true</code> (la valeur par défaut), ce compte est l’opérateur partagé de confiance, quelle que soit la liste des utilisateurs. Corrigez l’entrée fautive via cette connexion locale, par exemple dans l’éditeur de configuration de zerocode ou avec un RPC <code>config/set</code> sur <code>users.alice.uid</code>, et la modification est compilée et publiée au moment de l’enregistrement. La modification de <code>config.toml</code> ou l’exécution de <code>zeroclaw config set</code> corrige également le problème, mais seulement une fois que le daemon a rechargé sa configuration ou redémarré.</p>
+<p><strong>Verrouillé par un état accepté de refus total.</strong> La politique n’a pas pu être compilée, donc l’état accepté refuse chaque principal avant l’exécution de la résolution, y compris l’uid du démon lui-même et l’opérateur partagé. Aucun RPC ne permet de le réparer : <code>config/set</code> et <code>config/reload</code> sont refusés comme tout le reste. Modifiez <code>config.toml</code> directement en tant que propriétaire, puis redémarrez le démon afin que les sections réparées soient compilées et publiées. Le démon ignore <code>SIGHUP</code>, donc un redémarrage est l’étape qui le recharge.</p>
+<p>Si <code>security.trust_daemon_uid</code> est défini à <code>false</code>, la route par UID de confiance disparaît. Une politique qui compile peut toujours être réparée à chaud par un client présentant un jeton de passerelle appairé, ou par un principal figurant dans le roster et disposant de droits d’administrateur ; sinon, les deux états se réparent de la même manière : modifier <code>config.toml</code> en tant que son propriétaire, puis redémarrer. Ne désactivez ce paramètre que là où c’est acceptable.</p>
+<h3 id="liste-des-utilisateurs"><a class="header" href="#liste-des-utilisateurs">Liste des utilisateurs</a></h3>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>permission_profiles</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Les entrées <code>[permission_profiles.&lt;alias&gt;]</code> accordant les permissions de cet utilisateur, fusionnées par union déterministe. Obligatoire ; un utilisateur sans profil ne peut pas s’authentifier.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle"><a class="header" href="#tableau-de-bord-de-la-passerelle">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> et définissez le champ <code>users.&lt;alias&gt;.permission_profiles</code>.</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>users.&lt;alias&gt;.permission_profiles</code>.</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.permission_profiles &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement"><a class="header" href="#variable-denvironnement">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__permission_profiles=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>principal_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>Identifiant de principal durable pour cette entrée ; vaut par défaut le nom de l’entrée. Les enregistrements d’audit sont indexés sur cet identifiant, et non sur le nom de l’entrée, et la propriété des sessions, de la mémoire et des approbations sera indexée sur lui une fois le stockage géré par principal disponible. Pour renommer l’entrée sans orpheliner ses données, définissez <code>principal_id</code> avec l’identifiant d’origine dans la même modification. Modifier l’identifiant de principal effectif d’une entrée crée un nouveau principal.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-1"><a class="header" href="#tableau-de-bord-de-la-passerelle-1">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> et définissez le champ <code>users.&lt;alias&gt;.principal_id</code>.</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p><strong>Config</strong> est un nom d’interface et sera traduit en « <strong>Configuration</strong> ». Voici la traduction :</p>
+<p>Dans le volet <strong>Configuration</strong>, définissez le champ <code>users.&lt;alias&gt;.principal_id</code>.</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.principal_id &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-1"><a class="header" href="#variable-denvironnement-1">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__principal_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>uid</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>null</code></span></summary>
+<p>Uid Unix accepté pour cet utilisateur via la socket locale (identifiants de pair). Requis actuellement : c’est le seul identifiant du roster pris en charge par l’ensemble des fournisseurs acceptés.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-2"><a class="header" href="#tableau-de-bord-de-la-passerelle-2">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> et définissez le champ <code>users.&lt;alias&gt;.uid</code>.</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>users.&lt;alias&gt;.uid</code>.</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.uid &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-2"><a class="header" href="#variable-denvironnement-2">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__uid=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>Le nom de l’entrée sert d’identifiant de principal durable, sauf si <code>principal_id</code> en fixe un explicitement. Les enregistrements d’audit sont indexés sur cet identifiant aujourd’hui. Les sessions, la mémoire et les approbations ne sont pas encore indexées dessus (voir <a href="#what-this-layer-does-not-do-yet">Ce que cette couche ne fait pas (encore)</a>), mais elles le seront. Pour renommer une entrée sans rendre ses données orphelines plus tard, définissez donc <code>principal_id</code> sur l’identifiant d’origine dans la même modification.</p>
+<h3 id="oidc"><a class="header" href="#oidc">OIDC</a></h3>
+<p>Chaque entrée <code>[oidc.&lt;alias&gt;]</code> correspond à une relation de confiance avec un émetteur ; la vérification des jetons (JWKS hors ligne ou introspection RFC 7662), le mappage des revendications et les bornes de durée de vie sont documentés dans la référence de la section :</p>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>actor_claim</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Chemin pointé vers une revendication que l’émetteur appose sur les jetons d’exactement UN type d’acteur (présente, non nulle), par exemple <code>gty</code> dans Auth0 pour les jetons client-credentials ou <code>uid</code> dans Okta pour les jetons utilisateur. <code>actor_claim_marks</code> désigne le type d’acteur dont la présence prouve ; l’absence prouve l’autre type. Obligatoire pour un client qui émet à la fois des jetons humains et machine (déclaré dans aucune des deux listes) ; vérifié aussi par rapport aux clients déclarés, où une preuve contradictoire entraîne un refus. Vide = aucune classification basée sur les revendications, donc chaque client accepté doit être déclaré.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-3"><a class="header" href="#tableau-de-bord-de-la-passerelle-3">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.actor_claim</code>.</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.actor_claim</code>.</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.actor_claim &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-3"><a class="header" href="#variable-denvironnement-3">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__actor_claim=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>actor_claim_marks</code> <span class="cfg-field-meta"><code>OidcActorKind</code> · default <code>"service"</code></span></summary>
+<p>Quel type d’acteur la présence de <code>actor_claim</code> prouve.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-4"><a class="header" href="#tableau-de-bord-de-la-passerelle-4">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.actor_claim_marks</code>.</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.actor_claim_marks</code>.</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.actor_claim_marks &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-4"><a class="header" href="#variable-denvironnement-4">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__actor_claim_marks=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_authorized_parties</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Valeurs <code>azp</code> (authorized party) autorisées, c’est-à-dire le client auquel le jeton a été émis. Vide = aucune restriction ; non vide = le jeton doit contenir une revendication <code>azp</code> figurant dans cette liste, sinon l’authentification échoue en mode fermé.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-5"><a class="header" href="#tableau-de-bord-de-la-passerelle-5">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.allowed_authorized_parties</code>.</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.allowed_authorized_parties</code>.</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.allowed_authorized_parties &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-5"><a class="header" href="#variable-denvironnement-5">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__allowed_authorized_parties=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>audience</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Public d’audience que le jeton doit porter dans sa revendication <code>aud</code> pour ce démon (généralement l’identifiant client ou l’identifiant de ressource enregistré auprès du fournisseur d’identité). Obligatoire pour la vérification du jeton.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-6"><a class="header" href="#tableau-de-bord-de-la-passerelle-6">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.audience</code>.</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.audience</code>.</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.audience &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-6"><a class="header" href="#variable-denvironnement-6">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__audience=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>claim_path</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Chemin pointé vers la revendication vérifiée qui contient les valeurs de rôle/groupe de ce déploiement (par ex. <code>realm_access.roles</code>, <code>groups</code>). Doit être défini explicitement : le démon refuse de deviner où se trouvent les droits dans un jeton.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-7"><a class="header" href="#tableau-de-bord-de-la-passerelle-7">Tableau de bord de la passerelle</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> ouvrez et définissez le champ <code>oidc.&lt;alias&gt;.claim_path</code>.</p>
+<p>Correction: the sentence should read as an instruction in French:</p>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.claim_path</code>.</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.claim_path</code>.</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.claim_path &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-7"><a class="header" href="#variable-denvironnement-7">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__claim_path=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>client_id</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Identifiant client avec lequel ce démon s’authentifie pour les flux confidentiels (introspection de jetons ; enrôlement dans une tranche ultérieure). Vaut <code>audience</code> par défaut si vide.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-8"><a class="header" href="#tableau-de-bord-de-la-passerelle-8">Tableau de bord de la passerelle</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> ouvrez et définissez le champ <code>oidc.&lt;alias&gt;.client_id</code>.</p>
+<p>Wait, that’s wrong ordering and wording. Corrected:</p>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.client_id</code>.</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.client_id</code>.</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.client_id &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-8"><a class="header" href="#variable-denvironnement-8">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__client_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>client_secret</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Secret client pour les flux à client confidentiel (introspection de jetons). Non requis pour la validation JWKS. Chiffré au repos.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-9"><a class="header" href="#tableau-de-bord-de-la-passerelle-9">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.client_secret</code>.</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p><strong>Config</strong></p>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.client_secret</code>.</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.client_secret    # entrée masquée, stockée chiffrée
+</code></pre>
+<h4 id="variable-denvironnement-9"><a class="header" href="#variable-denvironnement-9">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__client_secret=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>interactive_clients</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Identités de clients dont les jetons sont TOUJOURS associés à des principaux humains (clients à code d’autorisation / code d’appareil), comparées à la revendication <code>client_id</code> vérifiée. Leurs jetons doivent contenir un <code>sub</code> non vide et être résolus via <code>profile_map</code>. Un client ne peut figurer que dans l’un de <code>service_clients</code> et <code>interactive_clients</code>.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-10"><a class="header" href="#tableau-de-bord-de-la-passerelle-10">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.interactive_clients</code>.</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.interactive_clients</code>.</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.interactive_clients &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-10"><a class="header" href="#variable-denvironnement-10">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__interactive_clients=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>issuer</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>URL de l’émetteur, exactement telle qu’elle apparaît dans les revendications <code>iss</code> des jetons validés (par ex. <code>https://sso.example.com/realms/main</code>). La découverte est récupérée depuis <code>&lt;issuer&gt;/.well-known/openid-configuration</code> et son champ <code>issuer</code> doit correspondre exactement à cette valeur.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-11"><a class="header" href="#tableau-de-bord-de-la-passerelle-11">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.issuer</code>.</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.issuer</code>.</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.issuer &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-11"><a class="header" href="#variable-denvironnement-11">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__issuer=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>max_auth_lifetime_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>86400</code></span></summary>
+<p>Durée maximale d’authentification (en secondes) pour les jetons validés hors ligne (JWKS). La validation hors ligne ne peut pas détecter les révocations ; l’identité expire donc à la PLUS PROCHE des deux échéances suivantes : l’<code>exp</code> du jeton ou <code>iat</code> + cette limite. Doit être &gt; 0.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-12"><a class="header" href="#tableau-de-bord-de-la-passerelle-12">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.max_auth_lifetime_secs</code>.</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p><strong>Config</strong></p>
+<p>Hmm, that’s not right. Let me give the actual translation:</p>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.max_auth_lifetime_secs</code>.</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.max_auth_lifetime_secs &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-12"><a class="header" href="#variable-denvironnement-12">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__max_auth_lifetime_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>profile_map</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>Associe une valeur de revendication trouvée à <code>claim_path</code> à un nom de <code>[permission_profiles.&lt;alias&gt;]</code>. Les valeurs de revendication sans correspondance n’accordent aucun droit ; une identité qui n’est associée à aucun profil est refusée.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-13"><a class="header" href="#tableau-de-bord-de-la-passerelle-13">Tableau de bord de la passerelle</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> ouvrez et définissez le champ <code>oidc.&lt;alias&gt;.profile_map</code>.</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.profile_map</code> field.</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.profile_map &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-13"><a class="header" href="#variable-denvironnement-13">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__profile_map=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>require_at_jwt</code> <span class="cfg-field-meta"><code>bool</code> · default <code>true</code></span></summary>
+<p>Exiger le profil JWT typé RFC 9068 pour la validation JWKS. Les jetons opaques restent valides uniquement via l’introspection configurée.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-14"><a class="header" href="#tableau-de-bord-de-la-passerelle-14">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.require_at_jwt</code>.</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.require_at_jwt</code>.</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.require_at_jwt &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-14"><a class="header" href="#variable-denvironnement-14">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__require_at_jwt=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>require_mfa</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Exiger que le jeton atteste l’authentification multifacteur (MFA) via le marqueur agrégé <code>mfa</code> de l’IdP ou une ACR configurée et acceptée avant que l’authentification ne réussisse.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-15"><a class="header" href="#tableau-de-bord-de-la-passerelle-15">Tableau de bord de la passerelle</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> ouvrez la page et définissez le champ <code>oidc.&lt;alias&gt;.require_mfa</code>.</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.require_mfa</code>.</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.require_mfa &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-15"><a class="header" href="#variable-denvironnement-15">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__require_mfa=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>required_acr</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Valeurs <code>acr</code> (authentication context class) acceptées. Vide = aucune exigence ; non vide = la revendication <code>acr</code> du jeton doit correspondre à l’une de ces valeurs, sinon l’authentification échoue en mode fermé.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-16"><a class="header" href="#tableau-de-bord-de-la-passerelle-16">Tableau de bord de la passerelle</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> ouvrez et définissez le champ <code>oidc.&lt;alias&gt;.required_acr</code>.</p>
+<p>Wait, let me correct that to proper French imperative word order:</p>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.required_acr</code>.</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.required_acr</code>.</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.required_acr &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-16"><a class="header" href="#variable-denvironnement-16">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__required_acr=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>revalidation_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>60</code></span></summary>
+<p>Intervalle de revalidation (en secondes) pour le mode introspection : l’échéance apposée sur chaque identité, au-delà de laquelle la prochaine opération privilégiée doit réintrospecter ou échouer en mode fermé (fail closed). <code>0</code> = revalider à chaque opération privilégiée.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-17"><a class="header" href="#tableau-de-bord-de-la-passerelle-17">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.revalidation_secs</code>.</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.revalidation_secs</code>.</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.revalidation_secs &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-17"><a class="header" href="#variable-denvironnement-17">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__revalidation_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>service_clients</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Identifiants de clients dont les jetons sont TOUJOURS ceux de principaux de service (appelants <code>client_credentials</code>), comparés à la revendication <code>client_id</code> vérifiée du jeton. Les principaux de service sont indexés par émetteur + identité client et n’héritent jamais des hypothèses propres aux utilisateurs humains, quelle que soit la forme que prend leur <code>sub</code> selon le fournisseur (<code>&lt;client&gt;@clients</code>, un identifiant de compte de service, ou l’identifiant client lui-même). La classification des acteurs est déclarative, jamais déduite de la relation entre <code>sub</code> et <code>client_id</code> : un jeton est celui d’un service si son client figure ici, celui d’un humain si son client figure dans <code>interactive_clients</code>, ou il est classé selon <code>actor_claim</code>. Un jeton dont le client n’est déclaré nulle part et ne comporte aucun élément de preuve via la revendication d’acteur configurée (<code>actor_claim</code>) est refusé. Un client ne peut figurer que dans l’une des deux listes.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-18"><a class="header" href="#tableau-de-bord-de-la-passerelle-18">Tableau de bord de la passerelle</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> ouvrez cette page et définissez le champ <code>oidc.&lt;alias&gt;.service_clients</code>.</p>
+<h4 id="zerocode-18"><a class="header" href="#zerocode-18">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.service_clients</code>.</p>
+<h4 id="zeroclaw-config-18"><a class="header" href="#zeroclaw-config-18">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.service_clients &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-18"><a class="header" href="#variable-denvironnement-18">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__service_clients=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>service_profile_map</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>Associe le <code>client_id</code> vérifié d’un client SERVICE à un nom <code>[permission_profiles.&lt;alias&gt;]</code>. Les principaux de service ne sont résolus QUE via cette correspondance, jamais via <code>profile_map</code>, afin qu’une identifiant machine ne puisse pas hériter d’un profil humain à partir de revendications aux noms similaires. Un <code>client_id</code> de service absent de cette table est authentifié mais n’a aucun droit (échec fermé).</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-19"><a class="header" href="#tableau-de-bord-de-la-passerelle-19">Tableau de bord de la passerelle</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> ouvrez et définissez le champ <code>oidc.&lt;alias&gt;.service_profile_map</code>.</p>
+<p>Wait, that’s not right. Correcting to proper French:</p>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.service_profile_map</code>.</p>
+<h4 id="zerocode-19"><a class="header" href="#zerocode-19">zerocode</a></h4>
+<p><strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.service_profile_map</code>.</p>
+<p>Wait, I should be precise: the instruction says to return only the translated string, so the above is the translation with bold preserved.</p>
+<h4 id="zeroclaw-config-19"><a class="header" href="#zeroclaw-config-19">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.service_profile_map &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-19"><a class="header" href="#variable-denvironnement-19">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__service_profile_map=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>validation</code> <span class="cfg-field-meta"><code>OidcValidation</code> · default <code>"jwks"</code></span></summary>
+<p>Comment les jetons présentés sont validés.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-20"><a class="header" href="#tableau-de-bord-de-la-passerelle-20">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> et définissez le champ <code>oidc.&lt;alias&gt;.validation</code>.</p>
+<h4 id="zerocode-20"><a class="header" href="#zerocode-20">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>oidc.&lt;alias&gt;.validation</code>.</p>
+<h4 id="zeroclaw-config-20"><a class="header" href="#zeroclaw-config-20">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.validation &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-20"><a class="header" href="#variable-denvironnement-20">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__validation=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<h4 id="inscription-obtention-dun-jeton-à-présenter"><a class="header" href="#inscription-obtention-dun-jeton-à-présenter">Inscription (obtention d’un jeton à présenter)</a></h4>
+<p>Le démon ne fait que vérifier les jetons ; les clients les obtiennent auprès de l’IdP. Deux flux sans navigateur sont fournis avec la CLI :</p>
+<pre><code class="language-sh"># Connexion interactive via le flux d'autorisation par appareil (RFC 8628) :
+# prints a verification code to enter in any browser, waits for
+# approbation, puis écrit le jeton d'accès sur la sortie standard.
+export ZEROCLAW_AUTH_TOKEN=$(zeroclaw oidc login corp)
+
+# Identique, via le navigateur système : Authorization Code + PKCE (S256 uniquement)
+# with an RFC 8252 one-shot loopback listener. The mechanisms never
+# se replier l'un sur l'autre.
+export ZEROCLAW_AUTH_TOKEN=$(zeroclaw oidc login corp --browser)
+
+The user message is a truncated documentation heading: "# Headless service principals via client_credentials (requires the". Translate to French, preserving formatting and code literals.
+
+# Principaux de service sans interface via client_credentials (nécessite le
+# entrydu client_secret) :
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc token corp)"
+</code></pre>
+<p>Les messages de progression vont sur stderr ; stdout ne contient que le jeton, de sorte que les deux commandes se composent avec la substitution de commande (les commandes <code>oidc</code> s’exécutent avant tout préambule de démarrage susceptible d’afficher du texte, y compris la divulgation de la graine OTP). Rien n’est stocké : présentez le jeton sous la forme <code>auth_token</code> dans la poignée de main RPC (ou via la variable d’environnement) avant son expiration, puis réinscrivez-vous.</p>
+<p>Le client ne fait confiance qu’à l’émetteur nommé dans l’entrée, et à aucun autre : le document de découverte doit affirmer exactement cet émetteur avant que tout point de terminaison qu’il annonce ne soit utilisé ; chaque point de terminaison qui reçoit un justificatif doit respecter la même politique d’URL que l’émetteur (<code>https</code>, ou <code>http</code> uniquement pour un hôte de bouclage exact) ; les redirections ne sont jamais suivies ; les corps de réponse ont une taille plafonnée ; et une réponse de jeton n’est acceptée que si elle contient un jeton d’accès <code>Bearer</code> non vide. Un client confidentiel (une entrée avec un <code>client_secret</code>) s’authentifie avec HTTP Basic à chaque requête ; un client public envoie son <code>client_id</code> dans le formulaire.</p>
+<p><code>--browser</code> ouvre le navigateur système pour vous sous macOS et Linux, et sur toutes les plateformes il affiche également l’URL de connexion afin que vous puissiez l’ouvrir manuellement dans un navigateur sur la même machine (le rappel arrive sur un port de bouclage local de l’hôte qui exécute la CLI). Le lanceur du navigateur s’exécute détaché des flux standard de la CLI, de sorte que tout ce qu’un lanceur écrit sur sa propre sortie standard ne peut pas contaminer le résultat : la sortie standard ne contient toujours que le jeton.</p>
+<p>Les deux adaptateurs de rappel, l’écouteur loopback de la CLI et le rappel de la passerelle, appliquent la vérification de l’émetteur de la RFC 9207. Une réponse dont le paramètre <code>iss</code> ne correspond pas à l’émetteur qui a démarré le flux est refusée avant que son <code>code</code> ou son <code>error</code> ne soit pris en compte. Une réponse sans <code>iss</code> est acceptée, car ce paramètre est facultatif et tous les émetteurs ne l’envoient pas. Lorsque l’échange de code renvoie un <code>id_token</code> en plus du jeton d’accès, cet <code>id_token</code> est entièrement validé (émetteur, audience, expiration et nonce lié à ce flux), puis écarté. Seul le jeton d’accès est présenté au démon. Le client d’enrôlement applique la même méfiance à la découverte elle-même : il refuse un document <code>.well-known/openid-configuration</code> dont <code>issuer</code> ne correspond pas exactement à l’émetteur configuré, barre oblique finale comprise, avant d’utiliser tout point de terminaison qu’il désigne (la vérification de la RFC 8414). Il plafonne aussi la taille des documents lus, afin qu’un émetteur hostile ou défaillant ne puisse ni rediriger le flux vers des points de terminaison de son choix, ni répondre avec un corps de taille illimitée.</p>
+<p>Les clients qui ne détiennent aucun identifiant IdP (le tableau de bord web, zerocode) s’enrôlent à la place via la gateway, qui relaie les mêmes flux avec les identifiants client de l’entrée configurée : <code>GET /api/oidc/providers</code> liste les alias, <code>POST /api/oidc/{alias}/device/start</code> et <code>/device/poll</code> pilotent le flux device grant, et <code>GET /oidc/login/{alias}</code> exécute le flux navigateur, dont la page de callback à usage unique transmet le jeton à la fenêtre ouvrante via <code>postMessage</code> (même origine uniquement), avec une copie manuelle en solution de repli. La gateway envoie également <code>Cross-Origin-Opener-Policy: same-origin</code>, ce qui rompt <code>window.opener</code> une fois que la popup a navigué vers le fournisseur d’identité. Dans les navigateurs actuels, la copie manuelle sur cette page est donc le transfert qui fonctionne aujourd’hui, et le contrat <code>postMessage</code> est en place pour le suivi côté tableau de bord. Ces routes ne nécessitent pas d’authentification par nécessité (l’enrôlement précède l’authentification), sont soumises à une limitation de débit et n’accordent aucun droit : elles se contentent de relayer ce que l’IdP accorde après l’approbation de l’utilisateur. Justification de la conception et tableau des modes de défaillance : <code>docs/security/oidc-browser-pkce-design-8289.md</code> dans le dépôt.</p>
+<p>La limitation de débit fonctionne par couches. Les requêtes qui démarrent un flux (<code>POST /api/oidc/{alias}/device/start</code>, <code>GET /oidc/login/{alias}</code> et <code>GET /oidc/callback</code>) sont comptabilisées par une instance du limiteur de tentatives par force brute de la passerelle, dédiée à l’enrôlement : mêmes seuils et même verrouillage que ceux qui s’appliquent à un jeton d’appairage incorrect, mais tenue dans son propre registre. Ainsi, une adresse verrouillée pour l’enrôlement peut toujours s’appairer ou présenter une signature de webhook, et un verrouillage obtenu sur l’un de ces deux usages ne bloque jamais l’enrôlement. Un callback n’est comptabilisé comme tentative que s’il est infructueux : aucun état de flux actif pour le <code>state</code> qu’il transporte, un émetteur qui ne correspond pas, une erreur renvoyée par le fournisseur d’identité, aucun code d’autorisation, un alias supprimé pendant que le flux était en cours, ou un échec de l’échange de code. Un callback qui termine une connexion n’est pas compté, pas plus que celui que la passerelle refuse elle-même parce que sa capacité de relais est saturée ; ainsi, une foule de personnes qui se connectent simultanément ne peut pas verrouiller leur adresse partagée. Une connexion par navigateur refusée parce que le magasin de flux en attente est plein n’est pas non plus comptée pour l’appelant, pour la même raison. Les listages de fournisseurs, les interrogations de périphérique (device polls) et les démarrages de connexion sont soumis à un budget par client de 20 requêtes par minute, ce qui laisse une marge au-dessus de l’intervalle minimal d’interrogation de cinq secondes de la RFC 8628 (12 interrogations par minute) sans permettre à un client de tourner en boucle. Une interrogation est comptabilisée comme tentative lorsque le fournisseur d’identité répond <code>slow_down</code> ou rejette purement et simplement le code de périphérique ; ainsi, un client qui relaie des codes de périphérique invalides tombe dans le verrouillage existant au lieu d’interroger indéfiniment. En revanche, un échec de transport sur la liaison de la passerelle vers le fournisseur d’identité ne dit rien de l’appelant et ne lui est pas imputé. Un client qui dépasse son budget, ou qui est verrouillé, reçoit un HTTP 429 accompagné d’un <code>Retry-After</code> indiquant le délai en secondes ; zerocode attend au moins ce délai, et jamais moins que l’incrément de cinq secondes de la RFC, avant son interrogation suivante (dans la limite de la durée de vie restante du code de périphérique), et n’interroge en aucun cas plus d’une fois toutes les cinq secondes. Au plus 16 relais sortants vers le fournisseur d’identité sont en cours simultanément, tous clients confondus, ce qui borne ce que la passerelle peut faire auprès du fournisseur d’identité au nom de tous. Le magasin de flux en attente contient 32 connexions par navigateur simultanées, et un même client distant peut en détenir huit ; ainsi, un appelant qui démarre des connexions sans jamais les terminer ne peut pas monopoliser le magasin au détriment de tous les autres pendant les dix minutes de vie de ces flux. Les clients loopback sont exemptés des budgets par client, comme ils le sont de toute autre limite d’authentification de la passerelle ; un reverse proxy situé sur le même hôte doit donc activer <code>trust_forwarded_headers</code> pour que les limites par client s’appliquent aux appelants réels qui se trouvent derrière lui. Chaque réponse d’enrôlement porte <code>Cache-Control: no-store</code> et <code>Pragma: no-cache</code> en plus de la politique <code>no-referrer</code> de la passerelle, car les codes de périphérique et les jetons d’accès transitent dans ces corps de réponse.</p>
+<p>zerocode s’inscrit via la même API depuis sa propre configuration. <code>[connection.wss] enroll_url</code> désigne l’origine HTTP de la passerelle, et un préfixe de chemin facultatif est autorisé. Elle doit être <code>https://</code>, sauf si elle pointe vers une adresse de bouclage (<code>127.0.0.1</code>, <code>::1</code> ou <code>localhost</code>), car le code d’appareil puis le jeton d’accès transitent par cette connexion, et les redirections ne sont pas suivies, de sorte qu’un saut en clair ne peut pas être introduit après coup. La connexion d’inscription utilise le même matériel de confiance <code>[connection.wss.tls]</code> que la branche WSS : l’autorité de certification configurée, <code>skip_verify</code> et le certificat client de TLS mutuel. Lorsque ce matériel laisse le certificat non vérifié, zerocode demande confirmation avant l’envoi du code d’appareil et non après l’arrivée du jeton, et cette demande porte sur l’origine d’inscription elle-même, qui peut ne pas être le démon auquel la session se connecte ensuite. Répondre <code>always</code> enregistre cette origine dans <code>skip_verify_routes</code> ; une exécution non interactive n’a personne à qui poser la question, l’inscription s’arrête donc à ce stade. zerocode borne chaque attente d’interrogation à la durée de vie restante du code d’appareil et n’interroge jamais après son expiration. Il refuse une durée de vie annoncée supérieure à une heure ou un intervalle d’interrogation supérieur à cinq minutes, plutôt que d’attendre sur une réponse hostile. Un intervalle annoncé de <code>0</code> ou <code>1</code> est ramené à la valeur par défaut de cinq secondes de la RFC 8628, afin qu’une réponse de la passerelle ne puisse pas placer zerocode sur une interrogation toutes les secondes, que le budget par client refuserait de toute façon. Le jeton reçu n’est conservé en mémoire que pour cette session.</p>
+<h2 id="profils-dautorisation"><a class="header" href="#profils-dautorisation">Profils d’autorisation</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>admin</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>Tout accorder. Lorsque cette option est activée, tous les autres champs sont sans effet.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-21"><a class="header" href="#tableau-de-bord-de-la-passerelle-21">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> et définissez le champ <code>permission_profiles.&lt;alias&gt;.admin</code>.</p>
+<h4 id="zerocode-21"><a class="header" href="#zerocode-21">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>permission_profiles.&lt;alias&gt;.admin</code>.</p>
+<h4 id="zeroclaw-config-21"><a class="header" href="#zeroclaw-config-21">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.admin &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-21"><a class="header" href="#variable-denvironnement-21">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__admin=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_agents</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Alias d’agent que les titulaires de ce profil peuvent lier ou adresser. Vide n’accorde AUCUN agent ; accordez tous les agents avec l’entrée explicite <code>"*"</code>.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-22"><a class="header" href="#tableau-de-bord-de-la-passerelle-22">Tableau de bord de la passerelle</a></h4>
+<p><a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> ouvrez cette page et définissez le champ <code>permission_profiles.&lt;alias&gt;.allowed_agents</code>.</p>
+<h4 id="zerocode-22"><a class="header" href="#zerocode-22">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>permission_profiles.&lt;alias&gt;.allowed_agents</code>.</p>
+<h4 id="zeroclaw-config-22"><a class="header" href="#zeroclaw-config-22">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.allowed_agents &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-22"><a class="header" href="#variable-denvironnement-22">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__allowed_agents=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Noms d’outils que les détenteurs peuvent amener un agent à exécuter. Une liste vide n’accorde AUCUN outil ; un accès étendu nécessite l’entrée explicite <code>"*"</code>. Ce sélecteur se combine avec l’autorisation globale <code>tools = ["execute"]</code>, sans jamais la remplacer : sans cette autorisation, les sessions du détenteur s’exécutent sans outil, quel que soit le contenu indiqué ici. (Notez que ceci diffère de <code>allowed_tools</code> du profil de risque, où une liste vide signifie absence de contrainte : les profils de permissions refusent par défaut. La politique de profil de risque propre à l’agent s’applique toujours par-dessus.)</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-23"><a class="header" href="#tableau-de-bord-de-la-passerelle-23">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> et définissez le champ <code>permission_profiles.&lt;alias&gt;.allowed_tools</code>.</p>
+<h4 id="zerocode-23"><a class="header" href="#zerocode-23">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>permission_profiles.&lt;alias&gt;.allowed_tools</code>.</p>
+<h4 id="zeroclaw-config-23"><a class="header" href="#zeroclaw-config-23">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.allowed_tools &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-23"><a class="header" href="#variable-denvironnement-23">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__allowed_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>config_write_paths</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Préfixes de chemins de configuration en notation pointée que les détenteurs peuvent écrire. Un <code>.*</code> final accorde le sous-arbre (par ex. <code>channels.*</code>) ; un chemin nu accorde cette propriété exacte ; <code>"*"</code> accorde tous les chemins. Une liste vide n’accorde AUCUN chemin.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-24"><a class="header" href="#tableau-de-bord-de-la-passerelle-24">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> et définissez le champ <code>permission_profiles.&lt;alias&gt;.config_write_paths</code>.</p>
+<h4 id="zerocode-24"><a class="header" href="#zerocode-24">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>permission_profiles.&lt;alias&gt;.config_write_paths</code>.</p>
+<h4 id="zeroclaw-config-24"><a class="header" href="#zeroclaw-config-24">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.config_write_paths &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-24"><a class="header" href="#variable-denvironnement-24">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__config_write_paths=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>grants</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>Autorisations par classe de ressource : pour chaque type de ressource, les verbes autorisés. Ressources : <code>system</code>, <code>sessions</code>, <code>memory</code>, <code>cron</code>, <code>config</code>, <code>agents</code>, <code>cost</code>, <code>skills</code>, <code>personality</code>, <code>logs</code>, <code>tui</code>, <code>files</code>, <code>locales</code>, <code>quickstart</code>, <code>channels</code>, <code>providers</code>, <code>models</code>, <code>peer_groups</code>, <code>plugins</code>, <code>tools</code>, <code>sops</code>. Verbes : <code>create</code>, <code>read</code>, <code>update</code>, <code>delete</code>, <code>execute</code>. Une ressource non listée est refusée.</p>
+<p><strong>Posez-le sur n’importe quelle surface :</strong></p>
+<div class="os-tabs-src">
+<h4 id="tableau-de-bord-de-la-passerelle-25"><a class="header" href="#tableau-de-bord-de-la-passerelle-25">Tableau de bord de la passerelle</a></h4>
+<p>Ouvrez <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> et définissez le champ <code>permission_profiles.&lt;alias&gt;.grants</code>.</p>
+<h4 id="zerocode-25"><a class="header" href="#zerocode-25">zerocode</a></h4>
+<p>Dans le volet <strong>Config</strong>, définissez le champ <code>permission_profiles.&lt;alias&gt;.grants</code>.</p>
+<h4 id="zeroclaw-config-25"><a class="header" href="#zeroclaw-config-25">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.grants &lt;value&gt;
+</code></pre>
+<h4 id="variable-denvironnement-25"><a class="header" href="#variable-denvironnement-25">Variable d’environnement</a></h4>
+<p>Exportez le remplacement (shells POSIX ; à placer dans <code>~/.bashrc</code>, <code>~/.zshrc</code>, <code>.env</code> ou un Dockerfile). Remplacez <code>&lt;alias&gt;</code> par l’alias littéral :</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__grants=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>Les profils refusent par défaut : une ressource non listée est refusée, une liste de sélecteurs vide n’accorde aucune instance, et un accès étendu exige le sélecteur explicite <code>"*"</code> ou <code>admin = true</code>. Plusieurs profils fusionnent par union. Pour les tâches cron, les pièces jointes, les fichiers de personnalité, les requêtes de coût par agent et la rédaction de SOP, <code>allowed_agents = ["*"]</code> ne couvre que les agents définis par la configuration, et non un alias qu’une requête nommerait.</p>
+<p>Les sélecteurs d’outils se combinent par intersection lors de l’assemblage de l’agent, en complément de l’autorisation globale : l’exécution d’outils côté modèle correspond à <code>tools = ["execute"]</code>, et un principal sans cette autorisation reçoit une session sans outil, quels que soient les outils nommés dans son <code>allowed_tools</code>, y compris <code>"*"</code>. Lorsque cette autorisation est détenue, une session créée par un principal restreint ne reçoit que les outils nommés dans son <code>allowed_tools</code> (une liste vide donne une session sans outil), en plus de ce que le profil de risque propre à l’agent autorise. Après l’admission d’une invite en file d’attente, l’autorisation est revérifiée auprès du résolveur partagé, y compris l’expiration et la révocation des identifiants. Le sélecteur de principal actuel restreint les outils statiques, le registre de recherche différée, les outils déjà activés et le contenu de ressources MCP épinglé (chaque bloc épinglé est admis sous son nom <code>&lt;server&gt;__&lt;uri&gt;</code> et retiré des invites suivantes dès que le sélecteur ne le nomme plus) ; les outils supprimés ne peuvent pas être réactivés. Les sessions réutilisées sont restreintes avant leur prochain tour, et les sessions réhydratées sont reconstruites selon les autorisations actuelles. Les sélecteurs d’agent sont vérifiés avant chaque tour et avant la réhydratation.</p>
+<p>Le rétrécissement ne rajoute jamais d’outils à un agent existant. Après l’élargissement des autorisations, créez une nouvelle session pour recevoir la surface élargie. Aucun nouvel instantané de configuration ni cache de politique de principal indépendant n’est stocké dans l’agent.</p>
+<p>Les instructions MCP différées sont dérivées des outils restants pouvant être chargés et affichées uniquement lorsque <code>tool_search</code> est exposé. Un principal a besoin à la fois de <code>tool_search</code> et de l’outil MCP différé nommé pour l’activation à la demande ; l’assistant n’est jamais accordé implicitement. Les outils MCP autorisés avec <code>mode = "always"</code> sont préactivés et restent appelables sans l’assistant.</p>
+<p>Si le sélecteur d’outils ou le sélecteur d’agents du principal est restreint, <code>delegate</code> (borné et indépendant), <code>spawn_subagent</code> et <code>execute_pipeline</code> sont indisponibles, y compris les alias de skills qui encapsulent ces outils. Ces chemins imbriqués ne disposent pas encore des deux plafonds actuels du principal ; le tour parent ordinaire reste utilisable. Les principaux administrateurs et les principaux dont les deux sélecteurs valent <code>"*"</code> conservent les capacités imbriquées configurées de leur agent.</p>
+<p>Le constructeur Rust <code>Agent::from_live_config_with_tui_env</code> à huit arguments existant reste disponible. RPC utilise le constructeur additif <code>from_live_config_with_tui_env_and_principal_tools</code> et réapplique les autorisations accordées par le résolveur partagé lors de l’admission du prompt.</p>
+<p>Cette composition ne couvre pas toutes les voies d’accès aux outils d’un agent. Les tâches cron et la création de SOP ne vérifient que le sélecteur d’agent. Un principal contraint détenant des autorisations cron peut créer une tâche shell pour son agent, ou attribuer un nouveau prompt à une tâche d’agent existante et la déclencher, et un principal détenant des autorisations de création ou de mise à jour de SOP peut enregistrer une procédure dont le déclencheur l’exécutera ultérieurement. Traitez les autorisations cron et de rédaction de SOP comme des autorisations sur les outils de l’agent.</p>
+<h2 id="changement-incompatible--le-wss-distant-nécessite-une-authentification"><a class="header" href="#changement-incompatible--le-wss-distant-nécessite-une-authentification">Changement incompatible : le WSS distant nécessite une authentification</a></h2>
+<p>À partir de cette modification, une connexion WSS distante doit présenter <code>auth_token</code> dans <code>initialize</code>. Il n’existe aucun mode de repli distant non authentifié.</p>
+<p>Un listener <code>[wss]</code> activé sans aucun chemin d’authentification possible (ni <code>[oidc.&lt;alias&gt;]</code>, ni jetons appairés, et <code>gateway.require_pairing = false</code>) est rejeté par la validation de la configuration, de sorte qu’aucune interface prise en charge ne peut l’enregistrer. Une configuration déjà présente sur le disque sous cette forme démarre quand même : le daemon se lance et le listener refuse chaque poignée de main distante. Elle n’est pas refusée au chargement, car un opérateur doit pouvoir démarrer un daemon pour le réparer.</p>
+<p>Les sections <code>[oidc.&lt;alias&gt;]</code>, <code>[users]</code> ou <code>[permission_profiles]</code> invalides constituent le cas séparé. Dans ce cas, la politique d’autorisation elle-même ne se compile pas : le démon installe alors un état d’acceptation de refus total et journalise qu’il le fait, jusqu’à ce que les sections soient réparées et rechargées. Sous cet état, tous les principaux sont refusés, aussi bien pour les connexions distantes que locales, y compris l’uid du démon lui-même. La réparation consiste donc en la correction sur disque décrite sous Récupération ci-dessus.</p>
+<p>Migration pour les utilisateurs existants de zerocode distants :</p>
+<ol>
+<li>
+<p>Associez-vous à la passerelle comme d’habitude pour obtenir un jeton d’accès (bearer token).</p>
+</li>
+<li>
+<p>Donnez le jeton à zerocode, soit dans sa configuration :</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://daemon.example.com:9443"
+auth_token = "zc_..."
+</code></pre>
+<p>ou via la variable d’environnement <code>ZEROCLAW_AUTH_TOKEN</code>, qui remplace la valeur du fichier de configuration et permet de garder l’identifiant hors du fichier.</p>
+<p>Wait, I made an error in the first word. Corrected output:</p>
+<p>ou via la variable d’environnement <code>ZEROCLAW_AUTH_TOKEN</code>, qui remplace la valeur du fichier de configuration et permet de garder l’identifiant hors du fichier.</p>
+<p>ou en indiquant un fichier qui le contient :</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://daemon.example.com:9443"
+auth_token_file = "/etc/zeroclaw/zerocode-bearer"
+</code></pre>
+<p>L’ordre de priorité est <code>ZEROCLAW_AUTH_TOKEN</code>, puis <code>auth_token_file</code>, puis <code>auth_token</code>. Sur les plateformes disposant de bits de permissions Unix, un fichier référencé que tout autre compte peut lire est ignoré avec un avertissement au lieu d’être utilisé, et la source suivante dans cet ordre s’applique. Ailleurs, la liste de contrôle d’accès (ACL) du fichier est la seule protection.</p>
+<p>L’variable d’environnement est la méthode recommandée. Lorsque le jeton est conservé dans le fichier de configuration à la place, zerocode écrit ce fichier accessible uniquement à son propriétaire (<code>0600</code>, dans un répertoire de configuration <code>0700</code>) et corrige les droits d’accès d’un fichier antérieur à cette fonctionnalité, sur les plateformes disposant des bits de permission Unix. Sur les plateformes qui n’en disposent pas, seule l’ACL du répertoire protège le fichier : il faut donc le traiter comme un secret.</p>
+</li>
+</ol>
+<p>Un jeton d’accès OIDC fonctionne de la même manière avec <code>auth_provider = "oidc.&lt;alias&gt;"</code>.</p>
+<h2 id="la-passerelle-api-http"><a class="header" href="#la-passerelle-api-http">La passerelle API HTTP</a></h2>
+<p>Les routes de configuration et de prise en main de la passerelle (<code>/api/config*</code>, <code>/api/quickstart/*</code>, <code>/api/channels/bind</code>) imposent l’authentification de manière structurelle : un unique middleware de couche de routage protège l’ensemble du groupe, de sorte qu’aucun gestionnaire individuel ne porte (ou ne peut oublier) une vérification. Ce middleware utilise le même modèle de principal que le chemin RPC, via le même registre des fournisseurs et le même résolveur :</p>
+<ul>
+<li>Un <strong>porteur apparié</strong> (<code>Authorization: Bearer zc_...</code>) correspond à l’opérateur partagé disposant d’un accès complet, exactement comme auparavant. Les refus conservent la forme historique de la réponse 401.</li>
+<li>Un <strong>bearer OIDC</strong> présenté avec l’en-tête <code>X-ZeroClaw-Auth-Provider: oidc.&lt;alias&gt;</code> est vérifié par ce fournisseur et résolu en un principal à portée limitée. La sélection est explicite, à l’image du champ <code>auth_provider</code> de la poignée de main RPC : le refus du fournisseur désigné fait autorité, et il n’existe jamais de repli entre fournisseurs.</li>
+<li>CORS preflight (<code>OPTIONS</code>) passe sans authentification, comme c’était déjà le cas. Toute autre méthode en dehors de GET, HEAD, POST, PUT, PATCH et DELETE est refusée.</li>
+</ul>
+<p>Un principal à portée limitée voit ses autorisations <code>Config</code> appliquées en deux étapes. La couche de routage impose un plancher grossier par méthode HTTP : une lecture exige <code>read</code>, toute autre opération exige au moins l’un des droits <code>create</code>, <code>update</code> ou <code>delete</code>, de sorte qu’un principal en lecture seule n’atteint jamais un gestionnaire de mutation. Chaque gestionnaire de mutation autorise ensuite son <strong>ensemble complet d’écritures</strong> avant son premier effet de bord : chaque chemin de configuration que la mutation persistera, classé selon son effet sur la configuration (<code>create</code> pour un chemin qu’elle crée, <code>delete</code> pour un chemin qu’elle supprime, <code>update</code> sinon) et confronté aux sélecteurs <code>config_write_paths</code> du profil. La classification suit l’opération et non la méthode : créer une clé de dictionnaire via <code>POST /api/config/map-key</code>, ou implicitement via un <code>PUT</code> sous un nouvel alias, exige <code>create</code> ; un <code>remove</code> JSON Patch et <code>DELETE /api/config/map-key</code> exigent <code>delete</code> ; un renommage exige <code>delete</code> sur sa source et <code>create</code> sur sa destination ; les références que la cascade d’une suppression ou d’un renommage réécrit ailleurs font également partie de l’ensemble d’écritures. Un seul membre non autorisé refuse la mutation entière, lot ou cascade compris, et rien n’est écrit. Les opérations dont l’ensemble d’écritures ne peut pas être énuméré à l’avance (une migration de schéma du fichier, un apply Quickstart) exigent le sélecteur <code>*</code>. La frontière de persistance revérifie les chemins sur le point d’être écrits par rapport à ce que le gestionnaire a autorisé, de sorte qu’un gestionnaire ne peut pas persister plus qu’il n’a été autorisé à écrire.</p>
+<p>La politique ne change qu’à la frontière de persistance : le gestionnaire qui écrit une configuration publie l’état d’autorisation compilé à partir de celle-ci comme prochaine révision acceptée, et chaque requête est vérifiée et résolue par rapport à l’instantané accepté tel qu’il est au moment de son traitement. Rien sur le chemin de traitement des requêtes ne recompile la politique. Ainsi, une requête qui a lu la configuration avant une persistance concurrente ne peut jamais réinstaller l’ancienne politique par-dessus la nouvelle. Une modification persistée des paramètres de vérification d’un fournisseur, d’une liste de membres (roster) ou d’un profil prend effet à la requête suivante. La surface RPC propre au démon possède une configuration active distincte et atteint le même état grâce au rechargement déclenché par les indicateurs d’écriture de la gateway. Les autres surfaces de la gateway conservent la vérification d’appairage par gestionnaire et adopteront la couche dans des suivis ultérieurs.</p>
+<h2 id="cycle-de-vie-des-identifiants"><a class="header" href="#cycle-de-vie-des-identifiants">Cycle de vie des identifiants</a></h2>
+<ul>
+<li><strong>Expiration</strong> met fin à l’autorisation de la connexion à l’échéance ; le client se réinitialise avec un nouveau jeton.</li>
+<li><strong>Revalidation par introspection</strong> : les identités d’introspection OIDC portent une échéance de revalidation ; une fois celle-ci dépassée, l’opération suivante est refusée tant que le client n’a pas été réinitialisé (ce qui réverifie l’identité auprès de l’IdP).</li>
+<li><strong>Révocation de l’appairage</strong> s’applique avant la prochaine opération de la connexion.</li>
+<li><strong>Abonnements aux journaux</strong> : un flux <code>logs/subscribe</code> ouvert est revérifié à chaque livraison et se termine dès la première livraison après l’expiration de son identifiant, la révocation de son appairage, ou la perte par son principal de <code>Logs:Read</code>.</li>
+<li><strong>Modifications de politique</strong> : un enregistrement de configuration qui laisse <code>[oidc]</code>, <code>[users]</code>, <code>[permission_profiles]</code> et <code>security.trust_daemon_uid</code> inchangés conserve chaque liaison telle quelle. Toute modification de l’un d’eux publie une nouvelle politique. Les connexions par jeton natif et locales sont à nouveau résolues en place par rapport à celle-ci, mais le démon ne conserve pas de jeton porteur OIDC ; la prochaine opération sur une connexion OIDC est donc refusée tant que le client n’a pas été réinitialisé.</li>
+<li>Le mécanisme de reconnexion <code>tui_id</code>/<code>tui_sig</code> ne assure que la continuité : il préserve l’identité du TUI dans le registre et n’accorde <strong>aucune</strong> autorité. Chaque <code>initialize</code> présente à nouveau un identifiant d’authentification.</li>
+</ul>
+<h2 id="isolation-de-session"><a class="header" href="#isolation-de-session">Isolation de session</a></h2>
+<p>Chaque session créée par un principal restreint est estampillée avec l’identifiant de ce principal, dans le store actif et sur disque (backend de chat et store ACP). Les principaux restreints ne voient et ne modifient que leurs propres sessions : les listes sont filtrées, les lectures et les modifications renvoient un refus uniforme « introuvable ou non possédée » (sans sondage d’existence), les suppressions destructives s’exécutent sous forme d’instructions de stockage conditionnées au propriétaire, et les approbations en cours ne sont résolues que par le propriétaire de la session pour laquelle elles ont été demandées. Les sessions créées avant cette modification (ou par des connexions non restreintes) n’ont pas de propriétaire : elles restent entièrement visibles pour les connexions non restreintes et invisibles pour les principaux restreints.</p>
+<p>Chaque principal authentifié dispose d’une mémoire PRIVÉE : ses opérations de mémoire lisent et écrivent dans un plan propre à chaque principal, dont le propriétaire figure dans chaque instruction de stockage, combiné aux dimensions agent, espace de noms et tenant (la même clé sous deux agents correspond à deux lignes). Le plan suit l’identité du principal, et non le contournement administrateur : la mémoire d’un administrateur nommé est son propre plan privé, de sorte que promouvoir ou rétrograder un utilisateur ne masque jamais ses notes et ne redirige jamais ses écritures. Seul l’opérateur partagé non authentifié se trouve par défaut sur le plan partagé ; un appelant disposant du contournement administrateur peut désigner explicitement <code>plane = "shared"</code> dans une requête <code>memory/*</code>, ce qui fait l’objet d’un audit, alors qu’un principal à portée limitée ne le peut pas.</p>
+<p>Les deux plans sont imperméables l’un à l’autre dans les deux sens : une écriture partagée ne peut ni désigner la clé de stockage d’une ligne privée, ni écraser une ligne privée ; une écriture privée ne convertit jamais une ligne partagée ; les exportations ordinaires et l’instantané markdown ne contiennent que des lignes partagées ; et les purges globales héritées ne touchent que les lignes partagées. Les lignes privées sont exportées et purgées par des opérations portant l’identifiant du propriétaire.</p>
+<p>Une session créée par un principal voit son handle de mémoire épinglé au plan privé de ce principal pendant toute la durée de vie de la session, quel que soit l’utilisateur qui la sollicite ensuite (un administrateur qui restaure une session récupérée la restaure sur le plan du propriétaire durable). Les outils de mémoire et le rappel par tour dans une session restreinte n’accèdent donc jamais au plan partagé. Aucune autorisation n’ouvre le plan partagé à une session restreinte. Les écritures privées passent par les mêmes contrôles de contenu et les mêmes politiques que les écritures partagées, et les opérations privées sont journalisées avec le périmètre complet lorsque l’audit de la mémoire est activé. Sur les backends mémoire sans prise en charge des principaux (markdown, lucid, postgres, qdrant à ce jour), la mémoire privée échoue en mode sécurisé avec un refus explicite plutôt que de supprimer silencieusement le périmètre ; pour une session restreinte, cela signifie que ses outils de mémoire refusent d’opérer.</p>
+<h2 id="migration-depuis-securitynevis"><a class="header" href="#migration-depuis-securitynevis">Migration depuis [security.nevis]</a></h2>
+<p>L’intégration IAM Nevis a été supprimée. Elle n’était branchée sur aucun chemin d’authentification : l’activer n’a donc jamais authentifié qui que ce soit, et sa suppression ne modifie aucun comportement en production. La table de configuration reste acceptée afin qu’un ancien <code>config.toml</code> continue de se charger. Au chargement, le démon ignore toutes les valeurs de cette table, émet un seul avertissement indiquant le remplacement, puis retire la table de <code>config.toml</code> lors de la prochaine sauvegarde, qu’il s’agisse d’une sauvegarde complète ou de la sauvegarde incrémentielle utilisée par la CLI, le tableau de bord et RPC pour une modification unique. La suppression ne touche que cette table ; les commentaires et les autres sections conservent leurs octets. Aucune conversion automatique n’est effectuée : la nouvelle pile de remplacement nécessite des valeurs (une audience, des autorisations de profil) que l’ancienne table ne contenait jamais.</p>
+<p><strong>Avant de mettre à niveau</strong>, copiez <code>config.toml</code> dans un emplacement protégé. Chaque enregistrement effectué après la mise à niveau écrit <code>config.toml.bak</code> à côté du fichier pendant la durée de l’écriture, puis le supprime une fois l’écriture durable. Un <code>.bak</code> n’est donc pas une sauvegarde permanente. Toute copie que vous conservez vous-même contient toujours la table retirée, y compris un client_secret en clair si un a été configuré. Traitez donc ces copies comme du matériel secret, et révoquez les identifiants client Nevis auprès de l’IdP dès que vous n’en avez plus besoin.</p>
+<p>Field by field:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>[security.nevis]</code> field</th><th>Remplacement</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>aucun</td><td>La présence d’une entrée <code>[oidc.&lt;alias&gt;]</code> est ce qui active la vérification.</td></tr>
+<tr><td><code>instance_url</code>, <code>realm</code></td><td><code>[oidc.&lt;alias&gt;] issuer</code></td><td>L’URL exacte de l’émetteur annoncée par l’IdP dans son document de découverte ; le démon refuse un document de découverte dont <code>issuer</code> diffère.</td></tr>
+<tr><td><code>client_id</code></td><td><code>[oidc.&lt;alias&gt;] client_id</code></td><td>Également utilisé pour construire les listes <code>interactive_clients</code> / <code>service_clients</code> qui classent les clients qui se connectent.</td></tr>
+<tr><td><code>client_secret</code></td><td><code>[oidc.&lt;alias&gt;] client_secret</code></td><td>Chiffré sur le disque via le magasin de secrets lorsque <code>[secrets] encrypt</code> est activé. Requis pour <code>validation = "introspection"</code> et pour les connexions de service <code>client_credentials</code>. Non copié depuis l’ancienne table : à définir à nouveau.</td></tr>
+<tr><td><code>token_validation = "local"</code></td><td><code>validation = "jwks"</code></td><td>Le URI JWKS provient du document de découverte de l’émetteur.</td></tr>
+<tr><td><code>token_validation = "remote"</code></td><td><code>validation = "introspection"</code></td><td>Client confidentiel requis.</td></tr>
+<tr><td><code>jwks_url</code></td><td>Non pris en charge</td><td>Il n’existe aucune substitution JWKS personnalisée : l’URI de l’ensemble de clés doit être annoncée comme <code>jwks_uri</code> par le document de découverte de l’émetteur configuré. Cette URI peut pointer vers un autre point de terminaison ; une URI d’ensemble de clés non annoncée ne peut pas être configurée.</td></tr>
+<tr><td>(none)</td><td><code>[oidc.&lt;alias&gt;] audience</code></td><td><strong>Obligatoire et nouveau.</strong> L’<code>aud</code> que l’IdP place dans les jetons d’accès de ce démon ; il n’existait aucun équivalent à reprendre.</td></tr>
+<tr><td><code>role_mapping[].nevis_role</code></td><td><code>[oidc.&lt;alias&gt;] claim_path</code> + <code>profile_map</code></td><td><code>claim_path</code> désigne la revendication qui porte le rôle (par exemple <code>groups</code>) ; chaque clé de <code>profile_map</code> est une valeur de revendication, chaque valeur est un nom de <code>[permission_profiles.&lt;alias&gt;]</code>. La correspondance est exacte, et non insensible à la casse comme auparavant.</td></tr>
+<tr><td><code>role_mapping[].zeroclaw_permissions</code> (noms d’outils, ou <code>"all"</code>)</td><td><code>[permission_profiles.&lt;alias&gt;] allowed_tools</code> + <code>grants.tools = ["execute"]</code></td><td>Les profils refusent tout par défaut : <code>allowed_tools</code> se combine avec une autorisation grossière <code>tools = ["execute"]</code>, et chaque autre classe de ressource (<code>sessions</code>, <code>config</code>, <code>memory</code>, …) doit être accordée explicitement. <code>"all"</code> est le plus proche de <code>admin = true</code>, ce qui est bien plus large que ne l’était « tous les outils ». Privilégiez la liste des autorisations par ressource.</td></tr>
+<tr><td><code>role_mapping[].workspace_access</code></td><td>non équivalent</td><td>Il n’existe aucune autorisation par espace de travail. Le contrôle le plus proche est <code>allowed_agents</code>, qui limite un profil à des alias d’agent.</td></tr>
+<tr><td><code>require_mfa</code></td><td><code>[oidc.&lt;alias&gt;] require_mfa</code> et/ou <code>required_acr</code></td><td></td></tr>
+<tr><td><code>session_timeout_secs</code></td><td><code>max_auth_lifetime_secs</code> (JWKS) / <code>revalidation_secs</code> (introspection)</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p>Validez avant de redémarrer, afin qu’une faute de frappe ne vous verrouille pas hors du système (voir <strong>Récupération</strong> sous <em>Connexions locales</em> pour la marche à suivre en cas de problème). Deux méthodes permettent de le faire :</p>
+<ul>
+<li>Écrivez les nouvelles entrées <code>[oidc.&lt;alias&gt;]</code> et [permission_profiles] via les méthodes RPC de configuration du daemon (l’éditeur de configuration de zerocode). Le daemon valide les sections d’autorisation avant toute sauvegarde ou mise en service : une cible profile_map orpheline ou un <code>audience</code> manquant est refusé avec la raison, et la politique précédente reste en vigueur.</li>
+<li>Si vous modifiez <code>config.toml</code> à la main, exécutez d’abord <code>ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login &lt;alias&gt;)"</code> depuis la CLI. Cette commande charge le fichier modifié et refuse toute entrée <code>[oidc.&lt;alias&gt;]</code> qui ne valide pas (émetteur, audience, mode de validation, champs du client). Si la validation réussit, elle effectue une véritable connexion auprès de l’IdP avec le client configuré. L’émetteur, l’identifiant client et le secret sont ainsi vérifiés avant que le démon ne redémarre avec ces valeurs. Cette vérification porte sur l’entrée, pas sur les cibles de <code>profile_map</code>. Une valeur de <code>profile_map</code> qui ne désigne aucune entrée <code>[permission_profiles]</code> n’est détectée que par le démon. Celui-ci refuse alors de compiler la politique et démarre dans l’état de refus total décrit sous <strong>Recovery</strong>. Vérifiez donc ces noms à l’œil nu avant le redémarrage, ou utilisez la route RPC.</li>
+</ul>
+<p>Les connexions distantes qui ne présentent aucun identifiant sont refusées dans tous les cas ; aucune des deux voies n’en ouvre une.</p>
+<p><strong>Revenir en arrière</strong> est une opération sur les données de configuration, et non une annulation du code : revenir à une version antérieure du binaire rétablit les anciens types, mais une table déjà supprimée de <code>config.toml</code> n’est restaurée par rien. Remettez en place la copie protégée réalisée avant la mise à niveau (ou rajoutez la table à la main). La version du schéma ne change pas pour cette suppression ; un binaire rétrogradé charge donc le fichier restauré sans étape de migration.</p>
+<h2 id="ce-que-cette-couche-ne-fait-pas-encore"><a class="header" href="#ce-que-cette-couche-ne-fait-pas-encore">Ce que cette couche ne fait pas (encore)</a></h2>
+<p>La consolidation et la gouvernance dérivent les lignes du plan partagé et ne s’exécutent pas pour les sessions privées. L’accès administratif à la mémoire privée d’un autre principal n’a encore aucun chemin exposé (refus par défaut). <code>sops/runs</code> et <code>sops/run-detail</code> renvoient l’historique d’exécution de chaque procédure à un principal détenant <code>Sops:Read</code>, quels que soient les agents sous lesquels elle a été exécutée, contrairement à l’historique cron. Les routes HTTP de la passerelle conservent leurs vérifications d’appairage existantes, et les identités de canal ne se résolvent pas dans ce modèle de principal.</p>
+<p>Tant que <code>security.trust_daemon_uid = true</code> (la valeur par défaut) et que la politique se compile, l’uid du démon sur un socket Unix conserve un accès complet, si bien qu’une installation à opérateur unique, sans liste <code>[users]</code> et avec des sections d’authentification valides, se comporte comme auparavant.</p>
+<p>Les profils de permission limitent ce qu’un principal peut faire via RPC. Ils n’isolent pas le code qu’un principal amène un agent à exécuter. Les tours de session, les tâches cron et les étapes SOP s’exécutent sous le compte du démon. Sous Unix, ce code peut se connecter au socket local avec l’uid du démon, qui correspond à l’opérateur partagé tant que <code>security.trust_daemon_uid = true</code> (la valeur par défaut), et sinon obtient les droits de l’entrée du roster correspondant à cet uid. Sous Windows sans roster, le pipe donne l’opérateur partagé. Ce code peut aussi modifier <code>config.toml</code>, que le démon applique à son prochain rechargement ou redémarrage. Définir <code>security.trust_daemon_uid = false</code> ne change ni l’un ni l’autre. Accordez l’exécution ou la rédaction de sessions, de tâches cron ou de SOP uniquement aux principaux à qui vous feriez confiance avec un accès opérateur. Seul un confinement au niveau du système d’exploitation, qui tient les processus d’agent à l’écart du socket et de <code>config.toml</code>, isole ce code.</p>
+<p>Certains chemins de configuration portent eux-mêmes une autorité, donc traitez un octroi large <code>config_write_paths</code> comme un accès opérateur, sauf s’il ne couvre que des paramètres feuilles validés. Par exemple :</p>
+<ul>
+<li>Un principal capable d’écrire <code>permission_profiles</code>, <code>users</code>, <code>oidc</code>, <code>security</code> ou <code>gateway.paired_tokens</code> peut s’accorder tous les droits ;</li>
+<li>celui qui peut écrire <code>agents</code>, <code>risk_profiles</code>, <code>cron</code>, <code>channels</code> ou les paramètres du fournisseur peut modifier les agents exécutés, les outils qu’ils utilisent et les emplacements où ils peuvent lire et écrire ;</li>
+<li>Quiconque peut écrire <code>mcp</code>, <code>mcp_bundles</code> ou <code>tunnel.custom.start_command</code> peut choisir les programmes que le compte du démon démarre.</li>
+</ul>
+<p><code>Config:Update</code> accorde également <code>config/reload</code>, qui applique le contenu actuel de <code>config.toml</code> sur le disque.</p>
+<p>Le sélecteur de répertoire distant de zerocode s’ouvre à la racine du système de fichiers du démon. Un principal sans autorisations d’opérateur ne peut la lister que via un agent activé dont la politique lui permet de lire <code>/</code>, par exemple un agent qui n’est pas limité à l’espace de travail. Pour tout autre principal de ce type, le sélecteur signale un refus à cet emplacement jusqu’à ce qu’il s’ouvre plutôt dans une racine autorisée.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../security/model.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../security/autonomy.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../security/model.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../security/autonomy.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

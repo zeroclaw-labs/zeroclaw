@@ -1,0 +1,508 @@
+<!DOCTYPE HTML>
+<html lang="fr" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Portabilité des agents - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Un agent n’est pas un fichier.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-85845c50.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/fr/agents/portability.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/agents/portability.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/agents/portability.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/agents/portability.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/agents/portability.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/agents/portability.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/agents/portability.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="Portabilité des agents - ZeroClaw Docs">
+        <meta property="og:description" content="Un agent n’est pas un fichier.">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/fr/agents/portability.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="Portabilité des agents - ZeroClaw Docs">
+        <meta name="twitter:description" content="Un agent n’est pas un fichier.">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="portabilité-des-agents"><a class="header" href="#portabilité-des-agents">Portabilité des agents</a></h1>
+<p>Un agent n’est pas un fichier. C’est une entrée de configuration qui référence des fournisseurs, des profils, des bundles et des serveurs MCP, ainsi qu’un répertoire de travail sur le disque. Le déplacer vers une autre installation implique de transférer les deux parties, et de décider ce qui ne doit pas être transféré du tout.</p>
+<p>Un <strong>bundle d’agent</strong> est la forme portable :</p>
+<pre><code class="language-text">&lt;bundle&gt;/
+├── zeroclaw-agent.toml    — manifest: format version, root alias, provenance,
+│                             required secrets, carried skill bundles,
+│                             dropped refs, risk flags
+├── config.toml            — the config closure this agent needs
+├── workspace/             — the agent's workspace tree
+└── skills/&lt;alias&gt;/        — content of each skill bundle the agent references
+</code></pre>
+<p><code>config.toml</code> est un <strong>fragment</strong>, et non une configuration complète. Il ne contient que les entrées que l’agent référence, et il doit être relu avant d’être approuvé.</p>
+<h2 id="exportation"><a class="header" href="#exportation">Exportation</a></h2>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">zeroclaw agents export &lt;alias&gt; --out ./my-agent
+</code></pre>
+</div>
+
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Indicateur</th><th>Effet</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--out &lt;dir&gt;</code></td><td>Répertoire de destination du bundle, créé s’il n’existe pas.</td></tr>
+<tr><td><code>--force</code></td><td>Remplacer une destination qui contient déjà des éléments.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Export est en lecture seule sur l’installation et signale trois éléments : les capacités qu’un opérateur destinataire accepterait, les identifiants qui ont été purgés, et la configuration qui n’a pas pu être transférée.</p>
+<p>Un bundle est <strong>publié, et non fusionné</strong>. L’export est construit dans un répertoire de staging situé à côté de la destination, puis substitué à celle-ci une fois terminé, donc :</p>
+<ul>
+<li><code>--force</code> <em>remplace</em> la destination. Un fichier issu d’un export précédent que le nouveau manifeste ne décrit pas est supprimé, au lieu d’être laissé en apparence comme faisant partie du bundle.</li>
+<li>Un échec signalé par l’export, comme un fichier de l’espace de travail illisible ou un disque plein, laisse la destination telle qu’elle était. L’arborescence temporaire est supprimée et tout bundle existant est restauré, de sorte qu’il n’existe aucun bundle partiellement écrit pouvant être pris pour un bundle complet.</li>
+<li>Une destination qui chevauche une arborescence lue par l’export est refusée avant que quoi que ce soit ne soit créé, dans les deux sens et pour l’espace de travail comme pour chaque bundle de skill : un <code>--out</code> <em>à l’intérieur</em> d’une source ferait consommer à la copie sa propre sortie, et un <code>--out</code> qui <em>contient</em> une source remplacerait l’arborescence exportée.</li>
+<li>Les composantes de chemin d’identité conservées et les noms de répertoires de contenu de compétences utilisent une grammaire que toutes les cibles prises en charge peuvent matérialiser. Cela exclut les séparateurs et les caractères de contrôle, les noms réservés à Windows tels que <code>con</code>, <code>nul</code> ou <code>lpt1</code>, avec ou sans extension, ainsi que les noms se terminant par un espace ou un point. Un chemin d’identité non sûr est supprimé. Un alias de compétence non sûr reste dans la fermeture de configuration afin que l’importateur manuel puisse le renommer ou le relier à nouveau, mais son contenu n’est pas placé sous <code>skills/&lt;alias&gt;/</code> ; le manifeste signale cette omission. L’alias de l’agent racine reste également inchangé au format 1 ; renommez donc un alias incompatible avec la cible avant de copier l’espace de travail par défaut sur cette cible.</li>
+<li>La fermeture est vérifiée avant l’écriture. Le fichier <code>config.toml</code> généré est relu puis soumis à la même validation que celle exécutée par l’installation qui l’importe, sur une configuration ne contenant rien d’autre. Une référence que l’installation source peut satisfaire mais que le bundle ne peut pas, comme une entrée de fournisseur ou de bundle jamais configurée, fait échouer l’export et indique le champ concerné, plutôt que de produire un bundle qui échouerait à l’arrivée.</li>
+<li>Ce qu’admet <code>--force</code> est un seul répertoire, et non simplement une chaîne de chemin. L’exportateur conserve le descripteur du répertoire parent et l’identité de la destination admise, puis les revérifie avant la publication. Tout changement de destination constaté par ces vérifications est refusé. Ces vérifications réduisent le risque de substitution, mais elles ne constituent pas une opération atomique de comparaison et échange (compare-and-swap) avec la suppression ou le renommage finaux. Ne laissez donc aucun autre processus modifier le répertoire de destination pendant la publication d’un export.</li>
+</ul>
+<h3 id="si-lexport-est-interrompu-en-cours-de-route"><a class="header" href="#si-lexport-est-interrompu-en-cours-de-route">Si l’export est interrompu en cours de route</a></h3>
+<p>L’échange se fait en deux renommages, pas en un seul : le bundle existant est d’abord mis de côté, puis le bundle préparé est déplacé à sa place. Cela suffit pour annuler un échec signalé par l’export, mais ce n’est pas atomique face à un crash. Si le processus ou l’hôte s’arrête entre ces deux renommages, la destination est absente et le bundle précédent reste intact à côté, sous un nom qui correspond au répertoire de préparation :</p>
+<pre><code class="language-text">&lt;parent&gt;/
+├── .zeroclaw-export-&lt;token&gt;       staged bundle, incomplete (safe to delete)
+└── .zeroclaw-export-old-&lt;token&gt;   the previous bundle, unchanged
+</code></pre>
+<p>Récupérez en renommant <code>.zeroclaw-export-old-&lt;token&gt;</code> vers la destination. Les deux répertoires sont cachés et partagent le même <code>&lt;token&gt;</code>, donc un export interrompu laisse une paire correspondante. Un export réussi ne laisse aucun des deux.</p>
+<h3 id="ce-que-la-fermeture-transporte"><a class="header" href="#ce-que-la-fermeture-transporte">Ce que la fermeture transporte</a></h3>
+<p>À partir de <code>[agents.&lt;alias&gt;]</code>, l’export suit chaque référence qui peut être reconstituée ailleurs :</p>
+<ul>
+<li>l’agent : les entrées <code>risk_profile</code> et <code>runtime_profile</code>;</li>
+<li>its entrées <code>skill_bundles</code>, <code>knowledge_bundles</code> et <code>mcp_bundles</code>;</li>
+<li>les entrées <code>[mcp.servers]</code> que ces bundles accordent réellement, résolues par le même chemin que celui qu’utilise le runtime, de sorte qu’un serveur retiré par <code>exclude</code> d’un bundle soit également absent de ce bundle ;</li>
+<li>chaque entrée de fournisseur nommée par l’agent (<code>model_provider</code>, <code>classifier_provider</code>, <code>summary_provider</code>, <code>tts_provider</code>, <code>transcription_provider</code>), transmise <strong>sans clé</strong> ;</li>
+<li>le fournisseur qu’un profil d’exécution embarqué désigne dans son propre <code>context_compression.summary_provider</code>, que l’agent ne mentionne jamais mais que la cible valide pour chaque profil ;</li>
+<li>chaque repli de fournisseur de modèle accessible selon les règles de profondeur et de cycle du runtime, également transmis sans clé ;</li>
+<li>le <strong>contenu</strong> de chaque bundle de compétences référencé, sous <code>skills/&lt;alias&gt;/</code>. Les compétences se trouvent dans l’arborescence <code>&lt;install&gt;/shared/skills/</code> propre à l’installation, et non dans l’espace de travail de l’agent. La configuration seule importerait donc un agent dont les compétences n’existent pas. Les filtres <code>include</code> et <code>exclude</code> de chaque bundle restreignent la copie : une compétence exclue par son bundle n’est pas transférée.</li>
+</ul>
+<p>La liste <code>skill_bundles</code> du manifeste indique ce que le bundle <em>contient</em>, et non ce que l’export devait transporter. Un bundle configuré sur l’agent mais sans répertoire sur l’hôte exportateur est plutôt signalé dans <code>dropped</code> avec la raison <code>source_missing</code>, et ne lève aucun indicateur <code>carried_skills</code>, de sorte que l’artefact n’annonce jamais une arborescence <code>skills/&lt;alias&gt;/</code> qu’il ne contient pas.</p>
+<p>La validité de la fermeture se vérifie ainsi : prise isolément, sur une installation sans aucune autre entrée, elle passe <code>Config::validate()</code>.</p>
+<p>Les valeurs égales à la valeur par défaut du schéma sont supprimées, de sorte que le fragment n’affiche que les choix effectivement faits plutôt que l’ensemble du schéma.</p>
+<h3 id="ce-quil-laisse-délibérément-de-côté"><a class="header" href="#ce-quil-laisse-délibérément-de-côté">Ce qu’il laisse délibérément de côté</a></h3>
+<p>Chaque omission est consignée dans la liste <code>dropped</code> du manifeste, avec une raison, afin que rien ne disparaisse silencieusement.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Abandonné</th><th>Raison</th></tr>
+</thead>
+<tbody>
+<tr><td><code>channels</code></td><td>Nommez les comptes et les identifiants qui n’existent que sur l’installation source.</td></tr>
+<tr><td><code>delegates</code>, <code>workspace.access</code>, <code>workspace.read_memory_from</code></td><td>Nommez les agents frères qui n’existeront pas sur la cible.</td></tr>
+<tr><td><code>workspace.path</code></td><td>Un chemin absolu de l’hôte source.</td></tr>
+<tr><td><code>identity.aieos_path</code></td><td>Conservé uniquement si le chemin désigne un fichier situé dans l’espace de travail exporté, selon la grammaire de chemins propre au format : séparateurs <code>/</code>, sans <code>..</code>, sans barres obliques inverses, sans préfixe de lecteur ou UNC, et sans caractères de contrôle, car l’hôte d’importation peut interpréter ces éléments différemment de l’hôte d’exportation. Un chemin conservé est réécrit selon cette grammaire (normalisé, avec des séparateurs <code>/</code>\ sur toutes les plateformes d’exportation), de sorte que la chaîne dans <code>config.toml</code> est la chaîne qui désigne le fichier transporté. Les chemins menant dans <code>memory/</code>, ainsi que les chemins dont le fichier n’a pas été copié, sont également supprimés.</td></tr>
+<tr><td><code>delegate_same_risk_profile</code></td><td>Définissez à <code>false</code> : sinon, la délégation automatique au sein du même profil atteindrait des agents sur la cible avec laquelle cet agent n’a jamais été associé.</td></tr>
+<tr><td><code>risk_profiles.&lt;alias&gt;.approval_route</code></td><td>Désigne un canal d’installation source et un approbateur distinct. Il est supprimé et signalé afin qu’un canal cible portant le même nom ne puisse pas hériter silencieusement de l’autorité d’approbation. Sa suppression supprime également la politique d’approbateur distinct du profil source ; si cette séparation est requise, réassociez une politique sur la cible avant d’activer l’agent.</td></tr>
+<tr><td><code>skill_bundles.&lt;alias&gt;.directory</code></td><td>Supprimé lorsqu’il est absolu, car il désigne l’hôte source, et la cible résout son emplacement par défaut pour l’alias. Un répertoire situé en dehors de <code>&lt;install&gt;/shared/</code>, l’arborescence que possède le contrat de skill-bundle, est supprimé avec son contenu : la configuration du bundle est transférée, mais ses skills ne sont pas à exporter par l’installation.</td></tr>
+<tr><td><code>a2a</code></td><td>Une surface exposée à l’extérieur ; l’agent doit être republié délibérément.</td></tr>
+<tr><td><code>cron_jobs</code></td><td>Non pris en charge par le format de bundle 1.</td></tr>
+<tr><td><code>workspace/memory/</code></td><td>Le magasin de mémoire. Voir ci-dessous.</td></tr>
+<tr><td><code>workspace/MEMORY_SNAPSHOT.md</code></td><td>L’export de la mémoire centrale à partir duquel le magasin se réhydrate : la mémoire sous une autre forme.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="la-mémoire-ne-se-transfère-pas"><a class="header" href="#la-mémoire-ne-se-transfère-pas">La mémoire ne se transfère pas</a></h3>
+<p>Le format 1 du bundle ne contient aucune mémoire, et aucun indicateur ne permet de l’activer. Le stockage est une base de données SQLite active en mode WAL : pendant que l’agent fonctionne, son état validé est réparti entre la base et son fichier auxiliaire <code>-wal</code>. Copier ces fichiers un par un peut donc capturer une base incohérente ou obsolète. Un bundle n’est pas un endroit où découvrir cela. Embarquer la mémoire exige une véritable frontière d’instantané, prise via l’API de sauvegarde de SQLite sur un stockage figé, ce qu’une version ultérieure du format pourra ajouter.</p>
+<p>Les deux formes que prend la mémoire sur le disque restent en place : le magasin situé dans <code>workspace/memory/</code> et le fichier <code>MEMORY_SNAPSHOT.md</code> à la racine de l’espace de travail, à partir duquel un agent restaure le magasin. Un agent importé démarre avec une mémoire vide.</p>
+<p>Les liens symboliques situés dans l’espace de travail sont ignorés au lieu d’être suivis : leur cible peut se trouver en dehors de l’espace de travail, et elle serait de toute façon résolue différemment sur l’hôte destinataire.</p>
+<p>Les racines source sont vérifiées en premier. Un répertoire d’espace de travail ou de bundle de compétences qui est un lien symbolique est refusé au lieu d’être suivi, car le suivre placerait toute la copie en dehors de l’arborescence que le bundle prétend contenir, avant même que les vérifications par entrée ci-dessous ne soient exécutées. Pointez la configuration vers le répertoire réel, puis exportez à nouveau.</p>
+<p>Ses ancêtres sont également vérifiés, par construction plutôt que par comparaison : une source qui utilise son emplacement par défaut est ouverte en parcourant chaque composant depuis la racine d’installation (<code>shared</code>, puis <code>skills</code>, puis le répertoire du bundle ; <code>agents</code>, puis l’alias, puis <code>workspace</code>), chacun via le descripteur du composant précédent, en refusant un lien symbolique à chaque étape. Un <code>shared/skills</code> ou <code>agents</code> redirigé est refusé quel que soit sa cible, même si celle-ci se trouve ailleurs dans l’installation, car le contenu des skills n’est lu que via de vrais répertoires sous <code>shared/</code>, et un workspace par défaut uniquement via de vrais répertoires sous <code>agents/</code>. Les liens symboliques <em>au-dessus</em> de la racine d’installation font partie du chemin de l’opérateur et sont suivis, avec la même confiance accordée à l’emplacement du fichier de configuration. Un <code>workspace.path</code> configuré par l’opérateur à un autre emplacement est exclu de cette règle : dans ce cas, l’emplacement configuré constitue la limite, et seul son dernier composant est refusé en tant que lien symbolique.</p>
+<p>L’espace de travail reste actif pendant l’exécution de l’export, car l’agent qui en est propriétaire peut y écrire via un appel d’outil ordinaire. La copie ne rouvre donc jamais un chemin par son nom. La racine de l’espace de travail est ouverte une seule fois, et chaque entrée qui se trouve en dessous est classée <em>et</em> lue via un descripteur sur le répertoire qui la contient, les deux étapes refusant de traverser un lien symbolique. C’est ce qui fait de l’omission une garantie plutôt qu’une simple vérification : une entrée remplacée entre-temps par un lien fait échouer l’export au lieu de le rediriger.</p>
+<p>Refuser de suivre un nom ne revient pas à prouver que les octets appartiennent à cette arborescence. Deux vérifications supplémentaires sont donc effectuées sur le descripteur que la copie est sur le point de lire. Un fichier portant plusieurs noms est ignoré, car un lien physique est un second nom pour un même objet, qui peut se trouver n’importe où sur l’hôte. L’objet ouvert doit être celui qui a été classé, comparé par identité du système de fichiers plutôt que par forme : une entrée retirée du répertoire puis remplacée par un autre fichier de l’hôte passerait sinon tous les tests, en étant un fichier ordinaire avec un seul lien dans le même répertoire.</p>
+<p>Refuser le lien compte même lorsqu’il pointe <em>à l’intérieur</em> de l’espace de travail. Le bundle a ses propres frontières de contenu, et un lien qui ne sort jamais de la racine peut tout de même les franchir : un fichier admis remplacé par un lien vers <code>memory/brain.db</code> ferait transiter le magasin de mémoire sous le nom admis, et une compétence admise remplacée par un lien vers une compétence que le bundle exclut ferait transiter le contenu exclu. Aucun des deux ne sort de l’espace de travail, et aucun n’est autorisé.</p>
+<h3 id="identifiants"><a class="header" href="#identifiants">Identifiants</a></h3>
+<p>Chaque champ que le schéma marque comme secret est effacé et remplacé par une chaîne vide, et son chemin de configuration est listé sous <code>required_secrets</code> dans le manifeste. Les chemins sont ceux qu’accepte <code>zeroclaw config set</code>, donc remplir un bundle revient à faire un simple copier-coller :</p>
+<pre><code class="language-sh">zeroclaw config set providers.models.anthropic.main.api-key
+zeroclaw config set mcp.servers.github.env.GITHUB_TOKEN
+</code></pre>
+<p>Le nettoyage est vérifié, pas présumé : si un texte chiffré de configuration chiffrée subsiste dans la fermeture, l’export est interrompu au lieu d’écrire le bundle.</p>
+<h4 id="ce-que-le-nettoyage-ne-fait-pas"><a class="header" href="#ce-que-le-nettoyage-ne-fait-pas">Ce que le nettoyage ne fait pas</a></h4>
+<p>Le nettoyage remplace par des valeurs vides les champs que le schéma marque comme secrets. Ce n’est pas une détection d’identifiants, et il n’examine pas les valeurs qu’il contient. Toutes les autres chaînes de la fermeture sont transmises exactement telles qu’elles sont configurées :</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Reporté tel quel</th><th>Un identifiant se retrouve là lorsque</th></tr>
+</thead>
+<tbody>
+<tr><td><code>mcp.servers.&lt;name&gt;.url</code></td><td>Le point de terminaison transporte un jeton ou une chaîne de requête signée.</td></tr>
+<tr><td><code>mcp.servers.&lt;name&gt;.command</code>, <code>.args</code></td><td>Une clé est transmise en ligne de commande plutôt que via <code>env</code>.</td></tr>
+<tr><td><code>providers.*.api_url</code></td><td>Un point de terminaison auto-hébergé intègre un jeton d’accès.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Le manifeste reprend à l’identique les lignes de commande des serveurs stdio dans <code>risk_flags</code>, de sorte qu’une information d’identification placée dans <code>args</code> figure à la fois dans le manifeste et dans le fragment de configuration.</p>
+<p>Certains champs transmis dépendent de l’état local de la cible, bien qu’il ne s’agisse pas de valeurs secrètes. <code>requires_openai_auth = true</code> nécessite le magasin d’authentification OpenAI propre à la cible. Les valeurs de <code>tls_ca_cert_path</code> du fournisseur de modèle et de MCP désignent des fichiers présents sur l’hôte d’exportation et doivent être remplacées par un chemin CA local à la cible. <code>allowed_roots</code> est transmis et signalé comme <code>extra_filesystem_roots</code> ; examinez ou supprimez chaque chemin avant d’activer le profil importé.</p>
+<p>Lisez ces valeurs avant de partager un bundle. Deux points requièrent votre attention plutôt que celle du schéma : les chaînes décrites ici, et les fichiers embarqués décrits dans <a href="#bundle-content-is-not-scanned">Le contenu du bundle n’est pas analysé</a>.</p>
+<h3 id="le-contenu-du-bundle-nest-pas-analysé"><a class="header" href="#le-contenu-du-bundle-nest-pas-analysé">Le contenu du bundle n’est pas analysé</a></h3>
+<p>Le nettoyage est une passe pilotée par le schéma sur la fermeture de configuration. Il n’atteint pas les fichiers qu’un bundle embarque, et rien d’autre non plus. Les filtres décident <em>quels</em> fichiers sont transmis ; rien n’inspecte le contenu de ceux qui le sont.</p>
+<p>Chaque fichier régulier qui passe les filtres d’espace de travail et de skills est copié octet par octet et n’est jamais analysé à la recherche de secrets. Ce qui ne voyage pas du tout est listé ailleurs sur cette page : le <a href="#memory-does-not-travel">magasin de mémoire et son instantané</a>, <a href="#exporting">les liens symboliques, les fichiers spéciaux et les liens physiques</a>, les skills rejetés par le <code>exclude</code> d’un bundle, ainsi que l’état résiduel à la racine d’un bundle de skill.</p>
+<p>Les fichiers isolés et les entrées spéciales à la racine d’un paquet de compétence sont en dehors de l’arborescence du contenu de la compétence. Ils ne sont ni copiés ni inclus dans les décomptes récursifs des entrées ignorées, donc inspectez séparément la racine du paquet source si cette distinction compte pour votre transmission.</p>
+<p>Ainsi, un fichier <code>.env</code> présent dans l’espace de travail, un jeton d’API collé dans une note, un <code>.git/config</code> dont l’URL distante contient un identifiant, ou un document privé sur lequel l’agent travaillait sont tous transmis exactement tels quels. L’export indique combien de fichiers il contient, mais il ne peut pas dire ce qu’ils renferment.</p>
+<p>I don’t see a documentation string to translate in your message, and I can’t read files or share bundles from here. If you paste the English text you want translated into French, I’ll return the translation with backticks, code, paths, URLs, and <code>config.toml</code> preserved exactly.</p>
+<h3 id="indicateurs-de-risque"><a class="header" href="#indicateurs-de-risque">Indicateurs de risque</a></h3>
+<p>La liste <code>risk_flags</code> du manifeste nomme chaque capacité du bundle qui élargit la frontière de confiance de l’installation réceptrice, liée au chemin de configuration qui l’accorde.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Indicateur</th><th>Soulevé par</th></tr>
+</thead>
+<tbody>
+<tr><td><code>full_autonomy</code></td><td><code>level = "full"</code>, aucune porte d’approbation par opération.</td></tr>
+<tr><td><code>filesystem_escape</code></td><td>L’politique <em>effective</em> est non confinée : <code>workspace_only = false</code>, <code>level = "full"</code> (qui désactive le confinement quelle que soit la valeur de <code>workspace_only</code>), ou <code>workspace.unrestricted_filesystem = true</code>.</td></tr>
+<tr><td><code>sandbox_disabled</code></td><td><code>sandbox_enabled = false</code>.</td></tr>
+<tr><td>approval_bypass</td><td><code>block_high_risk_commands</code> ou <code>require_approval_for_medium_risk</code> désactivé.</td></tr>
+<tr><td><code>env_passthrough</code></td><td><code>shell_env_passthrough</code> non vide : les variables d’environnement de l’hôte sont transmises aux sous-processus shell.</td></tr>
+<tr><td><code>extra_filesystem_roots</code></td><td>Liste <code>allowed_roots</code> non vide.</td></tr>
+<tr><td><code>delegation_enabled</code></td><td><code>delegation_policy.mode = "allow"</code>.</td></tr>
+<tr><td><code>process_spawn</code></td><td>Un serveur MCP stdio, qui démarre un processus local sur l’hôte cible.</td></tr>
+<tr><td><code>untrusted_startup_context</code></td><td>Les <code>pinned_resources</code> d’un serveur MCP : texte contrôlé par le serveur, lu dans le prompt système au démarrage.</td></tr>
+<tr><td><code>carried_skills</code></td><td>Le bundle contient le contenu d’un bundle de skill : les instructions que l’agent lit et les fichiers qu’il peut exécuter.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Un bundle provenant d’une source non fiable est une entrée non fiable. Lisez <code>config.toml</code> et les indicateurs de risque du manifeste avant d’importer un bundle, comme vous le feriez pour un script avant de l’exécuter.</p>
+<h2 id="importation"><a class="header" href="#importation">Importation</a></h2>
+<p>Pas encore implémenté. Un bundle s’applique manuellement aujourd’hui : fusionner <code>config.toml</code> dans la configuration de votre installation, en ajoutant un espace de noms à tout alias qui entre en conflit avec un alias déjà présent ; copier <code>workspace/</code> dans le répertoire workspace de l’agent ; copier chaque <code>skills/&lt;alias&gt;/</code> dans le répertoire que <em>votre</em> installation résout pour cet alias de bundle (<code>&lt;install&gt;/shared/skills/&lt;alias&gt;</code> sauf si le bundle définit <code>directory</code>) ; et fournir les identifiants listés dans <code>required_secrets</code>.</p>
+<p>Deux règles que <code>zeroclaw agents import</code> appliquera, et que toute fusion manuelle devra suivre :</p>
+<ul>
+<li><strong>Un import n’écrase jamais une entrée existante.</strong> Un bundle qui référence <code>risk_profiles.default</code> ne doit pas modifier <em>votre</em> profil <code>default</code>. Donnez un espace de noms à l’alias entrant, ou indiquez explicitement à l’agent d’utiliser un profil local.</li>
+<li><strong>La configuration fusionnée doit réussir <code>Config::validate()</code> avant d’être enregistrée.</strong> Une référence orpheline constitue un échec d’importation, et non un démarrage suivant défectueux.</li>
+</ul>
+<p>Je ne peux pas faire cela. Mon rôle ici est uniquement de traduire des chaînes de documentation technique de l’anglais vers le français. Je ne renomme pas les alias d’agent ou de bundles de compétences, je ne matérialise pas de chemins et je ne modifie pas de bundles entre Unix et Windows.</p>
+<p>Si vous me fournissez la chaîne anglaise à traduire, je la renverrai en français, en conservant les backticks, le gras, le code en ligne, les URL, les séquences d’échappement, les noms de commandes, les options CLI et les chemins déjà présents dans la source.</p>
+<h2 id="version-du-format"><a class="header" href="#version-du-format">Version du format</a></h2>
+<p>Les bundles portent <code>format_version = 1</code>. Une fermeture exportée est autosuffisante : elle se charge et se valide sur une installation neuve, sans aucune autre entrée présente.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../agents/multi-agent-setup.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../agents/delegation.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../agents/multi-agent-setup.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../agents/delegation.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

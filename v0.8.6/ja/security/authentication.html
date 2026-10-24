@@ -1,0 +1,1063 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>認証とプリンシパル - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="すべての RPC 接続は initialize ハンドシェイク中に プリンシパル…">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-2149462c.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/ja/security/authentication.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/security/authentication.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/security/authentication.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/security/authentication.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/security/authentication.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/security/authentication.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/security/authentication.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="認証とプリンシパル - ZeroClaw Docs">
+        <meta property="og:description" content="すべての RPC 接続は initialize ハンドシェイク中に プリンシパル…">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/ja/security/authentication.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="認証とプリンシパル - ZeroClaw Docs">
+        <meta name="twitter:description" content="すべての RPC 接続は initialize ハンドシェイク中に プリンシパル…">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="認証とプリンシパル"><a class="header" href="#認証とプリンシパル">認証とプリンシパル</a></h1>
+<p>すべての RPC 接続は <code>initialize</code> ハンドシェイク中に <strong>プリンシパル</strong> をバインドし、各メソッド呼び出しは、現在の設定がそのプリンシパルに付与している権限と照合されます。このページでは、プロバイダーセット、ローカルユーザーの一覧、パーミッションプロファイル、そして最も重要な既存のリモート接続に生じる変更点について説明します。</p>
+<h2 id="1パスでのモデル"><a class="header" href="#1パスでのモデル">1パスでのモデル</a></h2>
+<ol>
+<li>
+<p><strong>provider</strong> は認証情報を 1 つ検証します。ハンドシェイクで明示的な <code>auth_token</code> が指定されると、<code>auth_provider</code> で指定された provider（既定値は <code>native</code>、ゲートウェイのペアリングトークン）が選択されます。トークンがない場合、ローカルの Unix ソケットはカーネルのピア uid を <code>peercred</code> provider に提示します。選択された provider による拒否は最終的なものであり、認証情報が別の provider で再試行されることはありません。</p>
+</li>
+<li>
+<p><strong>共有リゾルバー</strong>は、検証済みの ID を正規のプリンシパル ID と、設定によってその ID に割り当てられたパーミッションプロファイルへ対応付けます。OIDC の ID は、検証済みの issuer と subject の組で識別され、ローカルのロスター ID は、永続的な <code>[users.&lt;name&gt;]</code> のプリンシパル ID で識別されます。</p>
+</li>
+<li>
+<p>RPCメソッドのうち、2つのハンドシェイクメソッドを除くすべては、必要なリソース動詞の権限に分類され、その権限がなければ拒否されます。<code>initialize</code>は認証情報そのものを伴い、<code>cert/renew</code>は、プリンシパルではなく、それを提示する相互TLSクライアント証明書によって認証されます。きめ細かなセレクタは、この上に組み合わさって適用されます:</p>
+<ul>
+<li>config writes check <code>config_write_paths</code>;</li>
+<li><code>session/new</code> と <code>session/prompt</code> は、エージェントのセレクタを確認し、そのエージェントのポリシーで読み取りと書き込みの両方が許可されたディレクトリにセッションのワークスペースを限定します。これはワークスペースがリクエストで指定された場合、再開されたセッションに保存されていた場合、永続セッションから復元された場合のいずれにも適用されます。セッションは要求されたパスの表記ではなく、解決後のディレクトリに紐付けられるため、許可後にシンボリックリンクされた cwd の参照先を変更してもセッションは移動しません。また、そのようなエイリアス経由で保持されているライブセッションは拒否されます。他のセッションメソッドは、<a href="#what-this-layer-does-not-do-yet">What this layer does not do (yet)</a> で説明されているとおり、まだエージェントをチェックしません;</li>
+<li>SOPの実行または承認には、そのSOPが実行するすべてのエージェントが必要で、セッションと同じツールセレクターのルールが適用されます。また、SOPの作成・保存・削除には、そのSOPが実行するエージェントが必要です。ステップにもプロシージャにもエージェントが指定されていないステップは、設定済みのエージェントエイリアスのうちソート順で最初のものとみなされます。これは、ヘッドレスエグゼキューターがフォールバックとして使用するエージェントです。決定論的なプロシージャのステップも含め、すべてのステップが対象になります。</li>
+<li>添付ファイル、パーソナリティファイル、エージェントを指定するコスト照会、cron ジョブは、いずれもエージェントセレクターを確認します。ローカルパスで送信される添付ファイルは、宛先エージェントのポリシーで読み取りが許可されている絶対パスも指定しなければなりません。フリートのコスト概要は、エージェント別の内訳にはプリンシパルのエージェントのみを表示しますが、その合計値とモデル別の使用量は引き続きすべてのエージェントを対象とします;</li>
+<li><code>fs/list_dir</code> は、呼び出し元のプリンシパルが利用できる有効なエージェントのポリシーで、そのエージェントに読み取りが許可されている絶対パスのみを一覧表示します。相対パス、<code>..</code> コンポーネント、そして Windows では、ネットワークパスおよびデバイスパスを拒否します。
+これらのルートは、各エージェントの解決済みポリシーに由来します。ポリシーには、そのリスクプロファイル、<code>workspace.access</code> が読み取りアクセス（セッションワークスペースの場合は読み取りと書き込み）を付与する兄弟ワークスペース、そして読み取り専用の共有スキルディレクトリが含まれます。ワークスペース限定ではないエージェント（自律性が <code>full</code> のもの、<code>workspace_only = false</code> を持つリスクプロファイル、<code>yolo</code> プリセット、または <code>workspace.unrestricted_filesystem = true</code> のもの）は、禁止パス以外の任意のパスを読み取れます。そのため、そのようなエージェントを利用できるプリンシパルは、そのエージェントが到達できる任意の場所にあるセッションを一覧表示したり開いたりできます。</li>
+</ul>
+<p><code>session/new</code> と <code>session/prompt</code> は、セッションのキューで待機した後にこれらのチェックを再度実行します。そのため、主体が権限を縮小される前、または認証情報が期限切れになる前にキューへ入ったリクエストは、順番が来た時点で拒否されます。</p>
+</li>
+</ol>
+<p>認可は、zerocodeの設定エディタが使用するデーモンのRPC設定メソッド経由の編集については<strong>即時</strong>に反映されます。この方法で<code>[permission_profiles]</code>、<code>[users]</code>、<code>[oidc]</code>、または<code>security.trust_daemon_uid</code>を編集すると、保存時にポリシーが再コンパイルされます。既存のネイティブトークン接続およびローカル接続は、次の操作時に再解決され、再接続も再起動も不要です。OIDC接続は再度初期化する必要があります。</p>
+<p>デーモンの外部で行われた編集（<code>config.toml</code>を直接編集する場合、Webダッシュボード経由、または<code>zeroclaw config set</code>を使用する場合）は、次回のデーモンのリロードまたは再起動時に適用されます。</p>
+<p>ゲートウェイのペアリング制御からゲートウェイのペアリングトークンを失効させると、そのトークンで認証された接続は、次の操作の前に無効になります。</p>
+<p>設定を編集して（RPC経由でも、ディスク上でも）<code>gateway.paired_tokens</code>からトークンを削除しても、実行中のデーモンには影響せず、そのトークンを使用している接続は引き続き認可されたままです。この削除は次回のデーモンのリロードまたは再起動時に適用されます。ただし、それまでにゲートウェイを通じて行われたペアリング変更により、そのトークンを含む現在のトークンセットが設定に書き戻された場合は除きます。</p>
+<p>トークンの失効は、ペアリング制御から行ってください。</p>
+<h2 id="プロバイダー"><a class="header" href="#プロバイダー">プロバイダー</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>プロバイダー</th><th>Credential</th><th>設定元</th></tr>
+</thead>
+<tbody>
+<tr><td><code>native</code></td><td>Gatewayペアリング用のベアラートークン</td><td>Gateway ペアリング（<code>/pair</code>）。デーモンとゲートウェイは1つのライブトークン管理主体を共有している</td></tr>
+<tr><td><code>peercred</code></td><td>ローカルソケット上のUnixピアUID</td><td>常時有効です。<code>[users.&lt;name&gt;].uid</code> は uid を名前付きプリンシパルに対応付けます。</td></tr>
+<tr><td><code>oidc.&lt;alias&gt;</code></td><td>JWT もしくは不透明型のベアラートークン（IdP 発行）</td><td><code>[oidc.&lt;alias&gt;]</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="ローカル接続"><a class="header" href="#ローカル接続">ローカル接続</a></h3>
+<p>Unixソケット上で、トークンを提示しない接続は、カーネルが報告するピアのuidによって識別されます。<code>security.trust_daemon_uid</code> が <code>true</code>（デフォルト）の間は、デーモンの<strong>自身のuid</strong>による接続が、<code>[users]</code> の名簿の有無にかかわらず、信頼された共有オペレーターとしてフルアクセスで扱われます。そのため、名簿のないインストールでも、デーモンを実行しているアカウントについては従来どおりに動作します。</p>
+<p>デーモンを実行するオペレーターは設定ファイルを所有しており、ローカルのみでのロックアウト復旧はこの権限に依存しています。Unix ソケットでは、<code>security.trust_daemon_uid</code> を <code>false</code> に設定すると、デーモン自身の UID を含むすべてのローカルピアが、ロスターを経由するか、トークンを提示する必要があります。この設定は、後述する Windows 名前付きパイプには効果がありません。</p>
+<p><strong>他の</strong> uid はすべて、明示的な <code>[users.&lt;name&gt;].uid</code> エントリによって対応付けられている必要があります。対応付けられていない uid（root を含む）がトークンを提示しない場合、ロスターの有無にかかわらずアクセスは拒否されます。共有オペレーターアクセスへのフォールバックはありません。リスナーはソケットを所有者専用として作成するため、現時点では、デーモン自身のアカウントと root だけがソケットに到達できます。ロスターのエントリは、他の uid が到達できるようになった後に何を行えるかを決定します。</p>
+<p>Windowsの名前付きパイプはpeer uidを伝送しません。ロスターが存在しない場合は、パイプのACLが認証情報となり、ローカル接続は共有オペレーターとして扱われます。<code>[users]</code> ロスターが存在すると、ローカルクライアントはトークンを提示する必要があり、<code>security.trust_daemon_uid</code> は効果を持たず、デーモン自身のアカウントには信頼されたローカル経路がありません。ポリシーのコンパイル中も、ペアリング済みのゲートウェイトークンは共有オペレーターとして認証されるため、それを送信するクライアントは、WSS経由でもパイプ経由でも、ロスターをライブで修復できます。zerocodeのローカルパイプ接続はトークンを送信しないため、そのようなクライアントがない場合、ロックアウトは<code>config.toml</code>を編集して再起動することで修復されます。</p>
+<p>クライアントは <code>initialize</code> でシェル環境を転送できます。これにより、デーモンのサブプロセスがクライアントの <code>PATH</code> と認証情報ソケットを参照できます（<a href="../zerocode/environment.html">環境変数の受け渡し</a>を参照）。このスナップショットは、ローカル接続上のオペレーターレベルのプリンシパル（共有オペレーター、または <code>admin = true</code> が設定されたロースターのプリンシパル）に対してのみ保持されます。それ以外のプリンシパルおよびすべてのリモート接続には、代わりにデーモン自身の環境が提供されます。</p>
+<p>セッションの作成または復元時に、資格が再度確認されます。転送された環境が空でないものを保持している既存のセッションは、現在認可されているローカルオペレーターだけが再開またはプロンプトを送信できます。WSS 経由で再接続した場合や、プロンプトのキュー待ち中に <code>admin</code> を失った場合、その環境は次のターンに引き継がれず、リクエストは実行前に拒否されます。転送された環境なしで続行するには、新しいセッションを作成してください。転送された値を持たないセッションは、他の認可チェックの対象となりますが、通常どおり再開できます。保持された環境は、そのセッションの存続期間中は変更できません。後続のリクエストを拒否しても、実行中のターンの下で保持された環境が書き換えられることはありません。再開には、現在の接続で認可された環境が、セッションの保持された環境と一致することも必要です。一致しない場合は、新しいセッションを作成してください。環境を持たないセッションは、<code>admin</code> が削除された後でも再開できます。</p>
+<h4 id="リカバリー"><a class="header" href="#リカバリー">リカバリー</a></h4>
+<p>リモート認証のバイパスは提供されません。リモート接続では、必ず有効な認証情報を提示する必要があります。認可ポリシーがまだコンパイルできる間は、ペアリング済みのゲートウェイトークンまたはoperatorレベルのプリンシパルを保持するクライアントであれば、どこからでもロックアウトを修復できます。そのような認証情報がない場合、また deny-all 状態にある場合は、復旧経路は常にデーモンを実行しているホスト上で行われます。どのローカル経路が適用されるかは、ポリシーがまだコンパイルできるかどうかによって決まります。</p>
+<p><strong>ポリシーがコンパイルできず、ロックアウトされています。</strong> 認可は有効で、ローカルの信頼済みパスは Unix ソケット上で維持されています。Windows の場合は、上記の名前付きパスに関する注記を参照してください。デーモン自身の uid としてローカル接続してください。<code>security.trust_daemon_uid = true</code>（デフォルト）の場合、そのアカウントはロスターの内容に関係なく、信頼された共有オペレーターとして扱われます。その口経由で問題のあるエントリを修復できます。例えば zerocode の設定エディタで行うか、RPC の <code>config/set</code> で <code>users.alice.uid</code> を指定します。変更は保存時点でコンパイルされ、公開されます。<code>config.toml</code> を編集する、または <code>zeroclaw config set</code> を実行しても修復できますが、その場合はデーモンが設定を再読み込みするか再起動された後にのみ反映されます。</p>
+<p><strong>deny-all の承認済み状態によりロックアウトされています。</strong> ポリシーがコンパイルされなかったため、承認済み状態は解決処理の前にすべてのプリンシパルを拒否します。デーモン自身の uid と共有オペレーターも含まれます。どの RPC でも修復できません。<code>config/set</code> と <code>config/reload</code> も、他のすべてと同様に拒否されます。所有者として <code>config.toml</code> を直接編集し、その後デーモンを再起動して、修復したセクションがコンパイル・公開されるようにしてください。デーモンは <code>SIGHUP</code> を無視するため、再読み込みには再起動が必要です。</p>
+<p><code>security.trust_daemon_uid</code> を <code>false</code> に設定すると、信頼された UID によるルートは無効になります。コンパイルは通るものの不適切なポリシーは、ペアリング済みのゲートウェイトークンを提示するクライアント、または管理者権限を持つ名簿上のプリンシパルによってライブで修復できます。それ以外の場合、どちらの状態でも修復方法は同じです。<code>config.toml</code> をその所有者として編集し、再起動してください。この設定をオフにするのは、それが許容できる場合に限ってください。</p>
+<h3 id="ユーザー名簿"><a class="header" href="#ユーザー名簿">ユーザー名簿</a></h3>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>permission_profiles</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p><code>[permission_profiles.&lt;alias&gt;]</code> エントリ。このユーザーの権限を付与するもので、決定的な和集合によってマージされます。必須項目であり、プロファイルを持たないユーザーは認証できません。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード"><a class="header" href="#ゲートウェイダッシュボード">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> を開き、<code>users.&lt;alias&gt;.permission_profiles</code> フィールドを設定してください。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>users.&lt;alias&gt;.permission_profiles</code> field. <strong>Config</strong> ペインで、<code>users.&lt;alias&gt;.permission_profiles</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.permission_profiles &lt;value&gt;
+</code></pre>
+<h4 id="環境変数"><a class="header" href="#環境変数">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__permission_profiles=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>principal_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>永続的なプリンシパルIDです。既定値はエントリ名です。監査レコードはエントリ名ではなくこのIDをキーにします。プリンシパル所有のストレージが導入されると、セッション、メモリ、承認の所有権もこのIDでキーされます。エントリの名前を変更してもデータが孤立しないようにするには、同じ編集内で <code>principal_id</code> を元のIDに設定してください。エントリの実効プリンシパルIDを変更すると、新しいプリンシパルが作成されます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-1"><a class="header" href="#ゲートウェイダッシュボード-1">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> を開き、<code>users.&lt;alias&gt;.principal_id</code> フィールドを設定してください。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>In the <strong>Config</strong> ペインで、<code>users.&lt;alias&gt;.principal_id</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.principal_id &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-1"><a class="header" href="#環境変数-1">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__principal_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>uid</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>null</code></span></summary>
+<p>Unixのuidを、ローカルソケット(peer credential)経由でこのユーザーに対して受け付けます。現時点で必須です。これは、受け付けられるプロバイダーセットが対応している唯一のroster認証情報だからです。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-2"><a class="header" href="#ゲートウェイダッシュボード-2">ゲートウェイダッシュボード</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> and set the <code>users.&lt;alias&gt;.uid</code> field.</p>
+<p>Wait, I need to translate this into Japanese, not return the English. Let me correct that.</p>
+<p><a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a> を開き、<code>users.&lt;alias&gt;.uid</code> フィールドを設定してください。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p><strong>Config</strong> ペインで <code>users.&lt;alias&gt;.uid</code> フィールドを設定してください。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.uid &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-2"><a class="header" href="#環境変数-2">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__uid=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>エントリ名は、<code>principal_id</code> で明示的に固定されていない限り、永続的な principal ID としても使われます。監査レコードは現在この ID をキーとしています。セッション、メモリ、承認はまだこの ID をキーとしていませんが（<a href="#what-this-layer-does-not-do-yet">What this layer does not do (yet)</a> を参照）、今後キーとするようになります。そのため、エントリの名前を変更しても後でデータが孤立しないように、同じ編集で <code>principal_id</code> に元の ID を設定してください。</p>
+<h3 id="oidc"><a class="header" href="#oidc">OIDC</a></h3>
+<p>各<code>[oidc.&lt;alias&gt;]</code>エントリは、1つの発行者(issuer)との間の1つの信頼関係を表します。トークンの検証(オフラインのJWKSまたはRFC 7662のイントロスペクション)、クレームマッピング、有効期間の上限については、セクションリファレンスに記載されています:</p>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>actor_claim</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>発行者が、いずれか一方のアクター種別のトークンにのみ付与するクレーム（存在し、null でないもの）へのドット区切りのパス。例：client-credentials トークンに付与される Auth0 の <code>gty</code>、またはユーザートークンに付与される Okta の <code>uid</code>。<code>actor_claim_marks</code> は、そのクレームが存在することで証明されるアクター種別を指定します。存在しない場合は、もう一方の種別が証明されます。人間向けトークンと機械向けトークンの両方を発行し、どちらのクライアントリストにも宣言されていないクライアントには必須です。宣言済みのクライアントに対しても検証され、矛盾する証拠がある場合は拒否されます。空の場合はクレームによる分類を行わないため、受け入れるすべてのクライアントを宣言する必要があります。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-3"><a class="header" href="#ゲートウェイダッシュボード-3">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.actor_claim</code> フィールドを設定します。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p><strong>Config</strong>ペインで、<code>oidc.&lt;alias&gt;.actor_claim</code>フィールドを設定します。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.actor_claim &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-3"><a class="header" href="#環境変数-3">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__actor_claim=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>actor_claim_marks</code> <span class="cfg-field-meta"><code>OidcActorKind</code> · default <code>"service"</code></span></summary>
+<p><code>actor_claim</code> の存在が証明するアクターの種類</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-4"><a class="header" href="#ゲートウェイダッシュボード-4">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.actor_claim_marks</code> フィールドを設定してください。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.actor_claim_marks</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.actor_claim_marks &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-4"><a class="header" href="#環境変数-4">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__actor_claim_marks=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_authorized_parties</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>許可された <code>azp</code>(authorized party、トークンの発行先のクライアント)の値です。空の場合は制限なし、空でない場合はトークンに、ここに記載された <code>azp</code> クレームが含まれていなければならず、含まれていない場合は認証が失敗します(フェイルクローズ)。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-5"><a class="header" href="#ゲートウェイダッシュボード-5">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.allowed_authorized_parties</code> フィールドを設定してください。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>In the <strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.allowed_authorized_parties</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.allowed_authorized_parties &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-5"><a class="header" href="#環境変数-5">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__allowed_authorized_parties=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>audience</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Audience（<code>aud</code> クレームに含まれるべきトークンの対象）。このデーモンで、通常は IdP に登録されたクライアント ID またはリソース識別子を指定します。トークン検証に必須です。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-6"><a class="header" href="#ゲートウェイダッシュボード-6">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.audience</code> フィールドを設定してください。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.audience</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.audience &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-6"><a class="header" href="#環境変数-6">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__audience=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>claim_path</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>検証済みクレームのドット区切りパス。このデプロイメントのロール／グループ値を保持します（例: <code>realm_access.roles</code>、<code>groups</code>）。デーモンはトークン内の権限の所在を推測しないため、明示的に設定する必要があります。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-7"><a class="header" href="#ゲートウェイダッシュボード-7">ゲートウェイダッシュボード</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.claim_path</code> field.</p>
+<p>Wait, I need to reconsider. The system asks to translate to Japanese. Let me produce the translation.</p>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.claim_path</code> フィールドを設定してください。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>In the <strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.claim_path</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.claim_path &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-7"><a class="header" href="#環境変数-7">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__claim_path=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>client_id</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Confidential flows（トークンのイントロスペクションなど。登録は後のスライスで対応）でこのデーモンが認証に使用するクライアント ID です。空の場合は <code>audience</code> がデフォルトとなります。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-8"><a class="header" href="#ゲートウェイダッシュボード-8">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.client_id</code> フィールドを設定します。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p><strong>Config</strong> ペインで <code>oidc.&lt;alias&gt;.client_id</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.client_id &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-8"><a class="header" href="#環境変数-8">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__client_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>client_secret</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>機密クライアントフロー（トークンイントロスペクション）用のクライアントシークレット。JWKS検証には不要です。保存時に暗号化されます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-9"><a class="header" href="#ゲートウェイダッシュボード-9">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.client_secret</code> フィールドを設定してください。</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p><strong>Config</strong> ペインで <code>oidc.&lt;alias&gt;.client_secret</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.client_secret    # マスクされた入力、暗号化して保存
+</code></pre>
+<h4 id="環境変数-9"><a class="header" href="#環境変数-9">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__client_secret=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>interactive_clients</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>トークンが常に人間のプリンシパルを表すクライアント識別子（認可コード / デバイスコードのクライアント）。検証済みの <code>client_id</code> クレームと照合されます。これらのトークンには空白でない <code>sub</code> が含まれている必要があり、<code>profile_map</code> を通じて解決される必要があります。クライアントは service_clients と interactive_clients のいずれか一方にのみ含めることができます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-10"><a class="header" href="#ゲートウェイダッシュボード-10">ゲートウェイダッシュボード</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.interactive_clients</code> field.</p>
+<p>Wait, that’s wrong. Let me translate properly.</p>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.interactive_clients</code> フィールドを設定してください。</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p><strong>Config</strong> ペインで <code>oidc.&lt;alias&gt;.interactive_clients</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.interactive_clients &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-10"><a class="header" href="#環境変数-10">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__interactive_clients=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>issuer</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>検証済みトークンの <code>iss</code> クレームに現れるとおりの発行者 URL（例: <code>https://sso.example.com/realms/main</code>）。ディスカバリは <code>&lt;issuer&gt;/.well-known/openid-configuration</code> から取得され、その <code>issuer</code> フィールドはこの値と完全に一致する必要があります。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-11"><a class="header" href="#ゲートウェイダッシュボード-11">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.issuer</code> フィールドを設定してください。</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.issuer</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.issuer &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-11"><a class="header" href="#環境変数-11">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__issuer=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>max_auth_lifetime_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>86400</code></span></summary>
+<p>オフライン検証（JWKS）トークンの最大認証有効期間（秒）。オフライン検証では失効を確認できないため、ID の有効期限は、トークンの <code>exp</code> と <code>iat</code> + この上限値のうち早い方となります。0 より大きい値を指定する必要があります。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-12"><a class="header" href="#ゲートウェイダッシュボード-12">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.max_auth_lifetime_secs</code> フィールドを設定してください。</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>In the <strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.max_auth_lifetime_secs</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.max_auth_lifetime_secs &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-12"><a class="header" href="#環境変数-12">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__max_auth_lifetime_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>profile_map</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p><code>claim_path</code> にある claim 値を <code>[permission_profiles.&lt;alias&gt;]</code> の名前にマッピングします。マッピングされていない claim 値には権限が付与されず、どのプロファイルにもマッピングされない identity は拒否されます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-13"><a class="header" href="#ゲートウェイダッシュボード-13">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.profile_map</code> フィールドを設定してください。</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>In the <strong>設定</strong>ペインで、<code>oidc.&lt;alias&gt;.profile_map</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.profile_map &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-13"><a class="header" href="#環境変数-13">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__profile_map=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>require_at_jwt</code> <span class="cfg-field-meta"><code>bool</code> · default <code>true</code></span></summary>
+<p>RFC 9068 準拠の型付き JWT プロファイルを JWKS 検証に必須とする。不透明トークンは、設定された introspection を通じてのみ有効とみなされる。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-14"><a class="header" href="#ゲートウェイダッシュボード-14">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.require_at_jwt</code> フィールドを設定してください。</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>In <strong>設定</strong> ペインで、<code>oidc.&lt;alias&gt;.require_at_jwt</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.require_at_jwt &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-14"><a class="header" href="#環境変数-14">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__require_at_jwt=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>require_mfa</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>IdP の集約 <code>mfa</code> マーカー、または許可された設定済みの ACR によって MFA が実施されたことをトークンが証明することを、認証成功の前に必須とする。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-15"><a class="header" href="#ゲートウェイダッシュボード-15">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.require_mfa</code> フィールドを設定してください。</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p><strong>Config</strong>ペインで、<code>oidc.&lt;alias&gt;.require_mfa</code>フィールドを設定します。</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.require_mfa &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-15"><a class="header" href="#環境変数-15">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__require_mfa=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>required_acr</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Acceptable <code>acr</code> (authentication context class) 値です。空の場合は要件なしを意味します。空でない場合、トークンの <code>acr</code> クレームはこれらの値のいずれかでなければならず、そうでなければ認証はフェイルクローズで失敗します。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-16"><a class="header" href="#ゲートウェイダッシュボード-16">ゲートウェイダッシュボード</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> and set the <code>oidc.&lt;alias&gt;.required_acr</code> field. <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.required_acr</code> フィールドを設定してください。</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p><strong>Config</strong> ペインで <code>oidc.&lt;alias&gt;.required_acr</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.required_acr &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-16"><a class="header" href="#環境変数-16">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__required_acr=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>revalidation_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>60</code></span></summary>
+<p>イントロスペクションモードの再検証間隔（秒）：各IDに付与される期限で、この期限を過ぎると次の特権操作では再度イントロスペクションを行うか、さもなければフェイルクローズで失敗させます。<code>0</code> = 特権操作のたびに再検証します。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-17"><a class="header" href="#ゲートウェイダッシュボード-17">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.revalidation_secs</code> フィールドを設定してください。</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>oidc.&lt;alias&gt;.revalidation_secs</code> field. <strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.revalidation_secs</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.revalidation_secs &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-17"><a class="header" href="#環境変数-17">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__revalidation_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>service_clients</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p><code>client_credentials</code> の呼び出し元で、トークンが常にサービスプリンシパルとなるクライアント ID です。検証済みトークンの <code>client_id</code> クレームと照合します。サービスプリンシパルは発行者とクライアント ID の組み合わせで識別され、プロバイダー固有の <code>sub</code> の形式（<code>&lt;client&gt;@clients</code>、サービスアカウントのユーザー ID、またはクライアント ID そのもの）に関係なく、人間のユーザーを前提とした扱いを継承しません。アクターの分類は宣言的に行われ、<code>sub</code>/<code>client_id</code> の関係から推測されることは決してありません。トークンのクライアントがこの一覧に含まれていればサービス、<code>interactive_clients</code> に含まれていれば人間、それ以外は <code>actor_claim</code> によって分類されます。どこにも宣言されておらず、設定された actor_claim の根拠もないクライアントのトークンは拒否されます。クライアントは2つの一覧のうち一方にのみ記載できます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-18"><a class="header" href="#ゲートウェイダッシュボード-18">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.service_clients</code> フィールドを設定してください。</p>
+<h4 id="zerocode-18"><a class="header" href="#zerocode-18">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.service_clients</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-18"><a class="header" href="#zeroclaw-config-18">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.service_clients &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-18"><a class="header" href="#環境変数-18">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__service_clients=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>service_profile_map</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p><code>SERVICE</code> クライアントの検証済み<code>client_id</code>を<code>[permission_profiles.&lt;alias&gt;]</code>の名前に対応付けます。サービスプリンシパルは、この対応表のみを通じて解決され、<code>profile_map</code>は決して使用されません。これにより、マシン認証情報が類似した名前のクレームから人間向けプロファイルを継承することを防ぎます。このマップにエントリがないサービスの<code>client_id</code>は、認証はされるものの、いかなる権限も付与されません（フェイルクローズ）。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-19"><a class="header" href="#ゲートウェイダッシュボード-19">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.service_profile_map</code> フィールドを設定してください。</p>
+<h4 id="zerocode-19"><a class="header" href="#zerocode-19">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.service_profile_map</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-19"><a class="header" href="#zeroclaw-config-19">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.service_profile_map &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-19"><a class="header" href="#環境変数-19">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__service_profile_map=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>validation</code> <span class="cfg-field-meta"><code>OidcValidation</code> · default <code>"jwks"</code></span></summary>
+<p>提示されたトークンの検証方法。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-20"><a class="header" href="#ゲートウェイダッシュボード-20">ゲートウェイダッシュボード</a></h4>
+<p>Translate to Japanese, preserving the link, backticks, and exact substrings.</p>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> を開き、<code>oidc.&lt;alias&gt;.validation</code> フィールドを設定してください。</p>
+<h4 id="zerocode-20"><a class="header" href="#zerocode-20">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>oidc.&lt;alias&gt;.validation</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-20"><a class="header" href="#zeroclaw-config-20">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.validation &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-20"><a class="header" href="#環境変数-20">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__validation=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<h4 id="登録中提示用のトークンを取得中"><a class="header" href="#登録中提示用のトークンを取得中">登録中（提示用のトークンを取得中）</a></h4>
+<p>デーモンはトークンを検証するだけで、クライアントはトークンを IdP から取得します。CLI には、ブラウザを使用しない 2 つのフローが同梱されています:</p>
+<pre><code class="language-sh"># Device Authorization Grant（RFC 8628）を使ったインタラクティブなサインイン:
+# prints a verification code to enter in any browser, waits for
+# 承認後、アクセストークンを標準出力に書き込みます。
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp)"
+
+# 同じ方法をシステムブラウザ経由で実行: 認可コード + PKCE（S256のみ）
+# with an RFC 8252 one-shot loopback listener. The mechanisms never
+# 互いに逆戻りしてしまう。
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp --browser)"
+
+# ヘッドレスサービスプリンシパルの client_credentials 方式（要件：
+# entryの client_secret):
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc token corp)"
+</code></pre>
+<p>進捗メッセージは標準エラー出力に出力され、標準出力にはトークンのみが出力されるため、どちらのコマンドもコマンド置換と組み合わせて使えます(<code>oidc</code> コマンドは、出力を行う可能性のある起動時の前処理より前に実行されます。OTPシードの開示も含みます)。トークンは保存されません。期限切れになる前に、RPCハンドシェイクで(または環境変数経由で)<code>auth_token</code> として提示し、その後で再登録してください。</p>
+<p>クライアントが信頼するのは、エントリに記載された発行者（issuer）のみで、それ以外は信頼しません。ディスカバリドキュメントは、広告するエンドポイントを使用する前に、その発行者をそのまま正確に示している必要があります。認証情報を受け取るすべてのエンドポイントは、発行者と同じURLポリシーを満たさなければなりません（<code>https</code>、または完全一致するループバックホストに限り<code>http</code>）。リダイレクトは決して追従せず、レスポンスボディにはサイズ上限を設けます。トークンレスポンスは、空でない<code>Bearer</code>アクセストークンを含む場合にのみ受け入れます。コンフィデンシャルクライアント（<code>client_secret</code>を持つエントリ）は、すべてのリクエストでHTTP Basic認証を用いて認証します。パブリッククライアントは、フォームに<code>client_id</code>を送信します。</p>
+<p><code>--browser</code> は macOS と Linux ではシステムのブラウザを自動で開き、すべてのプラットフォームでサインイン URL も表示します。そのため、CLI を実行しているのと同じマシン上のブラウザで手動に開くこともできます（コールバックは CLI を実行しているホストのループバックポートに届きます）。ブラウザ起動ツールは CLI の標準入出力から切り離された状態で実行されるため、起動ツールが自身の stdout に出力した内容が結果を汚染することはありません。stdout に出力されるのはトークンのみです。</p>
+<p>両方のコールバックアダプター（CLI のループバックリスナーとゲートウェイのコールバック）は、RFC 9207 の issuer チェックを強制します。<code>iss</code> パラメーターがフローを開始した issuer と一致しないレスポンスは、その <code>code</code> や <code>error</code> が処理される前に拒否されます。<code>iss</code> を含まないレスポンスは、このパラメーターが任意であり、すべての issuer がこれを送信するわけではないため、受け入れられます。コードの交換でアクセストークンと一緒に <code>id_token</code> が返される場合、その <code>id_token</code> は（issuer、audience、有効期限、このフローに紐づく nonce）をすべて検証された後、破棄されます。デーモンに提示されるのはアクセストークンのみです。エンロールメントクライアントは、ディスカバリー自体にも同様の警戒を適用します。設定された issuer と完全一致しない <code>issuer</code>（末尾のスラッシュを含む）を持つ <code>.well-known/openid-configuration</code> ドキュメントは、そこに記載されたいかなるエンドポイントも使用する前に拒否されます（RFC 8414 のチェック）。また、読み取るドキュメントのサイズには上限を設けています。これにより、悪意のある、あるいは壊れた issuer がフローを任意のエンドポイントへ誘導したり、上限のないボディを返したりすることはできません。</p>
+<p>IdP の認証情報を持たないクライアント(Web ダッシュボードや zerocode)は、代わりにゲートウェイ経由で登録します。ゲートウェイは、設定されたエントリのクライアント認証情報を使って同じフローを中継します。<code>GET /api/oidc/providers</code> はエイリアスの一覧を返し、<code>POST /api/oidc/{alias}/device/start</code> と <code>/device/poll</code> はデバイスグラントを実行し、<code>GET /oidc/login/{alias}</code> はブラウザフローを実行します。ワンタイムのコールバックページは、トークンを <code>postMessage</code>(同一オリジンのみ)で開いたウィンドウに渡し、手動コピーをフォールバックとして用意しています。ゲートウェイは <code>Cross-Origin-Opener-Policy: same-origin</code> も送信するため、ポップアップが ID プロバイダーを経由して遷移すると <code>window.opener</code> が切断されます。そのため、現在のブラウザでは、そのページでの手動コピーが実際に機能する引き渡し方法であり、<code>postMessage</code> の仕様は Web ダッシュボードの後続対応のために用意されています。これらのルートは、登録が認証より前に行われる必要があるため認証なしで提供され、レート制限がかかっています。また、何の権限も付与せず、ユーザーが承認した後に IdP が付与したものを中継するだけです。設計の根拠と障害モードの一覧は、リポジトリ内の <code>docs/security/oidc-browser-pkce-design-8289.md</code> を参照してください。</p>
+<p>レート制限は階層化されています。フローを開始するリクエスト（<code>POST /api/oidc/{alias}/device/start</code>、<code>GET /oidc/login/{alias}</code>、<code>GET /oidc/callback</code>）は、エンロールメント専用のゲートウェイのブルートフォース制限器のインスタンスにカウントされます。これは不正なペアリングトークンを制御するものと同じしきい値と同じロックアウトですが、独自の台帳で管理されます。そのため、エンロールメントからロックアウトされたアドレスでも、ペアリングや Webhook 署名の提示は可能であり、それらでロックアウトされても、エンロールメントはブロックされません。コールバックがカウントされるのは、非生産的な場合のみです。つまり、伴う <code>state</code> に対応する有効なフロー状態がない場合、発行者が一致しない場合、IdP がエラーを返した場合、認可コードがない場合、フロー進行中にエイリアスが削除された場合、またはコード交換に失敗した場合です。サインインを完了させるコールバックはコストがかからず、ゲートウェイの中継容量が使用中のため拒否したコールバックもコストがかかりません。これにより、同時にサインインする多数の人々が共有アドレスからロックアウトされることはありません。保留中フローストアが満杯のためにブラウザでのサインインが拒否された場合も、同じ理由で呼び出し元にコストはかかりません。プロバイダー一覧、デバイスポーリング、サインイン開始には、クライアントごとに1分あたり20リクエストのバジェットが適用されます。これは RFC 8628 の最小ポーリング間隔である5秒（1分あたり12回のポーリング）に余裕を持たせつつ、クライアントが連打できないようにするためのものです。ポーリングがカウントされるのは、IdP が <code>slow_down</code> を返した場合、またはデバイスコードを完全に拒否した場合です。これにより、不正なデバイスコードを中継するクライアントは、永続的にポーリングを続けるのではなく、既存のロックアウトに到達します。ゲートウェイ自身と IdP の間の転送失敗は呼び出し元に起因しないため、呼び出し元に課金されません。バジェットを超えた、またはロックアウトされたクライアントには、HTTP 429 と、遅延秒数を示す <code>Retry-After</code> が返されます。zerocode は、次のポーリングの前に少なくともその遅延時間を待機し、RFC の5秒増分より短くはしません（デバイスコードの残りの有効期間による上限は引き続き適用されます）。いかなる場合も、5秒に1回より速くポーリングすることはありません。すべてのクライアントを通じて、IdP への同時外向き中継は最大16件に制限されます。これにより、ゲートウェイが全クライアントに代わって IdP に対して行う処理の上限が決まります。保留中フローストアは同時に32件のブラウザサインインを保持し、1つのリモートクライアントが保持できるのは8件までです。これにより、サインインを開始しても完了させない呼び出し元が、それらのフローが有効な10分間、ストアを他のすべての利用者から奪うことはできません。ループバッククライアントは、他のゲートウェイ認証制限と同様に、クライアントごとのバジェットの対象外です。そのため、同一ホスト上にあるリバースプロキシは、クライアントごとの制限を実際の背後の呼び出し元に適用するために <code>trust_forwarded_headers</code> を有効にする必要があります。すべてのエンロールメントレスポンスには、ゲートウェイの <code>no-referrer</code> ポリシーに加えて <code>Cache-Control: no-store</code> と <code>Pragma: no-cache</code> が付与されます。これは、デバイスコードとアクセストークンがそれらのボディに含まれるためです。</p>
+<p>zerocodeは、自身の設定から同じAPIを経由して登録（enrollment）を行います。<code>[connection.wss] enroll_url</code> はゲートウェイのHTTPオリジンを指定し、オプションでパスプレフィックスを含めることができます。ループバックアドレス（<code>127.0.0.1</code>、<code>::1</code>、<code>localhost</code>）を指す場合を除き、<code>https://</code>である必要があります。デバイスコードとその後のアクセストークンがこの経路を通るためです。また、リダイレクトは追従されないため、後から平文の経路が割り込むことはありません。</p>
+<p>登録接続は、WSSの区間と同じ<code>[connection.wss.tls]</code>の信頼素材を使用します。すなわち、設定されたCA、<code>skip_verify</code>、および相互TLSのクライアント証明書です。この素材で証明書の検証が行われない場合、zerocodeはトークン受信後ではなく、デバイスコードを送信する前に確認を求めます。確認の対象は登録オリジン自体です。これは、その後セッションが接続するデーモンとは異なる場合があります。<code>always</code>と回答すると、そのオリジンが<code>skip_verify_routes</code>に記録されます。非対話型の実行では確認を行う相手がいないため、登録はそこで停止します。</p>
+<p>zerocodeは、すべてのポーリング待機時間をデバイスコードの残り有効期間に収まるよう切り詰め、有効期限切れ後はポーリングを行いません。有効期間が1時間を超える場合、またはポーリング間隔が5分を超える場合は、敵対的な応答に従ってスリープするのではなく、拒否します。アドバタイズされた間隔が<code>0</code>または<code>1</code>の場合は、RFC 8628のデフォルトである5秒に引き上げられます。これにより、ゲートウェイの応答によってzerocodeが1秒ごとのポーリングに陥ることはありません。そのようなポーリングは、クライアントごとの予算によってどのみち拒否されます。</p>
+<p>受け取ったトークンは、そのセッションの間のみメモリ上に保持されます。</p>
+<h2 id="パーミッションプロファイル"><a class="header" href="#パーミッションプロファイル">パーミッションプロファイル</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>admin</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>すべてを許可します。<code>true</code> の場合、他のフィールドはすべて無視されます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-21"><a class="header" href="#ゲートウェイダッシュボード-21">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> を開き、<code>permission_profiles.&lt;alias&gt;.admin</code> フィールドを設定してください。</p>
+<h4 id="zerocode-21"><a class="header" href="#zerocode-21">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>permission_profiles.&lt;alias&gt;.admin</code> field. <strong>設定</strong>ペインで、<code>permission_profiles.&lt;alias&gt;.admin</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-21"><a class="header" href="#zeroclaw-config-21">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.admin &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-21"><a class="header" href="#環境変数-21">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__admin=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_agents</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>このプロファイルの保有者がバインドまたは宛先指定できるエージェントのエイリアス。空の場合はエージェントは一切付与されません。すべてのエージェントを付与するには、明示的な <code>"*"</code> エントリを指定してください。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-22"><a class="header" href="#ゲートウェイダッシュボード-22">ゲートウェイダッシュボード</a></h4>
+<p><a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> を開き、<code>permission_profiles.&lt;alias&gt;.allowed_agents</code> フィールドを設定します。</p>
+<h4 id="zerocode-22"><a class="header" href="#zerocode-22">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>permission_profiles.&lt;alias&gt;.allowed_agents</code> field. <strong>Config</strong> ペインで、<code>permission_profiles.&lt;alias&gt;.allowed_agents</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-22"><a class="header" href="#zeroclaw-config-22">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.allowed_agents &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-22"><a class="header" href="#環境変数-22">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__allowed_agents=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Tool名は、保有者がエージェントに実行させる可能性のあるツールを示します。空の場合はツールが一切付与されず、広範なアクセスには明示的な <code>"*"</code> エントリが必要です。このセレクタは粗い粒度の <code>tools = ["execute"]</code> 付与と組み合わさるものであり、それを置き換えるものではありません。その付与がない場合、保有者のセッションはここで指定されたものに関係なくツールなしで実行されます。(注意: これはリスクプロファイルの <code>allowed_tools</code> とは異なり、そちらでは空は無制約を意味します。権限プロファイルは既定で拒否です。エージェント自身のリスクプロファイルポリシーは、その上にさらに適用されます。)</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-23"><a class="header" href="#ゲートウェイダッシュボード-23">ゲートウェイダッシュボード</a></h4>
+<p>Ja translation with preserved markup, URL, and identifiers.</p>
+<p><a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> を開き、<code>permission_profiles.&lt;alias&gt;.allowed_tools</code> フィールドを設定してください。</p>
+<h4 id="zerocode-23"><a class="header" href="#zerocode-23">zerocode</a></h4>
+<p>In the <strong>Config</strong> pane, set the <code>permission_profiles.&lt;alias&gt;.allowed_tools</code> field. <strong>Config</strong> ペインで、<code>permission_profiles.&lt;alias&gt;.allowed_tools</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-23"><a class="header" href="#zeroclaw-config-23">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.allowed_tools &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-23"><a class="header" href="#環境変数-23">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__allowed_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>config_write_paths</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>ドット区切りの設定パス接頭辞として、保持者は次のように記述できます。末尾の<code>.*</code>はサブツリー全体を許可します（例: <code>channels.*</code>）。ドットを含まないパスはその正確なプロパティのみを許可します。<code>"*"</code>はすべてのパスを許可します。空の場合は、どのパスも許可されません。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-24"><a class="header" href="#ゲートウェイダッシュボード-24">ゲートウェイダッシュボード</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> and set the <code>permission_profiles.&lt;alias&gt;.config_write_paths</code> field.</p>
+<p>Wait, that’s not right. Let me restate: the source is English and needs translating to Japanese.</p>
+<p><a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> を開き、<code>permission_profiles.&lt;alias&gt;.config_write_paths</code> フィールドを設定してください。</p>
+<h4 id="zerocode-24"><a class="header" href="#zerocode-24">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>permission_profiles.&lt;alias&gt;.config_write_paths</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-24"><a class="header" href="#zeroclaw-config-24">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.config_write_paths &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-24"><a class="header" href="#環境変数-24">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__config_write_paths=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>grants</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>リソースクラスごとの権限付与: 各リソース種別について、許可される操作(動詞)を定義します。</p>
+<p>リソース: <code>system</code>, <code>sessions</code>, <code>memory</code>, <code>cron</code>, <code>config</code>, <code>agents</code>, <code>cost</code>, <code>skills</code>, <code>personality</code>, <code>logs</code>, <code>tui</code>, <code>files</code>, <code>locales</code>, <code>quickstart</code>, <code>channels</code>, <code>providers</code>, <code>models</code>, <code>peer_groups</code>, <code>plugins</code>, <code>tools</code>, <code>sops</code></p>
+<p>動詞: <code>create</code>, <code>read</code>, <code>update</code>, <code>delete</code>, <code>execute</code></p>
+<p>一覧にないリソースは拒否されます。</p>
+<p><strong>任意のサーフェスに設定する場合:</strong></p>
+<div class="os-tabs-src">
+<h4 id="ゲートウェイダッシュボード-25"><a class="header" href="#ゲートウェイダッシュボード-25">ゲートウェイダッシュボード</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> を開き、<code>permission_profiles.&lt;alias&gt;.grants</code> フィールドを設定してください。</p>
+<h4 id="zerocode-25"><a class="header" href="#zerocode-25">zerocode</a></h4>
+<p><strong>Config</strong> ペインで、<code>permission_profiles.&lt;alias&gt;.grants</code> フィールドを設定します。</p>
+<h4 id="zeroclaw-config-25"><a class="header" href="#zeroclaw-config-25">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.grants &lt;value&gt;
+</code></pre>
+<h4 id="環境変数-25"><a class="header" href="#環境変数-25">環境変数</a></h4>
+<p>オーバーライドをエクスポートします（POSIXシェル用。<code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code>、またはDockerfileに記述します）。<code>&lt;alias&gt;</code>を実際のエイリアスに置き換えてください。</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__grants=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>プロファイルはデフォルト拒否です。リストにないリソースは拒否され、空のセレクターリストはインスタンスを一切許可せず、広範なアクセスには明示的な <code>"*"</code> セレクターまたは <code>admin = true</code> が必要です。複数のプロファイルは和集合でマージされます。cronジョブ、添付ファイル、パーソナリティファイル、エージェントごとのコスト照会、SOP作成では、<code>allowed_agents = ["*"]</code> は設定で定義されたエージェントのみを対象とし、リクエストで指定されたエイリアスは対象になりません。</p>
+<p>ツールセレクタは、エージェントの組み立て時に、粗い粒度の権限付与の上で積集合として合成されます。モデルから利用するツール実行は <code>tools = ["execute"]</code> です。この権限を持たないプリンシパルは、<code>allowed_tools</code> に何が指定されていても（<code>"*"</code> を含む）、ツールのないセッションを受け取ります。この権限を保持している場合、制約付きプリンシパルが作成したセッションは、<code>allowed_tools</code> で指定されたツールのみを受け取ります（空のリストの場合はツールのないセッションになります）。これはエージェント自身のリスクプロファイルで許可されている範囲の上で適用されます。キューに入ったプロンプトが受理された後、認証情報の有効期限や失効を含めて、共有リゾルバーに対して認可が再チェックされます。現在のプリンシパルのセレクタは、静的ツール、遅延検索レジストリ、既にアクティブ化されたツール、およびピン留めされた MCP リソースコンテンツを絞り込みます。各ピン留めブロックは <code>&lt;server&gt;__&lt;uri&gt;</code> という名前で受理され、セレクタがその名前を指定しなくなると後続のプロンプトから取り除かれます。削除されたツールは再アクティブ化できません。再利用されたセッションは次のターンの前に絞り込まれ、再水和されたセッションは現在の権限で再構築されます。エージェントのセレクタは、ターンの前と再水和の前にチェックされます。</p>
+<p>絞り込みによって既存のエージェントにツールが戻されることはありません。権限付与を拡大した後は、拡大されたツールの範囲を受け取るために新しいセッションを作成してください。エージェントには、新しい設定スナップショットや独立したプリンシパルポリシーのキャッシュは保存されません。</p>
+<p>Deferred MCP指示は、残りの読み込み可能なツールから導出され、<code>tool_search</code> が公開されている場合にのみ表示されます。プリンシパルがオンデマンドで有効化するには、<code>tool_search</code> と指名された遅延MCPツールの両方が必要です。ヘルパーが暗黙的に付与されることはありません。許可された <code>mode = "always"</code> のMCPツールは事前有効化され、ヘルパーなしでも引き続き呼び出し可能です。</p>
+<p>プリンシパルのツールセレクタまたはエージェントセレクタのいずれかが制限されている場合、<code>delegate</code>（bounded および independent）、<code>spawn_subagent</code>、<code>execute_pipeline</code> は、これらのツールをラップするスキルエイリアスを含めて利用できません。これらのネストされたパスは、現在の両方のプリンシパル上限をまだ持っていません。通常の親ターンは引き続き利用できます。管理者プリンシパル、および両方のセレクタが <code>"*"</code> に設定されたプリンシパルは、エージェントに設定されたネスト機能を引き続き保持します。</p>
+<p>既存の8引数Rust コンストラクタ <code>Agent::from_live_config_with_tui_env</code> は引き続き利用できます。RPC は追加の <code>from_live_config_with_tui_env_and_principal_tools</code> コンストラクタを使用し、プロンプトの受け付け時に共有リゾルバの権限付与を再適用します。</p>
+<p>そのコンポジションでは、エージェントのツールへのすべての経路はカバーされていません。cron ジョブと SOP の作成は、エージェントセレクターのみを確認しています。cron の権限を持つ制約付きプリンシパルは、そのエージェント向けの shell ジョブを作成したり、既存のエージェントジョブに新しいプロンプトを設定してトリガーしたりできます。SOP の作成または更新の権限を持つプリンシパルは、後でトリガーによって実行される手順を保存できます。cron および SOP 作成の権限は、エージェントのツールに対する権限として扱ってください。</p>
+<h2 id="breaking-change-リモートのwssには認証が必要になりました"><a class="header" href="#breaking-change-リモートのwssには認証が必要になりました">Breaking change: リモートのWSSには認証が必要になりました</a></h2>
+<p>リモートのWSS接続では、今後、<code>initialize</code> で <code>auth_token</code> を提示する必要があります。認証なしのリモートフォールバックはありません。</p>
+<p><code>[wss]</code> リスナーが有効で、認証情報の経路が存在しない設定（<code>[oidc.&lt;alias&gt;]</code> がなく、ペアリング済みトークンもなく、<code>gateway.require_pairing = false</code> の状態）は、設定の検証で拒否されるため、サポートされているどのインターフェースでも保存できません。この形の設定がすでにディスク上にある場合でも、起動は成功します。デーモンは起動しますが、リスナーはリモートからのすべてのハンドシェイクを拒否します。オペレーターが設定を修復するにはデーモンを起動できる必要があるため、この設定の読み込みは拒否されません。</p>
+<p><code>[oidc.&lt;alias&gt;]</code>、<code>[users]</code>、<code>[permission_profiles]</code> セクションが無効な場合は別のケースです。この場合は認可ポリシー自体がコンパイルできないため、デーモンは全拒否の accepted 状態をインストールし、セクションが修復されてリロードされるまでその旨をログに記録します。この状態では、リモート接続とローカル接続のどちらでも、デーモン自身の uid を含むすべてのプリンシパルが拒否されます。そのため、修復は上記の Recovery で説明しているディスク上の修復作業で行う必要があります。</p>
+<p>Japanese translation of the string, keeping “zerocode” unchanged as it is a project name:</p>
+<p>既存のリモート zerocode ユーザー向けの移行</p>
+<ol>
+<li>
+<p>ゲートウェイとペアリングして、ベアラートークンを取得してください。</p>
+</li>
+<li>
+<p>設定ファイルで zerocode にトークンを指定する場合:</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://daemon.example.com:9443"
+auth_token = "zc_..."
+</code></pre>
+<p>またはシェルの<code>ZEROCLAW_AUTH_TOKEN</code>環境変数で指定できます。この環境変数は設定ファイルの値より優先され、認証情報をファイルに残さずに済みます。</p>
+<p>または、それを含むファイルを指定して:</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://daemon.example.com:9443"
+auth_token_file = "/etc/zeroclaw/zerocode-bearer"
+</code></pre>
+<p>優先順位は <code>ZEROCLAW_AUTH_TOKEN</code>、<code>auth_token_file</code>、<code>auth_token</code> の順です。Unix のパーミッションビットを持つプラットフォームでは、他のアカウントが読み取れる参照先ファイルは使用されず、警告を出してスキップされます。その場合、同じ順序で次のソースが適用されます。それ以外の環境では、ファイルの ACL だけが唯一の保護手段となります。</p>
+<p>環境変数の使用を推奨します。トークンを代わりに設定ファイルに保存する場合、zerocode はそのファイルを所有者のみ読み書き可能（<code>0700</code> の設定ディレクトリ内で <code>0600</code>）にして書き込み、以前に作成されたファイルのパーミッションも修正します。これは Unix のパーミッションビットを持つプラットフォームの場合です。パーミッションビットがないプラットフォームでは、ディレクトリの ACL だけが保護手段となるため、そのファイルは機密情報として扱ってください。</p>
+</li>
+</ol>
+<p>OIDCアクセストークンも、<code>auth_provider = "oidc.&lt;alias&gt;"</code> を使って同じように動作します。</p>
+<h2 id="ゲートウェイの-http-api"><a class="header" href="#ゲートウェイの-http-api">ゲートウェイの HTTP API</a></h2>
+<p>ゲートウェイの設定およびオンボーディング用ルート（<code>/api/config*</code>、<code>/api/quickstart/*</code>、<code>/api/channels/bind</code>）は、認証を構造的に強制しています。ルートレイヤーのミドルウェアが1つでルートグループ全体を保護するため、個々のハンドラーが認証チェックを持つことも、そのチェックを忘れることもありません。このミドルウェアは、同じプロバイダーレジストリとリゾルバーを通じて、RPC経路と同じプリンシパルモデルを扱います:</p>
+<ul>
+<li><strong>paired bearer</strong> (<code>Authorization: Bearer zc_...</code>) は、従来どおり完全なアクセス権を持つ共有オペレーターに解決されます。拒否時は従来の 401 形式を維持します。</li>
+<li><strong>OIDC bearer</strong> を <code>X-ZeroClaw-Auth-Provider: oidc.&lt;alias&gt;</code> ヘッダーとともに提示すると、そのプロバイダーによって検証され、スコープ付きのプリンシパルに解決されます。プロバイダーの選択は明示的に行われ、RPC ハンドシェイクの <code>auth_provider</code> フィールドと同じ仕組みです。指定されたプロバイダーによる拒否が最終的な判断となり、プロバイダー間のフォールバックは一切行われません。</li>
+<li>CORSのプリフライトリクエスト（<code>OPTIONS</code>）は、これまでと同様に認証なしで通過します。GET、HEAD、POST、PUT、PATCH、DELETE以外のメソッドはすべて拒否されます。</li>
+</ul>
+<p>スコープ付きプリンシパルの <code>Config</code> 権限は2段階で適用されます。ルートレイヤーは HTTP メソッドごとに粗い下限を設けており、読み取りには <code>read</code> が必要で、それ以外には <code>create</code>、<code>update</code>、<code>delete</code> のいずれか少なくとも1つが必要です。そのため、読み取り専用のプリンシパルが変更系のハンドラに到達することはありません。各変更系ハンドラは、最初の副作用が発生する前に<strong>書き込みセット全体</strong>を認可します。書き込みセットとは、その変更によって永続化されるすべての設定パスであり、各パスは設定に対する作用によって分類されます（新たに作成するパスは <code>create</code>、削除するパスは <code>delete</code>、それ以外は <code>update</code>）。そのうえでプロファイルの <code>config_write_paths</code> セレクタと照合されます。分類は HTTP メソッドではなく操作に従います。<code>POST /api/config/map-key</code> によるマップキーの作成や、新しいエイリアスの下での <code>PUT</code> による暗黙的な作成には <code>create</code> が必要です。JSON Patch の <code>remove</code> と <code>DELETE /api/config/map-key</code> には <code>delete</code> が必要です。名前の変更には、移動元に対する <code>delete</code> と移動先に対する <code>create</code> が必要です。削除やリネームのカスケードによって他の場所で書き換えられる参照も、書き込みセットに含まれます。書き込みセットの中に1つでも未認可のメンバーがあれば、バッチやカスケードを含む変更全体が拒否され、何も書き込まれません。書き込みセットを事前に列挙できない操作（ファイルのスキーマ移行や Quickstart の適用など）には <code>*</code> セレクタが必要です。永続化の境界では、書き込まれようとしているパスをハンドラが認可したものと照合し直すため、ハンドラが認可された範囲を超えて永続化することはできません。</p>
+<p>ポリシーが変わるのは、この永続化の境界においてのみです。設定を書き込むハンドラーは、その設定からコンパイルした認可状態を次の受理済みリビジョンとして公開します。すべてのリクエストは、現時点の受理済みスナップショットに対して検証・解決されます。リクエストパス上ではポリシーを再コンパイルしないため、並行する永続化より前に設定を読み込んだリクエストが、新しいポリシーを古いポリシーで上書きしてしまうことは決して起こりません。プロバイダーの検証設定、ロスター、またはプロファイルに対して永続化された変更は、次のリクエストから有効になります。デーモン自身のRPCサーフェスは独立したライブ設定を保持しており、ゲートウェイの書き込みフラグがトリガーするリロードを通じて同じ状態に到達します。その他のゲートウェイのサーフェスは、ハンドラーごとにペアリングチェックを維持しており、この層の採用は後続の作業で行います。</p>
+<h2 id="認証情報のライフサイクル"><a class="header" href="#認証情報のライフサイクル">認証情報のライフサイクル</a></h2>
+<ul>
+<li><strong>有効期限切れ</strong>は、期限の時点で接続の認可を終了します。クライアントは新しいトークンで再初期化します。</li>
+<li><strong>イントロスペクションの再検証</strong>: OIDCイントロスペクションのIDには再検証の期限があり、期限を過ぎると、クライアントが再初期化(IdPに対して再検証を行う)するまで、次の操作は拒否されます。</li>
+<li><strong>ペアリングの取り消し</strong>は、接続の次の操作の前に適用されます。</li>
+<li><strong>ログのサブスクリプション</strong>: 開いている<code>logs/subscribe</code>ストリームは配信のたびに再検証され、認証情報の有効期限が切れた場合、ペアリングが取り消された場合、またはプリンシパルが<code>Logs:Read</code>を失った場合、その最初の配信以降に終了します。</li>
+<li><strong>ポリシーの変更</strong>: 設定の保存時に <code>[oidc]</code>、<code>[users]</code>、<code>[permission_profiles]</code>、<code>security.trust_daemon_uid</code> のいずれも変更されていない場合、すべてのバインディングはそのまま維持されます。これらのいずれかが変更されると、新しいポリシーが公開されます。ネイティブトークン接続およびローカル接続は、その新しいポリシーに対してその場で再解決されます。ただし、デーモンは OIDC ベアラートークンを保持しないため、OIDC 接続での次の操作は、クライアントが再初期化されるまで拒否されます。</li>
+<li><code>tui_id</code>/<code>tui_sig</code> による再接続の仕組みは継続性のみを担います。TUI のレジストリ上の ID を保持しますが、<strong>いかなる</strong>権限も付与しません。すべての <code>initialize</code> は認証情報を再提示します。</li>
+</ul>
+<h2 id="セッション分離"><a class="header" href="#セッション分離">セッション分離</a></h2>
+<p>すべてのスコープ付きプリンシパルが作成するセッションは、ライブストアとディスク上(チャットバックエンドおよびACPストア)の両方で、そのプリンシパルのIDが刻印されます。スコープ付きプリンシパルは、自身のセッションのみを閲覧・操作できます。一覧は絞り込まれ、読み取りと変更操作では、「存在しないか、所有されていない」という単一の統一された拒否応答が返されるため(存在の有無を探ることはできません)、破壊的な削除は所有者条件付きのストレージ文として実行されます。また、進行中の承認は、それが発生したセッションの所有者に対してのみ解決されます。この変更以前に作成されたセッション、またはアンスコープ接続によって作成されたセッションには所有者がありません。これらは、アンスコープ接続からは引き続き完全に閲覧可能であり、スコープ付きプリンシパルからは不可視のままです。</p>
+<p>認証済みのすべてのプリンシパルは PRIVATE メモリを持ちます。メモリ操作はプリンシパルごとの plane を読み書きし、その plane の所有者はすべてのストレージ文に含まれて、agent、namespace、tenant の各次元と組み合わされます（同じキーでも、2つの agent の下では2つの行になります）。plane はプリンシパルのアイデンティティに従い、管理者バイパスには従いません。名前付き管理者のメモリは、その管理者自身の private plane です。そのため、ユーザーを昇格または降格しても、そのユーザーのノートが見えなくなったり、書き込み先が変わったりすることはありません。デフォルトで shared plane に属するのは、未認証の共有オペレーターだけです。管理者バイパスを持つ呼び出し元は、<code>memory/*</code> リクエストで <code>plane = "shared"</code> を明示的に指定できます。この指定は監査されます。スコープ付きプリンシパルはこれを指定できません。</p>
+<p>この2つのプレーンは双方向で互いに干渉できません。共有書き込みはプライベート行のストレージキーを指定することも、プライベート行を上書きすることもできません。プライベート書き込みが共有行を変換することはありません。通常のエクスポートとMarkdownスナップショットには共有行のみが含まれます。従来の一括パージの対象も共有行のみです。プライベート行のエクスポートとパージは、所有者情報を伴う操作を通じて行われます。</p>
+<p>principal が作成したセッションのメモリハンドルは、そのセッションの生存期間中ずっと、その principal のプライベートプレーンに固定されます。後からセッションをプロンプトするのが誰であっても同様です（管理者が回収済みのセッションを復元する場合も、耐久性のあるオーナーのプレーン上で復元されます）。そのため、スコープ付きセッション内のメモリツールとターンごとのリコールは、共有プレーンに一切アクセスしません。スコープ付きセッションに共有プレーンを開放するグラントは存在しません。プライベートへの書き込みは、共有への書き込みと同じコンテンツスキャンおよびポリシーゲートを通過します。メモリ監査が有効な場合、プライベート操作はスコープ全体を含めて監査されます。principal をサポートしないメモリバックエンド（現時点では markdown、lucid、postgres、qdrant）では、プライベートメモリはスコープを黙って解除するのではなく、明確な拒否によってフェイルクローズします。スコープ付きセッションの場合、これはそのメモリツールが拒否されることを意味します。</p>
+<h2 id="securitynevis-からの移行"><a class="header" href="#securitynevis-からの移行">[security.nevis] からの移行</a></h2>
+<p>Nevis IAM 連携は削除されました。これは認証経路に一度も組み込まれておらず、有効化しても誰も認証されていなかったため、廃止しても稼働中の動作は変わりません。古い<code>config.toml</code>が引き続き読み込めるよう、この設定テーブルは引き続き受け付けられます。デーモンは読み込み時にテーブル内のすべての値を破棄し、代替先を示す警告を1件ログに出力します。そして次回の保存時に、全体保存でも、CLI、ダッシュボード、RPCが単一の編集に使う増分保存でも、<code>config.toml</code>からそのテーブルを削除します。この削除はそのテーブルのみに影響し、コメントや他のセクションはバイト単位でそのまま保持されます。自動変換は行われません。代替スタックには、古いテーブルが保持していなかった値（audience、プロファイルの権限付与）が必要だからです。</p>
+<p><strong>アップグレード前に</strong>、<code>config.toml</code> を保護された場所にコピーしてください。アップグレード後は、保存のたびに <code>config.toml.bak</code> がファイルの隣に書き込み中だけ作成され、書き込みが永続化された後に削除されます。そのため <code>.bak</code> は恒久的なバックアップにはなりません。自分で保存したコピーには、廃止されたテーブルが残っており、設定されていた場合は平文の <code>client_secret</code> も含まれるため、それらのコピーはシークレット情報として扱ってください。不要になったら、IdP 側で Nevis のクライアント資格情報を失効させてください。</p>
+<p>Field by field:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>[security.nevis]</code> フィールド</th><th>置換</th><th>注釈</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td><code>sop_execute</code>ツールによってトリガーされます(<code>zeroclaw sop run</code> CLI コマンドではありません)。</td><td><code>[oidc.&lt;alias&gt;]</code> エントリが存在すること自体が、検証を有効にするトリガーとなります。</td></tr>
+<tr><td><code>instance_url</code>, <code>realm</code></td><td><code>[oidc.&lt;alias&gt;] issuer</code></td><td>IdPが検出ドキュメントで公開する正確な発行者URL。デーモンは<code>issuer</code>が異なる検出ドキュメントを拒否します。</td></tr>
+<tr><td><code>client_id</code></td><td><code>[oidc.&lt;alias&gt;] client_id</code></td><td>|Also used to build the <code>interactive_clients</code> / <code>service_clients</code> lists that classify who is signing in. また、サインインするクライアントを分類する <code>interactive_clients</code> / <code>service_clients</code> リストの構築にも使用されます。| |-|</td></tr>
+<tr><td><code>client_secret</code></td><td><code>[oidc.&lt;alias&gt;] client_secret</code></td><td>ファイルへの保存時、<code>[secrets] encrypt</code> が有効な場合はシークレットストアを通じて暗号化されます。<code>validation = "introspection"</code> および <code>client_credentials</code> のサービスサインインでは必須です。古いテーブルからはコピーされないため、改めて設定してください。</td></tr>
+<tr><td>token_validation = “local”</td><td><code>validation = "jwks"</code></td><td>JWKS URIは発行者のディスカバリードキュメントから取得されます。</td></tr>
+<tr><td><code>token_validation = "remote"</code></td><td><code>validation = "introspection"</code></td><td>機密クライアントが必要です。</td></tr>
+<tr><td><code>jwks_url</code></td><td>サポートされていません</td><td>カスタムの JWKS オーバーライドはありません。キーセットの URI は、設定された発行者のディスカバリドキュメントで <code>jwks_uri</code> として公開されている必要があります。この URI は別のエンドポイントを指していても構いません。公開されていないキーセット URI は設定できません。</td></tr>
+<tr><td>(none)</td><td><code>[oidc.&lt;alias&gt;] audience</code></td><td><strong>必須・新規項目です。</strong> IdP がこのデーモン向けにアクセストークンへ設定する <code>aud</code> で、既存の設定から引き継ぐ対応項目はありません。</td></tr>
+<tr><td><code>role_mapping[].nevis_role</code></td><td><code>[oidc.&lt;alias&gt;] claim_path</code> + <code>profile_map</code></td><td><code>claim_path</code> は役割を運ぶクレーム名を指定します（例: <code>groups</code>）。各 <code>profile_map</code> のキーはクレーム値で、値は <code>[permission_profiles.&lt;alias&gt;]</code> の名前です。マッチングは大文字小文字を区別しない従来の方式ではなく、完全一致になります。</td></tr>
+<tr><td><code>role_mapping[].zeroclaw_permissions</code>（ツール名、または <code>"all"</code>）</td><td><code>[permission_profiles.&lt;alias&gt;] allowed_tools</code> + <code>grants.tools = ["execute"]</code></td><td>Profiles はデフォルトで拒否されます。<code>allowed_tools</code> は粗い粒度の <code>tools = ["execute"]</code> 付与と組み合わさり、それ以外のリソースクラス(<code>sessions</code>、<code>config</code>、<code>memory</code>、…)はすべて明示的に付与する必要があります。<code>"all"</code> は <code>admin = true</code> に最も近く、これは以前の「all tools」よりはるかに広範囲です。リソースの付与を列挙することを推奨します。</td></tr>
+<tr><td><code>role_mapping[].workspace_access</code></td><td>not equivalent</td><td>ワークスペース単位の権限付与はありません。最も近い制御手段は<code>allowed_agents</code>で、プロファイルの対象をエージェントのエイリアスに限定します。</td></tr>
+<tr><td><code>require_mfa</code></td><td><code>[oidc.&lt;alias&gt;] require_mfa</code> および/または <code>required_acr</code></td><td></td></tr>
+<tr><td><code>session_timeout_secs</code></td><td><code>max_auth_lifetime_secs</code> (JWKS) / <code>revalidation_secs</code> (introspection)</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p>Validate before you restart, so a typo does not lock everyone out (see <strong>Recovery</strong> under <em>Local connections</em> for the way back if it does). Two routes do that:</p>
+<p>Wait, I need to translate to Japanese. Let me produce the translation.</p>
+<p>再起動する前に検証すると、設定のタイプミスによって全員がロックアウトされるのを防げます（タイプミスが起きた場合の復旧方法は、<em>Local connections</em> の <strong>Recovery</strong> を参照してください）。これを行う方法は2つあります:</p>
+<ul>
+<li>
+<p>デーモンの RPC 設定メソッド（zerocode の設定エディタ）を通じて、新しい <code>[oidc.&lt;alias&gt;]</code> と <code>[permission_profiles]</code> のエントリを書き込みます。デーモンは、何も保存・反映される前に認可セクションを検証します。そのため、存在しない <code>profile_map</code> のターゲットや <code>audience</code> の欠落は、理由とともに拒否され、以前のポリシーが引き続き有効になります。</p>
+</li>
+<li>
+<p><code>config.toml</code> を手で編集した場合は、先に CLI から <code>ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login &lt;alias&gt;)"</code> を実行してください。このコマンドは編集後のファイルを読み込み、検証に通らない <code>[oidc.&lt;alias&gt;]</code> エントリ(issuer、audience、検証モード、クライアントフィールド)を拒否します。検証に成功すると、設定済みのクライアントで IdP に実際にサインインするため、デーモンが再起動してその設定を使う前に、issuer、クライアント ID、シークレットが正しいことを確認できます。</p>
+<p>ただし、このチェックはエントリ自体を対象とするもので、<code>profile_map</code> の参照先は検証しません。[permission_profiles] に存在しない名前を指す <code>profile_map</code> の値は、デーモンによってのみ検出されます。デーモンはポリシーのコンパイルを拒否し、<strong>Recovery</strong> に記載されている全拒否状態で起動します。そのため、再起動前に名前を目視で確認するか、RPC 経由の手段を使ってください。</p>
+</li>
+</ul>
+<p>リモート接続で認証情報が提示されない場合は、すべて拒否されます。どちらの経路でも接続は開かれません。</p>
+<p><strong>ロールバック</strong>は設定データの操作であり、コードの巻き戻しとは異なります。バイナリを元に戻すと古い型は復元されますが、<code>config.toml</code> から既に削除されたテーブルは、どの操作によっても復元されません。アップグレード前に取得した保護済みのコピーを戻すか、テーブルを手動で再追加してください。今回の廃止ではスキーマバージョンは変わらないため、ダウングレードしたバイナリは移行手順なしで復元後のファイルを読み込めます。</p>
+<h2 id="この層がまだ行わないこと"><a class="header" href="#この層がまだ行わないこと">この層がまだ行わないこと</a></h2>
+<p>統合とガバナンスは共有プレーンの行を導出するもので、プライベートセッションには実行されません。また、別のプリンシパルのプライベートメモリへの管理者アクセスは、現時点で公開された経路がありません（既定で拒否）。<code>sops/runs</code> と <code>sops/run-detail</code> は、実行したエージェントに関係なく、<code>Sops:Read</code> を保持するプリンシパルに対して、すべての手順の実行履歴を返します。これは cron の履歴とは異なります。Gateway の HTTP ルートは既存のペアリングチェックを維持し、チャネルの ID はこのプリンシパルモデルに解決されません。</p>
+<p><code>security.trust_daemon_uid = true</code>（デフォルト）であり、ポリシーがコンパイルされる場合、Unix ソケット上のデーモン自身の uid は完全なアクセス権を保持します。そのため、<code>[users]</code> ユーザー一覧がなく、認証セクションが有効な単一オペレーター構成のインストールは、従来どおり動作します。</p>
+<p>権限プロファイルは、プリンシパルが RPC 経由で実行できる操作を制限します。ただし、プリンシパルがエージェントに実行させるコードを隔離するものではありません。セッションのターン、cron ジョブ、SOP のステップはデーモンのアカウントで実行されます。Unix では、そのコードはデーモンの uid としてローカルソケットに接続できます。<code>security.trust_daemon_uid = true</code>（デフォルト）の間、この uid は共有オペレーターとして扱われます。それ以外の場合は、その uid に対応付けられたロスターのエントリが適用されます。ロスターがない Windows では、パイプを介して共有オペレーターとして扱われます。また、そのコードは <code>config.toml</code> を編集でき、デーモンは次回の再読み込みまたは再起動時にその変更を適用します。<code>security.trust_daemon_uid = false</code> を設定しても、これらの動作は変わりません。セッション、cron、または SOP の実行や作成は、オペレーターアクセスを委ねても信頼できるプリンシパルにのみ許可してください。エージェントプロセスがソケットと <code>config.toml</code> に触れられないようにする OS レベルの隔離だけが、このコードを実際に分離できます。</p>
+<p>一部の設定パス自体が権限を持つため、広範な <code>config_write_paths</code> の付与は、検証済みの末端設定のみを対象とする場合を除き、オペレーターアクセスとして扱ってください。例えば:</p>
+<ul>
+<li><code>permission_profiles</code>、<code>users</code>、<code>oidc</code>、<code>security</code>、または <code>gateway.paired_tokens</code> に書き込める権限を持つプリンシパルは、あらゆる権限を自分自身に付与できてしまいます;</li>
+<li><code>agents</code>、<code>risk_profiles</code>、<code>cron</code>、<code>channels</code>、またはプロバイダー設定に書き込める者は、どのエージェントが実行されるか、どのツールを使うか、どこを読み書きできるかを変更できます;</li>
+<li><code>mcp</code>、<code>mcp_bundles</code>、または <code>tunnel.custom.start_command</code> に書き込める者は、デーモンアカウントが起動するプログラムを選択できます。</li>
+</ul>
+<p><code>Config:Update</code> は、ディスク上の <code>config.toml</code> の内容を適用する <code>config/reload</code> も付与します。</p>
+<p>zerocode のリモートディレクトリピッカーは、デーモンのファイルシステムルートで開きます。オペレーター権限を持たないプリンシパルは、<code>/</code> の読み取りを許可するポリシーを持つ有効なエージェント（ワークスペース限定ではないエージェントなど）を経由する場合にのみ、そこを一覧表示できます。それ以外のそのようなプリンシパルに対しては、許可されたルート内で開かれるまで、ピッカーがそこでの拒否を報告します。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../security/model.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../security/autonomy.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../security/model.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../security/autonomy.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

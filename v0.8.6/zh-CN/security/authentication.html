@@ -1,0 +1,1046 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>认证与主体 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="每个到 daemon 的 RPC 连接都会在 initialize 握手期间绑定一个 principal，并且每次方法调用都会根据当前配置为该 principal 分配的权限进行检查。本页介绍 provider 集合、本地用户列表、权限配置文件，以及最重要的：现有远程连接会发生哪些变化。">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-be837aa1.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/security/authentication.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/security/authentication.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/security/authentication.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/security/authentication.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/security/authentication.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/security/authentication.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/security/authentication.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="认证与主体 - ZeroClaw Docs">
+        <meta property="og:description" content="每个到 daemon 的 RPC 连接都会在 initialize 握手期间绑定一个 principal，并且每次方法调用都会根据当前配置为该 principal 分配的权限进行检查。本页介绍 provider 集合、本地用户列表、权限配置文件，以及最重要的：现有远程连接会发生哪些变化。">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/zh-CN/security/authentication.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="认证与主体 - ZeroClaw Docs">
+        <meta name="twitter:description" content="每个到 daemon 的 RPC 连接都会在 initialize 握手期间绑定一个 principal，并且每次方法调用都会根据当前配置为该 principal 分配的权限进行检查。本页介绍 provider 集合、本地用户列表、权限配置文件，以及最重要的：现有远程连接会发生哪些变化。">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="认证与主体"><a class="header" href="#认证与主体">认证与主体</a></h1>
+<p>每个到 daemon 的 RPC 连接都会在 <code>initialize</code> 握手期间绑定一个 <strong>principal</strong>，并且每次方法调用都会根据当前配置为该 principal 分配的权限进行检查。本页介绍 provider 集合、本地用户列表、权限配置文件，以及最重要的：现有远程连接会发生哪些变化。</p>
+<h2 id="按一次处理完成"><a class="header" href="#按一次处理完成">按一次处理完成</a></h2>
+<ol>
+<li>
+<p><strong>provider</strong> 负责验证单个凭据：握手中显式提供的 <code>auth_token</code> 会选中由 <code>auth_provider</code> 指定的 provider（默认为 <code>native</code>，即网关配对令牌）；若未提供令牌，本地 Unix 套接字会将其内核对端 uid 提交给 <code>peercred</code> provider。被选中的 provider 一旦拒绝，该结论即为最终结果，凭据不会再尝试其他 provider。</p>
+</li>
+<li>
+<p><strong>共享解析器</strong>将已验证的身份映射为规范的主体 ID，以及配置为其分配的权限配置文件。OIDC 身份以已验证的 issuer + subject 作为键，本地名册身份则以其持久的 <code>[users.&lt;name&gt;]</code> 主体 ID 作为键。</p>
+</li>
+<li>
+<p>每个 RPC 方法（除两个握手方法外）都被归类到所需的资源-动词授权，缺少该授权则拒绝访问。<code>initialize</code> 携带凭据本身，而 <code>cert/renew</code> 则通过提交它的双向 TLS 客户端证书进行身份验证，而非通过主体（principal）。细粒度选择器在此基础上叠加：</p>
+<ul>
+<li>配置写入会检查 <code>config_write_paths</code>;</li>
+<li><code>session/new</code> 和 <code>session/prompt</code> 会检查 agent 选择器，并将会话工作区限定在该 agent 策略允许读写的目录内，无论工作区是由请求指定的、随恢复的会话一同存储的，还是从持久化会话中恢复的。会话绑定到解析后的目录，而非请求中的写法，因此在准入之后重新指向符号链接形式的 cwd 不会改变会话的目录；以此类别名保持的活动会话会被拒绝。其他会话方法目前尚未检查 agent，详见<a href="#what-this-layer-does-not-do-yet">此层尚未做的事情（待实现）</a>；</li>
+<li>运行或批准 SOP 时，需要具备其所运行的每个代理的权限，并遵循与会话相同的工具选择器规则；创建、保存或删除 SOP 时，同样需要具备其所运行代理的权限。未指定代理的步骤（无论是在步骤本身还是在流程上）视为按排序顺序排列的第一个已配置代理别名，即无头执行器回退使用的代理。每个步骤都计入在内，包括确定性流程中的步骤。</li>
+<li>附件、人格文件、指定了某个智能体的成本查询以及定时任务都会检查智能体选择器。通过本地路径发送的附件还必须指定一个目标智能体的策略允许其读取的绝对路径。舰队成本摘要的按智能体明细仅列出委托方的智能体，但其总计和按模型用量仍涵盖所有智能体；</li>
+<li><code>fs/list_dir</code> 仅列出启用的智能体（主体可使用的智能体）策略允许该智能体读取的绝对路径。它会拒绝相对路径、<code>..</code> 组件，以及在 Windows 上的网络路径和设备路径。
+这些根路径来自每个智能体解析后的策略：其风险配置文件、其 <code>workspace.access</code> 授予读取权限的同级工作区（对于会话工作区，还包括读写权限），以及只读的共享 skills 目录。非工作区限定的智能体（自治级别为 <code>full</code>、风险配置文件中设置了 <code>workspace_only = false</code>、使用 <code>yolo</code> 预设，或设置了 <code>workspace.unrestricted_filesystem = true</code>）可以读取任何不在禁止访问路径中的路径，因此有权使用此类智能体的主体，可以列出并打开该智能体能够访问的任意位置的会话。</li>
+</ul>
+<p><code>session/new</code> 和 <code>session/prompt</code> 在等待会话队列之后会重复执行这些检查，因此在请求排队期间，如果其主体权限被收窄或凭证已过期，该请求轮到执行时会被拒绝。</p>
+</li>
+</ol>
+<p>授权对通过守护进程 RPC 配置方法所做的编辑<strong>即时生效</strong>，zerocode 的配置编辑器正是使用这些方法。以这种方式编辑 <code>[permission_profiles]</code>、<code>[users]</code>、<code>[oidc]</code> 或 <code>security.trust_daemon_uid</code> 时，会在保存时重新编译策略。已建立的原生令牌连接和本地连接会在下一次操作时重新解析，无需重新连接或重启；OIDC 连接则必须重新初始化。在守护进程之外所做的编辑，包括直接修改 <code>config.toml</code>、通过 Web 仪表板修改，或使用 <code>zeroclaw config set</code>，将在下一次守护进程重新加载或重启时生效。通过网关的配对控制撤销网关配对令牌后，使用该令牌认证的连接将在其下一次操作前失效。通过编辑配置（无论是通过 RPC 还是直接修改磁盘文件）从 <code>gateway.paired_tokens</code> 中删除令牌，对正在运行的守护进程没有任何影响，使用该令牌的连接仍保持授权。该删除将在下一次守护进程重新加载或重启时生效，除非在此之前通过网关进行的配对变更将包括该令牌在内的当前生效令牌集写回配置。请通过配对控制撤销令牌。</p>
+<h2 id="提供者"><a class="header" href="#提供者">提供者</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>提供者</th><th>凭据</th><th>Configured by</th></tr>
+</thead>
+<tbody>
+<tr><td><code>native</code></td><td>Gateway 配对承载令牌</td><td>Gateway 配对（<code>/pair</code>）；守护进程与网关共享同一个实时令牌授权方</td></tr>
+<tr><td><code>peercred</code></td><td>Unix 域套接字上的对端 UID</td><td>常开；<code>[users.&lt;name&gt;].uid</code> 将 uid 映射到一个命名主体</td></tr>
+<tr><td><code>oidc.&lt;alias&gt;</code></td><td>JWT 或不透明的 Bearer 令牌（来自您的 IdP）</td><td><code>[oidc.&lt;alias&gt;]</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="本地连接"><a class="header" href="#本地连接">本地连接</a></h3>
+<p>在 Unix 套接字上，未提供令牌的连接通过其内核对端 uid 识别。当 <code>security.trust_daemon_uid</code> 为 <code>true</code>（默认值）时，守护进程的<strong>自身 uid</strong> 会以受信任的共享操作员身份连接，并拥有完全访问权限，无论是否配置了 <code>[users]</code> 名单。因此，未配置名单的安装对于运行守护进程的账户，其行为与之前保持一致。</p>
+<p>运行守护进程的操作员拥有其配置文件，而仅限本地的锁定恢复依赖于这一权限。在 Unix 套接字上，将 <code>security.trust_daemon_uid</code> 设置为 <code>false</code>，要求每个本地对端（包括守护进程自身的 uid）都必须通过名册映射或提供令牌。该设置对 Windows 命名管道无效，详见下文。</p>
+<p>任何其他 uid 都必须通过显式的 <code>[users.&lt;name&gt;].uid</code> 条目进行映射。未映射的 uid（包括 root）如果未提供令牌，则会被拒绝，无论是否存在 roster；不会回退到共享操作员访问权限。监听器以仅所有者可访问的方式创建套接字，因此目前只有守护进程自身的账户和 root 能够访问它；roster 条目决定了其他任何 uid 在获得访问权限后可以执行的操作。</p>
+<p>Windows 命名管道不携带对端 uid。在没有名册时,管道的 ACL 即为凭据,本地连接即视为共享操作员。一旦存在 <code>[users]</code> 名册,本地客户端必须在此出示令牌,<code>security.trust_daemon_uid</code> 不再生效,守护进程自身的账户也没有受信任的本地途径。在策略编译期间,已配对的网关令牌仍会被认证为共享操作员,因此发送该令牌的客户端(无论通过 WSS 还是通过管道)都可以在线修复名册。zerocode 的本地管道连接不发送令牌,因此若没有此类客户端,锁定状态需通过编辑 <code>config.toml</code> 并重启来修复。</p>
+<p>客户端可以在 <code>initialize</code> 中转发其 shell 环境，使守护进程的子进程能够看到其 <code>PATH</code> 和凭据套接字（参见 <a href="../zerocode/environment.html">环境变量透传</a>）。该快照仅保留给操作员级别的主体（共享操作员，或设置了 <code>admin = true</code> 的名册主体）在本地连接上使用。其他所有主体以及所有远程连接，则改用守护进程自身的环境。</p>
+<p>每次构建或恢复会话时都会重新检查资格。如果现有会话保留了非空的转发环境，则只有当前已获授权的本地操作员才能恢复或向其发送提示。通过 WSS 重新连接，或在提示排队期间失去 <code>admin</code> 权限，都不会将该环境带入下一轮：请求会在执行前被拒绝。若要在不使用转发环境的情况下继续，请创建新会话。没有转发值的会话仍可正常恢复，但需满足其他授权检查。保留的环境在会话生命周期内不可变；拒绝后续请求不会在已运行的轮次下方改写它。恢复时，当前连接的已授权环境还必须与会话保留的环境一致。若两者不同，请创建新会话；不含环境的会话在移除 <code>admin</code> 权限后仍可恢复。</p>
+<h4 id="恢复"><a class="header" href="#恢复">恢复</a></h4>
+<p>远程身份验证绕过功能从不提供：远程连接始终必须出示有效凭据。在授权策略仍可编译的情况下，持有已配对网关令牌或操作员级主体的客户端可以从任何位置修复锁定状态。若没有此类凭据，并且始终处于全部拒绝状态时，恢复路径需在运行守护进程的主机上执行。适用哪种本地恢复路径，取决于策略是否仍可编译。</p>
+<p><strong>无法修改已能编译的策略。</strong> 授权已生效，本地可信路径在 Unix socket 上保持完好；在 Windows 上，请参见上文的命名管道说明。以守护进程自身的 uid 进行本地连接：在 <code>security.trust_daemon_uid = true</code>（默认值）下，该账户即为受信任的共享操作员，无论名单中如何设置。通过该本地连接修复有问题的条目，例如在 zerocode 的配置编辑器中，或使用 RPC <code>config/set</code> 设置 <code>users.alice.uid</code>，更改会在保存时编译并发布。编辑 <code>config.toml</code> 或运行 <code>zeroclaw config set</code> 同样可以修复，但只有在守护进程重新加载或重启之后才会生效。</p>
+<p><strong>因已接受的全拒绝状态而被锁定。</strong> 策略未能编译，因此已接受的状态会在解析运行之前拒绝所有主体，包括守护进程自身的 uid 和共享操作员。没有任何 RPC 能修复它：<code>config/set</code> 和 <code>config/reload</code> 与其他所有操作一样被拒绝。请以 <code>config.toml</code> 的所有者身份直接编辑该文件，然后重启守护进程，以便编译并发布已修复的部分。守护进程会忽略 <code>SIGHUP</code>，因此需要重启才能使其重新加载。</p>
+<p>如果将 <code>security.trust_daemon_uid</code> 设置为 <code>false</code>，受信任 UID 途径就会失效。能够通过编译的策略，仍可能被出示已配对网关令牌的客户端，或拥有管理员授权的名册主体在运行时修复。否则，两种状态下的修复方式相同：以 <code>config.toml</code> 的所有者身份编辑该文件，然后重启。仅在可以接受的场景下关闭此设置。</p>
+<h3 id="用户名单"><a class="header" href="#用户名单">用户名单</a></h3>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>permission_profiles</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p><code>[permission_profiles.&lt;alias&gt;]</code> 条目，用于授予该用户的权限，按确定性并集合并。此项为必填；没有配置任何 profile 的用户无法通过身份验证。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板"><a class="header" href="#网关仪表板">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a>，并设置 <code>users.&lt;alias&gt;.permission_profiles</code> 字段。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>users.&lt;alias&gt;.permission_profiles</code> 字段。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.permission_profiles &lt;value&gt;
+</code></pre>
+<h4 id="环境变量"><a class="header" href="#环境变量">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__permission_profiles=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>principal_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>持久化的主体标识符，用于此条目；默认为条目名称。审计记录以此 id 为键，而非条目名称；在主体专属存储功能上线后，会话、记忆和审批的归属也将以此为键。若要重命名条目而不使其数据成为孤立数据，请在同一次编辑中将 <code>principal_id</code> 设置为原始 id。更改条目的有效主体 id 会创建一个新主体。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-1"><a class="header" href="#网关仪表板-1">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a>，并设置 <code>users.&lt;alias&gt;.principal_id</code> 字段。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中,设置 <code>users.&lt;alias&gt;.principal_id</code> 字段。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.principal_id &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-1"><a class="header" href="#环境变量-1">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__principal_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>uid</code> <span class="cfg-field-meta"><code>integer?</code> · default <code>null</code></span></summary>
+<p>Unix uid accepted for this user over the local socket (peer credential). Required today: it is the only roster credential the accepted provider set supports.</p>
+<p>Wait, the input above is the string to translate, and I should translate it, not repeat it. Translation:</p>
+<p>通过本地套接字（对端凭据）为此用户接受的 Unix uid。当前必需：它是已接受的提供方集合所支持的唯一 roster 凭据。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-2"><a class="header" href="#网关仪表板-2">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/users"><code>/config/users</code></a>，并设置 <code>users.&lt;alias&gt;.uid</code> 字段。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>users.&lt;alias&gt;.uid</code> 字段。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set users.&lt;alias&gt;.uid &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-2"><a class="header" href="#环境变量-2">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_users__&lt;alias&gt;__uid=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>条目名称在未通过 <code>principal_id</code> 显式指定时，即作为持久的主体 ID。审计记录当前即以该 ID 为键。会话、记忆和审批尚未以其为键（参见 <a href="#what-this-layer-does-not-do-yet">本层尚未实现的功能</a>），但未来将会如此。因此，若要重命名条目而不使其数据日后失去关联，请在同一次编辑中将 <code>principal_id</code> 设置为原始 ID。</p>
+<h3 id="oidc"><a class="header" href="#oidc">OIDC</a></h3>
+<p>每个 <code>[oidc.&lt;alias&gt;]</code> 条目对应一个与单一颁发者（issuer）的信任关系；令牌验证（离线 JWKS 或 RFC 7662 内省）、声明映射以及生命周期上限的说明，请参阅该章节的参考文档：</p>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>actor_claim</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>指向颁发者仅为某一类主体（actor）令牌添加的声明（存在且非 null）的点分隔路径，例如 Auth0 在 client-credentials 令牌上的 <code>gty</code>，或 Okta 在用户令牌上的 <code>uid</code>。<code>actor_claim_marks</code> 指明该声明存在所证明的主体类型，缺失则证明另一类主体。对于同时签发人类令牌和机器令牌的客户端（未在任一客户端列表中声明）为必需项；同时会针对已声明的客户端进行检查，若出现矛盾证据则拒绝访问。留空时表示不进行基于声明的分类，因此每个被接受的客户端都必须已声明。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-3"><a class="header" href="#网关仪表板-3">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.actor_claim</code> 字段。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中,设置 <code>oidc.&lt;alias&gt;.actor_claim</code> 字段。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.actor_claim &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-3"><a class="header" href="#环境变量-3">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__actor_claim=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>actor_claim_marks</code> <span class="cfg-field-meta"><code>OidcActorKind</code> · default <code>"service"</code></span></summary>
+<p><code>actor_claim</code> 的存在所证明的 actor 类型。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-4"><a class="header" href="#网关仪表板-4">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>，并设置 <code>oidc.&lt;alias&gt;.actor_claim_marks</code> 字段。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>oidc.&lt;alias&gt;.actor_claim_marks</code> 字段。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.actor_claim_marks &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-4"><a class="header" href="#环境变量-4">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__actor_claim_marks=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_authorized_parties</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>允许的 <code>azp</code>（授权方）值，即令牌签发给的客户端。为空表示不限制；非空表示令牌必须携带列在此处的 <code>azp</code> 声明，否则身份验证将失败并采取故障关闭（fail closed）策略。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-5"><a class="header" href="#网关仪表板-5">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.allowed_authorized_parties</code> 字段。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>在 <strong>Config</strong> 面板中，设置 <code>oidc.&lt;alias&gt;.allowed_authorized_parties</code> 字段。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.allowed_authorized_parties &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-5"><a class="header" href="#环境变量-5">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__allowed_authorized_parties=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>audience</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Audience 是此守护进程的 <code>aud</code> 声明中必须携带的值（通常为在身份提供方（IdP）注册的客户端 ID 或资源标识符）。令牌验证时必需。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-6"><a class="header" href="#网关仪表板-6">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.audience</code> 字段。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>oidc.&lt;alias&gt;.audience</code> 字段。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.audience &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-6"><a class="header" href="#环境变量-6">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__audience=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>claim_path</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>指向经过验证的声明的点分路径，该声明包含此部署的角色/组值（例如 <code>realm_access.roles</code>、<code>groups</code>）。必须显式设置：守护进程拒绝猜测权限授予信息在令牌中的位置。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-7"><a class="header" href="#网关仪表板-7">网关仪表板</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> 打开页面，并设置 <code>oidc.&lt;alias&gt;.claim_path</code> 字段。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>oidc.&lt;alias&gt;.claim_path</code> 字段。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.claim_path &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-7"><a class="header" href="#环境变量-7">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__claim_path=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>client_id</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>Client ID：守护进程在机密流程（令牌内省；注册将在后续阶段实现）中用于身份验证的客户端 ID。留空时默认为 <code>audience</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-8"><a class="header" href="#网关仪表板-8">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.client_id</code> 字段。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>oidc.&lt;alias&gt;.client_id</code> 字段。</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.client_id &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-8"><a class="header" href="#环境变量-8">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__client_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>client_secret</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>客户端密钥，用于机密客户端流程（令牌内省）。JWKS 验证不需要此项。静态加密存储。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-9"><a class="header" href="#网关仪表板-9">网关仪表板</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> 打开页面，并设置 <code>oidc.&lt;alias&gt;.client_secret</code> 字段。</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>在 <strong>Config</strong> 面板中,设置 <code>oidc.&lt;alias&gt;.client_secret</code> 字段。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.client_secret    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量-9"><a class="header" href="#环境变量-9">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__client_secret=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>interactive_clients</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>此类客户端的令牌始终对应人类主体（授权码 / 设备码客户端），按已验证的 <code>client_id</code> 声明进行匹配。其令牌必须包含非空的 <code>sub</code>，并能通过 <code>profile_map</code> 解析。同一客户端只能出现在 <code>service_clients</code> 和 <code>interactive_clients</code> 之一中。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-10"><a class="header" href="#网关仪表板-10">网关仪表板</a></h4>
+<p><a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> 打开页面，并设置 <code>oidc.&lt;alias&gt;.interactive_clients</code> 字段。</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>在 <strong>Config</strong> 面板中，设置 <code>oidc.&lt;alias&gt;.interactive_clients</code> 字段。</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.interactive_clients &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-10"><a class="header" href="#环境变量-10">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__interactive_clients=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>issuer</code> <span class="cfg-field-meta"><code>string</code> · default <code>""</code></span></summary>
+<p>与已验证令牌中的 <code>iss</code> 声明完全一致的颁发者 URL（例如 <code>https://sso.example.com/realms/main</code>）。发现文档从 <code>&lt;issuer&gt;/.well-known/openid-configuration</code> 获取，其中的 <code>issuer</code> 字段必须与此值完全一致。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-11"><a class="header" href="#网关仪表板-11">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>，并设置 <code>oidc.&lt;alias&gt;.issuer</code> 字段。</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>oidc.&lt;alias&gt;.issuer</code> 字段。</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.issuer &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-11"><a class="header" href="#环境变量-11">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__issuer=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>max_auth_lifetime_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>86400</code></span></summary>
+<p>最长认证有效期（秒），适用于离线验证（JWKS）的令牌。离线验证无法感知吊销状态，因此身份将在令牌的 <code>exp</code> 与 <code>iat</code> 加上该上限值两者中的较早时间点过期。必须大于 0。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-12"><a class="header" href="#网关仪表板-12">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.max_auth_lifetime_secs</code> 字段。</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>oidc.&lt;alias&gt;.max_auth_lifetime_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.max_auth_lifetime_secs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-12"><a class="header" href="#环境变量-12">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__max_auth_lifetime_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>profile_map</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>映射在 <code>claim_path</code> 处找到的声明值到 <code>[permission_profiles.&lt;alias&gt;]</code> 名称。没有映射的声明值不授予任何权限；未映射到任何配置文件的身份将被拒绝。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-13"><a class="header" href="#网关仪表板-13">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.profile_map</code> 字段。</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中设置 <code>oidc.&lt;alias&gt;.profile_map</code> 字段。</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.profile_map &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-13"><a class="header" href="#环境变量-13">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__profile_map=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>require_at_jwt</code> <span class="cfg-field-meta"><code>bool</code> · default <code>true</code></span></summary>
+<p>要求对 JWKS 验证使用 RFC 9068 定义的 typed JWT 配置文件。不透明令牌仅在通过已配置的内省端点时保持有效。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-14"><a class="header" href="#网关仪表板-14">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.require_at_jwt</code> 字段。</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>oidc.&lt;alias&gt;.require_at_jwt</code> 字段。</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.require_at_jwt &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-14"><a class="header" href="#环境变量-14">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__require_at_jwt=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>require_mfa</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>要求令牌通过身份提供方（IdP）的聚合 <code>mfa</code> 标记或已接受的已配置 ACR 证明已完成多因素认证，之后才能认证成功。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-15"><a class="header" href="#网关仪表板-15">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.require_mfa</code> 字段。</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中,设置 <code>oidc.&lt;alias&gt;.require_mfa</code> 字段。</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.require_mfa &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-15"><a class="header" href="#环境变量-15">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__require_mfa=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>required_acr</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>可接受的 <code>acr</code>（认证上下文类）值。留空表示无要求；非空时，令牌的 <code>acr</code> 声明必须是其中之一，否则认证失败（fail closed）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-16"><a class="header" href="#网关仪表板-16">网关仪表板</a></h4>
+<p>在 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a> 中打开页面，并设置 <code>oidc.&lt;alias&gt;.required_acr</code> 字段。</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>oidc.&lt;alias&gt;.required_acr</code> 字段。</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.required_acr &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-16"><a class="header" href="#环境变量-16">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__required_acr=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>revalidation_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>60</code></span></summary>
+<p>内省模式的重新验证间隔（秒）：为每个身份标记的截止时间，超过该时间后，下一次特权操作必须重新内省，否则以失败关闭方式拒绝。<code>0</code> 表示在每次特权操作时都重新验证。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-17"><a class="header" href="#网关仪表板-17">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.revalidation_secs</code> 字段。</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>在 <strong>Config</strong> 面板中,设置 <code>oidc.&lt;alias&gt;.revalidation_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.revalidation_secs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-17"><a class="header" href="#环境变量-17">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__revalidation_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>service_clients</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>其令牌始终为服务主体的客户端身份（<code>client_credentials</code> 调用方），与令牌经过验证的 <code>client_id</code> 声明进行匹配。服务主体以颁发者加客户端身份作为键，永远不会继承人类用户的假设，无论其 <code>sub</code> 采用何种提供方特定的格式（<code>&lt;client&gt;@clients</code>、服务账户用户 ID，或客户端 ID 本身）。主体分类是声明式的，绝不根据 <code>sub</code> 与 <code>client_id</code> 之间的关系推断：令牌为服务，是因为其客户端列于此处；为人类，是因为其客户端列于 <code>interactive_clients</code> 中；或者依据 <code>actor_claim</code> 进行分类。若令牌的客户端未在任何地方声明，且不包含已配置的 <code>actor_claim</code> 证据，则拒绝该令牌。同一客户端只能出现在两个列表之一中。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-18"><a class="header" href="#网关仪表板-18">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>，并设置 <code>oidc.&lt;alias&gt;.service_clients</code> 字段。</p>
+<h4 id="zerocode-18"><a class="header" href="#zerocode-18">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中设置 <code>oidc.&lt;alias&gt;.service_clients</code> 字段。</p>
+<h4 id="zeroclaw-config-18"><a class="header" href="#zeroclaw-config-18">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.service_clients &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-18"><a class="header" href="#环境变量-18">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__service_clients=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>service_profile_map</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>将 SERVICE 客户端已验证的 <code>client_id</code> 映射到 <code>[permission_profiles.&lt;alias&gt;]</code> 名称。服务主体仅通过此映射解析，绝不通过 <code>profile_map</code> 解析，因此机器凭证无法从名称相似的声明继承人工用户的配置文件。没有对应条目的服务 <code>client_id</code> 虽已通过身份验证，但不享有任何权限（失败即关闭）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-19"><a class="header" href="#网关仪表板-19">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>，并设置 <code>oidc.&lt;alias&gt;.service_profile_map</code> 字段。</p>
+<h4 id="zerocode-19"><a class="header" href="#zerocode-19">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中,设置 <code>oidc.&lt;alias&gt;.service_profile_map</code> 字段。</p>
+<h4 id="zeroclaw-config-19"><a class="header" href="#zeroclaw-config-19">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.service_profile_map &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-19"><a class="header" href="#环境变量-19">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__service_profile_map=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>validation</code> <span class="cfg-field-meta"><code>OidcValidation</code> · default <code>"jwks"</code></span></summary>
+<p>受理的令牌如何校验。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-20"><a class="header" href="#网关仪表板-20">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/oidc"><code>/config/oidc</code></a>,并设置 <code>oidc.&lt;alias&gt;.validation</code> 字段。</p>
+<h4 id="zerocode-20"><a class="header" href="#zerocode-20">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>oidc.&lt;alias&gt;.validation</code> 字段。</p>
+<h4 id="zeroclaw-config-20"><a class="header" href="#zeroclaw-config-20">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set oidc.&lt;alias&gt;.validation &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-20"><a class="header" href="#环境变量-20">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_oidc__&lt;alias&gt;__validation=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<h4 id="注册获取用于出示的令牌"><a class="header" href="#注册获取用于出示的令牌">注册（获取用于出示的令牌）</a></h4>
+<p>守护进程仅负责验证令牌；客户端需从身份提供方（IdP）获取令牌。CLI 内置两种无浏览器流程：</p>
+<pre><code class="language-sh"># 通过设备授权许可（RFC 8628）进行交互式登录：
+# prints a verification code to enter in any browser, waits for
+授权后，将访问令牌写入标准输出。
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp)"
+
+# 同样通过系统浏览器：Authorization Code + PKCE（仅 S256）
+# with an RFC 8252 one-shot loopback listener. The mechanisms never
+# 相互融合。
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp --browser)"
+
+# 通过 client_credentials 使用无界面服务主体（需要
+# entryś的 client_secret）：
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc token corp)"
+</code></pre>
+<p>进度消息输出到 stderr，stdout 仅输出令牌，因此两个命令都可以与命令替换组合使用（<code>oidc</code> 命令会在任何可能输出内容的启动前置步骤之前运行，包括 OTP 种子披露）。不会存储任何内容：请在令牌过期前，将其作为 <code>auth_token</code> 在 RPC 握手中提交（或通过环境变量提供），然后重新注册。</p>
+<p>客户端只信任条目中指定的 issuer，不信任其他任何来源。发现文档（discovery document）必须明确声明该 issuer 与之完全一致，之后才能使用其中公布的任何端点。凡是会接收凭据的端点，都必须满足与 issuer 相同的 URL 策略：使用 <code>https</code>，或仅当主机为精确的回环地址时才允许使用 <code>http</code>。重定向一律不跟随，响应正文有大小上限。只有包含非空 <code>Bearer</code> 访问令牌的令牌响应才会被接受。机密客户端（条目中包含 <code>client_secret</code>）在每个请求中都使用 HTTP Basic 进行认证；公共客户端则在表单中发送其 <code>client_id</code>。</p>
+<p><code>--browser</code> 在 macOS 和 Linux 上会为你自动打开系统浏览器，并且在所有平台上都会打印登录 URL，以便你在同一台机器的浏览器中手动打开（回调会发送到运行 CLI 的主机上的本地回环端口）。浏览器启动程序与 CLI 的标准流分离运行，因此启动程序自身写到 stdout 的任何内容都无法污染结果：stdout 仍然只输出令牌。</p>
+<p>两个回调适配器（CLI 的回环监听器和网关回调）都会执行 RFC 9207 的 issuer 校验。如果响应中的 <code>iss</code> 参数与发起该流程的 issuer 不匹配，则在处理其中的 <code>code</code> 或 <code>error</code> 之前直接拒绝。如果响应中完全没有 <code>iss</code>，则予以接受，因为该参数是可选的，并非所有 issuer 都会发送它。当代码交换在返回访问令牌的同时返回了 <code>id_token</code>，该 <code>id_token</code> 会被完整校验（包括 issuer、audience、过期时间以及与本次流程绑定的 nonce），校验通过后随即丢弃。只有访问令牌会被提交给守护进程。注册客户端对发现过程本身同样保持怀疑：在使用其中列出的任何端点之前，它会拒绝 <code>issuer</code> 与所配置 issuer 不完全一致（包括末尾斜杠）的 <code>.well-known/openid-configuration</code> 文档（即 RFC 8414 校验），并且会限制所读取文档的大小，从而确保恶意或故障的 issuer 无法将流程重定向到其自选的端点，也无法返回无上限的响应体。</p>
+<p>不持有 IdP 凭据的客户端（Web 仪表盘、zerocode）改为通过网关完成注册，网关使用已配置条目的客户端凭据代理相同的流程：<code>GET /api/oidc/providers</code> 列出别名，<code>POST /api/oidc/{alias}/device/start</code> 和 <code>/device/poll</code> 驱动设备授权流程，<code>GET /oidc/login/{alias}</code> 运行浏览器流程。其一次性回调页面通过 <code>postMessage</code>（仅限同源）将令牌交给打开它的窗口，并提供手动复制的备用方式。网关还会发送 <code>Cross-Origin-Opener-Policy: same-origin</code>，该响应头会在弹窗经由身份提供方跳转后切断 <code>window.opener</code>，因此在当前浏览器中，该页面上的手动复制是目前可用的交接方式，而 <code>postMessage</code> 约定已就位，供仪表盘后续开发使用。这些路由因注册先于认证而必然无需认证，并受速率限制，且不授予任何权限：它们只是转发用户批准后 IdP 所授予的内容。设计原理与故障模式表见仓库中的 <code>docs/security/oidc-browser-pkce-design-8289.md</code>。</p>
+<p>速率限制分层生效。启动流程的请求（<code>POST /api/oidc/{alias}/device/start</code>、<code>GET /oidc/login/{alias}</code> 和 <code>GET /oidc/callback</code>）会计入注册专用的网关暴力破解限制器实例。该实例与错误配对令牌所适用的阈值和锁定机制相同，但使用独立的计数账本，因此被注册阶段锁定的地址仍可进行配对或提交 Webhook 签名，而在这两者上触发的锁定也不会阻止注册。</p>
+<p>只有无效的回调才计为一次尝试：所携带的 <code>state</code> 没有对应的有效流程状态、颁发者不匹配、身份提供方返回错误、缺少授权码、流程进行中别名已被删除，或代码交换失败。成功完成登录的回调不计费，网关因中继容量已满而拒绝的回调同样不计费，这样大量同时登录的用户不会锁定其共享地址。因待处理流程存储已满而被拒绝的浏览器登录同样不计费，原因相同。</p>
+<p>提供方列表、设备轮询和登录启动请求，每个客户端的预算为每分钟 20 次请求。这一额度高于 RFC 8628 规定的五秒最小轮询间隔（每分钟 12 次轮询），留有余量，同时又能防止客户端疯狂轮询。当身份提供方返回 <code>slow_down</code> 或直接拒绝设备码时，该轮询计为一次尝试，因此提交无效设备码的客户端会触发现有锁定机制，而不会无限轮询。网关与身份提供方之间链路上的传输失败与调用方无关，不计入其费用。</p>
+<p>客户端超出预算或处于锁定状态时，会收到 HTTP 429 响应，并附带以秒为单位表示延迟的 <code>Retry-After</code>。zerocode 会至少等待该延迟时长，且不少于 RFC 规定的五秒递增间隔，然后才发起下一次轮询（仍受设备码剩余有效期限制）。无论何种情况，zerocode 的轮询频率都不会超过每五秒一次。</p>
+<p>所有客户端共同进行的对身份提供方的出站中继，同时最多有 16 个在进行中，从而限制网关代所有客户端对身份提供方的访问规模。</p>
+<p>待处理流程存储最多同时容纳 32 个浏览器登录。单个远程客户端最多可占用 8 个名额，因此，一个只发起登录却从不完成的调用方，无法在这些流程存活的十分钟内独占该存储，影响其他人。</p>
+<p>回环地址客户端与其他网关认证限制一样，免除各客户端的预算限制。因此，若反向代理与网关位于同一主机，则必须启用 <code>trust_forwarded_headers</code>，才能使各客户端限制作用于其背后的真实调用方。</p>
+<p>每个注册响应除网关既有的 no-referrer 策略外，还会附加 <code>Cache-Control: no-store</code> 和 <code>Pragma: no-cache</code>，因为设备码和访问令牌都会在这些响应体中传输。</p>
+<p>zerocode 通过同一 API 进行注册，其配置独立于会话连接。<code>[connection.wss] enroll_url</code> 指定网关的 HTTP 源，允许附加可选的路径前缀。除非指向环回地址（<code>127.0.0.1</code>、<code>::1</code> 或 <code>localhost</code>），否则必须使用 <code>https://</code>，因为设备码以及随后的访问令牌都会通过该连接传输。重定向不会被跟随，因此无法在事后引入明文跳转。注册连接使用与 WSS 链路相同的 <code>[connection.wss.tls]</code> 信任材料：配置的 CA、<code>skip_verify</code> 以及双向 TLS 客户端证书。当该材料未对证书进行校验时，zerocode 会在发送设备码之前而不是在令牌到达之后进行询问，并且询问的是注册源本身，它可能不是会话随后连接的守护进程。回答 <code>always</code> 会将该源记录到 <code>skip_verify_routes</code> 中。非交互式运行没有可供询问的对象，因此注册会在此处停止。zerocode 会将每次轮询等待时间限制在设备码的剩余有效期内，并且在设备码过期后不再轮询。对于声明的有效期超过一小时或轮询间隔超过五分钟的情况，它会直接拒绝，而不是对恶意的响应进行休眠等待。若通告的间隔为 <code>0</code> 或 <code>1</code>，则会提升至 RFC 8628 规定的五秒默认值，因此网关的响应不会使 zerocode 进入每秒一次的轮询，那样只会被每客户端配额拒绝。它接收到的令牌仅保存在内存中，且仅限于该会话。</p>
+<h2 id="权限配置文件"><a class="header" href="#权限配置文件">权限配置文件</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>admin</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>授予全部权限。为 true 时，其他所有字段均不生效。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-21"><a class="header" href="#网关仪表板-21">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a>,并设置 <code>permission_profiles.&lt;alias&gt;.admin</code> 字段。</p>
+<h4 id="zerocode-21"><a class="header" href="#zerocode-21">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中设置 <code>permission_profiles.&lt;alias&gt;.admin</code> 字段。</p>
+<h4 id="zeroclaw-config-21"><a class="header" href="#zeroclaw-config-21">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.admin &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-21"><a class="header" href="#环境变量-21">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__admin=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_agents</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Agent 别名：持有此配置文件的用户可以绑定或调用的代理。留空则不授予任何代理；如需授予所有代理，请使用显式的 <code>"*"</code> 条目。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-22"><a class="header" href="#网关仪表板-22">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a>,并设置 <code>permission_profiles.&lt;alias&gt;.allowed_agents</code> 字段。</p>
+<h4 id="zerocode-22"><a class="header" href="#zerocode-22">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>permission_profiles.&lt;alias&gt;.allowed_agents</code> 字段。</p>
+<h4 id="zeroclaw-config-22"><a class="header" href="#zeroclaw-config-22">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.allowed_agents &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-22"><a class="header" href="#环境变量-22">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__allowed_agents=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>可能被持有者的智能体运行的工具名称。空列表表示不授予任何工具；若需广泛访问权限，必须显式包含 <code>"*"</code> 条目。此选择器与粗粒度的 <code>tools = ["execute"]</code> 授权组合使用，而非替代它：若未授予该项，则持有者的会话无论此处列出什么都将无工具可用。（注意：这与风险配置文件中的 allowed_tools 不同，后者中空列表表示不受约束；权限配置文件默认拒绝。智能体自身的风险配置文件策略仍会在此之上生效。）</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-23"><a class="header" href="#网关仪表板-23">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a>,并设置 <code>permission_profiles.&lt;alias&gt;.allowed_tools</code> 字段。</p>
+<h4 id="zerocode-23"><a class="header" href="#zerocode-23">zerocode</a></h4>
+<p>在 <strong>Config</strong> 面板中，设置 <code>permission_profiles.&lt;alias&gt;.allowed_tools</code> 字段。</p>
+<h4 id="zeroclaw-config-23"><a class="header" href="#zeroclaw-config-23">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.allowed_tools &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-23"><a class="header" href="#环境变量-23">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__allowed_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>config_write_paths</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>Dotted config path prefixes holders may write. A trailing <code>.*</code> grants the subtree (e.g. <code>channels.*</code>); a bare path grants that exact prop; <code>"*"</code> grants every path. Empty grants NO paths.</p>
+<p>Wait — the source is English, so I should translate it. Here is the translation:</p>
+<p>持有者可以写入的点分配置路径前缀。以 <code>.*</code> 结尾表示授予整个子树（例如 <code>channels.*</code>）；裸路径表示仅授予该确切属性；<code>"*"</code> 表示授予所有路径。空值表示不授予任何路径。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-24"><a class="header" href="#网关仪表板-24">网关仪表板</a></h4>
+<p>Open <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a> 并设置 <code>permission_profiles.&lt;alias&gt;.config_write_paths</code> 字段。</p>
+<h4 id="zerocode-24"><a class="header" href="#zerocode-24">zerocode</a></h4>
+<p>在 <strong>Config</strong> 面板中，设置 <code>permission_profiles.&lt;alias&gt;.config_write_paths</code> 字段。</p>
+<h4 id="zeroclaw-config-24"><a class="header" href="#zeroclaw-config-24">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.config_write_paths &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-24"><a class="header" href="#环境变量-24">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__config_write_paths=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>grants</code> <span class="cfg-field-meta"><code>map</code> · default <code>{}</code></span></summary>
+<p>资源类授权：针对每种资源类型，允许的操作。资源包括：<code>system</code>、<code>sessions</code>、<code>memory</code>、<code>cron</code>、<code>config</code>、<code>agents</code>、<code>cost</code>、<code>skills</code>、<code>personality</code>、<code>logs</code>、<code>tui</code>、<code>files</code>、<code>locales</code>、<code>quickstart</code>、<code>channels</code>、<code>providers</code>、<code>models</code>、<code>peer_groups</code>、<code>plugins</code>、<code>tools</code>、<code>sops</code>。操作包括：<code>create</code>、<code>read</code>、<code>update</code>、<code>delete</code>、<code>execute</code>。未列出的资源一律拒绝访问。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-25"><a class="header" href="#网关仪表板-25">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/permission_profiles"><code>/config/permission_profiles</code></a>，并设置 <code>permission_profiles.&lt;alias&gt;.grants</code> 字段。</p>
+<h4 id="zerocode-25"><a class="header" href="#zerocode-25">zerocode</a></h4>
+<p>在 <strong>Config</strong> 面板中，设置 <code>permission_profiles.&lt;alias&gt;.grants</code> 字段。</p>
+<h4 id="zeroclaw-config-25"><a class="header" href="#zeroclaw-config-25">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set permission_profiles.&lt;alias&gt;.grants &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-25"><a class="header" href="#环境变量-25">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_permission_profiles__&lt;alias&gt;__grants=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>配置文件默认拒绝访问：未列出的资源会被拒绝，空的选择器列表不授予任何实例，广泛访问需要显式的 <code>"*"</code> 选择器或 <code>admin = true</code>。多个配置文件通过并集合并。对于定时任务、附件、人格文件、按代理的成本查询以及 SOP 编写，<code>allowed_agents = ["*"]</code> 仅覆盖配置中定义的代理，不覆盖请求中指定的任何别名。</p>
+<p>工具选择器在智能体组装时通过交集组合，并在粗粒度授权之上生效：面向模型的工具执行需要授予 <code>tools = ["execute"]</code>，没有该授权的主体将获得一个不带工具的会话，无论其 <code>allowed_tools</code> 中列出什么内容，包括 <code>"*"</code>。在持有该授权的前提下，受限主体创建的会话仅接收其 <code>allowed_tools</code> 所列出的工具（空列表将产生一个不带工具的会话），且仍受智能体自身风险配置所允许范围的约束。排队的提示词被接受后，将通过共享解析器重新检查授权，包括凭证过期和吊销。当前主体选择器会收窄静态工具、延迟搜索注册表、已激活的工具以及固定的 MCP 资源内容（每个固定内容块以其 <code>&lt;server&gt;__&lt;uri&gt;</code> 名称被接纳，一旦选择器不再指定该名称，它就会从后续提示词中撤回）；已移除的工具无法被重新激活。复用的会话会在其下一轮对话之前被收窄，而重新水合的会话则依据当前授权重新构建。智能体选择器会在每轮对话之前以及重新水合之前进行检查。</p>
+<p>收窄权限绝不会向已有的 agent 重新添加工具。扩大授权之后，需要创建一个新会话，以接收扩展后的工具范围。agent 中不会存储新的配置快照，也不会存储独立的主体策略缓存。</p>
+<p>延迟 MCP 指令源自剩余可加载的工具，且仅在暴露 <code>tool_search</code> 时显示。主体若要按需激活，需同时具备 <code>tool_search</code> 和指定的延迟 MCP 工具；该辅助工具绝不会被隐式授予。获准的 <code>mode = "always"</code> MCP 工具会被预激活，无需辅助工具即可保持可调用。</p>
+<p>如果主体的工具选择器或代理选择器中任一受限，则 <code>delegate</code>（有界且独立）、<code>spawn_subagent</code> 和 <code>execute_pipeline</code> 均不可用，包括包装这些工具的技能别名。这些嵌套路径目前尚未同时承载两个当前的主体上限；普通的父轮次仍可正常使用。管理员主体以及两个选择器均设为 <code>"*"</code> 的主体，保留其代理所配置的嵌套能力。</p>
+<p>现有的八参数 Rust 构造函数 <code>Agent::from_live_config_with_tui_env</code> 仍然可用。RPC 使用新增的 <code>from_live_config_with_tui_env_and_principal_tools</code> 构造函数，并在提示词准入时重新应用共享解析器的授权。</p>
+<p>该组合并未覆盖通往 agent 工具的所有途径。Cron 任务和 SOP 编写仅检查 agent 选择器。持有 cron 授权的受限主体可以为其 agent 创建 shell 任务，或为现有的 agent 任务设置新的提示词并触发它；持有 SOP 创建或更新授权的主体可以保存一个流程，其触发器会在之后运行该流程。应将 cron 和 SOP 编写授权视为对 agent 工具的授权。</p>
+<h2 id="破坏性变更远程-wss-需要身份验证"><a class="header" href="#破坏性变更远程-wss-需要身份验证">破坏性变更：远程 WSS 需要身份验证</a></h2>
+<p>从本次变更起，远程 WSS 连接必须在 <code>initialize</code> 中提供 <code>auth_token</code>。不存在未经身份验证的远程回退方案。</p>
+<p>一个启用了 <code>[wss]</code> 的监听器，如果不存在任何可用的凭证路径（既没有 <code>[oidc.&lt;alias&gt;]</code>，也没有已配对的令牌，且 <code>gateway.require_pairing = false</code>），会被配置校验拒绝，因此没有任何受支持的途径能够保存这种配置。已经存在于磁盘上、呈现此形态的配置仍然可以启动：守护进程会正常运行，而该监听器会拒绝所有远程握手。它不会拒绝加载，因为操作人员必须能够启动守护进程，才能修复该配置。</p>
+<p>无效的 <code>[oidc.&lt;alias&gt;]</code>、<code>[users]</code> 或 <code>[permission_profiles]</code> 配置段属于另一种情况。此时授权策略本身无法编译，因此守护进程会安装全部拒绝的接受状态，并记录日志说明其正在这样做，直到修复这些配置段并重新加载为止。在该状态下，所有主体都会被拒绝，无论远程还是本地连接，包括守护进程自身的 uid。因此，修复方法是上文「Recovery」一节所述的磁盘端修复。</p>
+<p>迁移现有远程 zerocode 用户：</p>
+<ol>
+<li>
+<p>与网关配对，以获取 Bearer 令牌。</p>
+</li>
+<li>
+<p>Give zerocode the token, either in its config:</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://daemon.example.com:9443"
+auth_token = "zc_..."
+</code></pre>
+<p>或者通过 <code>ZEROCLAW_AUTH_TOKEN</code> 环境变量进行设置，该变量会覆盖配置文件中的值，并使凭据不必写入文件中。</p>
+<p>或者通过指定包含它的文件：</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://daemon.example.com:9443"
+auth_token_file = "/etc/zeroclaw/zerocode-bearer"
+</code></pre>
+<p>优先级依次为 <code>ZEROCLAW_AUTH_TOKEN</code>、<code>auth_token_file</code>、<code>auth_token</code>。在支持 Unix 权限位的平台上，如果被引用的文件可被其他任何账户读取，则会跳过该文件并发出警告，而不是使用它，随后按该顺序应用下一个来源。在其他平台上，文件的 ACL 是唯一的防护措施。</p>
+<p>环境变量是推荐的方式。如果改为将令牌保存在配置文件中，zerocode 会将该文件设置为仅所有者可访问（<code>0600</code>，位于权限为 <code>0700</code> 的配置目录中），并修复早于此行为生成的文件的权限模式，前提是平台支持 Unix 权限位。在不支持权限位的平台上，目录 ACL 是唯一的保护措施，因此应将该文件视为机密信息。</p>
+</li>
+</ol>
+<p>OIDC 访问令牌的工作方式相同,配置方式为 <code>auth_provider = "oidc.&lt;alias&gt;"</code>。</p>
+<h2 id="网关-http-api"><a class="header" href="#网关-http-api">网关 HTTP API</a></h2>
+<p>网关的配置与引导路由（<code>/api/config*</code>、<code>/api/quickstart/*</code>、<code>/api/channels/bind</code>）在结构上强制执行身份验证：由一个路由层中间件统一守护整个路由组，因此没有任何单独的处理函数需要自行携带（或可能遗漏）鉴权检查。该中间件采用与 RPC 路径相同的主体（principal）模型，并通过相同的提供方注册表和解析器工作：</p>
+<ul>
+<li><strong>paired bearer</strong>（<code>Authorization: Bearer zc_...</code>）会解析为拥有完整权限的共享操作员，与之前的行为一致。拒绝访问时仍保持原有的 401 响应格式。</li>
+<li>使用 <code>X-ZeroClaw-Auth-Provider: oidc.&lt;alias&gt;</code> 请求头提交的 <strong>OIDC bearer</strong> 由该提供方验证，并解析为一个限定范围的主体（principal）。提供方的选择是显式的，与 RPC 握手中的 <code>auth_provider</code> 字段保持一致：被指定提供方的拒绝结果具有最终效力，且在不同提供方之间永不回退。</li>
+<li>CORS 预检请求（<code>OPTIONS</code>）与以往一样无需认证即可通过。除 GET、HEAD、POST、PUT、PATCH 和 DELETE 之外的其他方法均会被拒绝。</li>
+</ul>
+<p>受限主体的 <code>Config</code> 授权分两步执行。路由层按 HTTP 方法设置粗粒度下限：读取操作需要 <code>read</code>，其他操作至少需要 <code>create</code>、<code>update</code> 或 <code>delete</code> 之一，因此只读主体永远无法到达变更类处理器。随后，每个变更类处理器在执行第一个副作用之前，都会授权其<strong>完整写入集合</strong>：该变更将持久化的每个配置路径，按其对配置的影响分类（为新建路径为 <code>create</code>，为删除路径为 <code>delete</code>，其他情况为 <code>update</code>），并与配置档中的 <code>config_write_paths</code> 选择器进行匹配。分类依据的是操作本身，而非 HTTP 方法：通过 <code>POST /api/config/map-key</code> 创建映射键，或通过 <code>PUT</code> 在新别名下隐式创建，都需要 <code>create</code>；JSON Patch 的 <code>remove</code> 和 <code>DELETE /api/config/map-key</code> 需要 <code>delete</code>；重命名需要源路径的 <code>delete</code> 和目标路径的 <code>create</code>；删除或重命名级联改写到其他位置的引用同样属于写入集合。只要有一个成员未获授权，整个变更（包括批量操作或级联操作）就会被拒绝，且不写入任何内容。对于无法预先枚举写入集合的操作（例如文件的 schema 迁移、Quickstart 应用），则必须具备 <code>*</code> 选择器。持久化边界会将即将写入的路径与处理器已授权的路径重新核对，因此处理器无法持久化超出其授权范围的内容。</p>
+<p>策略仅在持久化边界处变更：写入配置的处理程序会将由该配置编译出的授权状态发布为下一个已接受的修订版本，每个请求都会根据当前已接受的快照进行验证和解析。请求路径上不会重新编译策略，因此读取配置后、并发持久化之前发出的请求，永远不会用较旧的策略覆盖较新的策略。对提供方验证设置、成员名册或配置档案的已持久化更改，将在下一个请求时生效。守护进程自身的 RPC 接口维护一份独立的实时配置，并通过网关写入标志触发的重新加载与同一状态保持一致。其他网关接口仍按各自处理程序执行配对检查，将在后续版本中采用该层。</p>
+<h2 id="凭据生命周期"><a class="header" href="#凭据生命周期">凭据生命周期</a></h2>
+<ul>
+<li><strong>过期</strong>会在截止时间结束连接的授权；客户端需使用新的令牌重新初始化。</li>
+<li><strong>内省重新验证</strong>：OIDC 内省身份带有重新验证截止时间；超过该时间后，下一次操作会被拒绝，直到客户端重新初始化（重新初始化会与 IdP 重新核验）。</li>
+<li><strong>配对撤销</strong>会在该连接的下一次操作之前生效。</li>
+<li><strong>日志订阅</strong>：打开的 <code>logs/subscribe</code> 流在每次投递时都会重新检查，并在凭据过期、配对被撤销或其主体失去 <code>Logs:Read</code> 权限后的第一次投递时结束。</li>
+<li><strong>策略变更</strong>：保存配置时，若 <code>[oidc]</code>、<code>[users]</code>、<code>[permission_profiles]</code> 和 security.trust_daemon_uid 保持不变，则所有绑定保持原样。对其中任一项的修改都会发布新策略。原生令牌连接和本地连接会就地依据新策略重新解析，但守护进程不保存 OIDC 承载令牌，因此在客户端重新初始化之前，OIDC 连接的下一次操作会被拒绝。</li>
+<li><code>tui_id</code>/<code>tui_sig</code> 重连机制仅用于保持连续性：它保留 TUI 的注册表身份，但<strong>不</strong>授予任何权限。每次 <code>initialize</code> 都需要重新提交凭证。</li>
+</ul>
+<h2 id="会话隔离"><a class="header" href="#会话隔离">会话隔离</a></h2>
+<p>每个由受限主体创建的会话，都会在运行时存储和磁盘上（聊天后端与 ACP 存储）标记该主体的 ID。受限主体只能看到和操作自己的会话：列表结果会被过滤；读取和修改操作统一返回“未找到或无所有权“的拒绝响应，不会探测会话是否存在；破坏性删除通过以所有者为条件的存储语句执行；进行中的审批请求仅能由其所属会话的所有者处理。此次变更之前创建的会话（或由非受限连接创建的会话）没有所有者：它们对非受限连接保持完全可见，对受限主体则不可见。</p>
+<p>每个已认证的主体都获得 PRIVATE 记忆：其记忆操作读写一个按主体划分的 plane，该 plane 的所有者（owner）会出现在每条存储语句中，并与 agent、namespace 和 tenant 维度组合（同一个 key 在两个 agent 下对应两行记录）。plane 跟随主体的身份，而非管理员旁路：具名管理员的记忆就是其自身的私有 plane，因此提升或降级用户都不会隐藏其笔记，也不会改变其写入的目标。只有未认证的共享操作员默认位于共享 plane 上；持有管理员旁路的调用方可以在 <code>memory/*</code> 请求上显式指定 <code>plane = "shared"</code>，此操作会被审计，而受限范围（scoped）的主体则不能这样做。</p>
+<p>两个平面在两个方向上都互不干扰：共享写入既不能指定私有行的存储键，也不能覆盖私有行；私有写入不会转换共享行；普通导出和 markdown 快照只包含共享行；旧版批量清除也只作用于共享行。私有行则通过携带所有者信息的操作进行导出和清除。</p>
+<p>会话由某个主体（principal）创建时，其内存句柄会在该会话的整个生命周期内绑定到该主体的私有平面，无论之后由谁发起提示。管理员恢复已回收的会话时，同样会在持久所有者的平面上恢复。因此，作用域会话中的内存工具和每轮召回从不访问共享平面。不存在任何授权可以向作用域会话开放共享平面。私有写入与共享写入经过相同的内容扫描和策略检查。启用内存审计后，私有操作会连同完整作用域一并记录审计日志。在尚不支持主体的内存后端（目前包括 markdown、lucid、postgres 和 qdrant）上，私有内存会以明确的拒绝信息失败关闭，而不会静默地取消作用域。对于作用域会话而言，这意味着其内存工具会拒绝执行。</p>
+<h2 id="从-securitynevis-迁移"><a class="header" href="#从-securitynevis-迁移">从 [security.nevis] 迁移</a></h2>
+<p>Nevis IAM 集成已被移除。它从未接入任何认证路径,因此启用它从来不会对任何人进行认证,移除它不会改变任何线上行为。为了让旧的 <code>config.toml</code> 仍能加载,系统仍接受其配置表。守护进程在加载时会丢弃该表中的所有值,记录一条警告并指出替代方案,并在下一次保存时将该表从 <code>config.toml</code> 中删除。无论是完整保存,还是 CLI、仪表盘和 RPC 为单次编辑所使用的增量保存,都是如此。移除操作只影响该表,注释和其他配置段的字节内容保持不变。不会自动进行任何转换:替代方案所需的值(如 audience 和 profile 授权)是旧配置表从未包含的。</p>
+<p><strong>升级前</strong>,请将 <code>config.toml</code> 复制到受保护的位置。升级后每次保存时,都会在写入期间于该文件旁边生成 <code>config.toml.bak</code>,写入持久化完成后再将其删除,因此 <code>.bak</code> 不是长期有效的备份。你自行保留的任何副本仍包含已弃用的配置表,其中若配置了明文 <code>client_secret</code>,也会一并保存,因此应将这些副本视为机密材料;在不再需要时,请在身份提供方(IdP)处吊销 Nevis 客户端凭据。</p>
+<p>Please paste the English strings you want translated, one per field, and I’ll translate each one to zh-CN.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>[security.nevis]</code> 字段</th><th>|Replacement 替换| |-|</th><th>备注</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>无</td><td>存在 <code>[oidc.&lt;alias&gt;]</code> 条目即可启用验证。</td></tr>
+<tr><td><code>instance_url</code>, <code>realm</code></td><td><code>[oidc.&lt;alias&gt;] issuer</code></td><td>IdP 发布的发现文档中所声明的确切颁发者 URL；守护进程会拒绝 <code>issuer</code> 与此不一致的发现文档。</td></tr>
+<tr><td><code>client_id</code></td><td><code>[oidc.&lt;alias&gt;] client_id</code></td><td>|Also used to build the <code>interactive_clients</code> / <code>service_clients</code> lists that classify who is signing in. 同时用于构建 <code>interactive_clients</code> / <code>service_clients</code> 列表，用来区分登录的客户端类型。| |-|</td></tr>
+<tr><td><code>client_secret</code></td><td><code>[oidc.&lt;alias&gt;] client_secret</code></td><td>在启用 <code>[secrets] encrypt</code> 时，该值通过 secret store 加密后存储在磁盘上。<code>validation = "introspection"</code> 以及 <code>client_credentials</code> 服务登录都需要此项。它不会从旧表中复制过来，需要重新设置。</td></tr>
+<tr><td><code>token_validation = "local"</code></td><td><code>validation = "jwks"</code></td><td>JWKS URI 来自颁发者的发现文档。</td></tr>
+<tr><td><code>token_validation = "remote"</code></td><td><code>validation = "introspection"</code></td><td>需要机密客户端。</td></tr>
+<tr><td><code>jwks_url</code></td><td>不支持</td><td>没有自定义 JWKS 覆盖项：密钥集 URI 必须由已配置颁发者的发现文档以 <code>jwks_uri</code> 形式公布。该 URI 可以指向其他端点；未公布的密钥集 URI 无法进行配置。</td></tr>
+<tr><td>(none)</td><td><code>[oidc.&lt;alias&gt;] audience</code></td><td><strong>必填，且为新增项。</strong> 这是身份提供方（IdP）为该守护进程签发的访问令牌中所包含的 <code>aud</code>；此前没有对应的配置项可沿用。</td></tr>
+<tr><td><code>role_mapping[].nevis_role</code></td><td><code>[oidc.&lt;alias&gt;] claim_path</code> + <code>profile_map</code></td><td><code>claim_path</code> 指定承载角色的声明（例如 <code>groups</code>）；每个 <code>profile_map</code> 的键是声明值，每个值是 <code>[permission_profiles.&lt;alias&gt;]</code> 名称。匹配为精确匹配，不再像之前那样不区分大小写。</td></tr>
+<tr><td><code>role_mapping[].zeroclaw_permissions</code>（工具名称，或 <code>"all"</code>）</td><td><code>[permission_profiles.&lt;alias&gt;] allowed_tools</code> + <code>grants.tools = ["execute"]</code></td><td>Profile 默认拒绝访问：<code>allowed_tools</code> 与粗粒度的 <code>tools = ["execute"]</code> 授权组合使用，其他所有资源类别（<code>sessions</code>、<code>config</code>、<code>memory</code> 等）都必须显式授权。<code>"all"</code> 最接近 <code>admin = true</code>，其范围远大于之前的“所有工具”。建议列出具体的资源授权。</td></tr>
+<tr><td><code>role_mapping[].workspace_access</code></td><td>不等价</td><td>没有按工作区授予的权限。最接近的控制项是 <code>allowed_agents</code>，它将配置文件限定为特定的代理别名。</td></tr>
+<tr><td><code>require_mfa</code></td><td><code>[oidc.&lt;alias&gt;] require_mfa</code> 和/或 <code>required_acr</code></td><td></td></tr>
+<tr><td><code>session_timeout_secs</code></td><td><code>max_auth_lifetime_secs</code>（JWKS）/ <code>revalidation_secs</code>（introspection）</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p>在重启之前先进行验证，以免因为拼写错误导致所有人被锁定在外（如果确实发生这种情况，恢复方法请参见 <em>Local connections</em> 下的 <strong>Recovery</strong>）。以下两种途径可以完成验证：</p>
+<ul>
+<li>通过守护进程的 RPC 配置方法（zerocode 的配置编辑器）写入新的 <code>[oidc.&lt;alias&gt;]</code> 和 <code>[permission_profiles]</code> 条目。守护进程会在保存或切换任何内容之前校验授权相关的配置段。如果 <code>profile_map</code> 指向不存在的目标，或缺少 <code>audience</code>，守护进程会拒绝该配置并给出原因，之前的策略保持生效。</li>
+<li>如果你手动编辑了 <code>config.toml</code>，请先从 CLI 运行 <code>ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login &lt;alias&gt;)"</code>。它会加载编辑后的文件，拒绝未通过校验的 <code>[oidc.&lt;alias&gt;]</code> 条目（issuer、audience、校验模式、客户端字段）。成功时，它会使用配置的客户端对 IdP 执行一次真实登录，因此在守护进程基于这些配置重启之前，issuer、客户端 ID 和密钥均已确认有效。该命令只检查条目本身，不检查 <code>profile_map</code> 的目标。如果某个 <code>profile_map</code> 值指向的名称在 <code>[permission_profiles]</code> 中不存在，只有守护进程会发现，随后它会拒绝编译策略，并进入 <strong>Recovery</strong> 中描述的全部拒绝状态。因此，请在重启前人工核对这些名称，或改用 RPC 途径。</li>
+</ul>
+<p>远程连接如果未提供任何凭据，则在所有情况下都会被拒绝；两种途径都不会开启此类连接。</p>
+<p><strong>回滚</strong>属于配置数据操作，而非代码回退：回退二进制文件只能恢复旧的类型，但已从 <code>config.toml</code> 中删除的表不会因此恢复。请放回升级前受保护的副本（或手动重新添加该表）。此次退役不会改变 schema 版本，因此降级后的二进制文件可以直接加载恢复后的文件，无需迁移步骤。</p>
+<h2 id="这一层目前不做的事情暂未实现"><a class="header" href="#这一层目前不做的事情暂未实现">这一层目前不做的事情（暂未实现）</a></h2>
+<p>整合与治理会推导共享平面的数据行，且不会对私有会话运行。针对其他主体私有记忆的管理访问目前尚无可用路径（默认拒绝）。持有 <code>Sops:Read</code> 的主体可通过 <code>sops/runs</code> 和 <code>sops/run-detail</code> 查看每个流程的运行历史，无论这些流程以哪个代理身份运行，这一点与 cron 历史不同。网关 HTTP 路由保留其现有的配对检查，渠道身份不会解析到此主体模型中。</p>
+<p>当 <code>security.trust_daemon_uid = true</code>（默认值）且策略编译通过时，守护进程自身的 uid 在 Unix 套接字上保留完全访问权限。因此，对于没有 <code>[users]</code> 名单、认证配置段有效的单操作员安装，其行为与之前保持一致。</p>
+<p>权限配置文件用于限制主体通过 RPC 可以执行的操作，但它们并不能隔离主体促使智能体运行的代码。会话轮次、定时任务和 SOP 步骤均以守护进程账户身份运行。在 Unix 上，这些代码可以以守护进程的 uid 连接本地套接字：当 <code>security.trust_daemon_uid = true</code>（默认值）时，该 uid 即为共享操作员；否则，它将获得映射到该 uid 的名册条目所拥有的权限。在没有名册的 Windows 上，命名管道会使其成为共享操作员。这些代码还可以编辑 <code>config.toml</code>，守护进程会在下一次重新加载或重启时应用这些修改。设置 <code>security.trust_daemon_uid = false</code> 并不会改变这两种情况。仅将会话、定时任务或 SOP 的执行或编写权限授予您愿意赋予操作员访问权限的主体。只有能够使智能体进程无法访问套接字和 <code>config.toml</code> 的操作系统级约束，才能隔离这些代码。</p>
+<p>有些配置路径本身就带有权限，因此除非 <code>config_write_paths</code> 的授权仅涵盖经过审核的叶子配置项，否则应将其宽泛授权视为运维人员访问权限。例如：</p>
+<ul>
+<li>一个能够写入 <code>permission_profiles</code>、<code>users</code>、<code>oidc</code>、<code>security</code> 或 <code>gateway.paired_tokens</code> 的主体可以授予自己任何权限;</li>
+<li>一个能够写入 <code>agents</code>、<code>risk_profiles</code>、<code>cron</code>、<code>channels</code> 或 provider 设置的主体，可以改变哪些 agent 运行、使用哪些工具，以及它们可以读写的位置；</li>
+<li>能够写入 <code>mcp</code>、<code>mcp_bundles</code> 或 <code>tunnel.custom.start_command</code> 的用户，可以选择由守护进程账户启动的程序。</li>
+</ul>
+<p><code>Config:Update</code> 还会授予 <code>config/reload</code>,它会应用磁盘上 <code>config.toml</code> 中的当前内容。</p>
+<p>zerocode 的远程目录选择器会在守护进程的文件系统根目录处打开。没有运营方授权的主体，只有通过策略允许读取 <code>/</code> 的已启用代理（例如非仅限工作区的代理）才能列出该目录。对于其他此类主体，选择器会在该位置报告拒绝访问，直到其在允许的根目录内打开为止。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../security/model.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../security/autonomy.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../security/model.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../security/autonomy.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

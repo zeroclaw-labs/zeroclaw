@@ -1,0 +1,638 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>CI &amp; Actions - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="每个 workflow 都位于 .github/workflows/。下面的部分按触发方式对它们分组：基于 git 事件自动触发，或通过 workflow_dispatch 和计划执行的由维护者调用/建议性 workflow。">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-be837aa1.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/maintainers/ci-and-actions.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/maintainers/ci-and-actions.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/maintainers/ci-and-actions.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/maintainers/ci-and-actions.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/maintainers/ci-and-actions.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/maintainers/ci-and-actions.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/maintainers/ci-and-actions.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="CI &amp; Actions - ZeroClaw Docs">
+        <meta property="og:description" content="每个 workflow 都位于 .github/workflows/。下面的部分按触发方式对它们分组：基于 git 事件自动触发，或通过 workflow_dispatch 和计划执行的由维护者调用/建议性 workflow。">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/zh-CN/maintainers/ci-and-actions.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="CI &amp; Actions - ZeroClaw Docs">
+        <meta name="twitter:description" content="每个 workflow 都位于 .github/workflows/。下面的部分按触发方式对它们分组：基于 git 事件自动触发，或通过 workflow_dispatch 和计划执行的由维护者调用/建议性 workflow。">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="ci--actions"><a class="header" href="#ci--actions">CI &amp; Actions</a></h1>
+<p>每个 workflow 都位于 <code>.github/workflows/</code>。下面的部分按触发方式对它们分组：基于 git 事件自动触发，或通过 <code>workflow_dispatch</code> 和计划执行的由维护者调用/建议性 workflow。</p>
+<h2 id="自动工作流"><a class="header" href="#自动工作流">自动工作流</a></h2>
+<h3 id="质量门禁ciyml"><a class="header" href="#质量门禁ciyml">质量门禁（<code>ci.yml</code>）</a></h3>
+<p>在每个针对 <code>master</code> 的 PR 以及向 <code>master</code> 的可信推送时触发。包含多个矩阵分支的组合任务：</p>
+<ul>
+<li><strong>fmt</strong>：<code>cargo fmt --all -- --check</code></li>
+<li><strong>history-guard</strong>：获取完整历史记录，并针对 <code>origin/master</code> 检查正在测试的提交；拉取请求使用显式的 <code>github.event.pull_request.head.sha</code>，而受信任的推送和合并队列运行使用 <code>github.sha</code>。该防护及其测试夹具会拒绝空的 <code>git merge-base</code>，防止嫁接出的第二个根提交在合并后导致 <code>git blame</code> 崩溃</li>
+<li><strong>代码检查</strong>：<code>cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings</code>，然后执行 <code>cargo doc --no-deps --workspace --exclude zeroclaw-desktop</code>（通过 <code>.cargo/config.toml</code> 中的 <code>build.rustdocflags</code> 将 rustdoc 警告视为致命错误；排除 desktop 以匹配 <code>xtask build_api</code> / docs-deploy，并避免 lint 运行器上的 GTK/<code>glib-sys</code>），以及注释规范门禁</li>
+<li><strong>build</strong>：为 <code>x86_64-unknown-linux-gnu</code> 和 <code>aarch64-apple-darwin</code> 无条件运行矩阵；当包归属选中其中任一命令时，单独的 <strong>windows-build</strong> 作业会检查 <code>x86_64-pc-windows-msvc</code>。</li>
+<li><strong>check</strong>：对工作区（不含 <code>zeroclaw-desktop</code>）执行两轮启用警告即失败的检查：一轮不启用默认特性；另一轮启用默认特性并附带 <code>--all-targets</code>，这是唯一在默认特性范围内编译测试目标的一轮。全特性范围由 <strong>lint</strong> 负责编译和类型检查，其 clippy 阶段在同一工作区上运行 <code>--features ci-all --all-targets</code>；单独再运行一个全特性的 <code>cargo check</code> 只会重复编译，不会增加覆盖范围。</li>
+<li><strong>check-32bit</strong>：<code>i686-unknown-linux-gnu</code>，不启用任何默认特性</li>
+<li><strong>check-plugin-backends</strong>：由 <code>scripts/ci/plugin_backend_change_filter.sh</code> 选中。在每个执行后端下编译 <code>zeroclaw-plugins</code>，并在 <code>plugins-wasm-cranelift</code> 下运行组件、运行时准入和根 CLI 插件测试。单独的 <code>plugin artifact smoke</code> 任务使用相同的特性构建 <code>zeroclaw</code> 二进制文件，并针对该二进制文件运行 <code>scripts/ci/plugin_artifact_smoke.sh</code>，其使用的软件包来自 <code>scripts/ci/build_plugin_smoke_packages.sh</code>。该冒烟测试接受任意 <code>zeroclaw</code> 二进制文件，使用一次性配置目录和 <code>scripts/ci/plugin_smoke_provider.py</code> 中的脚本化本地提供方，并驱动操作员自己的命令：<code>plugin install</code>、<code>config set</code>，以及执行该工具的一次智能体对话轮次。它检查以下内容：已安装的插件在操作员启用插件系统、开启发现并批准该工具之前保持未使用状态；为不请求这些值的软件包配置的值不会被下发；摘要错误的载荷、非组件的载荷以及属于其他 WIT world 的组件均被拒绝；严格签名模式拒绝未签名、不受信任或被编辑过的软件包，同时运行受信任的软件包。该任务的最后一步以相反的预期运行冒烟测试，并要求其返回为失败检查保留的退出状态。智能体对话轮次还依赖于路径过滤器未选中的 crate，例如 <code>zeroclaw-providers</code>、<code>zeroclaw-tools</code>、<code>zeroclaw-memory</code> 和 <code>zeroclaw-api</code>，因此这些 crate 的故障会首先在合并队列和 <code>master</code> 运行中显现，而该任务在这些运行中始终执行。</li>
+<li><strong>bench</strong>：基准测试编译检查；仅在推送到 <code>master</code>、合并队列运行以及手动触发时运行。PR 会跳过该检查（门禁将跳过视为非致命），因此基准测试的腐化仍可在发布前被发现，同时无需在每个 PR 上消耗编译资源。</li>
+<li><strong>test</strong>：独立的固件协议主机门禁（来自 <code>scripts/ci/firmware_protocol_gate.sh</code>），以及在 Linux 上运行的 <code>cargo nextest run --locked --workspace --exclude zeroclaw-desktop</code>，其中包括配置写入隔离和 Fluent 覆盖率（无裸露面向用户字符串）架构守卫。最后一个信息性步骤使用 <code>--run-ignored only</code> 针对已录制的固件数据，回放网关黄金帧场景（<code>crates/zeroclaw-gateway/tests/golden_frames.rs</code>：WebSocket 聊天、webhook JSON 与 SSE、<code>/api/events</code> 以及 ACP）。该步骤复用本作业的构建产物，将任何偏差以警告形式写入步骤摘要，且从不导致作业失败；在网关通过 RPC 与核心通信之前，它将保持信息性质。</li>
+<li><strong>test-tool-features</strong>：选择启用的 SaaS、编码 CLI 及外部适配器的测试，Cargo <code>default</code> 已不再构建这些内容：在根目录、config、tools、runtime、channels 和 gateway 库测试以及根目录报告模板集成测试上运行 <code>cargo nextest run</code>，并附带 <code>--features tools-compat</code>。<code>lint</code> 会在 <code>ci-all</code> 下编译相同的代码，但不运行任何测试。</li>
+<li><strong>memory-postgres-test</strong>：<code>cargo nextest run --locked -p zeroclaw-memory --features memory-postgres</code>，随后针对临时 PostgreSQL 17 服务运行该 crate 的串行忽略（ignored）验收测试</li>
+<li><strong>parallel-runtime-test</strong>：来自 <code>scripts/ci/parallel_runtime_test_gate.sh</code> 的重复同进程运行时/通道测试，与主测试任务并行运行，适用于相关 PR 路径，并在 <code>master</code> 推送和合并队列运行中无条件执行</li>
+<li><strong>security</strong>：<code>cargo deny check</code></li>
+<li><strong>nix-eval</strong>：评估 NixOS 模块断言（<code>nixos-module-eval</code> flake 检查）</li>
+<li><strong>docs-style</strong>: markdown lint、em-dash 书面语检查，以及通过 <code>scripts/ci/docs_quality_gate.sh</code> 和 <code>scripts/ci/docs_links_gate.sh</code> 进行变更行链接门禁</li>
+</ul>
+<p>Required gate 中的 Linux 任务运行在 Blacksmith 上，唯一例外是依赖内核的 Landlock 检查。编译密集型机器组使用 <code>blacksmith-8vcpu-ubuntu-2404</code>。运行 <code>fmt</code>、变更检测器、仓库守卫、文档和策略门禁、Nix 检查、容器冒烟测试、<code>security</code>、<code>web-permission-tests</code> 以及 <code>gate</code> 聚合器本身的管理性任务组使用 <code>blacksmith-4vcpu-ubuntu-2404</code>。唯一有意保留的 Linux 例外是 <code>test-landlock</code>，它继续运行在 GitHub 托管的 <code>ubuntu-latest</code> 上，因为 Landlock LSM 检查依赖托管内核。Windows 任务所有者恢复使用 <code>blacksmith-8vcpu-windows-2025</code>；macOS 和其他 Windows 任务保留 GitHub 托管的平台运行器。这种拆分是因为 2026-09-14 GitHub 托管运行器分配在整个组织范围内停滞，而 Blacksmith 仍在正常服务。管理性任务迁移后，托管服务中断只会影响平台特定检查，而不会导致整个 required gate 失败。所有任务都直接声明其运行器标签和缓存提供方输入；<code>tests/architecture/ci_runner_labels.rs</code> 会检查 Linux 清单（编译机器组、管理性机器组和托管 Linux 允许列表），以及仅用于恢复的 Windows 运行器和缓存写入方契约。工作任务不等待 <code>fmt</code>，这是有意做出的权衡：格式化失败的 PR 会额外消耗运行器资源。<code>CI Required Gate</code> 仍直接依赖 <code>fmt</code> 并汇总必需结果，因此格式错误仍会阻止合并。通过标签单独触发的建议性 Windows 工作流不在该门禁范围内，其 Linux 选择器也运行在 Blacksmith 4vcpu 类型上。分支保护规则固定使用复合门禁任务。<code>master</code> 推送运行保持相同的质量信号，同时为后续 PR 运行预热可信的 Rust 缓存。</p>
+<p>更改 <code>[workspace.package] version</code> 为稳定版 <code>X.Y.Z</code> 的拉取请求和合并队列条目也会运行 <code>crates-preflight</code>。该任务调用 <code>pub-crates.yml</code>，传入 <code>stage: preflight</code>，不传递任何密钥，并使用编译集群的 runner 标签。<code>crates-preflight-changes</code> 通过 scripts/ci/crates_preflight_trigger.sh 判断是否需要运行。其他所有变更都会跳过这两个任务，而被跳过的任务不会导致门禁失败。由于该任务是没有 <code>runs-on</code> 的可复用工作流调用，tests/architecture/ci_runner_labels.rs 会单独对其进行盘点，并要求其使用编译集群的标签。</p>
+<p>运行器清单同时覆盖 <code>ci.yml</code> 和 <code>windows-tests.yml</code>，并使用带工作流限定的作业标识，确保同名作业不会相互遮蔽。Linux/macOS 的 <code>build</code> 矩阵不等待任何检测器。单独的 Windows 编译、服务和恢复作业则等待 Blacksmith <code>windows-required-changes</code> 检测器。该检测器通过 <code>cargo metadata --locked --offline --no-deps</code> 读取包归属关系，不进行注册表解析或下载。非 Rust 的 <code>path-changes</code> 检测器与此包图保持独立。</p>
+<p>仅针对 <code>master</code> 分支的推送，计算密集型作业（以及用于判断 Windows clippy 和并行运行时作业是否执行的检测器）会先在 <code>master-debounce</code> 中等待五分钟。<code>master</code> 推送常以突发形式到达，而运行级别的 <code>cancel-in-progress</code> 只会在被取代的推送的编译集群已经启动之后才将其取消。加入等待后，在等待窗口内被取代的推送会在那个轻量作业仍处于休眠时就被取消。该作业在拉取请求和合并队列运行中会被跳过，而被跳过的作业无需占用运行器即可直接完成，因此它们的延迟保持不变。由于 GitHub 会通过隐式的 <code>success()</code> 将被跳过的上游作业的状态向下游传播，<code>master-debounce</code> 的每个下游作业都带有显式的 <code>!cancelled()</code> 条件，以及对每个依赖项的结果检查；若某个作业未如此配置，<code>tests/architecture/ci_runner_labels.rs</code> 将失败。<code>CI Required Gate</code> 依赖 <code>master-debounce</code>，因此防抖失败不会在门禁为绿色的同时留下被跳过的编译作业。代价是 master 运行开始编译前会多出五分钟，同时 master 的 Rust 缓存播种也会相应推迟同样的时长。</p>
+<p>Fresh 所需的 CI 通常是 Cargo 实际运行的那些 surface 所共享的证据。对同一 head、target 和 feature set 重新在本地运行相同的 Cargo 命令，只是重复确认，而不是更强的证明。在请求额外的 Cargo 或 Clippy 之前，请将变更的 surface 与当前工作流文件以及 PR 上实际执行的检查进行比较。额外验证应放在所需 gate 不能证明审查对象的地方：</p>
+<ul>
+<li>某个平台收到了编译检查，但没有收到测试；</li>
+<li>平台、crate 或路径位于所需的 lint 作业之外；</li>
+<li>桌面更改没有触发桌面工作流；</li>
+<li>发布目标位于 PR 矩阵之外，仅由 release/manual 工作流覆盖；</li>
+<li>过期、已取消、已跳过或不可用的 CI 不是新的证据。</li>
+</ul>
+<p>当定义或导入受 feature 条件控制时，请将其 <code>cfg</code> 谓词与每个使用方进行比较。验证启用配置和每个相关的禁用配置：启用 feature 的检查可以证明使用方仍能正常工作，而工作区范围的 no-default-features 检查则能捕获会产生警告的不匹配，例如未使用的私有定义或导入。该检查会在不带 <code>--all-targets</code> 的情况下运行 <code>cargo check</code>，因此从不会编译测试目标：一个受普通 <code>test</code> 条件控制、且其唯一调用方都位于某个 feature 后面的辅助函数，反而会由 default-features/all-targets 检查流程捕获。当所需的两个 CI 配置都没有覆盖已更改的谓词时，仍然需要针对性的 feature 组合。</p>
+<p>PostgreSQL 内存任务会在启用 <code>memory-postgres</code> 的情况下运行所有非 ignored 的 <code>zeroclaw-memory</code> 测试，然后将 <code>ZEROCLAW_TEST_POSTGRES_URL</code> 指向其一次性服务，串行运行该 crate 中的 ignored 测试。要在本地复现依赖数据库的那一半测试，请提供一个隔离的 PostgreSQL 数据库，并运行 <code>ZEROCLAW_TEST_POSTGRES_URL=postgres://&lt;user&gt;:&lt;password&gt;@127.0.0.1:5432/&lt;database&gt; cargo test --locked -p zeroclaw-memory --features memory-postgres -- --ignored --test-threads=1</code>。每个验收测试都拥有一个名称唯一的 schema，且只删除该 schema。</p>
+<p>Windows 必需编译仍会自动运行，无需标签，但它只检查命令实际能够编译的代码。在 PR 上，<code>scripts/ci/windows_test_scope.py --required-jobs</code> 会复用包根分类和反向依赖闭包。当受影响的闭包包含 <code>zeroclaw</code> 时，根命令运行；当其包含 <code>zeroclaw-channels</code> 时，voice-wake 命令运行。内部路径依赖边会保守地包括可选依赖、目标特定依赖、构建依赖和开发依赖。仅编辑独立的 ZeroCode 时，不会运行这些无关命令。工作区清单、锁文件、工具链、Cargo 配置、工作流/Action 控制项、未知路径，以及缺失或格式错误的证据，都会选中所有必需的 Windows 作业。主分支推送和合并队列构建始终运行所有这些作业。Linux/macOS 编译仍然无条件执行。</p>
+<p>服务冒烟测试会构建 <code>windows_service_smoke_fixture</code>，该夹具自行管理其模拟守护进程和参数分发。对根 CLI 文件 <code>src/main.rs</code> 的修改不会自动选中它。服务源码、运行时模块接线、夹具与冒烟脚本、config/spawn 依赖以及相关的清单和构建控制项仍保留覆盖范围。任务所有者恢复作业仍保留直接的控制平面和运行时模块接线触发条件。当包清单和构建脚本的反向依赖闭包触及 runtime 时，它们会选中这些原生作业；无关的网关或独立应用清单则不会。恢复用 shell 入口会委托给同一个包选择器，而不是另行维护第二份归属注册表。</p>
+<p>恢复测试在各自的 <code>windows-task-owner-recovery</code> 作业中运行，运行器为 <code>blacksmith-8vcpu-windows-2025</code>。由于其运行时单元测试工具无法复用 <code>cargo check</code> 的输出，该作业与编译并行执行。未被选中的作业会在分配 Windows 运行器之前跳过。<code>CI Required Gate</code> 直接读取检测器以及每个必需的 Windows 作业的结果，拒绝缺失的选择输出，并要求每个被选中的作业都必须成功。被选中但跳过、失败或被取消的作业，不能视为有意跳过。</p>
+<p>Recovery 直接调用固定版本的 <code>Swatinem/rust-cache</code> action，并设置 <code>shared-key: windows-recovery-blacksmith</code>，而不是假定 GitHub 构建运行器的缓存具有兼容的 Rust 环境哈希。只有在 <code>refs/heads/master</code> 上成功的 <code>push</code> 运行才会保存这个专用依赖缓存；PR 和 merge-queue 运行仅恢复该缓存。缓存未命中时会正常构建，并且不会跳过任何测试。默认的工作区产物清理保持启用，因此运行时测试框架仍会编译。这会新增一个消耗仓库存储的缓存命名空间；编译和服务冒烟测试保留其现有的运行器和缓存。</p>
+<h3 id="带标签门控的建议性-windows-测试windows-testsyml"><a class="header" href="#带标签门控的建议性-windows-测试windows-testsyml">带标签门控的建议性 Windows 测试（<code>windows-tests.yml</code>）</a></h3>
+<p>使用 <code>ci:windows</code> 的场景是：在 Windows 上执行测试能够弥补仅编译检查留下的重要缺口。典型情况包括进程或服务生命周期变更、PowerShell 执行、文件系统与路径处理、编码、原生依赖，以及 Windows CI 选择或执行逻辑的变更。它并非每个 Rust PR 的默认标签，也不适用于仅修改文档的变更或与 Windows 无关的 Linux 测试失败。</p>
+<p>给候选版本足够稳定、可以产出有价值的 Windows 验证证据后添加该标签。在以 Windows 为重点的迭代期间，每次更新都需要再次运行时保留该标签；一次性验证完成后，如果后续推送不再需要该覆盖范围，则移除该标签。无需该标签，必需的 Windows 编译仍会自动执行。每晚平台测试是合并后的兜底措施，不能替代变更需要 Windows 专项验证时的合并前执行。</p>
+<p>将 <code>ci:windows</code> 标签添加到以 master 为目标分支的 PR 上，即可选择启用建议性的 Windows 测试。添加该标签会为当前 PR 版本启动工作流。只要标签保持存在，推送（push）和重新打开（reopen）事件都会再次运行该工作流。添加无关标签既不会重新运行测试，也不会取消正在进行的 Windows 运行。移除该标签会停止后续的自动运行，但不会取消已在进行中的运行。该标签是计算成本开关，而非安全审批；GitHub 的 fork 工作流常规审批要求仍然适用。</p>
+<p>该工作流使用普通的只读 <code>pull_request</code> 事件，而非 <code>pull_request_target</code>，并测试该事件冻结的合并 SHA。它没有手动触发器（manual dispatch）。将其与 <code>ci.yml</code> 分开，可使添加标签时仅启动建议性工作流，而不会重新启动必需的 CI。必需的门禁不依赖于这些作业。</p>
+<p>在引用通过结果之前，请先阅读选择器摘要以及 Windows 作业自身的结论和日志。Windows 作业使用了 <code>continue-on-error</code>，因此仅凭工作流显示为绿色的结果，并不能证明其测试已通过。记录所测试的修订版本、所选范围以及任何失败的执行阶段；利用日志区分测试失败与选择或工作流失败。</p>
+<p>Linux 选择器会检查格式，比较 PR 基础 SHA 与已检出的合并修订版本，并生成 Cargo 工作区元数据。它将基线 <code>mode</code>、JSON <code>packages</code>、简要 <code>reason</code> 和 <code>needs_plugin_host</code> 写入作业输出与步骤摘要。该标签仅会启用现有选择器，而不是无条件运行完整测试套件。每夜平台测试仍是合并后自动执行的兜底检查。</p>
+<p><code>skip</code> 表示没有任何已变更路径影响当前工作区测试套件所覆盖的 Rust 编译或测试。<code>scoped</code> 会将 Rust 源码、测试、基准测试、示例以及包内本地清单路径映射到 Cargo 元数据中的包根目录，将该集合沿工作区反向依赖方闭包展开，将根目录 <code>src/</code> 和 <code>tests/</code> 映射到根包，对包名去重，并像现有工作区测试套件一样排除 <code>zeroclaw-desktop</code>。当工作区清单或依赖解析、<code>.cargo</code>、Rust 工具链、CI 或测试基础设施、选择器或工作流、未知路径、存在歧义的元数据以及其他无法安全映射的变更时，选择 <code>full</code>。每一处 <code>Cargo.lock</code> 变更都会选择 <code>full</code>，因为工作区范围的依赖解析可能影响直接变更清单之外的包。对根包、gateway 包或 provider 包的直接变更，以及对插件、运行时、插件配置、WIT、根插件激活、插件后端过滤器、依赖、选择器、选择器契约、<code>ci.yml</code> 或 <code>windows-tests.yml</code> 路径的变更，会设置 <code>needs_plugin_host=true</code>。这些控制文件的规则确保工作流修订会执行其所负责的插件宿主路径。变更路径输入格式错误或不可用时，选择基线 <code>full</code> 且为 true。Cargo 元数据缺失或格式错误时，同样选择基线 <code>full</code> 并设置 <code>needs_plugin_host=true</code>，因为无法安全地确定依赖闭包。</p>
+<p>对于 <code>scoped</code>，Windows 作业会向 <code>cargo nextest</code> 传入显式的 <code>-p</code> 参数；对于 <code>full</code>，则运行 <code>cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop</code>。当 <code>needs_plugin_host=true</code> 时，该作业会安装 <code>wasm32-wasip2</code>，并追加以下内容：启用了功能特性的 <code>zeroclaw-plugins</code> 组件目标，即 <code>channel_plugin_e2e</code>、<code>tool_plugin_timeout_e2e</code>、<code>reference_plugin</code>、<code>reference_plugin_e2e</code> 和 <code>tool_plugin_e2e</code>；插件库测试；运行时实时配置与准入回归测试；网关库测试；根 CLI 插件测试，包括插件注册表客户端、<code>plugins::</code> 模块（其中含 egress ceremony 的 Windows shell 证明）、CLI egress ceremony 测试，以及根二进制文件中的 <code>plugin update</code> 测试；运行真实二进制文件的 <code>plugin_update_cli</code> 和 <code>plugin_info_cli</code> 组件测试；以及根目录下的 <code>plugin_channel_runtime_e2e</code> 和 <code>channel_egress_e2e</code> 目标。每个追加的调用即使前面的调用失败也会运行，摘要会保留各阶段状态以及失败清单。该作业分别报告基线、插件宿主和总耗时。普通的 <code>scoped</code> 和 <code>full</code> 选择不会承担插件宿主的编译成本。此 PR 工作流会恢复兼容的 <code>platform-test</code> 缓存条目，但从不保存它们。它检出冻结的 PR 合并 SHA，且不会持久化检出凭据。被跳过的 Windows 作业是有意为之的，并会与选择器结果一同明确显示。</p>
+<h3 id="定期平台测试-platform-testsyml"><a class="header" href="#定期平台测试-platform-testsyml">定期平台测试 (<code>platform-tests.yml</code>)</a></h3>
+<p>在 <code>macos-15</code> 和 <code>windows-latest</code> 上运行 <code>cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast</code>，运行前会先执行一次成本较低的 Linux 格式检查。这次每晚运行的全工作区测试是基于标签选择的 Windows 测试覆盖的兜底，并通过 <code>--no-fail-fast</code> 汇总所有失败项。矩阵运行如下：</p>
+<ul>
+<li>修改 <code>platform-tests.yml</code> 本身的拉取请求；</li>
+<li>手动调度；以及</li>
+<li>每晚 03:17 UTC 的计划。</li>
+</ul>
+<p>这些 job 使用 <code>continue-on-error</code>，且不参与 <code>CI Required Gate</code>。它们是可移植性验证证据，而不是合并要求。普通代码 PR 不会自动启动这套完整矩阵；维护者可以在需要完整平台验证时，针对某个分支手动触发它。该工作流不会在普通 <code>push</code> 或 <code>merge_group</code> 事件中运行。<code>master</code> 上的每夜运行和手动触发运行可以写入受信任的缓存；拉取请求运行则不能。<code>--no-fail-fast</code> 可确保在一次运行中显示所有平台的失败情况。</p>
+<h3 id="每日顾问扫描-daily-audityml"><a class="header" href="#每日顾问扫描-daily-audityml">每日顾问扫描 (<code>daily-audit.yml</code>)</a></h3>
+<p>每日 UTC 时间 09:00 针对依赖树运行 <code>cargo deny check advisories</code>。发现问题时创建 issue。除非报告漏洞，否则不执行任何操作。</p>
+<h3 id="每日-npm-审计-daily-npm-audityml"><a class="header" href="#每日-npm-审计-daily-npm-audityml">每日 npm 审计 (<code>daily-npm-audit.yml</code>)</a></h3>
+<p>每天在 09:23 UTC 对 <code>web/package-lock.json</code> 运行 <code>npm audit --audit-level=high</code>。当高严重性 npm 安全公告影响已提交的 web 锁定文件时，打开一个去重的 <code>security</code> + <code>dependencies</code> 问题。</p>
+<h3 id="每周-trivy-镜像扫描-trivy-scheduledyml"><a class="header" href="#每周-trivy-镜像扫描-trivy-scheduledyml">每周 Trivy 镜像扫描 (<code>trivy-scheduled.yml</code>)</a></h3>
+<p>每周六扫描已发布的 <code>dist</code> 和 <code>default-features</code> GHCR 镜像，并将 HIGH/CRITICAL 发现项以 SARIF 形式上传到 Security 选项卡。扫描以报告优先（针对发现项设置 <code>exit-code: 0</code>），但如果预期镜像缺失，则会在 Trivy 设置之前使作业失败，并在错误中指出缺失的标签以及所属的发布者工作流。</p>
+<h3 id="每周-scoop-bucket-canary-scoop-bucket-canaryyml"><a class="header" href="#每周-scoop-bucket-canary-scoop-bucket-canaryyml">每周 Scoop Bucket Canary (<code>scoop-bucket-canary.yml</code>)</a></h3>
+<p>每周一针对当前稳定版本演练 Scoop 发布路径。它会解析最新的 <code>vX.Y.Z</code> 标签，并使用 <code>dry_run: true</code> 和 <code>credential_canary: true</code> 调用 <code>pub-scoop.yml</code>，因此会使用真实的 <code>SCOOP_BUCKET_TOKEN</code> 针对真实存储桶执行测试，而不会写入任何内容。</p>
+<p><code>credential_canary</code> 是该契约中“失败关闭”的部分：缺少 <code>SCOOP_BUCKET_REPO</code> 或 <code>SCOOP_BUCKET_TOKEN</code> 会导致运行失败，并且配置的凭据必须传递到 <code>git push --dry-run</code> 授权探测。仅使用 <code>dry_run: true</code> 的通用手动 <code>pub-scoop.yml</code> 运行在清单生成方面仍然是宽松的，并且在凭据不可用时可能会跳过该探测；不要将通用模式用作凭据验证的依据。</p>
+<p>之所以存在这一机制，是因为 <code>SCOOP_BUCKET_TOKEN</code> 与账户绑定：它会过期，并且当所属身份在存储桶上的协作者授权发生变化时，会悄无声息地失去写入权限。这两种情况都发生过。在 canary 之前，唯一会实际使用该凭据的是发布后的 <code>scoop</code> 作业，因此直到版本已经定稿并发布公告之后，才发现令牌已失效，而存储桶只能手动更新。</p>
+<p>金丝雀用于检测凭据失效。它有意不负责确保存储桶状态正确，也未接入 Release Stable：失效的包管理器凭据绝不能阻塞或延迟发布。</p>
+<h4 id="scoop-bucket-如何保持正确性"><a class="header" href="#scoop-bucket-如何保持正确性">Scoop bucket 如何保持正确性</a></h4>
+<p>目前，发布器是唯一的自动化写入者：</p>
+<ol>
+<li><strong><code>pub-scoop.yml</code> 在发布时推送。</strong> Scoop 用户在此操作成功后会立即看到新版本。它需要跨仓库的 <code>SCOOP_BUCKET_TOKEN</code>，这是最容易出问题的部分。</li>
+<li><strong>维护者恢复失败的推送。</strong> 轮换或修复令牌，调度 Scoop Bucket Canary 通过故障关闭的 <code>credential_canary</code> 路径对其进行验证，使用 <code>dry_run: false</code> 重新运行发布器，并确认 bucket 清单已写入发布版本。</li>
+</ol>
+<p><a href="https://github.com/zeroclaw-labs/scoop-zeroclaw/pull/1">scoop-zeroclaw#1</a> 中提出了由 bucket 侧 Excavator 执行的方案。该工作流合并后，bucket 仓库授予 Actions 读写工作流的权限，并且维护者的冒烟测试证明它能够提交更新后，它就可以成为不依赖凭据的恢复层。在满足这三个条件之前，不要假定失败的发布器会自动自愈。</p>
+<p><code>checkver</code> 和 <code>autoupdate</code> 块对于计划中的 Excavator 路径已经不可或缺。当前的推送路径还使用 <code>scripts/release/scoop_metadata.sh</code> 从 <code>autoupdate</code> 推导其发布 URL 模板，因此两条路径共用同一个清单契约。不要删除这些块，也不要手动将其从 <code>dist/scoop/zeroclaw.json</code> 中移除。</p>
+<h3 id="pr-路径标签器-pr-path-labeleryml"><a class="header" href="#pr-路径标签器-pr-path-labeleryml">PR 路径标签器 (<code>pr-path-labeler.yml</code>)</a></h3>
+<p>根据更改的文件自动应用路径和范围标签。它会在 PR 打开、重新打开以及每次向 PR 分支推送更新时运行。由于启用了 <code>sync-labels: true</code>，<code>.github/labeler.yml</code> 中定义的标签会根据当前 PR 文件集重新计算。</p>
+<p>该工作流不会应用 <code>risk:*</code>、<code>size:*</code>、<code>type:*</code>、贡献者等级、状态、解决结果、stale 或 pickup 标签。如果 PR 缺少路径/范围标签，请检查 <code>.github/labeler.yml</code> 中的路径是否覆盖了这些变更。</p>
+<p>Dependabot 在 <code>.github/dependabot.yml</code> 中为其自身的 PR 提供了单独的标签配置。Cargo 更新 PR 以 <code>dependencies</code> 开头；GitHub Actions 和 Docker 更新 PR 以 <code>ci</code> 和 <code>dependencies</code> 开头。</p>
+<h3 id="pr-大小标签器-pr-size-labeleryml"><a class="header" href="#pr-大小标签器-pr-size-labeleryml">PR 大小标签器 (<code>pr-size-labeler.yml</code>)</a></h3>
+<p>应用来自 PR 文件元数据的唯一一个规范 <code>size:*</code> 标签。它会在 PR 打开、重新打开以及每次推送到 PR 分支的更新时运行。分类器会先排除类文档文件和 <code>Cargo.lock</code>，然后统计新增行数加删除行数，并依据 <a href="./labels.html#size-labels">Labels</a> 中的阈值表应用标签。</p>
+<p>该工作流在 <code>pull_request_target</code> 中运行，以便能够为来自分支（fork）的 PR 写入标签，但它从可信的工作流/默认分支版本中获取分类器脚本。它不会检出、构建、导入、加载（source）或执行 PR 中的代码。它也不会应用 <code>risk:*</code>、<code>type:*</code>、贡献者等级、状态、解决结果、stale、pickup 或 ProjectV2 字段。</p>
+<h3 id="pr-风险报告pr-risk-labeleryml"><a class="header" href="#pr-风险报告pr-risk-labeleryml">PR 风险报告（<code>pr-risk-labeler.yml</code>）</a></h3>
+<p>在 PR 更新和 risk/security 标签变更时通过 <code>pull_request_target</code> 运行，并支持针对单个 PR 的手动触发。它从可信工作流版本中获取分类器和与 JSON 兼容的策略，仅在 #9530 仅测试证明需要时读取 PR 元数据、变更文件、标签以及 API 源文本，并生成可供人阅读的步骤摘要和 JSON 证据。它从不检出、构建、导入、加载（source）或执行拉取请求中的代码。</p>
+<p>第二阶段仅用于报告。该工作流具有 <code>contents: read</code> 和 <code>pull-requests: read</code> 权限，不会添加、移除或替换标签，不会创建提交状态，不会强制执行审批人数，也不要求仓库规则集。<code>risk:manual</code> 被报告为未来变更的硬性冻结，而 <code>domain:security</code> 则独立于建议的 <code>risk:*</code> 结果进行报告。</p>
+<p>分类器对不确定的证据默认向上升级。文档、测试夹具和已知的机械性元数据可以标记为 <code>risk:low</code>；常规行为变更标记为 <code>risk:medium</code>；涉及已配置的信任、凭据、兼容性、治理、发布权限、安全或工具链基线路径的变更标记为 <code>risk:high</code>。已签入的策略还包含确定性的变更行升级规则，涵盖工作流权限扩展、密钥访问、OIDC、制品发布、发布行为、提升权限的 <code>pull_request_target</code>、工具链安装或容器基线、发布基线变更，以及可能的 WIT 契约。如果上述内容敏感文件发生变更，但补丁不可用或格式错误，报告保持 <code>risk:high</code>，而不是猜测为 <code>risk:medium</code>。#9530 例外情况仅当完整的 Rust 补丁以及匹配的基线/目标源码证明所有高风险 Rust 变更都位于现有的 <code>#[cfg(test)]</code> 代码内时，才可以推荐 <code>risk:medium</code>；缺失、截断、格式错误、混合、条件编译、重命名、新增和删除等证据，均保持 <code>risk:high</code>。</p>
+<h3 id="项目仪表板规划器project-dashboard-planyml"><a class="header" href="#项目仪表板规划器project-dashboard-planyml">项目仪表板规划器（<code>project-dashboard-plan.yml</code>）</a></h3>
+<p>手动运行以处理单个 issue 编号。它会读取 issue 状态和标签，然后写入一条仅供报告的步骤摘要，建议最符合该 issue 的现有 Project Status 值。</p>
+<p>该工作流不会在 issue 事件上自动运行，不会写入 ProjectV2 字段、编辑 issue、添加标签、发表评论，也不会重新计算 PR 的 <code>risk:*</code> 或 <code>type:*</code> 标签。若要进行实时 ProjectV2 变更或自动化的 issue 事件规划，需要单独获批的字段映射、触发策略以及项目范围的凭据。</p>
+<h3 id="验证-pr-标题pr-titleyml"><a class="header" href="#验证-pr-标题pr-titleyml">验证 PR 标题（<code>pr-title.yml</code>）</a></h3>
+<p>在每次 PR 打开/编辑/同步时运行。运行验证器单元测试（<code>scripts/check-pr-title.test.sh</code>），并依据 Conventional Commits 检查 PR 标题（<code>scripts/check-pr-title.sh</code>）。</p>
+<h3 id="将-mdbook-文档部署到-pagesdocs-deployyml"><a class="header" href="#将-mdbook-文档部署到-pagesdocs-deployyml">将 mdBook 文档部署到 Pages（<code>docs-deploy.yml</code>）</a></h3>
+<p>在标签推送时触发（以及 <code>workflow_dispatch</code>）；构建并将带版本的文档发布到 <code>gh-pages</code> 分支。有关版本下限和引导规则，请参阅 <a href="./release-runbook.html#step-7-versioned-documentation-deployment">发布操作手册 → 版本化文档部署</a>。</p>
+<h3 id="docker-镜像-pr-检查docker-image-pryml"><a class="header" href="#docker-镜像-pr-检查docker-image-pryml">Docker 镜像 PR 检查（<code>docker-image-pr.yml</code>）</a></h3>
+<p>仅当 Docker 镜像、Compose 或发布 Docker 上下文文件发生变更时运行。它会校验合并后的默认与 Alpine Compose 配置。对于超出仅修改 Compose 的变更，它会构建默认和 Debian 预构建冒烟测试镜像以及源 Dockerfile，但不推送。若唯一的 Docker 路径变更是 <code>release-stable-manual.yml</code>，则只构建预构建冒烟测试镜像。发布工作流的 Docker 任务会通过 <code>scripts/ci/prepare_docker_context.sh</code> 打包预构建二进制文件，这些镜像正是用于验证它们，且该任务从不使用源 Dockerfile。如果差异还涉及任何源镜像输入（Dockerfile、Containerfile、Compose 文件、<code>.dockerignore</code>、配置模板、Docker 上下文脚本或本工作流），则仍会构建完整的源镜像矩阵。默认和 Alpine 源镜像面向 <code>linux/amd64</code> 与 <code>linux/arm64</code> 构建，Debian 源镜像面向 <code>linux/amd64</code> 构建。独立的 Alpine 和 Debian <code>linux/amd64</code> 通道会启用 <code>plugins-wasm-runtime-only</code>，使其构建上下文持续验证仓库的 WIT 契约可供启用插件的源码构建使用。</p>
+<p>所有功能的 <code>Containerfile</code> 源镜像在该文件或 Docker 工作流变更时，为 <code>linux/amd64</code> 构建。它使用隔离的缓存作用域，且既不加载也不推送。Alpine amd64 通道会运行两个二进制文件，通过合并后的 Compose 配置启动已构建的镜像，并检查网关健康状态和仪表板界面。Alpine arm64 通道仅覆盖编译和镜像组装。它在 <code>blacksmith-8vcpu-ubuntu-2404</code> 上进行交叉构建，该环境属于现有的 32 GB 大内存 Rust 运行器类别，因为其 release 链接阶段在 <code>ubuntu-latest</code> 上耗尽了内存。其他 Docker 作业仍在 <code>ubuntu-latest</code> 上运行；release 优化、构建标志和矩阵规模保持不变。仅涉及 Compose 的变更使用精简的 Alpine amd64 矩阵，以便仍然验证运行时契约，而无需重建无关镜像。所有作业均只具有仓库的只读权限，且没有镜像仓库写入权限。</p>
+<h3 id="docker-发布docker-publishyml"><a class="header" href="#docker-发布docker-publishyml">Docker 发布（<code>docker-publish.yml</code>）</a></h3>
+<p>构建、签名并扫描从 <code>dev/ci/docker-tags.toml</code> 生成的四变体矩阵：<code>minimal</code>、<code>default-features</code>、<code>dist</code> 和 <code>all-features</code>。人工创建的 <code>v*</code> 标签会直接启动此工作流。通过 <code>workflow_dispatch</code> 启动的稳定版发布会使用 <code>GITHUB_TOKEN</code> 创建其标签，而这不会触发另一个标签推送事件，因此在规范发布和 Docker 作业成功后，<code>release-stable-manual.yml</code> 会在不可变的发布标签处同步调用 Docker Publish。</p>
+<p>此矩阵是对稳定版本预构建的 <code>latest</code>、版本化及 <code>debian</code> 镜像的补充，而非替代。两条路径使用不同的构建输入并发布不同的标签。</p>
+<h3 id="discord-发布discord-releaseyml"><a class="header" href="#discord-发布discord-releaseyml">Discord 发布（<code>discord-release.yml</code>）</a></h3>
+<p>在稳定版发布成功后触发。将发布说明发布到社区 Discord。</p>
+<h3 id="推文发布-tweet-releaseyml"><a class="header" href="#推文发布-tweet-releaseyml">推文发布 (<code>tweet-release.yml</code>)</a></h3>
+<p>在稳定版发布成功后触发。发布一条公告推文。</p>
+<h3 id="每周-aur-新鲜度检查-aur-freshness-checkyml"><a class="header" href="#每周-aur-新鲜度检查-aur-freshness-checkyml">每周 AUR 新鲜度检查 (<code>aur-freshness-check.yml</code>)</a></h3>
+<p>每周一将已发布的 <code>zeroclawlabs</code> AUR 版本与当前稳定版 GitHub 发布版本进行比较，如果 AUR 版本落后则失败。</p>
+<p>发布到 AUR 是一种即发即忘的操作：如果 <code>pub-aur.yml</code> 失败，就不会有任何机制重新检查，因此软件包会悄无声息地落后。v0.8.4 之后发生的正是这种情况。<code>aur.archlinux.org</code> 的维护窗口与发布重叠，唯一一次未重试的克隆操作因 <code>The AUR is down due to maintenance</code> 而失败，软件包在没有任何信号的情况下落后三周。现在，发布器最多允许一个活动中的非试运行发布，并会进行重试以应对短暂中断；在同一并发组中，GitHub 可能会取代较早排队的真实发布，而试运行使用单独的组。每次尝试都会重新克隆权威的软件包状态，并拒绝用较旧的 <code>epoch:pkgver-pkgrel</code> 元组替换较新的元组。重试预算仍无法覆盖所有失败，因此此检查就是后备保障，可将无声遗漏或被取代的运行转化为可见的问题。</p>
+<p>如果无法访问 AUR RPC，检查会发出警告并通过，而不是失败。AUR 中断属于上游可用性问题，而不是软件包过时问题，下次计划运行时会重新检查。过时状态是持久的，因此延迟检测可以接受；但每周因他人的维护窗口而触发告警则不可接受。</p>
+<p>文档在发布流水线中构建和发布，而非每次推送 <code>master</code> 时构建。翻译是一个仅限本地的工作流，适用于专用翻译缓存 PR、新语言区域及发布翻译流程。常规英文文档 PR 可以推迟大范围生成的 <code>.po</code> 变更。贡献者指南请参阅 <a href="./docs-and-translations.html">Docs &amp; Translations</a>，发布流程请参阅 <a href="./release-runbook.html#refresh-and-pin-translations">Release Runbook</a>。</p>
+<h2 id="手动和建议性工作流"><a class="header" href="#手动和建议性工作流">手动和建议性工作流</a></h2>
+<h3 id="每月过期扫描monthly-outdatedyml"><a class="header" href="#每月过期扫描monthly-outdatedyml">每月过期扫描（<code>monthly-outdated.yml</code>）</a></h3>
+<p>每月 1 日 09:00 UTC 定时扫描。对所有工作区成员运行 <code>cargo outdated --workspace</code>。当发现过期依赖时，创建一个带有 <code>dependencies</code>-标签的 issue。权限：<code>contents: read</code> + <code>issues: write</code>。去重保护可在前一个 issue 仍然打开时防止重复累积。</p>
+<p>The issue 预览可能被截断，但其关联的 <code>monthly-outdated-report</code> 工件会保留完整的扫描输出 30 天。</p>
+<p>新问题的第一步分诊：检查所报告的过期 crates 是否存在与 semver 不兼容的版本跳变，以及下游 crate 的 API 是否发生了变化。如果版本跳变是琐碎的（patch/minor），则创建一个简短的仅依赖项 PR。如果升级因 semver 破坏而受阻，则关闭该问题，并附上一条说明和阻塞的 crate 名称。</p>
+<h3 id="跨平台构建cross-platform-build-manualyml"><a class="header" href="#跨平台构建cross-platform-build-manualyml">跨平台构建（<code>cross-platform-build-manual.yml</code>）</a></h3>
+<p>用于手动触发构建覆盖完整目标矩阵的发布二进制文件：Linux x86_64/aarch64 GNU 和 MUSL，以及 armv7 和 arm 硬浮点，macOS Intel/ARM、Windows x86_64，以及 <code>aarch64-linux-android</code>（使用 NDK 构建）。在打标签之前，使用此功能验证分支能否在非 Linux 目标上顺利编译。</p>
+<p>每次调度还会独立于构建运行一个小型发布工具冒烟测试矩阵。当只需要此项验证时，设置 <code>release_tools_only</code>；随后会跳过 web 和 release-build 作业。在受信任的 GitHub 托管 Linux x86_64 上，冒烟测试安装固定版本的 <code>cross</code> 归档，确认 <code>cross</code> 和 <code>cross-util</code> 均可用，并记录 <code>cross --version</code>。在受信任的 GitHub 托管 Windows x86_64 上，它使用与稳定版发布工作流相同的 Rust 版本和 Bash 到 Cargo 的路径形式，然后记录 <code>cargo-tauri.exe --version</code> 和 <code>cargo tauri --version</code>。每个执行分支都会在公开作业摘要中记录确切的测试提交和运行器架构。冒烟测试使用只读仓库权限，并且没有发布作业、环境、机密或制品上传。</p>
+<p>MUSL 构建任务也会通过 <code>scripts/ci/install_release_tool.sh</code> 安装 <code>cross</code>；该脚本会下载精确锁定的上游发布资源，并在安装前验证其 SHA-256。必需的 Repository Structure 作业会测试受支持的 runner 到资源的映射以及冒烟工作流契约，且不会发起网络调用。</p>
+<p>默认的 <code>qualification_profile: normal</code> 保留完整矩阵、<code>dist-broad</code> 原始二进制冒烟测试路线、标准 <code>dist</code> 归档路线、常规缓存策略，以及现有的 ARM64 内存生命周期和 macOS 180 分钟时限上限。其五个任务在任务作用域内保留 CARGO_INCREMENTAL=0。发布工具冒烟测试会在安装工具之前校验调度输入；常规产品任务则保持其独立的调度。</p>
+<p>选择 <code>qualification_profile: stable-gnu-ubuntu22</code>、<code>distribution: dist</code> 和 <code>release_tools_only: false</code>，以执行有限、不发布的资格鉴定。空值、未知值、格式错误、宽泛分发版或仅工具的组合都会被拒绝。四个 GNU 构建行运行在 Ubuntu22 上：x86_64、aarch64、armv7 和 arm。它们调用与 Stable 相同的本地 <code>build-release-payloads</code> 操作，并保留其现有的链接器和 ARMv6 绑定、Rust1.98、锁定的 release 配置文件、显式规范 features、普通 Cargo 作业、每行三个载荷、90 分钟上限，以及含边界的 83,886,080 字节主二进制文件大小上限。只有鉴定器会启用该操作的 features 输出；其清单仅消费这一个解析结果。Stable 保持证据开关关闭。</p>
+<p>独立的 web 和 fixture 生产者沿用现有入口点与 Stable 工具链配置。这三个构建角色直接调用固定版本的 Swatinem action，并使用原始的 <code>web</code>、<code>plugin-smoke-packages</code> 和 <code>build</code> 共享键。fixture 前缀以及每个 Ubuntu22 目标前缀均与 Stable 保持一致，默认的 target 恢复功能保持启用。每个限定缓存都使用 <code>save-if: false</code>，即使在 master 分支上也是如此。这些角色省略了 workflow/job 级别的 <code>CARGO_INCREMENTAL</code> 声明，与 Stable 保持一致。固定版本的缓存 action 会在构造缓存配置之前导出 <code>CARGO_INCREMENTAL=0</code>，并将该值保留到后续步骤中。生产者回执要求并记录有效字符串 <code>"0"</code>，完整性检查也校验同一个值。保留 action 导出的该值。常规 web 缓存策略保持不变。在接受缓存一致性之前，action 日志必须提供实际的主键、恢复键、命中情况和缓存来源。这些输入既不保证预热缓存，也不保证之后的 Stable 构建耗时。</p>
+<p>两个原生消费者分别运行 Ubuntu22 上的 x86 GNU 和 Ubuntu24-arm 上的 ARM64 GNU，各自有 30 分钟的时长上限。每个消费者都会校验并解压同一次运行生成的归档，在五分钟内运行完整的详细模式脚本化 provider 测试套件，并无条件调用感知归档的插件冒烟测试。不存在原始文件回退方案。被选定的完整性检查任务即使在上游失败后仍会运行，并会拒绝每个缺失、跳过、失败或已取消的角色。它使用未修改的校验器检查四个归档，检查十二个输入哈希及其保存的 ELF、编译器/sysroot 和资源观测结果，并检查两个原生证据载体。源提交、树、运行、尝试、profile、web 和 fixture 的哈希将这些回执绑定到同一次分发。</p>
+<p>在接受此路线之前，须保留实际的缓存回执，解读全部十二项 ABI 观测结果，并检查每个原生载体（carrier）所指定的十三项 provider 测试和十八项归档控制项。仅有成功的作业或载体清单，不能替代这些结果或维护者审查。证据缺失或无法解读时，应暂缓接受；这不授权自动进行预算、资源、功能或 ABI 策略的变更。Ubuntu24 ARM64 的执行结果不能作为 Ubuntu22 ARM64 运行时证明。ARM32、配套执行、Darwin、MUSL、Android、Windows、Stable 的完整矩阵以及发布就绪状态，各自都需要独立的证据。仅有源代码变更，不能证明上述任何运行时结果。</p>
+<h3 id="跨平台-clippy-cross-platform-clippyyml"><a class="header" href="#跨平台-clippy-cross-platform-clippyyml">跨平台 Clippy (<code>cross-platform-clippy.yml</code>)</a></h3>
+<p>在 macOS aarch64 和 Windows x86_64 目标上的手动及每周定时建议性 lint 覆盖。它镜像了所需的 PR lint 命令，并为每个平台设置了 <code>--target</code>，但故意不在 PR 上运行，也不属于 <code>CI Required Gate</code>。</p>
+<p>必需的 Linux Clippy、建议性的跨平台 Clippy 以及针对性的 Windows Clippy 都调用 <code>scripts/ci/run_clippy.sh</code>。该运行器负责支持的命令形式、Cargo 退出状态的传递，以及共享的耗时、缓存、编译次数和下载次数诊断信息。工作流文件继续负责触发器、运行器、工具链、缓存、超时设置以及必需门禁的纳入。</p>
+<h3 id="发布稳定版release-stable-manualyml"><a class="header" href="#发布稳定版release-stable-manualyml">发布稳定版（<code>release-stable-manual.yml</code>）</a></h3>
+<p>手动触发完整发布流水线。构建所有目标，创建 GitHub Release，将预构建的 <code>latest</code>、带版本号的以及 <code>debian</code> Docker 镜像推送到 GHCR，针对发布标签调用生成的 Docker 变体矩阵，触发网站重新部署，并调用分发子工作流（Scoop、AUR、Discord、tweet）。Homebrew Core 通过其自身的 autobump 服务检测新发布版本。两个环境关卡需要维护者在运行过程中批准：<code>github-releases</code>（<code>publish</code> 作业）和 <code>docker</code>。</p>
+<p>可下载的资源使用 GitHub 托管的 Build Level 2 证明。离线捆绑包和受信任根材料随附在一个验证归档文件中，两种 SBOM 格式在创建发行版之前都会进行校验和计算和证明。Cosign 仅限用于 GHCR 镜像签名。</p>
+<p>每个 64 位归档（实验性 Android 归档除外）都包含 WASM 插件宿主。派发的发布在创建 GitHub Release 及其自身的镜像推送之前会先验证这一点：<code>plugin-smoke-packages</code> 在 Linux 上一次性构建夹具插件包，<code>plugin-smoke</code> 则在与归档平台一致的 runner 上分别下载每个归档，并针对打包后的二进制文件运行 <code>scripts/ci/plugin_artifact_smoke.sh</code>（与拉取请求上 <code>check-plugin-backends</code> 冒烟任务运行的是同一个脚本）。<code>publish</code> 和 <code>docker</code> 会等待所有任务完成。一个 xtask 测试确保任务列表与注册表中各目标的插件策略保持一致，因此某个目标不能在没有对应任务的情况下携带宿主，也不能在仍携带宿主时失去其任务。构建任务会使任何超过尺寸检查步骤所设 80 MiB 上限的二进制文件失败。手动触发的 Cross-Platform Build 工作流会针对其构建的二进制文件重新执行相同的任务，因此分发变更可以通过一次派发完成度量和验证，然后再运行发布。由标签推送启动的发布也会触发其自身 <code>v*</code> 标签触发器下的 Docker Publish，且该运行不会等待冒烟测试。</p>
+<p>完整流程请参阅 <a href="./release-runbook.html">Release Runbook</a>。</p>
+<p>仅用于发布的构建工具不会在每次运行时都从源代码编译。该工作流通过 <code>scripts/ci/install_release_tool.sh</code> 安装固定版本的上游 <code>cross</code> 和 Tauri CLI 发布二进制文件；该脚本会在将二进制文件放入 Cargo 的 bin 目录之前，验证每个运行器专用归档文件对应的仓库 SHA-256。更新任一工具时，都必须同时更新其版本、资源名称和校验和，然后运行 <code>scripts/ci/install_release_tool.test.sh</code>。</p>
+<h3 id="软件包发布者"><a class="header" href="#软件包发布者">软件包发布者</a></h3>
+<p>每个工作流都在 <code>workflow_dispatch</code> 触发时运行，并接收一个版本输入参数。此外，它们也会在发布工作流成功发布后被调用。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>工作流</th><th>它的作用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pub-aur.yml</code></td><td>更新 Arch 用户仓库 <code>PKGBUILD</code> 并推送到 AUR</td></tr>
+<tr><td><code>pub-crates.yml</code></td><td>打包并验证协调的工作区发布版本，然后在 <code>crates-io</code> 环境门禁下按依赖顺序将其发布到 crates.io</td></tr>
+<tr><td><code>pub-scoop.yml</code></td><td>更新 Windows 的 Scoop 清单</td></tr>
+</tbody>
+</table>
+</div>
+<p>Homebrew Core 的<a href="https://docs.brew.sh/Autobump">官方 autobump 服务</a>会发现稳定的 GitHub 发布版本，并独立发起 formula 版本更新。不要恢复项目自有的 Homebrew 发布器或 fork token；这会重复 Homebrew 的权威自动化。</p>
+<h2 id="必需的密钥"><a class="header" href="#必需的密钥">必需的密钥</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>秘密</th><th>用于</th></tr>
+</thead>
+<tbody>
+<tr><td><code>AUR_SSH_KEY</code></td><td><code>pub-aur.yml</code></td></tr>
+<tr><td><code>CARGO_REGISTRY_TOKEN</code></td><td>仓库机密被显式传递给 <code>pub-crates.yml</code>，且仅由其受保护的发布作业引用；v0.8.5 需要使用 <code>publish-new</code> 发布 <code>zerorelay</code>、<code>zeroclaw-relay-proto</code> 和 <code>zeroclaw-tls</code>，而后续的协调更新需要使用 <code>publish-update</code></td></tr>
+<tr><td><code>DISCORD_WEBHOOK_URL</code></td><td><code>discord-release.yml</code></td></tr>
+<tr><td><code>TWITTER_ACCESS_TOKEN</code>、<code>TWITTER_ACCESS_TOKEN_SECRET</code>、<code>TWITTER_CONSUMER_API_KEY</code>、<code>TWITTER_CONSUMER_API_SECRET_KEY</code></td><td><code>tweet-release.yml</code></td></tr>
+<tr><td><code>SCOOP_BUCKET_TOKEN</code></td><td><code>pub-scoop.yml</code>、<code>release-stable-manual.yml</code>、<code>scoop-bucket-canary.yml</code>；仅限于 <code>zeroclaw-labs/scoop-zeroclaw</code> 且具有 Contents 读写权限的细粒度 PAT</td></tr>
+<tr><td><code>WEBSITE_REPO_PAT</code></td><td><code>release-stable-manual.yml</code>（触发网站仓库重新部署）</td></tr>
+<tr><td><code>GITHUB_TOKEN</code>（自动）</td><td>所有推送提交、创建 PR 或将镜像推送到 GHCR 的工作流</td></tr>
+</tbody>
+</table>
+</div>
+<p>Docker 镜像使用自动生成的 <code>GITHUB_TOKEN</code> 推送到 GHCR；不存在单独的注册表令牌。将 <code>CARGO_REGISTRY_TOKEN</code> 存储为仓库机密，并仅将这个指定的机密映射到可复用的发布器中。被调用的工作流仅在不可逆的发布步骤中引用它；该步骤所属的作业需要通过 <code>crates-io</code> 环境审批；无令牌的预检既不引用也不导出它。审批者启动发布作业之前，预检会对同一个不可变的发布提交进行打包。</p>
+<p>发布 Stable 通过其 <code>stage</code> 输入调用发布程序两次。<code>crates-preflight</code> 作业与二进制构建并行运行 <code>stage: preflight</code>，且不使用任何密钥。手动派发的发布尚无标签，因此它会直接校验本次运行的提交。GitHub Release 的 <code>publish</code> 作业依赖该作业，因此 crates 失败会在任何内容公开之前终止发布。创建 GitHub Release 之后，<code>crates</code> 作业使用令牌运行 <code>stage: publish</code>。该阶段要求新标签解析到同一提交，跳过重新校验，并上传 preflight 阶段已记录摘要的仪表板包。手动派发 <code>pub-crates.yml</code> 仍会在一次调用中运行两个阶段。</p>
+<p>两个作业都会从第二个稀疏检出的 <code>scripts/release/</code>（位于 <code>.release-tooling</code>，并从打包目录树中排除）运行发布脚本，并通过 <code>PUBLISH_SOURCE_ROOT</code> 传递源码树。在发布运行中，该检出即为发布提交。针对已有标签、从 <code>master</code> 发起的手动派发，会使用 <code>master</code> 的脚本处理已标记的源码树，因此发布脚本的修复无需移动标签即可应用到某个发布版本中。<code>resolve_crates_release.sh</code> 会拒绝任何其他工具提交。</p>
+<p>根 crate 将生成的仪表板随附在 <code>web/dist</code> 中。预检会构建一次该仪表板，记录每个文件路径及其内容的摘要，使用该目录树验证软件包，并将其作为 <code>crates-io-web-dist</code> 构件上传。发布作业不会重新构建仪表板，而是恢复该构件。<code>publish-crates.sh</code> 仅当恢复的目录树与记录的摘要一致时才会向 crates.io 发布，否则拒绝发布。该构件保留 30 天，以便审批延迟或发布作业失败后重新运行时仍能找到它。</p>
+<p>协调发布集中的大多数 crate 已经存在，并且可以使用 crates.io 的可信发布功能。v0.8.5 版本还会创建 <code>zerorelay</code>、<code>zeroclaw-relay-proto</code> 和 <code>zeroclaw-tls</code>，因此其引导令牌必须包含 <code>publish-new</code>。在每个 crate 都为此工作流配置可信发布者条目之前，环境令牌仍是引导路径。配置这些条目后，迁移该作业，使 GitHub 将 OIDC 身份交换为短期令牌，而不是继续保留 <code>CARGO_REGISTRY_TOKEN</code>。</p>
+<p>该组织当前在 Scoop bucket 上禁用了部署密钥，而自动生成的 <code>GITHUB_TOKEN</code> 无法写入另一个仓库。请将 <code>SCOOP_BUCKET_TOKEN</code> 的权限范围严格限制在该 bucket 内；不要重复使用维护者的宽泛 CLI 令牌。发布器会通过 <code>git push --dry-run</code> 检查写入权限，然后使用相同的 Git 传输通道执行实际更新。</p>
+<h3 id="轮换-scoop_bucket_token"><a class="header" href="#轮换-scoop_bucket_token">轮换 <code>SCOOP_BUCKET_TOKEN</code></a></h3>
+<p>由于部署密钥不可用，此凭据是个人访问令牌，因此存在两种相互独立的失效模式，而这两种模式都曾导致一次发布出现问题：</p>
+<ol>
+<li><strong>令牌会过期。</strong> 细粒度 PAT 的有效期有上限，因此无论其他内容是否发生变化，此问题都会按固定周期再次出现。</li>
+<li><strong>所有者身份失去了对存储桶的写入权限。</strong> 即使令牌仍然有效，其背后的账户也可能只是一个 <code>read</code> 协作者。这会产生 <code>remote: Permission to zeroclaw-labs/scoop-zeroclaw.git denied to &lt;account&gt;</code> 和 HTTP 403，而不是身份验证错误，因此看起来像是代码问题，实际却是权限问题。</li>
+</ol>
+<p>使用 <code>ZeroClaw-Bot</code> 账户持有令牌，绝不要使用个人账户，这样发布流程就不会依赖某一位维护者的凭据。要轮换令牌：</p>
+<ol>
+<li>以 <code>ZeroClaw-Bot</code> 身份创建一个细粒度 PAT，<strong>资源所有者</strong> 为 <code>zeroclaw-labs</code>，<strong>仓库访问权限</strong> 仅限于单个仓库 <code>zeroclaw-labs/scoop-zeroclaw</code>，并设置 <strong>仓库权限 → 内容：读取和写入</strong>。除此之外不设置任何权限。</li>
+<li>确认组织已批准该令牌。针对组织资源所有者的细粒度 PAT 在获得批准前会一直处于待处理状态，待处理令牌可以进行身份验证，但无法推送。</li>
+<li>确认 <code>ZeroClaw-Bot</code> 仍对该存储桶具有 <code>write</code> 权限：<code>gh api repos/zeroclaw-labs/scoop-zeroclaw/collaborators/ZeroClaw-Bot/permission --jq '.role_name'</code>。第 1 步不会授予仓库访问权限；它只会限定令牌可以使用的权限范围。令牌的权限不能超过其所有者已有的权限。</li>
+<li>设置机密：<code>gh secret set SCOOP_BUCKET_TOKEN --repo zeroclaw-labs/zeroclaw</code>。</li>
+<li>无需接触存储桶，通过触发 <a href="#weekly-scoop-bucket-canary-scoop-bucket-canaryyml">Scoop Bucket Canary</a> 进行验证。运行成功表明新令牌具备推送权限。</li>
+</ol>
+<p>轮换时，将过期日期记录在某个持久的位置。无论如何，canary 会在一周内发现过期的令牌，但那时它已经失效了。</p>
+<h3 id="aur-软件包所有权"><a class="header" href="#aur-软件包所有权">AUR 软件包所有权</a></h3>
+<p>项目所拥有的软件包目前是 <a href="https://aur.archlinux.org/packages/zeroclawlabs"><code>zeroclawlabs</code></a>，由 <code>zeroclaw-bot</code> 维护。规范名称为 <a href="https://aur.archlinux.org/packages/zeroclaw"><code>zeroclaw</code></a> 的软件包是第三方软件包，无法通过轮换 <code>AUR_SSH_KEY</code> 来接管。如果该维护者仍处于不活跃状态，请先遵循 <a href="https://wiki.archlinux.org/title/AUR_submission_guidelines#Requests">AUR 孤儿请求流程</a>，再更改 <code>pkgname</code> 或工作流的克隆目标。所有权转移后，请在一项经过审查的变更中协调软件包重命名或合并。</p>
+<h2 id="构建缓存行为"><a class="header" href="#构建缓存行为">构建缓存行为</a></h2>
+<p><code>ci.yml</code> 中大多数 Rust 密集型作业都通过本地 <code>./.github/actions/rust-cache</code> 复合操作进行缓存。该操作接收来自 Blacksmith 编译调用方的 <code>use-blacksmith: 'true'</code>，与这些作业直接指定的运行器标签一致。这两个值都是 <code>ci.yml</code> 中已提交的常量，而不是 Actions 变量。在源自 Fork 的 <code>pull_request</code> 运行中无法读取 <code>vars</code>，因此原先的 <code>CI_USE_BLACKSMITH</code> 开关会静默地将每个 Fork PR（占本仓库 PR 的 90%）发送到 GitHub 托管运行器，并使用冷缓存。原因是 master 迁移到 Blacksmith 后，已停止为 GitHub Actions 缓存预先填充数据。使用这些常量后，这些 Fork PR 作业会与对应的 master 作业一样，在 Blacksmith 运行器上使用 <code>useblacksmith/rust-cache</code>（Blacksmith NVMe 粘性磁盘）。若要将该组运行器迁回 <code>ubuntu-latest</code> + <code>Swatinem/rust-cache</code>，只需在一次经过审查的提交中修改 Linux 编译作业上的运行器标签和提供方输入即可，<code>tests/architecture/ci_runner_labels.rs</code> 会保持这些修改同步一致。无论如何选择，两个 action 引用都保留在复合操作中，因此两者都必须保留在允许列表中。Windows 任务负责人恢复流程是 Blacksmith 上的例外情况，它直接使用 <code>Swatinem/rust-cache</code>，并拥有自己由 master 预先填充的依赖缓存。macOS 和 Windows 构建分支继续使用 <code>Swatinem/rust-cache</code> 访问 GitHub Actions 缓存。<code>fmt</code>、<code>nix-eval</code> 和 <code>docs-style</code> 作业（均不编译工作区）不使用 Rust 缓存。<code>codeql.yml</code> 为其 Rust 扫描固定了相同的 Blacksmith 标签，因此现在没有任何工作流会读取 <code>CI_USE_BLACKSMITH</code> 变量；可以从仓库设置中删除该变量。以下行为在排查缓存相关的偶发故障时值得留意：</p>
+<ul>
+<li><strong>Matrix 各分支需要不同的缓存键。</strong> 缓存键由作业 id（或 <code>shared-key</code>）、运行器操作系统和架构、工具链、<code>CARGO*</code>/<code>RUST*</code> 环境变量以及 lockfile 派生而来。仅在功能标志或 cargo 参数上有所不同的 Matrix 分支会解析为相同的缓存键；先保存的分支占有该键，其他分支则恢复到不匹配的依赖集。在采用每个分支独立缓存键之前，cranelift 插件后端分支每次运行（包括 master 分支）都要重新编译约 620 个依赖 crate（约四分钟），因为它与 pulley 和仅运行时分支共用同一个键。因此，<code>check</code> 和 <code>check-plugin-backends</code> 为每个分支提供一个不含逗号的 <code>cache-key</code> Matrix 字段，并将其作为 <code>shared-key</code> 传递；依赖集确实相同的分支可以共享同一个键。新的 Rust Matrix 作业也应采用相同做法。</li>
+<li><strong>缓存写入仅限 master 分支。</strong> <code>save-if</code> 的条件为 <code>github.ref == 'refs/heads/master'</code>，因此 PR 运行会读取由 master 填充的缓存，但绝不会更新它。PR 分支无法用特定于分支的产物污染共享缓存。<code>master</code> 上的 <code>push</code> 触发器使得该工作流在合并后拥有一次可信的缓存写入运行。</li>
+<li><strong>恢复步骤仅在成功时保存缓存。</strong> 其 <code>cache-on-failure: 'false'</code> 设置可防止失败的恢复运行写入缓存。其他复合缓存编译任务保留 <code>cache-on-failure: true</code>，因此部分完成的 master 运行仍可为其下一次尝试提供预热缓存。</li>
+<li><strong>已启用 Windows 构建缓存。</strong> Windows 构建环节运行与 Linux 和 macOS 相同的固定版本 Rust 缓存 action。如果 Windows 缓存行为不稳定或出现回归，请还原此工作流更改，并在缓存 issue 中记录失败的 restore/save 证据。</li>
+<li><strong>增量编译已禁用。</strong> 工作流级别设置了 <code>CARGO_INCREMENTAL: 0</code>。增量构建会增大缓存体积，并在部分陈旧条件下产生不可复现的构建产物。</li>
+<li><strong><code>cargo-deny</code> 和 <code>cargo-nextest</code> 每次运行都会重新安装。</strong> <code>security</code> 作业运行 <code>cargo install cargo-deny --locked</code>;Linux 的 <code>test</code> 作业以及两个定时的 <code>platform-tests.yml</code> 任务会从 <code>get.nexte.st</code> 拉取相应平台的 <code>cargo-nextest</code> 二进制文件。高级 PR 的 Windows 作业则下载其固定版本的 nextest 发行包,并在解压前校验硬编码的 SHA-256 值,因为该作业会运行在数量更多的不可信 PR 上。两者都未被缓存,因此每次安装都会为对应作业增加固定的开销。改用 <code>taiki-e/install-action</code> 可以实现缓存,但该操作目前不在允许列表中。</li>
+</ul>
+<h2 id="当闸门变红时"><a class="header" href="#当闸门变红时">当闸门变红时</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>症状</th><th>首先要检查的事项</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Release Stable</code>（发布稳定版）在 <code>uses:</code> 引用变更后于 <code>startup_failure</code> 处中止，且没有任何作业</td><td>检查运行摘要和仓库的 Actions 策略。如果 GitHub 报告选择的操作遭到拒绝，请将变更后的 ref 与<a href="#allowed-actions">允许列表</a>进行比较，仅添加被拒绝的模式，等待设置生效，然后重新触发一次运行。否则，请调查工作流定义或其他仓库策略；仅凭 <code>startup_failure</code> 无法确定原因</td></tr>
+<tr><td><code>CI Required Gate</code> 红色</td><td>先 <code>fmt</code>，然后 <code>lint</code>，接着 <code>test</code>，最后 <code>build</code></td></tr>
+<tr><td>发布 <code>validate</code> 失败</td><td><code>Cargo.toml</code> 版本与工作流输入不匹配，或者标签已存在</td></tr>
+<tr><td>发布构建阶段失败</td><td>特定目标的作业日志。Android 为 <code>experimental</code>，并启用 <code>continue-on-error</code></td></tr>
+<tr><td>环境门限超时</td><td>从工作流运行页面重新运行超时的作业</td></tr>
+<tr><td>分发发布者失败</td><td>首先，使用 <code>dry_run: true</code> 手动重新运行相应的子工作流</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="允许的操作"><a class="header" href="#允许的操作">允许的操作</a></h2>
+<p>该仓库以 <code>selected</code> 模式运行 Actions，只有此允许列表中的操作才可运行。允许列表必须保持精简；新增的第三方操作在添加前需要维护者明确批准。</p>
+<p>所有第三方引用都固定到完整的提交 SHA，并附带尾部版本注释；下面的版本列记录的就是该注释。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>操作</th><th>用于</th><th>目的</th></tr>
+</thead>
+<tbody>
+<tr><td><code>actions/checkout</code> (<code>v6.0.2</code>)</td><td>大多数工作流</td><td>检出仓库</td></tr>
+<tr><td><code>actions/cache</code> (<code>v4.2.3</code>, <code>v5.0.5</code>)</td><td><code>docker-image-pr.yml</code>, <code>tweet-release.yml</code></td><td>通用依赖和 Trivy 数据库缓存</td></tr>
+<tr><td><code>actions/setup-node</code> (<code>v7.0.0</code>)</td><td><code>ci-sbom.yml</code>, <code>ci.yml</code>, <code>cross-platform-build-manual.yml</code>, <code>daily-npm-audit.yml</code>, <code>pub-crates.yml</code>, <code>release-stable-manual.yml</code></td><td>用于 npm SBOM 生成、Web 测试/审计以及 Web/桌面构建的 Node 工具链</td></tr>
+<tr><td><code>actions/upload-artifact</code>（<code>v7.0.1</code>）</td><td><code>release-stable-manual.yml</code>, <code>cross-platform-build-manual.yml</code>, <code>docker-publish.yml</code>, <code>trivy-scheduled.yml</code></td><td>上传构建产物和 Trivy SARIF 交接产物</td></tr>
+<tr><td><code>actions/download-artifact</code>（<code>v8.0.1</code>）</td><td><code>release-stable-manual.yml</code>、<code>cross-platform-build-manual.yml</code>、<code>docker-publish.yml</code></td><td>下载构建产物和 Trivy SARIF 交接产物</td></tr>
+<tr><td><code>actions/attest</code> (<code>v4.2.2</code>)</td><td><code>release-stable-manual.yml</code></td><td>为发布资产生成 GitHub 托管的构建级别 2 来源证明</td></tr>
+<tr><td><code>actions/labeler</code> (<code>v6.1.0</code>)</td><td><code>pr-path-labeler.yml</code></td><td>从 <code>.github/labeler.yml</code> 应用路径/作用域标签</td></tr>
+<tr><td><code>dtolnay/rust-toolchain</code> (<code>stable</code>, <code>v1</code>)</td><td><code>ci.yml</code>, <code>platform-tests.yml</code>, <code>pub-crates.yml</code>, <code>release-stable-manual.yml</code>, <code>cross-platform-build-manual.yml</code>, <code>cross-platform-clippy.yml</code>, <code>daily-audit.yml</code>, <code>docs-deploy.yml</code>, <code>codeql.yml</code></td><td>安装 Rust 工具链</td></tr>
+<tr><td><code>Swatinem/rust-cache</code> (<code>v2.9.2</code>)</td><td><code>ci.yml</code>（GitHub 托管的复合路径与直接 Blacksmith Windows 恢复）、<code>platform-tests.yml</code>、<code>pub-crates.yml</code>、<code>release-stable-manual.yml</code>、<code>cross-platform-build-manual.yml</code>、<code>cross-platform-clippy.yml</code>、<code>docs-deploy.yml</code></td><td>Cargo 构建/依赖缓存在 GitHub 托管运行器上的使用，以及 Blacksmith Windows 的恢复</td></tr>
+<tr><td><code>useblacksmith/rust-cache</code> (<code>v3.0.1</code>)</td><td><code>ci.yml</code>（Blacksmith 的路径 <code>./.github/actions/rust-cache</code>）</td><td>Cargo 构建/依赖缓存位于 Blacksmith sticky disk 上;由每个 Blacksmith 编译作业传递给复合操作的 <code>use-blacksmith: 'true'</code> 输入选择(一个已提交的常量)</td></tr>
+<tr><td><code>docker/setup-buildx-action</code> (<code>v3.11.1</code>, <code>v4.0.0</code>)</td><td><code>release-stable-manual.yml</code>, <code>docker-publish.yml</code></td><td>Docker Buildx 设置</td></tr>
+<tr><td><code>docker/login-action</code>（<code>v3.4.0</code>、<code>v4.1.0</code>）</td><td><code>release-stable-manual.yml</code>、<code>docker-publish.yml</code>、<code>trivy-scheduled.yml</code></td><td>GHCR 身份验证</td></tr>
+<tr><td><code>docker/build-push-action</code> (<code>v6.18.0</code>, <code>v7.1.0</code>)</td><td><code>release-stable-manual.yml</code>, <code>docker-publish.yml</code></td><td>多平台镜像构建与推送</td></tr>
+<tr><td><code>sigstore/cosign-installer</code> (<code>v3.8.1</code>)</td><td><code>release-stable-manual.yml</code>, <code>docker-publish.yml</code></td><td>安装 cosign 以实现无密钥 GHCR 容器镜像签名</td></tr>
+<tr><td><code>anchore/sbom-action</code> (<code>v0.24.0</code>)</td><td><code>release-stable-manual.yml</code></td><td>为每个发布生成 SPDX + CycloneDX SBOM。</td></tr>
+<tr><td><code>aquasecurity/trivy-action</code> (<code>v0.36.0</code>)</td><td><code>docker-image-pr.yml</code>、<code>docker-publish.yml</code>、<code>trivy-scheduled.yml</code></td><td>仅报告模式的容器漏洞扫描</td></tr>
+<tr><td><code>github/codeql-action/upload-sarif</code> (<code>v3.36.2</code>)</td><td><code>docker-publish.yml</code>, <code>trivy-scheduled.yml</code>, <code>ci-code-analysis.yml</code></td><td>将 Trivy 和 Semgrep SARIF 报告上传到安全选项卡</td></tr>
+<tr><td><code>github/codeql-action/init</code> (<code>v4.37.8</code>)</td><td><code>codeql.yml</code></td><td>初始化 CodeQL 分析（Rust 和 JS/TS）</td></tr>
+<tr><td><code>github/codeql-action/analyze</code> (<code>v4.37.8</code>)</td><td><code>codeql.yml</code></td><td>上传 CodeQL SARIF 到安全选项卡</td></tr>
+</tbody>
+</table>
+</div>
+<p>GitHub Release 本身是在 <code>publish</code> 作业内通过 <code>gh release create</code> 创建的，而不是通过 release action。</p>
+<p>等效的白名单模式（故意保持狭窄）：</p>
+<pre><code>actions/*
+dtolnay/rust-toolchain@*
+Swatinem/rust-cache@*
+useblacksmith/rust-cache@*
+docker/*
+sigstore/cosign-installer@*
+anchore/sbom-action@*
+aquasecurity/trivy-action@*
+github/codeql-action/upload-sarif@*
+github/codeql-action/init@*
+github/codeql-action/analyze@*
+</code></pre>
+<p>导出当前生效的策略：</p>
+<div class="os-tabs-src">
+<h3 id="sh"><a class="header" href="#sh">sh</a></h3>
+<pre><code class="language-sh">gh api repos/zeroclaw-labs/zeroclaw/actions/permissions
+gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
+</code></pre>
+</div>
+
+<p>任何添加或更改 <code>uses:</code> 操作来源的 PR 都必须在正文中包含一个白名单影响说明。避免使用宽泛的通配符例外；仅针对已验证缺失的操作扩展白名单。</p>
+<h2 id="维护规则"><a class="header" href="#维护规则">维护规则</a></h2>
+<ul>
+<li>保持 <code>CI Required Gate</code> 的确定性和简洁性。向该门禁添加作业需要有明确的质量依据。</li>
+<li>所有第三方操作引用必须固定到完整的提交 SHA（根据上述白名单策略）。</li>
+<li>保持 <code>ci.yml</code>、<code>dev/ci.sh</code> 和 <code>.githooks/pre-push</code> 一致。共享的检查项必须放在 <code>scripts/ci/</code> 中；每个调用方应调用该辅助脚本，而不是复制其命令。对于独立的固件协议检查项，文档中记录的本地入口点是 <code>./dev/ci.sh firmware-protocol</code>。</li>
+<li>保持 <code>scripts/ci/prepare_docker_context.sh</code>、<code>docker-image-pr.yml</code> 以及 <code>release-stable-manual.yml</code> 中的 Docker 作业相互一致，以便 PR 验证所使用的上下文结构与发布工作流所发布的保持相同。</li>
+<li>在更改发布证明、校验和、SBOM 或验证存档序列后，运行 <code>python3 scripts/ci/release_attestation_contract_test.py</code>。</li>
+<li><code>docs-style</code> gate 作业运行 <code>bash scripts/ci/docs_quality_gate.sh</code>（markdown lint + em-dash 文案检查）和 <code>bash scripts/ci/docs_links_gate.sh</code>（变更行链接检查）。在推送 docs 变更之前，请先在本地运行这两个脚本。</li>
+</ul>
+<h2 id="紧急回滚"><a class="header" href="#紧急回滚">紧急回滚</a></h2>
+<p>如果白名单在事件处理过程中锁定了关键操作：</p>
+<ol>
+<li>临时将 Actions 策略恢复为 <code>all</code>。</li>
+<li>在识别出缺失的条目后，恢复 <code>selected</code> 的白名单。</li>
+<li>记录事件和最终的白名单差异。</li>
+</ol>
+<p>这是通往 <code>all</code> 模式的唯一合理路径，并且它的存续时间绝不应超过该事件本身。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../maintainers/docs-and-translations.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../maintainers/skills.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../maintainers/docs-and-translations.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../maintainers/skills.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

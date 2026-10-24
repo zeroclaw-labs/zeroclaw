@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["POSIX_DELETION_GUIDANCE","SHELL_COMMAND_TOOLS"],"enum":["ShellDialect"],"fn":["needs_shell_dialect_guidance"],"struct":["ShellProfile"],"trait":["RuntimeAdapter"]};

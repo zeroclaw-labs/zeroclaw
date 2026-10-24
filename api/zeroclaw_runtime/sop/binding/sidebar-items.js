@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["BindingScope","ExtractedBinding"],"fn":["extract_bindings","extract_bindings_with_paths","remap_step_refs","resolve_args"],"struct":["BindingContext","BindingRef"]};

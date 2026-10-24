@@ -1,0 +1,473 @@
+<!DOCTYPE HTML>
+<html lang="es" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ADR-014: Autoridad de salida de plugins - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="id: ADR-014 title: Las instancias de plugins solo acceden a la red a través de una única autoridad de salida gestionada por el host date: 2026-08-20 status:…">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../../toc-769719c1.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/es/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="ADR-014: Autoridad de salida de plugins - ZeroClaw Docs">
+        <meta property="og:description" content="id: ADR-014 title: Las instancias de plugins solo acceden a la red a través de una única autoridad de salida gestionada por el host date: 2026-08-20 status:…">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/es/architecture/decisions/ADR-014-plugin-egress-authority.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="ADR-014: Autoridad de salida de plugins - ZeroClaw Docs">
+        <meta name="twitter:description" content="id: ADR-014 title: Las instancias de plugins solo acceden a la red a través de una única autoridad de salida gestionada por el host date: 2026-08-20 status:…">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <hr>
+<p>id: ADR-014 title: Las instancias de plugins solo acceden a la red a través de una única autoridad de salida gestionada por el host date: 2026-08-20 status: propuesto relates-to:</p>
+<ul>
+<li>ADR-006</li>
+<li>ADR-009</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/9395</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/8850</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/8398</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9580</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9137</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9582</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9584</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/11098</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/issues/10996</li>
+<li>https://github.com/zeroclaw-labs/zeroclaw/pull/9126</li>
+<li>crates/zeroclaw-infra/src/net_guard.rs</li>
+<li>crates/zeroclaw-plugins/src/egress.rs</li>
+<li>crates/zeroclaw-plugins/src/component.rs</li>
+<li>crates/zeroclaw-config/src/schema.rs</li>
+<li>crates/zeroclaw-tools/src/helpers/domain_guard.rs</li>
+</ul>
+<hr>
+<h1 id="adr-014-las-instancias-de-plugins-solo-acceden-a-la-red-a-través-de-una-única-autoridad-de-salida-egress-controlada-por-el-host"><a class="header" href="#adr-014-las-instancias-de-plugins-solo-acceden-a-la-red-a-través-de-una-única-autoridad-de-salida-egress-controlada-por-el-host">ADR-014: Las instancias de plugins solo acceden a la red a través de una única autoridad de salida (egress) controlada por el host</a></h1>
+<h2 id="contexto"><a class="header" href="#contexto">Contexto</a></h2>
+<p>Antes de que se publicara la aplicación de la política en #9582, ZeroClaw vinculaba la importación <code>wasi:http</code> en un almacén de plugins cuando el manifiesto del plugin solicitaba el permiso <code>http_client</code>. Ese almacén instalaba los hooks de solicitud predeterminados de wasmtime (<code>crates/zeroclaw-plugins/src/component.rs</code>), por lo que nada en el lado de ZeroClaw decidía a qué destinos podía conectarse el código invitado: no existía una lista de destinos permitidos, ni una protección por clase de dirección, ni una configuración accesible para el operador. Los permisos del manifiesto eran solicitudes, y el host concedía cada una tal cual (<code>crates/zeroclaw-plugins/src/instance.rs</code>), mientras que <code>plugins.security.signature_mode</code> tenía como valor predeterminado disabled. Por tanto, un componente sin firmar podía declarar <code>http_client</code>, recibirlo y convertirse en un pivote sin filtrar hacia servicios de loopback, la pasarela local o direcciones de metadatos de la nube. El fallo <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/9395">#9395</a> documenta esa consecuencia histórica; la versión actual aplica la política de destinos gestionada por el host.</p>
+<p>El componente hermano del lado del host ya deniega por defecto. La herramienta <code>http_request</code> rechaza toda llamada cuando su lista <code>allowed_domains</code> está vacía, y valida el destino y cada dirección resuelta frente a los rangos de metadatos, loopback y privados mediante <code>crates/zeroclaw-tools/src/helpers/domain_guard.rs</code> y <code>crates/zeroclaw-infra/src/net_guard.rs</code>. Dos rutas de salida en un mismo proceso ofrecían garantías opuestas.</p>
+<p>La presión sobre este límite aumenta con ADR-006, que convierte a los plugins de runtime en el destino de los canales opcionales, porque cada canal de mensajería es un consumidor de egress. Hoy <code>wit/v0/inbound.wit</code> establece claramente que un plugin de canal se ejecuta sin red y sin sockets, y el repositorio oficial de plugins contiene un borrador de interfaz de sockets en <code>wit/unstable/sockets.wit</code> para un transporte que el host no expone. El próximo transporte que llegue necesitará una respuesta ya existente a «¿puede esta instancia alcanzar esa dirección?», no una tercera.</p>
+<p>Parte de esta dirección ya se ha implementado. <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9580">#9580</a> trasladó el egreso HTTP integrado a un guardia de red compartido, <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9137">#9137</a> añadió la base de la política de egreso del lado del plugin, <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9582">#9582</a> aplicó la política en el límite de <code>wasi:http</code> y <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9126">#9126</a> añadió la configuración tipada de instancias. El proceso de concesión por parte del operador se incorporó para la instalación y el listado en <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/11098">#11098</a>, que reemplazó a <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9584">#9584</a>, y para los enlaces de canal mediante <code>zeroclaw plugin bind</code> bajo <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/10996">#10996</a>. Este registro establece la decisión que implementan y completan esos fragmentos. La RFC <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8398">#8398</a> está cerrada como RFC omnibus/reemplazada; este ADR registra la decisión focalizada sobre el egreso de red que sobrevivió a esa división: Q1 para permisos de red y Q4 para concesiones de destino extendidas por el usuario.</p>
+<p>Las alternativas son tratar la declaración en el manifiesto como la concesión en sí, mantener una única lista de permitidos global para todos los plugins instalados, o dar a cada transporte su propia política de destinos. Tratar el manifiesto como concesión mantiene la ruta de autoconcesión #9395 para paquetes sin firmar, viola la doctrina de cierre por defecto y convierte al manifiesto en una segunda fuente de verdad para la autoridad activa. Una lista de permitidos global impide el aislamiento por instancia, porque cualquier plugin instalado podría entonces alcanzar cualquier host que necesite otro plugin. Las políticas por transporte introducen tres controles para una misma pregunta y favorecen las divergencias, cuando la decisión sobre el destino es independiente del transporte.</p>
+<h2 id="decisión"><a class="header" href="#decisión">Decisión</a></h2>
+<h3 id="use-una-única-autoridad-de-salida-con-mecanismos-de-política-compartidos-y-denegación-por-defecto"><a class="header" href="#use-una-única-autoridad-de-salida-con-mecanismos-de-política-compartidos-y-denegación-por-defecto">Use una única autoridad de salida con mecanismos de política compartidos y denegación por defecto</a></h3>
+<p>Todo el tráfico de red saliente de los plugins, hoy <code>wasi:http</code> y cualquier futura importación de socket, WebSocket o perfil TLS, se canaliza a través de una única autoridad de salida gestionada por el host. La coincidencia de destinos, la clasificación de direcciones, la traducción NAT64 y el veredicto posterior a la resolución residen en <code>zeroclaw-infra::net_guard</code>, que ya utilizan las herramientas integradas. <code>crates/zeroclaw-plugins/src/egress.rs</code> contiene el servicio con alcance de instancia que consume esas primitivas y no reimplementa ninguna de ellas, y <code>zeroclaw-plugins</code> no depende de <code>zeroclaw-tools</code> para esto. Un plugin y una herramienta integrada no deben poder discrepar sobre si un destino es accesible.</p>
+<p>A plugin instance with no granted destination has no network reach. There is no compatibility mode in which <code>http_client</code> alone confers unrestricted HTTP. The permission grants the surface; the operator’s list grants the destinations.</p>
+<p>El servicio vuelve a verificar el permiso requerido por el transporte en el límite de la operación, aunque el enlazador solo expone las importaciones que se concedieron a una instancia admitida. La comprobación duplicada es una defensa en profundidad deliberada: un adaptador de transporte no debe poder convertir una importación enlazada pero no concedida en acceso a la red.</p>
+<h3 id="aplicar-en-el-límite-de-wasihttp-con-una-ruta-de-envío-fijada"><a class="header" href="#aplicar-en-el-límite-de-wasihttp-con-una-ruta-de-envío-fijada">Aplicar en el límite de <code>wasi:http</code> con una ruta de envío fijada</a></h3>
+<p>La aplicación de políticas reside en el límite de transporte. Una implementación de hooks de ZeroClaw almacenada por cada almacén de plugins reemplaza los hooks predeterminados de wasmtime, y su hook de solicitud evalúa la política en cada solicitud emitida por el invitado. La ruta de envío es propiedad del host y está fijada: resuelve el destino una sola vez, valida las direcciones resueltas mediante el guardia compartido y luego conecta únicamente a esas direcciones exactas, usando el nombre de host para SNI y la verificación del certificado. Una respuesta DNS no puede cambiar de clase entre la comprobación y la conexión, porque no hay una segunda resolución. <code>ResolvedDestination</code> existe para que esa propiedad sea estructural: conserva las direcciones validadas y no ofrece ninguna vía de regreso a una nueva consulta.</p>
+<p>The host never follows redirects on a guest’s behalf. A guest that chooses to chase a redirect issues a new request, and every hop passes the full policy independently.</p>
+<p>Wait, I need to correct myself: the source is in English, so I should translate it to Spanish. Here is the translation:</p>
+<p>El host nunca sigue redirecciones en nombre de un invitado. Un invitado que decide seguir una redirección emite una nueva solicitud, y cada salto pasa la política completa de forma independiente.</p>
+<p>Una denegación devuelve al invitado un error enmascarado que menciona la política en lugar de los detalles internos del host, y emite un evento de registro estructurado en el host que atribuye el intento a la instancia exacta.</p>
+<p>Esta modificación se incorporó en #9582 para <code>wasi:http</code>; las puertas restantes cubren la intersección, la cobertura de los fixtures y el despliegue en la flota.</p>
+<h3 id="que-el-manifiesto-declare-y-que-la-configuración-del-operador-conceda"><a class="header" href="#que-el-manifiesto-declare-y-que-la-configuración-del-operador-conceda">Que el manifiesto declare y que la configuración del operador conceda</a></h3>
+<p>Un manifiesto de plugin puede declarar los destinos que el paquete necesita en una sección <code>[egress]</code>: hosts exactos o patrones de sufijo explícitos. Esa declaración es una solicitud cubierta por la firma, una declaración de intención que viaja con el paquete. Nunca se consulta como concesión en el momento de la solicitud.</p>
+<p>El permiso se almacena en la configuración canónica del operador, como campos de texto plano en la fila <code>[[plugins.entries]]</code> de la instancia: <code>egress_hosts</code> para los destinos y <code>egress_allow_private</code> para la excepción de clase de dirección. Ambos son elementos hermanos deliberados del mapa <code>config</code> marcado con <code>#[secret]</code>, y nunca están dentro de él, porque la lista de permitidos es lo que el operador audita y debe seguir siendo legible en el archivo que revisa.</p>
+<p>El alcance efectivo de una instancia es la intersección de lo que solicita su manifiesto y de lo que concedió el operador. Una declaración, por sí sola, no otorga nada, y una concesión del operador no puede extenderse más allá de lo que el paquete declaró necesitar. Hay dos vías de concesión de primera clase:</p>
+<ol>
+<li>Sembrado a partir de la declaración durante la ceremonia de concesión que aparece a continuación.</li>
+<li>Redactado directamente por el operador, que es la única vía posible para un plugin cuyo destino es en sí mismo configuración de la instancia, como un Gitea autoalojado, un homeserver de Matrix o un Nextcloud en la LAN. El autor no puede conocer el host, así que el operador que lo configura es quien lo concede.</li>
+</ol>
+<p>La política se lee de la configuración canónica en cada solicitud, en lugar de guardarse como instantánea en el estado de la instancia, de modo que la edición de un operador se aplica a la siguiente conexión y no al siguiente reinicio. ADR-012, todavía en estado propuesto, describe el modo de aplicación relacionado limitado por generación; aquí sirve como contexto, no como autoridad.</p>
+<p>Los campos del operador, la lectura por solicitud y la declaración <code>[egress]</code> del manifiesto están combinados. La intersección aún no está implementada, por lo que en esta versión solo rige la concesión del operador; la puerta G1 la cubre.</p>
+<h3 id="mantén-la-gramática-de-destino-libre-de-una-forma-de-permitir-todo"><a class="header" href="#mantén-la-gramática-de-destino-libre-de-una-forma-de-permitir-todo">Mantén la gramática de destino libre de una forma de permitir todo</a></h3>
+<p>Las entradas son hosts exactos o patrones <code>*.suffix</code> explícitos. Un dominio simple nunca implica a sus subdominios, un patrón de sufijo nunca coincide con el dominio apex, y la ausencia de entradas significa “en cualquier lugar”. La validación rechaza un <code>*</code> sin más, y uno no validado solo coincidiría con un host llamado literalmente <code>*</code>, así que incluso una lista que hubiera eludido la validación falla en modo restrictivo. Un host expresado como dirección IP solo coincide con una entrada idéntica exacta, y nunca mediante un patrón de sufijo, porque las direcciones no tienen estructura de subdominios y tratar una como nombre con puntos permitiría que <code>*.0.0.1</code> coincidiera con <code>127.0.0.1</code>. Una lista vacía no coincide con nada. Los puertos no forman parte de una entrada: permitir un host concede todos los puertos de este.</p>
+<h3 id="mantener-las-clases-de-direcciones-bloqueadas-por-encima-de-la-lista-de-permitidos"><a class="header" href="#mantener-las-clases-de-direcciones-bloqueadas-por-encima-de-la-lista-de-permitidos">Mantener las clases de direcciones bloqueadas por encima de la lista de permitidos</a></h3>
+<p>Las direcciones de metadatos de la nube se rechazan incondicionalmente en ambos modos de acceso, por lo que una activación explícita por parte del operador para destinos privados nunca las vuelve a habilitar. Los destinos de loopback, link-local y de rangos privados se rechazan incluso cuando coincide un patrón, a menos que la entrada incluya ese host en <code>egress_allow_private</code>. La excepción solo relaja la clase de dirección: un host incluido allí pero no en <code>egress_hosts</code> sigue denegado, y replica la semántica de <code>allowed_private_hosts</code> que ya usan las herramientas integradas, de modo que ambos consumidores mantengan un mismo vocabulario.</p>
+<p>Un conjunto de respuestas que abarca ambas zonas de confianza se rechaza en lugar de reducirse a una de ellas, incluso cuando el acceso privado está autorizado. De lo contrario, el orden del resolutor o el mecanismo de reserva de conexión decide silenciosamente en qué zona termina la conexión.</p>
+<h3 id="hacer-que-los-operadores-declaren-los-prefijos-nat64-y-que-una-lista-malformada-falle-en-modo-fail-closed"><a class="header" href="#hacer-que-los-operadores-declaren-los-prefijos-nat64-y-que-una-lista-malformada-falle-en-modo-fail-closed">Hacer que los operadores declaren los prefijos NAT64 y que una lista malformada falle en modo fail-closed</a></h3>
+<p>Un traductor NAT64 entrega cualquier destino IPv6 dentro de su prefijo configurado a la dirección IPv4 incrustada en ese destino. El prefijo es una decisión de despliegue y nada en la dirección lo revela, por lo que un atacante que controla la respuesta DNS de un nombre de host puede devolver una dirección IPv6 aparentemente global que el traductor local entrega a <code>10.0.0.1</code> o <code>169.254.169.254</code>. <code>security.nat64_prefixes</code> es donde los operadores declaran las traducciones que su red realmente utiliza. Las entradas tienen el formato <code>&lt;ipv6&gt;/&lt;length&gt;</code> con las longitudes de la sección 2.2 de RFC 6052, las seis, y sin bits activos más allá del prefijo.</p>
+<p>Se aplican dos reglas, y ambas son más estrictas que la implementación obvia. Primero, una entrada incorrecta rechaza la lista completa en lugar de reducirla al subconjunto bien formado, porque una lista que se analizó como “ningún prefijo” es idéntica a un despliegue que no ejecuta ningún traductor y desactivaría la clasificación específica de red sin ninguna señal. Segundo, los prefijos declarados pueden solaparse, y una dirección puede entonces decodificarse a un destino IPv4 distinto según cada uno; todos esos destinos son accesibles, así que una dirección solo se acepta cuando cada traducción declarada que coincide con ella da como resultado un destino aceptable, y no cuando lo hace la primera que resulte aceptable.</p>
+<h3 id="haz-que-la-concesión-sea-una-ceremonia-explícita"><a class="header" href="#haz-que-la-concesión-sea-una-ceremonia-explícita">Haz que la concesión sea una ceremonia explícita</a></h3>
+<p><code>zeroclaw plugin install</code> imprime los destinos declarados de un paquete y los incorpora a las entradas que ya crea. Una instancia cuyo enlace se crea más adelante, como un alias de canal, recibe su entrada de salida cuando se crea ese enlace, a partir de la misma declaración y con la misma impresión. La instalación y la creación de enlaces son actos explícitos del operador, y la lista de permitidos impresa y persistida es su registro. <code>zeroclaw plugin list</code> muestra los destinos concedidos de cada instancia, para que el alcance pueda auditarse sin leer el archivo de configuración.</p>
+<p>Una actualización de paquete cuya declaración añade destinos no amplía una entrada existente. La CLI muestra la diferencia y el operador la aplica de forma deliberada. Si no existe una entrada, el tráfico saliente queda denegado.</p>
+<p>La precarga durante la instalación, la comparación de la actualización y el informe correspondiente de <code>zeroclaw plugin list</code> se incorporaron en #11098, que reemplazó a #9584. La precarga durante el enlace se incorporó con <code>zeroclaw plugin bind</code> en #10996, y <code>zeroclaw plugin install --channel-alias</code> ejecuta el mismo procedimiento durante una instalación. Como el operador indica el alias en ese momento, el procedimiento de enlace toma la concesión como una elección explícita: <code>--egress declared</code> precarga la declaración con la misma salida impresa que muestra la instalación, <code>--egress none</code> crea la entrada con una concesión vacía, y sin ninguno de los dos indicadores, un enlace que crearía la entrada a partir de una declaración no vacía se rechaza. Ninguno de los dos comandos extiende nunca una entrada existente.</p>
+<h3 id="vincular-los-transportes-futuros-al-mismo-objeto-de-política"><a class="header" href="#vincular-los-transportes-futuros-al-mismo-objeto-de-política">Vincular los transportes futuros al mismo objeto de política</a></h3>
+<p>Las importaciones de Socket, WebSocket y de perfil TLS, cuando el host las adopta, consumen esta misma política por instancia. Una conexión de socket o una actualización a WebSocket hacia un host y un puerto pasa por la misma lista de permitidos y las mismas reglas de clase de dirección, y un perfil TLS selecciona el material de confianza, pero nunca omite la política de destino. Una importación de transporte que no pueda enrutar su decisión de destino a través de este servicio no se incorpora.</p>
+<p>Los canales TCP sin procesar quedan fuera del alcance de este registro hasta que exista una capacidad de sockets WASI en el host. Mientras tanto, un canal cuyo protocolo no sea HTTP no tiene ruta del lado del plugin y sigue siendo nativo según la regla de excepción de capacidades de ADR-006. Matrix es una de esas excepciones, y este registro no la retira: el cifrado de extremo a extremo es la capacidad del host que falta de forma explícita, y la implementación nativa se mantiene hasta que el límite del plugin pueda soportarla. Se trata de una cuestión de ADR-006 sobre la paridad de capacidades, y nada de lo aquí expuesto la modifica.</p>
+<p>Una concesión es independiente del protocolo. Un operador que concede un host lo concede para cualquier transporte que ya permitan los permisos de esa instancia, por lo que no existe un eje separado para el texto plano ni un campo <code>egress_allow_plaintext</code>. La confidencialidad es el contrato del transporte con su par, no una segunda lista de destinos. Cuando un protocolo negocia TLS en banda, el host controla la transición de fase y nunca permite un respaldo a texto plano una vez iniciada la actualización.</p>
+<p>Los presupuestos de conexiones por instancia pertenecen a la base y no a cada transporte. <code>plugins.limits.max_connections_per_instance</code> se comparte entre todos los transportes y todos los almacenes que pertenecen a una misma instancia lógica, y una solicitud autorizada mantiene un arrendamiento durante toda la vida de su conexión.</p>
+<h3 id="limitar-la-entrada-de-manifiesto-no-confiable-en-el-mismo-límite"><a class="header" href="#limitar-la-entrada-de-manifiesto-no-confiable-en-el-mismo-límite">Limitar la entrada de manifiesto no confiable en el mismo límite</a></h3>
+<p>Un manifiesto es una entrada controlada por el atacante en el mismo límite de confianza que un destino de salida (egress), por lo que los bytes baratos del manifiesto no deben poder costar trabajo caro en el host. El trabajo tipado de configuración de instancias incluido en #9126 limita la validación de patrones en los esquemas suministrados por el manifiesto en consecuencia: los patrones se compilan en un motor de tiempo lineal con un límite explícito de 256 KiB para el programa compilado y un límite de 1 MiB para el DFA, y un patrón que supere cualquiera de los dos se rechaza como manifiesto inválido en lugar de compilarse. Rechazar el paquete es la dirección segura, porque un autor de plugin que quiera un patrón tan costoso puede escribir uno más pequeño, mientras que un host que ya ha empezado a compilarlo no puede recuperar su planificador. Se registra aquí porque refuerza el límite del que es responsable este ADR, no porque esté en la ruta de salida.</p>
+<h3 id="controles-de-aceptación"><a class="header" href="#controles-de-aceptación">Controles de aceptación</a></h3>
+<p>Este ADR permanece propuesto hasta que se cumplan todas estas condiciones:</p>
+<ul>
+<li>las primitivas de protección compartidas residen en <code>zeroclaw-infra::net_guard</code> con ambos consumidores conectados a ellas, los hooks por almacén y la ruta de envío fijada (pinned) se entregan para los almacenes de plugins, la declaración <code>[egress]</code> del manifiesto existe con análisis, validación y cobertura de firma, la concesión efectiva es la intersección de esa declaración con la entrada del operador, y la siembra en el momento de la instalación y en el momento de la vinculación, así como la ceremonia de comparación de diferencias en las actualizaciones, funcionan (G1);</li>
+<li>El CI obligatorio demuestra el límite con un <em>fixture</em> de componente real: denegado por defecto sin entrada, permitido mediante una entrada precargada, rechazo de metadatos y direcciones privadas sobre una lista de permitidos coincidente, y un componente que sigue una redirección desde un host permitido hacia una clase bloqueada tiene su segunda solicitud denegada (G2);</li>
+<li>el primer plugin de canal seleccionado por <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8850">#8850</a> se ejecuta con una entrada precargada para su host de API (G3); y</li>
+<li>El despliegue para la flota existente está completo: los paquetes del registro oficial <code>http_client</code> incluyen declaraciones <code>[egress]</code> en las versiones republicadas antes de que se active la aplicación en el host. Un diagnóstico durante la actualización enumera los destinos denegados de cada instancia instalada junto con el comando exacto de siembra. La versión que habilita la aplicación documenta la ruptura en su changelog, y #9395 ya está cerrado por el slice de aplicación (G4).</li>
+</ul>
+<p>La guarda compartida, los campos de operador en texto plano, la lectura de la política por solicitud, la gramática estricta de destinos, el límite de NAT64, el presupuesto de conexiones, la declaración <code>[egress]</code> del manifiesto, y la carga inicial en el momento de la instalación y del enlace con el diff de actualización están implementados. El resto de G1, la intersección de esa declaración con la entrada del operador, no lo está, como tampoco G2 a G4.</p>
+<h2 id="consecuencias"><a class="header" href="#consecuencias">Consecuencias</a></h2>
+<p>Consecuencias positivas:</p>
+<ul>
+<li>El cambio #9395 se cierra por construcción y no solo mediante una política de firmas, porque un componente sin firmar o malicioso no puede convertir una autosolicitud del manifiesto en alcance de red.</li>
+<li>Los operadores disponen de un único parámetro de texto plano, auditable, por instancia, y una modificación se aplica a la siguiente conexión sin volver a instanciar el invitado.</li>
+<li>Una actualización de paquete no puede ampliar el tráfico de salida de forma silenciosa.</li>
+<li>Las herramientas integradas y los plugins convergen en un mismo vocabulario de guardas en lugar de divergir entre sí.</li>
+<li>Un nuevo transporte hereda la decisión de destino en lugar de volver a abrirla.</li>
+</ul>
+<p>Consecuencias negativas:</p>
+<ul>
+<li>Este es un cambio incompatible para todo plugin <code>http_client</code> ya instalado: hasta que su entrada sea inicializada o definida, no tiene tráfico saliente. G4 existe por este motivo, y el cambio solo se distribuye cuando ya están disponibles el diagnóstico de migración y las declaraciones republicadas.</li>
+<li>El ceremonial añade un paso en el momento de la instalación y otro en el momento de la vinculación, además del estado de política por entrada.</li>
+<li>Los plugins con necesidades de destino dinámicas, como URLs suministradas por el usuario, no obtienen egreso comodín. Declaran patrones de sufijo que el operador acepta, dependen de entradas creadas por el operador o esperan a un servicio de obtención mediado por el host. Ese es el costo deliberado de la respuesta a la Q4 de #8398.</li>
+<li>Los despliegues detrás de un traductor NAT64 deben declarar sus prefijos para mantener precisa la frontera, y una evaluación conservadora de prefijos superpuestos puede rechazar un destino que el operador considera legítimo.</li>
+<li>La lectura de la política se realiza por solicitud y no por instanciación, por lo que el resolutor de configuración está en la ruta de la conexión.</li>
+</ul>
+<h2 id="referencias"><a class="header" href="#referencias">Referencias</a></h2>
+<ul>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/9395">Bug #9395: el plugin <code>wasi:http</code> de salida no tiene política de destino ni opción de configuración</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8850">Migration tracker #8850</a></li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8398">RFC #8398: modelo de permisos, configuración y secretos de plugins</a> (contexto cerrado/reemplazado)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9580">PR #9580: reforzar el egreso HTTP integrado en el guardián de red compartido</a> (fusionado)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9137">PR #9137: base compartida de política de egreso</a> (fusionado)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9582">PR #9582: aplicar una política de salida de red (egress) propiedad del host en el plugin <code>wasi:http</code></a> (fusionado)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9584">PR #9584: ceremonia de concesión de egress para la instalación y el listado de plugins</a> (cerrado, reemplazado por #11098)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/11098">PR #11098: conceder egress durante la instalación e informar si un plugin se carga</a> (fusionado)</li>
+<li>Issue #10996: sembrar la configuración de instancias de canal y los permisos](https://github.com/zeroclaw-labs/zeroclaw/issues/10996) (siembra en el momento de la vinculación)</li>
+<li><a href="https://github.com/zeroclaw-labs/zeroclaw/pull/9126">PR #9126: validación de configuración de instancia tipada</a> (fusionado)</li>
+<li><a href="./ADR-006-runtime-channel-plugins.html">ADR-006: Plugins de canal en tiempo de ejecución</a></li>
+<li><a href="./ADR-009-wit-wasmtime-plugin-execution.html">ADR-009: Ejecución de plugins WIT y wasmtime</a></li>
+<li><a href="./ADR-012-generation-scoped-live-config-apply.html">ADR-012: Aplicación de configuración en vivo con alcance por generación</a></li>
+<li><a href="../../security/model.html">Modelo de seguridad</a></li>
+<li><code>crates/zeroclaw-infra/src/net_guard.rs</code></li>
+<li><code>crates/zeroclaw-plugins/src/egress.rs</code></li>
+<li><code>crates/zeroclaw-plugins/src/component.rs</code></li>
+<li><code>crates/zeroclaw-config/src/schema.rs</code></li>
+<li><code>crates/zeroclaw-tools/src/helpers/domain_guard.rs</code></li>
+<li><code>crates/zeroclaw-tools/src/http_request.rs</code></li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../../architecture/decisions/ADR-013-key-source-authority.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../../architecture/decisions/ADR-015-unified-capability-catalog.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../../architecture/decisions/ADR-013-key-source-authority.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../../architecture/decisions/ADR-015-unified-capability-catalog.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../../clipboard-1626706a.min.js"></script>
+        <script src="../../highlight-abc7f01d.js"></script>
+        <script src="../../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../../_shared/mermaid.min.js"></script>
+        <script src="../../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["WILDCARD"],"enum":["Resource","Verb"],"struct":["ResolvedGrants","ResourceIter","VerbIter"]};

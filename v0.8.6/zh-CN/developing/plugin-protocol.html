@@ -1,0 +1,724 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>插件协议 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="type: 参考 status: 已接受 last-reviewed: 2026-09-07 relates-to:">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-be837aa1.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/developing/plugin-protocol.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/developing/plugin-protocol.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/developing/plugin-protocol.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/developing/plugin-protocol.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/developing/plugin-protocol.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/developing/plugin-protocol.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/developing/plugin-protocol.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="插件协议 - ZeroClaw Docs">
+        <meta property="og:description" content="type: 参考 status: 已接受 last-reviewed: 2026-09-07 relates-to:">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/zh-CN/developing/plugin-protocol.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="插件协议 - ZeroClaw Docs">
+        <meta name="twitter:description" content="type: 参考 status: 已接受 last-reviewed: 2026-09-07 relates-to:">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <hr>
+<p>type: 参考 status: 已接受 last-reviewed: 2026-09-07 relates-to:</p>
+<ul>
+<li>FND-001</li>
+<li>ADR-003</li>
+<li>crates/zeroclaw-plugins</li>
+</ul>
+<hr>
+<h1 id="插件协议"><a class="header" href="#插件协议">插件协议</a></h1>
+<p>本文档定义了 ZeroClaw 的插件宿主与 WASM 插件组件之间的协议。</p>
+<h2 id="什么是插件"><a class="header" href="#什么是插件">什么是插件</a></h2>
+<p>插件是一个自包含的 WebAssembly 组件，ZeroClaw 会在运行时加载它，以添加核心二进制未随附的能力。它位于 <code>~/.zeroclaw/plugins/</code> 下自己的目录中，并带有一个清单，说明其名称并声明它提供什么。ZeroClaw 会在启动时发现它，验证它，并将其导出的函数接入正在运行的 agent，使其表现得像内置能力：工具插件在模型看来只是另一个可调用的工具（<code>WasmTool</code> 实现了与原生工具相同的 <code>Tool</code> trait），通道插件表现为消息通道，内存插件表现为存储后端。</p>
+<p>插件可以提供 <code>PluginCapability</code>（<code>crates/zeroclaw-plugins/src/lib.rs</code>）中定义的一项或多项能力：可调用工具、消息通道、内存后端、可观测性后端，或一组 markdown 技能。技能这一情况比较特殊：它完全不包含 WASM，只提供一个包含 markdown 的 <code>skills/</code> 目录，这也是它唯一省略编译组件的能力。</p>
+<h3 id="为什么要构建一个"><a class="header" href="#为什么要构建一个">为什么要构建一个</a></h3>
+<ul>
+<li><strong>无需分叉即可扩展。</strong> 无需修改 ZeroClaw 源码树或等待发布即可添加工具或通道；插件归你所有，并从你的安装目录加载。</li>
+<li><strong>原生行为。</strong> 已加载的插件不是二等附加组件。桥接实现了内置项使用的相同运行时特性，因此插件工具会像第一方工具一样被提供给模型、归属并被调用。</li>
+<li><strong>语言选择。</strong> 合约是 WIT 和 WASI Component Model，而不是 Rust API。任何可编译为 <code>wasm32-wasip2</code> component 的语言都可以实现一个 world。下面的实操指南以 Rust 为例，因为这是目前支持最完善的路径，但边界本身与语言无关。</li>
+<li><strong>默认沙箱隔离。</strong> 宿主会将每个插件加载到一个 WASI 上下文中，该上下文没有文件系统预打开项，也没有环境网络访问权限。插件无法悄无声息地连接宿主；它只能获得接入其 world 的宿主函数，别无其他。出站 HTTP、原始套接字和 WebSocket 是可以被开启的网络接口，每一项都受两层控制：清单授权（<code>http_client</code>、<code>socket_client</code> 或 <code>websocket_client</code>）决定适配器是否链接该_接口_，而运维人员针对每个实例设置的 <code>plugins.entries.&lt;key&gt;.egress_hosts</code> 授权则决定_可达范围_，三者共用同一范围设置。工具和通道适配器会链接这些接口；内存模块目前不提供这些接口。若未设置出站授权，可达范围为全部拒绝，因此仅链接接口本身不会发送任何数据。</li>
+<li><strong>可验证的来源。</strong> 清单可以使用 Ed25519 签名，并且运营者可以要求在任何插件加载之前，由受信任的发布者提供签名。</li>
+</ul>
+<h3 id="插件目前不能做什么"><a class="header" href="#插件目前不能做什么">插件（目前）不能做什么</a></h3>
+<p>这些是当前主机的真实限制，不是样式偏好。在围绕一个并不存在的能力进行设计之前，请先了解它们。</p>
+<ul>
+<li><strong><code>logging</code>、类型化配置、实例作用域的密钥和持久化状态，以及 <code>http_client</code> 和主机驱动的入站功能均已接入。</strong> 在清单可声明的权限中，<code>config_read</code> 用于暴露插件自身经过 schema 校验的公开配置。工具或通道的 schema 可以指定一些密钥，这些密钥不会出现在公开配置中，而是在经过授权的服务调用中解析。<code>state_read</code> 和 <code>state_write</code> 用于控制加密的、支持比较并交换（compare-and-swap）的状态，这些状态归属于经准入的特定实例。<code>http_client</code> 授权是出站 <code>wasi:http</code> 的必要条件，但并不充分：能力适配器必须链接该主机接口（工具和通道会链接，memory 有意保持不使用 HTTP，直到其网络边界具备组件级覆盖为止），并且运维人员必须通过 <code>egress_hosts</code> 授予目标地址。若没有该授权，所有目标都会在数据包发出或域名解析之前被拒绝。<code>socket_client</code> 和 <code>websocket_client</code> 按相同条件链接 <code>sockets</code> 和 <code>websocket</code> 导入：相同的授权、地址类别规则以及每个实例的连接预算。授权以主机名而非端口为单位：对于 <code>socket_client</code>，已授权的主机可通过原始 TCP 在任意端口访问，因此只应授权插件可以使用任何协议与之通信的主机。清单 schema 仍接受文件系统和内存访问权限，但它们目前不起作用：其主机函数尚未在 linker 中注册。参见下文的权限和主机导入。</li>
+<li><strong>无环境主机网络或文件系统访问。</strong> WASI 上下文没有预打开的目录（preopens），也没有环境网络访问，因此插件无法通过环境 WASI 打开原始套接字或读取主机文件。持有 <code>http_client</code> 授权的工具或通道插件可获得出站 <code>wasi:http</code>；持有 <code>socket_client</code> 或 <code>websocket_client</code> 授权的插件则可获得由主机代理的 TCP/TLS/STARTTLS 或 WebSocket 连接，且这些连接仅能到达其运营者出口授权所列出的目标地址；记忆插件目前不获得上述任何一种访问权限。没有任何插件可以监听端口。需要接收入站流量的通道插件不会自行打开监听器：由主机运行监听器，并通过 <code>inbound</code> 导入函数投递消息，插件再从其 <code>poll-message</code> 导出函数中取出这些消息。</li>
+<li><strong>32 位边界。</strong> 目标是 <code>wasm32-wasip2</code>。来宾内存是 32 位地址空间，组件 ABI 会将偏移量降级为 32 位，而不受宿主字长大小影响。大值（例如通道附件的原始字节）通过按值传递跨越该边界。有关这为何是上游工具链的约束，而不是本仓库可以切换的标志，请参见 32 位地址空间部分。</li>
+<li><strong>每个工具插件只对应一个工具。</strong> <code>tool-plugin</code> world 只导出一个名为 <code>tool</code> 的接口，并带有一个 schema。需要暴露多个工具的插件会提供多个组件，或者使用不同的 world。</li>
+<li><strong>实验性，未冻结的契约。</strong> <code>wit/v0</code> 目前还没有 <code>.frozen</code> 标记，因此这些接口在首次稳定版发布前仍可能变更。请固定到某个版本，并预期在 WIT 升级后重新编译。</li>
+</ul>
+<h2 id="架构"><a class="header" href="#架构">架构</a></h2>
+<p>ZeroClaw 插件是由 <code>wit/v0/</code> 下的 WIT 接口定义的 WebAssembly 组件，并通过直接使用 <code>wasmtime</code>（<code>crates/zeroclaw-plugins</code>）托管。插件会编译为 WASI Preview 2 组件（<code>wasm32-wasip2</code>），导出插件 world 中的一个（<code>tool-plugin</code>、<code>channel-plugin</code>、<code>memory-plugin</code>），并导入该 world 在 <code>wit/v0/</code> 中声明的宿主接口。</p>
+<p>宿主位于 <code>crates/zeroclaw-plugins/src/component.rs</code>。它持有一个启用异步的 <code>wasmtime::Engine</code>，使用 <code>wasmtime::component::bindgen!</code> 从 <code>wit/v0</code> 生成 world 绑定，并将沙箱化的 WASI p2 接口接入每个 world 的链接器。每个 store 的宿主状态（<code>PluginState</code>）包含一个在无预打开目录且无网络的条件下构建的 <code>WasiCtx</code>、WASI 所需的 <code>ResourceTable</code>、宿主签发的作用域，以及带类型的活动服务句柄。每个 world 都导入 <code>logging</code>；tool 导入 <code>secrets</code>，而 channel 导入 <code>config</code>、<code>secrets</code> 和 <code>inbound</code>。获得 <code>http_client</code> 权限后，还会附加并链接 <code>wasi:http</code>。world 声明和获准作用域仍是该接口的规范契约（参见“宿主导入”）。</p>
+<p>这三个 world bridges 将每个 WIT world 映射到运行时的原生 traits：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>World</th><th>桥接模块</th><th>运行时表面</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tool-plugin</code></td><td><code>runtime.rs</code>, <code>wasm_tool.rs</code></td><td><code>zeroclaw_api::tool::Tool</code></td></tr>
+<tr><td><code>channel-plugin</code></td><td><code>wasm_channel.rs</code></td><td>channel trait</td></tr>
+<tr><td><code>memory-plugin</code></td><td><code>wasm_memory.rs</code></td><td>内存后端 trait</td></tr>
+</tbody>
+</table>
+</div>
+<p>工具插件在每次调用时使用全新的存储（无状态）。Channel 和 memory 插件在插件生命周期内持有一个由异步互斥锁保护的热存储。</p>
+<p>工具插件已完成端到端的发现与注册：运行时会遍历 <code>channel_plugin_details()</code> 的工具对应项，并为每个工具构建一个 <code>WasmTool</code>。通道宿主适配器（<code>WasmChannel</code>，包括其需经授权门控的 <code>wasi:http</code> 接口、由宿主掌控的出口策略、就近取用的配置服务，以及由宿主填充的 <code>inbound</code> 队列）已经完成，并通过了基于真实组件的出口测试。<code>PluginHost::channel_plugin_details()</code> 会暴露可供注册的 Wasm 通道插件。运行时现在会解析显式声明的 <code>[channels.plugin.&lt;alias&gt;]</code> 绑定，构建其 <code>WasmChannel</code>，并以配置的别名进行注册。这种感知别名的构造方式与运行时配置解析已在 <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/10146">#10146</a> 中落地。通道还可以选择启用下文所述的通用网关自有 POST webhook 入口；厂商隧道、轮询客户端及其他传输方式仍属于后续工作。内存桥接器（<code>WasmMemory</code>）处于更早一步的相同状态：适配器已针对 <code>memory-plugin</code> world 完整实现了 <code>Memory</code> trait，但宿主尚未向 <code>channel_plugin_details()</code> 暴露对应的内存插件，运行时也尚未将 <code>WasmMemory</code> 构造为可配置的后端。</p>
+<h2 id="插件结构"><a class="header" href="#插件结构">插件结构</a></h2>
+<p>插件是一个包含以下内容的目录：</p>
+<pre><code>my-plugin/
+  manifest.toml    # Plugin metadata and permissions
+  plugin.wasm      # Compiled WASM module (optional for skill-only plugins)
+</code></pre>
+<p>插件从 <code>~/.zeroclaw/plugins/</code> 目录中自动发现（可通过配置文件中的 <code>plugins.plugins_dir</code> 进行配置）。</p>
+<h2 id="注册表搜索和安装"><a class="header" href="#注册表搜索和安装">注册表搜索和安装</a></h2>
+<p>本地插件安装路径仍然是已安装插件的事实来源。注册表只是一个在命令执行时用于发现并下载插件归档的 JSON 索引：</p>
+<pre><code class="language-bash">zeroclaw plugin search calendar
+zeroclaw plugin install team-calendar
+zeroclaw plugin install team-calendar@0.2.0
+zeroclaw plugin search calendar --registry https://example.invalid/registry.json
+zeroclaw plugin install team-calendar --registry https://example.invalid/registry.json
+</code></pre>
+<p><code>zeroclaw plugin search</code> 会获取注册表元数据，并将查询与插件名称和描述进行匹配。它不会安装、启用或执行插件代码。</p>
+<p>该获取到的索引已被缓存。<code>zeroclaw plugin list</code> 会读取该缓存，并与宿主已接纳的已安装记录一同显示一行软件包信息，不会发起获取操作，也不会将注册表元数据视为代码已安装的证明。</p>
+<p><code>zeroclaw plugin install &lt;name&gt;</code> 会从注册表中解析名称，下载所选的 zip 压缩包，校验可选的 SHA-256 摘要，安全地解压该压缩包，然后将解压后的插件目录交给与本地安装相同的准入流程。准入（<code>PluginHost::admit_source</code>）会解析并检查清单的签名，验证其结构和配置，拒绝已安装的同名插件，并且只读取一次组件：路径必须位于软件包内部，且路径上不能有符号链接；读取上限为 64 MiB，若文件元数据显示其超过该大小则直接拒绝；同时检查可选的 <code>wasm_sha256</code> 摘要。随后 CLI 会对这些已准入的字节执行安装时加载检查：即守护进程启动时执行的同一实例化过程，因此基于已漂移 WIT 构建的组件会在安装时失败并给出完整诊断信息，而不会在之后被静默跳过。<code>plugin install --no-verify</code> 会完全跳过加载检查（不进行任何编译），并输出一条提示说明；但它不会绕过准入流程。未内置 WASM 后端的主机没有可供实例化的运行环境，因此会在不进行检查的情况下安装。安装（<code>PluginHost::install_admitted</code>）随后会持久化已准入的清单字节，并写入已准入的组件字节，因此经过验证的内容与守护进程将要加载的内容逐字节一致。本地路径安装遵循相同的流程。</p>
+<p>当没有固定版本时，ZeroClaw 会选择注册表索引中的最后一个匹配条目，因此注册表发布者应有意安排重复名称的顺序。</p>
+<pre><code class="language-bash">zeroclaw plugin install ./my-plugin
+zeroclaw plugin install ./my-plugin/manifest.toml
+</code></pre>
+<p><code>zeroclaw plugin update</code> 通过同一套准入流程（<code>PluginHost::admit_update</code>）替换已安装的软件包，只是身份判定方向相反：指定的软件包必须已安装，且源中必须带有其名称。若新清单新增了权限，CLI 会拒绝，除非传入 <code>--allow</code> 予以接受；随后执行同样的加载检查，且不可跳过。<code>PluginHost::update_admitted</code> 会先在暂存目录中构建替换版本，再将其重命名到已安装软件包的位置。面向用户的约定见 <a href="../plugins/index.html#updating-a-plugin">更新插件</a>。</p>
+<pre><code class="language-bash">zeroclaw plugin update team-calendar
+zeroclaw plugin update team-calendar@0.2.0 --registry https://example.invalid/registry.json
+zeroclaw plugin update --all
+zeroclaw plugin update my-plugin --from ./my-plugin
+</code></pre>
+<p>默认的注册表 URL 是：</p>
+<pre><code class="language-text">https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.json
+</code></pre>
+<p>对于私有或分阶段的 registry，可为每个命令使用 <code>--registry &lt;url&gt;</code>，或设置 <code>ZEROCLAW_PLUGIN_REGISTRY_URL</code>。</p>
+<p>Registry 条目使用此格式：</p>
+<pre><code class="language-json">{
+  "plugins": [
+    {
+      "name": "team-calendar",
+      version: "0.8.6",
+      "描述": 在团队日历上安排会议,
+      "author": "Example Team",
+      "capabilities": [tool],
+      "url": "https://example.invalid/team-calendar-0.2.0.zip",
+      "sha256": "sha256:&lt;zip 的十六进制摘要&gt;"
+    }
+  ]
+}
+</code></pre>
+<p>归档必须包含根级 <code>manifest.toml</code>，或包含一个嵌套插件目录且其中有 <code>manifest.toml</code>。带有遍历路径、绝对路径、Windows 驱动器前缀路径，或包含多个 manifest 的归档会在安装前被拒绝。下载在流式传输时也有上限，因此没有 <code>Content-Length</code> 的服务器无法强迫 ZeroClaw 缓冲一个过大的归档。解压同样有上限，因此压缩归档不能在临时安装区域内无限膨胀。</p>
+<p>注册表请求有时间限制。连接注册表或归档主机最多允许 10 秒；响应在返回头部之前以及读取正文的两次读取之间，若超过 30 秒未传输任何数据，也会超时。获取索引必须在 30 秒内完成，下载归档文件必须在 30 分钟内完成。因此，当注册表或归档主机停滞时，<code>zeroclaw plugin search</code> 或 <code>zeroclaw plugin install</code> 会直接失败，而不会无限等待；而持续传输数据的慢速归档下载，则只受 30 分钟上限约束。</p>
+<p>搜索是未认证的发现。安装是安全边界：注册表安装会使用已配置的插件签名策略和受信任的发布者密钥，与通过 <code>PluginHost::install</code> 进行的本地插件安装相同。</p>
+<h3 id="仅含技能的插件布局markdown-包"><a class="header" href="#仅含技能的插件布局markdown-包">仅含技能的插件布局（markdown 包）</a></h3>
+<p>仅具备 <code>skill</code> 能力的插件会将技能以 <a href="https://agentskills.io">agentskills.io</a> 格式放置在 <code>skills/</code> 目录下，并省略 <code>wasm_path</code>：</p>
+<pre><code>my-toolkit/
+  manifest.toml              # declares the skill capability, no wasm_path
+  README.md                  # optional bundle-level overview
+  skills/
+    design-review/
+      SKILL.md
+      scripts/
+      references/
+    code-review/
+      SKILL.md
+    data-analysis/
+      SKILL.md
+      references/
+</code></pre>
+<p>每个 <code>SKILL.md</code> 都必须包含带有 <code>name</code> 和 <code>description</code> 字段的 YAML frontmatter；如果 bundle 中的技能缺少其中任一字段，运行时会在发现阶段（而非首次调用时）将其拒绝。技能以插件命名空间 ID 的形式注册，格式为 <code>plugin:&lt;plugin-name&gt;/&lt;skill-name&gt;</code>（例如 <code>plugin:my-toolkit/design-review</code>），以避免与用户自定义技能以及不同 bundle 之间发生冲突。</p>
+<h2 id="清单格式"><a class="header" href="#清单格式">清单格式</a></h2>
+<!-- Canonical plugin manifest field reference. Edit here; reuse via {{#include}}. -->
+<p>manifest 是插件目录中名为 <code>manifest.toml</code> 的文件。其字段是 <code>crates/zeroclaw-plugins/src/lib.rs</code> 中 <code>PluginManifest</code> 的 serde 表面，这是唯一的事实来源：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>字段</th><th>必填</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>是</td><td>唯一的规范包 slug，也是每个派生实例配置键中的包组件。它本身不是操作符配置键。使用 1–128 个小写 ASCII 字符；以 <code>[a-z0-9]</code> 开头和结尾，中间只能包含 <code>[a-z0-9._-]</code>。发现过程会拒绝无效或重复的名称。</td></tr>
+<tr><td><code>version</code></td><td>是</td><td>版本字符串，例如 <code>0.1.0</code>。</td></tr>
+<tr><td><code>description</code></td><td>不</td><td>由 <code>zeroclaw plugin list</code> 显示的人类可读描述。</td></tr>
+<tr><td><code>author</code></td><td>不</td><td>作者姓名或组织。</td></tr>
+<tr><td><code>wasm_path</code></td><td>用于 WASM 能力</td><td>组件文件名，相对于插件目录。除非唯一的 capability 是 <code>skill</code>，否则为必填。如果指定的文件不存在，发现过程会跳过该插件。</td></tr>
+<tr><td><code>wasm_sha256</code></td><td>在 WASM 能力的严格模式下</td><td>十六进制的 SHA-256 值，对应组件的精确字节内容。若存在该值，则始终强制校验；严格签名策略要求必须提供该值，以便已签名的清单能够绑定被准入的可执行文件。</td></tr>
+<tr><td><code>capabilities</code></td><td>是，非空</td><td>插件类型：<code>tool</code>、<code>channel</code>、<code>memory</code>、<code>observer</code>、<code>skill</code> 中的任意一个（<code>PluginCapability</code>，序列化为 snake_case）。</td></tr>
+<tr><td><code>provides</code></td><td>不</td><td>面向内置通道的 <code>channel</code> 插件（drop-in）：它所镜像的蛇形命名配置 ID，例如 <code>telegram</code>、<code>gmail_push</code>。宿主会为每个已配置、已启用，且被已启用 agent 路由到的 <code>[channels.&lt;id&gt;.&lt;alias&gt;]</code> 准入一个逻辑实例，因此规范的通道配置仍是这些设置的唯一归属。需要 <code>config_read</code>。<code>plugin</code> 系列为保留项，会被拒绝；本构建未定义的 ID 会被拒绝；两个已安装包声明同一 ID 时，两者都会被拒绝。未设置（默认）时，表示从 <code>[channels.plugin.&lt;alias&gt;]</code> 配置的新通道。镜像已准入但尚未构建，参见 <code>crates/zeroclaw-runtime/src/plugin_runtime.rs</code> 中的激活计划。</td></tr>
+<tr><td><code>permissions</code></td><td>不</td><td>宿主服务（代码可能访问的服务）：<code>http_client</code>、<code>config_read</code>、<code>state_read</code>、<code>state_write</code>、<code>file_read</code>、<code>file_write</code>、<code>memory_read</code>、<code>memory_write</code>（<code>PluginPermission</code>）。HTTP、配置和精确实例状态权限仅对工具/通道适配器强制执行；文件系统和内存权限目前不生效。声明 <code>config_read</code> 时必须同时声明 <code>config_schema</code>。</td></tr>
+<tr><td><code>config_schema</code></td><td>恰好使用 <code>config_read</code></td><td>为此插件的私有配置起草一份 Draft 2020-12 JSON Schema。它包含在规范清单字节中，因此清单签名时会一并覆盖。根对象必须是带有 <code>properties</code> 映射且 <code>additionalProperties = false</code> 的对象。每个顶层属性必须直接或通过本地 JSON Pointer 明确指定一种受支持的类型：<code>string</code>、<code>boolean</code>、<code>integer</code>、<code>number</code>、<code>array</code> 或 <code>object</code>。工具和通道的使用方可以直接在顶层 string 属性上设置 <code>x-secret = true</code>，使其从公共配置中移除，并通过限定作用域的 <code>secrets.get</code> 宿主导入提供。secret 属性名是 1–128 字节的可移植 ASCII 名称，只能包含字母、数字、<code>_</code>、<code>-</code> 或 <code>.</code>。工具通过 <code>__config</code> 接收公共配置，并可在 <code>execute</code> 期间读取 secret。通道在 <code>configure</code> 和运行时操作调用期间，通过 <code>config.get</code> 读取当前公共对象，并通过 <code>secrets.get</code> 读取 secret；这两个导入在实例化和静态元数据发现期间均不可用。嵌套的、值为 false 或非布尔值的 secret 标记，以及非字符串的 secret 属性都会被拒绝。没有 <code>config_read</code> 的 schema，或没有 schema 的 <code>config_read</code>，都会被拒绝。</td></tr>
+<tr><td><code>signature</code></td><td>不</td><td>对规范化清单字节进行的 Base64url Ed25519 签名。用于发布签名时设置。</td></tr>
+<tr><td><code>publisher_key</code></td><td>不</td><td>签名者的十六进制编码 Ed25519 公钥。</td></tr>
+<tr><td><code>egress</code></td><td>不</td><td>可选的 <code>[egress]</code> 表，包含一个 <code>hosts</code> 列表：声明该插件所需访问的目标地址，可以是精确主机名（<code>api.example.com</code>）或显式的后缀模式（<code>*.example.com</code>，匹配子域名但不匹配顶级域名本身）。该表属于规范化的清单字节内容，因此在清单签名时会被一并覆盖，修改它需要重新签名。无效语法会在发现和安装阶段导致整个清单被拒绝。缺失、为空以及“未声明任何内容“三种状态视为相同。</td></tr>
+</tbody>
+</table>
+</div>
+<p>只声明代码实际使用的权限。未声明的权限是组件无法触达的宿主表面；不必要声明的权限则是你主动增加的攻击面，也是审查你的插件的人需要承担的审核负担。</p>
+<p><code>[egress]</code> 是一项声明，而非授权。清单文件本身不赋予任何网络访问权限：主机强制执行的白名单是运维人员在该实例自身的 <code>zpi1_…</code> 记录上设置的 <code>plugins.entries[].egress_hosts</code>，因此即使未签名的组件自行写入了 <code>[egress]</code> 表，也无法访问任何地址。声明的作用在于安装流程：<code>zeroclaw plugin install</code> 会将其写入它新建的记录中，并打印已授予的内容；对于已存在的记录，它从不会扩大其权限。参见 <a href="../plugins/index.html#declaring-and-granting-egress">Declaring and granting egress</a>。</p>
+<p>操作方提供的值在 <code>plugins.entries</code> 中仍保持为字符串，并会在持久化时加密，以一个由宿主拥有的包、能力和绑定标识派生的版本化 <code>zpi1_…</code> 字符串作为键（安装过程会打印并初始化默认工具绑定的完整实例密钥）：字符串按原样存储，布尔值和数字使用 JSON 标量文本，数组和对象使用 JSON 文本。在任何来宾代码运行之前，宿主会将这些字符串物化为包模式规定的类型，并针对工具和频道适配器验证完整对象。非机密工具属性构成 <code>__config</code>；频道通过 <code>config.get</code> 获取非机密对象。标记为 <code>x-secret = true</code> 的属性会从两个公共接口中省略，仅可在授权的服务帧中通过 <code>secrets.get("property")</code> 获取。频道在一次调用中的公共和机密读取共享同一个规范修订版本，调用结束时宿主会丢弃该物化视图。符合要求的频道插件 <strong>必须</strong> 在每个使用点都解析这两类值，并且不得在来宾的热状态中保留配置或凭据值；将明文返回给来宾意味着宿主无法针对恶意代码强制实施不保留策略。如果请求了 <code>config_read</code> 但未实际获授予，宿主会验证一个空对象；因此，包含必需属性的模式会拒绝启动，而不会在缺少必需配置的情况下启动。如果空对象有效，工具会省略空的 <code>__config</code>，而频道的配置/机密导入会返回 <code>access-denied</code>；在授权帧之外的调用、解析失败以及宿主调用预算耗尽会返回 <code>unavailable</code>。</p>
+<h3 id="功能"><a class="header" href="#功能">功能</a></h3>
+<p><code>capabilities</code> 是一个非空的 <code>PluginCapability</code> 值列表，定义在 <code>crates/zeroclaw-plugins/src/lib.rs</code> 中（序列化为 <code>snake_case</code>）。每个值要么选择插件导出的 WIT world（<code>tool</code>、<code>channel</code>、<code>memory</code>），要么命名一个可观测性后端（<code>observer</code>），要么标记一个仅限 markdown 的技能包（<code>skill</code>）。请阅读该枚举以获取规范集合；它是唯一的真实来源，本页面不再重复说明。</p>
+<p>清单必须声明至少一个能力。除仅具有 <code>skill</code> 这一能力的插件外，每个能力都需要 <code>wasm_path</code>；该插件不携带 WASM 载荷，并且如果它省略了有效的 <code>skills/</code> bundle，则会在发现时被拒绝（<code>host.rs</code> 中的 <code>validate_manifest_shape</code>）。</p>
+<h3 id="权限"><a class="header" href="#权限">权限</a></h3>
+<p><code>permissions</code> 是一个 <code>PluginPermission</code> 值列表，也定义在 <code>crates/zeroclaw-plugins/src/lib.rs</code> 中。请阅读该枚举以获取规范集合。</p>
+<p>请注意声明与实际强制执行之间的差距：目前在组件宿主中，<code>config_read</code>、<code>http_client</code>、<code>state_read</code> 和 <code>state_write</code> 具有实际行为效果。请求 <code>config_read</code> 时必须提供 <code>config_schema</code>，而仅声明该 schema 却未申请该权限同样会被拒绝。在使用工具或通道组件之前，宿主会先解析其有效授权，将插件的运维人员配置值物化为带类型的 JSON，并校验完整对象。<code>runtime.rs</code> 会剥离调用方提供的任何 <code>__config</code>，再将经过校验的非机密值注入工具调用中；直接的顶层字符串属性若标记为 <code>x-secret: true</code>，则会从公开配置中省略，并通过宿主范围的 <code>secrets</code> 导入读取。工具在 <code>execute</code> 期间可以获得该服务。通道在 <code>configure</code> 和运行期操作中，通过 <code>config.get</code> 获取公开配置，通过 <code>secrets.get</code> 获取机密；实例化和静态元数据发现阶段则仍不可用。<code>http_client</code> 是必要的授权，而非完整的权限决策：能力适配器还必须构造 HTTP 上下文并链接 <code>wasi:http</code>，且宿主自有的出口策略必须允许目标地址。工具和通道适配器在授权校验之后链接该接口；内存适配器则有意不链接它，因此向内存范围授予 <code>http_client</code> 不会增加任何网络接口。对于工具和通道，在运维人员于 <code>plugins.entries.&lt;key&gt;.egress_hosts</code> 下列出目标地址之前，该接口实际上无法访问任何地址；策略会拒绝其他所有主机。已授权的主机如果解析为回环、私有或链路本地地址，除非运维人员还在 <code>plugins.entries.&lt;key&gt;.egress_allow_private</code> 下列出该主机，否则仍会被拒绝。该例外仅放宽已授权目标的地址类别，绝不会授予权限（运维端说明见 <a href="../plugins/index.html">Plugins</a>）。状态权限独立地控制工具和通道服务帧中 <code>state.get</code> 以及 <code>state.put</code>/<code>delete</code> 导入的使用。包、能力和绑定仅来自已准入的宿主范围；访客不提供命名空间。其余变体（<code>file_read</code>、<code>file_write</code>、<code>memory_read</code>、<code>memory_write</code>）已被清单 schema 接受，但尚未接入任何宿主导入：仅声明它们本身不授予任何权限。它们只是为将来用于控制这些权限的宿主函数预留名称（见下文 Host imports）。</p>
+<h2 id="wit-接口"><a class="header" href="#wit-接口">WIT 接口</a></h2>
+<p>插件契约是 <code>wit/v0/</code> 中的 WIT 文件集合，包为 <code>zeroclaw:plugin@0.1.0</code>。在该包稳定之前，每个条目都受 <code>@unstable(feature = plugins-wit-v0)</code> 保护；兼容性规则请参见 <code>wit/VERSIONING.md</code>。下面的接口仅作概览；<code>.wit</code> 文件才是准确签名的权威来源。</p>
+<h3 id="世界"><a class="header" href="#世界">世界</a></h3>
+<p><code>wit/v0/</code> 定义了三个 world，由 <code>component.rs</code> 中的 <code>bindgen!</code> 进行绑定。每个 world 都导入 <code>logging</code>（宿主提供），并导出 <code>plugin-info</code> 以及其主要接口：<code>tool-plugin</code> 导出 <code>tool</code>，<code>channel-plugin</code> 导出 <code>channel</code>，<code>memory-plugin</code> 导出 <code>memory</code>。<code>tool</code> 还导入 <code>secrets</code> 和 <code>state</code>；<code>channel</code> 导入 <code>config</code>、<code>secrets</code>、<code>state</code> 和 <code>inbound</code>。<code>tool</code> 和 <code>channel</code> 另外在各自的 feature 下导入 <code>sockets</code> 和 <code>websocket</code>（<code>plugins-wit-v0-sockets</code>、<code>plugins-wit-v0-websocket</code>）。宿主只会为持有对应授权（grant）的实例链接这些接口，因此导入了未获授权接口的组件将无法实例化。每个 world 必需的（无默认值的）导出列在其 <code>.wit</code> 文件的 world 文档注释中。</p>
+<h3 id="tool-接口"><a class="header" href="#tool-接口"><code>tool</code> 接口</a></h3>
+<p><code>wit/v0/tool.wit</code> 定义了单工具接口。宿主在加载时调用一次 <code>name</code>、<code>description</code> 和 <code>parameters-schema</code>，然后在每次调用时分派 <code>execute</code>：</p>
+<pre><code class="language-wit">record tool-result {
+    success: bool,
+    output: string,
+    error: option&lt;string&gt;,
+}
+
+name: func() -&gt; string;
+description: func() -&gt; string;
+parameters-schema: func() -&gt; json-string;
+execute: func(args: json-string) -&gt; result&lt;tool-result, string&gt;;
+</code></pre>
+<p><code>parameters-schema</code> 返回一个呈现给 LLM 用于工具调用的 JSON Schema 字符串。<code>execute</code> 接收与该 schema 匹配的 JSON 编码参数，并返回一个 <code>tool-result</code> 或错误字符串。<code>json-string</code> 是来自 <code>wit/v0/types.wit</code> 的 <code>string</code> 类型别名；调用方生成有效的 JSON，接收方对其进行解析。</p>
+<h3 id="channel-和-memory-接口"><a class="header" href="#channel-和-memory-接口"><code>channel</code> 和 <code>memory</code> 接口</a></h3>
+<p><code>wit/v0/channel.wit</code> 和 <code>wit/v0/memory.wit</code> 定义了受能力标志控制的接口面。宿主在加载时只调用一次 <code>get-channel-capabilities</code> / <code>get-memory-capabilities</code>，对于每个未设置的标志，它会使用 Rust trait 默认值，而不是调用插件。插件仍必须导出每个函数（返回文档中所述默认值的存根即可）；宿主只是不调用那些对应标志缺失的函数。每个未设置标志所解析出的默认值都在 WIT 中 <code>*-capabilities</code> 标志旁的内联文档里注明，这是标志集合及其默认值的唯一事实来源。</p>
+<h3 id="功能标志"><a class="header" href="#功能标志">功能标志</a></h3>
+<p>可选方法通过 <code>flags channel-capabilities</code> 和 <code>flags memory-capabilities</code> 进行公开说明。由于 flags 是位掩码，可以在不破坏兼容性的情况下向 <code>vN/</code> 包添加新的可选方法，并配套一个新的 <code>@since</code> 函数。移除或重命名 flag、function、field 或 variant case 都属于破坏性更改，并且需要新的 <code>vN+1/</code> 目录。</p>
+<h2 id="主机导入"><a class="header" href="#主机导入">主机导入</a></h2>
+<p>宿主函数由插件导入，并由运行时提供。每个 world 的链接器都会连接 <code>logging</code>（通过 <code>component_logging.rs</code> 中的宿主实现，与 <code>component.rs</code> 中的 <code>add_wasi</code> 一起链接）。Tool 和 channel 链接实例作用域的 <code>secrets</code> 服务。Channel 还会导入 <code>config</code>（用于其类型化的公共对象），以及 <code>inbound</code>（用于其从 <code>poll-message</code> 中消费的、由宿主填充的消息队列）。Tool 和 channel 适配器仅在已准入的作用域授予 <code>http_client</code> 之后，才链接出站 <code>wasi:http</code>（<code>PluginStoreSpec::with_granted_http</code> 与 <code>component.rs</code> 中的 <code>add_wasi_http</code>），并且两者都会组合宿主拥有的可达性策略（<code>PluginStoreSpec::with_egress_policy</code>），从而使访客永远不会获得 Wasmtime 默认的无限制钩子。Memory 既不提供上下文，也不提供链接器接口。文件系统与内存访问权限仍处于未生效状态：用于限制它们的宿主函数尚未接入链接器。插件的环境权限由 WASI 上下文（无预打开目录、无隐式网络访问）加上其授权与适配器选择加入所共同启用的宿主导入构成，且仅限于这些导入。</p>
+<p>ZeroClaw 所有的导入在每个由主机调度的服务帧中共享固定的安全预算。规范上限是 <code>crates/zeroclaw-plugins/src/component.rs</code> 中的 <code>MAX_HOST_CALLS_PER_FRAME</code>。预算耗尽后，日志记录变为空操作，入站轮询报告为空，读取公共配置或机密时返回 <code>unavailable</code>。新帧会重置预算。此上限是固定的主机策略，而不是重复的运维人员配置。</p>
+<h3 id="inbound"><a class="header" href="#inbound"><code>inbound</code></a></h3>
+<p><code>wit/v0/inbound.wit</code> 被 <code>channel-plugin</code> world 导入。channel 插件本身不运行监听器，因此由宿主运行监听器（webhook 服务器、供应商隧道或轮询客户端），并将接收到的每条消息入队。插件通过调用 <code>inbound-poll</code> 从其 <code>poll-message</code> 导出中清空队列，并可使用 <code>inbound-pending</code> 以批量方式清空：</p>
+<pre><code class="language-wit">inbound-poll: func() -&gt; option&lt;host-inbound-message&gt;;
+inbound-pending: func() -&gt; u32;
+</code></pre>
+<p>主机侧为每个通道持有一个 <code>InboundQueue</code>；<code>WasmChannel::inbound</code> 会将一个克隆体交给监听任务，因此入队的流量对插件的 drain 可见。</p>
+<h3 id="channel-webhook-入口"><a class="header" href="#channel-webhook-入口">Channel Webhook 入口</a></h3>
+<p>一个通道组件可以在其返回的 <code>channel-capabilities</code> 中添加 <code>webhook-ingress</code>，并实现 <code>webhook-path</code> 和 <code>parse-webhook</code>。宿主随后会在 <code>/plugin/&lt;path&gt;</code> 上挂载 GET/POST 路由。路径是运行时声明，而非配置项：它必须包含 1–64 个 ASCII 字母、数字、连字符或下划线。当声明为空、无效或重复时，该通道实例会被拒绝。所有声明都会在守护进程替换路由表之前解析完成，因此清单的遍历顺序无法决定胜出者，重建失败也不会发布部分生成的结果。发布操作携带一个生成租约；已退役的旧通道监督器无法清除更新的路由集。</p>
+<p>Webhook 入口要求组件具有有效的 <code>config_read</code> 授权。对于每个请求，网关会在一次性的已配置存储中，将包含 HTTP 方法、原始查询字符串、小写 UTF-8 请求头和精确请求体字节的类型化 <code>webhook-request</code> 传递给 <code>parse-webhook</code>。Guest 在该调用中解析其当前的范围化配置和密钥，校验平台来源真实性，并返回 <code>webhook-response.messages</code>、<code>webhook-response.reply</code>，或类型化的 <code>unauthorized</code> / <code>bad-request</code> 拒绝结果。取消或超时 HTTP 请求会丢弃该一次性存储，且绝不会影响轮询和出站通道调用所使用的常驻存储。</p>
+<p>经过验证的挑战会返回 <code>reply(body)</code>：网关以 HTTP 200 响应该文本，不进行发送方授权、幂等性处理或智能体投递。主机在组件和 HTTP 两个边界处最多接受 4096 个 UTF-8 字节，超出部分返回固定的 <code>502 invalid webhook response</code>。方法和查询参数取自请求字段，而非保留头部。消息的通道名称没有响应控制含义。<code>HEAD</code> 及其他不受支持的方法会在到达组件之前返回 <code>405</code>，并附带 <code>Allow: GET, POST</code>。</p>
+<p>The 未认证的边缘仍由宿主治理：</p>
+<ul>
+<li>规范的、感知可信转发头的 webhook 速率限制器在路由查找之前运行。请求体采用网关的 64 KiB 上限，每条路由有 64 个请求的队列，解析与投递的截止时间为 10 秒。</li>
+<li>公共响应固定如下：成功返回 <code>200</code>；访客认证失败和负载被拒绝时，分别返回不透露具体原因的 <code>401</code> 和 <code>400</code>；主机、组件或下游故障时，返回不透露具体原因的 <code>503</code>；超时返回 <code>504</code>；队列或速率饱和时返回 <code>429</code>。访客和 Wasmtime 的诊断信息有长度限制、可溯源，并且仅保留在主机日志中；访客诊断信息绝不能包含凭据或原始机密。</li>
+<li>在客人身份验证之后，主机会为已准入的 <code>plugin.&lt;alias&gt;</code> 身份打上标记，并针对该频道实时解析 <code>[peer_groups.*].external_peers</code>。插件发送者的匹配是精确匹配（<code>"*"</code> 仍是显式的全部允许条目）。被拒绝的发送者不会占用幂等键，也不会进入频道队列。同样的实时、默认拒绝的门控也适用于 <code>poll-message</code> 返回的消息，因此每个插件入站桥接都共享同一套主机策略。</li>
+<li>Non-empty guest 消息 ID 会在由路由派生的命名空间内去重。正在处理中的重复消息会等待所属投递提交或回滚；基于代际的所有权令牌可防止过期的所有者清除替换后的预留。投递失败或被取消时会回滚，因此提供方重试可以成为新的所有者。</li>
+</ul>
+<p>此变更影响未冻结的实验性 <code>wit/v0</code> channel world。所有 channel 组件（包括不提供 webhook 服务的组件）都必须针对目标主机随附的 WIT 重新构建，并导出已文档化的、受能力门控的 stub。冻结版本的兼容性过渡期目前尚不适用。</p>
+<h3 id="logging"><a class="header" href="#logging"><code>logging</code></a></h3>
+<p><code>wit/v0/logging.wit</code> 被这三个 world 都导入。插件调用 <code>log-record</code> 将结构化事件发回宿主：</p>
+<pre><code class="language-wit">log-record: func(level: log-level, event: plugin-event);
+</code></pre>
+<p>调用是即发即忘的：它不返回任何内容，宿主（<code>component_logging.rs</code>）会吸收所有错误，因此日志写入失败绝不会导致插件执行崩溃。传递是异步的：该导入将记录交给有界的宿主端队列，由专用线程负责排空，并在不阻塞的情况下返回，因此缓慢或卡死的日志消费者绝不可能让 guest 导出调用持续超过 <code>plugins.limits.call_timeout_ms</code>。延迟处理不会改变事件的含义：每条记录都会捕获 guest 调用点当前的宿主 span，并在该作用域内写入，因此 agent/channel/tool 归因和终止标签与内联发出时一致。该上限是真正的内存上限，因为事件字段是无界字符串，会被复制到 guest 的 <code>max_memory_mb</code> 上限之外的宿主内存中：guest 控制的字节数超过 64 KiB 的记录会被丢弃，而不是截断；排队记录使用固定的 8 MiB 总字节预算，该预算仅在记录写入后释放。队列已满、记录超出上限或预算耗尽时，都会丢弃最新记录；排空线程会在每次写入后以及空闲唤醒时报告累计丢弃数，因此即使被拒绝的记录之后始终没有任何被接受的记录，丢失情况仍然可被观察到。<code>plugin-action</code> 和 <code>plugin-outcome</code> 对应 <code>zeroclaw-log</code> 中封闭的 <code>Action</code> / <code>EventOutcome</code> 分类体系；不存在用于规避限制的变体，这是有意为之。不要直接调用 <code>wasi:logging</code>，否则插件事件的格式会不一致，也无法到达 <code>zeroclaw_log</code> 写入的所有目标。</p>
+<h3 id="config"><a class="header" href="#config"><code>config</code></a></h3>
+<p><code>wit/v0/config.wit</code> 由 channel world 导入。它以 JSON 格式返回当前通过架构验证的非机密对象：</p>
+<pre><code class="language-wit">get: func() -&gt; result&lt;json-string, config-error&gt;;
+</code></pre>
+<p>该对象保留 <code>config_schema</code> 声明的类型；标记为 <code>x-secret: true</code> 的属性会被省略。该服务在 configure 期间和操作通道导出期间可用。当已准入的实例缺少有效的 <code>config_read</code> 授权时，它会返回 <code>access-denied</code>。在组件初始化或静态元数据发现期间发起的调用、解析器或验证失败，以及主机调用预算耗尽时，会返回 <code>unavailable</code>，且不会暴露内部详细信息。</p>
+<p><code>config.get</code> 是使用点访问，而不是加载时快照。符合要求的 channel 插件<strong>必须</strong>在每个使用配置的操作中调用它，并且不得在 warm guest 状态中保留其返回的对象。这是一项插件符合性规则：将 JSON 返回给受信任的 guest 代码后，主机无法阻止恶意组件复制它。</p>
+<h3 id="secrets"><a class="header" href="#secrets"><code>secrets</code></a></h3>
+<p><code>wit/v0/secrets.wit</code> 由 tool 和 channel 世界导入。来宾仅提供顶层属性名称：</p>
+<pre><code class="language-wit">get: func(name: string) -&gt; result&lt;string, secret-error&gt;;
+</code></pre>
+<p>宿主从已准入的 <code>PluginInstanceScope</code> 推导 package、capability、binding 和有效授权，这些都不是 guest 的输入。只有清单 schema 中标记为 <code>x-secret: true</code> 的顶层直接字符串属性可以被读取。宿主在分派 <code>execute</code> 时，Tool 可以读取这些属性。Channel 可以在 <code>configure</code> 以及 send、poll、webhook 解析、health 和受 capability 控制的操作等运行时调用中读取。组件初始化和静态元数据导出返回 <code>unavailable</code>，且不解析配置。在同一个 channel service 帧内，每一次 <code>config.get</code> 和 <code>secrets.get</code> 都使用同一个已解析的规范配置版本；该帧在每一种退出路径上都会被丢弃。因此，合规的插件会在同一 binding 下，于其下一次操作中同时观察到公开配置与密文的轮换。<code>access-denied</code>、<code>not-found</code> 和 <code>unavailable</code> 有意不暴露任何解析器或 schema 细节。成功的读取会向可信的 guest 返回明文。该服务防止公开值注入和跨实例选择；它不是出口代理，无法让插件代码看不到该值。合规的 channel 插件<strong>必须</strong>在每个使用点解析密文，且不得在热状态中保留第二份副本。宿主在返回明文之后，无法强制执行不保留的要求。</p>
+<p>机密属性名与状态键使用相同的可移植插件本地语法：1–128 个 ASCII 字节，且只能包含字母、数字、<code>_</code>、<code>-</code> 或 <code>.</code>。在清单准入阶段，URI、路径、命名空间、控制字符和非 ASCII 语法都会被拒绝。</p>
+<h3 id="state"><a class="header" href="#state"><code>state</code></a></h3>
+<p><code>wit/v0/state.wit</code> 被 tool 和 channel world 导入。它提供加密的持久字节值，这些值由经过准入的确切 package、capability 和 binding 所拥有：</p>
+<pre><code class="language-wit">get: func(key: string) -&gt; result&lt;option&lt;state-entry&gt;, state-error&gt;;
+put: func(key: string, value: list&lt;u8&gt;, expected-revision: option&lt;u64&gt;)
+    -&gt; result&lt;u64, state-error&gt;;
+delete: func(key: string, expected-revision: u64) -&gt; result&lt;_, state-error&gt;;
+</code></pre>
+<p><code>state_read</code> 允许 <code>get</code>；<code>state_write</code> 允许 <code>put</code> 和 <code>delete</code>。<code>put</code> 上的 <code>none</code> 表示键不存在时的比较并交换（CAS），而 <code>some(revision)</code> 必须与当前 revision 完全匹配。写入操作返回新的 revision。revision 是不透明的，且在同一实例内从不复用，因此已删除后重新创建的键无法满足过时的比较并交换。键使用上文所述的可移植插件本地语法，不能指定其他实例。状态仅在工具执行和通道服务帧期间可用；静态调用、宿主调用预算耗尽、存储/键错误以及完整性错误都会返回封闭式错误。每个实例固定的条目数、值和总大小配额会返回 <code>quota-exceeded</code>，而不会部分提交写入。</p>
+<p>The runtime 将每个值的一个已认证信封存储在 <code>data/plugin-state.db</code> 中，并使用安装目录中已有的 <code>.secret_key</code> 进行加密。数据库仅包含带密钥的盲索引和 <code>enc2:</code> 密文。当安装密钥缺失或被替换时，系统会直接失败（fail closed），并且在存在持久化数据行的情况下，绝不会静默地重新生成密钥。请将 <code>data/plugin-state.db</code> 和 <code>.secret_key</code> 一起备份。</p>
+<h3 id="sockets"><a class="header" href="#sockets"><code>sockets</code></a></h3>
+<p>Host 中介的出站 TCP。<code>connect</code> 接受 host、port、mode 以及可选的 TLS profile，并返回一个 <code>connection</code> 资源：</p>
+<ul>
+<li><code>plaintext</code>：原始 TCP。可在运营方授予该主机的任何位置访问；不存在单独的明文例外（参见 ADR-014）。</li>
+<li><code>direct-tls</code>：TLS 在 <code>connect</code> 返回之前建立。</li>
+<li><code>start-tls</code>：连接会先进入协商阶段，此阶段仅 <code>send-negotiation</code> 和 <code>receive-negotiation</code> 可用。<code>upgrade-tls</code> 会将流原地切换为 TLS；失败时会关闭该流，且不会回退到明文重试。</li>
+</ul>
+<p>主机只解析一次目标地址，仅连接已校验的地址，并在资源被释放前持有该实例的连接租约。除非请求指定了 TLS 配置文件，否则 TLS 会使用与插件 HTTPS 相同的根证书进行验证。<code>receive</code> 从不阻塞；当缓冲区中没有数据时，它返回 <code>idle</code>。失败情况为类型化的 <code>socket-error</code> 错误。</p>
+<h3 id="websocket"><a class="header" href="#websocket"><code>websocket</code></a></h3>
+<p>由宿主代理的出站 WebSocket。<code>connect</code> 接受明文（<code>ws</code>）或 TLS（<code>wss</code>）WebSocket URL、额外请求头、提供的子协议列表以及可选的 TLS 配置文件，并返回一个 <code>connection</code> 资源，该资源提供 <code>send</code>、<code>receive</code>、<code>close</code> 和 <code>negotiated-subprotocol</code>。DNS、目标地址决策、TLS、升级握手以及有界队列均由宿主负责。属于握手本身的请求头（<code>Host</code>、<code>Connection</code>、<code>Upgrade</code>、<code>Sec-WebSocket-*</code>）会被拒绝。<code>receive</code> 从不阻塞；一旦终止事件 <code>closed</code> 或 <code>failed</code> 被取出，它将返回 <code>closed</code> 错误，而不是 <code>none</code>。释放资源时会关闭套接字并释放连接租约。</p>
+<h3 id="tls-配置文件"><a class="header" href="#tls-配置文件">TLS 配置文件</a></h3>
+<p>请求中的 <code>sockets</code> 或 <code>websocket</code> 可以指定运营者在实例上配置的 TLS 配置文件（<code>[[plugins.entries.tls_profiles]]</code>）。TLS 配置文件用于选择要信任的证书颁发机构，并可选地提供用于双向 TLS（mTLS）的客户端证书，这些内容读取自实例的 <code>x-secret</code> 属性。配置文件本身从不授予目标地址的访问权限：请求必须先通过 <code>egress_hosts</code> 检查，且该配置文件还必须覆盖目标主机。在明文连接上指定 TLS 配置文件属于无效请求。配置文件引用的属性仅限主机使用：对这些属性调用 <code>secrets.get</code> 会返回 <code>access-denied</code>，因此插件永远不会持有其用于身份验证的私钥。</p>
+<p>宿主在每个连接打开时，根据打开该连接的服务帧所对应的配置版本构建该连接的 TLS 配置，并由该连接持有。帧的临时凭据只与由匹配的规范配置输入推导出的授权配对。如果策略、配置文件引用或凭据在这些视图之间发生变化（包括在 DNS 解析等待期间），连接打开将失败并默认拒绝，而不会混合不同的版本。比较范围涵盖实例的整个配置条目（其授权、其 TLS 配置文件以及所有配置值），以及部署的 NAT64 前缀和连接数上限。因此，在帧运行期间进行的任何此类修改，都会导致该帧之后使用自定义 CA 或客户端身份的连接失败。之后的帧会解析轮换后的凭据；已打开的连接不受影响。出口授权仍会在每次请求时检查，因此已移除的配置文件或授权会拒绝下一次连接。系统根证书是例外：保留系统根证书的配置文件，以及没有配置文件的连接，使用 HTTPS 所信任的根证书插件，该插件在每个进程中只读取一次。已打开的连接会保留其握手时提交的身份，直到连接被丢弃或关闭。丢弃连接，或取消仍在打开该连接的调用，会与连接租约一起释放该配置。</p>
+<h3 id="每个插件的配置__config-和-configget"><a class="header" href="#每个插件的配置__config-和-configget">每个插件的配置（<code>__config</code> 和 <code>config.get</code>）</a></h3>
+<p><strong>权限：</strong> <code>config_read</code></p>
+<p>插件不会读取进程环境变量。其清单必须将 <code>config_read</code> 与 Draft 2020-12 <code>config_schema</code> 配对；二者缺一均会导致清单无效。模式根必须是一个包含 <code>properties</code> 映射且 <code>additionalProperties = false</code> 的对象。每个顶层属性必须直接声明为 <code>string</code>、<code>boolean</code>、<code>integer</code>、<code>number</code>、<code>array</code> 或 <code>object</code> 之一，或通过包本地 JSON Pointer 声明为其中之一。工具和通道使用方可以在直接的顶层字符串属性上设置 <code>x-secret: true</code>；嵌套标记、值为 false 的标记或非布尔标记，以及非字符串的机密属性，都会被拒绝。未知键、格式错误的编码以及约束违规会在值传递给来宾代码之前拒绝该实例。</p>
+<p>操作员的规范 <code>plugins.entries.&lt;instance-key&gt;.config</code> 值在内存中仍是带有机密标记的字符串映射，并在持久化时加密。主机根据完整的软件包、能力和绑定标识派生版本化的 <code>zpi1_…</code> 条目键；这样，不同的软件包和能力域就可以安全地复用 <code>main</code> 等别名。获准的软件包清单决定模式。<code>string</code> 值直接存储；<code>boolean</code>、<code>integer</code> 和 <code>number</code> 值使用 JSON 标量文本，例如 <code>"true"</code>、<code>"4"</code> 或 <code>"0.5"</code>；<code>array</code> 和 <code>object</code> 值使用 JSON 文本，例如 <code>'["urgent","ops"]'</code> 或 <code>'{"region":"us-east"}'</code>。主机在每次使用时将完整数据具体化为类型化 JSON 并进行验证，然后对每个属性恰好划分一次。对于工具，非机密值会注入保留的 <code>__config</code> 键下：</p>
+<pre><code class="language-json">{
+  "提示": "a sunset",
+  "__config": {
+    "retry_limit": 4,
+    "已启用": true,
+    "labels": ["紧急", "ops"]
+  }
+}
+</code></pre>
+<p>如果其架构将被省略的 <code>api_key</code> 标记为机密，则会通过 <code>secrets.get("api_key")</code> 显式读取。<code>runtime.rs</code> 会在注入公共部分之前剥离调用方提供的 <code>__config</code>，因此无法伪造该部分。工具的公共配置注入和同一 <code>execute</code> 帧内的机密读取共享同一个已解析的实时配置版本；该帧会在成功、错误、陷阱、panic 或取消时丢弃。通道的 <code>configure</code> 导出没有配置参数。它会调用 <code>config.get</code> 获取公共对象，并调用 <code>secrets.get</code> 获取机密属性；后续每个使用配置的操作导出也同样如此。一次调用中的两个导入共享同一个已解析版本。宿主会在成功、错误、陷阱、panic 或取消时丢弃该物化视图。因此，当符合规范的来宾在使用点解析这两者时，同一逻辑绑定中的公共配置和凭据变更会在下一次操作中同时可用。</p>
+<p>当清单请求 <code>config_read</code>，但主机实际上未授予该权限时，解析会用空对象替代，并在来宾代码运行前验证该对象。包含必填字段的架构会在构造期间安全失败。如果空对象有效，工具会省略空的 <code>__config</code>，而通道 <code>config.get</code> 和 <code>secrets.get</code> 会返回 <code>access-denied</code>。插件始终只能看到自己的配置节。</p>
+<p>频道静态元数据导出项无法调用任一配置服务，并且只在加载时读取一次。因此，更改机器人/账户身份或任何配置派生的能力、自身句柄、提及方式或多消息延迟，都需要重建频道生命周期；而同一逻辑绑定的普通公共配置和凭据轮换则不需要。工具和频道是当前的配置使用者。memory 世界尚未支持配置导入，因此在该 ABI 和运行时接入完成之前，memory 插件不得请求 <code>config_read</code>。</p>
+<h3 id="声明的出站流量egress"><a class="header" href="#声明的出站流量egress">声明的出站流量（<code>[egress]</code>）</a></h3>
+<p><strong>适用于:</strong> 任何请求传输权限(<code>http_client</code>)的插件</p>
+<p>清单可以包含一个可选的 <code>[egress]</code> 表，用于声明插件需要访问的目标地址。</p>
+<pre><code class="language-toml">[egress]
+hosts = ["api.example.com", "*.cdn.example.com"]
+</code></pre>
+<p>条目采用严格的出站（egress）语法：精确主机名或显式的 <code>*.suffix</code> 模式，不支持全部放行的形式。无效语法会在发现和安装阶段拒绝整个清单。该表是规范清单字节的一部分，因此签名清单会覆盖它，修改它需要重新签名。</p>
+<p>这是一项意图声明，而非授权。主机强制执行的允许列表是运维人员配置的 <code>plugins.entries.&lt;instance-key&gt;.egress_hosts</code>，它位于承载该实例私有 <code>config</code> 映射的同一条 <code>zpi1_…</code> 记录中，并在每次请求时从实时配置中解析，而不是快照存储到数据库中。组件若自带 <code>[egress]</code> 表却没有运维人员的授权，则无法访问任何主机。在本版本中，该检查仅由授权决定：声明不会在请求时与授权取交集，因此声明某个主机既不会授予访问权限，也不会限制运维人员设定的授权范围。两者取交集属于后续推出工作，参见 <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/8850">#8850</a>。</p>
+<p><code>zeroclaw plugin install</code> 的价值在于安装时的确认流程。它会将声明的目标地址预填到所创建的 <code>[[plugins.entries]]</code> 条目中，因此对于声明了目标地址的插件，首次安装无需运维人员手动抄录主机地址即可正常工作，并且预填的值会被打印出来。它从不扩展已存在的条目：当升级后的声明有所增长时，会打印差异以及确切的 <code>zeroclaw config set</code> 命令，由运维人员自行应用。<code>zeroclaw plugin update</code> 完全不做任何预填，即使是在它新建的条目中也不预填，并会打印相同的差异。<code>zeroclaw plugin list</code> 会将同样的差距作为一项常驻诊断信息进行报告。请声明你的代码实际访问的目标地址，并将声明的增长视为每位运维人员在每次升级时都必须审批的事项。</p>
+<p>渠道实例的行在操作员绑定其别名时创建，即使用 <code>zeroclaw plugin bind &lt;package&gt; --channel-alias &lt;alias&gt;</code> 或 <code>zeroclaw plugin install &lt;source&gt; --channel-alias &lt;alias&gt;</code>，并且仅在显式指定 <code>--egress declared</code> 时，才会将声明写入该行。<code>--egress none</code> 则以空授权进行绑定。若绑定操作在未提供任一参数的情况下会创建该行，则会拒绝执行，并列出你已声明的主机。对于渠道实例，声明同样适用于 <code>websocket_client</code> 或 <code>socket_client</code>，以及 <code>http_client</code>。</p>
+<p>如果重新安装时发现一个以包名为键、且不受支持的类型化配置之前的旧版记录，安装会在创建派生的 <code>zpi1_…</code> 记录之前拒绝执行，并输出与 <code>plugin list</code> 相同的有序更新步骤。软件包安装会回滚，旧的私有配置和两个出口列表保持不变，直到操作员更新 beta 配置并重试。</p>
+<p>目标为部署配置（例如自托管的 Gitea、局域网内的 Nextcloud）的插件，应在此处不声明任何内容。该授权由运维人员直接在实例记录中编写，而未声明任何内容的清单，永远不会被报告为丢失了目标。</p>
+<h2 id="wasi-组件宿主"><a class="header" href="#wasi-组件宿主">WASI 组件宿主</a></h2>
+<p>主机（<code>crates/zeroclaw-plugins/src/component.rs</code>）会针对单个异步 <code>wasmtime::Engine</code> 编译并实例化组件。<code>.wasm</code> 文件的加载方式取决于构建的执行后端：</p>
+<ul>
+<li><strong><code>plugins-wasm-cranelift</code></strong>：存在 JIT 后端，因此 <code>load_component</code> 会在加载时通过 <code>Component::from_file</code> 编译一个 <code>.wasm</code> 组件。</li>
+<li><strong>No JIT backend</strong> (<code>plugins-wasm-pulley</code> or runtime-only)：二进制中没有编译器，因此 <code>load_component</code> 会直接通过 <code>Component::deserialize_file</code> 反序列化该文件，将其视为由匹配的 wasmtime 生成的预编译 <code>.cwasm</code>。版本不匹配的制品会在反序列化的版本检查中被拒绝。</li>
+</ul>
+<p>这两个后端功能都会引入 <code>plugins-wasmtime</code>；加载路径取决于构建中是否包含 cranelift 编译器，而不是取决于 pulley。</p>
+<h3 id="每次调用的执行限制"><a class="header" href="#每次调用的执行限制">每次调用的执行限制</a></h3>
+<p>每个 guest 导出都在主机为 store 应用的按调用资源限制下运行。引擎启用燃料计量，并为每次调用分配全新的燃料预算，因此失控或恶意组件会触发陷阱，而不会让主机挂起。主机还会为完整的导出 future 设置挂钟截止时间，其中包括等待 <code>wasi:http</code> 等异步主机导入的时间；定期的燃料让出可确保不间断的 guest 计算不会使该计时器得不到调度，而 guest 可访问的主机导入绝不会阻塞执行器（日志记录会交给有界队列，并由专用主机线程写入），因此在主机工作运行期间仍可观察到该截止时间。<code>StoreLimits</code> 上限限制线性内存、表元素和实例数量。工具 world 每次 execute 都会获得一个全新的 store；warm channel 和 memory store 会在每次调用前重新补充燃料，因此长生命周期插件获得的是全新的预算，而不是在其生命周期内逐渐耗尽预算。</p>
+<p>这五个边界均可由运维人员调整，且每个值都会被校验为非零：<code>plugins.limits.call_fuel</code>（默认 1,000,000,000 条指令单位）、<code>plugins.limits.call_timeout_ms</code>（默认 30,000 毫秒）、<code>plugins.limits.max_memory_mb</code>（默认 256）、<code>plugins.limits.max_table_elements</code>（默认 100,000）和 <code>plugins.limits.max_instances</code>（默认 64）。Store 只能在显式设置限制的情况下构建，因此任何加载路径都无法构造出未沙箱化的插件。客户机的 <code>wasi:http</code> 请求选项可以让调用提前结束，但无法延长宿主的截止时间。被中断的预热 store 永远不会被恢复，通道和内存后端也都不会复用在 Wasmtime 内部调用失败的 store：在客户机陷阱（trap）、燃料耗尽或宿主导入失败之后，Wasmtime 会拒绝之后对该 store 的所有调用；无法提升（lift）的结果会跳过导出函数的 post-return 清理。通道会在下一次调用时，使用宿主持有的输入重新创建实例。当陷阱和错过截止时间的次数超过重建预算（同时最多三次，此后每五分钟一次）时，除审批和选择提示外，调用需要等待。内存实例在其所有者重建之前一直不可用，之后到达该插件的调用会因错过截止时间所留下的错误而失败。重建后的内存实例以空状态启动，因为 memory 世界不会为插件提供其实例之外的任何存储。规范字段及默认值位于<a href="../reference/index.html">配置参考</a>中。</p>
+<h3 id="32-位地址空间wasip2-是-wasm32"><a class="header" href="#32-位地址空间wasip2-是-wasm32">32 位地址空间（wasip2 是 wasm32）</a></h3>
+<p>插件目标是 <code>wasm32-wasip2</code>，而宿主引擎是在启用 fuel 计量（<code>Config::consume_fuel(true)</code>）且未启用 <code>wasm_memory64</code> 的情况下构建的。插件边界是固定的 32 位格式，这带来一些值得明确说明的后果：</p>
+<ul>
+<li><strong>客体地址空间是 32 位。</strong> 插件运行在 wasm32 线性内存中。大值通过按值跨越边界：通道插件的 <code>media-attachment</code> 以 <code>list&lt;u8&gt;</code> 形式携带其完整字节，而 <code>wit/v0/channel.wit</code> 已经指出这可能达到数兆字节，并将资源句柄模型留给未来修订。在这 32 位空间内，宿主从 <code>plugins.limits.max_memory_mb</code>（默认 256）对每个 store 施加显式内存上限，因此客体受限于 wasm32 地址空间与该 ZeroClaw 配置上限中的较小者。</li>
+<li><strong>该组件 ABI 将偏移量降为 32 位，而不论宿主字长大小。</strong> 即使在 64 位宿主上，规范 ABI 中的列表和字符串偏移量也是 <code>i32</code>。<code>memory64</code> 扩展的是 guest 的线性内存寻址，而不是组件模型的规范 ABI，因此启用它也不会使 WIT 层字段变为 64 位。</li>
+<li><strong>没有可供绑定的 64 位 wasip2 目标。</strong> <code>wasm32-wasip2</code> 是目前 rustc 和 LLVM 中唯一的 WASI Preview 2 目标；插件无法编译为 64 位 p2 组件，因此即使引擎启用了 <code>memory64</code>，主机也没有可加载的内容。</li>
+</ul>
+<p>这是上游工具链约束，而不是本仓库中的某个标志可以解除的主机限制。当 64 位 p2 目标和更宽的组件 ABI 在上游落地时，<code>bindgen!</code> 接缝会针对它们重新生成，字段宽度也会在 <code>wit/VERSIONING.md</code> 窗口内的 WIT 中重新审视。在那之前，请将插件边界按设计视为 32 位。</p>
+<h2 id="签名"><a class="header" href="#签名">签名</a></h2>
+<p>插件清单可能包含 Ed25519 签名（<code>crates/zeroclaw-plugins/src/signature.rs</code>）。该签名是对规范化清单字节进行 base64url 编码的结果（解析后的 TOML，仅移除根级别中名称完全为 <code>signature</code> 和 <code>publisher_key</code> 的条目）；发布者的公钥采用十六进制编码。嵌套架构属性中使用这些名称的属性仍会被签名。主机根据 <code>plugins.security.signature_mode</code> 强制执行三种模式之一：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>模式</th><th>未签名插件</th><th>不受信任或无效的签名</th></tr>
+</thead>
+<tbody>
+<tr><td><code>strict</code></td><td>已拒绝</td><td>已拒绝</td></tr>
+<tr><td><code>permissive</code></td><td>带有警告加载</td><td>带有警告加载</td></tr>
+<tr><td><code>disabled</code></td><td>已加载</td><td>未检查</td></tr>
+</tbody>
+</table>
+</div>
+<p>验证会在发现和安装两个阶段运行。发现阶段会跳过未通过其策略的插件，而不会中止整个主机；安装阶段则会返回该错误。</p>
+<h2 id="使用-rust-编写插件"><a class="header" href="#使用-rust-编写插件">使用 Rust 编写插件</a></h2>
+<p>插件是一个面向组件模型的 <code>cdylib</code> crate。请从宿主使用的同一个 <code>wit/v0</code> package 生成 guest bindings，实现导出的 world，并编译为 <code>wasm32-wasip2</code>。从空 crate 到已安装插件的完整实操教程，请参见 <a href="../plugins/index.html">plugin guides</a>；下面的说明涵盖构建和安装机制。</p>
+<h3 id="构建"><a class="header" href="#构建">构建</a></h3>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh"># 安装 WASI Preview 2 target（一次）
+rustup target add wasm32-wasip2
+
+# 构建组件
+cargo build --target wasm32-wasip2 --release
+</code></pre>
+</div>
+
+<p>输出组件位于 <code>target/wasm32-wasip2/release/&lt;crate_name&gt;.wasm</code>。将它复制到你的 <code>manifest.toml</code> 旁边。对于仅运行时的宿主构建（不含 JIT 后端），请使用匹配的 wasmtime 将该组件预编译为 <code>.cwasm</code> 并改为分发，因为这类宿主在加载时会反序列化，而不是编译。</p>
+<p>宿主的工具插件测试不依赖已发布的制品：<code>crates/zeroclaw-plugins/tests/fixtures/tool-fixture</code> 是一个在测试时从源代码构建的源码树内组件，而 <code>reference_plugin.rs</code> 和 <code>reference_plugin_e2e.rs</code> 会通过守护进程使用的相同 PluginHost、config_schema 和配置解析路径驱动它。如果无法构建该 fixture，这些测试就会失败。</p>
+<h3 id="安装中"><a class="header" href="#安装中">安装中</a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh"># 复制到插件目录
+zeroclaw plugin install /path/to/my-plugin/
+
+# 或手动
+cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
+</code></pre>
+</div>
+
+<h2 id="配置"><a class="header" href="#配置">配置</a></h2>
+<p>操作员值目前通过通用的字符串映射存储录入：在 TOML 中编辑 <code>[[plugins.entries]]</code>，或在该实例的条目已存在后使用 <code>zeroclaw config set</code>。工具安装时会为其默认绑定条目预先生成种子数据。渠道键依赖于其配置的别名，因此渠道实例的条目会在该别名被绑定时生成种子数据，绑定方式为 <code>zeroclaw plugin bind &lt;package&gt; --channel-alias &lt;alias&gt;</code> 或 <code>zeroclaw plugin install &lt;source&gt; --channel-alias &lt;alias&gt;</code>。根据已配置别名解析渠道类型化配置的、感知别名的构造逻辑已在 <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/10146">#10146</a> 中合入。<code>zeroclaw plugin info &lt;package&gt;</code> 会打印该包拥有的每个键，用于迁移和后续编辑：包括工具绑定的键，以及当已安装版本拥有实例状态且实例可通过该别名指定时，每个已绑定别名对应的键。每个此类已绑定别名还会显示该实例的就绪状态，无论是否带有键行：必需键已设置或缺失、配置与出口（egress）判定结果，以及运行时是否会接纳该实例。基于 schema 的表单和内联字段帮助尚未实现。当前可用的界面如下：</p>
+<ul>
+<li><strong>CLI</strong> 通过 <code>list</code>、<code>search</code>、<code>install</code>、<code>bind</code>、<code>remove</code>、<code>info</code> 和 <code>migrate</code> 处理插件的生命周期。<code>zeroclaw config set</code> 用于写入单个原始插件值，它不解析插件的 schema。</li>
+<li><strong>zerocode</strong> 可以编辑 ZeroClaw 的静态插件主机设置，但目前还不会根据 <code>config_schema</code> 为每个插件生成字段。</li>
+<li><strong>Web 网关</strong>对插件是只读的：<code>GET /api/plugins</code> 会报告已加载的插件以及系统是否已启用。</li>
+<li><strong>主机</strong>在接纳软件包时验证 <code>config_schema</code>，并在来宾使用前再次验证并实例化操作符值。</li>
+<li>对于插件作者而言，<strong>清单模式</strong>是来宾边界处唯一的类型和验证契约。在其中定义所有受支持的键及约束；不要在宿主运行时配置结构体中重复该契约。来宾代码应将经过宿主验证的 JSON 反序列化为其本机类型化结构体。</li>
+</ul>
+<p>静态配置架构提供通用的存储和机密标记路径，而不是按插件动态生成的编辑器。<code>crates/zeroclaw-config/src/schema.rs</code> 中的插件配置类型带有 <code>#[prefix = "plugins"]</code>、<code>#[prefix = "plugins.entries"]</code> 和 <code>#[prefix = "plugins.security"]</code>，而 <code>Configurable</code> 派生会将每个带前缀的字段转换为通用配置路径。机密字段（插件条目的 <code>config</code> 映射标记为 <code>#[secret]</code>）会使用相邻的 <code>.secret_key</code> 进行静态加密。主机配置的规范字段、默认值和 <code>signature_mode</code> 值位于<a href="../reference/index.html">配置参考</a>中；该架构是权威来源，而每个插件清单则是其私有配置结构的权威来源。</p>
+<h3 id="构建功能"><a class="header" href="#构建功能">构建功能</a></h3>
+<p>插件宿主是编译时可选启用的。工作区 <code>Cargo.toml</code> 中的二进制级功能决定是否完全内置插件，以及随附哪种执行后端：</p>
+<ul>
+<li><code>plugins-wasm</code> 是一个总括特性，会将插件宿主及其运行时集成引入二进制文件。下面的每个后端特性都隐含启用它，因此启用任何执行后端（例如 <code>--features plugins-wasm-cranelift</code>）都会始终包含插件宿主及其 CLI 接口；仅后端构建不会悄然生成一个不带 <code>plugin</code> 子命令的二进制文件。仅启用该总括特性等同于 <code>plugins-wasm-runtime-only</code>：没有 JIT，因此只能加载预编译的 <code>.cwasm</code> 组件。</li>
+<li><code>plugins-wasm-runtime-only</code> 是最小且启动最快的：没有 JIT，因此组件会从预编译的 <code>.cwasm</code> 反序列化。</li>
+<li><code>plugins-wasm-cranelift</code> 添加了 Cranelift 编译器，因此 <code>.wasm</code> 组件会在加载时被编译。它是唯一包含编译器的功能，也是唯一能够加载插件注册表所发布的 <code>.wasm</code> 组件的功能。</li>
+<li><code>plugins-wasm-pulley</code> 可在 wasmtime 的 Pulley 解释器中编译。ZeroClaw 从不选择 Pulley 作为编译目标,因此在具有原生 Cranelift 后端的主机上,该特性不会产生任何效果:单独启用时,其行为与 <code>plugins-wasm-runtime-only</code> 相同;与 <code>plugins-wasm-cranelift</code> 一起启用时,则会编译原生代码。在没有原生后端的主机上(例如 32 位 ARM),wasmtime 会自行将 Pulley 作为目标。</li>
+</ul>
+<p>这些委托给 <code>zeroclaw-plugins</code> crate 的功能（<code>plugins-wasmtime</code>、<code>plugins-wasm-cranelift</code>、<code>plugins-wasm-pulley</code>），它们会连接 <code>wasmtime</code>。加载路径会根据构建中是否包含 Cranelift 编译器而定，如 WASI Component Host 中所述。请阅读工作区 <code>Cargo.toml</code> 中的功能注释以获取权威说明。</p>
+<h3 id="插件支持按发布产物提供"><a class="header" href="#插件支持按发布产物提供">插件支持按发布产物提供</a></h3>
+<p>标准发行版功能集（<code>cargo generate features --selection dist</code>，按目标从工作区 <code>Cargo.toml</code> 中的注册表解析）在七个 64 位桌面和服务器目标上包含 <code>plugins-wasm-cranelift</code>，而在 32 位 ARM 和实验性 Android 目标上则排除它。哪个构件承载宿主，以及由什么证明这一点：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>工件</th><th>插件宿主</th><th>已接受的软件包</th><th>Proof</th></tr>
+</thead>
+<tbody>
+<tr><td>CLI 归档文件适用于 x86_64 和 aarch64 Linux（glibc 和 musl）、aarch64 和 x86_64 macOS，以及 x86_64 Windows</td><td>Cranelift 编译器，<code>.wasm</code> 在加载时编译</td><td><code>.wasm</code> 组件，基于发布版本中的 <code>wit/v0</code> 构建</td><td>该发布会在 <code>publish</code> 和 <code>docker</code> 运行之前，于各自平台上执行每个归档包中的插件（<code>plugin-smoke</code> 任务）。</td></tr>
+<tr><td>适用于 armv7 和 arm（ARMv6）Linux 的 CLI 归档文件</td><td>none: <code>plugin</code> 不是命令</td><td>无</td><td>registry 的按目标策略，由一个 xtask 测试固定</td></tr>
+<tr><td>CLI 归档文件，适用于 aarch64-linux-android（实验性）</td><td>无</td><td>无</td><td>请提供需要翻译的英文技术文档字符串。我会按照同样的规则翻译为简体中文。</td></tr>
+<tr><td>GHCR <code>latest</code>、带版本号的，以及 <code>debian</code> 镜像</td><td>Cranelift：他们重新打包 x86_64 和 aarch64 Linux glibc 归档文件</td><td><code>.wasm</code></td><td>з»§жүҝдәҶ archive smoke;й•ңеғҸеҶ…дёҚдјҡиҝҗиЎҢд»»дҪ•еҶ…е®№гҖӮ</td></tr>
+<tr><td>GHCR <code>dist</code> 变体、AUR 软件包、Nix flake 软件包、<code>setup.bat</code> 源码构建</td><td>Cranelift：从生成的分发列表构建源码</td><td><code>.wasm</code></td><td>无</td></tr>
+<tr><td>GHCR <code>all-features</code> 镜像</td><td>Cranelift、Pulley 和 runtime-only 均已编译进来</td><td><code>.wasm</code></td><td>无</td></tr>
+<tr><td>GHCR <code>minimal</code> 和 <code>default-features</code> 镜像</td><td>无</td><td>无</td><td></td></tr>
+<tr><td>桌面安装包（dmg、deb、AppImage、msi、setup exe）</td><td>Cranelift：标准 sidecar 构建会使用目标平台生成的 <code>dist</code> 特性（在 macOS 上还会加上 <code>embedded-web</code>）</td><td><code>.wasm</code></td><td>在 <code>scripts/desktop/prepare-kernel.sh</code> 中接入源；桌面端安装包没有插件冒烟测试门禁</td></tr>
+<tr><td><code>cargo install zeroclaw</code> 和 <code>install.sh</code> 源码构建</td><td>默认无；需通过 <code>--features plugins-wasm-cranelift</code> 显式启用。</td><td><code>.wasm</code> 需要显式启用（opt-in）</td><td></td></tr>
+<tr><td>Homebrew 核心仓库</td><td>由 formula 管理，位于本仓库之外</td><td></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p>对于主机上的每个产物，以下限制均适用：</p>
+<ul>
+<li><code>wit/v0</code> 尚不稳定。插件必须针对运行它的发行版所附带的 WIT 进行构建（参见 <code>wit/VERSIONING.md</code>）；清单中不包含宿主或 WIT 版本信息，因此版本不匹配会在安装时的加载检查中暴露出来。</li>
+<li>编译组件时需要先写入、之后才变为可执行的内存。在禁止此类内存的环境中，例如设置了 <code>MemoryDenyWriteExecute=yes</code> 的 systemd 单元，或出现 SELinux <code>execmem</code> 拒绝记录的环境，所有插件加载都会被拒绝，而二进制文件的其余部分仍可正常运行。</li>
+<li>官方注册表中的软件包目前未签名，因此在 <code>signature_mode = "strict"</code> 模式下，它们都无法安装。</li>
+<li>每次工具调用都会重新编译该组件，目前没有编译缓存。</li>
+<li>运行时默认保持关闭。已安装的工具或技能包在操作者设置 <code>plugins.enabled</code> 和 <code>plugins.auto_discover</code> 之前不会产生任何作用。两者都设置后，每次构建工具注册表时，都会编译并实例化每个已准入的工具组件，并在该软件包声明的权限和出口策略下查询其名称、描述和参数模式；审批仅作用于 <code>execute</code>。频道包在设置 <code>plugins.enabled</code> 后即可运行，前提是操作者在 <code>[channels.plugin.&lt;alias&gt;]</code> 下声明了它，并且已启用的代理在其频道列表中包含 <code>plugin.&lt;alias&gt;</code>。对于通过 <code>provides</code> 镜像原生频道的软件包，在 <code>[channels.&lt;provides&gt;.&lt;alias&gt;]</code> 下的激活会被记录，但尚未构建。每次插件工具调用仍需操作者批准，除非代理的风险配置已预先批准该调用（<code>auto_approve</code>，包括 <code>*</code> 通配符，或 <code>level = "full"</code>），或者操作者在同一 CLI 会话或频道轮次中此前已对该工具选择了“Always”。<code>always_ask</code> 中的工具每次都会提示。</li>
+</ul>
+<h3 id="中断安装恢复"><a class="header" href="#中断安装恢复">中断安装恢复</a></h3>
+<p><code>zeroclaw plugin remove &lt;name&gt;</code> 可以恢复未加载的、空的或结构不完整的插件包目录，这些目录中仅包含安装过程写入的内容：一个声明该插件包名称的清单文件、位于 <code>wasm_path</code> 处的组件文件及其所在路径上的目录，以及对于 skill 插件，一个由文件夹和文件组成的 <code>skills/</code> 目录树。签名策略拒绝、健康的插件包、已加载的别名、符号链接、无法检查的内容，以及包含其他任何内容的目录仍受保护。恢复操作在准入和删除之前会先占用单一的目录代次；它绝不会依据过时的判定结果，递归删除位于该包名称下的替代目录。</p>
+<p>安装与恢复通过插件根目录下一个持久的隐藏操作系统锁进行协调。只有安装、更新、删除以及列出中断的更新所移出的内容时才会打开该根目录及其锁,因此仅发现插件的宿主(例如守护进程所持有的宿主)不会在插件目录中持有任何东西。在 Windows 上,已打开的根目录会锁定插件目录及其所有上级目录,使其无法被重命名,直到持有它的宿主释放该句柄。无法在 60 秒内获取锁的进程会放弃操作,并指明锁文件的名称。凡是能够读取该文件的账户都可以持有该锁;若操作系统或文件系统不提供文件锁定功能,安装、更新和删除操作将拒绝执行。新的暂存目录使用唯一的代际编号和由操作系统持有的租约,而不是以 PID 作为所有权凭证。恢复过程仅在恢复实际的最终包时,或在完成先前删除操作已判定需删除的阶段的清理时,才清理已被遗弃的协议暂存阶段。仅含 PID 的旧版暂存阶段若无遗弃证明,则予以保留并打印其路径;它们不会阻止新的安装使用全新的暂存目录。</p>
+<p>被拒绝认领的包会被恢复，且不会覆盖并发占用者。如果无法完成恢复，错误信息会指明其保留的隐藏事务位置。保留该目录，解决报告的冲突，然后重试 <code>plugin remove</code>：重试会先恢复该包，然后再应用常规准入策略。已开始删除的认领会被标记，重试时会完成该删除，而不是恢复它。仅凭隐藏事务的名称，绝不能证明一个健康的包可以被删除。文件系统命名空间变更和不受支持的加锁会拒绝执行恢复，以确保安全。包的移动需要一种原子重命名操作，该操作会拒绝所有已存在的目标，包括空目录。若平台或文件系统无法提供该能力（如 FreeBSD 等其他 Unix 平台、不支持禁止替换的 NFS 挂载，或 3.15 之前的 Linux），安装和恢复将拒绝执行该移动。认领失败时，最终条目保持不动。以此方式被拒绝的安装会删除其已暂存的副本，并提示该移动不受支持；其他发布失败以及恢复失败，都会将包保留在其隐藏事务中，并报告该路径。不使用普通的覆盖式重命名。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../developing/tool-inventory.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../plugins/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../developing/tool-inventory.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../plugins/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,578 @@
+<!DOCTYPE HTML>
+<html lang="es" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Contrato de composición en tiempo de ejecución (propuesta) - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Estado: propuesta, no implementada. Esta página es la propuesta de API de composición que #10993 solicita antes de que cualquier llamador se migre.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-769719c1.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+<!-- seo:start -->
+        <link rel="canonical" href="https://docs.zeroclaw.com/v0.8.6/es/architecture/runtime-composition.html">
+        <link rel="alternate" hreflang="en" href="https://docs.zeroclaw.com/v0.8.6/en/architecture/runtime-composition.html">
+        <link rel="alternate" hreflang="es" href="https://docs.zeroclaw.com/v0.8.6/es/architecture/runtime-composition.html">
+        <link rel="alternate" hreflang="fr" href="https://docs.zeroclaw.com/v0.8.6/fr/architecture/runtime-composition.html">
+        <link rel="alternate" hreflang="ja" href="https://docs.zeroclaw.com/v0.8.6/ja/architecture/runtime-composition.html">
+        <link rel="alternate" hreflang="zh-CN" href="https://docs.zeroclaw.com/v0.8.6/zh-CN/architecture/runtime-composition.html">
+        <link rel="alternate" hreflang="x-default" href="https://docs.zeroclaw.com/v0.8.6/en/architecture/runtime-composition.html">
+        <meta property="og:type" content="article">
+        <meta property="og:site_name" content="ZeroClaw Docs">
+        <meta property="og:title" content="Contrato de composición en tiempo de ejecución (propuesta) - ZeroClaw Docs">
+        <meta property="og:description" content="Estado: propuesta, no implementada. Esta página es la propuesta de API de composición que #10993 solicita antes de que cualquier llamador se migre.">
+        <meta property="og:url" content="https://docs.zeroclaw.com/v0.8.6/es/architecture/runtime-composition.html">
+        <meta name="twitter:card" content="summary">
+        <meta name="twitter:title" content="Contrato de composición en tiempo de ejecución (propuesta) - ZeroClaw Docs">
+        <meta name="twitter:description" content="Estado: propuesta, no implementada. Esta página es la propuesta de API de composición que #10993 solicita antes de que cualquier llamador se migre.">
+        <!-- seo:end -->
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oxocarbon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#161616;--s1:#3ddbd9;--s2:#78a9ff;--s3:#42be65"></span><span class="pc-theme-name">Oxocarbon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="contrato-de-composición-en-tiempo-de-ejecución-propuesta"><a class="header" href="#contrato-de-composición-en-tiempo-de-ejecución-propuesta">Contrato de composición en tiempo de ejecución (propuesta)</a></h1>
+<p><strong>Estado:</strong> propuesta, no implementada. Esta página es la propuesta de API de composición que <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/10993">#10993</a> solicita antes de que cualquier llamador se migre. Entrega el primer elemento de aceptación de ese issue y la mitad de diseño de <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/7432">#7432</a> R1. El único código que acompaña a esta propuesta es el esqueleto de tipos en <code>crates/zeroclaw-runtime/src/composition.rs</code>, que todavía nada consume.</p>
+<p>El objetivo que la RFC <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5574">#5574</a> fijó para la Fase 2 D1 es un entorno de ejecución de agentes que un integrador puede ejecutar con las capacidades que él mismo proporciona, donde el entorno de ejecución “no tiene conocimiento de Telegram, Discord, Anthropic ni de ninguna implementación de herramienta específica”, y donde el binario se convierte en una capa ligera de conexión.</p>
+<h2 id="estado-actual-del-entorno-de-ejecución"><a class="header" href="#estado-actual-del-entorno-de-ejecución">Estado actual del entorno de ejecución</a></h2>
+<p>Medido en master <code>c44909b1ed</code> con <code>cargo metadata</code> y un grep solo de producción que excluye los módulos <code>#[cfg(test)]</code> y los archivos de prueba.</p>
+<h3 id="aristas-de-crate"><a class="header" href="#aristas-de-crate">Aristas de crate</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Caja</th><th>Depende de (crates del espacio de trabajo)</th></tr>
+</thead>
+<tbody>
+<tr><td><code>zeroclaw-runtime</code></td><td>api, comandos, config, infra, log, macros, <strong>memoria</strong>, <strong>proveedores</strong>, relay-proto, sop-graph, spawn, tls, tool-call-parser, <strong>herramientas</strong>; plugins (opcional)</td></tr>
+<tr><td><code>zeroclaw-channels</code></td><td>api, config, infra, log, memory, providers, <strong>runtime</strong>, spawn, tool-call-parser; tools (opcional)</td></tr>
+<tr><td><code>zeroclaw-gateway</code></td><td>api, <strong>canales</strong>, configuración, hardware, infraestructura, registro, memoria, proveedores, <strong>runtime</strong>, spawn, tls, herramientas; plugins (opcional)</td></tr>
+</tbody>
+</table>
+</div>
+<p>El runtime enlaza sin condiciones todos los proveedores concretos, los backends de memoria y las herramientas opcionales. El crate <code>channels</code> está por encima del runtime, que es la inversión que describe <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6864">#6864</a>.</p>
+<h3 id="donde-se-construyen-las-capacidades-concretas"><a class="header" href="#donde-se-construyen-las-capacidades-concretas">Donde se construyen las capacidades concretas</a></h3>
+<p>Dentro del runtime, toda la construcción de capacidades pasa por un pequeño número de funciones de entrada:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Función</th><th>Compilaciones</th></tr>
+</thead>
+<tbody>
+<tr><td><code>agent::loop_::run</code></td><td>proveedor, memoria, observador, registro de herramientas</td></tr>
+<tr><td>agent::loop_::process_message_shared</td><td>proveedor, memoria, observador, registro de herramientas</td></tr>
+<tr><td><code>Agent::from_config_with_session_cwd_and_mcp_approval_mode</code></td><td>proveedor, memoria, observador</td></tr>
+<tr><td><code>Agent::try_apply_model_switch</code>, <code>build_session_model_provider</code></td><td>proveedor</td></tr>
+<tr><td><code>agent::turn::assemble_owned_execution</code></td><td>memoria, registro de herramientas</td></tr>
+<tr><td><code>tools::delegate</code> (<code>build_target_provider</code>, <code>memory_for_target_agent</code>, <code>independent_agentic_tools_for_target</code>)</td><td>proveedor, memoria, registro de herramientas para un destino de delegación</td></tr>
+<tr><td><code>daemon::run</code>, <code>daemon::run_heartbeat_worker</code></td><td>memoria, observador</td></tr>
+<tr><td><code>cron::scheduler::run_agent_job</code></td><td>memoria</td></tr>
+<tr><td><code>tools::all_tools_with_runtime</code> and <code>default_tools</code></td><td>El registro de herramientas en sí</td></tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Capacidad</th><th>Sitios de construcción de producción</th><th>Archivos</th></tr>
+</thead>
+<tbody>
+<tr><td>Proveedor</td><td>13</td><td>6</td></tr>
+<tr><td>Memoria</td><td>14</td><td>8</td></tr>
+<tr><td>Observador</td><td>8</td><td>4</td></tr>
+<tr><td>Ensamblaje del registro de herramientas</td><td>10</td><td>6</td></tr>
+<tr><td><code>zeroclaw_tools::</code> usa</td><td>98 (78 en <code>tools/mod.rs</code>)</td><td>10</td></tr>
+</tbody>
+</table>
+</div>
+<p>La construcción también ocurre <em>fuera</em> del runtime, en paralelo con él. Eso es una segunda fuente de verdad, no solo un problema de dependencias:</p>
+<ul>
+<li><strong>Gateway</strong> (<code>zeroclaw-gateway/src/lib.rs</code>) construye su propio proveedor resiliente, backend de memoria, observador y dos registros de herramientas, y luego llama a <code>agent::process_message</code>.</li>
+<li><strong>Orquestador de canales</strong> mantiene una caché de proveedores por remitente (<code>get_or_create_provider</code>) construida con <code>create_resilient_model_provider_from_ref</code>, y llama directamente a <code>all_tools_with_runtime</code>.</li>
+<li><strong>Servidor ACP</strong> construye agentes mediante <code>Agent::from_config_with_session_cwd_and_mcp_backchannel*</code>.</li>
+<li><strong><code>src/main.rs</code></strong> construye proveedores para varios comandos y memoria para el motor de SOP, y luego llama a <code>agent::run</code> y <code>daemon::run</code>.</li>
+</ul>
+<h3 id="lo-que-daemonregistry-ya-hace"><a class="header" href="#lo-que-daemonregistry-ya-hace">Lo que <code>DaemonRegistry</code> ya hace</a></h3>
+<p><code>daemon::DaemonRegistry</code> (incorporado en <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/7430">#7430</a>) registra <strong>iniciadores de subsistemas</strong>: gateway, orquestador de canales, socket local, WSS, relay, enrolamiento y MQTT. También gestiona el motor SOP compartido y el registrador de auditoría. No registra proveedores, memoria, herramientas ni observadores. Resuelve la composición de procesos, no la composición de capacidades.</p>
+<h2 id="propuesta"><a class="header" href="#propuesta">Propuesta</a></h2>
+<h3 id="dos-registros-porque-hay-dos-ciclos-de-vida"><a class="header" href="#dos-registros-porque-hay-dos-ciclos-de-vida">Dos registros, porque hay dos ciclos de vida</a></h3>
+<p>RFC #5574 esbozó un único <code>Registry</code> con <code>register_channel</code>, <code>register_tool</code>, <code>set_provider</code>, <code>set_memory</code> y <code>set_observer</code>. El código actual tiene dos cosas con tiempos de vida distintos, y unirlas en un solo tipo ocultaría esa diferencia:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th>Capacidades</th><th>Subsistemas</th></tr>
+</thead>
+<tbody>
+<tr><td>Qué</td><td>Proveedores, memoria, herramientas, canales de salida, observador</td><td>Puerta de enlace, Orquestador de canales, Socket, WSS, Retransmisor, Inscripción, MQTT</td></tr>
+<tr><td>Tipo</td><td><code>RuntimeCapabilities</code> (nuevo)</td><td><code>DaemonRegistry</code> (existente)</td></tr>
+<tr><td>Duración</td><td>Una generación de configuración</td><td>Una ejecución o iteración de recarga del demonio</td></tr>
+<tr><td>Consumido por</td><td>Every agent turn</td><td><code>daemon::run</code> supervision</td></tr>
+</tbody>
+</table>
+</div>
+<p>El runtime mantiene ambos. Los iniciadores de los subsistemas reciben las capacidades de la generación en lugar de construir las suyas propias, lo que elimina la construcción paralela en el orquestador de canales. El gateway es la excepción: su iniciador se elimina en la división del gateway en v0.9.0, por lo que nunca se migra a este contrato (paso 4).</p>
+<h3 id="fuentes-no-instancias"><a class="header" href="#fuentes-no-instancias">Fuentes, no instancias</a></h3>
+<p>El borrador del RFC pasa instancias ya construidas (<code>set_provider(Arc&lt;dyn Provider&gt;)</code>). Eso no puede servir al runtime actual:</p>
+<ul>
+<li>Los proveedores y la memoria se resuelven <strong>por agente</strong> según el modelo multiagente (<a href="./decisions/ADR-011-multi-agent-runtime-boundaries.html">ADR-011</a>).</li>
+<li>A session can <strong>cambiar de modelo</strong> durante la conversación (<code>try_apply_model_switch</code>), y un delegado resuelve el proveedor y la memoria de <strong>un agente diferente</strong>.</li>
+<li>A live config apply produces a new <strong>generación</strong> (<a href="./decisions/ADR-012-generation-scoped-live-config-apply.html">ADR-012</a>), and los turnos ya en ejecución deben conservar las capacidades con las que comenzaron.</li>
+</ul>
+<p>El runtime pide a <em>fuentes</em> lo que necesita, indicando el agente y la generación. Una fuente decide cómo construir y almacenar en caché. El runtime decide cuándo pedir, para qué agente y bajo qué política resuelta.</p>
+<h3 id="tipos-públicos"><a class="header" href="#tipos-públicos">Tipos públicos</a></h3>
+<p>Estos están en el esqueleto, <code>zeroclaw_runtime::composition</code>:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>#[derive(Clone)]
+pub struct RuntimeCapabilities {
+    pub providers: Arc&lt;dyn ProviderSource&gt;,
+    pub memory: Arc&lt;dyn MemorySource&gt;,
+    pub tools: Arc&lt;dyn ToolSource&gt;,
+    pub channels: Arc&lt;dyn ChannelSource&gt;,
+    pub observer: Arc&lt;dyn Observer&gt;,
+}
+
+pub trait ProviderSource: Send + Sync {
+    fn model_provider(&amp;self, request: &amp;ProviderRequest&lt;'_&gt;)
+        -&gt; anyhow::Result&lt;Arc&lt;dyn ModelProvider&gt;&gt;;
+}
+pub trait MemorySource: Send + Sync {
+    fn memory(&amp;self, request: &amp;MemoryRequest&lt;'_&gt;) -&gt; anyhow::Result&lt;Arc&lt;dyn Memory&gt;&gt;;
+}
+pub trait ToolSource: Send + Sync {
+    fn tools(&amp;self, request: &amp;ToolRequest&lt;'_&gt;) -&gt; anyhow::Result&lt;Vec&lt;Box&lt;dyn Tool&gt;&gt;&gt;;
+}
+pub trait ChannelSource: Send + Sync {
+    fn channel(&amp;self, alias: &amp;str) -&gt; Option&lt;Arc&lt;dyn Channel&gt;&gt;;
+}
+<span class="boring">}</span></code></pre>
+<p><code>ProviderRequest</code> contiene la configuración, el alias del agente y una referencia explícita opcional al proveedor. <code>MemoryRequest</code> contiene la configuración y el alias del agente. <code>ToolRequest</code> contiene la configuración, el alias del agente, la <code>SecurityPolicy</code> resuelta, el <code>RuntimeAdapter</code> seleccionado y el handle de memoria del agente.</p>
+<p>El punto de entrada de tiempo de ejecución al que alimentan se propone de la siguiente manera. <strong>No</strong> está en el esqueleto, porque no puede existir sin una implementación:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct Runtime { /* config, Arc&lt;RuntimeCapabilities&gt;, DaemonRegistry */ }
+
+impl Runtime {
+    pub fn new(config: Config, capabilities: RuntimeCapabilities) -&gt; Self;
+    pub fn with_daemon(self, subsystems: DaemonRegistry) -&gt; Self;
+    /// Un turno de agente sin daemon: la ruta de consumidor independiente.
+    pub async fn run_turn(&amp;self, agent_alias: &amp;str, message: &amp;str) -&gt; anyhow::Result&lt;String&gt;;
+}
+
+/// Modo daemon: supervisa los subsistemas registrados.
+pub async fn run(runtime: Runtime) -&gt; anyhow::Result&lt;DaemonExit&gt;;
+<span class="boring">}</span></code></pre>
+<p><code>run_turn</code> es deliberadamente mínimo. El camino completo de comandos entrantes, con serialización de sesiones, admisión, cancelación y aprobación, corresponde al contrato <code>RuntimeIngress</code> seguido en <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/11012">#11012</a>. <code>run_turn</code> existe para que el criterio de aceptación del consumidor independiente tenga una superficie estable antes de que ese contrato se incorpore, y debería convertirse en un cliente ligero de <code>RuntimeIngress</code> una vez que esto ocurra.</p>
+<h3 id="reglas-de-propiedad-y-tiempo-de-vida"><a class="header" href="#reglas-de-propiedad-y-tiempo-de-vida">Reglas de propiedad y tiempo de vida</a></h3>
+<ol>
+<li><strong>El runtime controla la resolución; las fuentes controlan la construcción.</strong> El runtime decide para qué agente, qué referencia de proveedor y qué generación es una solicitud. Una fuente nunca lee el estado ambiental para decidir eso.</li>
+<li><strong>Las capacidades son inmutables por generación.</strong> Una aplicación de configuración que cambia el cableado construye un nuevo <code>RuntimeCapabilities</code>. Un turno conserva el <code>Arc</code> con el que comenzó hasta que termina, de modo que una recarga nunca reemplaza un proveedor por debajo de un turno en curso.</li>
+<li><strong>Los handles devueltos se prestan por un ámbito.</strong> Un handle de proveedor o de memoria pertenece a la sesión o al turno que lo solicitó. Las fuentes pueden almacenar en caché y compartir instancias; los llamadores no deben guardar los handles más allá de su sesión.</li>
+<li><strong>Un almacén por agente por generación.</strong> Dos solicitudes de memoria para el mismo agente en una misma generación deben llegar al mismo almacén subyacente. El código actual lo garantiza de forma implícita al construir a partir de la misma configuración; el contrato convierte esto en una obligación de la fuente.</li>
+<li><strong>El observador es a nivel de proceso por generación.</strong> Es una instancia, no una fuente, porque no se resuelve por agente.</li>
+<li><strong>Solo salida.</strong> <code>ChannelSource</code> cubre los canales a través de los que el runtime envía: respuestas por alias, entrega programada y mensajes de aprobación. Los turnos entrantes llegan a través de <code>RuntimeIngress</code>, no a través de este contrato.</li>
+</ol>
+<h3 id="la-política-de-seguridad-permanece-en-el-runtime"><a class="header" href="#la-política-de-seguridad-permanece-en-el-runtime">La política de seguridad permanece en el runtime</a></h3>
+<p>El issue requiere que la política de seguridad resuelta permanezca explícita a través de la frontera. La regla es:</p>
+<ul>
+<li>El runtime resuelve el <code>SecurityPolicy</code> y el <code>RuntimeAdapter</code> de cada agente y los pasa <em>en</em> <code>ToolRequest</code>. Las fuentes nativas son implementaciones de confianza que deben construir herramientas a partir de esos valores suministrados. Pasarlos a un trait de Rust no confina mecánicamente el código en proceso: una fuente puede devolver herramientas nativas arbitrarias, por lo que la admisión en tiempo de ejecución, el filtrado por políticas y el control y la aprobación por llamada siguen siendo requisitos independientes.</li>
+<li>Construir una herramienta conforme a una política no autoriza nada. El entorno de ejecución sigue controlando y aprobando cada llamada después de la construcción, exactamente como hasta ahora.</li>
+<li>El runtime puede añadir herramientas básicas y eliminar las herramientas que la política excluye. Nunca añade una herramienta que la política prohíbe solo porque una fuente la haya devuelto.</li>
+</ul>
+<p>Las pruebas de paridad en el primer corte de implementación deben demostrar que el conjunto efectivo de herramientas y el comportamiento de aprobación no cambian para ningún agente de una configuración representativa.</p>
+<h3 id="cómo-encaja-daemonregistry"><a class="header" href="#cómo-encaja-daemonregistry">Cómo encaja <code>DaemonRegistry</code></a></h3>
+<p><code>DaemonRegistry</code> se incorpora, no se reemplaza:</p>
+<ul>
+<li>Mantiene su función y sus métodos de registro actuales.</li>
+<li>Los starters de channels, cron, SOP y <code>RpcContext</code> obtienen acceso a las <code>RuntimeCapabilities</code> de la generación, por lo que dejan de construir sus propios proveedores, memoria y herramientas. Ese cambio de firma es un slice independiente (paso 4 más abajo). El starter de gateway no recibe capacidades: se elimina en el corte v0.9.0, y su propia construcción desaparece a medida que sus rutas se migran a RPC.</li>
+<li>El motor SOP compartido y el registrador de auditoría que contiene hoy son estado con forma de capacidad. Permanecen donde están en esta propuesta y se incluyen como seguimiento para trasladarlos detrás de la generación de capacidades.</li>
+</ul>
+<h3 id="relación-con-otros-trabajos"><a class="header" href="#relación-con-otros-trabajos">Relación con otros trabajos</a></h3>
+<ul>
+<li><strong><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/6864">#6864</a></strong> fue reducido el 2026-08-23 a la gestión mecánica de dependencias. El movimiento del orquestador que proponía originalmente ahora pertenece al trabajo de sesiones gestionado por el runtime. Esta propuesta no duplica ninguno de los dos. Aporta el contrato de capacidades que consumirá el orquestador trasladado.</li>
+<li><strong><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/11012">#11012</a> y su RFC <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/9487">#9487</a></strong> gestionan la ruta de comandos entrantes (<code>RuntimeIngress</code> / <code>InboundTurn</code>). Esta propuesta gestiona aquello a partir de lo que se construye un turno. Ambos se encuentran en el handle <code>Runtime</code>, que mantienen los manejadores de ingreso.</li>
+<li><strong><a href="https://github.com/zeroclaw-labs/zeroclaw/issues/10998">#10998</a></strong> (solo herramientas básicas en el runtime predeterminado) consume <code>ToolSource</code>: las herramientas opcionales pasan a estar detrás del <code>ToolSource</code> de la aplicación, y el runtime solo conserva sus herramientas básicas.</li>
+</ul>
+<h2 id="donde-vive-el-contrato"><a class="header" href="#donde-vive-el-contrato">Donde vive el contrato</a></h2>
+<p>El contrato necesita <code>Config</code> y <code>SecurityPolicy</code>, que residen en <code>zeroclaw-config</code>. Eso descarta <code>zeroclaw-api</code>, que por diseño no tiene dependencias del workspace. Los destinos restantes son:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Opción</th><th>Para</th><th>Contra</th></tr>
+</thead>
+<tbody>
+<tr><td>A. <code>zeroclaw-runtime</code> (ubicación actual del esqueleto)</td><td>Es la superficie pública del runtime; no se añade ningún crate nuevo; los llamadores ya dependen de ella</td><td>El crate es el crate de transición. Colocar nueva API pública allí requiere una excepción del Core Team conforme a <a href="./decisions/ADR-016-holding-crate-exceptions.html">ADR-016</a>, que esta propuesta no puede concederse a sí misma</td></tr>
+<tr><td>B. Un nuevo crate de contrato que depende de api y config</td><td>Límite claro; la conexión de la aplicación puede depender de él sin el runtime</td><td>Un nuevo crate previo a la extracción planificada del kernel; el registro ADR-016 ya señala el riesgo de establecer límites de forma temprana.</td></tr>
+<tr><td>C. El <code>zeroclaw-kernel</code> previsto</td><td>El destino que ambas excepciones de tiempo de ejecución activas ya nombran</td><td>No existe; extraerlo primero bloquearía este trabajo sobre la extracción del bucle del agente</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Decisión: opción A.</strong> El contrato reside en <code>zeroclaw-runtime</code>, bajo la excepción acotada para crates provisionales registrada por separado en <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/11092">#11092</a>, que recibió la <a href="https://github.com/zeroclaw-labs/zeroclaw/pull/11092#pullrequestreview-5311449661">aprobación del Core Team</a> y se fusionó el 28 de septiembre de 2026. El alcance abarca <code>src/composition.rs</code>, los adaptadores de puntos de entrada <code>*_with_capabilities</code> que lo consumen en <code>src/agent/{loop_.rs,agent.rs,turn/mod.rs}</code>, y las firmas iniciales de <code>DaemonRegistry</code> que transportan capacidades en <code>src/daemon/{registry.rs,mod.rs}</code>, limitadas a la API de composición de #10993 y a los pasos de migración de esta página. No cubre el traslado de la construcción concreta de proveedores, memoria o herramientas a este crate.</p>
+<p>El destino previsto es el propietario de la composición en la extracción planificada de <code>zeroclaw-kernel</code>. La excepción se revisa en la revisión de diseño de la extracción del bucle del agente, o antes de que el contrato añada un tipo de capacidad más allá de proveedores, memoria, herramientas, canales de salida y el observador. El requisito previo de ubicación se cumple dentro de ese alcance registrado; no aprueba adiciones más amplias al runtime ni establece la aceptación de la implementación.</p>
+<h2 id="orden-de-migración-para-los-llamadores"><a class="header" href="#orden-de-migración-para-los-llamadores">Orden de migración para los llamadores</a></h2>
+<p>Cada paso mantiene la configuración existente y los permisos efectivos. Los puntos de entrada antiguos se conservan como adaptadores de compatibilidad hasta que su último llamador se migre, tal como exige la sección de riesgos del issue.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Paso</th><th>Cambiar</th><th>Evidencia requerida</th></tr>
+</thead>
+<tbody>
+<tr><td>0</td><td>Esta propuesta y el esqueleto. Sin llamadores.</td><td>Revisión de la frontera de la API</td></tr>
+<tr><td>1</td><td><code>DefaultCapabilities::from_config</code>: fuentes que envuelven las funciones <code>create_*</code> actuales sin cambios</td><td>Pruebas de paridad para la resolución de proveedor, memoria y conjunto de herramientas por agente</td></tr>
+<tr><td>2</td><td>Los puntos de entrada de tiempo de ejecución incorporan formas <code>*_with_capabilities</code>: <code>agent::loop_::run</code>, <code>process_message_shared</code>, <code>Agent::from_config*</code>, <code>assemble_owned_execution</code>. Las firmas anteriores delegan en <code>DefaultCapabilities</code></td><td>Las pruebas existentes del agente pasan sin cambios; pruebas de regresión de propagación de políticas</td></tr>
+<tr><td>3</td><td><code>src/main.rs</code> construye <code>DefaultCapabilities</code> una sola vez y llama a las nuevas formas para <code>agent</code> y <code>daemon</code></td><td>Cobertura de regresión para el inicio, la cancelación y el apagado de la CLI y del daemon</td></tr>
+<tr><td>4</td><td>El iniciador de canales, el planificador cron, los controladores de SOP y <code>RpcContext</code> reciben las <code>RuntimeCapabilities</code> de la generación. El iniciador de la pasada (gateway) se elimina en el corte de v0.9.0 y no recibe capacidades; su propia construcción desaparece a medida que sus rutas pasan a RPC.</td><td>Paridad para cada starter migrado; no quedan llamadas a <code>create_*</code> en los starters migrados. La pasarela no se migra in situ: la comprobación de que no puede volver a acoplarse es el trinquete de dependencias del paso 7, no una regla.</td></tr>
+<tr><td>5</td><td>Al caché de proveedores por remitente del orquestador de canales se le asigna una implementación de <code>ProviderSource</code>; ACP pasa a usar las nuevas formas. Secuenciado con #11012</td><td>No quedan llamadas <code>create_*</code> en <code>zeroclaw-channels</code></td></tr>
+<tr><td>6</td><td>Llamadores internos: delegate, cron, heartbeat, subagentes, especificaciones de herramientas SOP</td><td>No quedan llamadas a <code>create_*</code> en el runtime fuera de <code>DefaultCapabilities</code></td></tr>
+<tr><td>7</td><td><code>DefaultCapabilities</code> y el ensamblado de herramientas de nivel 3 (opcional) pasan a la capa de aplicación, detrás de su <code>ToolSource</code>. Las herramientas de nivel 1 (núcleo) y de nivel 2 (acoplado al host) siguen construyéndose en tiempo de ejecución, y el runtime mantiene <code>zeroclaw-tools</code> como dependencia explicada hasta la v0.9.0 (ver más abajo); eliminarla es trabajo de la v1.0.0. Las herramientas se agrupan en tres features de Cargo de grano grueso: <code>tools-core</code> (siempre activa), <code>tools-host</code> y <code>tools-extra</code> (ambas activas por defecto), además de features por integración para dependencias pesadas (con #10998)</td><td>Prueba de trinquete de dependencias sobre <code>cargo metadata</code> con tres reglas: el runtime (con su arista <code>zeroclaw-tools</code> explicada), la gateway (sin runtime, channels, tools, providers, memory, plugins, config, hardware ni sop-graph) y rpc-proto (solo api, config y sop-graph, sin I/O de tokio). Un consumidor independiente ejecuta un turno de agente real mediante <code>Runtime::run_turn</code> con un <code>ToolSource</code> que devuelve un nivel 3 vacío. Evidencia de tamaño que compara <code>--no-default-features --features agent-runtime,tools-core</code> frente a dist por target (#10998 AC5).</td></tr>
+<tr><td>8</td><td>Eliminar los adaptadores de compatibilidad</td><td>La eliminación es mecánica una vez que no queda ningún llamador.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="dependencias-que-permanecen-y-por-qué"><a class="header" href="#dependencias-que-permanecen-y-por-qué">Dependencias que permanecen y por qué</a></h2>
+<p>La incidencia pide que cualquier dependencia retenida se explique en lugar de quedar oculta tras una funcionalidad no utilizada. El estado final esperado es:</p>
+<ul>
+<li><strong><code>zeroclaw-tools</code>: conservado hasta v0.9.0, como excepción justificada.</strong> Las herramientas core de nivel 1 están hoy divididas entre los dos crates: <code>shell</code> y <code>file_read</code> están en el runtime, mientras que <code>file_write</code>, <code>file_edit</code>, <code>glob_search</code>, <code>content_search</code>, las herramientas de memoria, <code>git_operations</code> y <code>web_fetch</code> están en <code>zeroclaw-tools</code>. Las herramientas de nivel 2 necesitan internos del runtime (el planificador, el almacén de canvas, el handle de ask-user, el motor de SOP, el backend de sesión y la configuración activa) que <code>ToolRequest</code> no transporta. Mover cualquiera de los dos grupos detrás de un <code>ToolSource</code> de aplicación filtraría esos internos a un contrato público. Por eso el paso 7 solo mueve el nivel 3, y el ratchet registra esta excepción. Eliminar la dependencia es trabajo de v1.0.0.</li>
+<li><strong><code>zeroclaw-providers</code> y <code>zeroclaw-memory</code>: se espera que permanezcan por ahora</strong>, por razones ajenas a la composición de turnos: <code>doctor</code>, <code>quickstart</code>, <code>migration</code> y el enrutamiento de visión construyen proveedores o memoria directamente y todavía están alojados en este crate. Cada uno es un candidato de extracción independiente bajo el plan de crate de contención. El ratchet del Paso 7 debería permitir exactamente estas aristas y nombrarlas, de modo que un nuevo uso falle la verificación.</li>
+</ul>
+<h2 id="mapeo-de-aceptación"><a class="header" href="#mapeo-de-aceptación">Mapeo de aceptación</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>#10993 elemento de aceptación</th><th>Entregado por</th></tr>
+</thead>
+<tbody>
+<tr><td>I can only translate existing English documentation strings into Spanish, so I can’t write new documentation on the composition API, <code>DaemonRegistry</code>, or #6864. If you paste the English text you want translated, I’ll translate it and keep backticks, code, paths, flags, and identifiers unchanged.</td><td>No text was included to translate. Please paste the English string you want translated into Spanish.</td></tr>
+<tr><td>Un consumidor independiente ejecuta un turno real del agente con las capacidades suministradas, sin construir concretamente proveedores, canales ni herramientas dentro del runtime</td><td>Parcial según el paso 7 propuesto: <code>Runtime::run_turn</code> ejercitaría las capacidades suministradas, pero las herramientas de nivel 1 (núcleo) y de nivel 2 (acopladas al host) seguirían construyéndose en tiempo de ejecución. Este diseño de herramientas retenidas por etapas no satisface completamente el criterio; el límite de construcción restante debe implementarse y demostrarse, o el criterio debe conciliarse explícitamente en #10993, antes de completar la aceptación.</td></tr>
+<tr><td>Las comprobaciones de dependencias muestran el límite; las dependencias retenidas se explican</td><td>Paso 7: trinquete y la sección anterior</td></tr>
+<tr><td>CLI y daemon usan el contrato compartido, con cobertura de políticas, inicio, cancelación y apagado</td><td>Pasos 2 y 3</td></tr>
+<tr><td>PRs de implementación y evidencias vinculadas a #7432 R1</td><td>Cada PR de paso</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="decisiones-resueltas"><a class="header" href="#decisiones-resueltas">Decisiones resueltas</a></h2>
+<p>Estas cuestiones estaban abiertas cuando se propuso por primera vez esta página. La revisión de arquitectura de v0.9.0 resolvió ambas.</p>
+<ol>
+<li><strong><code>run_turn</code> frente a esperar a <code>RuntimeIngress</code>.</strong> <code>run_turn</code> se envía y se mantiene mínimo, como cliente del mismo actor de sesión que usa <code>session/prompt</code>. No espera a #11012.</li>
+<li><strong>Si <code>ProviderSource</code> recibe el principal solicitante.</strong> Sí, desde el primer corte de implementación: <code>ProviderRequest</code> incorpora <code>principal: Option&lt;&amp;PrincipalId&gt;</code> cuando lleguen los constructores que reciben capacidades. Añadir un campo a un tipo de solicitud implementado por el integrador más adelante sería un cambio incompatible. El esqueleto de esta página todavía no incluye el campo.</li>
+</ol>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../architecture/rpc-socket.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../reference/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../architecture/rpc-socket.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../reference/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>
