@@ -12756,6 +12756,9 @@ pub struct MemoryConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_api_key: Option<String>,
+    /// Text prepended to a search query, and only to the query, before it is embedded. Instruction-tuned embedding models are trained to embed a query and a stored passage differently and expect the query side to carry an instruction, for example `Instruct: Given a user message, retrieve memories that help answer it\nQuery:` for Qwen3-Embedding or `query: ` for E5-style models; without it they rank worse than keyword search. Stored memories are always embedded as they are, so setting or changing this needs no re-embedding. Leave unset for models that embed both sides the same way (OpenAI, Gemini).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_query_prefix: Option<String>,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
@@ -13326,6 +13329,7 @@ impl Default for MemoryConfig {
             embedding_dimensions: default_embedding_dims(),
             auto_reindex_on_identity_change: false,
             embedding_api_key: None,
+            embedding_query_prefix: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),
