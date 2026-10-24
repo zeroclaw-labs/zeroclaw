@@ -2,12 +2,19 @@
 
 Agent evaluation harness for ZeroClaw.
 
-**Phase 0 — deterministic replay.** Runs the *real* agent loop against scripted
+**Replay mode (default) — deterministic.** Runs the *real* agent loop against scripted
 LLM responses (an `LlmTrace` fixture) and grades the outcome against declarative
 expectations. Because the model output is fixed, a replay eval is free, fast, and
 fully deterministic: it proves the agent *machinery* (tool parsing, dispatch,
 multi-turn looping) behaves correctly given a known model output. It does **not**
-measure model quality — that is the live mode added in a later phase.
+measure model quality.
+
+**Live mode — real provider.** Runs the same fixtures against the provider named by
+`[eval] live_provider`: real tokens, real network egress, non-deterministic output.
+The tool surface is the `[eval] live_allowed_tools` allowlist, `shell` is hard-denied
+regardless of what a case or the config requests, approvals run through a
+non-interactive backchannel manager that auto-denies anything not allowlisted, and
+each turn is bounded by `[eval] case_timeout_secs`.
 
 ## CLI
 
@@ -18,10 +25,12 @@ zeroclaw eval run
 
 # Point at an explicit suite, emit machine-readable JSON
 zeroclaw eval run --suite evals/regression --format json
+
+# Run against the real provider from `[eval] live_provider` (real tokens, real egress)
+zeroclaw eval run --mode live
 ```
 
-Exits non-zero if any case fails, so it can gate CI. `--mode live` is reserved for
-a later phase and currently returns a clear error.
+Exits non-zero if any case fails, so it can gate CI.
 
 ## Case format
 
@@ -51,9 +60,14 @@ declarative `expects` the run is graded against.
 ```
 
 Supported expectations: `response_contains`, `response_not_contains`,
-`response_matches` (regex), `tools_used`, `tools_not_used`, `max_tool_calls`,
-`min_tool_calls`, `exact_tool_calls`, `all_tools_succeeded`,
-`tool_arguments_contain`, `tool_results_contain`.
+`response_matches` (regex), `response_json` (JSON pointer to expected value),
+`tools_used`, `tools_not_used`, `max_tool_calls`, `min_tool_calls`,
+`exact_tool_calls`, `all_tools_succeeded`, `tool_arguments_contain`,
+`tool_results_contain`, `workspace` (`file_exists`, `file_absent`,
+`file_contains`), and `budget` (`max_input_tokens`, `max_output_tokens`,
+`max_total_tokens`, `max_duration_ms`, `max_llm_calls`). Fixture loading rejects
+unknown keys and declarations that cannot fail; see the eval-harness book page
+for the full reference.
 
 ### Grading the dispatch boundary
 
@@ -85,8 +99,9 @@ Fixture loading rejects unknown nested fields, empty tool names or needles,
 `min_tool_calls: 0`, and contradictory min/max/exact bounds before execution.
 
 Replay fixtures may only call tools the harness registers; Phase 0 ships a
-side-effect-free `echo` tool (see `tools::default_tools`). Wiring the real
-sandboxed tool registry for live evals is a later phase.
+side-effect-free `echo` tool (see `tools::default_tools`). Live evals assemble
+the runtime tool registry under the case's workspace-only security policy and
+filter it to the effective allowlist; `shell` remains unavailable.
 
 ## Library shape
 
@@ -97,8 +112,9 @@ sandboxed tool registry for live evals is a later phase.
   (`RecordedCall`: name, arguments, result, success) and token usage. The
   recorded-call list is the canonical dispatch fact; tool names and aggregate
   success are derived from it rather than stored again.
-- `grader` — non-panicking `GradeResult` checks (the `Grader` trait is the
-  extension point for side-effect/budget/LLM-judge graders in later phases).
+- `grader` — non-panicking `GradeResult` checks: expectations, workspace
+  end state, and run budgets (the `Grader` trait remains the extension point,
+  with the LLM-judge grader still a later phase).
 - `runner` — builds an isolated agent per case, drives it, grades it.
 - `report` — pass/fail aggregation, table + JSON rendering.
 
