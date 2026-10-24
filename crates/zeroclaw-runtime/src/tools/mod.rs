@@ -222,6 +222,14 @@ pub struct ArcToolRef(pub Arc<dyn Tool>);
 
 #[async_trait]
 impl Tool for ArcToolRef {
+    fn builtin_target_name(&self) -> Option<&str> {
+        self.0.builtin_target_name()
+    }
+
+    fn with_builtin_target(&self, target: Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
+        self.0.with_builtin_target(target)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.0.requires_unrestricted_principal()
     }
@@ -360,6 +368,14 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
+    fn builtin_target_name(&self) -> Option<&str> {
+        self.inner.builtin_target_name()
+    }
+
+    fn with_builtin_target(&self, target: Arc<dyn Tool>) -> Option<Arc<dyn Tool>> {
+        self.inner.with_builtin_target(target)
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         self.inner.requires_unrestricted_principal()
     }
@@ -761,12 +777,8 @@ pub struct AllToolsResult {
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
     /// The exact `DelegateTool` this factory registered, in its concrete type.
     ///
-    /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
-    /// `dyn Tool`, so a regression cannot otherwise drive the *production*
-    /// delegate instance's nested-registry construction - it can only
-    /// re-derive the wiring by hand, which is exactly the thing that must not
-    /// be trusted. `None` when no agents are configured.
-    #[cfg(test)]
+    /// Retained so an owned session can bind its principal to the exact
+    /// registered delegate before any child memory tools are built.
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
@@ -774,9 +786,9 @@ impl AllToolsResult {
     /// Wrap an already-built tool vector as `assemble` INPUT, with every
     /// side-channel handle empty. This mints an `AllToolsResult` (the input to
     /// [`crate::tools::scoped::ScopedToolRegistry::assemble`]), NOT a
-    /// `ScopedToolRegistry` - it does not touch the seal. (`AllToolsResult`'s
-    /// fields are all `pub`, so a caller could already hand-roll this literal;
-    /// the helper just centralizes the "all handles empty" shape.) Used by the
+    /// `ScopedToolRegistry` - it does not touch the seal. Out-of-crate callers
+    /// must use it: the retained `delegate_tool` field is crate-private, so
+    /// they cannot hand-roll this literal. Used by the
     /// paths that already own a fixed / pre-filtered tool set (the skill-review
     /// harness, bounded delegation, and the `zeroclaw-eval` replay harness) and
     /// route it through `assemble` only to seal it: they pass `skills: &[]`,
@@ -794,7 +806,6 @@ impl AllToolsResult {
             poll_handle: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
-            #[cfg(test)]
             delegate_tool: None,
         }
     }
@@ -1362,6 +1373,7 @@ pub(crate) fn all_tools_with_runtime_context(
     execution_capability: Option<AgentExecutionCapability>,
     acp_sessions: Option<AcpSessionReadView>,
 ) -> anyhow::Result<AllToolsResult> {
+    let owner = memory.principal_scope();
     #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
     let late_trace = late_tool_search_observer::capture();
     let builder = move || {
@@ -1411,13 +1423,20 @@ pub(crate) fn all_tools_with_runtime_context(
                     "failed to spawn tool-registry builder thread: {error}"
                 ))
             })?;
-        match handle.join() {
+        let result = match handle.join() {
             Ok(result) => result,
             // Preserve the inline build's panic semantics: a builder panic is
             // resumed on the caller's thread exactly as if it had unwound
             // through the caller's frames.
             Err(panic) => std::panic::resume_unwind(panic),
+        }?;
+        // Child runs and cross-agent SOP steps arrive with already-private
+        // memory and never pass through Agent's later session routing. Bind
+        // the same delegate instance its canonical name and aliases retain.
+        if let (Some(owner), Some(delegate)) = (owner, result.delegate_tool.as_ref()) {
+            delegate.bind_principal_scope(owner)?;
         }
+        Ok(result)
     })
 }
 
@@ -2908,7 +2927,6 @@ fn all_tools_with_runtime_on_thread(
                     tools: boxed_registry_from_arcs(tool_arcs),
                     reserved_host_names,
                     delegate_handle: None,
-                    #[cfg(test)]
                     delegate_tool: None,
                     ask_user_handle,
                     channel_room_handle,
@@ -2988,7 +3006,6 @@ fn all_tools_with_runtime_on_thread(
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
-    #[cfg(test)]
     let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
     let delegate_handle: Option<DelegateParentToolsHandle> =
         if agents.is_empty() || !select_tool!("delegate") {
@@ -3052,10 +3069,7 @@ fn all_tools_with_runtime_on_thread(
                 late_tool_search_observer::arc_id(&delegate_tool),
                 0,
             );
-            #[cfg(test)]
-            {
-                built_delegate_tool = Some(Arc::clone(&delegate_tool));
-            }
+            built_delegate_tool = Some(Arc::clone(&delegate_tool));
             tool_arcs.push(delegate_tool as Arc<dyn Tool>);
             Some(parent_tools)
         };
@@ -3146,7 +3160,6 @@ fn all_tools_with_runtime_on_thread(
         reaction_handle,
         poll_handle: root_config.tools.is_enabled("poll").then_some(poll_handle),
         escalate_handle,
-        #[cfg(test)]
         delegate_tool: built_delegate_tool,
     })
 }
@@ -7993,6 +8006,34 @@ mod wrapper_spec_forwarding_tests {
             "ArcDelegatingTool must forward spec() so the inner Arc-shared \
              schema survives; the trait default deep-clones it every call"
         );
+    }
+
+    #[test]
+    fn arc_delegating_tool_forwards_builtin_target_identity() {
+        let spec: crate::skills::SkillTool = serde_json::from_value(serde_json::json!({
+            "name": "use", "description": "fixture", "kind": "builtin",
+            "target": "arc_schema_tool"
+        }))
+        .unwrap();
+        let alias: Arc<dyn Tool> = Arc::new(SkillBuiltinTool::new(
+            "bridge",
+            &spec,
+            Arc::new(ArcSchemaTool::new()),
+            HashMap::new(),
+        ));
+        let boxed = ArcDelegatingTool::boxed(Arc::clone(&alias));
+
+        assert_eq!(
+            boxed.builtin_target_name(),
+            Some("arc_schema_tool"),
+            "memory routing finds aliases by their builtin target, so the \
+             wrapper must report the alias's target"
+        );
+        let rebuilt = boxed
+            .with_builtin_target(Arc::new(ArcSchemaTool::new()))
+            .expect("the wrapper must let routing rebuild the alias");
+        assert_eq!(rebuilt.name(), alias.name());
+        assert_eq!(rebuilt.builtin_target_name(), Some("arc_schema_tool"));
     }
 }
 

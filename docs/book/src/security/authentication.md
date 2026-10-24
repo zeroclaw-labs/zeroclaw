@@ -396,6 +396,16 @@ existing agent job a new prompt and trigger it, and one holding SOP create
 or update grants can save a procedure whose trigger runs it later. Treat
 cron and SOP authoring grants as grants of the agent's tools.
 
+Principal-owned sessions may use synchronous and parallel delegation when
+their grants allow it. Background delegation and its `check_result`,
+`list_results`, `cancel_task`, and `await_sessions` actions are refused,
+including calls through skill aliases and nested delegates. Those task rows
+and result files currently use agent-alias visibility, which cannot protect
+one principal's private output from another principal using the same agent.
+This refusal includes administrator-owned sessions; their private memory is
+still private. Shared operator delegation remains available. Existing shared
+result artifacts are not migrated or removed by this restriction.
+
 ## Breaking change: remote WSS requires authentication
 
 From this change on, a remote WSS connection must present `auth_token` in
