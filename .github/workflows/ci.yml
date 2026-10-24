@@ -1597,6 +1597,8 @@ jobs:
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark::"
           - name: Matrix
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-matrix --lib matrix::"
+          - name: WhatsApp gateway
+            command: "cargo nextest run --locked -p zeroclaw-gateway --features channel-whatsapp-cloud --lib whatsapp_"
           - name: MQTT
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-mqtt --lib orchestrator::mqtt"
           - name: QQ

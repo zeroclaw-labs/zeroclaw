@@ -571,6 +571,11 @@ async fn streamed_prefix_relays_only_unforwarded_native_narration_suffix() {
 pub(crate) struct ToolProtocolPrompts {
     text_tools_section: String,
     max_chars: usize,
+    /// Caller-validated complete variants for attachment-bearing turns. This
+    /// is rendered per-turn input, not a durable session or policy cache.
+    /// Selecting the canonical variant avoids separator growth from repeated
+    /// section removal/insertion and never truncates a required attachment.
+    required_pair: Option<(String, String)>,
     /// The capped native request prompt, built from the complete native
     /// prompt. Only set when a cap applies: a history prompt that was capped
     /// for the text transport can have lost `## Safety` and later sections
@@ -580,6 +585,29 @@ pub(crate) struct ToolProtocolPrompts {
 }
 
 impl ToolProtocolPrompts {
+    /// Both complete prompts must already satisfy the caller's finite budget.
+    pub(crate) fn with_required_prompts(native: String, text: String) -> Self {
+        let text_tools_section = tool_section_bounds(&text)
+            .map(|bounds| text[bounds].to_string())
+            .unwrap_or_default();
+        Self {
+            text_tools_section,
+            max_chars: 0,
+            native_request: None,
+            required_pair: Some((native, text)),
+        }
+    }
+
+    fn required_prompt(&self, use_native_tools: bool) -> Option<&str> {
+        self.required_pair.as_ref().map(|(native, text)| {
+            if use_native_tools {
+                native.as_str()
+            } else {
+                text.as_str()
+            }
+        })
+    }
+
     /// Uncapped prompts for tests that exercise only the protocol swap.
     #[cfg(test)]
     pub(crate) fn new(native: String, text: String) -> Self {
@@ -601,21 +629,76 @@ impl ToolProtocolPrompts {
             text_tools_section,
             max_chars,
             native_request,
+            required_pair: None,
         }
     }
 }
 
 tokio::task_local! {
-    static TOOL_PROTOCOL_PROMPTS: Arc<ToolProtocolPrompts>;
+    /// `None` withholds an enclosing attachment-bearing turn's variants from
+    /// a nested future that owns an independent transcript.
+    static TOOL_PROTOCOL_PROMPTS: Option<Arc<ToolProtocolPrompts>>;
 }
 
-/// Scope complete prompt variants around an Agent turn. This remains transient
-/// request state: durable history keeps the caller-owned canonical prompt.
+fn with_scoped_tool_protocol_prompts<R>(f: impl FnOnce(&ToolProtocolPrompts) -> R) -> Option<R> {
+    TOOL_PROTOCOL_PROMPTS
+        .try_with(|prompts| prompts.as_deref().map(f))
+        .ok()
+        .flatten()
+}
+
+fn attachment_protocol_scope_active() -> bool {
+    with_scoped_tool_protocol_prompts(|prompts| prompts.required_pair.is_some()).unwrap_or(false)
+}
+
+/// Scope complete prompt variants around an Agent turn's own transcript. This
+/// remains transient request state: durable history keeps the canonical prompt.
 pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
     prompts: Arc<ToolProtocolPrompts>,
     future: F,
 ) -> F::Output {
-    TOOL_PROTOCOL_PROMPTS.scope(prompts, future).await
+    TOOL_PROTOCOL_PROMPTS.scope(Some(prompts), future).await
+}
+
+/// Independent transcripts must not consume their enclosing turn's attachment
+/// variants. Non-attachment scopes retain their existing behavior.
+pub(crate) async fn without_attachment_protocol_prompts<F: std::future::Future>(
+    future: F,
+) -> F::Output {
+    if attachment_protocol_scope_active() {
+        TOOL_PROTOCOL_PROMPTS.scope(None, future).await
+    } else {
+        future.await
+    }
+}
+
+// As with the v1 tool-hook exclusion in call_prep, private prompt content must
+// not enter modifying hooks. A projected/masked mutation policy would need a
+// separate architectural decision; provider working state is never replaced.
+fn modifying_llm_hooks_for_request<'a>(
+    hooks: Option<&'a crate::hooks::HookRunner>,
+    messages: &[ChatMessage],
+    turn_id: &str,
+) -> Option<&'a crate::hooks::HookRunner> {
+    let hooks = hooks.filter(|hooks| !hooks.is_empty())?;
+    if attachment_protocol_scope_active()
+        || crate::agent::prompt::provider_messages_carry_session_prompt_content(messages)
+    {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(serde_json::json!({
+                    "hook_phase": "before_llm_call",
+                    "reason": "session_prompt_content",
+                    "trace_id": turn_id,
+                })),
+            "Skipping modifying LLM hooks for private session-prompt content"
+        );
+        None
+    } else {
+        Some(hooks)
+    }
 }
 
 fn refresh_scoped_tool_protocol_prompt(
@@ -623,18 +706,23 @@ fn refresh_scoped_tool_protocol_prompt(
     request_messages: &mut [ChatMessage],
     use_native_tools: bool,
 ) {
-    let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+    let _ = with_scoped_tool_protocol_prompts(|prompts| {
         // History keeps the swapped prompt without re-capping it; only the
         // provider-bound copy is capped. A capped native request is rebuilt
         // from the complete native prompt, never from a capped text history.
         let mut history_prompts = None;
         if let Some(system) = history.iter_mut().find(|message| message.role == "system") {
             let before = system.content.clone();
-            replace_tool_protocol_section(
-                &mut system.content,
-                &prompts.text_tools_section,
-                use_native_tools,
-            );
+            if let Some(required) = prompts.required_prompt(use_native_tools) {
+                system.content = required.to_owned();
+                refresh_prompt_anchor(std::slice::from_mut(system), use_native_tools);
+            } else {
+                replace_tool_protocol_section(
+                    &mut system.content,
+                    &prompts.text_tools_section,
+                    use_native_tools,
+                );
+            }
             history_prompts = Some((before, system.content.clone()));
         }
         if let Some(system) = request_messages
@@ -646,12 +734,17 @@ fn refresh_scoped_tool_protocol_prompt(
             // hook text reaches the model as it does on the CLI path. The
             // request may already be finalized (the post-trim rebuild).
             let rebuilt = history_prompts.and_then(|(before, swapped)| {
-                let base = match (&prompts.native_request, use_native_tools) {
-                    (Some(native), true) => {
-                        let mut native = [ChatMessage::system(native.clone())];
-                        refresh_prompt_anchor(&mut native, true);
-                        let [native] = native;
-                        native.content
+                let canonical = prompts.required_prompt(use_native_tools).or_else(|| {
+                    use_native_tools
+                        .then_some(prompts.native_request.as_deref())
+                        .flatten()
+                });
+                let base = match canonical {
+                    Some(canonical) => {
+                        let mut selected = [ChatMessage::system(canonical.to_owned())];
+                        refresh_prompt_anchor(&mut selected, use_native_tools);
+                        let [selected] = selected;
+                        selected.content
                     }
                     _ => swapped,
                 };
@@ -701,6 +794,16 @@ fn single_tool_round_error() -> anyhow::Error {
 fn apply_single_tool_round_prompt(messages: &mut Vec<ChatMessage>) -> bool {
     let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
     if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        // Keep attachments opaque and last: export redaction removes this suffix,
+        // not the host's tool-round instruction or other diagnostic context.
+        let private_section = format!(
+            "\n\n{}",
+            zeroclaw_infra::session_prompts::SESSION_PROMPTS_SECTION_PREFIX
+        );
+        let attachments = system
+            .content
+            .find(&private_section)
+            .map(|start| system.content.split_off(start));
         system.content = system.content.replace(
             crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS,
             &instruction,
@@ -708,6 +811,9 @@ fn apply_single_tool_round_prompt(messages: &mut Vec<ChatMessage>) -> bool {
         if !system.content.ends_with(&instruction) {
             system.content.push_str("\n\n");
             system.content.push_str(&instruction);
+        }
+        if let Some(attachments) = attachments {
+            system.content.push_str(&attachments);
         }
         false
     } else {
@@ -770,9 +876,9 @@ fn apply_builtin_prompt_scope(
                         .strip_prefix(canonical)
                         .map(str::to_owned)
                         .or_else(|| {
-                            let refresh_cap = TOOL_PROTOCOL_PROMPTS
-                                .try_with(|prompts| prompts.max_chars)
-                                .unwrap_or(max_system_prompt_chars);
+                            let refresh_cap =
+                                with_scoped_tool_protocol_prompts(|prompts| prompts.max_chars)
+                                    .unwrap_or(max_system_prompt_chars);
                             let capped = crate::agent::system_prompt::finalize_system_prompt(
                                 canonical.to_owned(),
                                 refresh_cap,
@@ -1695,14 +1801,19 @@ async fn run_tool_call_loop_impl<'a>(
     let max_system_prompt_chars = config
         .zip(agent_alias)
         .map(|(config, alias)| config.effective_max_system_prompt_chars(alias))
-        .or_else(|| {
-            TOOL_PROTOCOL_PROMPTS
-                .try_with(|prompts| prompts.max_chars)
-                .ok()
-        })
+        .or_else(|| with_scoped_tool_protocol_prompts(|prompts| prompts.max_chars))
         .unwrap_or(0);
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
+
+    // A missing config is a test/degraded path. Preserve the production
+    // fail-closed default rather than accidentally treating it as disabled.
+    let session_prompt_approval_required = config
+        .map(|config| {
+            config.session_prompt_approval_for_agent(agent_alias)
+                == zeroclaw_config::schema::SessionPromptApproval::Required
+        })
+        .unwrap_or(true);
 
     turn_state.sync_pending();
 
@@ -1846,6 +1957,7 @@ async fn run_tool_call_loop_impl<'a>(
         context_limits,
         temperature,
         approval,
+        session_prompt_approval_required,
         channel_name,
         channel_reply_target,
         cancellation_token: cancellation_token.as_ref(),
@@ -1987,6 +2099,9 @@ async fn run_tool_call_loop_impl<'a>(
                         Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
                         None => (None, None),
                     };
+                    // Summary preparation uses hooks only for before_llm_call.
+                    let summary_hooks =
+                        modifying_llm_hooks_for_request(hooks, turn_state.history, turn_id);
                     let summary_result = finish_after_max_iterations(
                         injected_memory_preamble,
                         model_provider,
@@ -2007,7 +2122,7 @@ async fn run_tool_call_loop_impl<'a>(
                         config,
                         multimodal_config,
                         security,
-                        hooks,
+                        summary_hooks,
                         summary_image_cache,
                         summary_provider_image_state,
                         |provider, selected_model| {
@@ -2123,7 +2238,9 @@ async fn run_tool_call_loop_impl<'a>(
         let pre_hook_messages = provider_request_messages.clone();
         let mut hook_selected_model = None;
 
-        if let Some(hooks) = base_ctx.hooks.filter(|hooks| !hooks.is_empty()) {
+        if let Some(hooks) =
+            modifying_llm_hooks_for_request(base_ctx.hooks, &provider_request_messages, turn_id)
+        {
             let mut candidate_model = active_model.to_string();
             match hooks
                 .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
@@ -2203,7 +2320,7 @@ async fn run_tool_call_loop_impl<'a>(
         // the channel loop's existing hook/protocol behavior rather than
         // silently widening this delegation-focused repair into channel prompt
         // reconciliation.
-        let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
+        let uses_scoped_tool_protocol = with_scoped_tool_protocol_prompts(|_| ()).is_some();
         let protocol_model = if uses_scoped_tool_protocol {
             provider_dispatch_model
         } else {
@@ -2291,11 +2408,16 @@ async fn run_tool_call_loop_impl<'a>(
                     .map(|message| message.content.as_str()),
             );
         }
+        // Preserve post-hook messages before the request-only instruction is
+        // inserted inside the canonical prompt. A trim must match that complete
+        // prompt first, then reapply the instruction without removing host text.
+        let mut post_hook_snapshot = provider_request_messages.clone();
         if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
             && apply_single_tool_round_prompt(&mut provider_request_messages)
         {
             // A request-only system row must survive whole-turn trimming.
             prepared_source_rows.insert(0, usize::MAX);
+            post_hook_snapshot.insert(0, provider_request_messages[0].clone());
         }
 
         if context_token_budget > 0 {
@@ -2362,9 +2484,6 @@ async fn run_tool_call_loop_impl<'a>(
         let history_len_before = turn_state.history.len();
         let crumb_before = turn_state.crumb_present;
         let tokens_before_dispatch = dispatch_tokens(reported_population_estimated);
-        // Snapshot the post-hook request so trimming can preserve its
-        // mutations to retained messages rather than discarding them.
-        let post_hook_snapshot = provider_request_messages.clone();
         let post_hook_had_crumb = crumb_before;
         let original_body_start = turn_state
             .history
@@ -2991,7 +3110,11 @@ async fn run_tool_call_loop_impl<'a>(
                     "retry": malformed_tool_protocol_retries,
                     "max_retries": MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
                     "response_excerpt": truncate_with_ellipsis(
-                        &scrub_credentials(&response_text),
+                        &scrub_credentials(
+                            &crate::agent::prompt::redact_session_prompt_text_protocol_for_export(
+                                &response_text,
+                            ),
+                        ),
                         600
                     ),
                     })),
@@ -3269,6 +3392,7 @@ async fn run_tool_call_loop_impl<'a>(
             mut ordered_results,
             executable_indices,
             executable_calls,
+            hook_contexts,
             stream_calls,
         } = prepare_tool_calls(
             &ctx,
@@ -3348,9 +3472,9 @@ async fn run_tool_call_loop_impl<'a>(
                 // the turn aborts.
                 call_prep::abandon_unexecuted_prepared_contexts(
                     &ctx,
-                    iteration,
                     &executable_indices,
                     &executable_calls,
+                    &hook_contexts,
                     &[],
                 )
                 .await;
@@ -3362,18 +3486,23 @@ async fn run_tool_call_loop_impl<'a>(
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
+        let mut executed_completed_hook_contexts = Vec::new();
         let mut executed_completed_stream_calls = Vec::new();
         let mut executed_completed_outcomes = Vec::new();
-        for (slot, ((call_idx, call), stream_call)) in executed_slots.into_iter().zip(
-            executable_indices
-                .iter()
-                .copied()
-                .zip(executable_calls.iter())
-                .zip(stream_calls),
-        ) {
+        for (slot, (((call_idx, call), stream_call), hook_context)) in
+            executed_slots.into_iter().zip(
+                executable_indices
+                    .iter()
+                    .copied()
+                    .zip(executable_calls.iter())
+                    .zip(stream_calls)
+                    .zip(hook_contexts.iter()),
+            )
+        {
             if let Some(outcome) = slot {
                 executed_completed_indices.push(call_idx);
                 executed_completed_calls.push(call.clone());
+                executed_completed_hook_contexts.push(hook_context.clone());
                 executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
@@ -3383,6 +3512,7 @@ async fn run_tool_call_loop_impl<'a>(
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
+            &executed_completed_hook_contexts,
             &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
@@ -3395,9 +3525,9 @@ async fn run_tool_call_loop_impl<'a>(
             // post-execution handling and gets exactly one abandonment.
             call_prep::abandon_unexecuted_prepared_contexts(
                 &ctx,
-                iteration,
                 &executable_indices,
                 &executable_calls,
+                &hook_contexts,
                 &executed_completed_indices,
             )
             .await;
@@ -3563,6 +3693,8 @@ async fn run_tool_call_loop_impl<'a>(
         Some(state) => (Some(&mut *state.cache), Some(&mut *state.provider_state)),
         None => (None, None),
     };
+    // Summary preparation uses hooks only for before_llm_call.
+    let summary_hooks = modifying_llm_hooks_for_request(hooks, turn_state.history, turn_id);
     let summary_result = finish_after_max_iterations(
         injected_memory_preamble,
         model_provider,
@@ -3583,7 +3715,7 @@ async fn run_tool_call_loop_impl<'a>(
         config,
         multimodal_config,
         security,
-        hooks,
+        summary_hooks,
         summary_image_cache,
         summary_provider_image_state,
         |provider, selected_model| {
@@ -4382,7 +4514,10 @@ async fn drive_live_sop_actions(
                         // the step-context message pushed above and receives
                         // the step's final output below; intermediate child
                         // tool-chatter stays out of it. Same-agent steps keep
-                        // sharing the turn history unchanged.
+                        // sharing the turn history unchanged. An independent
+                        // child also runs outside the parent's attachment-
+                        // bearing protocol scope so refresh cannot replace
+                        // its own system prompt with the parent's variants.
                         let mut child_history: Vec<ChatMessage> = Vec::new();
                         let mut child_setup_error: Option<anyhow::Error> = None;
                         if let Some(o) = owned {
@@ -4438,7 +4573,7 @@ async fn drive_live_sop_actions(
                             // awaited after it, so a temporary would be dropped
                             // while the future still borrows it.
                             let mut nested_memory_preamble: Option<MemoryPreamble> = None;
-                            let step_result = ::zeroclaw_log::scope!(
+                            let nested_step = ::zeroclaw_log::scope!(
                                 sop_run_id: run_id.as_str(),
                                 =>
                                 crate::sop::executor::scope_step_call_sink(
@@ -4561,8 +4696,14 @@ async fn drive_live_sop_actions(
                                     sop_reassembly: sop_reassembly.clone(),
                                     })),
                                 )
-                            )
-                            .await;
+                            );
+                            let nested_step = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                                .scope(false, nested_step);
+                            let step_result = if owned.is_some() {
+                                without_attachment_protocol_prompts(Box::pin(nested_step)).await
+                            } else {
+                                nested_step.await
+                            };
                             // Replay child loop's new messages to the parent's
                             // new_messages_out for same-agent steps (§3.2.4).
                             if owned.is_none()
@@ -4757,19 +4898,30 @@ async fn drive_live_sop_actions(
 }
 
 fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
-    if let Some(first) = history.first_mut()
-        && (first.content.contains(NATIVE_TOOLS_TASK_FRAMING)
-            || first.content.contains(NO_TOOLS_TASK_FRAMING))
-    {
+    if let Some(first) = history.first_mut() {
+        // Framing belongs to the host. Identical phrases in the approved
+        // opaque attachment suffix must reach the provider unchanged.
+        let private_section = format!(
+            "\n\n{}",
+            zeroclaw_infra::session_prompts::SESSION_PROMPTS_SECTION_PREFIX
+        );
+        let host_end = first
+            .content
+            .find(&private_section)
+            .unwrap_or(first.content.len());
+        let host = &first.content[..host_end];
+        if !host.contains(NATIVE_TOOLS_TASK_FRAMING) && !host.contains(NO_TOOLS_TASK_FRAMING) {
+            return;
+        }
         let desired = if use_native_tools {
             NATIVE_TOOLS_TASK_FRAMING
         } else {
             NO_TOOLS_TASK_FRAMING
         };
-        first.content = first
-            .content
+        let refreshed = host
             .replacen(NATIVE_TOOLS_TASK_FRAMING, desired, 1)
             .replacen(NO_TOOLS_TASK_FRAMING, desired, 1);
+        first.content.replace_range(..host_end, &refreshed);
     }
 }
 
@@ -4806,10 +4958,142 @@ mod surface3_tests {
         assert_eq!(no_system[1].content, user.content);
     }
 
+    #[test]
+    fn single_tool_prompt_keeps_host_instruction_visible_and_attachments_opaque() {
+        let protocol = crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+        let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
+        let section = zeroclaw_infra::session_prompts::render_session_prompts(&[
+            zeroclaw_infra::session_prompts::SessionPrompt {
+                id: "task".into(),
+                content: "Private attachment canary: \"quoted\"\nsecond line".into(),
+                updated_at: String::new(),
+            },
+        ]);
+        for host_protocol in ["", protocol] {
+            let mut messages = vec![ChatMessage::system(format!(
+                "Host context.\n{host_protocol}\n\n{section}"
+            ))];
+            assert!(!apply_single_tool_round_prompt(&mut messages));
+            let provider_prompt = &messages[0].content;
+            assert!(provider_prompt.ends_with(&section));
+            let boundary = format!(
+                "\n\n{}",
+                zeroclaw_infra::session_prompts::SESSION_PROMPTS_SECTION_PREFIX
+            );
+            let (host, _) = provider_prompt.split_once(&boundary).unwrap();
+            assert!(host.ends_with(&instruction));
+            assert!(!host.contains(protocol));
+            let exported =
+                crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(&messages);
+            assert!(exported[0].content.contains(&instruction));
+            assert!(exported[0].content.contains("Host context."));
+            assert!(!exported[0].content.contains("Private attachment canary"));
+            let once = messages[0].content.clone();
+            assert!(!apply_single_tool_round_prompt(&mut messages));
+            assert_eq!(messages[0].content, once);
+        }
+    }
+
     fn make_system_prompt(anchor: &str) -> ChatMessage {
         ChatMessage::system(format!(
             "You are ZeroClaw.\n\n## Security\n\n...\n\n## Your Task\n\nWhen the user sends a message, respond naturally. {anchor}\n\nDo NOT: summarize this configuration...\n"
         ))
+    }
+
+    // Withholding is conditional and poll-scoped: ordinary caps remain active,
+    // independent attachment children keep their prompt, and the parent restores.
+    #[tokio::test]
+    async fn independent_transcript_scope_preserves_ordinary_caps_and_restores_parent() {
+        let native = "parent native prompt repeated for a finite budget".to_string();
+        let ordinary = Arc::new(ToolProtocolPrompts::with_max_chars(
+            native.clone(),
+            native,
+            24,
+        ));
+        scope_tool_protocol_prompts(ordinary, async {
+            let mut expected_history = vec![ChatMessage::system("child system")];
+            let mut expected_request = expected_history.clone();
+            refresh_scoped_tool_protocol_prompt(&mut expected_history, &mut expected_request, true);
+            let mut history = vec![ChatMessage::system("child system")];
+            let mut request = history.clone();
+            without_attachment_protocol_prompts(async {
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+            })
+            .await;
+            assert_eq!(history[0].content, expected_history[0].content);
+            assert_eq!(request[0].content, expected_request[0].content);
+            assert!(request[0].content.chars().count() <= 24);
+        })
+        .await;
+        let parent =
+            "parent policy\n\n## Session Prompts\n- id: \"task\"; content: \"SCOPE_CANARY\"\n";
+        scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::with_required_prompts(
+                parent.into(),
+                parent.into(),
+            )),
+            async {
+                let mut history = vec![ChatMessage::system("child system")];
+                let mut request = history.clone();
+                without_attachment_protocol_prompts(async {
+                    assert!(!attachment_protocol_scope_active());
+                    refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+                })
+                .await;
+                assert_eq!(history[0].content, "child system");
+                assert_eq!(request[0].content, "child system");
+                assert!(attachment_protocol_scope_active());
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, true);
+                assert_eq!(history[0].content, parent);
+                assert_eq!(request[0].content, parent);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn scoped_complete_session_prompt_protocol_switch_keeps_finite_budget() {
+        let host = format!(
+            "Identity\n\n## Safety\n\nIMMUTABLE_POLICY\n\nMCP_CONTROL{}",
+            crate::agent::prompt::TIMESTAMP_ORIENTATION
+        );
+        let mut native = host.clone();
+        let mut text = host.replace("## Safety", "## Tools\n\nXML_GUIDANCE\n\n## Safety");
+        let attachment = "## Session Prompts\n- id: \"task\"; content: \"retain task\"\n";
+        let cap = text.chars().count() + 2 + attachment.chars().count();
+        crate::agent::prompt::append_required_session_prompt_attachments(
+            &mut native,
+            attachment,
+            cap,
+        )
+        .unwrap();
+        crate::agent::prompt::append_required_session_prompt_attachments(
+            &mut text, attachment, cap,
+        )
+        .unwrap();
+        // Attachment-bearing Agent pairs have already passed the finite cap;
+        // they must never be head-truncated during a later protocol swap.
+        let prompts = Arc::new(ToolProtocolPrompts::with_required_prompts(
+            native.clone(),
+            text,
+        ));
+        let mut history = vec![ChatMessage::system(native)];
+        scope_tool_protocol_prompts(prompts, async {
+            for native_tools in [false, true, false, true] {
+                let mut request = history.clone();
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, native_tools);
+                let system = &request[0].content;
+                assert!(system.ends_with(attachment));
+                assert!(system.contains("IMMUTABLE_POLICY"));
+                assert!(system.contains("MCP_CONTROL"));
+                assert!(
+                    system.chars().count() <= cap,
+                    "protocol switching grew a validated prompt past its cap: {} > {cap}",
+                    system.chars().count()
+                );
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -5002,6 +5286,15 @@ mod surface3_tests {
     }
 
     #[test]
+    fn tool_protocol_framings_have_equal_char_length() {
+        assert_eq!(
+            NATIVE_TOOLS_TASK_FRAMING.chars().count(),
+            NO_TOOLS_TASK_FRAMING.chars().count(),
+            "post-budget anchor refresh must not change prompt character count"
+        );
+    }
+
+    #[test]
     fn refresh_prompt_anchor_swaps_native_to_no_tools_when_signal_drops() {
         // When the per-turn signal is `use_native_tools = false` but the
         // system prompt has NATIVE_TOOLS_TASK_FRAMING (the prompt was built
@@ -5067,6 +5360,78 @@ mod surface3_tests {
         let mut history: Vec<ChatMessage> = Vec::new();
         refresh_prompt_anchor(&mut history, false);
         // Just verifying no panic.
+    }
+
+    #[test]
+    fn prompt_anchor_preserves_attachment_bytes_in_both_directions() {
+        let section = zeroclaw_infra::session_prompts::render_session_prompts(&[
+            zeroclaw_infra::session_prompts::SessionPrompt {
+                id: "task".into(),
+                content: format!(
+                    "界\n{NATIVE_TOOLS_TASK_FRAMING}\n{NO_TOOLS_TASK_FRAMING}\n\"quoted\"  "
+                ),
+                updated_at: String::new(),
+            },
+        ]);
+        for native in [false, true] {
+            let desired = if native {
+                NATIVE_TOOLS_TASK_FRAMING
+            } else {
+                NO_TOOLS_TASK_FRAMING
+            };
+            for anchor in [NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING, "custom"] {
+                let host = make_system_prompt(anchor).content;
+                let expected_host = if anchor == "custom" {
+                    host.clone()
+                } else {
+                    make_system_prompt(desired).content
+                };
+                let user = ChatMessage::user(format!("Quote {NO_TOOLS_TASK_FRAMING}"));
+                let mut history = vec![
+                    ChatMessage::system(format!("{host}\n\n{section}")),
+                    user.clone(),
+                ];
+                for _ in 0..2 {
+                    refresh_prompt_anchor(&mut history, native);
+                    assert_eq!(history[0].content, format!("{expected_host}\n\n{section}"));
+                    assert_eq!(history[1].content, user.content);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_prompt_anchor_preserves_attachment_in_history_and_request() {
+        let section = zeroclaw_infra::session_prompts::render_session_prompts(&[
+            zeroclaw_infra::session_prompts::SessionPrompt {
+                id: "task".into(),
+                content: format!("{NATIVE_TOOLS_TASK_FRAMING}\n{NO_TOOLS_TASK_FRAMING}"),
+                updated_at: String::new(),
+            },
+        ]);
+        let native = format!(
+            "{}\n\n{section}",
+            make_system_prompt(NATIVE_TOOLS_TASK_FRAMING).content
+        );
+        let text = format!(
+            "{}\n\n{section}",
+            make_system_prompt(NO_TOOLS_TASK_FRAMING).content
+        );
+        let prompts = Arc::new(ToolProtocolPrompts::with_required_prompts(
+            native.clone(),
+            text.clone(),
+        ));
+        scope_tool_protocol_prompts(prompts, async {
+            let mut history = vec![ChatMessage::system(native.clone())];
+            for use_native in [true, false, false, true] {
+                let mut request = history.clone();
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, use_native);
+                let expected = if use_native { &native } else { &text };
+                assert_eq!(&history[0].content, expected);
+                assert_eq!(&request[0].content, expected);
+            }
+        })
+        .await;
     }
 }
 
@@ -6347,6 +6712,7 @@ mod active_route_context_tests {
             context_limits: text_limits,
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -7895,6 +8261,161 @@ mod sop_step_reassembly_tests {
         .await
     }
 
+    struct PromptPrivacyHook(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for PromptPrivacyHook {
+        fn name(&self) -> &str {
+            "prompt-privacy-probe"
+        }
+
+        async fn before_llm_call(
+            &self,
+            messages: &mut Vec<ChatMessage>,
+            _model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            messages.push(ChatMessage::user("hook-rewrite"));
+            crate::hooks::HookResult::Continue(())
+        }
+    }
+
+    // A marked explicit-list exchange remains private even without an attachment
+    // section in the current system prompt; provider working history stays raw.
+    #[tokio::test]
+    async fn prompt_tool_exchange_history_skips_modifying_llm_hook() {
+        let mut history = vec![ChatMessage::system("ordinary system")];
+        history_append::append_tool_round_to_history(
+            &mut history,
+            "listing complete".into(),
+            &[],
+            &[results_collect::ToolRoundResult {
+                tool_call_id: None,
+                output: "LIST_CANARY".into(),
+                attachments: Vec::new(),
+                sensitive_session_prompt: true,
+            }],
+            "LIST_CANARY",
+            false,
+        );
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CaptureProvider {
+            requests: requests.clone(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(PromptPrivacyHook(calls.clone())));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        run_budgeted_test_loop_with_hooks(
+            &provider,
+            &mut history,
+            &tools,
+            ExecutionTreeBudget::root(10),
+            CancellationToken::new(),
+            10,
+            None,
+            Some(&hooks),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            requests.lock().unwrap()[0]
+                .0
+                .iter()
+                .any(|m| m.content.contains("LIST_CANARY"))
+        );
+    }
+
+    // Summary dispatch is a separate modifying-hook boundary, not protected by
+    // redacting the later void callback in the ordinary provider path.
+    #[tokio::test]
+    async fn max_iteration_summary_skips_llm_hook_for_attachment_history() {
+        let mut history = vec![
+            ChatMessage::system(
+                "host policy\n\n## Session Prompts\n- id: \"task\"; content: \"SUMMARY_CANARY\"\n",
+            ),
+            ChatMessage::user("finish"),
+        ];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CaptureProvider {
+            requests: requests.clone(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(PromptPrivacyHook(calls.clone())));
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        let result = run_budgeted_test_loop_with_hooks(
+            &provider,
+            &mut history,
+            &tools,
+            ExecutionTreeBudget::root(1),
+            CancellationToken::new(),
+            10,
+            None,
+            Some(&hooks),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("execution-tree iteration budget"));
+        assert!(
+            requests.lock().unwrap()[0].1.is_empty(),
+            "summary offers no tools"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            requests.lock().unwrap()[0]
+                .0
+                .iter()
+                .any(|m| m.content.contains("SUMMARY_CANARY"))
+        );
+    }
+
+    // Restored privacy placeholders contain no private bytes and must not
+    // disable ordinary request transformations.
+    #[tokio::test]
+    async fn restored_prompt_redaction_carriers_keep_modifying_llm_hooks() {
+        for carrier in [
+            "[Session-prompt tool exchange omitted from export]",
+            "[Tool results]\n[Session-prompt tool exchange omitted from export]",
+        ] {
+            let mut history = vec![
+                ChatMessage::system("ordinary system"),
+                ChatMessage::user(carrier),
+            ];
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider = CaptureProvider {
+                requests: requests.clone(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(PromptPrivacyHook(calls.clone())));
+            let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+            run_budgeted_test_loop_with_hooks(
+                &provider,
+                &mut history,
+                &tools,
+                ExecutionTreeBudget::root(10),
+                CancellationToken::new(),
+                10,
+                None,
+                Some(&hooks),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                requests.lock().unwrap()[0]
+                    .0
+                    .iter()
+                    .any(|m| m.content == "hook-rewrite")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn tree_budget_final_completion_prepares_images_and_honors_hooks() {
         struct SummaryProbe(Arc<AtomicUsize>, &'static str, bool);
@@ -8608,6 +9129,82 @@ mod sop_step_reassembly_tests {
         assert_eq!(result.effective_agent.as_deref(), Some("stepper"));
     }
 
+    // A distinct step agent must retain its own system prompt even while the
+    // parent turn has an attachment-bearing protocol pair in task-local scope.
+    #[tokio::test]
+    async fn cross_agent_step_never_inherits_attachment_protocol_prompts() {
+        let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+        let config = zeroclaw_config::schema::Config::default();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut exec_cache = std::collections::HashMap::new();
+        exec_cache.insert(
+            "stepper".into(),
+            seeded_owned(
+                requests.clone(),
+                Vec::new(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+                Some(0.42),
+            ),
+        );
+        let parent =
+            "PARENT_SYSTEM_MARKER\n\n## Session Prompts\n- id: \"task\"; content: \"SOP_CANARY\"\n";
+        let mut history = vec![
+            ChatMessage::system(parent),
+            ChatMessage::user(PARENT_MARKER),
+        ];
+        let mut new_out = Vec::new();
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::with_required_prompts(
+                parent.into(),
+                parent.into(),
+            )),
+            drive_step(
+                engine.clone(),
+                action,
+                &TextProvider,
+                &tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                Some(&mut new_out),
+                Some("outer"),
+                Some(SopStepReassembly {
+                    config: &config,
+                    live_config: None,
+                }),
+                None,
+                &mut exec_cache,
+            ),
+        )
+        .await;
+        let captured = requests.lock().unwrap();
+        assert!(!captured.is_empty());
+        for (messages, _, _) in captured.iter() {
+            assert!(messages.iter().all(|m| !m.content.contains("SOP_CANARY")
+                && !m.content.contains("PARENT_SYSTEM_MARKER")));
+            assert_eq!(messages.first().map(|m| m.role.as_str()), Some("system"));
+            assert_eq!(messages.last().map(|m| m.role.as_str()), Some("user"));
+        }
+        assert_eq!(history[0].content, parent);
+        assert_eq!(
+            history
+                .last()
+                .map(|m| (m.role.as_str(), m.content.as_str())),
+            Some(("assistant", "child-done"))
+        );
+        assert_eq!(
+            new_out.last().map(|m| m.content.as_str()),
+            Some("child-done")
+        );
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
+        );
+    }
+
     /// The child registry and the child's own `tool_filter_groups` govern the
     /// tool specs the nested loop offers the child provider — through the
     /// loop's final filters, not just at assembly.
@@ -8828,6 +9425,68 @@ mod sop_step_reassembly_tests {
         assert_eq!(
             step1_result(&engine, &run_id).effective_agent.as_deref(),
             Some("outer")
+        );
+    }
+
+    // A same-agent SOP step is still the current primary transcript, rather
+    // than a new recipient; its existing replay and prompt-tool exclusion stay.
+    #[tokio::test]
+    async fn same_agent_step_keeps_attachment_turn_transcript() {
+        let (engine, run_id, action) = start_single_cross_agent_step("outer");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = CaptureProvider {
+            requests: requests.clone(),
+        };
+        let parent = "PARENT_SYSTEM_MARKER\n\n## Session Prompts\n- id: \"task\"; content: \"SAME_AGENT_CANARY\"\n";
+        let mut history = vec![ChatMessage::system(parent)];
+        let mut new_out = Vec::new();
+        let mut cache = std::collections::HashMap::new();
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        scope_tool_protocol_prompts(
+            Arc::new(ToolProtocolPrompts::with_required_prompts(
+                parent.into(),
+                parent.into(),
+            )),
+            drive_step(
+                engine.clone(),
+                action,
+                &provider,
+                &tools,
+                &crate::observability::NoopObserver {},
+                &mut history,
+                None,
+                None,
+                Some(&mut new_out),
+                Some("outer"),
+                None,
+                None,
+                &mut cache,
+            ),
+        )
+        .await;
+        let captured = requests.lock().unwrap();
+        assert!(!captured.is_empty());
+        for (messages, offered_tools, _) in captured.iter() {
+            assert_eq!(messages[0].content, parent);
+            assert!(
+                offered_tools
+                    .iter()
+                    .all(|name| !name.starts_with("session_prompt_"))
+            );
+        }
+        assert!(cache.is_empty());
+        assert_eq!(history[0].content, parent);
+        assert_eq!(
+            history.last().map(|m| m.content.as_str()),
+            Some("child-done")
+        );
+        assert_eq!(
+            new_out.last().map(|m| m.content.as_str()),
+            Some("child-done")
+        );
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
         );
     }
 

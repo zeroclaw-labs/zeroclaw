@@ -144,6 +144,13 @@ pub trait HookHandler: Send + Sync {
         HookResult::Continue(prompt)
     }
 
+    /// Transform or cancel an ordinary prepared model request.
+    ///
+    /// The runtime skips this callback for requests carrying host-private
+    /// session-prompt content (attachments or session-prompt tool exchanges),
+    /// including programmatically registered handlers. Such requests dispatch
+    /// as prepared, without hook mutation, model selection, or cancellation.
+    /// `on_llm_input` still receives its masked export projection.
     async fn before_llm_call(
         &self,
         _messages: &mut Vec<ChatMessage>,

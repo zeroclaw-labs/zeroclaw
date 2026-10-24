@@ -464,11 +464,13 @@ call site.
 Two operational constraints worth repeating from the
 [plugins overview](./index.md):
 
-- **Package and tool names must not conflict with a registered tool.**
+- **Package and tool names must not conflict with a registered tool or an
+  always-reserved name.**
   Registration refuses a conflict instead of letting one tool shadow another.
   If your package name (the manifest `name`) matches an already registered
-  tool, the plugin is refused before its component is instantiated, and the
-  host logs a `WARN` event with `error_key` `plugin_package_name_conflict` in
+  tool or an always-reserved name, the plugin is refused before its component
+  is instantiated, and the host logs a `WARN` event with `error_key`
+  `plugin_package_name_conflict` in
   its `attributes`. If the name your `name` export returns matches one, the
   tool is not registered, and the `error_key` is `plugin_tool_name_conflict`.
   A `name` export that contains `__` is never registered either: MCP tools use
@@ -482,7 +484,10 @@ Two operational constraints worth repeating from the
   can be refused on another. A tool named like one a connected peripheral or
   a skill contributes is dropped later, when the agent's tools are assembled,
   with the same `plugin_tool_name_conflict` `error_key`. Pick names that are
-  unique outright. See
+  unique outright. The native session-prompt names `session_prompt_list`,
+  `session_prompt_set`, and `session_prompt_delete` are always reserved, even
+  when `channels.session_prompts_enabled = false`, so plugins cannot
+  impersonate these sensitive operations. See
   [Tool name conflicts](../developing/how-plugins-work.md#tool-name-conflicts)
   for the operator view.
 - **One tool per component.** The `tool-plugin` world exports a single `tool`
