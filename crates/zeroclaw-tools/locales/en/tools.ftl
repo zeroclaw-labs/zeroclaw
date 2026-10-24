@@ -252,6 +252,15 @@ tool-web-search-tool-error-anysearch-invalid-response = Invalid AnySearch API re
 tool-web-search-tool-error-anysearch-api = AnySearch returned error (code { $code }): { $message }
 tool-web-search-tool-anysearch-no-title = No title
 tool-web-search-tool-anysearch-no-error-details = no error details
+tool-web-search-tool-error-firecrawl-api-key-not-configured = Firecrawl API key not configured. Set [web_search] firecrawl_api_key in config.toml (or ZEROCLAW_web_search__firecrawl_api_key). Obtain one at https://www.firecrawl.dev/app/api-keys
+tool-web-search-tool-error-firecrawl-api-key-decrypted-empty = Firecrawl API key not configured (decrypted value is empty)
+tool-web-search-tool-error-firecrawl-config-read = Failed to read config file { $path } for Firecrawl API key: { $error }
+tool-web-search-tool-error-firecrawl-config-parse = Failed to parse config file { $path } for Firecrawl API key (error_code={ $error_code }{ $location }). Fix the TOML syntax; the parser message is withheld because it can quote the offending line.
+tool-web-search-tool-error-firecrawl-config-parse-line = , line={ $line }
+tool-web-search-tool-error-firecrawl-invalid-response = Invalid Firecrawl API response
+tool-web-search-tool-error-firecrawl-api = Firecrawl search returned an error: { $message }
+tool-web-search-tool-firecrawl-no-title = No title
+tool-web-search-tool-firecrawl-no-error-details = (no message)
 
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
