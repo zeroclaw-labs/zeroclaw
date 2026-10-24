@@ -417,7 +417,11 @@ async fn run_manual_job_inner(
         );
     }
 
-    if let Some(tx) = event_tx {
+    // A quiet `NO_REPLY` result is withheld from live subscribers, as on
+    // channel delivery; run history above still records it.
+    if let Some(tx) = event_tx
+        && announce_delivery_decision(&outcome.output).should_deliver()
+    {
         let _ = tx.send(serde_json::json!({
             "type": "cron_result",
             "job_id": job.id,
@@ -996,8 +1000,10 @@ async fn process_due_jobs(
                 "Scheduler job '' failed: "
             );
         }
-        // Broadcast cron result to dashboard/SSE clients.
-        if let Some(tx) = event_tx {
+        // Broadcast cron result to dashboard/SSE clients unless quiet `NO_REPLY`.
+        if let Some(tx) = event_tx
+            && announce_delivery_decision(&output).should_deliver()
+        {
             let _ = tx.send(serde_json::json!({
                 "type": "cron_result",
                 "job_id": job_id,
@@ -2203,6 +2209,46 @@ mod tests {
                 .as_str()
                 .unwrap_or("")
                 .contains("rpc-manual-ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_manual_job_records_but_does_not_broadcast_a_quiet_result() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let mut job = cron::add_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            Some("manual-quiet".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo NO_REPLY",
+            None,
+            true,
+        )
+        .expect("test job should be persisted");
+        job.shell_output_format = CronShellOutputFormat::Raw;
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let event_tx = Some(tx);
+
+        run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &event_tx).await;
+
+        let runs = cron::list_runs(&config, &job.id, 10).expect("run history should list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].output.as_deref(), Some("NO_REPLY"));
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "a quiet result must not be broadcast"
         );
     }
 
@@ -4298,6 +4344,43 @@ mod tests {
         assert_eq!(event["success"], true);
         assert!(event["output"].as_str().unwrap().contains("broadcast-ok"));
         assert!(event["timestamp"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn broadcast_withholds_quiet_no_reply_results() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let mut quiet = test_job("echo NO_REPLY");
+        quiet.id = "quiet".into();
+        let mut failed = test_job("echo 'NO_REPLY[FAIL]: database check timed out'");
+        failed.id = "failed".into();
+        for job in [&mut quiet, &mut failed] {
+            job.shell_output_format = CronShellOutputFormat::Raw;
+            config
+                .agents
+                .get_mut(TEST_AGENT)
+                .unwrap()
+                .cron_jobs
+                .push(job.id.clone());
+        }
+        let component = unique_component("broadcast-quiet");
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
+        let event_tx: EventBroadcast = Some(tx);
+
+        process_due_jobs(&config, vec![quiet, failed], &component, &event_tx, None).await;
+
+        let event = rx.try_recv().expect("the FAIL result should be broadcast");
+        assert_eq!(event["job_id"], "failed");
+        assert_eq!(event["output"], "NO_REPLY[FAIL]: database check timed out");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "the quiet result must not be broadcast"
+        );
     }
 
     #[tokio::test]
