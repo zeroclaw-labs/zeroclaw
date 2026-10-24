@@ -166,6 +166,7 @@ zc-queue-missing-completion-single-key-ghost = Fin non confirmée. { $key } pour
 zc-queue-paused-no-key-ghost = File en pause. Configurez une touche de reprise.
 zc-queue-item-injected = (injection)
 zc-queue-resumed = File d'attente reprise.
+zc-steer-unconfirmed = Impossible de confirmer que le tour en cours a reçu votre message ; il est revenu dans la saisie. Il est peut-être déjà arrivé : vérifiez avant de le renvoyer.
 zc-queue-clear-empty = La file d'attente est déjà vide.
 zc-queue-cleared-all = { $count } message(s) en file d'attente supprimé(s).
 zc-queue-cleared-one = Message en file d'attente { $index } supprimé.

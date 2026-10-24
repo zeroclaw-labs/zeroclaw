@@ -184,6 +184,7 @@ zc-queue-missing-completion-single-key-ghost = Completion unconfirmed. { $key } 
 zc-queue-paused-no-key-ghost = Queue paused. Set a send or resume key.
 zc-queue-item-injected = (inject)
 zc-queue-resumed = Queue resumed.
+zc-steer-unconfirmed = Couldn't confirm the running turn got your message; it's back in the input. It may already have arrived, so check before sending again.
 zc-queue-clear-empty = Queue is already empty.
 zc-queue-cleared-all = Cleared { $count } queued message(s).
 zc-queue-cleared-one = Cleared queued message { $index }.
