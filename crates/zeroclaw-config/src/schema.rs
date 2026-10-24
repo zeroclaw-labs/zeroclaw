@@ -6555,6 +6555,14 @@ pub struct LocalWhisperTranscriptionProviderConfig {
     /// Optional language hint (passed through to the local endpoint).
     #[serde(default)]
     pub language: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it and rarely host a model literally named
+    /// `"whisper"`. Leave unset for servers that choose their model at startup
+    /// (`whisper.cpp`), which take no selector field and rely on the legacy
+    /// wire shape.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB to match the cloud cap; raise as needed.
     #[serde(default = "default_local_whisper_max_audio_bytes")]
@@ -6586,6 +6594,7 @@ impl Default for LocalWhisperTranscriptionProviderConfig {
             uri: String::new(),
             bearer_token: None,
             language: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
@@ -6726,6 +6735,12 @@ pub struct LocalWhisperConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it; leave unset for servers that choose their model
+    /// at startup (`whisper.cpp`).
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB — matching the cloud API cap for a safe out-of-the-box
     /// experience. Self-hosted endpoints can accept much larger files; raise this
@@ -6762,6 +6777,7 @@ impl Default for LocalWhisperConfig {
         Self {
             url: String::new(),
             bearer_token: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
