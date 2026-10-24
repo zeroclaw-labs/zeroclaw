@@ -18,7 +18,7 @@ use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
-use pulldown_cmark::{Options, Parser, html};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
 use sha2::{Digest, Sha256};
@@ -917,7 +917,10 @@ impl EmailChannel {
         let email = if self.config.html_body {
             let alt = MultiPart::alternative()
                 .singlepart(SinglePart::plain(body.to_string()))
-                .singlepart(SinglePart::html(markdown_to_html(body)));
+                .singlepart(SinglePart::html(markdown_to_html(
+                    body,
+                    &self.config.html_image_domains,
+                )));
             if att_parts.is_empty() {
                 builder.multipart(alt)?
             } else {
@@ -972,14 +975,96 @@ impl ::zeroclaw_api::attribution::Attributable for EmailChannel {
     }
 }
 
-fn markdown_to_html(md: &str) -> String {
+/// Render the agent's Markdown as the HTML part of an outbound message.
+///
+/// Markdown lets raw HTML through, and the agent's text can be steered by the
+/// mail it answers, so the HTML part is built from Markdown structure only:
+/// - Raw inline HTML is dropped (the text between tags stays); `<br>` becomes
+///   a line break. A raw HTML block is shown as text, never as markup.
+/// - An image is kept only when its source is an inline attachment (`cid:`)
+///   or an `https` URL on `image_domains`; any other image is reduced to its
+///   alt text. A remote image is fetched by the reader's mail client, so an
+///   arbitrary one could carry data out in its URL.
+/// - A link is kept only for `http`, `https`, `mailto` and `tel`; any other
+///   target is reduced to the link text.
+fn markdown_to_html(md: &str, image_domains: &[String]) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser = Parser::new_ext(md, options);
+    let mut dropping_image = false;
+    let mut dropped_links: Vec<bool> = Vec::new();
+    let events = Parser::new_ext(md, options).filter_map(|event| match event {
+        Event::InlineHtml(raw) if is_line_break_tag(&raw) => Some(Event::HardBreak),
+        Event::InlineHtml(_) => None,
+        Event::Html(raw) => Some(Event::Text(raw)),
+        Event::Start(Tag::Image { ref dest_url, .. }) => {
+            if image_source_allowed(dest_url, image_domains) {
+                Some(event)
+            } else {
+                dropping_image = true;
+                None
+            }
+        }
+        Event::End(TagEnd::Image) if dropping_image => {
+            dropping_image = false;
+            None
+        }
+        Event::Start(Tag::Link { ref dest_url, .. }) => {
+            let allowed = link_target_allowed(dest_url);
+            dropped_links.push(!allowed);
+            allowed.then_some(event)
+        }
+        Event::End(TagEnd::Link) => {
+            if dropped_links.pop().unwrap_or(false) {
+                None
+            } else {
+                Some(event)
+            }
+        }
+        other => Some(other),
+    });
     let mut html_output = String::new();
-    html::push_html(&mut html_output, parser);
+    html::push_html(&mut html_output, events);
     html_output
+}
+
+fn is_line_break_tag(raw: &str) -> bool {
+    let tag: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(tag.as_str(), "<br>" | "<br/>")
+}
+
+/// Whether an image source may appear in the HTML part: an inline attachment
+/// (`cid:`), or an `https` URL whose host is one of `domains` or below one.
+fn image_source_allowed(src: &str, domains: &[String]) -> bool {
+    let src = src.trim();
+    if src
+        .get(..4)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("cid:"))
+    {
+        return true;
+    }
+    let Ok(url) = url::Url::parse(src) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    domains.iter().any(|domain| {
+        let domain = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+        !domain.is_empty() && (host == domain || host.ends_with(&format!(".{domain}")))
+    })
+}
+
+fn link_target_allowed(target: &str) -> bool {
+    url::Url::parse(target.trim())
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "mailto" | "tel"))
 }
 
 fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
@@ -1347,6 +1432,7 @@ mod tests {
             excluded_tools: vec![],
             oauth2: None,
             observer_mode: false,
+            html_image_domains: Vec::new(),
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -1377,6 +1463,7 @@ mod tests {
             excluded_tools: vec![],
             oauth2: None,
             observer_mode: false,
+            html_image_domains: Vec::new(),
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -1406,6 +1493,7 @@ mod tests {
             excluded_tools: vec![],
             oauth2: None,
             observer_mode: false,
+            html_image_domains: Vec::new(),
         }
     }
 
@@ -2203,6 +2291,7 @@ mod tests {
             html_body: true,
             oauth2: None,
             observer_mode: false,
+            html_image_domains: Vec::new(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -2371,5 +2460,96 @@ mod tests {
             "  smtp_pass  ".to_string(),
         );
         assert_eq!(creds, expected);
+    }
+
+    // -- outbound HTML safety --
+
+    fn html(md: &str) -> String {
+        markdown_to_html(md, &["oxfirst.example".to_string()])
+    }
+
+    #[test]
+    fn raw_inline_html_is_dropped_but_its_text_kept() {
+        let out = html("Hello <b>world</b> and <span style=\"x\">more</span>");
+        assert!(out.contains("Hello world and more"), "{out}");
+        assert!(!out.contains("<b>") && !out.contains("<span"), "{out}");
+    }
+
+    #[test]
+    fn a_br_tag_becomes_a_line_break() {
+        assert!(html("one<br>two").contains("one<br />"));
+        assert!(html("one<BR />two").contains("one<br />"));
+    }
+
+    #[test]
+    fn a_raw_html_block_is_shown_as_text() {
+        let out = html("<div onclick=\"x()\">hi</div>\n");
+        assert!(out.contains("&lt;div"), "{out}");
+        assert!(!out.contains("<div"), "{out}");
+    }
+
+    #[test]
+    fn a_remote_image_is_reduced_to_its_alt_text() {
+        for src in [
+            "https://attacker.invalid/p.png?d=secret",
+            "http://oxfirst.example/logo.png",
+            "https://evil-oxfirst.example/logo.png",
+            "https://oxfirst.example@attacker.invalid/logo.png",
+            "data:image/png;base64,AAAA",
+        ] {
+            let out = html(&format!("![the logo]({src})"));
+            assert!(!out.contains("<img"), "{src}: {out}");
+            assert!(out.contains("the logo"), "{src}: {out}");
+        }
+    }
+
+    #[test]
+    fn listed_and_inline_images_are_kept() {
+        for src in [
+            "https://oxfirst.example/logo.png",
+            "https://www.oxfirst.example/logo.png",
+            "cid:logo@example.invalid",
+        ] {
+            assert!(html(&format!("![logo]({src})")).contains("<img"), "{src}");
+        }
+        // No listed domains: only inline attachments.
+        assert!(!markdown_to_html("![l](https://oxfirst.example/l.png)", &[]).contains("<img"));
+    }
+
+    #[test]
+    fn unsafe_link_targets_keep_only_their_text() {
+        let out = html("[click](javascript:alert(1)) and [site](https://example.invalid)");
+        assert!(!out.contains("javascript"), "{out}");
+        assert!(out.contains("click"), "{out}");
+        assert!(out.contains("href=\"https://example.invalid\""), "{out}");
+    }
+
+    #[test]
+    fn tables_and_emphasis_still_render() {
+        let out = html("| a | b |\n|---|---|\n| 1 | 2 |\n\n**bold** ~~gone~~");
+        assert!(
+            out.contains("<table>") && out.contains("<strong>bold</strong>"),
+            "{out}"
+        );
+        assert!(out.contains("<del>gone</del>"), "{out}");
+    }
+
+    #[test]
+    fn the_sent_html_part_drops_a_remote_image() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let message = SendMessage::new(
+            "Report ![x](https://attacker.invalid/t.png?d=1)",
+            "user@example.invalid",
+        );
+        let email = channel.build_email_message(&message).unwrap();
+        let wire = String::from_utf8_lossy(&email.formatted()).into_owned();
+        // The plain part keeps the agent's text as written; a mail client
+        // fetches nothing from it. The HTML part must carry no image element.
+        assert!(wire.contains("text/html"), "{wire}");
+        assert!(!wire.contains("<img"), "{wire}");
     }
 }
