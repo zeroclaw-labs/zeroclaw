@@ -32,7 +32,7 @@ When uncertain, classify upward and ask a maintainer to resolve the boundary bef
 
 Risk labels are currently manual. #9345 keeps any future risk classifier report-only until maintainers separately enable mutation. Follow the [labels automation contract](./labels.md#automation-contract): `risk:manual` freezes automated risk replacement when a maintainer correction should persist, but it never lowers the review or approval requirement.
 
-Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
+Labels are maintainer metadata handled by [final administrative review](./pr-workflow.md#final-administrative-review). Evaluate the real risk during substantive review, but do not ask authors to repair labels or stop code review for metadata cleanup.
 
 ## Standard workflow
 
@@ -40,14 +40,14 @@ Labels are maintainer metadata. If the correct label is obvious and you have per
 
 For every new PR, before reading any code:
 
-1. Confirm the PR template is complete: summary, validation evidence, security & privacy, compatibility, rollback (for medium/high).
-2. Confirm labels are present and plausible: `size:*`, `risk:*`, scope labels, contributor tier where applicable.
+1. Read the linked issue and confirm the PR addresses its agreed problem; apply the [issue-alignment gate](../contributing/pr-review-protocol.md#issue-alignment) when the link is missing or behavior exceeds that scope.
+2. Screen new dependencies, repository sources, and services under [integration decisions](../contributing/pr-review-protocol.md#integration-decisions), including prior approval and existing holds.
 3. Confirm `CI Required Gate` signal status.
 4. Confirm scope is one concern. Mixed-feature mega-PRs go back for a split unless the mix is explicitly justified.
 5. Confirm privacy / data-hygiene rules. See [Privacy](../contributing/privacy.md) for the full rulebook.
 6. If the PR changes presentation-sensitive visual behavior, confirm the author exercised the actual supported interface and supplied privacy-safe screenshots at representative terminal or viewport dimensions with enough surrounding context to judge the result. Require numerical dimensions only when needed to reproduce or assess a concrete presentation concern, such as wrapping, clipping, or responsive layout. For a semantic-only rendered-interface change that cannot affect presentation or interaction behavior, exact-head automated evidence is sufficient only when it observes the final supported-interface output through the real renderer; pre-render composition and helper-level assertions do not qualify. A concrete presentation concern restores the screenshot requirement. For a qualifying plain-text change that makes no presentation-sensitive claim and has no concrete presentation concern identified by a reviewer, exact output from the supported interface on an identifiable revision is sufficient. Treat `N/A` as valid only when no user-visible interface state changed. A statement that the applicable evidence was not produced records the gap but does not satisfy it.
 
-If any intake check fails, leave one actionable checklist comment and stop. Don't deep-review a PR that hasn't passed intake: the back-and-forth is cheaper at this layer than after the diff has been reasoned about.
+When intake reveals a substantive blocker, draft one actionable finding and identify review work still needed. Investigate a red CI result under [failure attribution](../contributing/pr-review-protocol.md#failure-attribution); a proven unrelated failure on `master` does not block substantive review. Template, label, milestone, and queue checks remain [final merge responsibilities](./pr-workflow.md#final-administrative-review), and no comment or verdict is published without authorization.
 
 ### Fast-lane checklist (every PR)
 
@@ -196,11 +196,11 @@ When review demand exceeds capacity:
 2. Ask overlapping PRs to consolidate; close older ones with a superseded or replaced rationale after the author acknowledges. See [Superseding PRs](./superseding.md) for the attribution rules.
 3. Use the PR stale ramp below. PR backlog pruning uses `needs-author-action` and `stale-candidate`; issue stale sweeps use `status:stale` under the canonical [issue stale policy](./labels.md#issue-stale-policy).
 
-When a maintainer submits a request-changes review and the next step is on the PR author, apply `needs-author-action` in the same review/label packet. Do not add it when the requested change is maintainer-fixable and a maintainer intends to push the cleanup, when another maintainer or owner is taking over the branch, or when the block is waiting on a maintainer decision rather than author work.
+When a request-changes review leaves the next step with the PR author, a maintainer or separately authorized queue workflow applies `needs-author-action` as administrative follow-up. Keep this routing current while a PR is blocked; do not wait until merge, and do not make it part of the substantive review skill. Do not add it when a maintainer intends to push the cleanup, another maintainer or owner is taking over the branch, or the block is waiting on a maintainer decision rather than author work.
 
 | State | When to use | Required public note | Follow-up |
 |---|---|---|---|
-| `needs-author-action` | The next PR step is on the author: rebase, conflict fix, scope split, review answer, requested code change, or refreshed validation. | A review or comment names the concrete action. Request-changes reviews should apply this label when they leave the next action with the author. | Remove the label when the author pushes a substantive update or provides requested information, then continue normal review. This is not a closure warning by itself. |
+| `needs-author-action` | The next PR step is on the author: rebase, conflict fix, scope split, review answer, requested code change, or refreshed validation. | A review or comment names the concrete action; separate administrative follow-up applies the label. | Remove the label when the author pushes a substantive update or provides requested information, then continue normal review. This is not a closure warning by itself. |
 | `stale-candidate` | A prior author-action request has sat unanswered and the PR now blocks useful review, or the branch is clearly stale, dirty, or obsolete against current `master`. Do not stale-escalate work that is parked under a visible maintainer plan, explicit dependency, active owner, or recorded revisit date. | A comment names the requested action and a follow-up date, normally 7-10 days out unless a maintainer chooses a longer window. It should distinguish a stale branch from a still-valid bug or feature request. | At the follow-up date, re-check live state. If the author responded or the branch became reviewable, remove or keep off `stale-candidate`. If there is still no response and no maintainer takeover or replacement path, close with a backlog-hygiene rationale and a clear reopening or replacement path. |
 
 If the underlying bug or feature is still valid, preserve it in an issue, tracker row, replacement PR, or takeover plan instead of implying that the idea was rejected. Require rebase + fresh validation evidence before reopening anything that's been stale-closed.
