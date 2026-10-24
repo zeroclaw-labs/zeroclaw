@@ -88,6 +88,11 @@ impl SendMessageToPeerTool {
 
 #[async_trait]
 impl Tool for SendMessageToPeerTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        // This path uses agent authority without carrying the session owner.
+        true
+    }
+
     fn name(&self) -> &str {
         "send_message_to_peer"
     }
