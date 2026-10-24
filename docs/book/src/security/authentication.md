@@ -63,13 +63,19 @@ importantly, what changes for existing remote connections.
    narrowed or its credential expired is refused when its turn comes.
 
 Authorization is **live** for edits made through the daemon's RPC config
-methods, which is what zerocode's config editor uses: editing
-`[permission_profiles]`, `[users]`, `[oidc]`, or `security.trust_daemon_uid`
-that way re-compiles the policy at save time. Established native-token and
+methods (used by zerocode's config editor) and its supervised gateway's
+configuration API (used by the web dashboard). Both share the daemon
+generation's live configuration, config write lock, and accepted authorization
+authority. Editing `[permission_profiles]`, `[users]`, `[oidc]`, or
+`security.trust_daemon_uid` through either surface compiles and publishes the
+policy at save time, before the write returns success. Established native-token and
 local connections re-resolve at their next operation, with no reconnect or
-restart, and an OIDC connection must initialize again. Edits made
-outside the daemon, directly in `config.toml`, through the web dashboard, or
-with `zeroclaw config set`, apply at the next daemon reload or restart.
+restart, and an OIDC connection must initialize again. The dashboard's
+pending-reload flag still covers daemon-owned subsystems that need rebuilding;
+it does not delay this authorization publication. Edits made outside the
+daemon, directly in `config.toml` or with `zeroclaw config set`, still apply
+at the next daemon reload or restart. These authorization CLI writes save to disk without
+publishing to the running daemon or triggering its reload.
 Revoking a gateway pairing token through the gateway's pairing controls
 invalidates connections authenticated with it before their next operation.
 Removing a token from `gateway.paired_tokens` by editing config, over RPC
@@ -504,9 +510,11 @@ against the accepted snapshot as it stands. Nothing on the request
 path recompiles policy, so a request that read the configuration
 before a concurrent persist can never reinstall the older policy over
 the newer one; a persisted change to a provider's verification
-settings, a roster or a profile takes effect on the next request. The
-daemon's own RPC surface holds a separate live configuration and
-reaches the same state through the reload the gateway write flags.
+settings, a roster or a profile takes effect on the next request. In a
+supervised run, the gateway and RPC surface share the live configuration,
+write lock, and accepted policy authority, so a save through either surface
+publishes to both. A standalone gateway has its own authority; it does not
+publish changes to a separately running daemon.
 Other gateway surfaces keep the pairing check per handler and adopt the
 layer in follow-ups.
 
