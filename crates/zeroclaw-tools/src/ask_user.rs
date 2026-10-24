@@ -16,6 +16,10 @@ pub type ChannelMapHandle = Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>;
 /// Default timeout in seconds when waiting for a user response.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+/// Result when a structured-only channel returns no choice: the user closed
+/// the prompt without picking (or, rarely, the client cannot show choices).
+const DISMISSED_OUTPUT: &str = "DISMISSED: the user closed the question without choosing.";
+
 /// Agent-callable tool for sending a question to a user and waiting for their response.
 pub struct AskUserTool {
     security: Arc<SecurityPolicy>,
@@ -188,9 +192,13 @@ impl Tool for AskUserTool {
         //   - default impl / no native UI → "caller should fall back to send+listen"
         //   - ACP/RPC after Decline|Cancel → also `Ok(None)`
         // Only free-form-capable channels may take the send+listen fallback.
-        // Structured-only channels (ACP, RPC Code tab, WS approval) must fail
-        // fast: their `listen` never delivers a reply, so fallthrough either
+        // Structured-only channels (ACP, RPC Code tab, WS approval) must return
+        // at once: their `listen` never delivers a reply, so fallthrough either
         // hangs until timeout or returns a misleading "channel closed" error.
+        // There `Ok(None)` is almost always the user dismissing the prompt,
+        // which is an answer, not a tool failure: report it as a successful
+        // "no answer" so the card does not show an error and the agent is not
+        // told to retry.
         if let Some(ref choices_vec) = choices
             && !choices_vec.is_empty()
         {
@@ -210,14 +218,9 @@ impl Tool for AskUserTool {
                 }
                 Ok(None) => {
                     return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Channel '{channel_name}' did not complete the structured choice \
-                             (user cancelled/declined, or the channel has no free-form fallback). \
-                             Retry ask_user; free-form questions on this channel await ACP \
-                             elicitation Phase 2."
-                        )),
+                        success: true,
+                        output: DISMISSED_OUTPUT.to_string().into(),
+                        error: None,
                     });
                 }
                 Err(e) => {
@@ -675,11 +678,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_choice_none_on_structured_only_channel_fails_fast() {
+    async fn request_choice_none_on_structured_only_channel_returns_dismissed_at_once() {
         // Regression: Ok(None) from request_choice used to fall through to
         // send+listen. On ACP/RPC channels listen never delivers a reply, so
         // the tool hung until timeout (default 300s) and the session had to
-        // be cancelled manually.
+        // be cancelled manually. Then it returned a tool error telling the
+        // agent to retry; a dismissal is the user's answer, not a failure.
         let ch = Arc::new(StructuredOnlyChannel::new("rpc", Ok(None)));
         let tool = make_tool_with_channels(vec![("rpc", Arc::clone(&ch) as Arc<dyn Channel>)]);
 
@@ -696,23 +700,15 @@ mod tests {
 
         assert!(
             elapsed < std::time::Duration::from_secs(2),
-            "must fail fast, not wait on listen; elapsed={elapsed:?}"
+            "must return at once, not wait on listen; elapsed={elapsed:?}"
         );
         assert!(
-            !result.success,
-            "expected failure, got success: {:?}",
-            result.output
+            result.success,
+            "a dismissal is not a tool failure: {:?}",
+            result.error
         );
-        let err = result.error.as_deref().unwrap_or("");
-        assert!(
-            err.contains("rpc")
-                || err.contains("choices")
-                || err.contains("free-form")
-                || err.contains("declined")
-                || err.contains("cancelled")
-                || err.contains("cancel"),
-            "error should explain structured-only failure; got: {err}"
-        );
+        assert!(result.error.is_none());
+        assert_eq!(result.output, DISMISSED_OUTPUT);
         assert!(
             !*ch.listen_called.lock(),
             "must not fall through to listen on a structured-only channel"
