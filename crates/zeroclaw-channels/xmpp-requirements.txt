@@ -1,0 +1,4 @@
+# Optional external runtime for channel-xmpp. Install into a dedicated venv.
+slixmpp==1.12.0
+# Optional if omemo_enabled=false. This backend is AGPL-3.0-only; not vendored.
+slixmpp-omemo==2.1.0

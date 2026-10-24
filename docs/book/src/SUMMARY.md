@@ -94,6 +94,7 @@
 - [Channels & Integrations](./channels/overview.md)
   - [Peer Groups](./channels/peer-groups.md)
   - [Matrix](./channels/matrix.md)
+  - [XMPP / Prosody](./channels/xmpp.md)
   - [Telegram](./channels/telegram.md)
   - [Discord](./channels/discord.md)
   - [Slack](./channels/slack.md)

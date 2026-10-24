@@ -9,6 +9,7 @@ homepage.workspace = true
 publish = true
 
 [dependencies]
+jid = { version = "0.12", optional = true }
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
@@ -194,6 +195,7 @@ channels-full = [
   "channel-git",
   "channel-imessage",
   "channel-irc",
+  "channel-xmpp",
   "channel-lark",
   "channel-line",
   "channel-linq",
@@ -255,6 +257,7 @@ channel-discord = ["ws-transport"]
 channel-slack = ["ws-transport"]
 channel-signal = []
 channel-mattermost = ["ws-transport"]
+channel-xmpp = ["tokio-util/codec", "dep:jid"]
 channel-irc = ["tls-client"]
 channel-twitch = ["channel-irc"]
 channel-imessage = ["dep:rusqlite"]

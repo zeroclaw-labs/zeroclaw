@@ -1597,6 +1597,8 @@ jobs:
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark::"
           - name: Matrix
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-matrix --lib matrix::"
+          - name: XMPP
+            command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-xmpp --lib xmpp:: compiled_channel_keys_have_intentional_announcement_delivery_registration compiled_channel_keys_have_intentional_one_shot_builder_support"
           - name: MQTT
             command: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-mqtt --lib orchestrator::mqtt"
           - name: QQ

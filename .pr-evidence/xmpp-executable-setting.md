@@ -1,0 +1,7 @@
+# XMPP executable setting hardening
+
+The channel schema no longer contains `python_path`; the supported config setter rejects it. An old serialized value is ignored rather than executed. The compatibility worker resolves its interpreter from the trusted daemon process environment (`ZEROCLAW_XMPP_PYTHON`, default `python3`), never from channel settings. Existing virtualenv operators must migrate this setting to the service environment before upgrading.
+
+The actual WebUI renderer was exercised locally in Chrome with a synthetic API matching the new channel field set. Advanced has five fields and no executable-path control. Transport selection, masked password replacement, OMEMO option persistence, enablement and canonical peer-policy writes passed; no page errors or horizontal mobile overflow were observed. The refreshed `xmpp-omemo-desktop.png` records the Advanced tab at 1440 x 1000. This browser fixture is not a production authentication or native OMEMO interoperability test.
+
+The temporary browser script and raw JSON remain outside the PR. Exact code revision `508ffa78c` passed release-profile Rust adapter tests (3/3, including simultaneous full-pipe send/receive) and config integration tests (3/3, including rejection of the executable property and legacy-value roundtrip). The screenshot-only follow-up changes no runtime code. Native Rust transport migration remains a separate outstanding requirement; this compatibility hardening does not claim to complete it.

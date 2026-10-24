@@ -6665,7 +6665,10 @@ fn outbound_content_format_for_channel(channel: &str) -> OutboundContentFormat {
     let channel_type = channel
         .split_once('.')
         .map_or(channel, |(channel_type, _)| channel_type);
-    if channel_type.eq_ignore_ascii_case("irc") || channel_type.eq_ignore_ascii_case("twitch") {
+    if channel_type.eq_ignore_ascii_case("xmpp")
+        || channel_type.eq_ignore_ascii_case("irc")
+        || channel_type.eq_ignore_ascii_case("twitch")
+    {
         OutboundContentFormat::PlainText
     } else {
         OutboundContentFormat::Markdown
@@ -13779,6 +13782,23 @@ fn build_channel_by_id(
         "gmail_push" | "gmail-push" => {
             anyhow::bail!("Gmail Push channel requires the `channel-email` feature");
         }
+        #[cfg(feature = "channel-xmpp")]
+        "xmpp" => {
+            let xmpp = config
+                .channels
+                .xmpp
+                .get("default")
+                .context("XMPP channel is not configured")?;
+            let live = config_arc.clone();
+            Ok(Arc::new(crate::xmpp::XmppChannel::new(
+                xmpp.clone(),
+                "default".into(),
+                config.data_dir.clone(),
+                Arc::new(move || live.read().channel_external_peers("xmpp", "default")),
+            )))
+        }
+        #[cfg(not(feature = "channel-xmpp"))]
+        "xmpp" => anyhow::bail!("XMPP requires the channel-xmpp feature"),
         #[cfg(feature = "channel-irc")]
         "irc" => {
             let irc_cfg = config
@@ -15420,6 +15440,25 @@ fn collect_configured_channels_with_authority(
             "Email/Gmail Push channel is configured but this build was compiled without \
              `channel-email`; skipping Email and Gmail Push."
         );
+    }
+
+    #[cfg(feature = "channel-xmpp")]
+    for (alias, xmpp) in &config.channels.xmpp {
+        if !xmpp.enabled || !active_channel_aliases.contains(&format!("xmpp.{alias}")) {
+            continue;
+        }
+        let live = config_arc.clone();
+        let peer_alias = alias.clone();
+        channels.push(ConfiguredChannel {
+            display_name: "XMPP",
+            alias: Some(alias.clone()),
+            channel: Arc::new(crate::xmpp::XmppChannel::new(
+                xmpp.clone(),
+                alias.clone(),
+                config.data_dir.clone(),
+                Arc::new(move || live.read().channel_external_peers("xmpp", &peer_alias)),
+            )),
+        });
     }
 
     #[cfg(feature = "channel-irc")]
@@ -57114,6 +57153,7 @@ Done."#;
             "gmail-push",
             "gmail_push",
             "irc",
+            "xmpp",
             "twitch",
             "dingtalk",
             "wecom",

@@ -5033,6 +5033,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "jid"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01200283c7e9307b1afee820eea16008048b6712ef768617e18f36aadb1ed272"
+dependencies = [
+ "idna",
+ "memchr",
+ "stringprep",
+]
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13939,6 +13950,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "image",
+ "jid",
  "jsonwebtoken",
  "lapin",
  "lettre",
