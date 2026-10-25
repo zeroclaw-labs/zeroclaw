@@ -1157,6 +1157,44 @@ fn plugin_config_values(
         })
 }
 
+/// Resolve one plugin instance's configuration from canonical config: the row
+/// under `config_entry_key`, validated by
+/// [`zeroclaw_plugins::config::resolve_plugin_config_from`] under `scope`, with
+/// the instance's TLS secret material reserved for the host and the TLS
+/// coherence witness of the same config view.
+///
+/// This is the runtime's whole per-instance config check. The host services'
+/// resolver runs it for every instance the runtime constructs, and
+/// [`crate::plugin_runtime::tool_instance_config_verdict`] runs it for a
+/// report, so the two cannot disagree. `read` yields the config view; it is
+/// called at most once, after the schema and grant checks that need no values.
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn resolve_instance_config<C: std::ops::Deref<Target = Config>>(
+    manifest: &zeroclaw_plugins::PluginManifest,
+    scope: &zeroclaw_plugins::instance::PluginInstanceScope,
+    config_entry_key: &str,
+    read: impl FnOnce() -> C,
+) -> Result<zeroclaw_plugins::config::ResolvedPluginConfig, zeroclaw_plugins::error::PluginError> {
+    let package = scope.id().package();
+    // Filled from the same config view the values come from, so the reserved
+    // set and the secrets it withholds share one revision.
+    let mut host_only = Vec::new();
+    let mut witness = None;
+    let resolved = zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+        let config = read();
+        witness = Some(plugin_tls_config_witness(&config, config_entry_key)?);
+        host_only = plugin_tls_secret_properties(&config, config_entry_key);
+        plugin_config_values(&config, config_entry_key, package)
+    })?;
+    let resolved = resolved.reserve_for_host(host_only);
+    // A schema permitted to withhold config does not invoke the source
+    // closure. Preserve that empty view; it cannot materialize TLS secrets.
+    Ok(match witness {
+        Some(witness) => resolved.with_tls_config_witness(witness),
+        None => resolved,
+    })
+}
+
 #[cfg(feature = "plugins-wasm")]
 pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
@@ -1178,41 +1216,18 @@ pub(crate) fn plugin_host_services(
         let manifest = host
             .manifest(package)
             .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
-        // Filled from the same config view the values come from, so the
-        // reserved set and the secrets it withholds share one revision.
-        let mut host_only = Vec::new();
-        let mut witness = None;
-        let resolved = if let Some(live_config) = &live_config {
-            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
-                // Transient per-call view: schema/grant checks happen before
-                // this access, and the global lock is released before guest
-                // setup.
-                let config = live_config.read();
-                witness = Some(plugin_tls_config_witness(&config, &config_entry_key)?);
-                host_only = plugin_tls_secret_properties(&config, &config_entry_key);
-                plugin_config_values(&config, &config_entry_key, package)
-            })
+        if let Some(live_config) = &live_config {
+            // Transient per-call view: schema/grant checks happen before this
+            // access, and the global lock is released before guest setup.
+            resolve_instance_config(manifest, scope, &config_entry_key, || live_config.read())
         } else {
             let config = fallback_config.as_ref().ok_or_else(|| {
                 zeroclaw_plugins::error::PluginError::InvalidConfig(
                     "plugin config source is unavailable".to_string(),
                 )
             })?;
-            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
-                witness = Some(plugin_tls_config_witness(config, &config_entry_key)?);
-                host_only = plugin_tls_secret_properties(config, &config_entry_key);
-                plugin_config_values(config, &config_entry_key, package)
-            })
-        };
-        resolved.map(|resolved| {
-            let resolved = resolved.reserve_for_host(host_only);
-            // A schema permitted to withhold config does not invoke the source
-            // closure. Preserve that empty view; it cannot materialize TLS secrets.
-            match witness {
-                Some(witness) => resolved.with_tls_config_witness(witness),
-                None => resolved,
-            }
-        })
+            resolve_instance_config(manifest, scope, &config_entry_key, || &**config)
+        }
     });
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),

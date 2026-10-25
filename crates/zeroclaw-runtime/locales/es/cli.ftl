@@ -1051,6 +1051,9 @@ cli-plugin-info-load-failed =
     Recompila el complemento con el WIT que incluye este host (consulta wit/v0) y vuelve a instalarlo.
 cli-plugin-info-load-not-applicable = Carga: no aplicable. Es un complemento solo de skill, así que no hay ningún componente que instanciar.
 cli-plugin-info-load-failed-exit = el complemento '{$name}' no se carga en este host
+cli-plugin-info-load-config-refused =
+    Carga: no. El componente se instancia con el mundo WIT de este host, pero el runtime rechaza su configuración: {$error}
+    La configuración es el mapa `config` de la fila [[plugins.entries]] llamada '{$key}'. Ajústala al config_schema del paquete instalado, o elimina sus valores si el paquete no declara ninguno.
 cli-estop-domains-none = {"  "}domain_blocks:  (ninguno)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (ninguno)
