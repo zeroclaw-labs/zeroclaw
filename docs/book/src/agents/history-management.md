@@ -207,7 +207,7 @@ identifier_policy = "strict"
 ```
 
 - The threshold is compared against the **provider-reported input token count
-  of the turn that just finished** — the same number the client's context meter
+  of the turn that just finished**: the same number the client's context meter
   shows. Compaction therefore runs at the turn boundary, after the final
   response, never while a request is in flight.
 - The summary replaces a range of **whole turns**: a tool call and its result
