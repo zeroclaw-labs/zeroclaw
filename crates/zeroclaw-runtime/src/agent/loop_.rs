@@ -2769,57 +2769,6 @@ async fn run_inner(
                         );
                         continue;
                     }
-                    "/compact" => {
-                        let no_preamble = None;
-                        let outcome = crate::agent::turn::compact_and_announce(
-                            crate::agent::turn::CompactionRequest {
-                                history: &mut history,
-                                crumb_present: &mut history_has_trim_breadcrumb,
-                                injected_memory_preamble: &no_preamble,
-                                provider: model_provider.as_ref(),
-                                model: &model_name,
-                                temperature,
-                                config: Some(&config),
-                                agent_alias: Some(agent_alias),
-                                context_limits,
-                                observer: observer.as_ref(),
-                                event_tx: None,
-                                on_delta: None,
-                                turn_id: "interactive-compact",
-                                trigger_tokens: 0,
-                                forced: true,
-                            },
-                        )
-                        .await;
-                        if outcome.compacted {
-                            println!(
-                                "{}",
-                                crate::i18n::get_required_cli_string_with_args(
-                                    "history-compaction-done",
-                                    &[
-                                        ("turns", &outcome.turns_compacted.to_string()),
-                                        ("before", &outcome.tokens_before.to_string()),
-                                        ("after", &outcome.tokens_after.to_string()),
-                                    ],
-                                )
-                            );
-                        } else {
-                            println!(
-                                "{}",
-                                crate::i18n::get_required_cli_string(
-                                    "history-compaction-nothing-to-do"
-                                )
-                            );
-                        }
-                        if let Some(path) = session_state_file.as_deref() {
-                            save_interactive_session_history_with_crumb(
-                                path,
-                                &history,
-                                history_has_trim_breadcrumb,
-                            )?;
-                        }
-                        continue;
-                    }
                     "/clear" | "/new" => {
                         println!(
                             "This will clear the current conversation and delete all session memory."
