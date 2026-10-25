@@ -1,0 +1,42 @@
+schema: spec-driven
+
+context: |
+  ZeroClaw 是 Rust 2024 workspace，包含可插拔的模型提供方、通道、工具和记忆，
+  HTTP/WebSocket 网关，以及 React/TypeScript Web 界面。
+  仓库指令具有约束力：先读根目录 AGENTS.md。非简单架构、配置、安全或工作流任务
+  从 docs/book/src/contributing/architecture-map.md 开始，只加载其路由的相关参考。
+  确定实现归属前读取适用的下级 AGENTS.md。
+  zeroclaw-runtime 是过渡 holding crate，新子系统必须放在其外部。可复用已有 API；
+  修改其承载的功能须按契约先提取，或取得适用且已有记录的 Core 例外。
+  引入状态前先指明权威归属。已有事实须在使用时从当前权威源解析；索引、UI 视图
+  和通知是派生结果，不能成为第二套策略或业务状态权威。
+  新增外部入口默认关闭。保留配对、授权、沙箱、审批、隐私和数据外发边界；
+  未验证权威 token 消费方前，不得声称 Cookie 到期也使原始 Bearer 到期。
+  新子系统或重大安全／架构边界须先按 docs/book/src/contributing/rfcs.md
+  形成持久化 RFC 决策，再实施。OpenSpec 产物齐备不等于 RFC 批准或 Core 例外。
+  运行时 CLI、工具和引导文案使用 zeroclaw_runtime::i18n 的必需 Fluent helper；
+  Web 文案遵循 web/src/lib/i18n.ts；zerocode 使用独立 catalogue。
+  日志保持英文，不包含秘密和个人数据。
+  正式文档以英文 Markdown 为源，按本地化流程处理，不能手改生成译文。
+  中文 prd/ 评审材料不能直接移入 docs/book 作为正式源文档。
+  使用非 master 分支、conventional commits 和完整 PR 模板，禁止直接推送 master。
+  在实际变更的用户边界验证，只报告真实运行的命令，并说明影响、迁移和回滚。
+
+rules:
+  proposal:
+    - 标明引用的 PRD／规格版本，区分 P0 范围与延期工作。
+    - 显式披露共享子系统影响和激活兼容性副作用。
+    - 说明所需 RFC 或归属决策，不暗示其已经获批。
+  design:
+    - 明确权威状态、当前策略的执行点、失败和回滚边界。
+    - 区分已有能力、计划新增能力和尚未测量的候选限制。
+    - 标注产品假设及更严格的设计选择；不能将新行为归到不相关的 PRD 验收编号。
+    - 业务子系统放在 zeroclaw-runtime 外，并说明替代方案。
+  specs:
+    - 使用可测试的 SHALL／MUST 规范要求，以及四级 Scenario 标题和 WHEN／THEN 结果。
+    - 适用时覆盖权限、并发、到期／撤销、隐私和用户可见失败。
+    - 明确同意前的信息披露要求，不能只写泛化的授权标签。
+  tasks:
+    - 使用带编号的未勾选任务，明确实现或证据边界。
+    - 映射所有引用的 PRD 验收项，覆盖所有者主动操作及 TTL 路径。
+    - 包含本地化、正式源文档、迁移、用户边界验证和回滚工作。
