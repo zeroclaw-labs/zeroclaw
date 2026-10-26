@@ -1047,7 +1047,11 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         const commentSeed: Record<string, string> = {};
         for (const e of resp.entries) {
           const staged = configDraft.drafts[e.path];
-          seed[e.path] = staged?.input ?? defaultInputValue(e);
+          const savedInput = defaultInputValue(e);
+          if (staged?.input === savedInput) {
+            configDraft.clearDraft(e.path);
+          }
+          seed[e.path] = staged?.input ?? savedInput;
           const stagedComment = configDraft.comments[e.path];
           if (stagedComment) commentSeed[e.path] = stagedComment;
         }
@@ -1207,7 +1211,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     // between a field edited via its own row and one edited via the grid.
     const applyFieldValue = (f: ListResponseEntry, v: string) => {
       setDraft((d) => ({ ...d, [f.path]: v }));
-      const baseline = defaultInputValue(f);
+      const baseline =
+        configDraft.savingDrafts[f.path]?.input ?? defaultInputValue(f);
       if (v === baseline || (f.is_secret && v.length === 0)) {
         configDraft.clearDraft(f.path);
       } else {
