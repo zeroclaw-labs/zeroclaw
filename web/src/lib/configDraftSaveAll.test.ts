@@ -58,6 +58,7 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
   let listCalls = 0;
   const patches: unknown[][] = [];
   let delayNextPatch = false;
+  let failNextPatch = false;
   let releasePendingPatch: (() => void) | undefined;
 
   const globals: Record<string, unknown> = {
@@ -144,6 +145,10 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
         await new Promise<void>((resolve) => {
           releasePendingPatch = resolve;
         });
+      }
+      if (failNextPatch) {
+        failNextPatch = false;
+        return new Response("mock gateway rejected save", { status: 500 });
       }
       const update = ops.find((op) => op.path === "channels.show_tool_calls");
       if (update && typeof update.value === "boolean") {
@@ -305,6 +310,49 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       domWindow.document.body.textContent ?? "",
       /1 unsaved change/,
       "a subsequent edit must use the value persisted by the second save",
+    );
+
+    delayNextPatch = true;
+    failNextPatch = true;
+    await act(async () => {
+      findButton(domWindow.document, "Save all").click();
+      await flushEffects();
+    });
+    assert.equal(patches.length, 4);
+    assert.ok(releasePendingPatch, "expected the failing patch to be pending");
+
+    await act(async () => {
+      domWindow.document.querySelector<HappyHTMLButtonElement>(
+        'button[role="switch"]',
+      )?.click();
+    });
+    await act(async () => {
+      domWindow.document.querySelector<HappyHTMLButtonElement>(
+        'button[role="switch"]',
+      )?.click();
+    });
+    await act(async () => {
+      releasePendingPatch?.();
+      await flushEffects();
+    });
+
+    assert.equal(savedValue, true, "the failed patch must not change the server value");
+    assert.equal(
+      domWindow.document
+        .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
+        ?.getAttribute("aria-checked"),
+      "false",
+      "the latest input should remain visible after the failed save",
+    );
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /1 unsaved change/,
+      "the failed value should remain staged for retry",
+    );
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /mock gateway rejected save/,
+      "the failed-save error should remain visible with the unsaved draft",
     );
   } finally {
     if (root) {
