@@ -26,7 +26,7 @@ async function flushEffects(): Promise<void> {
   }
 }
 
-test("Save all refreshes a mounted field form's saved baseline", async () => {
+test("Save all refreshes the saved baseline and preserves in-flight edits", async () => {
   const domWindow = new Window();
   const container = domWindow.document.createElement("div");
   domWindow.document.body.appendChild(container);
@@ -57,6 +57,8 @@ test("Save all refreshes a mounted field form's saved baseline", async () => {
   let savedValue = false;
   let listCalls = 0;
   const patches: unknown[][] = [];
+  let delayNextPatch = false;
+  let releasePendingPatch: (() => void) | undefined;
 
   const globals: Record<string, unknown> = {
     window: domWindow,
@@ -137,6 +139,12 @@ test("Save all refreshes a mounted field form's saved baseline", async () => {
         value?: unknown;
       }>;
       patches.push(ops);
+      if (delayNextPatch) {
+        delayNextPatch = false;
+        await new Promise<void>((resolve) => {
+          releasePendingPatch = resolve;
+        });
+      }
       const update = ops.find((op) => op.path === "channels.show_tool_calls");
       if (update && typeof update.value === "boolean") {
         savedValue = update.value;
@@ -243,7 +251,60 @@ test("Save all refreshes a mounted field form's saved baseline", async () => {
     assert.match(
       domWindow.document.body.textContent ?? "",
       /1 unsaved change/,
-      "a change back to the original value must be compared with the new baseline",
+      "a change back to the old value must be compared with the new baseline",
+    );
+
+    delayNextPatch = true;
+    await act(async () => {
+      findButton(domWindow.document, "Save all").click();
+      await flushEffects();
+    });
+    assert.equal(patches.length, 2);
+    assert.ok(releasePendingPatch, "expected the second patch to be pending");
+
+    await act(async () => {
+      domWindow.document.querySelector<HappyHTMLButtonElement>(
+        'button[role="switch"]',
+      )?.click();
+    });
+    await act(async () => {
+      releasePendingPatch?.();
+      await flushEffects();
+    });
+
+    assert.equal(savedValue, false);
+    assert.equal(
+      domWindow.document
+        .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
+        ?.getAttribute("aria-checked"),
+      "true",
+      "the newer in-flight edit should remain staged after the save completes",
+    );
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /1 unsaved change/,
+    );
+
+    await act(async () => {
+      findButton(domWindow.document, "Save all").click();
+      await flushEffects();
+    });
+    assert.equal(savedValue, true);
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /No unsaved changes/,
+    );
+    assert.equal(findButton(domWindow.document, "Save").disabled, true);
+
+    await act(async () => {
+      domWindow.document.querySelector<HappyHTMLButtonElement>(
+        'button[role="switch"]',
+      )?.click();
+    });
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /1 unsaved change/,
+      "a subsequent edit must use the value persisted by the second save",
     );
   } finally {
     if (root) {

@@ -36,7 +36,9 @@ type ConfigDraftState = {
 };
 
 type ConfigDraftCtx = ConfigDraftState & {
-  /** Advances after Save all so mounted forms refresh their saved baseline. */
+  /** Draft values currently being submitted by Save all. */
+  savingDrafts: Record<string, DraftEntry>;
+  /** Advances after Save all finishes so mounted forms reconcile with the gateway. */
   saveAllVersion: number;
   setDraft: (path: string, input: string, value?: unknown) => void;
   clearDraft: (path: string) => void;
@@ -60,6 +62,9 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
   const [drafts, setDrafts] = useState<Record<string, DraftEntry>>({});
   const [comments, setComments] = useState<Record<string, string>>({});
   const [tombstones, setTombstones] = useState<Set<string>>(() => new Set());
+  const [savingDrafts, setSavingDrafts] = useState<Record<string, DraftEntry>>(
+    {},
+  );
   const [saveAllVersion, setSaveAllVersion] = useState(0);
 
   const setDraft = useCallback((path: string, input: string, value?: unknown) => {
@@ -229,6 +234,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
     if (ops.length === 0) {
       return { saved: true, results: [], warnings: [] };
     }
+    setSavingDrafts(drafts);
     try {
       const resp = await patchConfig(ops);
       // Clear only the snapshot that was submitted. Edits made while the
@@ -263,12 +269,14 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
         }
         return next ?? current;
       });
-      setSaveAllVersion((version) => version + 1);
       return resp;
     } catch (e) {
       // Surface ApiError unchanged so the banner can display field-bound errors.
       if (e instanceof ApiError) throw e;
       throw e;
+    } finally {
+      setSavingDrafts({});
+      setSaveAllVersion((version) => version + 1);
     }
   }, [drafts, comments, tombstones]);
 
@@ -292,6 +300,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       drafts,
       comments,
       tombstones,
+      savingDrafts,
       saveAllVersion,
       setDraft,
       clearDraft,
@@ -308,6 +317,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       drafts,
       comments,
       tombstones,
+      savingDrafts,
       saveAllVersion,
       setDraft,
       clearDraft,
