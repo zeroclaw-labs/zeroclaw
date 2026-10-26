@@ -152,12 +152,15 @@ pub fn context_window_exceeded_from_error(err: &anyhow::Error) -> Option<&Contex
         .find_map(|source| source.downcast_ref::<ContextWindowExceeded>())
 }
 
-/// The non-droppable system floor alone meets or exceeds the operator's
-/// context token budget. No history trim can bring such a request under
-/// budget, so the turn is refused before any provider call instead of
-/// dispatching a request the budget already rejects.
+/// The non-droppable request floor meets or exceeds the operator's context
+/// token budget. The floor is the system messages plus the native tool
+/// definitions serialized into the same provider request — no history trim
+/// can remove either share — so the turn is refused before any provider call
+/// instead of dispatching a request the budget already rejects.
 #[derive(Debug)]
 pub struct SystemPromptFloorExceedsBudget {
+    /// The measured floor in tokens: system-prompt messages plus native tool
+    /// schema tokens when the request carries tool definitions.
     pub system_floor_tokens: usize,
     pub context_token_budget: usize,
 }

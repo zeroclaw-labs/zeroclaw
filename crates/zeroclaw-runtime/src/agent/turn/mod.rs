@@ -1076,10 +1076,12 @@ fn context_window_exceeded_error(
     .into()
 }
 
-/// Refuse a request whose non-droppable system floor already meets or exceeds
-/// the operator's context budget. The warning event keeps its historical
-/// `context_floor_exceeds_budget` key — dashboards and the incident trace
-/// match on it — but the turn now fails closed instead of dispatching.
+/// Refuse a request whose non-droppable floor — the system messages plus the
+/// native tool definitions serialized into the same provider request —
+/// already meets or exceeds the operator's context budget. The warning event
+/// keeps its historical `context_floor_exceeds_budget` key — dashboards and
+/// the incident trace match on it — but the turn now fails closed instead of
+/// dispatching.
 fn context_floor_budget_exceeded_error(
     (provider_name, model): (&str, &str),
     system_floor: usize,
@@ -2418,15 +2420,29 @@ async fn run_tool_call_loop_impl<'a>(
             prepared_source_rows.insert(0, usize::MAX);
         }
 
+        // Native tool definitions are serialized into the same provider
+        // request as the system messages, so providers that count them in
+        // `input_tokens` report a population of messages plus tool schemas.
+        // Both shares are non-droppable — no history trim can remove either
+        // one — so the floor below is measured on the exact specs this
+        // iteration will send.
+        let tool_schema_tokens = if use_native_tools {
+            crate::agent::history::estimate_tool_schema_tokens(tool_specs)
+        } else {
+            0
+        };
+
         if context_token_budget > 0 {
             let system_floor =
-                crate::agent::history::estimate_system_floor_tokens(&provider_request_messages);
-            // Hard stop: when the system floor alone meets or exceeds the
-            // context budget, no history trim can bring the request under it,
-            // so the request must not reach the provider (the warning-only
-            // predecessor of this gate sent a 563K-char system prompt to a
-            // live conversation on 2026-10-20). The refusal is a typed turn
-            // error, not a panic, so callers can deliver the remediation.
+                crate::agent::history::estimate_system_floor_tokens(&provider_request_messages)
+                    + tool_schema_tokens;
+            // Hard stop: when the non-droppable floor (system messages plus
+            // native tool schemas) meets or exceeds the context budget, no
+            // history trim can bring the request under it, so the request
+            // must not reach the provider (the warning-only predecessor of
+            // this gate sent a 563K-char system prompt to a live conversation
+            // on 2026-10-20). The refusal is a typed turn error, not a panic,
+            // so callers can deliver the remediation.
             //
             // The refusal is raised only when the operator budget is the
             // binding constraint (`budget < model capacity`): when the budget
@@ -2454,15 +2470,10 @@ async fn run_tool_call_loop_impl<'a>(
         // provider this iteration (after any pre-LLM-call hook rewrites),
         // before any assistant/tool-result output is appended to `history`.
         // `enforce_reported_budget` below needs this as the calibration
-        // denominator, not a later, larger `history` estimate.
-        // Native tool definitions are serialized into the same provider
-        // request, so providers that count them in `input_tokens` report a
-        // population of messages plus tool schemas.
-        let tool_schema_tokens = if use_native_tools {
-            crate::agent::history::estimate_tool_schema_tokens(tool_specs)
-        } else {
-            0
-        };
+        // denominator, not a later, larger `history` estimate. Native tool
+        // definitions are serialized into the same provider request, so
+        // providers that count them in `input_tokens` report a population of
+        // messages plus tool schemas.
         let mut reported_population_estimated =
             crate::agent::history::estimate_history_tokens(&provider_request_messages)
                 + tool_schema_tokens;
@@ -11114,6 +11125,10 @@ mod tool_lifecycle_abandonment_tests {
     /// text-only response once the script is exhausted.
     struct ScriptedProvider {
         responses: Mutex<Vec<ChatResponse>>,
+        /// Provider dispatches observed by this mock. The budget-gate
+        /// regressions assert that a refused turn stops before this
+        /// increments.
+        calls: Mutex<usize>,
     }
 
     impl zeroclaw_api::attribution::Attributable for ScriptedProvider {
@@ -11151,6 +11166,7 @@ mod tool_lifecycle_abandonment_tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
+            *self.calls.lock().expect("call count lock") += 1;
             let mut queue = self.responses.lock().expect("script queue lock");
             if queue.is_empty() {
                 return Ok(text_response());
@@ -11182,6 +11198,46 @@ mod tool_lifecycle_abandonment_tests {
         }
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: args.to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// A tool whose parameter schema carries operator-scale bulk, so a
+    /// request's native tool-schema share is non-trivial next to the system
+    /// floor in budget-gate tests.
+    struct SchemaHeavyTool {
+        name: String,
+        schema: serde_json::Value,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SchemaHeavyTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for SchemaHeavyTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "carries a heavy native schema"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            self.schema.clone()
         }
         async fn execute(
             &self,
@@ -11381,6 +11437,36 @@ mod tool_lifecycle_abandonment_tests {
         tools: Vec<Box<dyn crate::tools::Tool>>,
     ) -> crate::tools::scoped::ScopedToolRegistry {
         crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools)
+    }
+
+    /// Build a registry of `count` tools whose serialized schemas total
+    /// `schema_chars` bytes each, returning the estimated native schema-token
+    /// share alongside the registry so tests can place the operator budget
+    /// exactly at or above the non-droppable floor.
+    fn heavy_schema_registry(
+        count: usize,
+        schema_chars: usize,
+    ) -> (usize, crate::tools::scoped::ScopedToolRegistry) {
+        let tools: Vec<Box<dyn crate::tools::Tool>> = (0..count)
+            .map(|index| {
+                Box::new(SchemaHeavyTool {
+                    name: format!("heavy_schema_tool_{index}"),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "payload": {
+                                "type": "string",
+                                "description": "x".repeat(schema_chars),
+                            },
+                        },
+                    }),
+                }) as Box<dyn crate::tools::Tool>
+            })
+            .collect();
+        let schema_tokens = crate::agent::history::estimate_tool_schema_tokens(
+            &tools.iter().map(|tool| tool.spec()).collect::<Vec<_>>(),
+        );
+        (schema_tokens, registry_with(tools))
     }
 
     struct ImageRecoveryProvider {
@@ -11706,6 +11792,7 @@ mod tool_lifecycle_abandonment_tests {
 
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![text_response()]),
+            calls: Mutex::new(0),
         };
         let registry = registry_with(Vec::new());
         let observer = NoopObserver;
@@ -11749,6 +11836,7 @@ mod tool_lifecycle_abandonment_tests {
         ];
         let provider = ScriptedProvider {
             responses: Mutex::new(vec![]),
+            calls: Mutex::new(0),
         };
         let registry = registry_with(Vec::new());
         let observer = NoopObserver;
@@ -11784,6 +11872,153 @@ mod tool_lifecycle_abandonment_tests {
     }
 
     #[tokio::test]
+    async fn system_floor_gate_counts_native_tool_schemas_and_refuses_before_dispatch() {
+        // Reviewer repro: the system prompt alone fits the budget and the
+        // tool schemas alone fit the budget, but their SUM meets the budget —
+        // both ride in the same provider request and no history trim can
+        // remove either one. The legacy system-only measurement dispatched
+        // exactly this shape.
+        let mut history = vec![
+            ChatMessage::system("compact system prompt".to_string()),
+            ChatMessage::user("hello".to_string()),
+        ];
+        let (schema_tokens, registry) = heavy_schema_registry(6, 6_000);
+        let system_floor = crate::agent::history::estimate_system_floor_tokens(&history);
+        assert!(
+            schema_tokens > 0,
+            "the heavy registry must contribute a native schema share"
+        );
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![]),
+            calls: Mutex::new(0),
+        };
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+
+        // The budget sits exactly at the combined floor, below the 32,000
+        // model-window stub, so the operator budget (not capacity) binds.
+        let budget = system_floor + schema_tokens;
+        let result = run_scripted_loop_with_budget(
+            &provider,
+            &registry,
+            &observer,
+            None,
+            &pacing,
+            "floor-tool-schemas-refusal",
+            false,
+            None,
+            &mut history,
+            budget,
+            None,
+        )
+        .await;
+
+        let error = result.expect_err(
+            "a floor of system messages plus native tool schemas at the budget \
+             must fail closed before dispatch",
+        );
+        let refusal = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<SystemPromptFloorExceedsBudget>())
+            .expect("the refusal must keep its typed budget cause");
+        assert_eq!(refusal.context_token_budget, budget);
+        assert_eq!(
+            refusal.system_floor_tokens, budget,
+            "the measured floor must include the native tool schema tokens, \
+             not just the system messages (system floor alone: {system_floor})"
+        );
+        assert_eq!(
+            *provider.calls.lock().expect("call count lock"),
+            0,
+            "the budget refusal must stop the turn before any provider dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_floor_gate_dispatches_when_floor_with_schemas_fits_budget() {
+        // The same heavy-schema shape dispatches once the budget clears the
+        // whole non-droppable floor: the gate is a fail-closed stop, not a
+        // penalty on requests that fit.
+        let mut history = vec![
+            ChatMessage::system("compact system prompt".to_string()),
+            ChatMessage::user("hello".to_string()),
+        ];
+        let (schema_tokens, registry) = heavy_schema_registry(6, 6_000);
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![text_response()]),
+            calls: Mutex::new(0),
+        };
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+
+        let budget = crate::agent::history::estimate_history_tokens(&history) + schema_tokens + 128;
+        run_scripted_loop_with_budget(
+            &provider,
+            &registry,
+            &observer,
+            None,
+            &pacing,
+            "floor-tool-schemas-dispatch",
+            false,
+            None,
+            &mut history,
+            budget,
+            None,
+        )
+        .await
+        .expect("a request whose floor fits the budget must dispatch");
+        assert_eq!(
+            *provider.calls.lock().expect("call count lock"),
+            1,
+            "the turn must reach the provider exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_floor_gate_opt_out_zero_budget_dispatches_heavy_schemas() {
+        // A zero budget is the explicit proactive-trimming disable sentinel:
+        // it must never hard-stop, even when the combined floor would meet a
+        // nonzero budget. Capacity is the only remaining bound and the heavy
+        // schema share fits the model-window stub.
+        let mut history = vec![
+            ChatMessage::system("compact system prompt".to_string()),
+            ChatMessage::user("hello".to_string()),
+        ];
+        let (schema_tokens, registry) = heavy_schema_registry(6, 6_000);
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![text_response()]),
+            calls: Mutex::new(0),
+        };
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+
+        run_scripted_loop_with_budget(
+            &provider,
+            &registry,
+            &observer,
+            None,
+            &pacing,
+            "floor-tool-schemas-zero-budget",
+            false,
+            None,
+            &mut history,
+            0,
+            None,
+        )
+        .await
+        .expect("a zero budget must keep dispatching regardless of the floor");
+        assert_eq!(
+            *provider.calls.lock().expect("call count lock"),
+            1,
+            "the opt-out budget must not block the provider call"
+        );
+        assert!(
+            schema_tokens > 0,
+            "the scenario must actually carry a native schema share"
+        );
+    }
+
+    #[tokio::test]
     async fn completed_batch_pairs_before_with_after_and_never_abandons() {
         let observer = NoopObserver;
         let pacing = zeroclaw_config::schema::PacingConfig::default();
@@ -11799,6 +12034,7 @@ mod tool_lifecycle_abandonment_tests {
                 usage: None,
                 reasoning_content: None,
             }]),
+            calls: Mutex::new(0),
         };
         let registry = registry_with(vec![
             Box::new(EchoTool {
@@ -11853,6 +12089,7 @@ mod tool_lifecycle_abandonment_tests {
                 usage: None,
                 reasoning_content: None,
             }]),
+            calls: Mutex::new(0),
         };
         let registry = registry_with(vec![Box::new(FailingTool {
             name: "failing_tool".to_string(),
@@ -11900,6 +12137,7 @@ mod tool_lifecycle_abandonment_tests {
                 usage: None,
                 reasoning_content: None,
             }]),
+            calls: Mutex::new(0),
         };
         let registry = registry_with(vec![
             Box::new(InterruptingTool {
@@ -12070,6 +12308,7 @@ mod tool_lifecycle_abandonment_tests {
                 usage: None,
                 reasoning_content: None,
             }]),
+            calls: Mutex::new(0),
         };
         let registry = registry_with(vec![Box::new(HangingTool {
             name: "hang_tool".to_string(),
