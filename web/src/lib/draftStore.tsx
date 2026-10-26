@@ -36,6 +36,8 @@ type ConfigDraftState = {
 };
 
 type ConfigDraftCtx = ConfigDraftState & {
+  /** Advances after Save all so mounted forms refresh their saved baseline. */
+  saveAllVersion: number;
   setDraft: (path: string, input: string, value?: unknown) => void;
   clearDraft: (path: string) => void;
   setComment: (path: string, comment: string) => void;
@@ -58,6 +60,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
   const [drafts, setDrafts] = useState<Record<string, DraftEntry>>({});
   const [comments, setComments] = useState<Record<string, string>>({});
   const [tombstones, setTombstones] = useState<Set<string>>(() => new Set());
+  const [saveAllVersion, setSaveAllVersion] = useState(0);
 
   const setDraft = useCallback((path: string, input: string, value?: unknown) => {
     setDrafts((prev) => ({ ...prev, [path]: { input, value } }));
@@ -200,30 +203,67 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
   const saveAll = useCallback(async (): Promise<PatchResponse> => {
     const ops: PatchOp[] = [];
     const draftedPaths = new Set<string>();
+    const submittedCommentPaths = new Set<string>();
+    const submittedTombstones = new Set<string>();
     for (const [path, entry] of Object.entries(drafts)) {
       draftedPaths.add(path);
       const op: PatchOp = { op: 'replace', path, value: entry.value };
       const c = comments[path];
-      if (c && c.length > 0) op.comment = c;
+      if (c && c.length > 0) {
+        op.comment = c;
+        submittedCommentPaths.add(path);
+      }
       ops.push(op);
     }
     for (const [path, comment] of Object.entries(comments)) {
       if (draftedPaths.has(path) || tombstones.has(path)) continue;
       ops.push({ op: 'comment', path, comment });
+      submittedCommentPaths.add(path);
     }
     for (const path of tombstones) {
       if (draftedPaths.has(path)) continue;
       ops.push({ op: 'remove', path });
+      submittedTombstones.add(path);
+      if (path in comments) submittedCommentPaths.add(path);
     }
     if (ops.length === 0) {
       return { saved: true, results: [], warnings: [] };
     }
     try {
       const resp = await patchConfig(ops);
-      // Successful save: clear everything that just landed.
-      setDrafts({});
-      setComments({});
-      setTombstones(new Set());
+      // Clear only the snapshot that was submitted. Edits made while the
+      // request was in flight remain staged and are reseeded by mounted forms.
+      setDrafts((current) => {
+        let next: Record<string, DraftEntry> | null = null;
+        for (const [path, submitted] of Object.entries(drafts)) {
+          if (current[path]?.input === submitted.input) {
+            next ??= { ...current };
+            delete next[path];
+          }
+        }
+        return next ?? current;
+      });
+      setComments((current) => {
+        let next: Record<string, string> | null = null;
+        for (const path of submittedCommentPaths) {
+          if (current[path] === comments[path]) {
+            next ??= { ...current };
+            delete next[path];
+          }
+        }
+        return next ?? current;
+      });
+      setTombstones((current) => {
+        let next: Set<string> | null = null;
+        for (const path of submittedTombstones) {
+          if (current.has(path)) {
+            next ??= new Set(current);
+            next.delete(path);
+          }
+        }
+        return next ?? current;
+      });
+      setSaveAllVersion((version) => version + 1);
       return resp;
     } catch (e) {
       // Surface ApiError unchanged so the banner can display field-bound errors.
@@ -252,6 +292,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       drafts,
       comments,
       tombstones,
+      saveAllVersion,
       setDraft,
       clearDraft,
       setComment,
@@ -267,6 +308,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       drafts,
       comments,
       tombstones,
+      saveAllVersion,
       setDraft,
       clearDraft,
       setComment,
