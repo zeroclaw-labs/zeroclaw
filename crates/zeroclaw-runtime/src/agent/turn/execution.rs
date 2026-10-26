@@ -45,6 +45,10 @@ pub struct SettledAttemptSummary {
     pub output_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub accepted: bool,
+    /// Display-only estimate of the summary request's input tokens, set by
+    /// the caller when the provider omitted `input_tokens`. Rejected attempts
+    /// leave this `None`; accounting reads only `input_tokens`.
+    pub estimated_input_tokens: Option<u64>,
 }
 
 /// Append summaries for the billable subset of `attempts` as rejected
@@ -64,6 +68,7 @@ fn extend_rejected_summaries(out: &mut Vec<SettledAttemptSummary>, attempts: &[A
                 billable.usage,
             ),
             accepted: false,
+            estimated_input_tokens: None,
         });
     }
 }
@@ -171,6 +176,11 @@ impl ResolvedModelAccess<'_> {
                         .and_then(|usage| usage.output_tokens),
                     cost_usd: accepted_cost_usd,
                     accepted: true,
+                    // The caller (max_iter) fills this from the summary
+                    // request's message history when the provider omitted
+                    // `input_tokens`, so the context meter keeps its numerator
+                    // after the final-summary event.
+                    estimated_input_tokens: None,
                 });
                 Ok(response)
             }

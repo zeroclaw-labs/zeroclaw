@@ -38,6 +38,7 @@ cli-integrations-chat-imessage-transport = Sends messages through AppleScript au
 cli-integrations-chat-imessage-permissions = Grant macOS Automation access to control Messages and Full Disk Access to read the Messages database.
 cli-integrations-chat-generic-setup = Run {$command}, open Config, configure the required fields, routing, and access for {$channel}, review the settings, then enable it.
 cli-skills-about = Manage skills (user-defined capabilities)
+cli-plugin-about = Manage WASM plugins
 cli-sop-about = Manage standard operating procedures (SOPs)
 cli-migrate-about = Migrate data from other agent runtimes
 cli-auth-about = Manage provider subscription authentication profiles
@@ -521,6 +522,31 @@ cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gate
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+cli-config-lifecycle-dir-not-directory =
+    Config lifecycle path {$path} is not a directory. ZeroClaw creates it as a directory, so something else replaced it. Check what it is, remove it, then retry:
+    {$command}
+cli-config-lifecycle-dir-root-owner =
+    Config lifecycle directory {$path} belongs to root, usually because ZeroClaw was run with sudo. Run ZeroClaw as {$user}, not with sudo. Other files written during that run may belong to root too. Check the directory's contents, then give it back and retry:
+    {$command}
+    If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-lifecycle-dir-running-as-root = Config lifecycle directory {$path} belongs to {$owner}, but ZeroClaw is running as root. Run ZeroClaw as {$owner}, without sudo.
+cli-config-lifecycle-dir-foreign-owner =
+    Config lifecycle directory {$path} belongs to {$owner}, but ZeroClaw is running as {$user}. If it should belong to {$user}, check its contents first, because chown -R also hands over anything another user hard-linked into it (ZeroClaw's .lifecycle holds only config-lifecycle.lock, with a link count of 1). Then take it over and retry:
+    {$command}
+    Otherwise run ZeroClaw as {$owner}. If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-lifecycle-dir-writable =
+    Config lifecycle directory {$path} is writable by its group or by other users (mode {$mode}), so they could replace its config lock. ZeroClaw creates it owner-only and does not change the permissions of an existing directory. Check its contents, then restrict it and retry:
+    {$command}
+    If chmod has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-data-dir-root-owner =
+    Data directory {$path} belongs to root, so ZeroClaw cannot create its config lock directory there. If an earlier run with sudo created it, give it back and retry:
+    {$command}
+    If it belongs to root on purpose, run ZeroClaw as its owner or point data_dir elsewhere.
+cli-config-data-dir-running-as-root = Data directory {$path} belongs to {$owner}, but ZeroClaw is running as root. Run ZeroClaw as {$owner}, without sudo.
+cli-config-data-dir-foreign-owner =
+    Data directory {$path} belongs to {$owner}, so ZeroClaw, running as {$user}, cannot create its config lock directory there. Run ZeroClaw as {$owner}, or point data_dir at a directory of your own. If the directory really is yours, check its contents first, because chown -R also hands over anything another user hard-linked into it, then take it over and retry:
+    {$command}
+    If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
 cli-standalone-daemon-owned = Cannot run `zeroclaw {$command}` while another ZeroClaw process owns the config state at {$path}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.
 
 # ── peripherals (zeroclaw peripheral) ──
@@ -563,6 +589,10 @@ cli-sop-logs-row = {$timestamp} {$severity} {$category}.{$action} {$message}
 cli-sop-logs-disabled = Log persistence is not enabled.
 cli-sop-logs-incomplete = Some retained log segments could not be read; this history may be incomplete.
 cli-sop-status-failure-reason = Failure reason: {$reason}
+cli-sop-run-copy-stale = Run {$run_id} changed in the store since this engine last read it (revision {$seen_revision} -> {$stored_revision}, now {$status} on step {$step}); this engine adopted the stored record and did not apply the transition
+cli-sop-run-copy-revision-unknown = unknown
+cli-sop-run-copy-changed = Run {$run_id} changed in the store since this engine last read it
+cli-sop-run-copy-reload-failed = Run {$run_id} changed in the store since this engine last read it, and reloading it failed: {$error}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}
@@ -668,6 +698,7 @@ cli-quickstart-row-risk-profile = {$glyph} Risk profile       — {$summary}
 cli-quickstart-row-memory = {$glyph} Memory             — {$summary}
 cli-quickstart-row-channels = {$glyph} Channels (0..N)    — {$summary}
 cli-quickstart-row-peer-groups = {$glyph} Peer groups        — {$summary}
+cli-quickstart-row-plugins = {$glyph} Plugins            — {$summary}
 cli-quickstart-row-agent-identity = {$glyph} Agent identity     — {$summary}
 cli-quickstart-summary-not-yet-chosen = not yet chosen
 cli-quickstart-summary-not-yet-visited = not yet visited
@@ -698,6 +729,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}Finish later with: claude setup-
 cli-quickstart-auth-failed = {"  "}Auth setup didn't complete: {$error}
 cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` field for `{$provider}` — falling back to manual entry. Please report this.
 cli-quickstart-model-id-for = Model id for {$name}
+cli-quickstart-model-type-id = Type a model ID…
 cli-quickstart-risk-profile-prompt = Risk profile
 cli-quickstart-memory-backend-prompt = Memory backend
 cli-quickstart-add-channel = + Add a channel
@@ -768,6 +800,104 @@ cli-quickstart-error-personality-stage-failed = stage {$filename} failed: {$err}
 cli-quickstart-error-personality-write-failed = write {$path} failed: {$err}
 cli-quickstart-error-agent-name-required = agent name is required
 cli-quickstart-error-agent-exists = agent `{$name}` already exists
+cli-quickstart-plugins-summary-none = none
+cli-quickstart-plugins-summary-installed = {$name} (installed)
+cli-quickstart-plugins-registry-unavailable = The plugin registry index could not be fetched: {$error}
+cli-quickstart-plugins-registry-unpopulated = The public plugin registry is not populated yet. To use another registry, set the ZEROCLAW_PLUGIN_REGISTRY_URL environment variable to its index URL and run Quickstart again.
+cli-quickstart-plugins-registry-prompt = Plugin registry unavailable
+cli-quickstart-plugins-registry-retry = Retry
+cli-quickstart-plugins-registry-continue = Continue without plugins
+cli-quickstart-plugins-row-failed = The plugin list could not be opened: {$error}
+cli-quickstart-plugins-section-unreadable = The [plugins] section of {$path} could not be read, so Quickstart cannot install plugins. Repair that section, then run Quickstart again to install them.
+cli-quickstart-plugins-none-available = The registry offers no tool plugins right now.
+cli-quickstart-plugins-select-prompt = Tool plugins to install (Space toggles, Enter confirms, Esc goes back)
+cli-quickstart-plugins-choice-available = {$name} {$version}: {$description}
+cli-quickstart-plugins-choice-installed = {$name} {$version} (installed): {$description}
+cli-quickstart-plugins-choice-installed-other = {$name} {$version} (installed; the registry has {$registry_version}): {$description}
+cli-quickstart-plugins-installing = Installing the selected plugins before creating the agent.
+cli-quickstart-plugins-resolving = Resolving {$name} {$version} from the plugin registry...
+cli-quickstart-plugins-not-available = {$name} is no longer installed and is not in the registry, so nothing was installed for it.
+cli-quickstart-plugins-no-integrity-hash = Refused {$name}: its registry entry has no sha256 digest, so the download cannot be verified. Nothing was installed.
+cli-quickstart-plugins-not-a-tool = Skipped {$name}: its manifest provides no tool, and Quickstart installs tool plugins only. Nothing was installed.
+cli-quickstart-plugins-failed = {$name} was not installed: {$error}
+cli-quickstart-plugins-legacy-row-refused = {$name} was not installed: its config entry would go beside the [[plugins.entries]] row named '{$legacy}', which is in the pre-1.0 key format from before typed config. Rename that row to '{$key}' in your config file, save, then run Quickstart again.
+cli-quickstart-plugins-load-check-failed = {$name} was not installed: it does not load against this host: {$error}. To install it anyway, knowing it is skipped at startup, run: {$command}. That command asks no signature or network access question, and seeds a config entry it creates with the HTTP destinations the manifest declares.
+cli-quickstart-plugins-rollback-failed = {$name} could not be configured: {$error}. Undoing its install failed too ({$rollback_error}), so it is still installed. Remove it with: {$command}
+cli-quickstart-plugins-about-name = Plugin {$name} {$version}
+cli-quickstart-plugins-about-author = Author: {$author}
+cli-quickstart-plugins-about-author-claimed = Author (publisher's claim, not verified): {$author}
+cli-quickstart-plugins-about-signature-verified = Signature: verified, signed with the trusted publisher key {$key}
+cli-quickstart-plugins-about-signature-unsigned = Signature: none, so nothing verifies who published this plugin.
+cli-quickstart-plugins-about-signature-untrusted = Signature: present, but its publisher key is not in plugins.security.trusted_publisher_keys, so who published this plugin is not verified.
+cli-quickstart-plugins-about-signature-invalid = Signature: invalid. The manifest does not verify against the signature it carries, so it may have been changed after it was signed.
+cli-quickstart-plugins-about-description = Description: {$description}
+cli-quickstart-plugins-about-capabilities = Capabilities: {$list}
+cli-quickstart-plugins-about-permissions = Permissions: {$list}
+cli-quickstart-plugins-about-destinations = Declared network destinations: {$list}
+cli-quickstart-plugins-about-none = none
+cli-quickstart-plugins-unverified-prompt = Install {$name} although nothing verifies who published it?
+cli-quickstart-plugins-existing-row = {$name} already has a config entry. Quickstart keeps its network grant and its settings as they are.
+cli-quickstart-plugins-egress-prompt = Network access for {$name}
+cli-quickstart-plugins-egress-grant = Grant the declared destinations
+cli-quickstart-plugins-egress-withhold = Install without network access
+cli-quickstart-plugins-egress-skip = Skip this plugin
+cli-quickstart-plugins-skipped = Skipped {$name}. Nothing was installed for it.
+cli-quickstart-plugins-config-heading = Settings for {$name}:
+cli-quickstart-plugins-config-unsupported = {$name} has settings Quickstart cannot prompt for: {$keys}. Set them later with `zeroclaw config set`.
+cli-quickstart-plugins-config-required-unsupported = {$name} requires settings Quickstart cannot prompt for: {$keys}. No answers here could complete its settings, so Quickstart asks for none of them.
+cli-quickstart-plugins-config-optional-prompt = Configure the optional settings for {$name}?
+cli-quickstart-plugins-config-invalid = These settings do not satisfy the schema of {$name}: {$error}
+cli-quickstart-plugins-config-defaults-prompt = Install {$name} without these settings? You can set them later with `zeroclaw config set`.
+cli-quickstart-plugins-config-undeclared-prompt = The settings schema of {$name} requires settings it does not declare: {$keys}. No config entry can satisfy it, so the plugin's tool would not be usable. Install it anyway?
+cli-quickstart-plugins-config-cancelled = Configuration of {$name} was cancelled.
+cli-quickstart-plugins-config-saved = Saved settings for {$name}: {$keys}
+cli-quickstart-plugins-config-save-failed = {$name} is installed, but its settings ({$keys}) could not be saved: {$error}. Set each one with:
+cli-quickstart-plugins-field-json-array = Enter a JSON array.
+cli-quickstart-plugins-field-json-object = Enter a JSON object.
+cli-quickstart-plugins-installed = Installed {$name} {$version}.
+cli-quickstart-plugins-already-installed = {$name} is already installed. Quickstart leaves the installed version as it is.
+cli-quickstart-plugins-kept-not-configured = {$name} stays installed, but Quickstart could not finish setting it up: {$error}
+cli-quickstart-plugins-missing-row = {$name} has no config entry, so Quickstart creates one. Choose what network access it grants.
+cli-quickstart-plugins-row-skipped = {$name} stays installed without a config entry, so it reaches no network destination. To create the entry later, without network access, run: {$command}
+cli-quickstart-plugins-grant-declared-later = To let {$name} reach its {$count} declared destination(s), also run this after creating the entry: {$command}
+cli-quickstart-plugins-no-declared-hosts = {$name} requests network access but declares no destinations, so its config entry grants none. To grant the hosts your deployment uses, append them to this command as one comma-separated value: {$command}
+cli-quickstart-plugins-activation-heading = Activating plugins turns on {$settings}, which activates:
+cli-quickstart-plugins-activation-tool = tool plugin {$name}
+cli-quickstart-plugins-activation-skill = skill plugin {$name}
+cli-quickstart-plugins-activation-channel = channel plugin.{$alias} (package {$name})
+cli-quickstart-plugins-activation-others = This also activates plugins or channel instances that this run did not install or finish setting up.
+cli-quickstart-plugins-activation-unverified = The plugins directory could not be read ({$error}), so this list may leave out plugins that would also activate.
+cli-quickstart-plugins-activation-prompt = Activate plugins now?
+cli-quickstart-plugins-activation-declined = The plugins stay installed but inactive. Activate them later with:
+cli-quickstart-plugins-activation-enabled = Plugin activation is on.
+cli-quickstart-plugins-activation-save-failed = Plugin activation could not be saved: {$error}. Activate plugins later with:
+cli-quickstart-plugins-readiness-heading = Plugin status:
+cli-quickstart-plugins-ready = {$name}: admitted as a tool (config entry {$key}). The tool registry registers it when it is next built, unless its name clashes with a tool already registered or its tool description cannot be read.
+cli-quickstart-plugins-ready-plugins-disabled = {$name}: inactive, because plugins.enabled is off.
+cli-quickstart-plugins-ready-auto-discover-disabled = {$name}: inactive, because plugins.auto_discover is off.
+cli-quickstart-plugins-ready-not-installed = {$name}: not installed.
+cli-quickstart-plugins-ready-not-a-tool = {$name}: installed, but it provides no tool.
+cli-quickstart-plugins-ready-does-not-load = {$name}: installed, but it does not load against this host, so ZeroClaw skips it at startup. See why with: {$command}
+cli-quickstart-plugins-ready-ceiling = {$name}: inactive, because the plugins.max_active_instances limit ({$max}) is reached.
+cli-quickstart-plugins-ready-unknown = {$name}: status unavailable: {$error}
+cli-quickstart-plugins-ready-rejected = {$name}: installed, but not usable, because its config entry does not satisfy the plugin's settings schema: {$error}
+cli-quickstart-plugins-ready-missing-settings = {$name}: these required settings are not set: {$keys}. Set each one with:
+cli-quickstart-plugins-ready-missing-nonportable = {$name}: these required settings are not set: {$keys}. Quickstart prints commands only for setting names of up to 128 ASCII letters, digits, `.`, `-` and `_`, which are safe to show and to paste into a shell. Set these in the config file, or with a `zeroclaw config set` command you quote yourself.
+cli-quickstart-plugins-ready-undeclared-required = {$name}: its settings schema requires settings it does not declare, so no config entry can satisfy it until the plugin's publisher fixes the schema: {$keys}.
+cli-quickstart-plugins-ready-no-row = {$name}: installed, but it has no config entry yet, so it has no settings and no network grant. Create the entry with: {$command}
+cli-quickstart-plugins-ready-legacy-row = {$name}: installed, but its config entry is still the [[plugins.entries]] row named '{$legacy}', in the pre-1.0 key format from before typed config, which the runtime does not read, so the plugin has no settings and no network grant. Rename that row to '{$key}' in your config file, then save.
+cli-quickstart-plugins-ready-legacy-row-listed = {$name}: installed, but its config entry is still the [[plugins.entries]] row named '{$legacy}', in the pre-1.0 key format from before typed config, which the runtime does not read, so the plugin has no settings and no network grant. Rename that row to '{$key}' in your config file, then save. To see the update steps, including any network grant the renamed row still needs, run: {$command}
+cli-quickstart-plugins-ready-no-entry-needed = {$name}: admitted as a tool. It has nothing to configure, so it needs no config entry. The tool registry registers it when it is next built, unless its name clashes with a tool already registered or its tool description cannot be read.
+cli-quickstart-plugins-readiness-unavailable = Plugin status is unavailable: {$error}
+cli-quickstart-plugins-restart-note = A daemon that is already running keeps the configuration it loaded: the config entries, settings, network grants and plugin activation changes this run wrote reach it only after it restarts or reloads its configuration. If plugin activation was already on in that configuration, it can load a newly installed plugin sooner, the next time it builds its tool registry (for example for a new session), with the config entry it had loaded for that plugin, never one this run wrote: without one, the plugin has no settings and no network grant, and an older entry, such as one kept from an earlier install, applies with its settings and network grant. If it runs as the installed service, restart it with: {$command}. `zeroclaw agent` and other one-shot commands pick them up the next time they start.
+cli-quickstart-plugins-stopped = Quickstart stopped before creating the agent. Plugins installed or configured in this run stay in place: {$names}.
+cli-quickstart-plugins-stopped-none = Quickstart stopped before creating the agent. No plugin was installed or configured.
+cli-quickstart-plugins-apply-failed-state = Plugins installed or configured before the agent step stay in place: {$names}. Re-running Quickstart will not reinstall them.
+cli-quickstart-plugins-apply-failed-state-activated = Plugins installed or configured before the agent step stay in place: {$names}, and plugin activation stays on. Re-running Quickstart will not reinstall them.
+cli-quickstart-plugins-apply-failed-activated = Plugin activation turned on before the agent step stays on.
+cli-quickstart-plugins-agent-not-created = Your agent was not created.
+cli-quickstart-plugins-remove-heading = To remove a plugin this run installed, run:
+cli-quickstart-plugins-fix-and-rerun = Fix the following and run quickstart again:
 cli-no-channels-compiled = {"  "}No channel types are compiled into this binary.
 cli-quickstart-complete = Quickstart complete. Created agent `{$alias}`.
 cli-next-steps = Next steps:
@@ -808,6 +938,11 @@ cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
 cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
+cli-security-status-sandbox-description-firejail-args-rejected = Firejail selected, but firejail_args were rejected; commands are blocked ({$reason})
+cli-security-firejail-args-error-empty = firejail_args rejected: an entry is empty
+cli-security-firejail-args-error-whitespace = firejail_args rejected: {$arg} has leading or trailing whitespace
+cli-security-firejail-args-error-not-option = firejail_args rejected: {$arg} is not a Firejail option; write each option as one `--option` or `--option=value` entry
+cli-security-firejail-args-error-conflict = firejail_args rejected: {$name} conflicts with the options ZeroClaw's Firejail wrapper sets
 cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
 cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
 cli-security-status-credentials-classes-none = none
@@ -892,6 +1027,7 @@ cli-config-all-configured = All sections already configured.
 cli-config-initialized-sections = Initialized {$count} section(s) with defaults:
 cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
+cli-config-patch-notice-flush-failed = Config patch was saved, but its notice could not be flushed
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
 cli-plugin-catalog-heading = Plugins:
@@ -915,6 +1051,7 @@ cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry
 cli-plugin-egress-seeded = Granted egress for '{$name}' from its manifest declaration ({$count} destination(s)):
 cli-plugin-egress-destination = → {$host}
 cli-plugin-egress-edit-command = Edit this grant later with: {$command}
+cli-plugin-egress-withheld = Network access for '{$name}' was withheld: its config entry grants no destinations. Grant the {$count} declared destination(s) later with: {$command}
 cli-plugin-egress-declared-not-granted = Plugin '{$name}' declares {$count} destination(s) its existing config entry does not grant:
 cli-plugin-egress-added = + {$host}
 cli-plugin-egress-apply-command = Grant them deliberately with: {$command}
@@ -933,6 +1070,14 @@ cli-plugin-egress-repair-incomplete = {$name}: after the printed command the run
 cli-plugin-egress-deployment-rejected = The runtime rejects every plugin egress policy in this deployment ({$reason}), so no plugin's grant can take effect until it is fixed. Check `security.nat64_prefixes` and `plugins.limits.max_connections_per_instance`.
 cli-plugin-install-verify-failed = install failed: '{$name}' does not load against this host: {$error} — rebuild the plugin against this host's WIT (see wit/v0), or override with --no-verify to install anyway.
 cli-plugin-install-verify-bypassed = note: skipping the install-time load check for '{$name}' (--no-verify); if it does not load against this host it will be skipped at startup
+cli-plugin-install-unadmitted-package = install failed: '{$name}' already exists in the plugins directory but is not an installed package, and install never overwrites it. If an interrupted install left it behind, delete it with `zeroclaw plugin remove {$name}`, then install again.
+cli-plugin-remove-unadmitted-package = `zeroclaw plugin remove` left '{$name}' in place: {$reason}. It deletes a directory the host has not loaded only when the directory is empty, or when it holds only what an install writes and admission rejects its own contents rather than its signature; delete '{$name}' by hand if it should go.
+cli-plugin-install-retained = Install could not publish the package and kept the staged copy at {$path}: {$reason}. Resolve the occupied name or filesystem error, then run the install again.
+cli-plugin-install-move-unsupported = Install needs a rename that refuses an existing destination, and this platform or filesystem has none ({$reason}). Nothing was installed and no staged copy was kept. This build refuses that move on FreeBSD and other Unix systems besides Linux, Android and macOS. Linux before 3.15 and NFS mounts without no-replace support also lack the operation; choose a plugins directory on a filesystem that supports atomic no-replace moves.
+cli-plugin-install-move-unsupported-cleanup = Install cannot safely publish on this platform or filesystem ({$reason}). Nothing was installed. Cleanup of its unpublished transaction could not be confirmed at {$path}. Repair safe no-replace move support and resolve this cleanup failure before attempting another install.
+cli-plugin-recovery-retained = Recovery retained files at {$path}: {$reason}. Resolve the occupied destination or filesystem error, then retry plugin remove.
+cli-plugin-staging-retained = Retained staging at {$path} because its ownership could not be proved abandoned. The recovered package can be installed again using fresh staging.
+cli-plugin-namespace-changed = Plugin operation refused because filesystem ownership changed: {$reason}. Inspect the plugins directory before retrying.
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-config-section-degraded-executable = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Use the running executable at `{$executable}` with `config migrate` to see the parse error, then repair the file.
 cli-plugin-list-entry-loads = {$name} v{$version} — {$description} [loads]
@@ -985,6 +1130,37 @@ cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
 cli-plugin-migrated = Moved {$count} plugin(s) from {$path} to {$target}.
 cli-plugin-migrate-none = Nothing to migrate.
+cli-plugin-install-already-installed = install failed: '{$name}' is already installed, and install never replaces a package. Update it with: {$command}
+cli-plugin-list-displaced = Note: an interrupted update left '{$name}' displaced, so it is not loaded. Run `{$command}` to put it back and update it from the registry, or `{$local}` to put it back and update it from a package directory instead.
+cli-plugin-update-about = Replace installed plugins with another version from the registry, or with a local package directory
+cli-plugin-update-usage-from = --from takes exactly one plugin name, without a version: the package directory decides the version.
+cli-plugin-update-usage-allow = --allow and --allow-token apply to exactly one plugin: name that plugin alone, pinned to the version you approve.
+cli-plugin-update-usage-allow-item = '{$item}' is not an --allow or --allow-token item: use permission:<name>, capability:<name>, provides:<id>, or publisher:<key>.
+cli-plugin-update-checking = Checking the plugin registry for updates...
+cli-plugin-update-restored = Restored '{$name}' {$version}, which an interrupted update had left displaced.
+cli-plugin-update-updated = Updated '{$name}' from {$from} to {$to}.
+cli-plugin-update-downgraded = Replaced '{$name}' {$from} with {$to}, an older version than the one installed.
+cli-plugin-update-reinstalled = Reinstalled '{$name}' {$version}.
+cli-plugin-update-up-to-date = '{$name}' is up to date ({$version}).
+cli-plugin-update-not-listed = Skipped '{$name}': the registry does not list it.
+cli-plugin-update-needs-approval = '{$name}' {$version} requests authority the installed version does not have:
+cli-plugin-update-approval-item = + {$item}
+cli-plugin-update-approval-command = Nothing was changed. To accept it and update, run: {$command}
+cli-plugin-update-not-installed = Could not update '{$name}': it is not installed. Install it with: {$command}
+cli-plugin-update-failed = Could not update '{$name}': {$error}
+cli-plugin-update-failed-kept = Could not update '{$name}': {$error}. Version {$version} is still installed.
+cli-plugin-update-legacy-row = Could not update '{$name}': its config row still uses the pre-1.0 key format. Version {$version} is still installed.
+cli-plugin-update-interrupted = Could not update '{$name}': {$error}. Its previous version was not moved back and is preserved at {$preserved}. Run `{$command}` to put it back and try the update again, unless a package named '{$name}' is installed by then.
+cli-plugin-update-not-in-registry = the registry does not list '{$spec}'
+cli-plugin-update-does-not-load = it does not load against this host: {$error}
+cli-plugin-update-displaced-ambiguous = an interrupted update left several copies of '{$name}' ({$paths}), and which one was installed last is not known. Rename the one to keep to '{$name}' in the plugins directory, then run this command again
+cli-plugin-update-displaced-occupied = an interrupted update left it at {$displaced}, but {$occupant} is in the way. Move that aside, then run this command again
+cli-plugin-update-config-rejected = warning: '{$name}' {$version} rejects the configuration of its instance {$key} ({$error}). That instance will not load until its configuration fits the new version.
+cli-plugin-update-leftover = warning: the replaced version of '{$name}' could not be deleted from {$path} ({$error}). It is not loaded; delete it by hand, or the next update of '{$name}' tries to delete it again.
+cli-plugin-update-restored-not-admitted = the copy an interrupted update left was put back at {$path}, but this host does not admit it; run `zeroclaw plugin list --verbose` to see why
+cli-plugin-update-summary = Updated: {$updated}. Up to date: {$current}. Skipped: {$skipped}. Not updated: {$failed}.
+cli-plugin-update-restart = Restart the daemon so plugin instances it has already started use the new version.
+cli-plugin-update-failed-exit = {$count} plugin(s) not updated.
 cli-estop-resume-done = Estop resume completed.
 cli-estop-engaged = Estop engaged.
 cli-estop-status = Estop status:
@@ -1004,6 +1180,8 @@ cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
 cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
 model-switch-catalog-failed = Could not load catalog for configured provider profile {$provider}: {$error}
+model-switch-provider-not-allowed = Model switch to {$provider} is not allowed by the active effort-routing policy.
+model-switch-route-selector-not-allowed = Model ID cannot be a route selector; provide a provider-local model ID.
 cli-config-backed-up = Backed up to {$path}
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}
@@ -1017,6 +1195,9 @@ cli-plugin-info-load-failed =
     Rebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it.
 cli-plugin-info-load-not-applicable = Loads: not applicable. This is a skill-only plugin, so there is no component to instantiate.
 cli-plugin-info-load-failed-exit = plugin '{$name}' does not load against this host
+cli-plugin-info-load-config-refused =
+    Loads: no. The component instantiates against this host's WIT world, but the runtime refuses its configuration: {$error}
+    The configuration is the `config` map of the [[plugins.entries]] row named '{$key}'. Make it match the installed package's config_schema, or remove its values if the package declares none.
 cli-estop-domains-none = {"  "}domain_blocks:  (none)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (none)
@@ -1091,6 +1272,9 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-single-tool-rounds-prompt = Use at most one tool call in each response. Wait for its result before choosing another tool call.
+turn-single-tool-rounds-unsupported = [Single-tool rounds are unavailable on the current provider route. Continuing with batch tool calls.]
+turn-single-tool-rounds-violation = The provider returned multiple tool calls under single-tool policy. No tools from this response were executed.
 turn-provider-images-quarantined =
     { $count_plural ->
         [one] 1 image that had not previously succeeded with this provider was omitted after the provider rejected the request.
@@ -1187,6 +1371,7 @@ channel-runtime-set-provider-switched =
 channel-runtime-set-provider-init-failed =
     Failed to initialize model_provider `{ $provider }`. Route unchanged.
     Details: { $error }
+channel-runtime-effort-routing-invalid = ⚠️ Effort routing configuration is invalid. Check the configured local and cloud route hints.
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` has multiple configured aliases. Qualify which one with `/models { $family }.<alias>`: { $list }
 channel-runtime-provider-no-alias = No configured provider entry for `{ $provider }`. Add `[providers.models.{ $provider }]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones.
 channel-runtime-provider-unknown = Unknown model_provider `{ $provider }`. Use `/models` to list valid model_providers.
@@ -1428,6 +1613,7 @@ cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
 # always) stay hardcoded ASCII in Rust — only the surrounding prose is
 # localized here.
 channel-approval-heading = Tool approval required
+channel-approval-independent-delegate = Independent delegate {$target} from {$caller}
 channel-approval-heading-shout = APPROVAL REQUIRED
 channel-approval-tool-label = Tool
 channel-approval-args-label = Args

@@ -12,6 +12,16 @@ pub enum AgentStatus {
     Error,
 }
 
+/// Status the splash listens for (`zeroclaw://splash-status`). Drives the
+/// splash copy when the app starts its own daemon or hits a problem; the happy
+/// path is covered by the splash's own health polling.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SplashStatus {
+    /// `starting` | `error` | `missing`.
+    pub kind: &'static str,
+    pub message: String,
+}
+
 /// Shared application state behind an `Arc<RwLock<_>>`.
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -19,6 +29,9 @@ pub struct AppState {
     pub token: Option<String>,
     pub connected: bool,
     pub agent_status: AgentStatus,
+    /// The failure reported while finding or starting a daemon. It is kept
+    /// here because a splash opened after the status event never saw it.
+    pub startup_failure: Option<SplashStatus>,
 }
 
 impl Default for AppState {
@@ -28,6 +41,7 @@ impl Default for AppState {
             token: None,
             connected: false,
             agent_status: AgentStatus::Idle,
+            startup_failure: None,
         }
     }
 }
@@ -51,6 +65,22 @@ mod tests {
         assert!(state.token.is_none());
         assert!(!state.connected);
         assert_eq!(state.agent_status, AgentStatus::Idle);
+        assert!(state.startup_failure.is_none());
+    }
+
+    #[test]
+    fn splash_status_serializes_the_fields_the_splash_reads() {
+        let status = SplashStatus {
+            kind: "missing",
+            message: "Couldn't find the `zeroclaw` binary.".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            serde_json::json!({
+                "kind": "missing",
+                "message": "Couldn't find the `zeroclaw` binary.",
+            })
+        );
     }
 
     #[test]

@@ -778,6 +778,9 @@ rpc_type! {
     pub struct ConfigSetResult {
         pub prop: String,
         pub set: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -837,6 +840,9 @@ rpc_type! {
     pub struct ConfigDeleteResult {
         pub prop: String,
         pub deleted: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -878,6 +884,9 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub created: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -893,6 +902,9 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub deleted: bool,
+        /// Exact publication committed by this request, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub revision: Option<crate::config_application::PublishedConfigRevision>,
     }
 }
 
@@ -968,6 +980,10 @@ rpc_type! {
     pub struct AgentStatusEntry {
         pub alias: String,
         pub enabled: bool,
+        /// Current configured profile, not a running session's retained generation.
+        /// Absent when no configured runtime profile resolves for this agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub runtime_profile: Option<String>,
         #[serde(default)]
         pub live_sessions: usize,
         #[serde(default)]
@@ -1356,6 +1372,8 @@ rpc_type! {
 rpc_type! {
     /// Config readiness status for the dashboard/TUI.
     pub struct ConfigStatusResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub application: Option<crate::config_application::ConfigApplicationStatus>,
         pub needs_quickstart: bool,
         pub reason: String,
         pub has_partial_state: bool,
@@ -1742,10 +1760,18 @@ pub enum SessionUpdateEvent {
     /// full context window (provider `context_window`), exposed distinctly so a
     /// client can render capacity and budget separately. Any may be absent when
     /// the provider doesn't report usage or the value can't be resolved.
+    ///
+    /// `input_tokens_source` states where `input_tokens` came from. It is
+    /// `provider` for a provider-reported count and `estimate` when the
+    /// provider omitted usage and the runtime substituted a local estimate so
+    /// the meter still has a numerator. Clients should render an estimated
+    /// value as approximate. It is absent when `input_tokens` is absent.
     ContextUsage {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens_source: Option<zeroclaw_api::agent::TokenCountSource>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1784,6 +1810,15 @@ pub enum SessionUpdateEvent {
         /// turn never reached a model call (refusals, missing sessions).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Box<TurnUsageTotals>>,
+    },
+    /// Recorded spend reached `cost.warn_at_percent` of a shared daily or
+    /// monthly limit. Non-blocking and at most once per turn; the turn
+    /// continues. `period` is `"day"` or `"month"`.
+    BudgetWarning {
+        session_id: String,
+        current_usd: f64,
+        limit_usd: f64,
+        period: zeroclaw_api::agent::BudgetWarningPeriod,
     },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context

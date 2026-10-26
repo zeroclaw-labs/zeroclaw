@@ -246,6 +246,61 @@ use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::ChatRequest;
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ToolCall};
 
+#[derive(Debug, Clone)]
+struct EffortTurnRoute {
+    model_provider: String,
+    model: String,
+    allowed_provider_refs: Arc<HashSet<String>>,
+}
+
+fn effort_turn_route(
+    config: &Config,
+    policy: Option<&zeroclaw_config::scattered_types::EffortRoutingConfig>,
+    message: &str,
+) -> Result<Option<EffortTurnRoute>> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let selection = crate::agent::eval::resolve_effort_route(policy, &config.model_routes, message)
+        .ok_or_else(|| {
+            anyhow::Error::msg(
+                "effort routing is enabled but its local/cloud hints are missing or ambiguous",
+            )
+        })?;
+    crate::agent::eval::log_effort_route_selection(&selection, message.len(), "direct");
+    Ok(Some(EffortTurnRoute {
+        model_provider: selection.route.model_provider.clone(),
+        model: selection.route.model.clone(),
+        allowed_provider_refs: Arc::new(selection.allowed_provider_refs),
+    }))
+}
+
+fn effort_scoped_provider_config(
+    config: &Config,
+    allowed_provider_refs: &HashSet<String>,
+) -> Box<Config> {
+    let mut scoped = Box::new(config.clone());
+    for (_, _, profile) in scoped.providers.models.iter_entries_mut() {
+        profile
+            .fallback
+            .retain(|candidate| allowed_provider_refs.contains(candidate.trim()));
+    }
+    let excluded_profiles: Vec<(String, String)> = scoped
+        .providers
+        .models
+        .iter_entries()
+        .filter(|(family, alias, _)| !allowed_provider_refs.contains(&format!("{family}.{alias}")))
+        .map(|(family, alias, _)| (family.to_string(), alias.to_string()))
+        .collect();
+    for (family, alias) in excluded_profiles {
+        scoped.providers.models.remove_alias(&family, &alias);
+    }
+    scoped
+        .model_routes
+        .retain(|route| allowed_provider_refs.contains(&route.model_provider));
+    scoped
+}
+
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
     TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
@@ -808,14 +863,43 @@ pub(crate) fn build_system_prompt_for_turn(
         activated_tools,
     )?;
     let excluded_tool_names: HashSet<&str> = excluded_tools.iter().map(String::as_str).collect();
+    let builtin_discovery = activated_tools.filter(|_| {
+        !excluded_tool_names.contains("tool_search")
+            && tools_registry
+                .iter()
+                .any(|tool| tool.name() == "tool_search")
+    });
+    let hidden_builtin_names = builtin_discovery.map_or_else(HashSet::new, |state| {
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hidden_builtin_names()
+    });
     let effective_tool_names: HashSet<&str> = tools_registry
         .iter()
         .map(|tool| tool.name())
         .filter(|name| !excluded_tool_names.contains(*name))
         .collect();
+    let prompt_tool_names: HashSet<&str> = effective_tool_names
+        .iter()
+        .copied()
+        .filter(|name| !hidden_builtin_names.contains(*name))
+        .collect();
     let mut turn_tool_descs = tool_descs.to_vec();
-    turn_tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+    turn_tool_descs.retain(|(name, _)| prompt_tool_names.contains(name));
     let mut turn_deferred_section = deferred_section.to_string();
+    if let Some(state) = builtin_discovery {
+        let section = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deferred_builtin_prompt_section_filtered(|name| effective_tool_names.contains(name));
+        if !section.is_empty() {
+            if !turn_deferred_section.is_empty() {
+                turn_deferred_section.push_str("\n\n");
+            }
+            turn_deferred_section.push_str(&section);
+        }
+    }
     let expose_text_tool_protocol = apply_text_tool_prompt_policy(
         native_tools,
         strict_tool_parsing,
@@ -828,7 +912,7 @@ pub(crate) fn build_system_prompt_for_turn(
             agent_workspace,
             model_name,
             &turn_tool_descs,
-            |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
+            |name| skill_tools_protocol_exposed && prompt_tool_names.contains(name),
             skills,
             identity_config,
             bootstrap_max_chars,
@@ -845,7 +929,7 @@ pub(crate) fn build_system_prompt_for_turn(
     if expose_text_tool_protocol {
         system_prompt.push_str(&build_tool_instructions_for_names(
             tools_registry,
-            &effective_tool_names,
+            &prompt_tool_names,
         ));
     }
     if !turn_deferred_section.is_empty() {
@@ -1021,6 +1105,7 @@ pub async fn agent_turn(
         max_tool_iterations,
         approval,
         security,
+        None,
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
@@ -1061,6 +1146,7 @@ async fn agent_turn_with_sop_reassembly(
     max_tool_iterations: usize,
     approval: Option<&ApprovalManager>,
     security: Option<&SecurityPolicy>,
+    provider_attempt_allowlist: Option<Arc<HashSet<String>>>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
@@ -1164,7 +1250,10 @@ async fn agent_turn_with_sop_reassembly(
                 max_tool_result_chars,
                 context_limits,
                 context_limits_resolver: None,
-                knobs: &LoopKnobs::default(),
+                knobs: &LoopKnobs {
+                    provider_attempt_allowlist,
+                    ..LoopKnobs::default()
+                },
             },
         ),
         history,
@@ -1717,6 +1806,7 @@ pub async fn run(
 
         // ── Resolve model_provider ─────────────────────────────────────────
         let agent_provider_ref = agent_provider_composite(&config, agent_alias);
+        let automatic_model_routing = provider_override.is_none() && model_override.is_none();
         let mut provider_name = provider_override
             .as_deref()
             .or(agent_provider_ref.as_deref())
@@ -1747,6 +1837,25 @@ pub async fn run(
              [providers.models.{provider_name}.<alias>].model is unset and --model was not passed"
             ),
         };
+        let mut effort_provider_config = None;
+        let mut active_effort_provider_refs: Option<Arc<HashSet<String>>> = None;
+        if automatic_model_routing && let Some(initial_message) = message.as_deref() {
+            let effective_message =
+                crate::agent::thinking::strip_thinking_directive(initial_message);
+            if let Some(selection) = effort_turn_route(
+                &config,
+                agent.resolved.effort_routing.as_ref(),
+                effective_message.as_ref(),
+            )? {
+                provider_name = selection.model_provider;
+                model_name = selection.model;
+                effort_provider_config = Some(effort_scoped_provider_config(
+                    &config,
+                    selection.allowed_provider_refs.as_ref(),
+                ));
+                active_effort_provider_refs = Some(selection.allowed_provider_refs);
+            }
+        }
         let mut context_limits =
             config.resolved_context_limits_for_route(agent_alias, &provider_name, &model_name);
 
@@ -1781,14 +1890,15 @@ pub async fn run(
         // (e.g. an xai key) to a different provider family that doesn't expect it.
         let (initial_api_key, initial_uri) =
             api_key_and_uri_for_provider(&config, &provider_name, agent_model_provider);
+        let provider_config = effort_provider_config.as_deref().unwrap_or(&config);
         let mut model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
+                provider_config,
                 &provider_name,
                 initial_api_key.as_deref(),
                 initial_uri.as_deref(),
                 &config.reliability,
-                &config.model_routes,
+                &provider_config.model_routes,
                 &model_name,
                 &provider_runtime_options,
             )?;
@@ -1903,7 +2013,7 @@ pub async fn run(
                 "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
             ));
         }
-        if config.composio.enabled {
+        if crate::tools::composio_tool_available(&config) {
             tool_descs.push((
             "composio",
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
@@ -2250,7 +2360,7 @@ pub async fn run(
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                             run_tool_call_loop(ToolLoop {
-                                                                exec: ResolvedAgentExecution::resolve(
+                                    exec: ResolvedAgentExecution::resolve(
                                     ResolvedModelAccess {
                                         model_provider: model_provider.as_ref(),
                                         provider_name: &provider_name,
@@ -2281,7 +2391,11 @@ pub async fn run(
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
                                         context_limits,
                                         context_limits_resolver: None,
-                                        knobs: &LoopKnobs::default(),
+                                        knobs: &LoopKnobs {
+                                            provider_attempt_allowlist:
+                                                active_effort_provider_refs.clone(),
+                                            ..LoopKnobs::default()
+                                        },
                                     },
                                 ),
                                 history: &mut history,
@@ -2353,14 +2467,19 @@ pub async fn run(
                                 &new_model_provider,
                                 agent_model_provider,
                             );
+                            let switch_provider_config = active_effort_provider_refs
+                                .as_deref()
+                                .map(|allowed| effort_scoped_provider_config(&config, allowed));
+                            let switch_provider_config =
+                                switch_provider_config.as_deref().unwrap_or(&config);
                             model_provider =
                                 zeroclaw_providers::create_routed_model_provider_with_options(
-                                    &config,
+                                    switch_provider_config,
                                     &new_model_provider,
                                     switch_api_key.as_deref(),
                                     switch_uri.as_deref(),
                                     &config.reliability,
-                                    &config.model_routes,
+                                    &switch_provider_config.model_routes,
                                     &new_model,
                                     &zeroclaw_providers::options_for_provider_ref(
                                         &config,
@@ -2521,6 +2640,9 @@ pub async fn run(
             let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
             let mut provider_image_state = crate::agent::turn::ProviderImageState::default();
 
+            // The shipped REPL reads stdin directly instead of going through
+            // `CliChannel::listen`, so it must own the terminal erase guard.
+            let _utf8_erase_guard = crate::cli_input::ensure_terminal_utf8_erase();
             loop {
                 print!("> ");
                 let _ = std::io::stdout().flush();
@@ -2647,6 +2769,57 @@ pub async fn run(
                         t + thinking_params.temperature_adjustment,
                     )
                 });
+
+                if automatic_model_routing
+                    && let Some(selection) = effort_turn_route(
+                        &config,
+                        agent.resolved.effort_routing.as_ref(),
+                        &effective_input,
+                    )?
+                {
+                    if provider_name != selection.model_provider
+                        || model_name != selection.model
+                        || active_effort_provider_refs.as_deref()
+                            != Some(selection.allowed_provider_refs.as_ref())
+                    {
+                        let (route_api_key, route_uri) = api_key_and_uri_for_provider(
+                            &config,
+                            &selection.model_provider,
+                            agent_model_provider,
+                        );
+                        let scoped_config = effort_scoped_provider_config(
+                            &config,
+                            selection.allowed_provider_refs.as_ref(),
+                        );
+                        model_provider =
+                            zeroclaw_providers::create_routed_model_provider_with_options(
+                                &scoped_config,
+                                &selection.model_provider,
+                                route_api_key.as_deref(),
+                                route_uri.as_deref(),
+                                &config.reliability,
+                                &scoped_config.model_routes,
+                                &selection.model,
+                                &zeroclaw_providers::options_for_provider_ref(
+                                    &config,
+                                    &selection.model_provider,
+                                    &zeroclaw_providers::provider_runtime_options_for_agent(
+                                        &config,
+                                        agent_alias,
+                                    ),
+                                ),
+                            )?;
+                        provider_name = selection.model_provider;
+                        model_name = selection.model;
+                        context_limits = config.resolved_context_limits_for_route(
+                            agent_alias,
+                            &provider_name,
+                            &model_name,
+                        );
+                        turn_guard.set_model_route(provider_name.clone(), model_name.clone());
+                    }
+                    active_effort_provider_refs = Some(selection.allowed_provider_refs);
+                }
 
                 // Compute per-turn excluded MCP tools from tool_filter_groups
                 // before the provider call; the system prompt is rebuilt from
@@ -2892,7 +3065,11 @@ pub async fn run(
                                                 .max_tool_result_chars,
                                             context_limits,
                                             context_limits_resolver: None,
-                                            knobs: &LoopKnobs::default(),
+                                            knobs: &LoopKnobs {
+                                                provider_attempt_allowlist:
+                                                    active_effort_provider_refs.clone(),
+                                                ..LoopKnobs::default()
+                                            },
                                         },
                                     ),
                                     history: &mut history,
@@ -2970,14 +3147,19 @@ pub async fn run(
                                     &new_model_provider,
                                     agent_model_provider,
                                 );
+                                let switch_provider_config = active_effort_provider_refs
+                                    .as_deref()
+                                    .map(|allowed| effort_scoped_provider_config(&config, allowed));
+                                let switch_provider_config =
+                                    switch_provider_config.as_deref().unwrap_or(&config);
                                 model_provider =
                                     zeroclaw_providers::create_routed_model_provider_with_options(
-                                        &config,
+                                        switch_provider_config,
                                         &new_model_provider,
                                         switch_api_key2.as_deref(),
                                         switch_uri2.as_deref(),
                                         &config.reliability,
-                                        &config.model_routes,
+                                        &switch_provider_config.model_routes,
                                         &new_model,
                                         &zeroclaw_providers::options_for_provider_ref(
                                             &config,
@@ -3660,7 +3842,7 @@ async fn process_message_inner(
             );
         }
 
-        let model_name = match agent_model_provider
+        let mut model_name = match agent_model_provider
             .as_ref()
             .and_then(|e| e.model.as_deref())
             .map(str::trim)
@@ -3672,22 +3854,47 @@ async fn process_message_inner(
              `model` set. Configure [providers.models.{provider_name}.<alias>] model = \"...\"."
             ),
         };
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        let agent_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
             &config,
             provider_name,
             provider_alias.as_str(),
         );
-        let model_provider_ref = format!("{provider_name}.{provider_alias}");
+        let mut model_provider_ref = format!("{provider_name}.{provider_alias}");
+        let mut effort_provider_config = None;
+        let mut effort_provider_refs: Option<Arc<HashSet<String>>> = None;
+        let effective_message = crate::agent::thinking::strip_thinking_directive(message);
+        if let Some(selection) = effort_turn_route(
+            &config,
+            agent.resolved.effort_routing.as_ref(),
+            effective_message.as_ref(),
+        )? {
+            model_provider_ref = selection.model_provider;
+            model_name = selection.model;
+            effort_provider_config = Some(effort_scoped_provider_config(
+                &config,
+                selection.allowed_provider_refs.as_ref(),
+            ));
+            effort_provider_refs = Some(selection.allowed_provider_refs);
+        }
+        let provider_runtime_options = zeroclaw_providers::options_for_provider_ref(
+            &config,
+            &model_provider_ref,
+            &agent_provider_runtime_options,
+        );
+        let (initial_api_key, initial_uri) = api_key_and_uri_for_provider(
+            &config,
+            &model_provider_ref,
+            agent_model_provider.as_ref(),
+        );
+        let provider_config = effort_provider_config.as_deref().unwrap_or(&config);
         let model_provider: Box<dyn ModelProvider> =
             zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
+                provider_config,
                 &model_provider_ref,
-                agent_model_provider
-                    .as_ref()
-                    .and_then(|e| e.api_key.as_deref()),
-                agent_model_provider.as_ref().and_then(|e| e.uri.as_deref()),
+                initial_api_key.as_deref(),
+                initial_uri.as_deref(),
                 &config.reliability,
-                &config.model_routes,
+                &provider_config.model_routes,
                 &model_name,
                 &provider_runtime_options,
             )?;
@@ -3741,7 +3948,7 @@ async fn process_message_inner(
         if config.browser.enabled {
             tool_descs.push(("browser_open", "Open approved URLs in browser."));
         }
-        if config.composio.enabled {
+        if crate::tools::composio_tool_available(&config) {
             tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
         }
         tool_descs.push((
@@ -3801,7 +4008,31 @@ async fn process_message_inner(
             .map(|tool| tool.name())
             .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
             .collect();
-        tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+        let builtin_discovery = activated_handle_pm
+            .as_ref()
+            .filter(|_| effective_tool_names.contains("tool_search"));
+        let hidden_builtin_names = builtin_discovery.map_or_else(HashSet::new, |state| {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .hidden_builtin_names()
+        });
+        let prompt_tool_names: HashSet<&str> = effective_tool_names
+            .iter()
+            .copied()
+            .filter(|name| !hidden_builtin_names.contains(*name))
+            .collect();
+        tool_descs.retain(|(name, _)| prompt_tool_names.contains(name));
+        if let Some(state) = builtin_discovery {
+            deferred_section.push_str(
+                &state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .deferred_builtin_prompt_section_filtered(|name| {
+                        effective_tool_names.contains(name)
+                    }),
+            );
+        }
 
         let bootstrap_max_chars = if eff_compact_context {
             Some(crate::agent::system_prompt::COMPACT_BOOTSTRAP_MAX_CHARS)
@@ -3831,7 +4062,7 @@ async fn process_message_inner(
                 &agent_workspace,
                 &model_name,
                 &tool_descs,
-                |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
+                |name| skill_tools_protocol_exposed && prompt_tool_names.contains(name),
                 &skills,
                 Some(&agent.identity),
                 bootstrap_max_chars,
@@ -3847,7 +4078,7 @@ async fn process_message_inner(
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
                 &tools_registry,
-                &effective_tool_names,
+                &prompt_tool_names,
             ));
         }
         if !deferred_section.is_empty() {
@@ -3998,6 +4229,7 @@ async fn process_message_inner(
                     // tools, so the no-vision image-marker gate reads the
                     // exact ledger the file tools enforce.
                     Some(&security),
+                    effort_provider_refs.clone(),
                     &excluded_tools,
                     &agent.resolved.tool_call_dedup_exempt,
                     activated_handle_pm.as_ref(),
@@ -4047,10 +4279,114 @@ async fn process_message_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, estimate_history_tokens, load_interactive_session_history,
-        make_query_summary, maybe_inject_channel_delivery_defaults,
-        save_interactive_session_history, seed_channel_handles, truncate_tool_result,
+        apply_text_tool_prompt_policy, effort_scoped_provider_config, effort_turn_route,
+        estimate_history_tokens, load_interactive_session_history, make_query_summary,
+        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
+        seed_channel_handles, truncate_tool_result,
     };
+
+    #[test]
+    fn effort_turn_route_limits_local_and_cloud_provider_attempts() {
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+        use zeroclaw_config::schema::{Config, ModelRouteConfig};
+
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "local")
+            .unwrap()
+            .fallback
+            .push(zeroclaw_config::providers::ModelProviderRef::new(
+                "custom.cloud",
+            ));
+        config.providers.models.ensure("custom", "cloud").unwrap();
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "custom.local".into(),
+                model: "small".into(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "custom.cloud".into(),
+                model: "large".into(),
+                api_key: None,
+            },
+        ];
+        let policy = EffortRoutingConfig {
+            local_hint: "local".into(),
+            cloud_hint: "cloud".into(),
+            cloud_escalation: CloudEscalationPolicy::Auto,
+        };
+
+        let local = effort_turn_route(&config, Some(&policy), "say hello")
+            .unwrap()
+            .unwrap();
+        assert_eq!(local.model_provider, "custom.local");
+        assert_eq!(local.model, "small");
+        assert_eq!(
+            local.allowed_provider_refs.as_ref(),
+            &std::collections::HashSet::from(["custom.local".to_string()])
+        );
+        let local_config =
+            effort_scoped_provider_config(&config, local.allowed_provider_refs.as_ref());
+        assert!(
+            local_config
+                .providers
+                .models
+                .find("custom", "local")
+                .unwrap()
+                .fallback
+                .is_empty(),
+            "a local turn must prune a configured cloud reliability fallback"
+        );
+        assert!(
+            local_config
+                .providers
+                .models
+                .find("custom", "cloud")
+                .is_none(),
+            "direct turns must remove excluded profiles so side routes such as vision cannot construct them"
+        );
+
+        let cloud = effort_turn_route(&config, Some(&policy), &"a".repeat(201))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cloud.model_provider, "custom.cloud");
+        assert_eq!(cloud.model, "large");
+        assert_eq!(
+            cloud.allowed_provider_refs.as_ref(),
+            &std::collections::HashSet::from([
+                "custom.local".to_string(),
+                "custom.cloud".to_string(),
+            ])
+        );
+
+        let mut malformed = config.clone();
+        malformed.model_routes.retain(|route| route.hint != "local");
+        assert!(
+            effort_turn_route(&malformed, Some(&policy), "say hello").is_err(),
+            "an opted-in policy with a missing hint must fail closed"
+        );
+
+        let mut duplicate_route = config;
+        let mut final_local_route = duplicate_route.model_routes[0].clone();
+        final_local_route.model_provider = "custom.final".into();
+        final_local_route.model = "final-small".into();
+        duplicate_route.model_routes.push(final_local_route);
+        let selected = effort_turn_route(&duplicate_route, Some(&policy), "say hello")
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.model_provider, "custom.final");
+        assert_eq!(selected.model, "final-small");
+        assert_eq!(
+            selected.allowed_provider_refs.as_ref(),
+            &std::collections::HashSet::from(["custom.final".to_string()]),
+            "the final exact-match route must define the provider boundary"
+        );
+    }
 
     /// One decision, four gates. The origin gate is the load-bearing one:
     /// the heartbeat session-context shape defeats the content filter (it no
@@ -7654,7 +7990,7 @@ mod tests {
         )
         .await;
         assert!(msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN));
-        assert!(msg.contains("- remembered: the server is prod-3"));
+        assert!(msg.contains("remembered: the server is prod-3"));
         assert!(msg.ends_with("what server?"));
         assert_eq!(recalls.len(), 1);
         assert!(recalls[0].1, "recall event must report success");
@@ -8417,9 +8753,59 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_enforces_sop_step_tool_scope() {
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        let model_provider = ScriptedModelProvider {
-            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+        struct ScopeCaptureProvider {
+            inner: ScriptedModelProvider,
+            requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        impl zeroclaw_api::attribution::Attributable for ScopeCaptureProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Attributable::role(&self.inner)
+            }
+            fn alias(&self) -> &str {
+                "sop-scope-capture"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for ScopeCaptureProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                self.inner.capabilities()
+            }
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                unreachable!("structured requests are used")
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(request.messages.to_vec());
+                self.inner.chat(request, model, temperature).await
+            }
+        }
+
+        for (native, allow_search, cap, configless) in [
+            (false, false, 0, false),
+            (true, false, 0, false),
+            (false, true, 0, false),
+            (true, true, 0, false),
+            (false, false, 900, false),
+            (false, false, 10_000, false),
+            (false, false, 900, true),
+        ] {
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let mut responses = vec![
                 ChatResponse {
                     text: None,
                     tool_calls: vec![ToolCall {
@@ -8454,142 +8840,293 @@ mod tests {
                     usage: None,
                     reasoning_content: None,
                 },
-            ]))),
-            capabilities: ProviderCapabilities {
-                native_tool_calling: true,
-                ..ProviderCapabilities::default()
-            },
-        };
-
-        let sop = crate::sop::Sop {
-            name: "scoped-sop".to_string(),
-            description: "scoped sop".to_string(),
-            version: "1".to_string(),
-            priority: crate::sop::SopPriority::Normal,
-            execution_mode: crate::sop::SopExecutionMode::Auto,
-            triggers: vec![crate::sop::SopTrigger::Manual],
-            steps: vec![crate::sop::SopStep {
-                number: 1,
-                title: "Scoped".to_string(),
-                body: "Use only allowed tools".to_string(),
-                scope: Some(crate::sop::StepToolScope {
-                    allow: Some(vec!["allowed_tool".to_string()]),
-                    deny: Vec::new(),
-                }),
-                ..crate::sop::SopStep::default()
-            }],
-            cooldown_secs: 0,
-            max_concurrent: 1,
-            location: None,
-            deterministic: false,
-            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
-            max_pending_approvals: 0,
-            agent: None,
-            decision: None,
-        };
-        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
-            step_scope_enforce: true,
-            ..zeroclaw_config::schema::SopConfig::default()
-        });
-        engine.replace_sops_for_test(vec![sop]);
-        let engine = Arc::new(Mutex::new(engine));
-
-        let allowed_invocations = Arc::new(AtomicUsize::new(0));
-        let denied_invocations = Arc::new(AtomicUsize::new(0));
-        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
-            Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
-            Box::new(CountingTool::new(
-                "allowed_tool",
-                Arc::clone(&allowed_invocations),
-            )),
-            Box::new(CountingTool::new(
-                "denied_tool",
-                Arc::clone(&denied_invocations),
-            )),
-        ]);
-
-        let mut history = vec![
-            ChatMessage::system("test-system"),
-            ChatMessage::user("start the scoped sop"),
-        ];
-        let observer = NoopObserver;
-
-        let result = run_tool_call_loop(ToolLoop {
-            parent_agent_alias: None,
-            served_route_sink: None,
-            sop_reassembly: None,
-            exec: ResolvedAgentExecution {
-                model_access: ResolvedModelAccess {
-                    model_provider: &model_provider,
-                    provider_name: "mock-provider",
-                    model: "mock-model",
-                    dispatch_model: "mock-model",
-                    temperature: Some(0.0),
+            ];
+            if !native {
+                for response in &mut responses {
+                    if !response.tool_calls.is_empty() {
+                        let call = &response.tool_calls[0];
+                        response.text = Some(format!(
+                            "<tool_call>{{\"name\":\"{}\",\"arguments\":{}}}</tool_call>",
+                            call.name, call.arguments
+                        ));
+                        response.tool_calls.clear();
+                    }
+                }
+            }
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let model_provider = ScopeCaptureProvider {
+                inner: ScriptedModelProvider {
+                    responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+                    capabilities: ProviderCapabilities {
+                        native_tool_calling: native,
+                        ..ProviderCapabilities::default()
+                    },
                 },
-                tools_registry: &tools_registry,
-                observer: &observer,
-                silent: true,
-                approval: None,
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
-                max_tool_iterations: 6,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
-                parallel_tools: false,
-                max_tool_result_chars: 0,
-                context_limits: test_context_limits(0),
-                context_limits_resolver: None,
-                receipt_generator: None,
-                knobs: &LoopKnobs::default(),
-                security: None,
-            },
-            history: &mut history,
-            // Test transcripts start fresh: no prior trim, no crumb.
-            history_has_trim_breadcrumb: &mut false,
-            injected_memory_preamble: &mut None,
-            channel_name: "agent",
-            channel_reply_target: None,
-            cancellation_token: None,
-            on_delta: None,
-            shared_budget: None,
-            channel: None,
-            collected_receipts: None,
-            event_tx: None,
-            steering: None,
-            new_messages_out: None,
-            image_cache: None,
-            memory: None,
-            ingress: IngressContext::sub_turn(),
-            agent_alias: Some("test-agent"),
-            turn_id: &turn_id,
-        })
-        .await
-        .expect("scoped SOP execution should complete");
+                requests: Arc::clone(&requests),
+            };
 
-        assert_eq!(result, "outer done");
-        assert_eq!(allowed_invocations.load(Ordering::SeqCst), 0);
-        assert_eq!(denied_invocations.load(Ordering::SeqCst), 0);
-        assert!(
-            history.iter().any(|msg| msg
-                .content
-                .contains("Tool not available in this turn: denied_tool")),
-            "denied tool call should be recorded as unavailable in history: {history:?}"
-        );
+            let sop = crate::sop::Sop {
+                name: "scoped-sop".to_string(),
+                description: "scoped sop".to_string(),
+                version: "1".to_string(),
+                priority: crate::sop::SopPriority::Normal,
+                execution_mode: crate::sop::SopExecutionMode::Auto,
+                triggers: vec![crate::sop::SopTrigger::Manual],
+                steps: vec![crate::sop::SopStep {
+                    number: 1,
+                    title: "Scoped".to_string(),
+                    body: "Use only allowed tools".to_string(),
+                    scope: Some(crate::sop::StepToolScope {
+                        allow: Some(if allow_search {
+                            vec!["allowed_tool".to_string(), "tool_search".to_string()]
+                        } else {
+                            vec!["allowed_tool".to_string()]
+                        }),
+                        deny: Vec::new(),
+                    }),
+                    ..crate::sop::SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: false,
+                admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: None,
+                decision: None,
+            };
+            let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig {
+                step_scope_enforce: true,
+                ..zeroclaw_config::schema::SopConfig::default()
+            });
+            engine.replace_sops_for_test(vec![sop]);
+            let engine = Arc::new(Mutex::new(engine));
 
-        let started = sop_started_run_id_from_history(&history)
-            .expect("sop_execute tool result should include a run id");
-        let engine = engine.lock().unwrap();
-        let run = engine
-            .get_run(&started)
-            .expect("run should remain queryable after completion");
-        assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
-        assert_eq!(run.step_results.len(), 1);
-        assert_eq!(run.step_results[0].output, "step recovered");
+            let allowed_invocations = Arc::new(AtomicUsize::new(0));
+            let denied_invocations = Arc::new(AtomicUsize::new(0));
+            let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
+                mock_tool("tool_search"),
+                Box::new(CountingTool::new(
+                    "allowed_tool",
+                    Arc::clone(&allowed_invocations),
+                )),
+                Box::new(CountingTool::new(
+                    "denied_tool",
+                    Arc::clone(&denied_invocations),
+                )),
+            ]);
+            let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+            activated.lock().unwrap().set_deferred_builtin_specs(
+                tools_registry
+                    .iter()
+                    .filter(|tool| matches!(tool.name(), "allowed_tool" | "denied_tool"))
+                    .map(|tool| tool.spec())
+                    .collect(),
+            );
+            let workspace = tempdir().unwrap();
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.runtime_profiles.insert(
+                "scoped".to_string(),
+                zeroclaw_config::schema::RuntimeProfileConfig {
+                    max_system_prompt_chars: Some(cap),
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "test-agent".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::new("scoped"),
+                    ..Default::default()
+                },
+            );
+            let parent_prompt = super::build_system_prompt_for_turn(
+                workspace.path(),
+                "mock-model",
+                &[],
+                "",
+                &[],
+                None,
+                None,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                &model_provider,
+                &tools_registry,
+                &[],
+                Some(&activated),
+                false,
+                zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+                false,
+                0,
+                true,
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+
+            let parent_prompt = parent_prompt.replacen(
+                "## Safety",
+                "## Hardware Access\nRetain hardware guidance.\n\n## Safety",
+                1,
+            );
+            let parent_prompt =
+                crate::agent::system_prompt::finalize_system_prompt(parent_prompt, cap);
+            let scoped_prompts = Arc::new(crate::agent::turn::ToolProtocolPrompts::with_max_chars(
+                parent_prompt.clone(),
+                parent_prompt.clone(),
+                cap,
+            ));
+            let mut history = vec![
+                ChatMessage::system(&parent_prompt),
+                ChatMessage::user("start the scoped sop"),
+            ];
+            let observer = NoopObserver;
+
+            let multimodal_config = zeroclaw_config::schema::MultimodalConfig::default();
+            let pacing = zeroclaw_config::schema::PacingConfig::default();
+            let knobs = LoopKnobs::default();
+            let mut history_has_trim_breadcrumb = false;
+            let mut injected_memory_preamble = None;
+            let turn = run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                served_route_sink: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &multimodal_config,
+                    config: (!configless).then_some(&config),
+                    max_tool_iterations: 6,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: Some(&activated),
+                    model_switch_callback: None,
+                    pacing: &pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &knobs,
+                    security: None,
+                },
+                history: &mut history,
+                // Test transcripts start fresh: no prior trim, no crumb.
+                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
+                injected_memory_preamble: &mut injected_memory_preamble,
+                channel_name: "agent",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: Some("test-agent"),
+                turn_id: &turn_id,
+            });
+            let result = if configless {
+                crate::agent::turn::scope_tool_protocol_prompts(scoped_prompts, turn).await
+            } else {
+                turn.await
+            }
+            .expect("scoped SOP execution should complete");
+
+            assert_eq!(result, "outer done");
+            assert_eq!(allowed_invocations.load(Ordering::SeqCst), 0);
+            assert_eq!(denied_invocations.load(Ordering::SeqCst), 0);
+            let denial = if native {
+                "Tool not available in this turn: denied_tool"
+            } else {
+                "[Tool call parse error]"
+            };
+            assert!(
+                history.iter().any(|msg| msg.content.contains(denial)),
+                "denied tool call must be rejected before execution: {history:?}"
+            );
+
+            let started = sop_started_run_id_from_history(&history)
+                .expect("sop_execute tool result should include a run id");
+            let engine = engine.lock().unwrap();
+            let run = engine
+                .get_run(&started)
+                .expect("run should remain queryable after completion");
+            assert_eq!(run.status, crate::sop::SopRunStatus::Completed);
+            assert_eq!(run.step_results.len(), 1);
+            assert_eq!(run.step_results[0].output, "step recovered");
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            let prompt = |index: usize| {
+                requests[index]
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .unwrap()
+                    .content
+                    .as_str()
+            };
+            if cap == 0 || cap == 10_000 {
+                assert!(prompt(0).contains("<available-deferred-builtin-tools>"));
+            }
+            for index in [1, 2] {
+                if cap > 0 {
+                    assert!(prompt(index).chars().count() <= cap);
+                    assert!(
+                        prompt(index)
+                            .trim_end()
+                            .ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION.trim_end()),
+                        "orientation missing: cap={cap}, configless={configless}, request={index}"
+                    );
+                    assert_eq!(
+                        prompt(index)
+                            .matches(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                            .count(),
+                        1
+                    );
+                }
+                assert_eq!(
+                    prompt(index).contains("<available-deferred-builtin-tools>"),
+                    allow_search
+                );
+                assert!(!prompt(index).contains("denied_tool - "));
+                if allow_search {
+                    assert!(prompt(index).contains("allowed_tool - "));
+                    assert!(!prompt(index).contains("**allowed_tool**"));
+                }
+                if cap == 0 || cap == 10_000 {
+                    assert!(prompt(index).contains("Retain hardware guidance."));
+                }
+                if !native && !allow_search && (cap == 0 || cap == 10_000) {
+                    assert_eq!(prompt(index).matches("## Tool Use Protocol").count(), 1);
+                    assert!(prompt(index).contains("**allowed_tool**"));
+                    assert!(prompt(index).contains("Parameters:"));
+                    assert!(!prompt(index).contains("**denied_tool**"));
+                    assert!(!prompt(index).contains("**tool_search**"));
+                }
+            }
+            assert_eq!(
+                prompt(0),
+                prompt(3),
+                "step fallback must not mutate the parent prompt"
+            );
+            assert_eq!(history[0].content, prompt(3));
+            assert_eq!(activated.lock().unwrap().hidden_builtin_names().len(), 2);
+        }
     }
 
     /// Activates a deferred tool into the shared set when called, standing in
@@ -13485,14 +14022,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("hi")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -13500,6 +14038,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13572,14 +14111,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("hi")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -13587,6 +14127,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13625,6 +14166,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13651,14 +14193,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("return a support case JSON object")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -13666,6 +14209,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13692,14 +14236,15 @@ This is an example, not an invocation."#;
         )];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -13707,6 +14252,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -13792,6 +14338,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13875,6 +14422,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -13961,6 +14509,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -14035,14 +14584,15 @@ This is an example, not an invocation."#;
         let messages = vec![ChatMessage::user("hi")];
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
 
+        let tools = [crate::tools::ToolSpec::new(
+            "count_tool".to_string(),
+            "Count values".to_string(),
+            serde_json::json!({"type": "object"}),
+        )];
         let outcome = consume_provider_streaming_response(
             &provider,
             &messages,
-            Some(&[crate::tools::ToolSpec::new(
-                "count_tool".to_string(),
-                "Count values".to_string(),
-                serde_json::json!({"type": "object"}),
-            )]),
+            Some(&tools),
             "mock-model",
             Some(0.0),
             None,
@@ -14050,6 +14600,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -14134,6 +14685,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -14221,6 +14773,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should finish");
@@ -14713,6 +15266,7 @@ This is an example, not an invocation."#;
             None, // event_tx
             true,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            Some(&tools),
         )
         .await
         .expect("streaming should finish");
@@ -16403,6 +16957,76 @@ Let me check the result."#;
         );
     }
 
+    #[tokio::test]
+    async fn turn_prompt_defers_builtin_definition_until_search_selection() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let tools = vec![
+            mock_tool("shell"),
+            mock_tool("catalog_probe"),
+            mock_tool("tool_search"),
+        ];
+        let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
+        activated
+            .lock()
+            .unwrap()
+            .set_deferred_builtin_specs(vec![tools[1].spec()]);
+        let build = |excluded: &[String]| {
+            super::build_system_prompt_for_turn(
+                workspace.path(),
+                "test-model",
+                &[],
+                "",
+                &[],
+                None,
+                None,
+                &RiskProfileConfig::default(),
+                &provider,
+                &tools,
+                excluded,
+                Some(&activated),
+                false,
+                SkillsPromptInjectionMode::Full,
+                false,
+                usize::MAX,
+                false,
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let initial = build(&[]);
+        assert!(initial.contains("catalog_probe - "));
+        assert!(!initial.contains("**catalog_probe**"));
+        let search_allowed = build(&["catalog_probe".into()]);
+        assert!(!search_allowed.contains("catalog_probe"));
+        assert!(!search_allowed.contains("<available-deferred-builtin-tools>"));
+        assert!(search_allowed.contains("tool_search"));
+        assert_eq!(activated.lock().unwrap().hidden_builtin_names().len(), 1);
+        let eager = build(&["tool_search".into()]);
+        assert!(eager.contains("**catalog_probe**"));
+        assert!(!eager.contains("catalog_probe - "));
+        assert!(!eager.contains("tool_search"));
+        let excluded = build(&["tool_search".into(), "catalog_probe".into()]);
+        assert!(!excluded.contains("catalog_probe"));
+        let search = crate::tools::ToolSearchTool::for_builtin_schemas(Arc::clone(&activated));
+        let result = search
+            .execute(serde_json::json!({"query": "select:catalog_probe"}))
+            .await
+            .unwrap();
+        assert!(result.output.contains("\"name\": \"catalog_probe\""));
+        let selected = build(&[]);
+        assert!(selected.contains(&format!(
+            "**catalog_probe**: {}\nParameters: `{}`\n",
+            tools[1].description(),
+            tools[1].parameters_schema()
+        )));
+        assert!(!selected.contains("catalog_probe - "));
+    }
+
     #[test]
     fn turn_prompt_budget_applies_after_deferred_and_thinking_sections() {
         use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
@@ -16575,6 +17199,7 @@ Let me check the result."#;
         let risk_profile = RiskProfileConfig::default();
         let built = crate::tools::AllToolsResult {
             tools: vec![mock_tool("shell")],
+            reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -17053,6 +17678,7 @@ Let me check the result."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should succeed");
@@ -17148,6 +17774,7 @@ Let me check the result."#;
             None, // event_tx
             false,
             zeroclaw_config::schema::StreamReasoningMode::Status,
+            None,
         )
         .await
         .expect("streaming should succeed");
@@ -20055,6 +20682,7 @@ Let me check the result."#;
             },
             ..zeroclaw_config::schema::Config::default()
         };
+        config.tools.optional = vec!["file_download".into()];
         let provider = config
             .providers
             .models
@@ -20142,7 +20770,8 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn process_message_seam_narrows_safe_defaults_outside_allowed_tools() {
-        let config = zeroclaw_config::schema::Config::default();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.tools.optional = vec!["calculator".into()];
         let security = Arc::new(TestPolicy {
             workspace_dir: std::env::temp_dir(),
             ..TestPolicy::default()
@@ -20175,8 +20804,8 @@ Let me check the result."#;
 
         let before = tool_names(&built.tools);
         assert!(
-            before.contains(&"web_search_tool"),
-            "precondition: web_search_tool in the eager registry, got {before:?}"
+            before.contains(&"calculator"),
+            "precondition: calculator in the eager registry, got {before:?}"
         );
         assert!(
             before.contains(&"shell"),
@@ -20214,8 +20843,8 @@ Let me check the result."#;
 
         let filtered: Vec<&str> = assembled.registry.iter().map(|t| t.name()).collect();
         assert!(
-            !filtered.contains(&"web_search_tool"),
-            "unified filter must DROP a read-only default outside allowed_tools \
+            !filtered.contains(&"calculator"),
+            "unified filter must DROP a selected optional tool outside allowed_tools \
              (the removed safe-defaults admit retained it), got {filtered:?}"
         );
         assert!(
@@ -20668,13 +21297,32 @@ Let me check the result."#;
         assert_correlations(&broadcast_records, &traces);
 
         zeroclaw_log::flush_for_test().expect("flush runtime trace");
-        let persisted = std::fs::read_to_string(
-            zeroclaw_log::runtime_trace_path().expect("runtime trace path"),
+        let trace_path = zeroclaw_log::runtime_trace_path().expect("runtime trace path");
+
+        // The trace file is process-wide: tests running alongside this one keep
+        // appending to it after the flush, so the tail can be a record another
+        // test is still writing, cut anywhere, even inside a multi-byte
+        // character. Leave such a record behind the flushed ones so every run
+        // exercises the tolerance below.
+        let mut partial =
+            br#"{"trace_id":"in-flight","message":"llm_request","content":""#.to_vec();
+        partial.push(0xE2);
+        std::io::Write::write_all(
+            &mut std::fs::OpenOptions::new()
+                .append(true)
+                .open(&trace_path)
+                .expect("open runtime trace for append"),
+            &partial,
         )
-        .expect("read runtime trace");
+        .expect("append a partial record");
+
+        // The flush drained this test's own records, so none of them can be
+        // partial. Keep the lines that parse; `assert_correlations` then
+        // selects this test's records by trace id, as the broadcast check does.
+        let persisted = std::fs::read(&trace_path).expect("read runtime trace");
         let persisted_records: Vec<serde_json::Value> = persisted
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| serde_json::from_slice(line).ok())
             .collect();
         assert_correlations(&persisted_records, &traces);
     }
@@ -21520,6 +22168,33 @@ Let me check the result."#;
                 .expect("capacity failure must retain its typed cause");
             assert_eq!(exceeded.model_context_window, capacity);
             assert!(exceeded.estimated_tokens > capacity);
+            // The shares are what lets an operator see what filled the window.
+            assert!(
+                exceeded.system_tokens > 0,
+                "the request's system prompt must be accounted for"
+            );
+            if matches!(scenario, HookBudgetScenario::SummaryFloor) {
+                assert_eq!(
+                    exceeded.tool_schema_tokens, 0,
+                    "the graceful summary is tools-free, so no schema share"
+                );
+            } else {
+                assert!(
+                    exceeded.tool_schema_tokens > 0,
+                    "a native-tools request must report its schema share"
+                );
+            }
+            // Raw shares are parts of the raw total, and calibration only
+            // ever scales that total up, so neither ordering can invert.
+            assert!(
+                exceeded.system_tokens + exceeded.tool_schema_tokens
+                    <= exceeded.raw_estimated_tokens,
+                "the shares must be parts of the raw total"
+            );
+            assert!(
+                exceeded.raw_estimated_tokens <= exceeded.estimated_tokens,
+                "calibration only ever scales the total up"
+            );
         } else {
             let text = result.expect("request must fit");
             if summary {
@@ -22993,15 +23668,18 @@ Let me check the result."#;
     async fn run_model_switch_emits_single_balanced_pair_for_the_switched_route() {
         use axum::{Json, Router, extract::State, routing::post};
         use tokio::net::TcpListener;
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+            AliasedAgentConfig, ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
         };
 
         let _hook_lock = observability::HOOK_TEST_LOCK.lock().await;
 
-        // First response: a native tool call requesting a switch to
-        // `ollama.switched`. Second response (only reachable once the
-        // switched-to provider is actually in use): plain "done".
+        // The simple prompt stays on the local route. First response: a native
+        // tool call requesting a different model on that allowed provider.
+        // Second response (only reachable once the switched-to model is
+        // actually in use): plain "done".
         type CallCount = Arc<std::sync::atomic::AtomicUsize>;
 
         async fn respond_switch_then_done(
@@ -23018,7 +23696,7 @@ Let me check the result."#;
                                 "type": "function",
                                 "function": {
                                     "name": "model_switch",
-                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.switched\",\"model\":\"switched-model\"}"
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.default\",\"model\":\"switched-model\"}"
                                 }
                             }]
                         }
@@ -23046,7 +23724,8 @@ Let me check the result."#;
         });
 
         let (_tmp, mut config) = isolated_run_test_config();
-        for alias in ["default", "switched"] {
+        config.tools.optional = vec!["model_switch".into()];
+        for (alias, vision) in [("default", true), ("switched", false), ("vision", true)] {
             config.providers.models.ollama.insert(
                 alias.to_string(),
                 OllamaModelProviderConfig {
@@ -23054,6 +23733,7 @@ Let me check the result."#;
                         model: Some(format!("run-lifecycle-switch-{alias}-model")),
                         timeout_secs: Some(5),
                         uri: Some(format!("http://{addr}")),
+                        vision: Some(vision),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -23065,12 +23745,39 @@ Let me check the result."#;
             AliasedAgentConfig {
                 model_provider: "ollama.default".into(),
                 risk_profile: "default".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "ollama.default".into(),
+                model: "run-lifecycle-switch-default-model".into(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "ollama.switched".into(),
+                model: "switched-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".to_string(),
+            RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Auto,
+                }),
                 ..Default::default()
             },
         );
         config
             .risk_profiles
             .insert("default".to_string(), RiskProfileConfig::default());
+        config.multimodal.vision_model_provider = Some("ollama.vision".to_string());
 
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
@@ -23079,7 +23786,7 @@ Let me check the result."#;
         let result = super::run(
             config,
             "run-lifecycle-switch-agent",
-            Some("please switch models".to_string()),
+            Some("please switch models [IMAGE:data:image/png;base64,aQ==]".to_string()),
             None,
             None,
             None,
@@ -23138,9 +23845,362 @@ Let me check the result."#;
             .expect("AgentEnd for the switch agent should be present");
         assert_eq!(
             end_route,
-            ("ollama.switched".to_string(), "switched-model".to_string()),
+            ("ollama.default".to_string(), "switched-model".to_string()),
             "AgentEnd must be attributed to the switched-TO route (set_model_route), \
              not the original one, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_never_effort_policy_blocks_model_issued_cloud_switch() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        type CallCount = Arc<std::sync::atomic::AtomicUsize>;
+
+        async fn local_switch_then_done(State(calls): State<CallCount>) -> Json<serde_json::Value> {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-blocked-cloud-switch",
+                                "type": "function",
+                                "function": {
+                                    "name": "model_switch",
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.cloud\",\"model\":\"cloud-model\"}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+            } else {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                }))
+            }
+        }
+
+        async fn cloud_response(State(calls): State<CallCount>) -> Json<serde_json::Value> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "cloud must not be called"}}]
+            }))
+        }
+
+        let local_calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let local_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local test listener should bind");
+        let local_addr = local_listener
+            .local_addr()
+            .expect("local listener should have address");
+        let local_app = Router::new()
+            .route("/v1/chat/completions", post(local_switch_then_done))
+            .with_state(Arc::clone(&local_calls));
+        let local_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(local_listener, local_app)
+                .await
+                .expect("local test server should run");
+        });
+
+        let cloud_calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cloud_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("cloud test listener should bind");
+        let cloud_addr = cloud_listener
+            .local_addr()
+            .expect("cloud listener should have address");
+        let cloud_app = Router::new()
+            .route("/v1/chat/completions", post(cloud_response))
+            .with_state(Arc::clone(&cloud_calls));
+        let cloud_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(cloud_listener, cloud_app)
+                .await
+                .expect("cloud test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        for (alias, model, uri) in [
+            ("local", "local-model", format!("http://{local_addr}")),
+            ("cloud", "cloud-model", format!("http://{cloud_addr}")),
+        ] {
+            config.providers.models.ollama.insert(
+                alias.to_string(),
+                OllamaModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        timeout_secs: Some(5),
+                        uri: Some(uri),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        config.agents.insert(
+            "never-cloud-switch-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                risk_profile: "default".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "ollama.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "ollama.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".to_string(),
+            RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Never,
+                }),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let result = super::run(
+            config,
+            "never-cloud-switch-agent",
+            Some("please switch models".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        local_server.abort();
+        cloud_server.abort();
+
+        assert_eq!(
+            result.expect("local provider should complete the turn"),
+            "done"
+        );
+        assert_eq!(
+            local_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the local provider should receive the initial call and the post-tool continuation"
+        );
+        assert_eq!(
+            cloud_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a model-issued switch must not reach the cloud provider under cloud_escalation = never"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_never_effort_policy_keeps_cloud_fallback_out_after_local_switch() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::StatusCode,
+            response::{IntoResponse, Response},
+            routing::post,
+        };
+        use tokio::net::TcpListener;
+        use zeroclaw_config::scattered_types::{CloudEscalationPolicy, EffortRoutingConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, ModelRouteConfig, OllamaModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        type CallCount = Arc<std::sync::atomic::AtomicUsize>;
+
+        async fn local_switch_then_fail(State(calls): State<CallCount>) -> Response {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                return Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-local-switch-before-failure",
+                                "type": "function",
+                                "function": {
+                                    "name": "model_switch",
+                                    "arguments": "{\"action\":\"set\",\"model_provider\":\"ollama.local\",\"model\":\"switched-local-model\"}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+                .into_response();
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "local failure after switch"})),
+            )
+                .into_response()
+        }
+
+        async fn cloud_response(State(calls): State<CallCount>) -> Json<serde_json::Value> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "cloud must not be called"}}]
+            }))
+        }
+
+        let local_calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let local_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("local test listener should bind");
+        let local_addr = local_listener
+            .local_addr()
+            .expect("local listener should have address");
+        let local_app = Router::new()
+            .route("/v1/chat/completions", post(local_switch_then_fail))
+            .with_state(Arc::clone(&local_calls));
+        let local_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(local_listener, local_app)
+                .await
+                .expect("local test server should run");
+        });
+
+        let cloud_calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cloud_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("cloud test listener should bind");
+        let cloud_addr = cloud_listener
+            .local_addr()
+            .expect("cloud listener should have address");
+        let cloud_app = Router::new()
+            .route("/v1/chat/completions", post(cloud_response))
+            .with_state(Arc::clone(&cloud_calls));
+        let cloud_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(cloud_listener, cloud_app)
+                .await
+                .expect("cloud test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.providers.models.ollama.insert(
+            "local".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("local-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{local_addr}")),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "ollama.cloud",
+                    )],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "cloud".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cloud-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{cloud_addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "never-cloud-fallback-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.local".into(),
+                risk_profile: "default".into(),
+                runtime_profile: "effort".into(),
+                ..Default::default()
+            },
+        );
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "ollama.local".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "ollama.cloud".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".to_string(),
+            RuntimeProfileConfig {
+                effort_routing: Some(EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    cloud_escalation: CloudEscalationPolicy::Never,
+                }),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+        config.reliability.provider_retries = 0;
+
+        let result = super::run(
+            config,
+            "never-cloud-fallback-agent",
+            Some("please switch local models".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        local_server.abort();
+        cloud_server.abort();
+
+        assert!(
+            result.is_err(),
+            "the turn should surface the local failure instead of escaping to cloud"
+        );
+        assert_eq!(
+            local_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the local provider should receive the initial call and the post-switch failure"
+        );
+        assert_eq!(
+            cloud_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a rebuild after an accepted local switch must keep configured cloud fallback outside the never-policy boundary"
         );
     }
 

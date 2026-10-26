@@ -1,10 +1,6 @@
 # Config pane
 
-zerocode's **Config** pane is the way to configure a running ZeroClaw. Each
-setting has a typed control, validation, and an inline explanation of what it
-does, and most settings apply live without a daemon restart. Open it from any
-zerocode session and edit settings there rather than hand editing the config
-file.
+zerocode's **Config** pane configures a running ZeroClaw. Each setting has a typed control, validation, and an inline explanation. A successful save persists the change, while application to running components depends on the setting and target. Open Config from any zerocode session to edit settings.
 
 Settings still persist to your config, and the docs
 describe the relevant fields so you can see exactly what a given control writes. Read
@@ -23,10 +19,20 @@ Keybindings use canonical modifier names: `control` is literal Control, `primary
   daemon, so a typo cannot leave the config in a state that fails to load.
 - **Discoverability.** Every setting carries an inline description, so you do
   not have to cross-reference the config reference to know what a field does.
-- **Live apply.** Most settings take effect on the next frame, with no restart.
+- **Application feedback.** Saved changes show acknowledged application results for the affected running targets when the daemon supports them. Other settings require an explicit reload.
 - **Registry-backed lists.** Provider, channel, model, and theme choices come
   from the backend registry, so the options you see are exactly the ones this
   build supports.
+
+## Saved and applied changes
+
+After a daemon Config edit succeeds, the application summary keeps the saved property and its revision separate from the running targets' outcomes. Press `s` outside an editor or search field to open application status. Use Up/Down or Page Up/Page Down to scroll and Escape to return. The configured `application_status` action can replace the default shortcut.
+
+Each result shows canonical path components, its revision, and the daemon or session instance it describes. A session can report **Applied live** while the daemon still reports **Reload required** for the same change. **Pending** means the target has not acknowledged the update; **Rejected** means the attempted target did not accept it. Schema capability and a successful save alone do not establish application.
+
+A missing receipt, unsupported status API, failed read, replacement daemon epoch, or missing result displays **Application status unavailable**. The daemon retains a bounded set of observed changes, not a complete inventory or persistent history. Truncation and absent records never imply success. Results for an unrelated older edit retain their actual revision; results from another writer's later edit cannot acknowledge your save. Alias operations routed through separate lifecycle methods may have no save receipt and remain unavailable for exact-save feedback.
+
+Application status refreshes while Config is visible. Leaving Config or losing the connection invalidates its cached application view. Reload continues through the existing explicit reload action and confirmation; reading status does not trigger it. Local ZeroCode settings, personality files and skill files keep their own save feedback because they do not share the daemon configuration application ledger.
 
 ## Local UI settings (`zerocode-config.toml`)
 

@@ -218,6 +218,22 @@ zeroclaw plugin install ./my-plugin
 zeroclaw plugin install ./my-plugin/manifest.toml
 ```
 
+`zeroclaw plugin update` replaces an installed package through the same
+admission (`PluginHost::admit_update`) with the identity decided the other way
+round: the named package must be installed, and the source must carry its
+name. The CLI refuses authority the new manifest adds unless `--allow` accepts
+it, runs the same load check with no way to skip it, and
+`PluginHost::update_admitted` builds the replacement in a staging directory
+before renaming it into the installed package's place. The operator-facing
+contract is in [Updating a plugin](../plugins/index.md#updating-a-plugin).
+
+```bash
+zeroclaw plugin update team-calendar
+zeroclaw plugin update team-calendar@0.2.0 --registry https://example.invalid/registry.json
+zeroclaw plugin update --all
+zeroclaw plugin update my-plugin --from ./my-plugin
+```
+
 The default registry URL is:
 
 ```text
@@ -234,7 +250,7 @@ Registry entries use this shape:
   "plugins": [
     {
       "name": "team-calendar",
-      "version": "0.8.5",
+      "version": "0.8.7",
       "description": "Schedule meetings on a team calendar",
       "author": "Example Team",
       "capabilities": ["tool"],
@@ -673,6 +689,24 @@ connection is an invalid request. The properties a profile references are
 host-only: `secrets.get` returns `access-denied` for them, so the plugin never
 holds the private key it authenticates with.
 
+The host builds each connection's TLS configuration when that connection
+opens, from the configuration revision of the service frame that opens it, and
+the connection owns it. The frame's transient material is paired only with an
+authorization derived from matching canonical configuration inputs. If policy,
+profile references, or material changes between those views (including while
+DNS is pending), opening the connection fails closed rather than combining
+revisions. The comparison covers the instance's whole configuration entry (its
+grants, its TLS profiles, and every config value) and the deployment's NAT64
+prefixes and connection limit, so any such edit made while a frame runs fails
+that frame's later connections that use a custom CA or client identity. A
+later frame resolves rotated material; already-open connections are unchanged. Egress grants remain checked on each request, so a removed
+profile or grant refuses the next connection. System roots are the exception: a profile that keeps them,
+and a connection without a profile, use the roots plugin HTTPS trusts, which
+are read once per process. A connection that is already open keeps the
+identity it presented in its handshake until it is dropped or closed. Dropping
+it, or cancelling the call that is still opening it, releases the
+configuration together with the connection lease.
+
 ### Per-plugin config (`__config` and `config.get`)
 
 **Permission:** `config_read`
@@ -775,9 +809,11 @@ plugin that declares its destinations works without the operator transcribing
 hosts, and the seeded values are printed. It never extends a row that already
 exists: an upgrade whose declaration grew prints the difference plus the exact
 `zeroclaw config set` command, and the operator applies it. `zeroclaw plugin
-list` reports the same gap as a standing diagnostic. Declare the destinations
-your code actually contacts, and treat a growing declaration as something every
-operator has to approve on every upgrade.
+update` seeds nothing at all, not even into a row it creates, and prints the
+same difference. `zeroclaw plugin list` reports the same gap as a standing
+diagnostic. Declare the destinations your code actually contacts, and treat a
+growing declaration as something every operator has to approve on every
+upgrade.
 
 A channel instance's row is created when an operator binds its alias, with
 `zeroclaw plugin bind <package> --channel-alias <alias>` or with
@@ -840,12 +876,17 @@ The five bounds are operator-tunable and every value is validated as non-zero:
 only be built with explicit limits, so no load path can construct an
 unsandboxed plugin. Guest `wasi:http` request options may end a call sooner but
 cannot extend the host deadline. An interrupted warm store is never resumed,
-and a channel never reuses a store whose call trapped: channels recreate the
-instance from host-owned inputs on the next call, waiting when traps and
-missed deadlines, other than in approval and choice prompts, outrun a rebuild
-budget of three at once and one per five minutes after that, while memory
-instances remain unavailable until their owner rebuilds them. The canonical
-fields and defaults live in the
+and neither a channel nor a memory backend reuses a store whose call failed
+inside Wasmtime: after a guest trap, exhausted fuel, or a failed host import,
+Wasmtime refuses every later call into the store, and a result it could not
+lift skips the export's post-return cleanup. Channels recreate the instance
+from host-owned inputs on the next call, waiting when traps and missed
+deadlines, other than in approval and choice prompts, outrun a rebuild budget
+of three at once and one per five minutes after that. Memory instances remain
+unavailable until their owner rebuilds them, and later calls that reach the
+plugin fail with the error a missed deadline leaves. A rebuilt memory instance
+starts empty, because the memory world gives a plugin no storage outside its
+own instance. The canonical fields and defaults live in the
 [Config reference](../reference/index.md).
 
 ### 32-bit address space (wasip2 is wasm32)
@@ -1010,13 +1051,117 @@ execution backend ships:
   only precompiled `.cwasm` components load.
 - `plugins-wasm-runtime-only` is the smallest and fastest to start: no JIT, so
   components are deserialized from a precompiled `.cwasm`.
-- `plugins-wasm-cranelift` adds the Cranelift JIT, so a `.wasm` component is
-  compiled on load.
-- `plugins-wasm-pulley` is the most portable, supporting compilation on targets
-  Cranelift does not cover.
+- `plugins-wasm-cranelift` adds the Cranelift compiler, so a `.wasm` component
+  is compiled on load. It is the only feature that includes a compiler, and
+  the only one that can load the `.wasm` components the plugin registry
+  publishes.
+- `plugins-wasm-pulley` compiles in wasmtime's Pulley interpreter. ZeroClaw
+  never selects Pulley as a compilation target, so on hosts with a native
+  Cranelift backend the feature changes nothing: alone it behaves like
+  `plugins-wasm-runtime-only`, and with `plugins-wasm-cranelift` it compiles
+  native code. On hosts without a native backend, such as 32-bit ARM,
+  wasmtime targets Pulley by itself.
 
 These delegate to the `zeroclaw-plugins` crate features
 (`plugins-wasmtime`, `plugins-wasm-cranelift`, `plugins-wasm-pulley`) that wire
 up `wasmtime`. The load path keys off whether the Cranelift compiler is in the
 build, as described under WASI Component Host. Read the feature comments in the
 workspace `Cargo.toml` for the authoritative descriptions.
+
+### Plugin support per release artifact
+
+The standard distribution feature set (`cargo generate features --selection
+dist`, resolved per target from the registry in the workspace `Cargo.toml`)
+carries `plugins-wasm-cranelift` on the seven 64-bit desktop and server targets
+and excludes it on 32-bit ARM and the experimental Android target. Which
+artifact carries the host, and what proves it:
+
+| Artifact | Plugin host | Accepted package | Proof |
+|---|---|---|---|
+| CLI archives for x86_64 and aarch64 Linux (glibc and musl), aarch64 and x86_64 macOS, x86_64 Windows | Cranelift compiler, `.wasm` compiled on load | `.wasm` component built against the release's `wit/v0` | the release executes a plugin from each archive on its own platform (the `plugin-smoke` job) before `publish` and `docker` run |
+| CLI archives for armv7 and arm (ARMv6) Linux | none: `plugin` is not a command | none | the registry's per-target policy, pinned by an xtask test |
+| CLI archive for aarch64-linux-android (experimental) | none | none | the same policy |
+| GHCR `latest`, versioned, and `debian` images | Cranelift: they repackage the x86_64 and aarch64 Linux glibc archives | `.wasm` | inherits the archive smoke; nothing runs inside the image |
+| GHCR `dist` variant, AUR package, Nix flake package, `setup.bat` source build | Cranelift: source builds from the generated distribution list | `.wasm` | none |
+| GHCR `all-features` image | Cranelift, Pulley, and runtime-only all compiled in | `.wasm` | none |
+| GHCR `minimal` and `default-features` images | none | none | |
+| Desktop bundles (dmg, deb, AppImage, msi, setup exe) | Cranelift: the standard sidecar build uses the target's generated `dist` features (plus `embedded-web` on macOS) | `.wasm` | source wiring in `scripts/desktop/prepare-kernel.sh`; desktop bundles have no plugin smoke gate |
+| `cargo install zeroclaw` and the `install.sh` source build | none by default; opt in with `--features plugins-wasm-cranelift` | `.wasm` with the opt-in | |
+| Homebrew core | formula-owned, outside this repository | | |
+
+Limits that hold for every artifact with the host:
+
+- `wit/v0` is unstable. A plugin must be built against the WIT shipped with
+  the release that runs it (`wit/VERSIONING.md`); the manifest carries no host
+  or WIT version, so a mismatch surfaces at the install-time load check.
+- Compiling a component needs memory that becomes executable after it is
+  written. Environments that forbid that, such as systemd units with
+  `MemoryDenyWriteExecute=yes` or SELinux `execmem` denials, refuse every
+  plugin load while the rest of the binary runs normally.
+- Official registry packages are unsigned today, so under
+  `signature_mode = "strict"` none of them install.
+- Every tool call compiles the component again; there is no compilation cache.
+- The runtime defaults stay closed. An installed tool or skill package
+  contributes nothing until the operator sets `plugins.enabled` and
+  `plugins.auto_discover`. Once both are set, every build of the tool
+  registry compiles and instantiates each admitted tool component and
+  queries its name, description, and parameter schema under the package's
+  declared permissions and egress policy; approval gates `execute` only. A
+  channel package runs once `plugins.enabled` is set, the operator declares
+  it under `[channels.plugin.<alias>]`, and an enabled agent lists
+  `plugin.<alias>` among its channels; for a package that mirrors a native
+  channel through `provides`, activation under `[channels.<provides>.<alias>]`
+  is recorded but not constructed yet. Each plugin tool call still needs
+  operator approval unless the agent's risk profile pre-approves it
+  (`auto_approve`, including the `*` wildcard, or `level = "full"`) or the
+  operator answered Always for that tool earlier in the same CLI session or
+  channel turn; tools in `always_ask` prompt every time.
+
+### Interrupted installation recovery
+
+`zeroclaw plugin remove <name>` can recover an unloaded, empty or structurally
+incomplete package directory that holds only what an install writes: a
+manifest naming that package, the component file at `wasm_path` with the
+folders on its way, and, for a skill plugin, a `skills/` tree of folders and
+files. Signature-policy refusals, healthy packages, loaded aliases, symlinks,
+uninspectable contents, and directories holding anything else remain
+protected. Recovery claims a single directory generation before admission and
+deletion; it never uses a stale verdict to recursively delete a replacement at
+the package name.
+
+Install and recovery coordinate through a persistent hidden OS lock under the
+plugins root. Only install, update, remove, and listing what an interrupted
+update displaced open that root and its lock, so a host that only discovers
+plugins, such as one the daemon keeps, holds nothing in the plugins directory. On Windows an open root pins the plugins directory and
+its ancestors against rename until its host drops. A process that cannot take
+the lock within 60 seconds gives up and names the lock file. Any account that
+can read that file can hold the lock, so the plugins directory is treated as
+one account's state: on Unix the lock and each transaction lease are created
+readable and writable by their owner only (mode `0600`). A lock another
+account created, for example with `sudo`, cannot be opened, so install,
+update and remove fail at once and name it; remove that file while nothing is
+installing. Where the operating
+system or filesystem offers no file locking, install, update and remove refuse. New
+staging directories use unique generations and an OS-held lease, rather than a
+PID as ownership evidence. Recovery cleans an abandoned protocol stage only
+while recovering an actual final package, or while finishing the delete of one
+an earlier remove had judged. Legacy PID-only stages without proof of
+abandonment are retained and their paths are printed; they do not prevent a new
+install from using fresh staging.
+
+A refused claimed package is restored without overwriting a concurrent
+occupant. If restoration cannot complete, the error names its retained hidden
+transaction location. Preserve that directory, resolve the reported conflict,
+and retry `plugin remove`: retry restores the package before applying normal
+admission policy. A claim whose delete had begun is marked, and a retry
+finishes that delete instead of restoring it. A hidden transaction is never, by its name alone, evidence
+that a healthy package can be deleted. Filesystem namespace changes and
+unsupported locking refuse recovery safely. Package moves require an atomic
+rename that refuses every existing destination, including an empty directory.
+Where the platform or filesystem cannot provide it (other Unix platforms such
+as FreeBSD, an NFS mount without no-replace support, or Linux before 3.15),
+installation and recovery refuse the move. A failed claim leaves the final
+entry unmoved. An install refused this way removes the copy it staged and
+says the move is unsupported; any other failed publication, and a failed
+restoration, retains the package in its hidden transaction and reports that
+path. No plain replacing rename is used.

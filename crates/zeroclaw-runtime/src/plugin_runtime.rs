@@ -255,17 +255,22 @@ impl PluginActivationPlan {
             }
         }
 
-        if config.plugins.auto_discover {
-            for (manifest, _) in host.tool_plugin_details() {
+        // The per-package rule for the default tool binding is
+        // `decide_tool_binding`, shared with `tool_instance_admission` so a
+        // report of this pass cannot drift from it. A package it refuses is
+        // skipped here; the reason is only reported by that query.
+        let tool_packages = tool_package_names(host);
+        for (manifest, _) in host.tool_plugin_details() {
+            if let ToolBindingDecision::Candidate(scope) =
+                decide_tool_binding(config, host, &tool_packages, &manifest.name)?
+            {
                 candidates.push(ActivationCandidate {
                     explicit: false,
-                    scope: PluginInstanceScope::for_package_binding(
-                        manifest,
-                        PluginCapability::Tool,
-                        manifest.permissions.iter().copied(),
-                    )?,
+                    scope,
                 });
             }
+        }
+        if config.plugins.auto_discover {
             for (manifest, _) in host.skill_plugin_details() {
                 candidates.push(ActivationCandidate {
                     explicit: false,
@@ -576,6 +581,232 @@ fn decide_explicit_channel(
 #[cfg(feature = "plugins-wasm")]
 fn channel_package_names(host: &PluginHost) -> HashSet<&str> {
     host.channel_plugin_details()
+        .into_iter()
+        .map(|(manifest, _)| manifest.name.as_str())
+        .collect()
+}
+
+/// Whether one installed package's default tool binding is an activation
+/// candidate, and if not, the first precondition the plan finds unmet, in the
+/// order the plan applies them.
+///
+/// Only [`Self::Admitted`] is an activation decision, and it is the plan's
+/// own. `PluginsDisabled` is the global switch, the next three are the plan's
+/// per-package checks, and `CeilingReached` is the shared ceiling, which only
+/// a whole plan can apply.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolInstanceAdmission {
+    /// `plugins.enabled` is off, so no plugin instance activates.
+    PluginsDisabled,
+    /// `plugins.auto_discover` is off, so installed tool packages stay dormant.
+    AutoDiscoverDisabled,
+    /// The plugin host has no admitted package with this name.
+    PackageNotInstalled,
+    /// The package is installed but the host does not list it as a tool
+    /// plugin: it does not declare the tool capability.
+    PackageNotATool,
+    /// Candidates ordered ahead of this one took every instance slot.
+    CeilingReached {
+        /// The configured `plugins.max_active_instances`.
+        max_active_instances: usize,
+    },
+    /// The plan admits the package's tool instance. Admission is not
+    /// construction: the loader can still refuse the instance, for example
+    /// when its component does not load.
+    Admitted {
+        /// Name of the `[[plugins.entries]]` row that configures the instance.
+        instance_key: String,
+    },
+}
+
+/// The activation plan's own verdict on one installed package's default tool
+/// binding.
+///
+/// Anything that reports whether an installed tool package will activate,
+/// such as Quickstart after installing one, asks this rather than restating
+/// the admission rules. The per-package checks run through the helper the
+/// plan's tool pass uses, in the same order. The ceiling verdict comes from
+/// building that plan and asking whether it admitted this instance.
+///
+/// Like the plan, this is guest-free: it reads canonical config and the
+/// manifests the host already admitted, never touches component bytes, and
+/// runs no guest code.
+///
+/// The verdict describes `config` as given. A running daemon keeps acting on
+/// the config it loaded until it restarts or reloads.
+///
+/// # Errors
+///
+/// Returns the plan's own error when this package's instance identity cannot
+/// be formed, and, for a package that meets every precondition, when the
+/// whole plan cannot be built or the admitted instance's config key cannot be
+/// derived. The runtime starts no plugin instance in either plan failure,
+/// because its own plan fails the same way.
+#[cfg(feature = "plugins-wasm")]
+pub fn tool_instance_admission(
+    config: &Config,
+    host: &PluginHost,
+    package: &str,
+) -> Result<ToolInstanceAdmission, PluginError> {
+    if !config.plugins.enabled {
+        return Ok(ToolInstanceAdmission::PluginsDisabled);
+    }
+    let tool_packages = tool_package_names(host);
+    let scope = match decide_tool_binding(config, host, &tool_packages, package)? {
+        ToolBindingDecision::Candidate(scope) => scope,
+        ToolBindingDecision::Unmet(unmet) => return Ok(unmet),
+    };
+    // Nothing but the ceiling removes an auto-discovered candidate from the
+    // plan: it truncates the one sorted candidate sequence. So a candidate the
+    // plan does not admit is one the ceiling left out.
+    let plan = PluginActivationPlan::build(config, host)?;
+    if plan.admits(
+        scope.id().package(),
+        PluginCapability::Tool,
+        scope.id().binding(),
+    ) {
+        Ok(ToolInstanceAdmission::Admitted {
+            instance_key: scope.id().config_entry_key()?,
+        })
+    } else {
+        Ok(ToolInstanceAdmission::CeilingReached {
+            max_active_instances: config.plugins.max_active_instances,
+        })
+    }
+}
+
+/// One package's outcome in the plan's tool pass.
+#[cfg(feature = "plugins-wasm")]
+enum ToolBindingDecision {
+    /// Every per-package precondition holds: the plan places this scope among
+    /// its auto-discovered candidates, where the shared ceiling still applies.
+    Candidate(PluginInstanceScope),
+    /// The first per-package precondition that does not hold.
+    Unmet(ToolInstanceAdmission),
+}
+
+/// The tool pass's rule for one installed package's default tool binding.
+///
+/// This is the one statement of that rule: [`PluginActivationPlan::build`]
+/// keeps the candidates it yields and [`tool_instance_admission`] reports its
+/// refusals, so a change here changes both. A package is a candidate only when
+/// `plugins.auto_discover` is on, the host admitted the package, and the host
+/// lists it as a tool plugin. The checks run in that order and stop at the
+/// first that fails, which is the order [`ToolInstanceAdmission`] lists them
+/// in.
+///
+/// `tool_packages` is [`tool_package_names`] of the same host, taken as an
+/// argument so the plan computes it once for all packages.
+///
+/// # Errors
+///
+/// A package that passes every check but whose instance identity cannot be
+/// formed is an error rather than a refusal: it fails the plan as a whole.
+#[cfg(feature = "plugins-wasm")]
+fn decide_tool_binding(
+    config: &Config,
+    host: &PluginHost,
+    tool_packages: &HashSet<&str>,
+    package: &str,
+) -> Result<ToolBindingDecision, PluginError> {
+    if !config.plugins.auto_discover {
+        return Ok(ToolBindingDecision::Unmet(
+            ToolInstanceAdmission::AutoDiscoverDisabled,
+        ));
+    }
+    let Some(manifest) = host.manifest(package) else {
+        return Ok(ToolBindingDecision::Unmet(
+            ToolInstanceAdmission::PackageNotInstalled,
+        ));
+    };
+    if !tool_packages.contains(manifest.name.as_str()) {
+        return Ok(ToolBindingDecision::Unmet(
+            ToolInstanceAdmission::PackageNotATool,
+        ));
+    }
+    Ok(ToolBindingDecision::Candidate(tool_binding_scope(
+        manifest,
+    )?))
+}
+
+/// The scope the plan admits a package's default tool instance under: the
+/// package binding, holding every permission the manifest requests.
+#[cfg(feature = "plugins-wasm")]
+fn tool_binding_scope(
+    manifest: &zeroclaw_plugins::PluginManifest,
+) -> Result<PluginInstanceScope, PluginError> {
+    PluginInstanceScope::for_package_binding(
+        manifest,
+        PluginCapability::Tool,
+        manifest.permissions.iter().copied(),
+    )
+}
+
+/// The runtime's verdict on the configuration of one installed package's
+/// default tool instance.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+pub enum ToolConfigVerdict {
+    /// The config resolver accepts the instance's configuration.
+    Accepted,
+    /// The manifest does not declare the tool capability, so the runtime
+    /// builds no tool instance of the package.
+    NotATool,
+    /// The config resolver refuses it, so the runtime skips the tool.
+    Refused {
+        /// Name of the `[[plugins.entries]]` row the configuration is read from.
+        instance_key: String,
+        /// The resolver's refusal, as the runtime records it when it skips
+        /// the tool.
+        error: PluginError,
+    },
+}
+
+/// Whether the runtime accepts the configuration of `manifest`'s default tool
+/// instance under `config`.
+///
+/// The runtime resolves a tool instance's configuration before it runs any
+/// guest code, and skips the tool when that fails. This runs the same
+/// resolution, [`crate::tools::resolve_instance_config`], under the scope the
+/// plan's tool pass admits. A report of whether a tool loads, such as
+/// `plugin info`, asks this so it gives the runtime's answer for the
+/// configuration as well as for the component.
+///
+/// Like [`tool_instance_admission`], this is guest-free and describes `config`
+/// as given. It does not consult `plugins.enabled`, `plugins.auto_discover` or
+/// the instance ceiling: those decide whether the instance is admitted, this
+/// decides whether an admitted instance's configuration is accepted.
+///
+/// # Errors
+///
+/// Returns the plan's own error when the instance identity cannot be formed.
+#[cfg(feature = "plugins-wasm")]
+pub fn tool_instance_config_verdict(
+    config: &Config,
+    manifest: &zeroclaw_plugins::PluginManifest,
+) -> Result<ToolConfigVerdict, PluginError> {
+    if !manifest.capabilities.contains(&PluginCapability::Tool) {
+        return Ok(ToolConfigVerdict::NotATool);
+    }
+    let scope = tool_binding_scope(manifest)?;
+    let instance_key = scope.id().config_entry_key()?;
+    let resolved =
+        crate::tools::resolve_instance_config(manifest, &scope, &instance_key, || config);
+    Ok(match resolved {
+        Ok(_) => ToolConfigVerdict::Accepted,
+        Err(error) => ToolConfigVerdict::Refused {
+            instance_key,
+            error,
+        },
+    })
+}
+
+/// Names of the admitted packages whose default tool binding the plan can
+/// admit: the ones the host lists as tool plugins.
+#[cfg(feature = "plugins-wasm")]
+fn tool_package_names(host: &PluginHost) -> HashSet<&str> {
+    host.tool_plugin_details()
         .into_iter()
         .map(|(manifest, _)| manifest.name.as_str())
         .collect()
@@ -1638,6 +1869,236 @@ mod tests {
                 .is_none(),
             "a package without the channel capability must not back a channel binding"
         );
+    }
+
+    #[test]
+    fn tool_admission_reports_the_admitted_instance_key() {
+        let (_plugins, config, host) = fixture();
+        let plan = PluginActivationPlan::build(&config, &host).unwrap();
+        let expected = plan
+            .scope("zeta", PluginCapability::Tool, "zeta")
+            .expect("the fixture plan admits zeta's tool")
+            .id()
+            .config_entry_key()
+            .unwrap();
+
+        assert_eq!(
+            tool_instance_admission(&config, &host, "zeta").unwrap(),
+            ToolInstanceAdmission::Admitted {
+                instance_key: expected
+            }
+        );
+    }
+
+    #[test]
+    fn tool_admission_reports_a_disabled_plugin_system_before_any_other_gate() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.enabled = false;
+        config.plugins.auto_discover = false;
+
+        // An admissible tool, a skill-only package and a missing package each
+        // fail a later gate too, but the first gate in order is the one named.
+        for package in ["zeta", "beta", "not-installed"] {
+            assert_eq!(
+                tool_instance_admission(&config, &host, package).unwrap(),
+                ToolInstanceAdmission::PluginsDisabled,
+                "{package}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_admission_reports_disabled_auto_discovery() {
+        let (_plugins, mut config, host) = fixture();
+        config.plugins.auto_discover = false;
+
+        for package in ["zeta", "not-installed"] {
+            assert_eq!(
+                tool_instance_admission(&config, &host, package).unwrap(),
+                ToolInstanceAdmission::AutoDiscoverDisabled,
+                "{package}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_admission_tells_a_missing_package_from_a_non_tool_package() {
+        let (_plugins, config, host) = fixture();
+
+        assert_eq!(
+            tool_instance_admission(&config, &host, "not-installed").unwrap(),
+            ToolInstanceAdmission::PackageNotInstalled
+        );
+        // `beta` is installed but ships only a skill.
+        assert_eq!(
+            tool_instance_admission(&config, &host, "beta").unwrap(),
+            ToolInstanceAdmission::PackageNotATool
+        );
+    }
+
+    #[test]
+    fn tool_admission_attributes_a_refused_tool_to_the_shared_ceiling() {
+        let (_plugins, mut config, host) = fixture();
+        // Plan order puts both explicit channels, alpha's tool and beta's skill
+        // into the four slots, which leaves zeta's tool past the ceiling.
+        config.plugins.max_active_instances = 4;
+
+        assert!(matches!(
+            tool_instance_admission(&config, &host, "alpha").unwrap(),
+            ToolInstanceAdmission::Admitted { .. }
+        ));
+        assert_eq!(
+            tool_instance_admission(&config, &host, "zeta").unwrap(),
+            ToolInstanceAdmission::CeilingReached {
+                max_active_instances: 4
+            }
+        );
+    }
+
+    #[test]
+    fn tool_admission_agrees_with_the_activation_plan_for_every_package() {
+        let (_plugins, mut config, host) = fixture();
+        let mut reached = std::collections::HashSet::new();
+
+        // Both switches off in turn, and a ceiling that admits every tool or
+        // truncates zeta's.
+        for (enabled, auto_discover, ceiling) in [
+            (true, true, 10),
+            (true, true, 4),
+            (true, false, 10),
+            (false, true, 10),
+        ] {
+            config.plugins.enabled = enabled;
+            config.plugins.auto_discover = auto_discover;
+            config.plugins.max_active_instances = ceiling;
+            let plan = PluginActivationPlan::build(&config, &host).unwrap();
+
+            for package in ["alpha", "beta", "not-installed", "zeta"] {
+                let verdict = tool_instance_admission(&config, &host, package).unwrap();
+                let planned = plan
+                    .scope(package, PluginCapability::Tool, package)
+                    .is_some();
+                assert_eq!(
+                    matches!(verdict, ToolInstanceAdmission::Admitted { .. }),
+                    planned,
+                    "enabled={enabled}, auto_discover={auto_discover}, max={ceiling}, \
+                     package {package}: the query said {verdict:?}"
+                );
+                reached.insert(std::mem::discriminant(&verdict));
+            }
+        }
+
+        // Not vacuous: the cases reach every verdict a package can get, so
+        // agreement is shown for each one.
+        assert_eq!(reached.len(), 6, "every verdict is reached");
+    }
+
+    /// The config verdict is the runtime's own: for each set of rows a tool
+    /// instance can meet, it gives the answer of the config resolver the
+    /// runtime constructs tools with, with the same message and the row it
+    /// read. Both run one function, so this pins that they keep doing so.
+    #[test]
+    fn tool_config_verdict_agrees_with_the_runtime_config_resolver() {
+        let plugins = TempDir::new().unwrap();
+        let write = |name: &str, capability: &str, extra: &str| {
+            let plugin_dir = plugins.path().join(name);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                format!(
+                    "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"{capability}\"]\n{extra}"
+                ),
+            )
+            .unwrap();
+            std::fs::write(plugin_dir.join("plugin.wasm"), b"not a component").unwrap();
+        };
+        write("schemaless", "tool", "permissions = []\n");
+        write(
+            "labelled",
+            "tool",
+            "permissions = [\"config_read\"]\n\
+             config_schema = { type = \"object\", additionalProperties = false, \
+             properties = { label = { type = \"string\" } } }\n",
+        );
+        write("relay", "channel", "permissions = []\n");
+        // `config_read` without a schema never reaches either path: package
+        // admission refuses it, so no host loads it.
+        write("readless", "tool", "permissions = [\"config_read\"]\n");
+        let host = Arc::new(PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        assert!(host.manifest("readless").is_none());
+
+        let values = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect()
+        };
+        /// The package, the `config` maps of the rows under its instance key
+        /// (none, one, or a duplicate pair), and whether the runtime accepts
+        /// them.
+        type Case = (&'static str, Vec<HashMap<String, String>>, bool);
+        let cases: [Case; 7] = [
+            // Values left on the row for a package without a schema.
+            ("schemaless", vec![values(&[("label", "masked")])], false),
+            ("schemaless", vec![HashMap::new()], true),
+            ("schemaless", Vec::new(), true),
+            ("labelled", vec![values(&[("label", "masked")])], true),
+            ("labelled", vec![values(&[("colour", "red")])], false),
+            ("labelled", Vec::new(), true),
+            ("labelled", vec![HashMap::new(), HashMap::new()], false),
+        ];
+        for (package, rows, accepted) in cases {
+            let manifest = host.manifest(package).unwrap();
+            let scope = tool_binding_scope(manifest).unwrap();
+            let key = scope.id().config_entry_key().unwrap();
+            let mut config = Config::default();
+            for row in &rows {
+                config
+                    .plugins
+                    .entries
+                    .push(zeroclaw_config::schema::PluginEntryConfig {
+                        name: key.clone(),
+                        config: row.clone(),
+                        ..zeroclaw_config::schema::PluginEntryConfig::default()
+                    });
+            }
+            let runtime = crate::tools::plugin_host_services(
+                Arc::clone(&host),
+                Arc::new(config.clone()),
+                None,
+            )
+            .resolve_config(&scope)
+            .map(drop);
+
+            match (
+                tool_instance_config_verdict(&config, manifest).unwrap(),
+                runtime,
+            ) {
+                (ToolConfigVerdict::Accepted, Ok(())) => {
+                    assert!(accepted, "{package} {rows:?}: both accept");
+                }
+                (
+                    ToolConfigVerdict::Refused {
+                        instance_key,
+                        error,
+                    },
+                    Err(runtime),
+                ) => {
+                    assert!(!accepted, "{package} {rows:?}: both refuse");
+                    assert_eq!(instance_key, key, "the refusal names the row it read");
+                    assert_eq!(error.to_string(), runtime.to_string());
+                }
+                (verdict, runtime) => {
+                    panic!("{package} {rows:?}: verdict {verdict:?}, runtime {runtime:?}")
+                }
+            }
+        }
+
+        let relay = host.manifest("relay").unwrap();
+        assert!(matches!(
+            tool_instance_config_verdict(&Config::default(), relay).unwrap(),
+            ToolConfigVerdict::NotATool
+        ));
     }
 
     #[test]

@@ -44,7 +44,6 @@ pub use execution::{
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
-pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
     ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
     is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
@@ -54,7 +53,11 @@ pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,
     is_model_switch_requested, is_tool_loop_cancelled,
 };
-pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
+pub(crate) use outcome::{SteeringPending, StreamCancelledAfterOutput};
+pub(crate) use outcome::{
+    current_model_switch_state, model_switch_provider_allowed,
+    scope_model_switch_provider_allowlist, scope_model_switch_state,
+};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
@@ -63,7 +66,8 @@ pub(crate) use parse_response::{
 };
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
-    ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
+    ProviderCallOutcome, announce_budget_warning, announce_llm_request, call_provider,
+    enforce_tool_loop_budget,
 };
 pub use redact::scrub_credentials;
 pub(crate) use results_collect::{
@@ -74,8 +78,10 @@ pub use steering::{
 };
 #[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
-pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
-pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};
+#[cfg(test)]
+use tool_specs::IterationToolSpecs;
+pub(crate) use tool_specs::build_iteration_tool_specs;
+pub(crate) use vision_route::prepare_messages_for_iteration;
 
 use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
@@ -84,7 +90,7 @@ use crate::agent::tool_execution::{
     should_execute_tools_in_parallel,
 };
 use crate::live_config_authority::AgentExecutionAdmission;
-use crate::security::ingress::{IngressPolicy, ingress_policy};
+use crate::security::ingress::{IngressPolicy, ingress_policy, steering_policy};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::{HashSet, VecDeque};
@@ -687,6 +693,29 @@ fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
     Some(start..end)
 }
 
+fn single_tool_round_error() -> anyhow::Error {
+    anyhow::Error::new(stream_consume::SingleToolRoundViolation::default())
+}
+
+/// Only adjust the runtime's tool protocol and transient request prompt.
+fn apply_single_tool_round_prompt(messages: &mut Vec<ChatMessage>) -> bool {
+    let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
+    if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        system.content = system.content.replace(
+            crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS,
+            &instruction,
+        );
+        if !system.content.ends_with(&instruction) {
+            system.content.push_str("\n\n");
+            system.content.push_str(&instruction);
+        }
+        false
+    } else {
+        messages.insert(0, ChatMessage::system(instruction));
+        true
+    }
+}
+
 fn replace_tool_protocol_section(
     prompt: &mut String,
     text_tools_section: &str,
@@ -704,6 +733,128 @@ fn replace_tool_protocol_section(
     if !use_native_tools && !text_tools_section.is_empty() {
         let insertion = prompt.find("## Safety").unwrap_or(prompt.len());
         prompt.insert_str(insertion, &format!("{text_tools_section}\n\n"));
+    }
+}
+
+fn apply_builtin_prompt_scope(
+    messages: &mut [ChatMessage],
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    effective_names: &HashSet<String>,
+    deferred_section: &str,
+    use_native_tools: bool,
+    strict_tool_parsing: bool,
+    max_system_prompt_chars: usize,
+    mut canonical_prompt: Option<&str>,
+) {
+    let names: HashSet<&str> = effective_names.iter().map(String::as_str).collect();
+    let instructions =
+        if use_native_tools || strict_tool_parsing || effective_names.contains("tool_search") {
+            String::new()
+        } else {
+            crate::agent::loop_::build_tool_instructions_for_names(tools_registry, &names)
+        };
+    for message in messages
+        .iter_mut()
+        .filter(|message| message.role == "system")
+    {
+        // Hooks may append instructions outside the assembly cap. Preserve an
+        // exact suffix, using the cap applied by scoped refresh to identify its base.
+        let hook_suffix = if instructions.is_empty() {
+            None
+        } else {
+            canonical_prompt
+                .take()
+                .and_then(|canonical| {
+                    message
+                        .content
+                        .strip_prefix(canonical)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            let refresh_cap = TOOL_PROTOCOL_PROMPTS
+                                .try_with(|prompts| prompts.max_chars)
+                                .unwrap_or(max_system_prompt_chars);
+                            let capped = crate::agent::system_prompt::finalize_system_prompt(
+                                canonical.to_owned(),
+                                refresh_cap,
+                            );
+                            message.content.strip_prefix(&capped).map(str::to_owned)
+                        })
+                })
+                .filter(|suffix| !suffix.is_empty())
+        };
+        if let Some(suffix) = hook_suffix.as_ref() {
+            message
+                .content
+                .truncate(message.content.len() - suffix.len());
+        }
+        // A same-agent step shares history, but its discovery route is narrower.
+        // Reconcile only the request clone, preserving unrelated prompt sections.
+        let mut catalogue_inserted = false;
+        for heading in [
+            "## Deferred Built-in Tools\n",
+            "## Tools\n",
+            "## Tool Use Protocol\n",
+        ] {
+            if heading != "## Deferred Built-in Tools\n"
+                && (use_native_tools
+                    || strict_tool_parsing
+                    || effective_names.contains("tool_search"))
+            {
+                continue;
+            }
+            let mut cursor = 0;
+            while let Some(offset) = message.content[cursor..].find(heading) {
+                let start = cursor + offset;
+                let body = start + heading.len();
+                let section_end = message.content[body..]
+                    .find("\n## ")
+                    .map_or(message.content.len(), |offset| body + offset);
+                let section_end = message.content[body..section_end]
+                    .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                    .map_or(section_end, |offset| body + offset);
+                let (end, complete) = if heading == "## Deferred Built-in Tools\n" {
+                    let close = "</available-deferred-builtin-tools>";
+                    message.content[body..section_end]
+                        .find(close)
+                        .map_or((section_end, false), |offset| {
+                            (body + offset + close.len(), true)
+                        })
+                } else {
+                    (section_end, true)
+                };
+                let catalogue = deferred_section.trim_end_matches('\n');
+                // Keep assembly's omission/budget decisions; projection may only shrink.
+                let replacement = if heading == "## Deferred Built-in Tools\n"
+                    && complete
+                    && !catalogue_inserted
+                    && catalogue.chars().count() <= message.content[start..end].chars().count()
+                {
+                    catalogue_inserted = true;
+                    catalogue
+                } else {
+                    ""
+                };
+                message.content.replace_range(start..end, replacement);
+                cursor = start + replacement.len();
+            }
+        }
+        if !instructions.is_empty() {
+            // Keep orientation at the tail so finalization cannot retain it twice.
+            let insertion = message
+                .content
+                .find(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                .unwrap_or(message.content.len());
+            message
+                .content
+                .insert_str(insertion, &format!("\n{instructions}"));
+            message.content = crate::agent::system_prompt::finalize_system_prompt(
+                std::mem::take(&mut message.content),
+                max_system_prompt_chars,
+            );
+            if let Some(suffix) = hook_suffix {
+                message.content.push_str(&suffix);
+            }
+        }
     }
 }
 
@@ -814,6 +965,7 @@ async fn projected_provider_facing_tokens(
         .round() as usize
 }
 
+#[derive(Debug)]
 pub(crate) struct ReportedRequestUsage {
     provider_name: String,
     model: String,
@@ -869,11 +1021,18 @@ fn dispatch_trim_budget(limits: zeroclaw_config::schema::ResolvedContextLimits) 
     }
 }
 
+/// The uncalibrated estimate of a request and its shares, carried into the
+/// overflow error so the operator can see what filled the window:
+/// `(raw_estimated_tokens, system_tokens, tool_schema_tokens)`. All three are
+/// in raw-estimate units; calibration is applied only to the total.
+type RequestShares = (usize, usize, usize);
+
 fn context_window_exceeded_error(
     (provider_name, model): (&str, &str),
     limits: zeroclaw_config::schema::ResolvedContextLimits,
     tokens: u64,
     token_source: zeroclaw_api::agent::TokenCountSource,
+    (raw_estimated_tokens, system_tokens, tool_schema_tokens): RequestShares,
 ) -> anyhow::Error {
     let span = ::zeroclaw_log::info_span!(
         target: "zeroclaw_log_internal_scope",
@@ -894,12 +1053,18 @@ fn context_window_exceeded_error(
                 "model_context_window": limits.model_context_window,
                 "model_context_window_source": format!("{:?}", limits.model_context_window_source),
                 "context_token_budget": limits.context_token_budget,
+                "raw_estimated_tokens": raw_estimated_tokens,
+                "system_tokens": system_tokens,
+                "tool_schema_tokens": tool_schema_tokens,
             })),
         "Provider-facing request exceeds the active model context window"
     );
     ContextWindowExceeded {
         estimated_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
         model_context_window: limits.model_context_window,
+        raw_estimated_tokens,
+        system_tokens,
+        tool_schema_tokens,
     }
     .into()
 }
@@ -1414,13 +1579,44 @@ async fn emit_rejected_attempt_usage(
                     provider_ref: billable.attempt.provider_ref().to_string(),
                     model: billable.attempt.model().to_string(),
                     accepted: false,
+                    // Rejected billing telemetry never feeds the context
+                    // meter, so it carries no display estimate.
+                    estimated_input_tokens: None,
                 })
                 .await;
         }
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+/// The Agent wrapper admits steering before history insertion. Admit only
+/// the original user message, or skip admission on subsequent rounds.
+pub(crate) enum InitialIngressSubject<'a> {
+    Original(&'a str),
+    AlreadyAdmitted,
+}
+
+/// `reported_usage` is the last provider-reported usage from a run that
+/// yielded with `SteeringPending`, so the resumed run calibrates its first
+/// dispatch exactly as the yielded run would have.
+pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
+    p: ToolLoop<'a>,
+    subject: InitialIngressSubject<'a>,
+    reported_usage: Option<ReportedRequestUsage>,
+) -> impl std::future::Future<Output = Result<String>> + 'a {
+    run_tool_call_loop_impl(p, Some(subject), reported_usage)
+}
+
+pub fn run_tool_call_loop(
+    p: ToolLoop<'_>,
+) -> impl std::future::Future<Output = Result<String>> + '_ {
+    run_tool_call_loop_impl(p, None, None)
+}
+
+async fn run_tool_call_loop_impl<'a>(
+    mut p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+    seed_reported_usage: Option<ReportedRequestUsage>,
+) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -1494,6 +1690,18 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
+    // Config-backed loops resolve the executing alias; configless Agent turns
+    // already carry this cap in their transient protocol context. Zero is unlimited.
+    let max_system_prompt_chars = config
+        .zip(agent_alias)
+        .map(|(config, alias)| config.effective_max_system_prompt_chars(alias))
+        .or_else(|| {
+            TOOL_PROTOCOL_PROMPTS
+                .try_with(|prompts| prompts.max_chars)
+                .ok()
+        })
+        .unwrap_or(0);
+
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
@@ -1513,30 +1721,38 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         );
     }
 
-    let p1_text = turn_state
-        .history
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map_or("", |m| m.content.as_str());
-    match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
-        // DEFAULT — the only arm reachable under the default policy. Proceed
-        // into the loop exactly as today.
-        IngressDecision::Loop => {}
-        // Phase 3: wrap the message as untrusted data before it enters history.
-        // Until framing exists, proceed as Loop (behavior-identical).
-        IngressDecision::Annotate { .. } => {}
-        // Phase 2: divert the turn into a managed SOP run instead of the loop.
-        // Not reachable under the default policy; proceed-as-loop for now.
-        IngressDecision::Gate { .. } => {
-            // TODO(PR C): hand this turn to the SOP run the gate names.
-        }
-        // Not reachable under the default policy; refuse the turn when it is.
-        IngressDecision::Drop { ref reason } => {
-            return Ok(crate::i18n::get_required_cli_string_with_args(
-                "turn-ingress-dropped",
-                &[("reason", reason.as_str())],
-            ));
+    let p1_text = match &initial_ingress {
+        Some(InitialIngressSubject::Original(text)) => Some(*text),
+        Some(InitialIngressSubject::AlreadyAdmitted) => None,
+        None => Some(
+            turn_state
+                .history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map_or("", |m| m.content.as_str()),
+        ),
+    };
+    if let Some(p1_text) = p1_text {
+        match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
+            // DEFAULT — the only arm reachable under the default policy. Proceed
+            // into the loop exactly as today.
+            IngressDecision::Loop => {}
+            // Phase 3: wrap the message as untrusted data before it enters history.
+            // Until framing exists, proceed as Loop (behavior-identical).
+            IngressDecision::Annotate { .. } => {}
+            // Phase 2: divert the turn into a managed SOP run instead of the loop.
+            // Not reachable under the default policy; proceed-as-loop for now.
+            IngressDecision::Gate { .. } => {
+                // TODO(PR C): hand this turn to the SOP run the gate names.
+            }
+            // Not reachable under the default policy; refuse the turn when it is.
+            IngressDecision::Drop { ref reason } => {
+                return Ok(crate::i18n::get_required_cli_string_with_args(
+                    "turn-ingress-dropped",
+                    &[("reason", reason.as_str())],
+                ));
+            }
         }
     }
 
@@ -1609,6 +1825,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
+    let mut single_tool_limitation_reported = false;
     let mut malformed_tool_protocol_retries: usize = 0;
     // Text withheld by the streaming text guard on a previous attempt,
     // stored with its trailing whitespace trimmed. A repeat that is
@@ -1656,7 +1873,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
     // Usage describes the completed request, not a prediction of the next
     // hook-selected model, schemas, or prepared messages.
-    let mut pending_reported_usage: Option<ReportedRequestUsage> = None;
+    let mut pending_reported_usage: Option<ReportedRequestUsage> = seed_reported_usage;
+    // One `BudgetWarning` per turn at most (see `announce_budget_warning`).
+    let mut budget_warning_sent = false;
 
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
@@ -1686,35 +1905,65 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             });
         let excluded_tools: &[String] = step_scoped_excluded.as_deref().unwrap_or(excluded_tools);
 
-        for steering_input in drain_steering_messages(&mut steering) {
-            // This loop cannot narrow its registry mid-run, so it admits only
-            // a sender that is still authorized and whose posture narrows
-            // nothing; anything else is dropped rather than run with more
-            // than the sender now holds.
-            match steering_input.admit() {
-                SteeringAdmission::Admitted(posture) if posture == SteeringPosture::default() => {}
-                _ => continue,
-            }
-            let steering_message = steering_input.into_text();
-            match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
-                // DEFAULT — append the injection to history exactly as today.
-                IngressDecision::Loop => {}
-                // Phase 3: frame as untrusted data; proceed as Loop until
-                // framing exists (behavior-identical).
-                IngressDecision::Annotate { .. } => {}
-                // Phase 2: divert this injection into the SOP run rather than
-                // history. Not reachable under the default policy.
-                IngressDecision::Gate { .. } => {
-                    // TODO(PR C): route this steering message into the gated
-                    // SOP run instead of appending it to history.
+        if knobs.yield_to_steering {
+            // The caller judges steering; this loop only hands control back
+            // once a tool round has finished and a message is waiting. A
+            // model switch queued by that round goes first: the switch check
+            // below returns it, the caller applies it, and the steering is
+            // taken at the top of the caller's next round on the new model.
+            let switch_pending = model_switch_callback.as_ref().is_some_and(|callback| {
+                callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(|(p, m)| p != provider_name || m != model)
+            });
+            if iteration > 0
+                && !switch_pending
+                && steering.as_deref().is_some_and(|rx| !rx.is_empty())
+            {
+                *history_has_trim_breadcrumb = turn_state.crumb_present;
+                return Err(SteeringPending {
+                    display_text: accumulated_display_text,
+                    reported_usage: pending_reported_usage.take(),
                 }
-                // Not reachable under the default policy; drop the injection
-                // (do not append it) when it is.
-                IngressDecision::Drop { .. } => continue,
+                .into());
             }
-            let msg = ChatMessage::user(steering_message);
-            has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
-            turn_state.push_dual(msg);
+        } else {
+            for steering_input in drain_steering_messages(&mut steering) {
+                // This loop cannot narrow its registry mid-run, so it admits only
+                // a sender that is still authorized and whose posture narrows
+                // nothing; anything else is dropped rather than run with more
+                // than the sender now holds.
+                match steering_input.admit() {
+                    SteeringAdmission::Admitted(posture)
+                        if posture == SteeringPosture::default() => {}
+                    _ => continue,
+                }
+                match steering_policy(
+                    steering_input.text(),
+                    steering_input.ingress(),
+                    &ingress_policy_cfg,
+                ) {
+                    // DEFAULT — append the injection to history exactly as today.
+                    IngressDecision::Loop => {}
+                    // Phase 3: frame as untrusted data; proceed as Loop until
+                    // framing exists (behavior-identical).
+                    IngressDecision::Annotate { .. } => {}
+                    // Phase 2: divert this injection into the SOP run rather than
+                    // history. Not reachable under the default policy.
+                    IngressDecision::Gate { .. } => {
+                        // TODO(PR C): route this steering message into the gated
+                        // SOP run instead of appending it to history.
+                    }
+                    // Not reachable under the default policy; drop the injection
+                    // (do not append it) when it is.
+                    IngressDecision::Drop { .. } => continue,
+                }
+                let msg = ChatMessage::user(steering_input.into_text());
+                has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
+                turn_state.push_dual(msg);
+            }
         }
 
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -1822,17 +2071,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
-            config,
-            model_provider,
-            turn_state.history,
-            multimodal_config,
-            provider_name,
-            model,
-            dispatch_model,
-            security,
-        )
-        .await?;
+        let (vision_model_provider_box, degrade_strip_images) =
+            vision_route::resolve_vision_provider_with_allowed_refs(
+                config,
+                model_provider,
+                turn_state.history,
+                multimodal_config,
+                provider_name,
+                model,
+                dispatch_model,
+                security,
+                knobs.provider_attempt_allowlist.as_deref(),
+            )
+            .await?;
 
         let (
             active_model_provider,
@@ -1859,7 +2110,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let (prepared_messages, prepared_source_rows) =
+        let (prepared_messages, mut prepared_source_rows) =
             vision_route::prepare_messages_with_source_rows(
                 turn_state.history,
                 multimodal_config,
@@ -1983,11 +2234,36 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             });
         }
         iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
-        let IterationToolSpecs {
-            ref tool_specs,
-            use_native_tools,
-            ..
-        } = iteration_tool_specs;
+        let tool_specs = iteration_tool_specs.request_tool_specs();
+        let use_native_tools = iteration_tool_specs.use_native_tools;
+        let builtin_prompt_section = activated_tools.and_then(|state| {
+            let state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.has_deferred_builtin_schemas().then(|| {
+                if iteration_tool_specs
+                    .known_tool_names
+                    .contains("tool_search")
+                    && (use_native_tools || !strict_tool_parsing)
+                {
+                    state.deferred_builtin_prompt_section_filtered(|name| {
+                        iteration_tool_specs.known_tool_names.contains(name)
+                    })
+                } else {
+                    String::new()
+                }
+            })
+        });
+
+        let single_tool_rounds_requested = config
+            .zip(agent_alias)
+            .is_some_and(|(config, alias)| config.effective_single_tool_rounds(alias));
+        let policy = if single_tool_rounds_requested
+            && use_native_tools
+            && active_model_provider.supports_single_tool_rounds(provider_dispatch_model)
+        {
+            zeroclaw_api::model_provider::ToolRoundPolicy::Single
+        } else {
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch
+        };
 
         // Tool protocol selection follows the provider-facing selector. Direct
         // Agent turns also refresh their scoped complete prompt after a hook
@@ -1999,6 +2275,29 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &mut provider_request_messages,
             use_native_tools,
         );
+        if let Some(section) = builtin_prompt_section.as_deref() {
+            apply_builtin_prompt_scope(
+                &mut provider_request_messages,
+                tools_registry,
+                &iteration_tool_specs.known_tool_names,
+                section,
+                use_native_tools,
+                strict_tool_parsing,
+                max_system_prompt_chars,
+                turn_state
+                    .history
+                    .iter()
+                    .find(|message| message.role == "system")
+                    .map(|message| message.content.as_str()),
+            );
+        }
+        if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && apply_single_tool_round_prompt(&mut provider_request_messages)
+        {
+            // A request-only system row must survive whole-turn trimming.
+            prepared_source_rows.insert(0, usize::MAX);
+        }
+
         if context_token_budget > 0 {
             let system_floor =
                 crate::agent::history::estimate_system_floor_tokens(&provider_request_messages);
@@ -2147,6 +2446,25 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     &mut trimmed_post_hook,
                     use_native_tools,
                 );
+                if let Some(section) = builtin_prompt_section.as_deref() {
+                    apply_builtin_prompt_scope(
+                        &mut trimmed_post_hook,
+                        tools_registry,
+                        &iteration_tool_specs.known_tool_names,
+                        section,
+                        use_native_tools,
+                        strict_tool_parsing,
+                        max_system_prompt_chars,
+                        turn_state
+                            .history
+                            .iter()
+                            .find(|message| message.role == "system")
+                            .map(|message| message.content.as_str()),
+                    );
+                }
+                if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single {
+                    apply_single_tool_round_prompt(&mut trimmed_post_hook);
+                }
                 provider_request_messages = trimmed_post_hook;
                 reported_population_estimated =
                     crate::agent::history::estimate_history_tokens(&provider_request_messages)
@@ -2285,6 +2603,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 active_context_limits,
                 retained_tokens,
                 dispatch_token_source,
+                (
+                    reported_population_estimated,
+                    crate::agent::history::estimate_system_floor_tokens(&provider_request_messages),
+                    tool_schema_tokens,
+                ),
             ));
         }
 
@@ -2318,8 +2641,26 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
         // state, and a rejected turn never reaches the provider — announcing
         // first would claim the agent is waiting on a model that is never
-        // called.
+        // called. The warning goes first so a turn that is about to be
+        // stopped by the hard limit is never the first sign of trouble.
+        announce_budget_warning(event_tx.as_ref(), &mut budget_warning_sent);
         enforce_tool_loop_budget()?;
+
+        if single_tool_rounds_requested
+            && !tool_specs.is_empty()
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Batch
+            && !single_tool_limitation_reported
+        {
+            let notice =
+                crate::i18n::get_required_cli_string("turn-single-tool-rounds-unsupported");
+            let notice = format!("{notice}\n\n");
+            accumulated_display_text.push_str(&notice);
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &notice).await;
+            if let Some(tx) = on_delta.as_ref() {
+                let _ = tx.send(StreamDelta::Text(notice)).await;
+            }
+            single_tool_limitation_reported = true;
+        }
 
         if strict_tool_parsing
             && !tool_specs.is_empty()
@@ -2338,7 +2679,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
-            Some(tool_specs.as_slice())
+            Some(tool_specs)
         } else {
             None
         };
@@ -2400,11 +2741,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             active_model_provider_name,
             provider_request_model,
             provider_dispatch_model,
-            &provider_request_messages,
+            zeroclaw_api::model_provider::ChatRequest {
+                messages: &provider_request_messages,
+                tools: request_tools,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
             image_recovery_messages.as_deref(),
-            request_tools,
             should_consume_provider_stream,
+            policy,
             iteration,
+            use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
@@ -2487,6 +2836,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // success with no final text and no tool calls cannot complete a turn.
         // This runs before response-success telemetry and history mutation.
         let chat_result = chat_result.and_then(|response| {
+            if policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+                && iteration_tool_specs.exceeds_single_tool_round(&response, strict_tool_parsing)
+            {
+                return Err(single_tool_round_error());
+            }
             if response.is_semantically_empty_terminal() {
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
@@ -2975,6 +3329,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .await
                 }
             });
+        let execution = scope_model_switch_provider_allowlist(
+            knobs.provider_attempt_allowlist.clone(),
+            execution,
+        );
         let execution_result = match shared_budget.clone() {
             Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
             None => execution.await,
@@ -4108,7 +4466,16 @@ async fn drive_live_sop_actions(
                                                 None => security,
                                             },
                                             multimodal_config,
-                                            config,
+                                            config: if owned.is_some() {
+                                                Some(execution_config.as_deref().unwrap_or(
+                                                    sop_reassembly
+                                                        .as_ref()
+                                                        .expect("owned implies a reassembly handle")
+                                                        .config,
+                                                ))
+                                            } else {
+                                                config
+                                            },
                                             hooks,
                                             activated_tools: eff_activated,
                                             // Deliberately NOT the outer round's
@@ -4410,6 +4777,34 @@ fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
 mod surface3_tests {
     use super::*;
     use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+
+    #[test]
+    fn single_tool_prompt_changes_only_owned_protocol_and_is_idempotent() {
+        let protocol = crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+        let instruction = crate::i18n::get_required_cli_string("turn-single-tool-rounds-prompt");
+        let user = ChatMessage::user(format!("Quote this unchanged: {protocol}"));
+        let mut messages = vec![
+            ChatMessage::system(format!(
+                "Personality stays.\n{protocol}Other instructions stay."
+            )),
+            user.clone(),
+        ];
+        assert!(!apply_single_tool_round_prompt(&mut messages));
+        assert!(messages[0].content.starts_with("Personality stays.\n"));
+        assert!(messages[0].content.contains("Other instructions stay."));
+        assert!(!messages[0].content.contains(protocol));
+        assert!(messages[0].content.ends_with(&instruction));
+        assert_eq!(messages[1].content, user.content);
+        let once = messages[0].content.clone();
+        assert!(!apply_single_tool_round_prompt(&mut messages));
+        assert_eq!(messages[0].content, once);
+
+        let mut no_system = vec![user.clone()];
+        assert!(apply_single_tool_round_prompt(&mut no_system));
+        assert_eq!(no_system[0].role, "system");
+        assert_eq!(no_system[0].content, instruction);
+        assert_eq!(no_system[1].content, user.content);
+    }
 
     fn make_system_prompt(anchor: &str) -> ChatMessage {
         ChatMessage::system(format!(
@@ -5983,6 +6378,7 @@ mod active_route_context_tests {
         };
         let specs = IterationToolSpecs {
             tool_specs: Vec::new(),
+            exposed_tool_specs: None,
             known_tool_names: HashSet::new(),
             use_native_tools: false,
         };
@@ -6695,6 +7091,7 @@ mod sop_step_reassembly_tests {
             },
             ..Config::default()
         };
+        config.tools.optional = vec!["file_download".into()];
         config.risk_profiles.insert(
             "stepper".to_string(),
             RiskProfileConfig {
@@ -7104,6 +7501,230 @@ mod sop_step_reassembly_tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn builtin_search_fallback_preserves_strict_policy_and_scoped_replay() {
+        let tools: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(NamedTool("allowed_tool")),
+            Box::new(NamedTool("denied_tool")),
+        ];
+        let names = HashSet::from(["allowed_tool".to_string()]);
+        let prompt = "## Tools\nParent tools.\n\n## Tool Use Protocol\nParent protocol.\n\n## Safety\nKeep safety guidance.\n\n## Hardware Access\nKeep hardware guidance.\n\n## Deferred Built-in Tools\n<available-deferred-builtin-tools>\nallowed_tool\ndenied_tool\n</available-deferred-builtin-tools>\n\n## Context\nKeep context.";
+        let mut history = vec![ChatMessage::system(prompt), ChatMessage::user(prompt)];
+        let mut request = history.clone();
+        let prompts = Arc::new(ToolProtocolPrompts::new(prompt.into(), prompt.into()));
+        scope_tool_protocol_prompts(prompts, async {
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false, 0, None);
+            // Trim rebuilds the projected request, then refreshes the cached section.
+            refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+            apply_builtin_prompt_scope(&mut request, &tools, &names, "", false, false, 0, None);
+        })
+        .await;
+        assert_eq!(
+            request[0].content.matches("## Tool Use Protocol").count(),
+            1
+        );
+        assert_eq!(request[0].content.matches("**allowed_tool**").count(), 1);
+        assert!(!request[0].content.contains("denied_tool"));
+        assert!(
+            !request[0]
+                .content
+                .contains("available-deferred-builtin-tools")
+        );
+        for section in [
+            "Keep safety guidance.",
+            "Keep hardware guidance.",
+            "Keep context.",
+        ] {
+            assert!(request[0].content.contains(section));
+        }
+        assert_eq!(request[1].content, prompt);
+        assert_eq!(history[0].content, prompt);
+
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let uncapped = format!("Identity: \u{03bb}\u{732b}\n{prompt}{orientation}");
+        for (cap, hook) in [
+            (orientation.chars().count() + 30, ""),
+            (orientation.chars().count() + 30, "\nHOOK_INSTRUCTION"),
+            (10_000, ""),
+            (0, ""),
+        ] {
+            let input = crate::agent::system_prompt::finalize_system_prompt(uncapped.clone(), cap);
+            let mut history = vec![ChatMessage::system(&input)];
+            let mut request = history.clone();
+            let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(
+                uncapped.clone(),
+                uncapped.clone(),
+                cap,
+            ));
+            scope_tool_protocol_prompts(prompts, async {
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+                let parent = history[0].content.clone();
+                for _ in 0..2 {
+                    if !hook.is_empty() {
+                        // Content-mutating hooks run once per request, not during trim.
+                        request = vec![ChatMessage::system(format!("{parent}{hook}"))];
+                    }
+                    refresh_scoped_tool_protocol_prompt(&mut history, &mut request, false);
+                    apply_builtin_prompt_scope(
+                        &mut request,
+                        &tools,
+                        &names,
+                        "",
+                        false,
+                        false,
+                        cap,
+                        Some(&parent),
+                    );
+                    let base = request[0]
+                        .content
+                        .strip_suffix(hook)
+                        .expect("hook suffix survives");
+                    assert!(cap == 0 || base.chars().count() <= cap);
+                    assert!(base.ends_with(orientation));
+                    assert_eq!(base.matches(orientation).count(), 1);
+                    assert!(!request[0].content.contains("denied_tool"));
+                    if cap == 0 || cap == 10_000 {
+                        assert!(request[0].content.contains("**allowed_tool**"));
+                        assert!(request[0].content.contains("## Tool Use Protocol"));
+                    }
+                    assert_eq!(history[0].content, parent);
+                }
+            })
+            .await;
+        }
+
+        let mut activated = crate::tools::ActivatedToolSet::new();
+        activated.set_deferred_builtin_specs(tools.iter().map(|tool| tool.spec()).collect());
+        let search_names = HashSet::from(["allowed_tool".to_string(), "tool_search".to_string()]);
+        let section =
+            activated.deferred_builtin_prompt_section_filtered(|name| search_names.contains(name));
+        let catalogue = &prompt[prompt.find("## Deferred Built-in Tools").unwrap()
+            ..prompt.find("\n\n## Context").unwrap()];
+        let too_small = catalogue.to_string();
+        let prompt = prompt.replace(
+            catalogue,
+            activated
+                .deferred_builtin_prompt_section()
+                .trim_end_matches('\n'),
+        );
+        let catalogue = &prompt[prompt.find("## Deferred Built-in Tools").unwrap()
+            ..prompt.find("\n\n## Context").unwrap()];
+        let incomplete = catalogue.replace("</available-deferred-builtin-tools>", "");
+        let orientation = crate::agent::prompt::TIMESTAMP_ORIENTATION;
+        let truncated_cap = prompt[..prompt.find("</available-deferred-builtin-tools>").unwrap()]
+            .chars()
+            .count()
+            + orientation.chars().count();
+        let truncated = crate::agent::system_prompt::finalize_system_prompt(
+            format!("{prompt}{orientation}"),
+            truncated_cap,
+        );
+        let omitted_cap = prompt[..prompt.find("## Deferred Built-in Tools").unwrap()]
+            .chars()
+            .count()
+            + orientation.chars().count();
+        let omitted = crate::agent::system_prompt::finalize_system_prompt(
+            format!("{prompt}{orientation}"),
+            omitted_cap,
+        );
+        assert!(truncated.contains(orientation));
+        assert!(!truncated.contains("</available-deferred-builtin-tools>"));
+        assert!(!omitted.contains("## Deferred Built-in Tools"));
+        for (input, native, catalogue_count, cap) in [
+            (format!("{prompt}\n{catalogue}"), false, 1, None),
+            (format!("{prompt}\n{catalogue}"), true, 1, None),
+            (
+                format!("{incomplete}\n## Context\nKeep context.\n{catalogue}"),
+                false,
+                1,
+                None,
+            ),
+            (truncated.clone(), false, 0, Some(truncated_cap)),
+            (truncated.clone(), true, 0, Some(truncated_cap)),
+            (omitted.clone(), false, 0, Some(omitted_cap)),
+            (omitted.clone(), true, 0, Some(omitted_cap)),
+            (too_small, false, 0, None),
+        ] {
+            let mut history = vec![ChatMessage::system(&input)];
+            let mut request = vec![ChatMessage::system(&input), ChatMessage::user(&prompt)];
+            let prompts = Arc::new(ToolProtocolPrompts::new(input.clone(), input.clone()));
+            scope_tool_protocol_prompts(prompts, async {
+                refresh_scoped_tool_protocol_prompt(&mut history, &mut request, native);
+                let parent_prompt = history[0].content.clone();
+                for _ in 0..2 {
+                    refresh_scoped_tool_protocol_prompt(&mut history, &mut request, native);
+                    let before_chars = request[0].content.chars().count();
+                    apply_builtin_prompt_scope(
+                        &mut request,
+                        &tools,
+                        &search_names,
+                        &section,
+                        native,
+                        false,
+                        cap.unwrap_or(0),
+                        None,
+                    );
+                    assert!(request[0].content.chars().count() <= before_chars);
+                    if let Some(cap) = cap {
+                        assert!(request[0].content.chars().count() <= cap);
+                    }
+                    assert_eq!(history[0].content, parent_prompt);
+                }
+            })
+            .await;
+            assert_eq!(
+                request[0]
+                    .content
+                    .matches("<available-deferred-builtin-tools>")
+                    .count(),
+                catalogue_count
+            );
+            assert_eq!(
+                request[0].content.contains("allowed_tool - "),
+                catalogue_count == 1
+            );
+            assert!(!request[0].content.contains("denied_tool"));
+            if input.contains("Keep context.") {
+                assert!(request[0].content.contains("Keep context."));
+            }
+            if input.contains(crate::agent::prompt::TIMESTAMP_ORIENTATION) {
+                assert!(
+                    request[0]
+                        .content
+                        .contains(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+                );
+            }
+            assert_eq!(request[1].content, prompt);
+        }
+        assert_eq!(activated.hidden_builtin_names().len(), 2);
+
+        let strict_prompt = &prompt[prompt.find("## Safety").unwrap()..];
+        let mut strict = vec![ChatMessage::system(strict_prompt)];
+        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true, 0, None);
+        assert!(
+            !strict[0]
+                .content
+                .contains("available-deferred-builtin-tools")
+        );
+        assert!(!strict[0].content.contains("## Tool Use Protocol"));
+        assert!(!strict[0].content.contains("**allowed_tool**"));
+        assert!(strict[0].content.contains("Keep hardware guidance."));
+        let mut strict = vec![ChatMessage::system(truncated)];
+        apply_builtin_prompt_scope(&mut strict, &tools, &search_names, "", false, true, 0, None);
+        assert!(!strict[0].content.contains("denied_tool"));
+        assert!(
+            !strict[0]
+                .content
+                .contains("available-deferred-builtin-tools")
+        );
+        assert!(
+            strict[0]
+                .content
+                .contains(crate::agent::prompt::TIMESTAMP_ORIENTATION)
+        );
     }
 
     struct BudgetToolCallingProvider;
