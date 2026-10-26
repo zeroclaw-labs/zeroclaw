@@ -984,6 +984,13 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     const reloadSequence = useRef(0);
     const sharedDraftsRef = useRef(configDraft.drafts);
     sharedDraftsRef.current = configDraft.drafts;
+    const savingDraftsRef = useRef(configDraft.savingDrafts);
+    savingDraftsRef.current = configDraft.savingDrafts;
+    const hasLoadedRef = useRef(false);
+    const lastReloadStateRef = useRef({
+      prefix,
+      saveAllVersion: configDraft.saveAllVersion,
+    });
 
     // When this form edits a channel block (`channels.<type>.<alias>`), its
     // `excluded_tools` ToolPicker should list the OWNING agent's scoped tools
@@ -1037,20 +1044,26 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       [schema],
     );
 
-    const reload = async () => {
+    const reload = async (background = false) => {
       const requestId = ++reloadSequence.current;
-      setLoading(true);
-      setTopError(null);
+      if (!background) {
+        setLoading(true);
+        setTopError(null);
+      }
       try {
         const resp = await listProps(prefix);
         if (requestId !== reloadSequence.current) return;
         setEntries(resp.entries);
+        setTopError(null);
         const seed: Record<string, string> = {};
         const commentSeed: Record<string, string> = {};
         for (const e of resp.entries) {
           const staged = sharedDraftsRef.current[e.path];
           const savedInput = defaultInputValue(e);
-          if (staged?.input === savedInput) {
+          if (
+            staged?.input === savedInput &&
+            savingDraftsRef.current[e.path] === undefined
+          ) {
             configDraft.clearDraftIfInput(e.path, staged.input);
           }
           seed[e.path] = staged?.input ?? savedInput;
@@ -1059,6 +1072,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         }
         setDraft(seed);
         setComments(commentSeed);
+        hasLoadedRef.current = true;
       } catch (e) {
         if (requestId !== reloadSequence.current) return;
         if (e instanceof ApiError) {
@@ -1069,12 +1083,25 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           );
         }
       } finally {
-        if (requestId === reloadSequence.current) setLoading(false);
+        if (!background && requestId === reloadSequence.current) {
+          setLoading(false);
+        }
       }
     };
 
     useEffect(() => {
-      void reload();
+      const previous = lastReloadStateRef.current;
+      const prefixChanged = previous.prefix !== prefix;
+      const saveAllChanged =
+        previous.saveAllVersion !== configDraft.saveAllVersion;
+      lastReloadStateRef.current = {
+        prefix,
+        saveAllVersion: configDraft.saveAllVersion,
+      };
+      if (prefixChanged) hasLoadedRef.current = false;
+      const background =
+        !prefixChanged && saveAllChanged && hasLoadedRef.current;
+      void reload(background);
       return () => {
         reloadSequence.current += 1;
       };
@@ -1214,7 +1241,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     const applyFieldValue = (f: ListResponseEntry, v: string) => {
       setDraft((d) => ({ ...d, [f.path]: v }));
       const submittedInput = configDraft.savingDrafts[f.path]?.input;
-      const baseline = submittedInput ?? defaultInputValue(f);
+      const baseline = defaultInputValue(f);
       if (
         (v === baseline && submittedInput === undefined) ||
         (f.is_secret && v.length === 0)
