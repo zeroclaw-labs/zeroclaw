@@ -273,15 +273,17 @@ pub fn context_floor_remediation(system_floor: usize, budget: usize) -> String {
     )
 }
 
-/// True when the non-droppable system floor alone stays under the context
-/// budget, so whole-turn history trimming still has room to bring a request
-/// under it. A zero budget disables proactive trimming and never hard-stops.
+/// True when the non-droppable request floor stays under the context budget,
+/// so whole-turn history trimming still has room to bring a request under
+/// it. The `system_floor` operand is the caller-measured floor: the system
+/// messages plus, when the request carries them, the native tool definitions
+/// serialized into the same request — no history trim can reduce either
+/// share. A zero budget disables proactive trimming and never hard-stops.
 /// When this is false, and the operator budget (not model capacity) is the
-/// binding constraint, the caller refuses the request before dispatch: no
-/// trim can reduce the system floor, so the provider would receive a request
-/// the operator's budget already rejects. When the budget reaches model
-/// capacity the caller leaves the refusal to the capacity check, which
-/// reports the model-window remediation instead.
+/// binding constraint, the caller refuses the request before dispatch: the
+/// provider would receive a request the operator's budget already rejects.
+/// When the budget reaches model capacity the caller leaves the refusal to
+/// the capacity check, which reports the model-window remediation instead.
 #[must_use]
 pub fn system_floor_within_budget(system_floor: usize, context_token_budget: usize) -> bool {
     context_token_budget == 0 || system_floor < context_token_budget
