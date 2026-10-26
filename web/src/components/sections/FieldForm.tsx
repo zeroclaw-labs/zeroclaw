@@ -986,6 +986,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     sharedDraftsRef.current = configDraft.drafts;
     const savingDraftsRef = useRef(configDraft.savingDrafts);
     savingDraftsRef.current = configDraft.savingDrafts;
+    const refreshInFlightRef = useRef(false);
     const hasLoadedRef = useRef(false);
     const lastReloadStateRef = useRef({
       prefix,
@@ -1046,6 +1047,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
 
     const reload = async (background = false) => {
       const requestId = ++reloadSequence.current;
+      refreshInFlightRef.current = true;
       if (!background) {
         setLoading(true);
         setTopError(null);
@@ -1083,7 +1085,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           );
         }
       } finally {
-        if (!background && requestId === reloadSequence.current) {
+        if (requestId === reloadSequence.current) {
+          refreshInFlightRef.current = false;
           setLoading(false);
         }
       }
@@ -1243,7 +1246,9 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       const submittedInput = configDraft.savingDrafts[f.path]?.input;
       const baseline = defaultInputValue(f);
       if (
-        (v === baseline && submittedInput === undefined) ||
+        (v === baseline &&
+          submittedInput === undefined &&
+          !refreshInFlightRef.current) ||
         (f.is_secret && v.length === 0)
       ) {
         configDraft.clearDraft(f.path);

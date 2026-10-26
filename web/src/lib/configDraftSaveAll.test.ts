@@ -287,7 +287,23 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       "background refresh should not replace the form with a spinner",
     );
     await act(async () => {
-      releasePendingList?.();
+      originalSwitch.click();
+    });
+    assert.equal(
+      originalSwitch.getAttribute("aria-checked"),
+      "false",
+      "an edit made during the background refresh should remain visible",
+    );
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /1 unsaved change/,
+      "an edit matching the old baseline must remain staged until refresh completes",
+    );
+    const finishFirstRefresh = releasePendingList;
+    releasePendingList = undefined;
+    assert.ok(finishFirstRefresh, "expected the delayed baseline request");
+    await act(async () => {
+      finishFirstRefresh();
       await flushEffects();
     });
     assert.strictEqual(
@@ -297,28 +313,44 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       originalSwitch,
       "refresh completion should keep the same switch DOM node mounted",
     );
-    assert.match(
-      domWindow.document.body.textContent ?? "",
-      /No unsaved changes/,
-    );
     assert.equal(
       domWindow.document
         .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
         ?.getAttribute("aria-checked"),
-      "true",
+      "false",
     );
-    const groupSaveButton = findButton(domWindow.document, "Save");
-    assert.equal(groupSaveButton.disabled, true);
+    assert.strictEqual(
+      domWindow.document.activeElement,
+      originalSwitch,
+      "background refresh should preserve field focus through completion",
+    );
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /1 unsaved change/,
+      "the edit should be compared with the refreshed server value",
+    );
+
+    // Save the edit against the refreshed baseline before exercising the
+    // separate in-flight PATCH and section-reload race below.
+    await act(async () => {
+      findButton(domWindow.document, "Save all").click();
+      await flushEffects();
+    });
+    assert.equal(savedValue, false);
+    assert.equal(patches.length, 2);
+    assert.match(
+      domWindow.document.body.textContent ?? "",
+      /No unsaved changes/,
+    );
+    assert.equal(findButton(domWindow.document, "Save").disabled, true);
 
     await act(async () => {
-      domWindow.document.querySelector<HappyHTMLButtonElement>(
-        'button[role="switch"]',
-      )?.click();
+      originalSwitch.click();
     });
     assert.match(
       domWindow.document.body.textContent ?? "",
       /1 unsaved change/,
-      "a change back to the old value must be compared with the new baseline",
+      "a subsequent edit must be compared with the refreshed baseline",
     );
 
     delayNextPatch = true;
@@ -326,7 +358,7 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       findButton(domWindow.document, "Save all").click();
       await flushEffects();
     });
-    assert.equal(patches.length, 2);
+    assert.equal(patches.length, 3);
     assert.ok(releasePendingPatch, "expected the second patch to be pending");
 
     await act(async () => {
@@ -346,20 +378,23 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       domWindow.document
         .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
         ?.getAttribute("aria-checked"),
-      "true",
-      "a prefix reload must preserve a draft for a path with a save in flight",
+      "false",
+      "a prefix reload must preserve a draft matching the old baseline while the save is in flight",
     );
+    const finishSectionSave = releasePendingPatch;
+    releasePendingPatch = undefined;
+    assert.ok(finishSectionSave, "expected the delayed section save");
     await act(async () => {
-      releasePendingPatch?.();
+      finishSectionSave();
       await flushEffects();
     });
 
-    assert.equal(savedValue, false);
+    assert.equal(savedValue, true);
     assert.equal(
       domWindow.document
         .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
         ?.getAttribute("aria-checked"),
-      "true",
+      "false",
       "the newer in-flight edit should remain staged after the save completes",
     );
     assert.match(
@@ -371,7 +406,7 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       findButton(domWindow.document, "Save all").click();
       await flushEffects();
     });
-    assert.equal(savedValue, true);
+    assert.equal(savedValue, false);
     assert.match(
       domWindow.document.body.textContent ?? "",
       /No unsaved changes/,
@@ -386,7 +421,7 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
     assert.match(
       domWindow.document.body.textContent ?? "",
       /1 unsaved change/,
-      "a subsequent edit must use the value persisted by the second save",
+      "a subsequent edit must use the value persisted by the follow-up save",
     );
 
     delayNextPatch = true;
@@ -395,7 +430,7 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       findButton(domWindow.document, "Save all").click();
       await flushEffects();
     });
-    assert.equal(patches.length, 4);
+    assert.equal(patches.length, 5);
     assert.ok(releasePendingPatch, "expected the failing patch to be pending");
 
     await act(async () => {
@@ -408,17 +443,21 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
         'button[role="switch"]',
       )?.click();
     });
+    const finishFailedSave: (() => void) | undefined =
+      releasePendingPatch as (() => void) | undefined;
+    releasePendingPatch = undefined;
+    assert.ok(finishFailedSave, "expected the delayed failing save");
     await act(async () => {
-      releasePendingPatch?.();
+      finishFailedSave();
       await flushEffects();
     });
 
-    assert.equal(savedValue, true, "the failed patch must not change the server value");
+    assert.equal(savedValue, false, "the failed patch must not change the server value");
     assert.equal(
       domWindow.document
         .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
         ?.getAttribute("aria-checked"),
-      "false",
+      "true",
       "the latest input should remain visible after the failed save",
     );
     assert.match(
@@ -430,6 +469,54 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
       domWindow.document.body.textContent ?? "",
       /mock gateway rejected save/,
       "the failed-save error should remain visible with the unsaved draft",
+    );
+
+    // A local group save can start a foreground reload while global Save all
+    // is pending. The newer background reload must clear that spinner state.
+    delayNextPatch = true;
+    await act(async () => {
+      findButton(domWindow.document, "Save all").click();
+      await flushEffects();
+    });
+    assert.equal(patches.length, 6);
+    assert.ok(releasePendingPatch, "expected the overlapping global save");
+    delayNextList = true;
+    await act(async () => {
+      findButton(domWindow.document, "Save").click();
+      await flushEffects();
+    });
+    assert.equal(patches.length, 7);
+    assert.ok(releasePendingList, "expected the group save reload to be pending");
+    assert.match(
+      domWindow.document.body.innerHTML,
+      /animate-spin/,
+      "the group save should show its foreground loading state before refresh replacement",
+    );
+
+    const finishOverlappingSave: (() => void) | undefined =
+      releasePendingPatch as (() => void) | undefined;
+    releasePendingPatch = undefined;
+    assert.ok(finishOverlappingSave, "expected the delayed global save");
+    await act(async () => {
+      finishOverlappingSave();
+      await flushEffects();
+    });
+    const finishGroupReload: (() => void) | undefined =
+      releasePendingList as (() => void) | undefined;
+    releasePendingList = undefined;
+    assert.ok(finishGroupReload, "expected the shared group reload request");
+    await act(async () => {
+      finishGroupReload();
+      await flushEffects();
+    });
+    assert.doesNotMatch(
+      domWindow.document.body.innerHTML,
+      /animate-spin/,
+      "the latest background refresh should clear an older foreground loading state",
+    );
+    assert.ok(
+      domWindow.document.querySelector('button[role="switch"]'),
+      "the form should render after the overlapping save refresh completes",
     );
   } finally {
     if (root) {
