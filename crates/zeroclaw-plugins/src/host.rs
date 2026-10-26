@@ -704,7 +704,17 @@ impl PluginHost {
 
     /// Remove a plugin by name.
     ///
-    /// For a loaded plugin, the directory at its name is deleted. For a name the
+    /// For a loaded plugin, the directory it was loaded from, which need not be
+    /// named `name`, is claimed under the package lock and deleted through the
+    /// claim once it proves to hold the generation this host loaded; a claimed
+    /// generation that does not is put back and refused as
+    /// [`PluginError::NamespaceChanged`]. A claim this cannot settle, because
+    /// that put-back or the delete fails, is reported as
+    /// [`PluginError::RecoveryRetained`]. The claim records only `name`, so the
+    /// next remove of `name` puts what it holds back at `name`, not in the
+    /// directory it came from, and refuses while something occupies `name`.
+    /// Claiming needs the atomic no-replace move install and recovery use, and
+    /// refuses where the platform or filesystem has none. For a name the
     /// host did not load, `remove` is the recovery path for an interrupted
     /// install: it claims and validates the exact directory generation and
     /// cleans only staging whose protocol lease proves abandonment. Ambiguous
@@ -734,13 +744,57 @@ impl PluginHost {
         recovery::pause("remove-before-lock");
         let root = opened_root(&self.recovery_root, &self.plugins_dir)?;
         let _guard = root.lock()?;
-        if self.loaded.remove(name).is_some() {
-            // Existing loaded-package semantics are not the recovery classifier.
-            let plugin_dir = self.plugins_dir.join(name);
-            if plugin_dir.exists() {
-                std::fs::remove_dir_all(plugin_dir)?;
+        if let Some(installed) = self.loaded.get(name) {
+            // The directory the package was loaded from, which need not be
+            // named `name`, is claimed, checked to hold the generation this
+            // host loaded, and deleted through the claim, as an update
+            // replaces it. Nothing at `name` is touched unless the package was
+            // loaded from there.
+            let entry = package_entry(&self.plugins_dir, &installed.plugin_dir)?;
+            let held = root.transaction(name, "recovering")?;
+            match held.claim(root, &entry) {
+                Ok(()) => {}
+                // Already gone, so nothing is left to delete.
+                Err(PluginError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.loaded.remove(name);
+                    finish_naming_entry(&self.plugins_dir, root, held)?;
+                    return Ok(Vec::new());
+                }
+                Err(error) => {
+                    let _ = held.finish(root);
+                    return Err(error);
+                }
             }
-            return Ok(Vec::new());
+            #[cfg(test)]
+            recovery::pause("loaded-after-claim");
+            if let Err(error) = self.claimed_is_loaded(&held, name) {
+                // Not the generation this host loaded: it goes back where it
+                // was. One that cannot stays in the claim. The claim records
+                // only `name`, so the next remove of `name` puts it back at
+                // `name`, not where it came from, and refuses while something
+                // occupies `name`.
+                return Err(match held.publish(root, &entry) {
+                    Ok(()) => {
+                        let _ = held.finish(root);
+                        error
+                    }
+                    Err(restore) => {
+                        self.loaded.remove(name);
+                        PluginError::RecoveryRetained {
+                            path: root.retained_path(&held),
+                            reason: format!("{error}; moving it back: {restore}"),
+                        }
+                    }
+                });
+            }
+            self.loaded.remove(name);
+            return match delete_claimed(&self.plugins_dir, root, held)? {
+                None => Ok(Vec::new()),
+                Some((left, reason)) => Err(PluginError::RecoveryRetained {
+                    path: left.display().to_string(),
+                    reason,
+                }),
+            };
         }
         crate::instance::validate_package_name(name)
             .map_err(|_| PluginError::NotFound(name.into()))?;
@@ -7200,6 +7254,237 @@ capabilities = ["tool"]
         assert!(!plugins.path().join("weather").exists());
         let rediscovered = PluginHost::from_plugins_dir(plugins.path()).unwrap();
         assert_eq!(rediscovered.get_plugin("weather").unwrap().version, "2.0.0");
+    }
+
+    /// A package discovered in a directory named differently from its manifest
+    /// is removed from that directory. An unrelated directory at its name is
+    /// not the package's, and is left as it is.
+    #[test]
+    fn remove_deletes_the_directory_the_package_was_loaded_from() {
+        let plugins = tempdir().unwrap();
+        let discovered_in = plugins.path().join("legacy-dir");
+        std::fs::create_dir(&discovered_in).unwrap();
+        write_tool_version(&discovered_in, "weather", "1.0.0", b"\0asm v1");
+        let unrelated = plugins.path().join("weather");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("notes.txt"), b"keep").unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(host.get_plugin("weather").is_some());
+
+        host.remove("weather").unwrap();
+
+        assert!(!discovered_in.exists(), "the loaded package is deleted");
+        assert_eq!(
+            package_bytes(&unrelated),
+            vec![("notes.txt".to_string(), b"keep".to_vec())],
+            "the directory at the package's name is not the package's"
+        );
+        assert!(host.get_plugin("weather").is_none());
+        assert!(hidden_entries(plugins.path()).is_empty());
+        let rediscovered = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(rediscovered.get_plugin("weather").is_none());
+    }
+
+    /// A loaded package whose directory is already gone leaves nothing to
+    /// delete, and its name is not a fallback: what sits there is kept.
+    #[test]
+    fn remove_of_a_package_whose_directory_is_gone_keeps_what_is_at_its_name() {
+        let plugins = tempdir().unwrap();
+        let discovered_in = plugins.path().join("legacy-dir");
+        std::fs::create_dir(&discovered_in).unwrap();
+        write_tool_version(&discovered_in, "weather", "1.0.0", b"\0asm v1");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        std::fs::remove_dir_all(&discovered_in).unwrap();
+        let unrelated = plugins.path().join("weather");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("notes.txt"), b"keep").unwrap();
+
+        host.remove("weather").unwrap();
+
+        assert_eq!(
+            package_bytes(&unrelated),
+            vec![("notes.txt".to_string(), b"keep".to_vec())]
+        );
+        assert!(host.get_plugin("weather").is_none());
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// Remove deletes only the generation this host loaded. A package
+    /// replaced on disk since is put back untouched and the remove refused.
+    #[test]
+    fn remove_refuses_a_package_that_changed_since_this_host_loaded_it() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+
+        // Another host removes the package and installs a different one.
+        std::fs::remove_dir_all(plugins.path().join("weather")).unwrap();
+        std::fs::create_dir(plugins.path().join("weather")).unwrap();
+        write_tool_version(
+            &plugins.path().join("weather"),
+            "weather",
+            "1.5.0",
+            b"\0asm reinstalled",
+        );
+        let reinstalled = package_bytes(&plugins.path().join("weather"));
+
+        let err = host
+            .remove("weather")
+            .expect_err("a changed package is not this remove's to delete");
+        assert!(matches!(err, PluginError::NamespaceChanged(_)), "{err}");
+        assert_eq!(package_bytes(&plugins.path().join("weather")), reinstalled);
+        assert!(hidden_entries(plugins.path()).is_empty());
+        assert!(
+            host.get_plugin("weather").is_some(),
+            "a refused remove keeps the package loaded"
+        );
+    }
+
+    /// An unrelated directory swapped in for a loaded package after load is
+    /// not the loaded generation: it is put back as it was, and the remove is
+    /// refused as a namespace change.
+    #[test]
+    fn remove_puts_back_an_unrelated_directory_swapped_in_for_a_loaded_package() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let installed = plugins.path().join("weather");
+        std::fs::remove_dir_all(&installed).unwrap();
+        std::fs::create_dir(&installed).unwrap();
+        std::fs::write(installed.join("notes.txt"), b"keep").unwrap();
+
+        let err = host
+            .remove("weather")
+            .expect_err("an unrelated directory is not this remove's to delete");
+        assert!(matches!(err, PluginError::NamespaceChanged(_)), "{err}");
+        assert_eq!(
+            package_bytes(&installed),
+            vec![("notes.txt".to_string(), b"keep".to_vec())]
+        );
+        assert!(hidden_entries(plugins.path()).is_empty());
+        assert!(host.get_plugin("weather").is_some());
+    }
+
+    /// A symlink swapped in for a loaded package after load, even to an
+    /// identical copy outside the plugins directory, is never followed: the
+    /// link is put back, its target is untouched, and the remove is refused.
+    #[cfg(unix)]
+    #[test]
+    fn remove_puts_back_a_symlink_swapped_in_for_a_loaded_package() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let outside = tempdir().unwrap();
+        let copy = outside.path().join("weather");
+        std::fs::create_dir(&copy).unwrap();
+        write_tool_version(&copy, "weather", "1.0.0", b"\0asm v1");
+        let target = package_bytes(&copy);
+        let installed = plugins.path().join("weather");
+        std::fs::remove_dir_all(&installed).unwrap();
+        std::os::unix::fs::symlink(&copy, &installed).unwrap();
+
+        let err = host
+            .remove("weather")
+            .expect_err("a symlink is not this remove's to follow");
+        assert!(matches!(err, PluginError::Io(_)), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&installed)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(package_bytes(&copy), target);
+        assert!(hidden_entries(plugins.path()).is_empty());
+        assert!(host.get_plugin("weather").is_some());
+    }
+
+    /// A loaded skill bundle, which ships no component, is removed from the
+    /// directory it was loaded from like any other package.
+    #[test]
+    fn remove_deletes_a_loaded_skill_bundle_from_the_directory_it_was_loaded_from() {
+        let plugins = tempdir().unwrap();
+        write_skill_bundle_plugin(plugins.path(), "greetings", &["greet"]);
+        let discovered_in = plugins.path().join("legacy-dir");
+        std::fs::rename(plugins.path().join("greetings"), &discovered_in).unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(host.get_plugin("greetings").is_some());
+
+        host.remove("greetings").unwrap();
+
+        assert!(!discovered_in.exists());
+        assert!(host.get_plugin("greetings").is_none());
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// Where the no-replace move is unsupported, removing a loaded package
+    /// refuses with the move's error and keeps the package installed and
+    /// loaded.
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn remove_of_a_loaded_package_refuses_where_the_no_replace_move_is_unsupported() {
+        let plugins = tempdir().unwrap();
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        install_tool_version(&mut host, "weather", "1.0.0", b"\0asm v1");
+        let installed = package_bytes(&plugins.path().join("weather"));
+
+        let previous = recovery::FORCE_RENAME_ERROR
+            .with(|error| error.replace(Some(rustix::io::Errno::NOSYS)));
+        let err = host.remove("weather");
+        recovery::FORCE_RENAME_ERROR.with(|error| error.set(previous));
+
+        let err = err.expect_err("no claim without a no-replace move");
+        assert!(
+            matches!(&err, PluginError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("IO error: atomic no-replace package move unavailable"),
+            "{err}"
+        );
+        assert_eq!(package_bytes(&plugins.path().join("weather")), installed);
+        assert!(host.get_plugin("weather").is_some());
+        assert!(hidden_entries(plugins.path()).is_empty());
+    }
+
+    /// A loaded package whose claimed directory cannot be deleted is reported
+    /// where it is kept, marked for deletion, and the next remove finishes the
+    /// delete.
+    #[cfg(unix)]
+    #[test]
+    fn a_loaded_package_that_cannot_be_deleted_is_reported_and_the_next_remove_finishes_it() {
+        if !permissions_can_block_a_delete() {
+            return;
+        }
+        let plugins = tempdir().unwrap();
+        let discovered_in = plugins.path().join("legacy-dir");
+        std::fs::create_dir(&discovered_in).unwrap();
+        write_tool_version(&discovered_in, "weather", "1.0.0", b"\0asm v1");
+        lock_a_file_inside(&discovered_in);
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).unwrap();
+        assert!(host.get_plugin("weather").is_some());
+
+        let err = host
+            .remove("weather")
+            .expect_err("the locked file cannot be deleted");
+        let claim = hidden_entries(plugins.path())
+            .into_iter()
+            .find(|entry| entry.contains("recovering-v1"))
+            .expect("the claim is kept");
+        assert!(
+            matches!(&err, PluginError::RecoveryRetained { path, .. } if path.contains(&claim)),
+            "{err}"
+        );
+        assert!(!discovered_in.exists());
+        assert!(host.get_plugin("weather").is_none());
+
+        unlock(&plugins.path().join(&claim).join("package"));
+        PluginHost::from_plugins_dir(plugins.path())
+            .unwrap()
+            .remove("weather")
+            .expect("the next remove finishes the delete");
+        assert!(hidden_entries(plugins.path()).is_empty());
+        assert!(!plugins.path().join("weather").exists());
     }
 
     /// A replacement that cannot be staged never touches the installed

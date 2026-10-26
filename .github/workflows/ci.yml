@@ -760,7 +760,7 @@ jobs:
     needs: [master-debounce]
     if: ${{ !cancelled() && needs.master-debounce.result != 'failure' }}
     runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.timeout-minutes || 20 }}
     strategy:
       fail-fast: false
       matrix:
@@ -777,6 +777,9 @@ jobs:
             features: plugins-wasm-cranelift
             suite: runtime
             cache-key: plugins-cranelift-runtime
+            # Six serial test steps. Warm-cache runs reached 18-20 minutes
+            # and hit the shared 20-minute limit (#10558).
+            timeout-minutes: 30
           - name: plugins pulley backend
             features: plugins-wasm-pulley
             suite: check
@@ -838,7 +841,9 @@ jobs:
         # Module filter, not a single test name: agent::plugin_live_config holds
         # every production-constructor live-config regression (direct Agent and
         # independently delegated registries today), and a filter pinned to one
-        # test name silently skips the others.
+        # test name silently skips the others. The filter only scopes the step:
+        # the receipt-bound late_tool_search tests ignore themselves without the
+        # fixture receipt the next step prepares.
         run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib agent::plugin_live_config
       # Feature-gated admission proofs. These only compile under plugins-wasm, so
       # the default-feature workspace Test job never runs them: the activation
@@ -846,6 +851,9 @@ jobs:
       # default-false gate, the repeated-construction determinism, and the
       # pre-construction collision refusal. Filters are passed after `--` because
       # `cargo test` accepts only one positional TESTNAME; the harness ORs them.
+      # The 23 late_tool_search tests are #[ignore]d because they need the
+      # fixture receipt this step builds. The step checks that they are exactly
+      # the ignored tests in its selection, then opts in with --include-ignored.
       - name: Run runtime plugin admission regressions
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
         run: |
@@ -1246,16 +1254,19 @@ jobs:
                      ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT=str(receipt_path),
                      ZEROCLAW_LATE_TOOL_SEARCH_CASE_RECEIPTS=str(cases))
           base = ['cargo', 'test', '--locked', '-p', 'zeroclaw-runtime', '--features', 'plugins-wasm-cranelift', '--lib', '--']
-          code, listing = run(base + [prefix, '--list'], 2 * 1024 * 1024, env=env)
-          print(listing.decode('utf-8', errors='replace'), end='', flush=True)
-          listed = re.findall(rb'^(tools::r5_namespace_tests::late_tool_search\w*): test$', listing, re.M)
-          if code or sorted(name.decode() for name in listed) != sorted(expected):
-              raise RuntimeError('exact twenty-three namespace listing refused')
           # Keep the original larger OR selection and its order; new prefix is appended.
           selectors_old = ['plugin_runtime::', 'tools::tests::shared_ceiling', 'tools::tests::repeated_loader',
                            'tools::tests::auto_discover', 'tools::tests::colliding_plugin',
                            'tools::tests::plugin_tls_coherence']
-          code, output = run(base + selectors_old + [prefix], 16 * 1024 * 1024, env=env)
+          # The ignored tests in the whole selection must be exactly the 23: one
+          # that lost its #[ignore], or another ignored test --include-ignored
+          # would sweep in, refuses the listing.
+          code, listing = run(base + selectors_old + [prefix, '--ignored', '--list'], 2 * 1024 * 1024, env=env)
+          print(listing.decode('utf-8', errors='replace'), end='', flush=True)
+          listed = re.findall(rb'^(\S+): test$', listing, re.M)
+          if code or sorted(name.decode() for name in listed) != sorted(expected):
+              raise RuntimeError('exact twenty-three namespace listing refused')
+          code, output = run(base + selectors_old + [prefix, '--include-ignored'], 16 * 1024 * 1024, env=env)
           print(output.decode('utf-8', errors='replace'), end='', flush=True)
           passed = re.findall(rb'^test (tools::r5_namespace_tests::late_tool_search\w*) \.\.\. ok$', output, re.M)
           if code or sorted(name.decode() for name in passed) != sorted(expected):
