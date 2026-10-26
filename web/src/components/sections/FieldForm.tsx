@@ -24,6 +24,7 @@ import {
   useEffect,
   useImperativeHandle,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import type { KeyboardEvent, ReactNode } from "react";
@@ -980,6 +981,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       undefined,
     );
     const [filter, setFilter] = useState("");
+    const reloadSequence = useRef(0);
 
     // When this form edits a channel block (`channels.<type>.<alias>`), its
     // `excluded_tools` ToolPicker should list the OWNING agent's scoped tools
@@ -1034,10 +1036,12 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     );
 
     const reload = async () => {
+      const requestId = ++reloadSequence.current;
       setLoading(true);
       setTopError(null);
       try {
         const resp = await listProps(prefix);
+        if (requestId !== reloadSequence.current) return;
         setEntries(resp.entries);
         const seed: Record<string, string> = {};
         const commentSeed: Record<string, string> = {};
@@ -1050,6 +1054,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         setDraft(seed);
         setComments(commentSeed);
       } catch (e) {
+        if (requestId !== reloadSequence.current) return;
         if (e instanceof ApiError) {
           setTopError(`[${e.envelope.code}] ${e.envelope.message}`);
         } else {
@@ -1058,14 +1063,17 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
           );
         }
       } finally {
-        setLoading(false);
+        if (requestId === reloadSequence.current) setLoading(false);
       }
     };
 
     useEffect(() => {
       void reload();
+      return () => {
+        reloadSequence.current += 1;
+      };
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [prefix]);
+    }, [prefix, configDraft.saveAllVersion]);
 
     const actionableEntries = useMemo(() => {
       if (!scopeActionsToIncludedPaths || !includePath) return entries;
