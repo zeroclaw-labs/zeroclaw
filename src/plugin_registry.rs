@@ -105,17 +105,36 @@ pub(crate) async fn download_registry_entry(
         .await
 }
 
+/// The default registry answered 404: it serves no index yet.
+///
+/// Its text is what `plugin install` and `plugin search` print, and it names
+/// their `--registry` flag. A caller without that flag, such as Quickstart,
+/// recognizes this type in the error chain and says how it picks another
+/// registry instead.
+#[derive(Debug)]
+pub(crate) struct DefaultRegistryUnpopulated;
+
+impl std::fmt::Display for DefaultRegistryUnpopulated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the public plugin registry is not populated yet; use --registry <url> to point at a custom registry",
+        )
+    }
+}
+
+impl std::error::Error for DefaultRegistryUnpopulated {}
+
 /// Request bounds for registry traffic.
 ///
 /// `Default` is the production policy. Tests inject shorter bounds so a
 /// stalled server fails in milliseconds rather than after the real bound.
 #[derive(Clone, Copy, Debug)]
-struct RegistryTimeouts {
-    connect: Duration,
+pub(crate) struct RegistryTimeouts {
+    pub(crate) connect: Duration,
     /// The longest silence on any request; see [`REGISTRY_READ_TIMEOUT`].
-    read: Duration,
-    index: Duration,
-    archive: Duration,
+    pub(crate) read: Duration,
+    pub(crate) index: Duration,
+    pub(crate) archive: Duration,
 }
 
 impl Default for RegistryTimeouts {
@@ -131,13 +150,13 @@ impl Default for RegistryTimeouts {
 
 /// Every registry request goes through this client, so none of them can run
 /// unbounded.
-struct RegistryClient {
+pub(crate) struct RegistryClient {
     http: reqwest::Client,
     timeouts: RegistryTimeouts,
 }
 
 impl RegistryClient {
-    fn new(timeouts: RegistryTimeouts) -> Result<Self> {
+    pub(crate) fn new(timeouts: RegistryTimeouts) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(timeouts.connect)
             .read_timeout(timeouts.read)
@@ -146,7 +165,7 @@ impl RegistryClient {
         Ok(Self { http, timeouts })
     }
 
-    async fn fetch_index(&self, registry_url: &str) -> Result<PluginRegistryIndex> {
+    pub(crate) async fn fetch_index(&self, registry_url: &str) -> Result<PluginRegistryIndex> {
         let response = self
             .http
             .get(registry_url)
@@ -157,9 +176,7 @@ impl RegistryClient {
         let status = response.status();
         if !status.is_success() {
             if status == reqwest::StatusCode::NOT_FOUND && registry_url == DEFAULT_REGISTRY_URL {
-                bail!(
-                    "the public plugin registry is not populated yet; use --registry <url> to point at a custom registry"
-                );
+                return Err(DefaultRegistryUnpopulated.into());
             }
             bail!("plugin registry returned HTTP {status} for {registry_url}");
         }
@@ -169,7 +186,10 @@ impl RegistryClient {
             .context("parsing plugin registry JSON")
     }
 
-    async fn download_entry(&self, entry: &PluginRegistryEntry) -> Result<DownloadedPlugin> {
+    pub(crate) async fn download_entry(
+        &self,
+        entry: &PluginRegistryEntry,
+    ) -> Result<DownloadedPlugin> {
         let bytes = self.download_archive_bytes(&entry.url).await?;
         verify_sha256_if_present(&bytes, entry.sha256.as_deref())?;
 
@@ -271,14 +291,15 @@ where
     let mut extracted_bytes = 0_u64;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let enclosed = enclosed_zip_path(file.name(), &file)?;
+        let raw_name = file.name()?.into_owned();
+        let enclosed = enclosed_zip_path(&raw_name, &file)?;
         let out_path = dest.join(enclosed);
         if file.is_dir() {
             std::fs::create_dir_all(&out_path)?;
             continue;
         }
         let Some(parent) = out_path.parent() else {
-            bail!("plugin archive entry has no parent: {}", file.name());
+            bail!("plugin archive entry has no parent: {raw_name}");
         };
         if extracted_bytes.saturating_add(file.size()) > max_extracted_bytes {
             bail!("plugin archive exceeds extracted size limit of {max_extracted_bytes} bytes");

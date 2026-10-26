@@ -222,12 +222,38 @@ impl ModelSwitchTool {
             }
         };
 
+        if !crate::agent::turn::model_switch_provider_allowed(&model_provider) {
+            return Ok(ToolResult {
+                success: false,
+                output: serde_json::to_string_pretty(&json!({
+                    "model_provider": model_provider,
+                }))?
+                .into(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "model-switch-provider-not-allowed",
+                    &[("provider", &model_provider)],
+                )),
+            });
+        }
+
         let model = model.trim();
         if model.is_empty() {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some("Model ID cannot be empty".to_string()),
+            });
+        }
+        if model
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("hint:"))
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "model-switch-route-selector-not-allowed",
+                )),
             });
         }
 
@@ -245,7 +271,7 @@ impl ModelSwitchTool {
                 "message": "Model switch requested",
                 "model_provider": model_provider,
                 "model": model,
-                "note": "The active runtime path will consume this provider-profile/model switch where model_switch is supported. This does not write persisted config."
+                "note": "Where the runtime supports model_switch, the switch takes effect on your next model call within this same turn. Either way, continue the user's task now and deliver the result in this reply: nothing runs between turns, so ending the reply with a promise to report later means no work will happen. This does not write persisted config."
             }))?.into(),
             error: None,
         })
@@ -411,7 +437,8 @@ impl ModelSwitchTool {
 mod tests {
     use super::*;
     use crate::agent::turn::{
-        ModelSwitchCallback, current_model_switch_state, scope_model_switch_state,
+        ModelSwitchCallback, current_model_switch_state, scope_model_switch_provider_allowlist,
+        scope_model_switch_state,
     };
 
     fn test_config() -> Config {
@@ -494,6 +521,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_rejects_provider_outside_turn_allowlist() {
+        let state = Arc::new(std::sync::Mutex::new(None));
+        let allowed = Arc::new(std::collections::HashSet::from(
+            ["custom.local".to_string()],
+        ));
+
+        let result = scope_model_switch_state(
+            Arc::clone(&state),
+            scope_model_switch_provider_allowlist(Some(allowed), async {
+                tool().handle_set(&json!({
+                    "model_provider": "openai.default",
+                    "model": "gpt-4o"
+                }))
+            }),
+        )
+        .await
+        .expect("set should return a tool result");
+
+        assert!(!result.success);
+        let expected = crate::i18n::get_required_cli_string_with_args(
+            "model-switch-provider-not-allowed",
+            &[("provider", "openai.default")],
+        );
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(pending_switch(&state), None);
+    }
+
+    #[tokio::test]
+    async fn set_rejects_route_selector_as_provider_local_model() {
+        with_switch_state(|state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "openai.default",
+                    "model": "hint:cloud"
+                }))
+                .expect("set should return a tool result");
+
+            assert!(!result.success);
+            let expected =
+                crate::i18n::get_required_cli_string("model-switch-route-selector-not-allowed");
+            assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+            assert_eq!(pending_switch(&state), None);
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn set_rejects_unconfigured_provider_profile_ref() {
         with_switch_state(|state| {
             let result = tool()
@@ -533,6 +607,30 @@ mod tests {
                 pending_switch(&state),
                 Some(("custom.local".to_string(), "local-model".to_string()))
             );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_result_tells_the_model_to_finish_the_task_in_the_same_reply() {
+        with_switch_state(|_state| {
+            let result = tool()
+                .handle_set(&json!({
+                    "model_provider": "custom.local",
+                    "model": "local-model"
+                }))
+                .expect("set should return a tool result");
+            assert!(result.success, "unexpected error: {:?}", result.error);
+
+            let payload: serde_json::Value =
+                serde_json::from_str(&result.output.to_string()).expect("set output is JSON");
+            let note = payload["note"].as_str().expect("set output carries a note");
+            // A model that reads "switch requested" as a stopping point ends the
+            // turn with a promise, and nothing runs between turns.
+            assert!(note.contains("continue the user's task now"), "{note}");
+            assert!(note.contains("in this reply"), "{note}");
+            assert!(note.contains("nothing runs between turns"), "{note}");
+            assert!(note.contains("does not write persisted config"), "{note}");
         })
         .await;
     }

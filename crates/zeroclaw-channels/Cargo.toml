@@ -21,7 +21,7 @@ zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools = { workspace = true, optional = true }
 anyhow = "1.0"
 lru = "0.18.2"
-rumqttc = { version = "0.25", optional = true }
+rumqttc = { package = "rumqttc-v4-next", version = "0.34", optional = true }
 notify = { version = "6", optional = true }
 glob = { version = "0.3", optional = true }
 lapin = { version = "2", optional = true, default-features = false, features = [
@@ -315,6 +315,7 @@ matrix-sdk = { version = "0.19", default-features = false, features = [
 ] }
 matrix-sdk-base = { version = "0.19", default-features = false, features = ["e2e-encryption"] }
 matrix-sdk-test = "0.19"
+rcgen = "0.13"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 tempfile = "3.26"
 toml = "1.0"

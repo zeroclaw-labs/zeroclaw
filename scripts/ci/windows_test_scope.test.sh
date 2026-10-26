@@ -476,6 +476,7 @@ plugin_root_command = 'cargo nextest run --locked --no-fail-fast \\\n           
 plugin_lib_command = "cargo nextest run --locked --no-fail-fast \\\n              -p zeroclaw-plugins \\\n              --no-default-features \\\n              --features plugins-wasm-cranelift \\\n              --lib"
 plugin_runtime_config_command = "cargo nextest run --locked --no-fail-fast \\\n              -p zeroclaw-runtime \\\n              --features plugins-wasm-cranelift \\\n              --lib \\\n              live_agent_plugin_tool_observes_config_reload_after_construction"
 plugin_runtime_admission_command = "cargo nextest run --locked --no-fail-fast \\\n              -p zeroclaw-runtime \\\n              --features plugins-wasm-cranelift \\\n              --lib \\\n              plugin_runtime::"
+plugin_update_cli_command = "cargo nextest run --locked --no-fail-fast \\\n              --features plugins-wasm-cranelift \\\n              --test component \\\n              plugin_update_cli plugin_info_cli"
 assert "bash scripts/ci/windows_test_scope.test.sh" in scope_job
 metadata_fallback = 'if ! cargo metadata --locked --format-version 1 > "$metadata_file"; then'
 assert metadata_fallback in scope_job
@@ -499,6 +500,26 @@ assert "-p zeroclaw-gateway" in windows_job
 assert "--features plugins-wasm" in windows_job
 assert "--bin zeroclaw" in windows_job
 assert "plugin_registry::" in windows_job
+for update_filter in (
+    "tests::a_batch_leaves_a_package_displaced",
+    "tests::a_legacy_row_refusal",
+    "tests::a_package_that_goes_away",
+    "tests::a_package_the_registry_does_not_list",
+    "tests::a_refused_update",
+    "tests::a_restored_copy_the_policy_rejects",
+    "tests::an_interrupted_update",
+    "tests::an_update_",
+    "tests::config_rejections_name_the_instance",
+    "tests::installing_an_installed_package_points_at_plugin_update",
+    "tests::rendered_update_tokens",
+    "tests::the_displaced_note",
+    "tests::update_",
+):
+    assert update_filter in windows_job
+assert plugin_update_cli_command in windows_job
+for component_filter in ("plugin_update_cli", "plugin_info_cli"):
+    assert component_filter in plugin_backend_job
+    assert component_filter in plugin_update_cli_command
 for admission_filter in (
     "plugin_runtime::",
     "tools::tests::shared_ceiling",
@@ -519,13 +540,17 @@ assert 'plugin_runtime_config_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_runtime_admission_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_gateway_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_cli_status=${PIPESTATUS[0]}' in windows_job
+assert 'plugin_update_cli_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_root_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_gateway_status != 0' in windows_job
 assert 'plugin_cli_status != 0' in windows_job
+assert 'plugin_update_cli_status != 0' in windows_job
 assert '}plugin-gateway"' in windows_job
 assert '}plugin-cli"' in windows_job
+assert '}plugin-update-cli"' in windows_job
 assert 'Plugin-host gateway status' in windows_job
 assert 'Plugin-host CLI status' in windows_job
+assert 'Plugin-host update CLI status' in windows_job
 assert 'Failure inventory' in windows_job
 assert 'Baseline duration' in windows_job
 assert 'Plugin-host duration' in windows_job
@@ -544,7 +569,9 @@ assert windows_job.index('plugin_runtime_admission_status=${PIPESTATUS[0]}') < w
 assert windows_job.index("-p zeroclaw-gateway") < windows_job.index('plugin_gateway_status=${PIPESTATUS[0]}')
 assert windows_job.index('plugin_gateway_status=${PIPESTATUS[0]}') < windows_job.index("--bin zeroclaw")
 assert windows_job.index("--bin zeroclaw") < windows_job.index('plugin_cli_status=${PIPESTATUS[0]}')
-assert windows_job.index('plugin_cli_status=${PIPESTATUS[0]}') < windows_job.index(plugin_root_command)
+assert windows_job.index('plugin_cli_status=${PIPESTATUS[0]}') < windows_job.index(plugin_update_cli_command)
+assert windows_job.index(plugin_update_cli_command) < windows_job.index('plugin_update_cli_status=${PIPESTATUS[0]}')
+assert windows_job.index('plugin_update_cli_status=${PIPESTATUS[0]}') < windows_job.index(plugin_root_command)
 assert windows_job.index(plugin_root_command) < windows_job.index('plugin_root_status=${PIPESTATUS[0]}')
 scoped_case = windows_job.split("\n            scoped)\n", 1)[1].split(
     "\n              ;;\n", 1

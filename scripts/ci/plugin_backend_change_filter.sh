@@ -17,7 +17,10 @@
 # `zeroclaw` test targets. The root binary's plugin modules are listed for the
 # same reason: `mod plugins` and the plugin registry only compile under
 # `plugins-wasm`, so the default-feature Test job cannot run their tests and
-# this job is where they run. `src/main.rs` holds the plugin CLI itself.
+# this job is where they run. `src/main.rs` holds the plugin CLI itself, and
+# the plugin CLI component tests that drive it run only in this job too.
+# The plugin artifact smoke harness is listed as well: this job is the only
+# place its scripts run before a release, so a change to them has to run it.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
 # printed value to GITHUB_OUTPUT.
 
@@ -33,11 +36,15 @@ while IFS= read -r path; do
         tests/channel_websocket_e2e.rs|\
         tests/plugin_channel_runtime_e2e.rs|\
         tests/channel_egress_e2e.rs|\
-        src/plugins/*|src/plugin_registry.rs|src/main.rs|\
+        tests/component/plugin_info_cli.rs|tests/component/plugin_update_cli.rs|\
+        src/plugins/*|src/plugin_registry.rs|src/quickstart_plugins/*|src/main.rs|\
         wit/*|\
         Cargo.toml|Cargo.lock|\
         .github/workflows/ci.yml|\
-        scripts/ci/plugin_backend_change_filter*.sh)
+        scripts/ci/plugin_backend_change_filter*.sh|\
+        scripts/ci/plugin_artifact_smoke*.sh|\
+        scripts/ci/plugin_smoke_provider*.py|\
+        scripts/ci/build_plugin_smoke_packages.sh)
             run=true
             ;;
     esac
