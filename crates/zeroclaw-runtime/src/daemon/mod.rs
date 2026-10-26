@@ -5339,15 +5339,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_gateway_bind_mode_starts_fresh_on_free_port() {
-        // Reserve an ephemeral port, then release it so the address is free.
+    async fn classify_gateway_bind_outcome_starts_fresh_on_successful_bind() {
+        // Keep the successful bind owned until classification instead of
+        // releasing the port and racing other listeners to bind it again.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
-            .expect("reserve port");
+            .expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
         assert_eq!(
-            detect_gateway_bind_mode(&Config::default(), "127.0.0.1", port).await,
+            classify_gateway_bind_outcome(Ok(listener), &Config::default(), "127.0.0.1", port)
+                .await,
             GatewayBindMode::StartFresh
         );
     }

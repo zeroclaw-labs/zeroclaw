@@ -126,6 +126,17 @@ pub struct SopEngine {
     /// Decision models by alias, consulted by dispatch for SOPs with a
     /// `[decision]` table. An SOP whose alias is absent resolves fail-closed.
     decision_models: HashMap<String, Arc<dyn super::decision::DecisionModel>>,
+    /// Store revision of the last record of each held run that this engine
+    /// read or wrote. Every write is stamped one past it, so the store's
+    /// revision guard refuses a write from a copy another writer (a second
+    /// engine over the same store) has since moved on, instead of letting the
+    /// older copy overwrite the record.
+    run_revisions: parking_lot::Mutex<HashMap<String, u64>>,
+    /// Identifies this engine as the writer of every run record it persists.
+    /// Two engines that build identical state from the same revision then
+    /// still write different records, so the store refuses the second write
+    /// as a conflict instead of accepting it as a retry of the first.
+    writer_id: String,
 }
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
@@ -217,6 +228,54 @@ impl OrphanedRunSettlementQueue {
             .map(|(run_id, kind)| (run_id.clone(), *kind))
             .collect()
     }
+}
+
+/// A transition was refused because this engine's copy of the run was out of
+/// date: another writer had advanced or finished the run. By the time this is
+/// returned the engine has already adopted the stored record.
+#[derive(Debug)]
+struct StaleRunCopy {
+    run_id: String,
+    local_step: Option<u32>,
+    seen_revision: Option<u64>,
+    stored_revision: u64,
+    stored_status: SopRunStatus,
+    stored_step: u32,
+}
+
+impl std::fmt::Display for StaleRunCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let seen_revision = self.seen_revision.map_or_else(
+            || crate::i18n::get_required_cli_string("cli-sop-run-copy-revision-unknown"),
+            |r| r.to_string(),
+        );
+        f.write_str(&crate::i18n::get_required_cli_string_with_args(
+            "cli-sop-run-copy-stale",
+            &[
+                ("run_id", self.run_id.as_str()),
+                ("seen_revision", seen_revision.as_str()),
+                ("stored_revision", &self.stored_revision.to_string()),
+                ("status", &self.stored_status.to_string()),
+                ("step", &self.stored_step.to_string()),
+            ],
+        ))
+    }
+}
+
+impl std::error::Error for StaleRunCopy {}
+
+/// Whether a transition was refused because the engine's copy of the run was
+/// stale. The engine has already adopted the stored record, so a retry works
+/// from current state.
+pub fn err_is_stale_run_copy(err: &anyhow::Error) -> bool {
+    err.is::<StaleRunCopy>()
+}
+
+/// A terminal write the store refused because it already holds newer state
+/// for the run. Retrying the same write cannot succeed.
+fn err_is_stale_terminal_write(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<TerminalPersistenceRetained>()
+        .is_some_and(|retained| retained.source.is_stale_write())
 }
 
 #[derive(Debug)]
@@ -318,12 +377,16 @@ enum ActivePersistOutcome {
     Saved,
     CapacityFull,
     Failed,
+    /// The store holds newer state than this engine's copy of the run.
+    Stale,
 }
 
 enum ParkPersistOutcome {
     Released,
     CapacityFull,
     PersistFailed,
+    /// The store holds newer state than this engine's copy of the run.
+    Stale,
 }
 
 enum GateClearTransition {
@@ -430,6 +493,8 @@ impl SopEngine {
             headless_drivers: std::collections::HashSet::new(),
             pending_orphan_settlements: OrphanedRunSettlementQueue::default(),
             decision_models: HashMap::new(),
+            run_revisions: parking_lot::Mutex::new(HashMap::new()),
+            writer_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -582,6 +647,9 @@ impl SopEngine {
         principal: super::approval::ApprovalPrincipal,
         drive_inline_capability_tail: bool,
     ) -> Result<super::approval::BrokerOutcome> {
+        // A decision on a copy another writer has since moved on would resume
+        // or overwrite a gate that is no longer the one stored.
+        self.refuse_stale_gate_copy(run_id)?;
         let broker = Arc::clone(&self.approval_broker);
         if let Some(step) = self.active_runs.get(run_id).and_then(|run| {
             (run.status == SopRunStatus::PausedCheckpoint).then_some(run.current_step)
@@ -749,7 +817,9 @@ impl SopEngine {
                     }
                     let run_id = pr.run.run_id.clone();
                     let cancel_requested = pr.run.status == SopRunStatus::CancelRequested;
+                    let revision = pr.revision;
                     if self.active_runs.insert(run_id.clone(), pr.run).is_none() {
+                        self.note_run_revision(&run_id, revision);
                         restored += 1;
                         if parked {
                             replay_parked_requests.push(run_id);
@@ -881,14 +951,262 @@ impl SopEngine {
         }
     }
 
-    /// Next monotonic revision for a run: one past whatever the store currently
-    /// holds (0 if absent). Keeps every persist strictly newer so the store's
-    /// revision guard accepts it; a cheap indexed lookup on either backend.
+    /// Next revision for a run: one past the record this engine last read or
+    /// wrote, so a write from a copy that another writer has since moved on is
+    /// refused by the store's revision guard. A run this engine never read (a
+    /// new run) falls back to one past whatever the store holds (0 if absent).
     fn next_run_revision(&self, run_id: &str) -> u64 {
+        if let Some(seen) = self.run_revisions.lock().get(run_id) {
+            return seen.saturating_add(1);
+        }
         match self.store.load_run(run_id) {
             Ok(Some(existing)) => existing.revision.saturating_add(1),
             _ => 0,
         }
+    }
+
+    /// The record this engine writes for `run`: stamped one past the revision
+    /// it last read or wrote, and carrying this engine as its writer.
+    fn persisted_run(&self, run: &SopRun) -> PersistedRun {
+        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
+        pr.revision = self.next_run_revision(&run.run_id);
+        pr.writer = Some(self.writer_id.clone());
+        pr
+    }
+
+    fn note_run_revision(&self, run_id: &str, revision: u64) {
+        self.run_revisions
+            .lock()
+            .insert(run_id.to_string(), revision);
+    }
+
+    fn forget_run_revision(&self, run_id: &str) {
+        self.run_revisions.lock().remove(run_id);
+    }
+
+    /// Whether the store holds a newer record of `run_id` than this engine's
+    /// copy: another writer advanced or finished the run since this engine
+    /// last read or wrote it. A store read error is returned, not treated as
+    /// "current", so callers fail closed.
+    fn copy_is_stale(&self, run_id: &str) -> Result<bool> {
+        let Some(seen) = self.run_revisions.lock().get(run_id).copied() else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .load_run(run_id)?
+            .is_some_and(|stored| stored.revision > seen))
+    }
+
+    /// Replace a stale copy of `run_id` with the stored record and return the
+    /// `StaleRunCopy` error a caller refuses with. A terminal record moves the
+    /// run to `finished_runs`; an active one replaces the in-memory copy along
+    /// with this engine's per-run bookkeeping for the old copy.
+    ///
+    /// Adopting is not itself a refusal: callers that go ahead against the
+    /// adopted record (a cancel, an unchanged gate) record nothing, and callers
+    /// that refuse record it through `refused`.
+    fn drop_stale_copy(&mut self, run_id: &str) -> anyhow::Error {
+        let seen = self.run_revisions.lock().get(run_id).copied();
+        let local_step = self.active_runs.get(run_id).map(|run| run.current_step);
+        let stored = match self.store.load_run(run_id) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                return anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
+                    "cli-sop-run-copy-changed",
+                    &[("run_id", run_id)],
+                ));
+            }
+            Err(e) => {
+                return anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
+                    "cli-sop-run-copy-reload-failed",
+                    &[("run_id", run_id), ("error", &e.to_string())],
+                ));
+            }
+        };
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "run_id": run_id,
+                    "current_step": local_step,
+                    "seen_revision": seen,
+                    "stored_revision": stored.revision,
+                    "stored_status": stored.run.status.to_string(),
+                })
+            ),
+            "SOP engine: this engine's copy of the run is out of date; adopting the stored record"
+        );
+        let err = anyhow::Error::new(StaleRunCopy {
+            run_id: run_id.to_string(),
+            local_step,
+            seen_revision: seen,
+            stored_revision: stored.revision,
+            stored_status: stored.run.status,
+            stored_step: stored.run.current_step,
+        });
+        if is_terminal_status(stored.run.status) {
+            self.adopt_terminal_record(run_id, stored.run);
+        } else {
+            self.claims_pending_persist.remove(run_id);
+            self.claims_retained_after_terminal_rollback.remove(run_id);
+            self.cancellation_finalization_ready.remove(run_id);
+            self.step_budget_finalization_ready.remove(run_id);
+            self.note_run_revision(run_id, stored.revision);
+            self.active_runs.insert(run_id.to_string(), stored.run);
+        }
+        err
+    }
+
+    /// Record that a transition was refused on a stale copy, and return the
+    /// error to refuse with.
+    fn refused(&self, stale: anyhow::Error) -> anyhow::Error {
+        if let Some(copy) = stale.downcast_ref::<StaleRunCopy>() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "run_id": copy.run_id,
+                        "current_step": copy.local_step,
+                        "seen_revision": copy.seen_revision,
+                        "stored_revision": copy.stored_revision,
+                        "stored_status": copy.stored_status.to_string(),
+                    })),
+                "SOP engine: refused a transition from an out-of-date copy of the run"
+            );
+            self.record_transition_event(
+                &copy.run_id,
+                "run_copy_stale",
+                Some(format!(
+                    "a transition from an out-of-date copy of the run (step {}) was refused; \
+                     the stored record is {} on step {}, and transitions that copy logged \
+                     after its last successful write were not applied",
+                    copy.local_step.unwrap_or_default(),
+                    copy.stored_status,
+                    copy.stored_step
+                )),
+                ::serde_json::json!({
+                    "step": copy.local_step,
+                    "stored_step": copy.stored_step,
+                    "stored_status": copy.stored_status.to_string(),
+                    "seen_revision": copy.seen_revision,
+                    "stored_revision": copy.stored_revision,
+                }),
+            );
+        }
+        stale
+    }
+
+    /// Adopt the stored record after the store refused this copy's write, and
+    /// return the recorded refusal.
+    fn drop_and_refuse(&mut self, run_id: &str) -> anyhow::Error {
+        let stale = self.drop_stale_copy(run_id);
+        self.refused(stale)
+    }
+
+    /// Adopt the stored record of a held run if this engine's copy is stale,
+    /// returning the `StaleRunCopy` error a caller refuses with.
+    fn adopt_if_stale(&mut self, run_id: &str) -> Result<Option<anyhow::Error>> {
+        if self.active_runs.contains_key(run_id) && self.copy_is_stale(run_id)? {
+            return Ok(Some(self.drop_stale_copy(run_id)));
+        }
+        Ok(None)
+    }
+
+    /// A driver boundary's transition passed the stale check, but its write was
+    /// refused because another writer moved the run on in between. A refused
+    /// dispatch or park write has adopted the stored record already; a refused
+    /// terminal write has not, so adopt it here. As at the stale check, a
+    /// cancellation requested through another engine is then finished at this
+    /// boundary, so the run is not left claimed with nobody to finish it.
+    /// Anything else stays refused, and an error that is not a refused write,
+    /// or a reload that fails, is returned unchanged.
+    fn finish_cancel_after_refused_write(
+        &mut self,
+        run_id: &str,
+        advanced: Result<SopRunAction>,
+    ) -> Result<SopRunAction> {
+        let (stale, recorded) = match advanced {
+            Err(e) if err_is_stale_terminal_write(&e) => {
+                let stale = self.drop_stale_copy(run_id);
+                if !err_is_stale_run_copy(&stale) {
+                    return Err(e);
+                }
+                (stale, false)
+            }
+            // A refused dispatch or park write has recorded its refusal.
+            Err(e) if err_is_stale_run_copy(&e) => (e, true),
+            advanced => return advanced,
+        };
+        if let Some(cancelled) = self.finish_requested_cancellation(run_id)? {
+            return Ok(cancelled);
+        }
+        Err(if recorded { stale } else { self.refused(stale) })
+    }
+
+    /// Refuse a gate decision on a held run whose stored record is newer than
+    /// this engine's copy. The stored record is adopted first, so a retry works
+    /// from current state instead of being refused again. When the stored
+    /// record still presents the same gate (same status, step and gate
+    /// revision), only its revision moved (an escalation re-stamp, say), so the
+    /// decision goes ahead against the adopted record instead of being refused.
+    fn refuse_stale_gate_copy(&mut self, run_id: &str) -> Result<()> {
+        let gate = |run: &SopRun| (run.status, run.current_step, run.revision);
+        let Some(before) = self.active_runs.get(run_id).map(gate) else {
+            return Ok(());
+        };
+        match self.adopt_if_stale(run_id)? {
+            Some(stale)
+                if err_is_stale_run_copy(&stale)
+                    && self.active_runs.get(run_id).map(gate) == Some(before) =>
+            {
+                Ok(())
+            }
+            Some(stale) => Err(self.refused(stale)),
+            None => Ok(()),
+        }
+    }
+
+    /// Restore `prior` after a failed transition, unless the failure was a
+    /// stale copy: that path already adopted the stored record, and putting
+    /// the old copy back would pair stale content with the stored revision.
+    fn restore_prior_run(&mut self, run_id: &str, prior: SopRun, err: &anyhow::Error) {
+        if !err_is_stale_run_copy(err) {
+            self.active_runs.insert(run_id.to_string(), prior);
+        }
+    }
+
+    /// Reconcile this engine's view with a terminal record another writer
+    /// stored: the run leaves `active_runs` and joins `finished_runs`. This is
+    /// view reconciliation, not another completion.
+    fn adopt_terminal_record(&mut self, run_id: &str, run: SopRun) {
+        self.claims_pending_persist.remove(run_id);
+        self.claims_retained_after_terminal_rollback.remove(run_id);
+        self.cancellation_finalization_ready.remove(run_id);
+        self.step_budget_finalization_ready.remove(run_id);
+        self.active_runs.remove(run_id);
+        self.forget_run_revision(run_id);
+        self.finished_runs.retain(|run| run.run_id != run_id);
+        self.finished_runs.push(run);
+        let max = self.config.max_finished_runs;
+        if max > 0 && self.finished_runs.len() > max {
+            let excess = self.finished_runs.len() - max;
+            self.finished_runs.drain(..excess);
+        }
+    }
+
+    /// Persist an active run that is about to hand out its next step, and
+    /// refuse to hand it out if the store holds newer state than this copy.
+    /// Other persist failures stay best-effort, as in `persist_active`.
+    fn persist_active_before_dispatch(&mut self, run_id: &str) -> Result<()> {
+        if matches!(
+            self.persist_active_checked_with_capacity(run_id, None),
+            ActivePersistOutcome::Stale
+        ) {
+            return Err(self.drop_and_refuse(run_id));
+        }
+        Ok(())
     }
 
     /// Persist a still-active run (best-effort; logs on failure). Cheap no-op
@@ -920,29 +1238,39 @@ impl SopEngine {
             return ActivePersistOutcome::Saved;
         };
         self.heartbeat_claim_for_run(run);
-        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
         // Each persist is a new state revision; the store rejects a
         // same-revision divergent write, so advance past what is stored.
-        pr.revision = self.next_run_revision(run_id);
-        let outcome = match max_pending {
-            Some(max_pending) => {
-                match self.store.save_run_with_pending_capacity(&pr, max_pending) {
-                    Ok(true) => ActivePersistOutcome::Saved,
-                    Ok(false) => ActivePersistOutcome::CapacityFull,
-                    Err(e) => {
-                        Self::log_persist_failure(run_id, e);
-                        ActivePersistOutcome::Failed
+        let pr = self.persisted_run(run);
+        let saved = match max_pending {
+            Some(max_pending) => self
+                .store
+                .save_run_with_pending_capacity(&pr, max_pending)
+                .map(|saved| {
+                    if saved {
+                        ActivePersistOutcome::Saved
+                    } else {
+                        ActivePersistOutcome::CapacityFull
                     }
-                }
-            }
-            None => match self.store.save_run(&pr) {
-                Ok(()) => ActivePersistOutcome::Saved,
-                Err(e) => {
-                    Self::log_persist_failure(run_id, e);
-                    ActivePersistOutcome::Failed
-                }
-            },
+                }),
+            None => self
+                .store
+                .save_run(&pr)
+                .map(|()| ActivePersistOutcome::Saved),
         };
+        let outcome = match saved {
+            Ok(outcome) => outcome,
+            Err(e) if e.is_stale_write() => {
+                Self::log_persist_failure(run_id, e);
+                return ActivePersistOutcome::Stale;
+            }
+            Err(e) => {
+                Self::log_persist_failure(run_id, e);
+                ActivePersistOutcome::Failed
+            }
+        };
+        if matches!(outcome, ActivePersistOutcome::Saved) {
+            self.note_run_revision(run_id, pr.revision);
+        }
         if !matches!(outcome, ActivePersistOutcome::CapacityFull) {
             self.notify_run(run, true);
         }
@@ -1004,8 +1332,7 @@ impl SopEngine {
             .cloned()
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
         self.heartbeat_claim_for_run(&run);
-        let mut persisted = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
-        persisted.revision = self.next_run_revision(run_id);
+        let persisted = self.persisted_run(&run);
         Ok((persisted, run))
     }
 
@@ -1018,6 +1345,7 @@ impl SopEngine {
         event: &SopEventRecord,
     ) -> Result<()> {
         let (persisted, run) = self.persisted_active_snapshot(run_id)?;
+        let revision = persisted.revision;
         self.store.save_run_with_event(&persisted, event).map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1030,6 +1358,7 @@ impl SopEngine {
             );
             anyhow::Error::new(e)
         })?;
+        self.note_run_revision(run_id, revision);
         self.notify_run(&run, true);
         Ok(())
     }
@@ -1050,6 +1379,7 @@ impl SopEngine {
                 ParkPersistOutcome::Released
             }
             ActivePersistOutcome::CapacityFull => ParkPersistOutcome::CapacityFull,
+            ActivePersistOutcome::Stale => ParkPersistOutcome::Stale,
             ActivePersistOutcome::Failed => {
                 // Track this run so `heartbeat_active_claims` keeps renewing its KEPT
                 // claim despite the park status (see `claims_pending_persist`'s doc):
@@ -1109,6 +1439,10 @@ impl SopEngine {
                     }
                 }
                 ActivePersistOutcome::CapacityFull | ActivePersistOutcome::Failed => {}
+                ActivePersistOutcome::Stale => {
+                    self.claims_pending_persist.remove(&run_id);
+                    let _ = self.drop_and_refuse(&run_id);
+                }
             }
         }
     }
@@ -1171,6 +1505,9 @@ impl SopEngine {
                 // no-op when the step has no policy request route.
                 ParkPersistOutcome::Released => self.notify_park_request(&run_id),
                 ParkPersistOutcome::PersistFailed => {}
+                ParkPersistOutcome::Stale => {
+                    let _ = self.drop_and_refuse(&run_id);
+                }
                 ParkPersistOutcome::CapacityFull => {
                     let reason = self.pending_pool_capacity_raced_reason(&sop);
                     Self::log_pending_capacity_full(&run_id, &reason);
@@ -1456,10 +1793,9 @@ impl SopEngine {
 
     /// Persist a run that has reached a terminal state and release its claim atomically.
     fn persist_terminal(&self, run: &SopRun) -> Result<()> {
-        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
         // The terminal write is the run's final revision; advance past the last
         // active snapshot so the store's revision guard accepts it.
-        pr.revision = self.next_run_revision(&run.run_id);
+        let pr = self.persisted_run(run);
         self.store.finish_run(&run.run_id, &pr).map_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1475,6 +1811,7 @@ impl SopEngine {
                 source: e,
             })
         })?;
+        self.forget_run_revision(&run.run_id);
         self.notify_run(run, false);
         Ok(())
     }
@@ -1483,8 +1820,7 @@ impl SopEngine {
     /// terminal run, release its claim, and append the gate-resolution ledger row
     /// in one store transaction.
     fn persist_terminal_with_gate_event(&self, run: &SopRun, event: &SopEventRecord) -> Result<()> {
-        let mut pr = PersistedRun::new(run.clone(), now_iso8601(), run.trigger_event.source);
-        pr.revision = self.next_run_revision(&run.run_id);
+        let pr = self.persisted_run(run);
         self.store
             .finish_run_with_event(&run.run_id, &pr, event)
             .map_err(|e| {
@@ -1502,6 +1838,7 @@ impl SopEngine {
                     source: e,
                 })
             })?;
+        self.forget_run_revision(&run.run_id);
         self.notify_run(run, false);
         Ok(())
     }
@@ -2158,6 +2495,56 @@ impl SopEngine {
     }
 
     pub fn advance_step(&mut self, run_id: &str, result: SopStepResult) -> Result<SopRunAction> {
+        // A result is routed against this engine's copy of the run. If another
+        // writer has since advanced or finished the run, routing it here would
+        // promote from stale state, re-run later steps, and overwrite what the
+        // record says ran. Adopt the stored record and refuse instead, unless
+        // the record now carries a cancellation requested through another
+        // engine: this driver is at a safe boundary, so it finishes it here.
+        if let Some(stale) = self.adopt_if_stale(run_id)? {
+            match self
+                .active_runs
+                .get(run_id)
+                .map(|run| (run.status, run.current_step))
+            {
+                // Still on the step that produced this result: the path below
+                // records it, as for any cancellation, and then finishes the
+                // cancellation at this boundary.
+                Some((SopRunStatus::CancelRequested, step)) if step == result.step_number => {}
+                Some((SopRunStatus::CancelRequested, current)) => {
+                    // The result is for a step the stored run has left, so it
+                    // is not recorded; leave that on the run's trail.
+                    self.record_transition_event(
+                        run_id,
+                        "step_result_stale",
+                        Some(format!(
+                            "result for step {} arrived while the run is on step {current}",
+                            result.step_number
+                        )),
+                        ::serde_json::json!({
+                            "step": result.step_number,
+                            "current_step": current,
+                        }),
+                    );
+                    return match self.finish_requested_cancellation(run_id)? {
+                        Some(cancelled) => Ok(cancelled),
+                        None => Err(self.refused(stale)),
+                    };
+                }
+                _ => return Err(self.refused(stale)),
+            }
+        }
+        let advanced = self.advance_current_step(run_id, result);
+        self.finish_cancel_after_refused_write(run_id, advanced)
+    }
+
+    /// Route a result for the step this engine's copy of the run is on: the
+    /// part of `advance_step` after its stale check.
+    fn advance_current_step(
+        &mut self,
+        run_id: &str,
+        result: SopStepResult,
+    ) -> Result<SopRunAction> {
         let (sop_name, current_step_number) = {
             let run = self.active_runs.get(run_id).ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -2855,9 +3242,10 @@ impl SopEngine {
                         reason,
                     });
                 }
+                ParkPersistOutcome::Stale => return Err(self.drop_and_refuse(run_id)),
             }
         } else {
-            self.persist_active(run_id);
+            self.persist_active_before_dispatch(run_id)?;
         }
         Ok(action)
     }
@@ -3274,7 +3662,15 @@ impl SopEngine {
                     last_error = None;
                     break;
                 }
-                Err(e) => last_error = Some(e),
+                Err(e) => {
+                    // Another writer moved the run on: the same write will be
+                    // refused again. Maintenance adopts the stored record.
+                    let stale = err_is_stale_terminal_write(&e);
+                    last_error = Some(e);
+                    if stale {
+                        break;
+                    }
+                }
             }
         }
         if let Some(e) = last_error {
@@ -3309,6 +3705,9 @@ impl SopEngine {
         reason: Option<String>,
         actor: Option<String>,
     ) -> Result<Option<CancelOutcome>> {
+        // Decide against the stored record. A copy another writer has moved on
+        // would fail this cancel at its write on every retry.
+        let _ = self.adopt_if_stale(run_id)?;
         let Some(status) = self.active_runs.get(run_id).map(|run| run.status) else {
             return Ok(self
                 .get_run(run_id)
@@ -3539,23 +3938,8 @@ impl SopEngine {
         // A restored cache can be stale even when populated: another generation
         // may already have settled this run through the shared queue.
         if let Some(stored) = self.store.load_run(run_id)? {
-            if matches!(
-                stored.run.status,
-                SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
-            ) {
-                self.claims_pending_persist.remove(run_id);
-                self.claims_retained_after_terminal_rollback.remove(run_id);
-                self.cancellation_finalization_ready.remove(run_id);
-                self.step_budget_finalization_ready.remove(run_id);
-                self.active_runs.remove(run_id);
-                // This is view reconciliation, not another completion.
-                self.finished_runs.retain(|run| run.run_id != run_id);
-                self.finished_runs.push(stored.run);
-                let max = self.config.max_finished_runs;
-                if max > 0 && self.finished_runs.len() > max {
-                    let excess = self.finished_runs.len() - max;
-                    self.finished_runs.drain(..excess);
-                }
+            if is_terminal_status(stored.run.status) {
+                self.adopt_terminal_record(run_id, stored.run);
                 return Ok(false);
             } else {
                 let needs_settlement = matches!(
@@ -3564,6 +3948,7 @@ impl SopEngine {
                 ) || (kind == OrphanedRunSettlement::DrainedBeforeAdmission
                     && stored.run.status == SopRunStatus::Pending);
                 if needs_settlement || self.active_runs.contains_key(run_id) {
+                    self.note_run_revision(run_id, stored.revision);
                     self.active_runs.insert(run_id.to_string(), stored.run);
                 }
                 return Ok(needs_settlement);
@@ -3639,6 +4024,7 @@ impl SopEngine {
     }
 
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
+        self.refuse_stale_gate_copy(run_id)?;
         self.resume_checkpoint(run_id, None)
     }
 
@@ -3747,8 +4133,11 @@ impl SopEngine {
                 // this lock, so this is unreachable in practice. If the advance
                 // still fails, roll the run back to `PausedCheckpoint` and release
                 // the just-reacquired claim so a run that made no progress does not
-                // get stuck in `Running` holding a leaked exec slot.
-                if let Some(run) = self.active_runs.get_mut(run_id) {
+                // get stuck in `Running` holding a leaked exec slot. A stale copy
+                // has already adopted the stored record; leave that in place.
+                if !err_is_stale_run_copy(&e)
+                    && let Some(run) = self.active_runs.get_mut(run_id)
+                {
                     run.status = SopRunStatus::PausedCheckpoint;
                     run.waiting_since = prior_waiting_since;
                 }
@@ -4064,6 +4453,7 @@ impl SopEngine {
         run_id: &str,
         decision: super::approval::ApprovalDecision,
     ) -> Result<SopRunAction> {
+        self.refuse_stale_gate_copy(run_id)?;
         match decision {
             super::approval::ApprovalDecision::Approve => self.approve_step(run_id),
             super::approval::ApprovalDecision::Deny { reason } => {
@@ -4231,7 +4621,7 @@ impl SopEngine {
         ) {
             Ok(route) => route,
             Err(e) => {
-                self.active_runs.insert(run_id.to_string(), prior_run);
+                self.restore_prior_run(run_id, prior_run, &e);
                 if !denial_terminates {
                     self.release_claim_on_park(run_id);
                 }
@@ -4267,7 +4657,7 @@ impl SopEngine {
                         Ok(action)
                     }
                     Err(e) => {
-                        self.active_runs.insert(run_id.to_string(), prior_run);
+                        self.restore_prior_run(run_id, prior_run, &e);
                         if !denial_terminates {
                             self.release_claim_on_park(run_id);
                         }
@@ -4283,7 +4673,7 @@ impl SopEngine {
             ) {
                 Ok(action) => Ok(action),
                 Err(e) => {
-                    self.active_runs.insert(run_id.to_string(), prior_run);
+                    self.restore_prior_run(run_id, prior_run, &e);
                     if !denial_terminates {
                         self.release_claim_on_park(run_id);
                     }
@@ -4489,7 +4879,7 @@ impl SopEngine {
                 Ok(action)
             }
             Err(e) => {
-                self.active_runs.insert(run_id.to_string(), prior_run);
+                self.restore_prior_run(run_id, prior_run, &e);
                 // The terminal write was rejected, so the durable store may still
                 // restore this parked run. Keep the claim acquired for this decision
                 // attempt to prevent another trigger from taking its execution slot.
@@ -4731,10 +5121,21 @@ impl SopEngine {
         run_id: &str,
         action: SopRunAction,
     ) -> Result<SopRunAction> {
+        // The driver released the engine lock since this action was handed
+        // out. If another writer moved the run on meanwhile, this copy must not
+        // execute the next capability: adopt the stored record, finish a
+        // cancellation requested through another engine at this boundary, and
+        // otherwise refuse.
+        if let Some(stale) = self.adopt_if_stale(run_id)? {
+            return match self.finish_requested_cancellation(run_id)? {
+                Some(cancelled) => Ok(cancelled),
+                None => Err(self.refused(stale)),
+            };
+        }
         if let Some(cancelled) = self.finish_requested_cancellation(run_id)? {
             return Ok(cancelled);
         }
-        match action {
+        let advanced = match action {
             SopRunAction::DeterministicStep {
                 ref step,
                 ref input,
@@ -4756,7 +5157,8 @@ impl SopEngine {
                 self.fail_headless_driverless_step(run_id, &sop_name, step)
             }
             terminal => Ok(terminal),
-        }
+        };
+        self.finish_cancel_after_refused_write(run_id, advanced)
     }
 
     /// Fail a run whose headless driver consumed its bounded step budget.
@@ -5339,6 +5741,7 @@ impl SopEngine {
         &mut self,
         state: DeterministicRunState,
     ) -> Result<SopRunAction> {
+        self.refuse_stale_gate_copy(&state.run_id)?;
         // Validate the run exists and is paused (immutable read), capturing its SOP
         // name, before any mutation - so the fail-closed reacquire can run first.
         let sop_name = match self.active_runs.get(&state.run_id) {
@@ -5473,8 +5876,11 @@ impl SopEngine {
                 // under this lock, so this is unreachable in practice. If it still
                 // fails, roll the run back to `PausedCheckpoint` and release the
                 // just-reacquired claim so it doesn't get stuck in `Running`
-                // holding a leaked exec slot.
-                if let Some(run) = self.active_runs.get_mut(&run_id) {
+                // holding a leaked exec slot. A stale copy has already adopted
+                // the stored record; leave that in place.
+                if !err_is_stale_run_copy(&e)
+                    && let Some(run) = self.active_runs.get_mut(&run_id)
+                {
                     run.status = SopRunStatus::PausedCheckpoint;
                     run.waiting_since = prior_waiting_since;
                     run.llm_calls_saved = prior_llm_calls_saved;
@@ -5587,6 +5993,7 @@ impl SopEngine {
                             reason,
                         });
                     }
+                    ParkPersistOutcome::Stale => return Err(self.drop_and_refuse(run_id)),
                 }
 
                 Ok(SopRunAction::CheckpointWait {
@@ -5604,7 +6011,7 @@ impl SopEngine {
                 // of running inline. Shared-engine drivers can then drop the lock
                 // between capabilities, allowing cancellation to become visible at
                 // the next safe step boundary.
-                self.persist_active(run_id);
+                self.persist_active_before_dispatch(run_id)?;
 
                 Ok(SopRunAction::DeterministicStep {
                     run_id: run_id.to_string(),
@@ -5706,6 +6113,12 @@ impl SopEngine {
         let action_cfg = self.config.approval_timeout_action;
         let mut actions = Vec::new();
         for run_id in self.overdue_waiting_run_ids() {
+            // A gate another writer already resolved or moved on must not time
+            // out here. Adopting the stored record drops it from this sweep;
+            // nothing was attempted, so no refusal is recorded.
+            if !matches!(self.adopt_if_stale(&run_id), Ok(None)) {
+                continue;
+            }
             if let Some(a) =
                 super::approval::timeout::apply_timeout_action(self, &run_id, action_cfg)
             {
@@ -5761,6 +6174,31 @@ impl SopEngine {
         }
     }
 
+    /// Before a maintenance retry of a terminal write, adopt the stored record
+    /// if another writer moved the run on; otherwise the refused write would be
+    /// retried every tick. The driver for the run has already exited, so an
+    /// adopted cancellation request is still safe to finish here. Returns
+    /// whether the retry should go ahead this tick.
+    fn adopt_stale_copy_for_retry(&mut self, run_id: &str) -> bool {
+        match self.adopt_if_stale(run_id) {
+            Ok(None) => true,
+            Ok(Some(stale)) => {
+                let _ = self.refused(stale);
+                let cancel_requested = self
+                    .active_runs
+                    .get(run_id)
+                    .is_some_and(|run| run.status == SopRunStatus::CancelRequested);
+                if cancel_requested {
+                    self.cancellation_finalization_ready
+                        .insert(run_id.to_string());
+                }
+                false
+            }
+            // The store could not be read; try again next tick.
+            Err(_) => false,
+        }
+    }
+
     fn retry_ready_step_budget_finalizations(&mut self) -> usize {
         let ready: Vec<String> = self
             .step_budget_finalization_ready
@@ -5769,6 +6207,9 @@ impl SopEngine {
             .collect();
         let mut finalized = 0;
         for run_id in ready {
+            if !self.adopt_stale_copy_for_retry(&run_id) {
+                continue;
+            }
             match self.active_runs.get(&run_id).map(|run| run.status) {
                 Some(SopRunStatus::Running) => match self.fail_headless_step_budget(&run_id) {
                     Ok(_) => finalized += 1,
@@ -5811,6 +6252,9 @@ impl SopEngine {
             .collect();
         let mut finalized = 0;
         for run_id in ready {
+            if !self.adopt_stale_copy_for_retry(&run_id) {
+                continue;
+            }
             match self.finish_requested_cancellation(&run_id) {
                 Ok(Some(_)) => finalized += 1,
                 Ok(None) => {
@@ -6120,7 +6564,7 @@ impl SopEngine {
                         match self.finish_run_with_gate_event(run_id, status, reason, event) {
                             Ok(action) => action,
                             Err(e) => {
-                                self.active_runs.insert(run_id.to_string(), prior_run);
+                                self.restore_prior_run(run_id, prior_run, &e);
                                 self.release_claim_on_park(run_id);
                                 return Err(e);
                             }
@@ -6132,7 +6576,7 @@ impl SopEngine {
                 }
             },
             Err(e) => {
-                self.active_runs.insert(run_id.to_string(), prior_run);
+                self.restore_prior_run(run_id, prior_run, &e);
                 self.release_claim_on_park(run_id);
                 return Err(e);
             }
@@ -6450,6 +6894,7 @@ impl SopEngine {
         decision: super::approval::ApprovalDecision,
         principal: super::approval::ApprovalPrincipal,
     ) -> Result<super::approval::ResolveOutcome> {
+        self.refuse_stale_gate_copy(run_id)?;
         super::approval::resolve::resolve_gate(self, run_id, decision, principal)
     }
 }
@@ -6993,6 +7438,13 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+fn is_terminal_status(status: SopRunStatus) -> bool {
+    matches!(
+        status,
+        SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
+    )
 }
 
 /// A1: whether a run in `active_runs` currently occupies an execution slot (holds
@@ -8901,6 +9353,1404 @@ mod tests {
         );
     }
 
+    /// The refusal a stale copy gets once it has adopted the stored record.
+    fn is_stale_copy_refusal(err: &anyhow::Error) -> bool {
+        err.to_string()
+            .contains("adopted the stored record and did not apply the transition")
+    }
+
+    /// The refusal is rendered from the Fluent catalog with every argument
+    /// filled in, so it follows the selected language.
+    #[test]
+    fn stale_copy_refusal_renders_from_the_catalog() {
+        let status = SopRunStatus::CancelRequested.to_string();
+        let refusal = StaleRunCopy {
+            run_id: "run-7".into(),
+            local_step: Some(1),
+            seen_revision: Some(3),
+            stored_revision: 5,
+            stored_status: SopRunStatus::CancelRequested,
+            stored_step: 2,
+        }
+        .to_string();
+        assert_eq!(
+            refusal,
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-sop-run-copy-stale",
+                &[
+                    ("run_id", "run-7"),
+                    ("seen_revision", "3"),
+                    ("stored_revision", "5"),
+                    ("status", status.as_str()),
+                    ("step", "2"),
+                ],
+            )
+        );
+        assert!(
+            refusal.contains("run-7") && refusal.contains("3 -> 5") && !refusal.contains('{'),
+            "got {refusal}"
+        );
+    }
+
+    fn four_step_sop(name: &str) -> Sop {
+        let mut sop = test_sop(name, SopExecutionMode::Auto, SopPriority::Normal);
+        for number in 3..=4 {
+            sop.steps.push(SopStep {
+                number,
+                title: format!("Step {number}"),
+                body: format!("Do step {number}"),
+                ..SopStep::default()
+            });
+        }
+        sop
+    }
+
+    /// A run completes while a second engine over the same store still holds
+    /// the copy it restored at step 1, and a result reaches that copy. The
+    /// stale copy must not record it, promote the run, or write its older
+    /// state over the terminal record, or the run goes back to `Running` and
+    /// replays from step 2 with its recorded results replaced.
+    fn assert_stale_copy_cannot_reopen_terminal_run(store: Arc<dyn SopRunStore>) {
+        let sop = four_step_sop("replayed");
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner.start_run("replayed", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let mut stale = engine_with_sops(vec![sop]).with_store(store.clone());
+        stale.restore_runs();
+        assert_eq!(stale.active_runs()[&run_id].current_step, 1);
+
+        for step in 1..=3 {
+            owner
+                .advance_step(&run_id, completed_step_result(step, "done"))
+                .unwrap();
+        }
+        let action = owner
+            .advance_step(&run_id, completed_step_result(4, "removed worktree"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+
+        let replay = stale.advance_step(&run_id, completed_step_result(1, "removed worktree"));
+        assert!(
+            replay.as_ref().is_err_and(is_stale_copy_refusal),
+            "a stale copy must not advance a finished run, got {replay:?}"
+        );
+
+        let stored = store.load_run(&run_id).unwrap().expect("run persisted");
+        assert_eq!(
+            stored.run.status,
+            SopRunStatus::Completed,
+            "the terminal record must stay terminal"
+        );
+        assert_eq!(
+            stored
+                .run
+                .step_results
+                .iter()
+                .map(|r| r.step_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "the recorded step results must not be replaced"
+        );
+        assert!(
+            store
+                .load_active_runs()
+                .unwrap()
+                .iter()
+                .all(|r| r.run_id() != run_id),
+            "a restart must not pick the finished run back up"
+        );
+        assert!(
+            !stale.active_runs().contains_key(&run_id),
+            "the stale engine must drop its copy"
+        );
+    }
+
+    #[test]
+    fn stale_copy_cannot_reopen_a_terminal_run_in_sqlite() {
+        assert_stale_copy_cannot_reopen_terminal_run(Arc::new(
+            super::super::store::SqliteRunStore::open_in_memory().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn stale_copy_cannot_reopen_a_terminal_run_in_memory() {
+        assert_stale_copy_cannot_reopen_terminal_run(Arc::new(InMemoryRunStore::new()));
+    }
+
+    /// Once the owner records step 2's output-schema rejection, a copy that
+    /// never saw it must not promote the run past step 2 or replace the
+    /// recorded rejection with its own result.
+    #[test]
+    fn stale_copy_cannot_promote_past_a_recorded_schema_rejection() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut sop = four_step_sop("late-reject");
+        sop.steps[1].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[1].on_failure = StepFailure::Retry { max: 1 };
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner.start_run("late-reject", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+
+        let mut stale = engine_with_sops(vec![sop]).with_store(store.clone());
+        stale.restore_runs();
+        assert_eq!(stale.active_runs()[&run_id].current_step, 2);
+
+        let action = owner
+            .advance_step(&run_id, completed_step_result(2, "prose, not an object"))
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2),
+            "the rejected step is retried, got {action:?}"
+        );
+
+        let promoted = stale.advance_step(&run_id, completed_step_result(2, r#"{"ok":true}"#));
+        assert!(
+            promoted.as_ref().is_err_and(is_stale_copy_refusal),
+            "a stale copy must not promote the run, got {promoted:?}"
+        );
+
+        let stored = store.load_run(&run_id).unwrap().expect("run persisted");
+        assert_eq!(
+            stored.run.current_step, 2,
+            "the run stays on the rejected step"
+        );
+        assert_eq!(
+            stored
+                .run
+                .step_results
+                .iter()
+                .map(|r| (r.step_number, r.status))
+                .collect::<Vec<_>>(),
+            vec![(1, SopStepStatus::Completed), (2, SopStepStatus::Failed)],
+            "the recorded rejection must survive"
+        );
+        let events = owner.run_events(&run_id).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.kind == "step_promoted" && e.payload["from_step"] == 2),
+            "no step may be promoted past the rejected step"
+        );
+    }
+
+    /// A gate decision on a copy of a run that another writer has since
+    /// finished is refused, and the copy is replaced by the stored record, so
+    /// the engine stops holding a gate that no longer exists instead of
+    /// refusing every later decision on it.
+    #[test]
+    fn stale_copy_of_a_finished_run_cannot_resolve_its_old_gate() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut sop = test_sop("stale-gate", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[1].requires_confirmation = true;
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner.start_run("stale-gate", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let action = owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+
+        let mut stale = engine_with_sops(vec![sop]).with_store(store.clone());
+        stale.restore_runs();
+        assert_eq!(
+            stale.active_runs()[&run_id].status,
+            SopRunStatus::WaitingApproval
+        );
+
+        approve_gate_cli(&mut owner, &run_id);
+        let action = owner
+            .advance_step(&run_id, completed_step_result(2, "two"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+
+        let decided = stale.resolve_via_broker(
+            &run_id,
+            ApprovalDecision::Approve,
+            ApprovalPrincipal::cli(None),
+        );
+        assert!(
+            decided.as_ref().is_err_and(is_stale_copy_refusal),
+            "a stale copy must not resolve a finished run's gate, got {decided:?}"
+        );
+        assert!(
+            !stale.active_runs().contains_key(&run_id),
+            "the stale engine must drop its parked copy"
+        );
+        assert_eq!(
+            stale.get_run(&run_id).map(|r| r.status),
+            Some(SopRunStatus::Completed)
+        );
+        assert_eq!(
+            store.load_run(&run_id).unwrap().unwrap().run.status,
+            SopRunStatus::Completed
+        );
+    }
+
+    /// A stale engine's write is stamped from the revision it last saw, so the
+    /// store's revision guard refuses it rather than letting the older copy
+    /// overwrite the record. Exercises the stamp alone, with no pre-check.
+    #[test]
+    fn stale_copy_write_is_refused_by_its_revision() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let sop = four_step_sop("stale-write");
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner.start_run("stale-write", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let mut stale = engine_with_sops(vec![sop]).with_store(store.clone());
+        stale.restore_runs();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let before = store.load_run(&run_id).unwrap().unwrap();
+
+        assert!(
+            !stale.persist_active_checked(&run_id),
+            "the stale copy's write must be refused"
+        );
+        let after = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(after.revision, before.revision, "the write must be refused");
+        assert_eq!(after.run.current_step, 2);
+        assert_eq!(after.run.step_results.len(), 1);
+    }
+
+    /// Delegates to another store, except that the next `load_run` after it is
+    /// armed returns an older record. The engine's pre-check then passes, so
+    /// only the write-time refusal can stop a stale copy.
+    struct LaggingLoadStore {
+        inner: Arc<dyn SopRunStore>,
+        lagged: parking_lot::Mutex<Option<PersistedRun>>,
+    }
+    impl SopRunStore for LaggingLoadStore {
+        fn save_run(&self, r: &PersistedRun) -> Result<(), StoreError> {
+            self.inner.save_run(r)
+        }
+        fn save_run_with_event(
+            &self,
+            r: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.save_run_with_event(r, e)
+        }
+        fn finish_run(&self, id: &str, t: &PersistedRun) -> Result<(), StoreError> {
+            self.inner.finish_run(id, t)
+        }
+        fn finish_run_with_event(
+            &self,
+            id: &str,
+            t: &PersistedRun,
+            e: &SopEventRecord,
+        ) -> Result<u64, StoreError> {
+            self.inner.finish_run_with_event(id, t, e)
+        }
+        fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_active_runs()
+        }
+        fn load_terminal_runs(&self, limit: usize) -> Result<Vec<PersistedRun>, StoreError> {
+            self.inner.load_terminal_runs(limit)
+        }
+        fn load_run(&self, id: &str) -> Result<Option<PersistedRun>, StoreError> {
+            if let Some(older) = self.lagged.lock().take() {
+                return Ok(Some(older));
+            }
+            self.inner.load_run(id)
+        }
+        fn last_terminal_completed_at(&self, s: &str) -> Result<Option<String>, StoreError> {
+            self.inner.last_terminal_completed_at(s)
+        }
+        fn try_claim_run(
+            &self,
+            id: &str,
+            s: &str,
+            p: usize,
+            g: usize,
+        ) -> Result<Option<ClaimToken>, StoreError> {
+            self.inner.try_claim_run(id, s, p, g)
+        }
+        fn renew_claim_for_restore(&self, id: &str, s: &str) -> Result<ClaimToken, StoreError> {
+            self.inner.renew_claim_for_restore(id, s)
+        }
+        fn claim_counts(&self, s: &str) -> Result<(usize, usize), StoreError> {
+            self.inner.claim_counts(s)
+        }
+        fn heartbeat_claim(&self, t: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.heartbeat_claim(t)
+        }
+        fn release_claim(&self, t: &ClaimToken) -> Result<(), StoreError> {
+            self.inner.release_claim(t)
+        }
+        fn expired_claims(&self, n: &str) -> Result<Vec<ClaimToken>, StoreError> {
+            self.inner.expired_claims(n)
+        }
+        fn append_event(&self, e: &SopEventRecord) -> Result<u64, StoreError> {
+            self.inner.append_event(e)
+        }
+        fn list_events(&self, id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
+            self.inner.list_events(id)
+        }
+        fn save_proposal(&self, p: &ProposalRecord) -> Result<(), StoreError> {
+            self.inner.save_proposal(p)
+        }
+        fn load_proposal(&self, id: &str) -> Result<Option<ProposalRecord>, StoreError> {
+            self.inner.load_proposal(id)
+        }
+        fn list_proposals(
+            &self,
+            s: Option<ProposalStatus>,
+        ) -> Result<Vec<ProposalRecord>, StoreError> {
+            self.inner.list_proposals(s)
+        }
+        fn prune(&self, p: &RetentionPolicy) -> Result<usize, StoreError> {
+            self.inner.prune(p)
+        }
+        fn health_check(&self) -> bool {
+            self.inner.health_check()
+        }
+        fn backend(&self) -> &'static str {
+            "lagging-load-test"
+        }
+    }
+
+    /// Another writer lands between the pre-check and the write. The persist
+    /// that would hand out the next step is refused, so no `ExecuteStep`
+    /// comes out of the stale copy and the stored record is untouched.
+    #[test]
+    fn stale_copy_is_refused_at_the_dispatch_write() {
+        let inner: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: inner.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let sop = four_step_sop("late-write");
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(inner.clone());
+        let action = owner.start_run("late-write", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let mut stale = engine_with_sops(vec![sop]).with_store(lagging.clone());
+        stale.restore_runs();
+        let seen = inner.load_run(&run_id).unwrap().unwrap();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let before = inner.load_run(&run_id).unwrap().unwrap();
+        *lagging.lagged.lock() = Some(seen);
+
+        let err = stale
+            .advance_step(&run_id, completed_step_result(1, "one again"))
+            .unwrap_err();
+        assert!(is_stale_copy_refusal(&err), "got {err}");
+        let after = inner.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(after.revision, before.revision, "the write must be refused");
+        assert_eq!(after.run.step_results[0].output, "one");
+        assert_eq!(
+            stale.active_runs()[&run_id].current_step,
+            2,
+            "the stale engine adopts the stored record"
+        );
+    }
+
+    /// Wait until the wall clock is early in a second, so that the writes made
+    /// right after it carry the same second-precision timestamp.
+    fn wait_for_the_start_of_a_second() {
+        while std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_millis()
+            > 50
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Two engines hold the same copy of a run, and the same result for its
+    /// current step reaches both within one second. Both pass the stale check
+    /// before either writes (the second engine's check is served the record
+    /// both started from), so both stamp the same next revision. Building
+    /// identical state from the same revision must not let the second write
+    /// through as a retry of the first, or both engines hand out the next step
+    /// and its side effects run twice.
+    fn assert_matching_writes_dispatch_the_next_step_once(store: Arc<dyn SopRunStore>) {
+        let sop = four_step_sop("matching-writes");
+        let mut first = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = first.start_run("matching-writes", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: store.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let mut second = engine_with_sops(vec![sop]).with_store(lagging.clone());
+        second.restore_runs();
+        let seen = store.load_run(&run_id).unwrap().unwrap();
+
+        let result = completed_step_result(1, "one");
+        wait_for_the_start_of_a_second();
+        let a = first.advance_step(&run_id, result.clone());
+        *lagging.lagged.lock() = Some(seen.clone());
+        let b = second.advance_step(&run_id, result);
+
+        let dispatched = [&a, &b]
+            .into_iter()
+            .filter(|action| {
+                matches!(action, Ok(SopRunAction::ExecuteStep { step, .. }) if step.number == 2)
+            })
+            .count();
+        assert_eq!(
+            dispatched, 1,
+            "step 2 must be handed out once, got {a:?} and {b:?}"
+        );
+        assert!(
+            b.as_ref().is_err_and(is_stale_copy_refusal),
+            "the second write must be refused, got {b:?}"
+        );
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.revision, seen.revision + 1);
+        assert_eq!(stored.run.current_step, 2);
+        assert_eq!(stored.run.step_results.len(), 1);
+        assert_eq!(
+            second.active_runs()[&run_id].current_step,
+            2,
+            "the refused engine adopts the stored record"
+        );
+    }
+
+    #[test]
+    fn matching_writes_dispatch_the_next_step_once_in_sqlite() {
+        assert_matching_writes_dispatch_the_next_step_once(Arc::new(
+            super::super::store::SqliteRunStore::open_in_memory().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn matching_writes_dispatch_the_next_step_once_in_memory() {
+        assert_matching_writes_dispatch_the_next_step_once(Arc::new(InMemoryRunStore::new()));
+    }
+
+    /// The same race over two connections to one database file, the way a
+    /// CLI process and the daemon share `runs.db`.
+    #[test]
+    fn matching_writes_dispatch_the_next_step_once_across_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let sop = four_step_sop("matching-files");
+        let first_store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open(&path).unwrap());
+        let second_store = Arc::new(LaggingLoadStore {
+            inner: Arc::new(super::super::store::SqliteRunStore::open(&path).unwrap()),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let mut first = engine_with_sops(vec![sop.clone()]).with_store(first_store.clone());
+        let action = first.start_run("matching-files", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let mut second = engine_with_sops(vec![sop]).with_store(second_store.clone());
+        second.restore_runs();
+        let seen = first_store.load_run(&run_id).unwrap().unwrap();
+
+        let result = completed_step_result(1, "one");
+        wait_for_the_start_of_a_second();
+        let a = first.advance_step(&run_id, result.clone());
+        *second_store.lagged.lock() = Some(seen);
+        let b = second.advance_step(&run_id, result);
+
+        assert!(
+            matches!(a, Ok(SopRunAction::ExecuteStep { ref step, .. }) if step.number == 2),
+            "got {a:?}"
+        );
+        assert!(
+            b.as_ref().is_err_and(is_stale_copy_refusal),
+            "the second write must be refused, got {b:?}"
+        );
+        assert_eq!(
+            first_store
+                .load_run(&run_id)
+                .unwrap()
+                .unwrap()
+                .run
+                .step_results
+                .len(),
+            1
+        );
+    }
+
+    /// The same race at the final step: the second engine's terminal write is
+    /// a competing completion, not a retry of the first, so only one engine
+    /// completes the run and the other adopts the stored terminal record.
+    #[test]
+    fn matching_final_writes_complete_the_run_once() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let sop = test_sop(
+            "matching-final",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        let mut first = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = first.start_run("matching-final", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        first
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: store.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let mut second = engine_with_sops(vec![sop]).with_store(lagging.clone());
+        second.restore_runs();
+        let seen = store.load_run(&run_id).unwrap().unwrap();
+
+        let result = completed_step_result(2, "two");
+        wait_for_the_start_of_a_second();
+        let a = first.advance_step(&run_id, result.clone());
+        *lagging.lagged.lock() = Some(seen);
+        let b = second.advance_step(&run_id, result);
+
+        assert!(matches!(a, Ok(SopRunAction::Completed { .. })), "got {a:?}");
+        assert!(
+            b.as_ref().is_err_and(is_stale_copy_refusal),
+            "the second completion must be refused, got {b:?}"
+        );
+        assert!(!second.active_runs().contains_key(&run_id));
+        assert_eq!(
+            second.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::Completed)
+        );
+    }
+
+    /// A cancel requested through another engine lands after the final
+    /// step's result passed the driver's stale check, so the run's terminal
+    /// write is refused. The driver adopts the stored request and finishes
+    /// the cancellation, instead of exiting with the run claimed and `Running`
+    /// in its copy and nobody left to finish it.
+    #[test]
+    fn remote_cancel_after_the_final_step_check_is_finished_by_the_driver() {
+        let inner: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: inner.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let sop = test_sop("cancel-final", SopExecutionMode::Auto, SopPriority::Normal);
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(lagging.clone());
+        let action = owner.start_run("cancel-final", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let seen = inner.load_run(&run_id).unwrap().unwrap();
+        let mut other = engine_with_sops(vec![sop]).with_store(inner.clone());
+        other.restore_runs();
+        assert_eq!(
+            other
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        *lagging.lagged.lock() = Some(seen);
+
+        let action = owner.advance_step(&run_id, completed_step_result(2, "two"));
+        assert!(
+            matches!(action, Ok(SopRunAction::Cancelled { .. })),
+            "got {action:?}"
+        );
+        let stored = inner.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(inner.claim_counts("cancel-final").unwrap(), (0, 0));
+        assert!(!owner.active_runs().contains_key(&run_id));
+    }
+
+    /// The same race at a step that hands out the next one: the refused
+    /// dispatch write adopts the stored request, and the driver finishes the
+    /// cancellation there instead of only refusing.
+    #[test]
+    fn remote_cancel_after_a_step_check_is_finished_at_the_dispatch_write() {
+        let inner: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: inner.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let sop = four_step_sop("cancel-dispatch");
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(lagging.clone());
+        let action = owner.start_run("cancel-dispatch", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let seen = inner.load_run(&run_id).unwrap().unwrap();
+        let mut other = engine_with_sops(vec![sop]).with_store(inner.clone());
+        other.restore_runs();
+        assert_eq!(
+            other
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        *lagging.lagged.lock() = Some(seen);
+
+        let action = owner.advance_step(&run_id, completed_step_result(1, "one"));
+        assert!(
+            matches!(action, Ok(SopRunAction::Cancelled { .. })),
+            "got {action:?}"
+        );
+        let stored = inner.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(inner.claim_counts("cancel-dispatch").unwrap(), (0, 0));
+        assert!(!owner.active_runs().contains_key(&run_id));
+    }
+
+    /// Another engine finished the run after the final step's check passed.
+    /// The refused terminal write adopts the stored terminal record, so this
+    /// engine stops holding a `Running` copy of a finished run.
+    #[test]
+    fn terminal_write_refused_by_a_finished_run_adopts_its_record() {
+        let inner: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: inner.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let sop = test_sop(
+            "finished-elsewhere",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(lagging.clone());
+        let action = owner
+            .start_run("finished-elsewhere", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let seen = inner.load_run(&run_id).unwrap().unwrap();
+        let mut other = engine_with_sops(vec![sop]).with_store(inner.clone());
+        other.restore_runs();
+        let done = other
+            .advance_step(&run_id, completed_step_result(2, "two, elsewhere"))
+            .unwrap();
+        assert!(matches!(done, SopRunAction::Completed { .. }));
+        *lagging.lagged.lock() = Some(seen);
+
+        let action = owner.advance_step(&run_id, completed_step_result(2, "two"));
+        assert!(
+            action.as_ref().is_err_and(is_stale_copy_refusal),
+            "got {action:?}"
+        );
+        let stored = inner.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Completed);
+        assert_eq!(stored.run.step_results[1].output, "two, elsewhere");
+        assert!(!owner.active_runs().contains_key(&run_id));
+        assert_eq!(
+            owner.get_run(&run_id).map(|run| run.status),
+            Some(SopRunStatus::Completed)
+        );
+    }
+
+    /// The stale check cannot read the stored record (here a damaged row). The
+    /// step result is refused rather than treated as current, so nothing is
+    /// recorded or handed out and the stored row is left as it was.
+    #[test]
+    fn unreadable_stored_record_fails_the_stale_check_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open(&path).unwrap());
+        let sop = four_step_sop("unreadable");
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let action = engine.start_run("unreadable", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let damage = rusqlite::Connection::open(&path).unwrap();
+        damage
+            .execute(
+                "UPDATE sop_runs SET json = 'not a run' WHERE run_id = ?1",
+                rusqlite::params![run_id],
+            )
+            .unwrap();
+        let row = |conn: &rusqlite::Connection| -> (i64, String) {
+            conn.query_row(
+                "SELECT revision, json FROM sop_runs WHERE run_id = ?1",
+                rusqlite::params![run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let before = row(&damage);
+
+        let advanced = engine.advance_step(&run_id, completed_step_result(1, "one"));
+        assert!(advanced.is_err(), "got {advanced:?}");
+        assert_eq!(row(&damage), before, "the stored row must be untouched");
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.current_step, 1);
+        assert!(
+            run.step_results.is_empty(),
+            "the result must not be recorded"
+        );
+    }
+
+    /// A gate the owner already resolved must not time out from a stale
+    /// engine's copy. The sweep adopts the stored record and skips the run.
+    #[test]
+    fn approval_timeout_skips_a_gate_another_engine_resolved() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut sop = test_sop("stale-timeout", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[1].requires_confirmation = true;
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner.start_run("stale-timeout", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let action = owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+
+        let mut stale = engine_with_config_sops(
+            SopConfig {
+                approval_timeout_secs: 1,
+                approval_timeout_action: zeroclaw_config::schema::ApprovalTimeoutAction::Cancel,
+                ..SopConfig::default()
+            },
+            vec![sop],
+        )
+        .with_store(store.clone());
+        stale.restore_runs();
+        stale.active_runs.get_mut(&run_id).unwrap().waiting_since =
+            Some("2020-01-01T00:00:00Z".into());
+        approve_gate_cli(&mut owner, &run_id);
+        let before = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(before.run.status, SopRunStatus::Running);
+
+        let actions = stale.check_approval_timeouts();
+        assert!(actions.is_empty(), "got {actions:?}");
+        let after = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.run.status, SopRunStatus::Running);
+        assert_eq!(
+            stale.active_runs()[&run_id].status,
+            SopRunStatus::Running,
+            "the sweep adopts the stored record"
+        );
+        let events = store.list_events(&run_id).unwrap();
+        assert!(!events.iter().any(|e| e.kind == "gate_timed_out"));
+        assert!(
+            !events.iter().any(|e| e.kind == "run_copy_stale"),
+            "skipping a gate that was already resolved is not a refusal"
+        );
+    }
+
+    /// The order first reported: another engine promotes the run past step 2,
+    /// then the owner's late step-2 result arrives. The owner must not record a
+    /// rejection for, or retry, a step the stored run has already left.
+    #[test]
+    fn late_result_on_a_stale_copy_is_not_rejected_or_retried() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut sop = four_step_sop("promoted-first");
+        sop.steps[1].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[1].on_failure = StepFailure::Retry { max: 1 };
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner.start_run("promoted-first", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+
+        let mut other = engine_with_sops(vec![sop]).with_store(store.clone());
+        other.restore_runs();
+        let action = other
+            .advance_step(&run_id, completed_step_result(2, r#"{"ok":true}"#))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 3));
+
+        let err = owner
+            .advance_step(&run_id, completed_step_result(2, "prose, not an object"))
+            .unwrap_err();
+        assert!(is_stale_copy_refusal(&err), "got {err}");
+        let events = store.list_events(&run_id).unwrap();
+        assert!(!events.iter().any(|e| e.kind == "step_schema_reject"));
+        assert!(!events.iter().any(|e| e.kind == "step_retry"));
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.current_step, 3);
+        assert_eq!(
+            stored
+                .run
+                .step_results
+                .iter()
+                .map(|r| (r.step_number, r.status))
+                .collect::<Vec<_>>(),
+            vec![(1, SopStepStatus::Completed), (2, SopStepStatus::Completed)]
+        );
+        assert_eq!(owner.active_runs()[&run_id].current_step, 3);
+    }
+
+    /// A cancel requested through another engine lands while the driver's
+    /// step is in flight. At the step boundary the driver records the step's
+    /// result and finishes the cancellation instead of stalling on its stale
+    /// copy with the claim still held.
+    #[test]
+    fn cancel_requested_through_another_engine_finishes_at_the_driver_boundary() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let sop = test_sop("remote-cancel", SopExecutionMode::Auto, SopPriority::Normal);
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner.start_run("remote-cancel", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let mut other = engine_with_sops(vec![sop]).with_store(store.clone());
+        other.restore_runs();
+        assert_eq!(
+            other
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+
+        let action = owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Cancelled { .. }),
+            "got {action:?}"
+        );
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(
+            stored
+                .run
+                .step_results
+                .iter()
+                .map(|r| r.step_number)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the step that ran is recorded"
+        );
+        assert_eq!(store.claim_counts("remote-cancel").unwrap(), (0, 0));
+        assert!(!owner.active_runs().contains_key(&run_id));
+    }
+
+    /// The adopted cancellation request is on a later step than the result: the
+    /// other engine advanced the run before cancelling it. The stale driver
+    /// still finishes the cancellation at its boundary rather than leave the run
+    /// claimed with nobody finishing it; the late result is not recorded.
+    #[test]
+    fn remote_cancel_on_a_later_step_is_finished_at_a_stale_driver_boundary() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let sop = four_step_sop("cancel-later-step");
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner
+            .start_run("cancel-later-step", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let mut other = engine_with_sops(vec![sop]).with_store(store.clone());
+        other.restore_runs();
+        other
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert_eq!(
+            other
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+
+        let action = owner
+            .advance_step(&run_id, completed_step_result(1, "one, late"))
+            .unwrap();
+        assert!(
+            matches!(action, SopRunAction::Cancelled { .. }),
+            "got {action:?}"
+        );
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(
+            stored
+                .run
+                .step_results
+                .iter()
+                .map(|r| (r.step_number, r.output.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "one")],
+            "only the result the stored run recorded survives"
+        );
+        let dropped = store
+            .list_events(&run_id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.kind == "step_result_stale")
+            .expect("the dropped late result is on the run's trail");
+        assert_eq!(dropped.payload["step"], 1);
+        assert_eq!(dropped.payload["current_step"], 2);
+        assert_eq!(store.claim_counts("cancel-later-step").unwrap(), (0, 0));
+    }
+
+    /// A cancel through an engine whose copy is out of date is decided against
+    /// the stored run: the run was approved and is running elsewhere, so the
+    /// cancel is requested rather than applied to the gate the copy remembers.
+    #[test]
+    fn cancel_through_a_stale_engine_is_decided_against_the_stored_run() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut sop = test_sop("stale-cancel", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[1].requires_confirmation = true;
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner.start_run("stale-cancel", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let mut stale = engine_with_sops(vec![sop]).with_store(store.clone());
+        stale.restore_runs();
+        approve_gate_cli(&mut owner, &run_id);
+
+        let outcome = stale
+            .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+            .unwrap();
+        assert_eq!(outcome, Some(CancelOutcome::Requested));
+        assert_eq!(
+            store.load_run(&run_id).unwrap().unwrap().run.status,
+            SopRunStatus::CancelRequested
+        );
+    }
+
+    /// Another writer re-saved the parked run without changing its gate. A
+    /// decision through an engine holding the older copy goes ahead against the
+    /// adopted record, and adopting it is not recorded as a refusal.
+    #[test]
+    fn decision_on_a_stale_copy_of_the_same_gate_goes_ahead() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut sop = test_sop("same-gate", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[1].requires_confirmation = true;
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner.start_run("same-gate", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        let mut stale = engine_with_sops(vec![sop]).with_store(store.clone());
+        stale.restore_runs();
+        assert!(owner.persist_active_checked(&run_id));
+
+        let action = approve_gate_cli(&mut stale, &run_id);
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2),
+            "got {action:?}"
+        );
+        assert!(
+            !store
+                .list_events(&run_id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "run_copy_stale")
+        );
+    }
+
+    /// Another writer lands between the pre-check and the write, and the
+    /// stale copy's next step parks at a gate. The park write is refused too,
+    /// so the copy neither presents the gate nor keeps its stale parked state.
+    #[test]
+    fn stale_copy_is_refused_at_the_park_write() {
+        let inner: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let lagging = Arc::new(LaggingLoadStore {
+            inner: inner.clone(),
+            lagged: parking_lot::Mutex::new(None),
+        });
+        let mut sop = four_step_sop("late-park");
+        sop.steps[1].requires_confirmation = true;
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(inner.clone());
+        let action = owner.start_run("late-park", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let mut stale = engine_with_sops(vec![sop]).with_store(lagging.clone());
+        stale.restore_runs();
+        let seen = inner.load_run(&run_id).unwrap().unwrap();
+        let action = owner
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+        let before = inner.load_run(&run_id).unwrap().unwrap();
+        *lagging.lagged.lock() = Some(seen);
+
+        let err = stale
+            .advance_step(&run_id, completed_step_result(1, "one again"))
+            .unwrap_err();
+        assert!(is_stale_copy_refusal(&err), "got {err}");
+        let after = inner.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(
+            after.revision, before.revision,
+            "the park write must be refused"
+        );
+        assert_eq!(after.run.step_results[0].output, "one");
+        assert_eq!(
+            stale.active_runs()[&run_id].step_results[0].output,
+            "one",
+            "the stale engine adopts the stored record"
+        );
+    }
+
+    /// The owner could not finish a cancellation (its terminal write failed),
+    /// and another engine finished it instead. Maintenance adopts the stored
+    /// terminal record instead of retrying the refused write every tick.
+    #[test]
+    fn maintenance_adopts_a_cancellation_another_engine_finished() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let sop = test_sop(
+            "finished-elsewhere",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner
+            .start_run("finished-elsewhere", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert_eq!(
+            owner
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        // At its boundary the driver recorded the step's result, then the
+        // cancellation's terminal write failed.
+        owner
+            .active_runs
+            .get_mut(&run_id)
+            .unwrap()
+            .step_results
+            .push(completed_step_result(1, "one"));
+        owner.cancellation_finalization_ready.insert(run_id.clone());
+
+        let mut other = engine_with_sops(vec![sop]).with_store(store.clone());
+        other.restore_runs();
+        assert_eq!(
+            store.load_run(&run_id).unwrap().unwrap().run.status,
+            SopRunStatus::Cancelled
+        );
+
+        owner.run_maintenance_tick();
+        assert!(
+            !owner.cancellation_finalization_ready.contains(&run_id),
+            "the retry ends once the stored record is adopted"
+        );
+        assert!(!owner.active_runs().contains_key(&run_id));
+        assert_eq!(
+            owner.get_run(&run_id).map(|r| r.status),
+            Some(SopRunStatus::Cancelled)
+        );
+    }
+
+    /// A headless driver ran out of budget and exited, but its `Failed` write
+    /// did not land; meanwhile another engine requested a cancel. Maintenance
+    /// adopts the request and finishes the cancel instead of writing a stale
+    /// `Failed` over it.
+    #[test]
+    fn maintenance_finishes_a_remote_cancel_instead_of_a_stale_budget_failure() {
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let sop = test_sop(
+            "budget-then-cancel",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = owner
+            .start_run("budget-then-cancel", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        owner.step_budget_finalization_ready.insert(run_id.clone());
+
+        let mut other = engine_with_sops(vec![sop]).with_store(store.clone());
+        other.restore_runs();
+        assert_eq!(
+            other
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+
+        owner.run_maintenance_tick();
+        assert_eq!(
+            store.load_run(&run_id).unwrap().unwrap().run.status,
+            SopRunStatus::Cancelled
+        );
+        assert_eq!(store.claim_counts("budget-then-cancel").unwrap(), (0, 0));
+        assert!(!owner.active_runs().contains_key(&run_id));
+    }
+
+    struct CountingCapability {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl super::super::capability::SopCapability for CountingCapability {
+        fn id(&self) -> &'static str {
+            "count.calls"
+        }
+
+        fn describe(&self) -> super::super::capability::CapabilityInfo {
+            super::super::capability::CapabilityInfo {
+                id: self.id(),
+                description: "Count executions",
+                deterministic: true,
+                idempotent: false,
+                reversible: false,
+                supports_retry: false,
+                required_permissions: Vec::new(),
+                input_schema: None,
+                output_schema: None,
+            }
+        }
+
+        fn execute(
+            &self,
+            _ctx: super::super::capability::CapabilityContext,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<super::super::capability::CapabilityResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(super::super::capability::CapabilityResult::success(
+                serde_json::json!({"ok": true}),
+            ))
+        }
+    }
+
+    /// The headless deterministic driver releases the engine lock between
+    /// capabilities. A cancel requested through another engine in that gap
+    /// must stop the next capability from running at all.
+    #[test]
+    fn stale_deterministic_copy_runs_no_capability_after_a_remote_cancel() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = SopCapabilityRegistry::with_builtins();
+        registry.register(CountingCapability {
+            calls: calls.clone(),
+        });
+        let registry = Arc::new(registry);
+        let mut sop = deterministic_sop_all_execute("det-remote-cancel");
+        for step in &mut sop.steps {
+            step.kind = SopStepKind::Capability;
+            step.capability = Some("count.calls".into());
+        }
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut owner = engine_with_sops(vec![sop.clone()])
+            .with_store(store.clone())
+            .with_capabilities(registry.clone());
+        let first = owner
+            .start_run("det-remote-cancel", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let second = owner
+            .advance_headless_deterministic_step(&run_id, first)
+            .unwrap();
+        assert!(
+            matches!(second, SopRunAction::DeterministicStep { ref step, .. } if step.number == 2),
+            "got {second:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut other = engine_with_sops(vec![sop])
+            .with_store(store.clone())
+            .with_capabilities(registry);
+        other.restore_runs();
+        assert_eq!(
+            other
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+
+        let action = owner.advance_headless_deterministic_step(&run_id, second);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second capability must not run"
+        );
+        assert!(
+            matches!(action, Ok(SopRunAction::Cancelled { .. })),
+            "got {action:?}"
+        );
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(store.claim_counts("det-remote-cancel").unwrap(), (0, 0));
+    }
+
+    /// Requests the run's cancellation through another engine while it runs,
+    /// the way an operator cancel lands during a long capability. The first
+    /// call returns normally; every later call cancels before returning.
+    struct CancelThroughAnotherEngine {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        other: Arc<parking_lot::Mutex<Option<SopEngine>>>,
+    }
+
+    impl super::super::capability::SopCapability for CancelThroughAnotherEngine {
+        fn id(&self) -> &'static str {
+            "cancel.elsewhere"
+        }
+
+        fn describe(&self) -> super::super::capability::CapabilityInfo {
+            super::super::capability::CapabilityInfo {
+                id: self.id(),
+                description: "Cancel the run through another engine",
+                deterministic: true,
+                idempotent: false,
+                reversible: false,
+                supports_retry: false,
+                required_permissions: Vec::new(),
+                input_schema: None,
+                output_schema: None,
+            }
+        }
+
+        fn execute(
+            &self,
+            ctx: super::super::capability::CapabilityContext,
+            _input: serde_json::Value,
+        ) -> anyhow::Result<super::super::capability::CapabilityResult> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0
+                && let Some(other) = self.other.lock().as_mut()
+            {
+                other.restore_runs();
+                assert_eq!(
+                    other
+                        .cancel_run_idempotent(&ctx.run_id, None, Some("gateway:operator".into()))
+                        .unwrap(),
+                    Some(CancelOutcome::Requested)
+                );
+            }
+            Ok(super::super::capability::CapabilityResult::success(
+                serde_json::json!({"ok": true}),
+            ))
+        }
+    }
+
+    /// A cancel requested through another engine while the driver's second
+    /// capability runs. Whether the write after it hands out a third step or
+    /// finishes the run, it is refused, and the driver finishes the adopted
+    /// cancellation instead of exiting with the run still claimed.
+    fn assert_cancel_during_a_capability_is_finished(steps: u32) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let other = Arc::new(parking_lot::Mutex::new(None));
+        let mut registry = SopCapabilityRegistry::with_builtins();
+        registry.register(CancelThroughAnotherEngine {
+            calls: calls.clone(),
+            other: other.clone(),
+        });
+        let registry = Arc::new(registry);
+        let mut sop = deterministic_sop_all_execute("det-cancel-mid-step");
+        while sop.steps.len() < steps as usize {
+            let number = sop.steps.len() as u32 + 1;
+            sop.steps.push(SopStep {
+                number,
+                title: format!("Step {number}"),
+                body: format!("Do step {number}"),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            });
+        }
+        for step in &mut sop.steps {
+            step.kind = SopStepKind::Capability;
+            step.capability = Some("cancel.elsewhere".into());
+        }
+        let store: Arc<dyn SopRunStore> =
+            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        let mut owner = engine_with_sops(vec![sop.clone()])
+            .with_store(store.clone())
+            .with_capabilities(registry.clone());
+        *other.lock() = Some(
+            engine_with_sops(vec![sop])
+                .with_store(store.clone())
+                .with_capabilities(registry),
+        );
+        let first = owner
+            .start_run("det-cancel-mid-step", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let second = owner
+            .advance_headless_deterministic_step(&run_id, first)
+            .unwrap();
+        assert!(
+            matches!(second, SopRunAction::DeterministicStep { ref step, .. } if step.number == 2),
+            "got {second:?}"
+        );
+
+        let action = owner.advance_headless_deterministic_step(&run_id, second);
+        assert!(
+            matches!(action, Ok(SopRunAction::Cancelled { .. })),
+            "got {action:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(store.claim_counts("det-cancel-mid-step").unwrap(), (0, 0));
+        assert!(!owner.active_runs().contains_key(&run_id));
+    }
+
+    #[test]
+    fn cancel_during_the_final_capability_is_finished_by_the_driver() {
+        assert_cancel_during_a_capability_is_finished(2);
+    }
+
+    #[test]
+    fn cancel_during_a_capability_is_finished_at_the_next_dispatch_write() {
+        assert_cancel_during_a_capability_is_finished(3);
+    }
+
+    /// The late rejection was first seen on runs resumed through an approval
+    /// gate. On that path too, a step's output-schema rejection is recorded
+    /// and retried before any later step is promoted.
+    #[test]
+    fn gate_resumed_step_records_schema_rejection_before_any_promotion() {
+        let mut sop = four_step_sop("gated-reject");
+        sop.steps[1].requires_confirmation = true;
+        sop.steps[1].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[1].on_failure = StepFailure::Retry { max: 1 };
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("gated-reject", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let action = engine
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::WaitApproval { .. }));
+        let action = approve_gate_cli(&mut engine, &run_id);
+        assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2));
+
+        let action = engine
+            .advance_step(&run_id, completed_step_result(2, "prose, not an object"))
+            .unwrap();
+        assert!(
+            !matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number > 2),
+            "a rejected step must not hand out a later step, got {action:?}"
+        );
+        let events = engine.run_events(&run_id).unwrap();
+        let reject = events
+            .iter()
+            .position(|e| e.kind == "step_schema_reject" && e.payload["step"] == 2)
+            .expect("the rejection is recorded");
+        assert!(events[reject + 1..].iter().any(|e| e.kind == "step_retry"));
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.kind == "step_promoted" && e.payload["from_step"] == 2),
+            "no step may be promoted past the rejected step"
+        );
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.current_step, 2);
+        assert_eq!(
+            run.step_results.last().map(|r| r.status),
+            Some(SopStepStatus::Failed)
+        );
+    }
+
     #[test]
     fn headless_driver_lease_is_exclusive_until_released() {
         let mut engine = engine_with_sops(vec![]);
@@ -10404,42 +12254,41 @@ mod tests {
         sop.cooldown_secs = 3600; // 1 hour
         let sops = vec![sop];
         let mut engine_a = engine_with_sops(sops.clone()).with_store(store.clone());
-        let mut engine_b = engine_with_sops(sops).with_store(store.clone());
+        let mut engine_b = engine_with_sops(sops.clone()).with_store(store.clone());
+        let mut engine_c = engine_with_sops(sops).with_store(store.clone());
 
-        // Engine A starts and finishes a run (writes a terminal row to the store).
+        // Engine A's run reaches the store as terminal with a completion well
+        // past the cooldown window. A terminal record is written once, so it is
+        // finished here directly with the old completion time.
         let action = engine_a.start_run("s1", manual_event()).unwrap();
         let run_id = extract_run_id(&action).to_string();
-        engine_a
-            .finish_run(&run_id, SopRunStatus::Completed, None)
-            .unwrap();
-
-        // Engine B never ran this SOP, so it has no local finished entry. It must
-        // still see the cooldown via the shared store.
-        assert!(
-            !engine_b.can_start("s1"),
-            "a second engine must observe the cooldown from the shared store"
-        );
-        assert!(
-            engine_b.start_run("s1", manual_event()).is_err(),
-            "start_run must bail while the shared-store cooldown is active"
-        );
-
-        // Advance the stored completion past the cooldown window (supersede the
-        // same run's terminal row with an older completed_at, newer revision). The
-        // store now reports an elapsed cooldown, so B may start.
         let stored = store.load_run(&run_id).unwrap().unwrap();
         let mut aged = stored.clone();
         aged.revision = stored.revision + 1;
+        aged.run.status = SopRunStatus::Completed;
         aged.run.completed_at = Some("2000-01-01T00:00:00Z".to_string());
         store.finish_run(&run_id, &aged).unwrap();
 
+        // The store reports an elapsed cooldown, so engine B may start.
         assert!(
             engine_b.can_start("s1"),
             "once the shared-store cooldown window passes, the second engine may start"
         );
+        let action = engine_b.start_run("s1", manual_event()).unwrap();
+        let run_b = extract_run_id(&action).to_string();
+        engine_b
+            .finish_run(&run_b, SopRunStatus::Completed, None)
+            .unwrap();
+
+        // Engine C never ran this SOP, so it has no local finished entry. It must
+        // still see the cooldown B's run started via the shared store.
         assert!(
-            engine_b.start_run("s1", manual_event()).is_ok(),
-            "start_run succeeds after the shared-store cooldown elapses"
+            !engine_c.can_start("s1"),
+            "a third engine must observe the cooldown from the shared store"
+        );
+        assert!(
+            engine_c.start_run("s1", manual_event()).is_err(),
+            "start_run must bail while the shared-store cooldown is active"
         );
     }
 

@@ -1054,6 +1054,9 @@ cli-plugin-info-load-failed =
     Recompilez le plugin avec le WIT fourni par cet hôte (voir wit/v0), puis réinstallez-le.
 cli-plugin-info-load-not-applicable = Chargement : sans objet. Ce plugin ne contient que des compétences, il n'y a donc aucun composant à instancier.
 cli-plugin-info-load-failed-exit = le plugin « {$name} » ne se charge pas sur cet hôte
+cli-plugin-info-load-config-refused =
+    Chargement : non. Le composant s'instancie avec le monde WIT de cet hôte, mais le runtime refuse sa configuration : {$error}
+    La configuration est la table `config` de la ligne [[plugins.entries]] nommée « {$key} ». Rendez-la conforme au config_schema du paquet installé, ou supprimez ses valeurs si le paquet n'en déclare aucun.
 cli-estop-domains-none = {"  "}domain_blocks:  (aucun)
 cli-estop-domains = {"  "}domain_blocks:  { $v }
 cli-estop-tools-none = {"  "}tool_freeze:    (aucun)

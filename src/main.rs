@@ -3660,7 +3660,9 @@ fn with_update_pointer(
 /// This is the verdict that separates the two, and it comes from the same
 /// `verify_component_loads` check `plugin install` gates on: a plugin that
 /// predates that gate, was installed with `--no-verify`, or outlived a host
-/// upgrade is exactly the case the install gate cannot cover.
+/// upgrade is exactly the case the install gate cannot cover. For a tool, the
+/// runtime also refuses an instance whose configuration does not resolve, so
+/// the verdict asks the runtime's own config check as well.
 #[cfg(feature = "plugins-wasm")]
 #[derive(Debug)]
 enum PluginLoadStatus {
@@ -3669,6 +3671,14 @@ enum PluginLoadStatus {
     /// It does not. Carries the full wasmtime cause chain, including the
     /// WIT-drift rebuild hint when instantiation was what failed.
     Fails(String),
+    /// The component instantiates, but the runtime refuses the configuration
+    /// of the package's tool instance and skips the tool.
+    ConfigRefused {
+        /// The `[[plugins.entries]]` row the configuration is read from.
+        instance_key: String,
+        /// The runtime's reason, escaped for the terminal.
+        reason: String,
+    },
     /// A skill-only package ships no component, so there is nothing to load.
     NoComponent,
 }
@@ -3679,17 +3689,22 @@ impl PluginLoadStatus {
     /// it. Only a real load failure qualifies: a skill-only package has
     /// nothing to instantiate, which is not evidence that anything is broken.
     const fn is_load_failure(&self) -> bool {
-        matches!(self, Self::Fails(_))
+        matches!(self, Self::Fails(_) | Self::ConfigRefused { .. })
     }
 }
 
-/// Run the load-check for one installed plugin.
+/// Run the load-check for one installed plugin: the component against this
+/// host's WIT world, then, for a component that instantiates, the runtime's
+/// check of the tool instance's configuration in `config`.
 #[cfg(feature = "plugins-wasm")]
 async fn installed_plugin_load_status(
     host: &zeroclaw::plugins::host::PluginHost,
     info: &zeroclaw::plugins::PluginInfo,
     limits: zeroclaw::plugins::component::PluginLimits,
+    config: &crate::config::schema::Config,
 ) -> Result<PluginLoadStatus> {
+    use zeroclaw_runtime::plugin_runtime::ToolConfigVerdict;
+
     // The host's admitted bytes, not a reread of `wasm_path`: these are what
     // the daemon compiles, so the verdict describes what will actually run.
     let Some(component) = host.admitted_component(&info.name) else {
@@ -3698,10 +3713,31 @@ async fn installed_plugin_load_status(
     let manifest = host
         .manifest(&info.name)
         .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
-    match zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await {
-        Ok(()) => Ok(PluginLoadStatus::Loads),
-        Err(error) => Ok(PluginLoadStatus::Fails(format!("{error:#}"))),
+    if let Err(error) =
+        zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await
+    {
+        return Ok(PluginLoadStatus::Fails(format!("{error:#}")));
     }
+    // An admitted manifest always forms its instance key, so the verdict
+    // cannot fail in practice. If it ever does, that is this plugin's load
+    // failure, never the whole command's.
+    Ok(
+        match zeroclaw_runtime::plugin_runtime::tool_instance_config_verdict(config, manifest) {
+            Ok(ToolConfigVerdict::Accepted | ToolConfigVerdict::NotATool) => {
+                PluginLoadStatus::Loads
+            }
+            Ok(ToolConfigVerdict::Refused {
+                instance_key,
+                error,
+            }) => PluginLoadStatus::ConfigRefused {
+                instance_key,
+                // The resolver's message can quote publisher text, such as a
+                // schema property name.
+                reason: crate::plugins::channel_instance::escape_unprintable(&error.to_string()),
+            },
+            Err(error) => PluginLoadStatus::Fails(format!("{error:#}")),
+        },
+    )
 }
 
 /// The first line of a diagnostic. A list row annotates each plugin with just
@@ -3748,7 +3784,8 @@ fn plugin_list_lines(
                 &args,
                 format!("{identity} [loads]"),
             ),
-            PluginLoadStatus::Fails(error) => {
+            PluginLoadStatus::Fails(error)
+            | PluginLoadStatus::ConfigRefused { reason: error, .. } => {
                 let cause = first_line(error);
                 let mut args = args.to_vec();
                 args.push(("error", cause));
@@ -3869,6 +3906,16 @@ fn plugin_info_lines(
             &[("error", error)],
             format!(
                 "Loads: no. {error}\nRebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it."
+            ),
+        ),
+        PluginLoadStatus::ConfigRefused {
+            instance_key,
+            reason,
+        } => ta(
+            "cli-plugin-info-load-config-refused",
+            &[("error", reason), ("key", instance_key)],
+            format!(
+                "Loads: no. The component instantiates against this host's WIT world, but the runtime refuses its configuration: {reason}\nThe configuration is the `config` map of the [[plugins.entries]] row named '{instance_key}'. Make it match the installed package's config_schema, or remove its values if the package declares none."
             ),
         ),
         PluginLoadStatus::NoComponent => t(
@@ -13599,7 +13646,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     for info in &plugins {
                         entries.push((
                             info.clone(),
-                            Some(installed_plugin_load_status(&host, info, limits).await?),
+                            Some(installed_plugin_load_status(&host, info, limits, &config).await?),
                         ));
                     }
                     for line in plugin_list_lines(&entries) {
@@ -13872,7 +13919,8 @@ Add pricing to the active provider profile or supply a catalog entry."
                         // The load-check always runs here. "Why does my plugin
                         // not show up?" is the question this command is reached
                         // for, and discovery metadata cannot answer it.
-                        let status = installed_plugin_load_status(&host, &info, limits).await?;
+                        let status =
+                            installed_plugin_load_status(&host, &info, limits, &config).await?;
                         for line in plugin_info_lines(
                             &info,
                             &instance_rows,
@@ -22068,9 +22116,14 @@ type = "string"
             )
             .unwrap();
 
-            let status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .unwrap();
+            let status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(status, PluginLoadStatus::Loads),
                 "the in-tree tool fixture must load against this host; got {status:?}"
@@ -22116,6 +22169,7 @@ type = "string"
                 &host,
                 &info,
                 zeroclaw_runtime::plugin_runtime::plugin_limits(&constrained),
+                &constrained,
             )
             .await
             .expect("the load verdict is reported, not raised");
@@ -22124,9 +22178,14 @@ type = "string"
                 "a limit below the component's required instances must not report loads: {constrained_status:?}"
             );
 
-            let default_status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .expect("the load verdict is reported, not raised");
+            let default_status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .expect("the load verdict is reported, not raised");
             assert!(
                 matches!(default_status, PluginLoadStatus::Loads),
                 "the same component must load under the default runtime limits: {default_status:?}"
@@ -22164,9 +22223,14 @@ type = "string"
                 "discovery still calls the package loaded, which is why the check is needed"
             );
 
-            let status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .unwrap();
+            let status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .unwrap();
             let PluginLoadStatus::Fails(cause) = &status else {
                 panic!("a non-component artifact must not report as loading; got {status:?}");
             };
@@ -22285,9 +22349,14 @@ type = "string"
                 .expect("the skill bundle is discovered");
             assert!(info.wasm_path.is_none(), "the fixture ships no component");
 
-            let status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .unwrap();
+            let status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(status, PluginLoadStatus::NoComponent),
                 "a component-less package is not applicable, not broken; got {status:?}"
@@ -22295,11 +22364,190 @@ type = "string"
             assert!(!status.is_load_failure(), "and must not fail the exit code");
         }
 
+        /// The fixture as a release that stopped reading config ships it: no
+        /// permission and no `config_schema`.
+        const FIXTURE_MANIFEST_WITHOUT_CONFIG: &str = r#"name = "tool-fixture"
+version = "0.0.0"
+wasm_path = "tool-fixture.wasm"
+capabilities = ["tool"]
+permissions = []
+"#;
+
+        /// The runtime's reason for refusing values handed to a package without
+        /// a `config_schema`. Like a load failure's cause, it is not translated.
+        const NO_SCHEMA_REFUSAL: &str = "has configured values but declares no config_schema";
+
+        /// Install the fixture under `manifest` through `plugin install`'s own
+        /// path: the load check, the publish and the row seeding.
+        async fn install_fixture_with(
+            host: &mut PluginHost,
+            config: &mut crate::config::schema::Config,
+            source: &Path,
+            manifest: &str,
+        ) {
+            std::fs::create_dir_all(source).unwrap();
+            std::fs::copy(
+                super::tool_component_fixture::wasm(),
+                source.join("tool-fixture.wasm"),
+            )
+            .unwrap();
+            std::fs::write(source.join("manifest.toml"), manifest).unwrap();
+            let admitted = host
+                .admit_source(source.to_str().expect("utf-8 temp path"))
+                .expect("admit the fixture");
+            Box::pin(install_admitted_source(
+                host,
+                config,
+                admitted,
+                None,
+                verifier_limits(),
+                false,
+                |_| {},
+            ))
+            .await
+            .expect("install the fixture");
+        }
+
+        /// In the order an operator meets it: a value set for the package that
+        /// reads config stays on its row after `plugin remove`, and a
+        /// reinstall without a `config_schema` meets it. The runtime refuses
+        /// that tool instance, so `plugin info` and `plugin list --verify` say
+        /// it does not load. With the value removed it loads.
+        #[tokio::test]
+        async fn values_left_for_a_reinstall_without_a_config_schema_do_not_load() {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut config = super::config_in_dir(workspace.path());
+            let mut host = PluginHost::new(workspace.path()).expect("throwaway plugin host");
+
+            install_fixture_with(
+                &mut host,
+                &mut config,
+                &workspace.path().join("source/with-config"),
+                FIXTURE_MANIFEST,
+            )
+            .await;
+            let key = installed_instance_rows(&config, &host, "tool-fixture")
+                .unwrap()
+                .into_iter()
+                .find(|row| !row.is_channel())
+                .expect("install seeds the tool row")
+                .key;
+            // `config set plugins.entries.<key>.config.label masked`
+            config
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key)
+                .expect("the seeded row")
+                .config
+                .insert("label".to_string(), "masked".to_string());
+            let info = host.get_plugin("tool-fixture").unwrap();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits(), &config)
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::Loads),
+                "the package whose schema declares the value loads with it: {status:?}"
+            );
+
+            host.remove_with_report("tool-fixture")
+                .expect("remove the package");
+            install_fixture_with(
+                &mut host,
+                &mut config,
+                &workspace.path().join("source/without-config"),
+                FIXTURE_MANIFEST_WITHOUT_CONFIG,
+            )
+            .await;
+
+            let info = host.get_plugin("tool-fixture").unwrap();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits(), &config)
+                .await
+                .unwrap();
+            let PluginLoadStatus::ConfigRefused {
+                instance_key,
+                reason,
+            } = &status
+            else {
+                panic!("the runtime skips this tool, so it must not report as loading: {status:?}");
+            };
+            assert_eq!(instance_key, &key, "the verdict names the row it read");
+            assert!(reason.contains(NO_SCHEMA_REFUSAL), "{reason}");
+            assert!(status.is_load_failure(), "plugin info exits non-zero");
+
+            let rows = installed_instance_rows(&config, &host, &info.name).unwrap();
+            let info_lines = plugin_info_lines(&info, &rows, &[], &[], &status);
+            let verdict = info_lines.last().unwrap();
+            assert!(
+                verdict.contains(&key) && verdict.contains(NO_SCHEMA_REFUSAL),
+                "the info verdict carries the row and the reason: {info_lines:#?}"
+            );
+            let listed = plugin_list_lines(&[(info.clone(), Some(status))]);
+            let loads = plugin_list_lines(&[(info.clone(), Some(PluginLoadStatus::Loads))]);
+            assert!(
+                listed[1].contains("tool-fixture") && listed[1].contains(NO_SCHEMA_REFUSAL),
+                "the verified row names the refusal: {listed:#?}"
+            );
+            assert_ne!(listed[1], loads[1], "and is not the [loads] row");
+
+            // The remedy the verdict names: remove the values from the row.
+            config
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key)
+                .unwrap()
+                .config
+                .clear();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits(), &config)
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::Loads),
+                "with the values removed the reinstalled package loads: {status:?}"
+            );
+        }
+
+        /// The issue's other shape, `config_read` without a `config_schema`, is
+        /// refused when the package is admitted, so neither `plugin install`
+        /// nor the runtime ever meets it.
+        #[test]
+        fn a_package_requesting_config_read_without_a_schema_is_refused_at_install() {
+            let workspace = tempfile::tempdir().unwrap();
+            let source = workspace.path().join("source/readless");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(
+                source.join("manifest.toml"),
+                FIXTURE_MANIFEST_WITHOUT_CONFIG
+                    .replace("permissions = []", "permissions = [\"config_read\"]"),
+            )
+            .unwrap();
+            std::fs::write(source.join("tool-fixture.wasm"), b"\0asm").unwrap();
+            let host = PluginHost::new(workspace.path()).expect("throwaway plugin host");
+
+            let Err(error) = host.admit_source(source.to_str().expect("utf-8 temp path")) else {
+                panic!("a config_read package without a schema must not be admitted");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("requests config_read but declares no config_schema"),
+                "{error}"
+            );
+        }
+
         #[test]
         fn only_a_real_load_failure_makes_plugin_info_exit_non_zero() {
             // The exit code is the scriptable part of the contract. A package
             // with no component must not be reported as broken.
             assert!(PluginLoadStatus::Fails("boom".to_string()).is_load_failure());
+            assert!(
+                PluginLoadStatus::ConfigRefused {
+                    instance_key: "zpi1_key".to_string(),
+                    reason: "refused".to_string(),
+                }
+                .is_load_failure()
+            );
             assert!(!PluginLoadStatus::Loads.is_load_failure());
             assert!(!PluginLoadStatus::NoComponent.is_load_failure());
         }
