@@ -982,6 +982,8 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     );
     const [filter, setFilter] = useState("");
     const reloadSequence = useRef(0);
+    const sharedDraftsRef = useRef(configDraft.drafts);
+    sharedDraftsRef.current = configDraft.drafts;
 
     // When this form edits a channel block (`channels.<type>.<alias>`), its
     // `excluded_tools` ToolPicker should list the OWNING agent's scoped tools
@@ -1046,10 +1048,10 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         const seed: Record<string, string> = {};
         const commentSeed: Record<string, string> = {};
         for (const e of resp.entries) {
-          const staged = configDraft.drafts[e.path];
+          const staged = sharedDraftsRef.current[e.path];
           const savedInput = defaultInputValue(e);
           if (staged?.input === savedInput) {
-            configDraft.clearDraft(e.path);
+            configDraft.clearDraftIfInput(e.path, staged.input);
           }
           seed[e.path] = staged?.input ?? savedInput;
           const stagedComment = configDraft.comments[e.path];
