@@ -1213,11 +1213,16 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     // between a field edited via its own row and one edited via the grid.
     const applyFieldValue = (f: ListResponseEntry, v: string) => {
       setDraft((d) => ({ ...d, [f.path]: v }));
-      const baseline =
-        configDraft.savingDrafts[f.path]?.input ?? defaultInputValue(f);
-      if (v === baseline || (f.is_secret && v.length === 0)) {
+      const submittedInput = configDraft.savingDrafts[f.path]?.input;
+      const baseline = submittedInput ?? defaultInputValue(f);
+      if (
+        (v === baseline && submittedInput === undefined) ||
+        (f.is_secret && v.length === 0)
+      ) {
         configDraft.clearDraft(f.path);
       } else {
+        // Keep edits staged while this path's submitted value is in flight.
+        // Save all can discard a matching draft only after that value succeeds.
         let parsed: unknown;
         try {
           parsed = parseInput(f, v);
