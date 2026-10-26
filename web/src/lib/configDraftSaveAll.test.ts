@@ -57,6 +57,8 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
   let savedValue = false;
   let listCalls = 0;
   const patches: unknown[][] = [];
+  let delayNextList = false;
+  let releasePendingList: (() => void) | undefined;
   let delayNextPatch = false;
   let failNextPatch = false;
   let releasePendingPatch: (() => void) | undefined;
@@ -99,20 +101,28 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
     const url = new URL(rawUrl, "http://localhost");
     if (url.pathname === "/api/config/list") {
       listCalls += 1;
+      if (delayNextList) {
+        delayNextList = false;
+        await new Promise<void>((resolve) => {
+          releasePendingList = resolve;
+        });
+      }
+      const entries =
+        url.searchParams.get("prefix") === "other"
+          ? []
+          : [
+              {
+                path: "channels.show_tool_calls",
+                category: "channels",
+                kind: "bool",
+                type_hint: "bool",
+                value: savedValue,
+                populated: true,
+                is_secret: false,
+              },
+            ];
       return new Response(
-        JSON.stringify({
-          entries: [
-            {
-              path: "channels.show_tool_calls",
-              category: "channels",
-              kind: "bool",
-              type_hint: "bool",
-              value: savedValue,
-              populated: true,
-              is_secret: false,
-            },
-          ],
-        }),
+        JSON.stringify({ entries }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     }
@@ -194,6 +204,31 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
         ),
       ]);
 
+    function FormHarness() {
+      const [prefix, setPrefix] = React.useState("channels");
+      return React.createElement(
+        React.Fragment,
+        null,
+        React.createElement(
+          "button",
+          {
+            onClick: () =>
+              setPrefix((current) =>
+                current === "channels" ? "other" : "channels",
+              ),
+          },
+          "Toggle section",
+        ),
+        React.createElement(FieldForm, {
+          prefix,
+          includePath: (path: string) =>
+            path === "channels.show_tool_calls",
+          scopeActionsToIncludedPaths: true,
+        }),
+        React.createElement(UnsavedChangesBanner),
+      );
+    }
+
     const { createRoot } = await import("react-dom/client");
     root = createRoot(container as unknown as HTMLElement);
     await act(async () => {
@@ -201,17 +236,7 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
         React.createElement(
           ConfigDraftProvider,
           null,
-          React.createElement(
-            React.Fragment,
-            null,
-            React.createElement(FieldForm, {
-              prefix: "channels",
-              includePath: (path: string) =>
-                path === "channels.show_tool_calls",
-              scopeActionsToIncludedPaths: true,
-            }),
-            React.createElement(UnsavedChangesBanner),
-          ),
+          React.createElement(FormHarness),
         ),
       );
       await flushEffects();
@@ -227,6 +252,13 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
     });
     assert.match(domWindow.document.body.textContent ?? "", /1 unsaved change/);
 
+    const originalSwitch =
+      domWindow.document.querySelector<HappyHTMLButtonElement>(
+        'button[role="switch"]',
+      );
+    assert.ok(originalSwitch, "expected the field switch to render");
+    originalSwitch.focus();
+    delayNextList = true;
     await act(async () => {
       findButton(domWindow.document, "Save all").click();
       await flushEffects();
@@ -235,6 +267,36 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
     assert.equal(savedValue, true);
     assert.equal(patches.length, 1);
     assert.ok(listCalls >= 2, "expected Save all to refresh the field baseline");
+    assert.ok(releasePendingList, "expected the baseline refresh to be pending");
+    originalSwitch.focus();
+    assert.strictEqual(
+      domWindow.document.querySelector<HappyHTMLButtonElement>(
+        'button[role="switch"]',
+      ),
+      originalSwitch,
+      "background refresh should keep the switch DOM node mounted",
+    );
+    assert.strictEqual(
+      domWindow.document.activeElement,
+      originalSwitch,
+      "background refresh should preserve field focus while loading",
+    );
+    assert.doesNotMatch(
+      domWindow.document.body.innerHTML,
+      /animate-spin/,
+      "background refresh should not replace the form with a spinner",
+    );
+    await act(async () => {
+      releasePendingList?.();
+      await flushEffects();
+    });
+    assert.strictEqual(
+      domWindow.document.querySelector<HappyHTMLButtonElement>(
+        'button[role="switch"]',
+      ),
+      originalSwitch,
+      "refresh completion should keep the same switch DOM node mounted",
+    );
     assert.match(
       domWindow.document.body.textContent ?? "",
       /No unsaved changes/,
@@ -272,6 +334,21 @@ test("Save all refreshes the saved baseline and preserves in-flight edits", asyn
         'button[role="switch"]',
       )?.click();
     });
+    await act(async () => {
+      findButton(domWindow.document, "Toggle section").click();
+      await flushEffects();
+    });
+    await act(async () => {
+      findButton(domWindow.document, "Toggle section").click();
+      await flushEffects();
+    });
+    assert.equal(
+      domWindow.document
+        .querySelector<HappyHTMLButtonElement>('button[role="switch"]')
+        ?.getAttribute("aria-checked"),
+      "true",
+      "a prefix reload must preserve a draft for a path with a save in flight",
+    );
     await act(async () => {
       releasePendingPatch?.();
       await flushEffects();
