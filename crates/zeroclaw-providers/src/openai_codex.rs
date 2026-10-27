@@ -1433,7 +1433,7 @@ impl OpenAiCodexModelProvider {
                 // requests and answers `stream: false` with
                 // 400 "Stream must be set to true", so a non-streaming retry
                 // can never recover there: retry the stream once instead.
-                // Custom endpoints keep the non-streaming recovery (#6668).
+                // Custom endpoints keep the non-streaming recovery.
                 let retry_streaming = !self.custom_endpoint;
                 let retry_label = if retry_streaming {
                     "streaming retry"
@@ -1730,6 +1730,22 @@ mod tests {
         tempfile::TempDir,
         crate::RuntimeProxyTestGuard,
     ) {
+        mock_codex_provider_with(replies, false).await
+    }
+
+    /// With `stream_only`, the mock rejects any request whose body does not
+    /// set `stream: true` the way the default ChatGPT Codex backend does
+    /// (400 "Stream must be set to true"), without consuming a queued reply.
+    async fn mock_codex_provider_with(
+        replies: Vec<MockCodexReply>,
+        stream_only: bool,
+    ) -> (
+        OpenAiCodexModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+        crate::RuntimeProxyTestGuard,
+    ) {
         use axum::http::header;
         use axum::response::IntoResponse;
         use axum::{Json, Router, routing::post};
@@ -1749,7 +1765,16 @@ mod tests {
                 let captured = Arc::clone(&captured_clone);
                 let replies = Arc::clone(&replies_clone);
                 async move {
+                    let streaming = body["stream"] == true;
                     captured.lock().unwrap().push(body);
+                    if stream_only && !streaming {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"detail":"Stream must be set to true"}"#.to_string(),
+                        )
+                            .into_response();
+                    }
                     match replies
                         .lock()
                         .unwrap()
@@ -2292,9 +2317,9 @@ mod tests {
     /// `response.created` without any output or terminal event.
     const CODEX_STREAM_ENDED_AFTER_CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\",\"output\":[]}}\n\n";
 
-    /// A mock provider that behaves like the default ChatGPT Codex endpoint
-    /// (OAuth credentials, not a custom API-key endpoint), which accepts only
-    /// streaming requests.
+    /// A mock provider configured as the default ChatGPT Codex endpoint (OAuth
+    /// credentials, `custom_endpoint == false`) whose server, like the real
+    /// backend, rejects `stream: false` with 400 "Stream must be set to true".
     async fn stream_only_codex_provider(
         replies: Vec<MockCodexReply>,
     ) -> (
@@ -2305,7 +2330,7 @@ mod tests {
         crate::RuntimeProxyTestGuard,
     ) {
         let (mut provider, captured, server_handle, temp_dir, proxy_guard) =
-            mock_codex_provider(replies).await;
+            mock_codex_provider_with(replies, true).await;
         provider
             .auth
             .store_openai_tokens(
@@ -2396,6 +2421,79 @@ mod tests {
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 2, "exactly one retry, no third request");
         assert!(requests.iter().all(|request| request["stream"] == true));
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_default_endpoint_streaming_retry_http_error_is_not_retried_again() {
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            stream_only_codex_provider(vec![
+                MockCodexReply::Sse(CODEX_STREAM_ENDED_AFTER_CREATED),
+                MockCodexReply::Status(axum::http::StatusCode::TOO_MANY_REQUESTS, "rate limited"),
+            ])
+            .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("an HTTP error on the streaming retry must fail");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("OpenAI Codex API error (429"),
+            "retry HTTP status should surface through api_error: {message}"
+        );
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "exactly one retry, no third request");
+        assert!(requests.iter().all(|request| request["stream"] == true));
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_custom_endpoint_reports_non_streaming_retry_failure() {
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![
+                MockCodexReply::Sse(CODEX_STREAM_ENDED_AFTER_CREATED),
+                MockCodexReply::Sse(CODEX_STREAM_ENDED_AFTER_CREATED),
+            ])
+            .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let err = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("two empty responses must fail");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("non-streaming retry failed"),
+            "custom endpoints keep the non-streaming retry: {message}"
+        );
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2, "exactly one retry, no third request");
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[1]["stream"], false);
 
         server_handle.abort();
     }
