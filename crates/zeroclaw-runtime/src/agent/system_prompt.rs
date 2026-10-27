@@ -291,6 +291,21 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         );
     }
 
+    // ── 0a. Project Context (identity) ──────────────────────────
+    // Render the workspace identity files near the top, before
+    // Tools/Skills/Workspace: `finalize_system_prompt` keeps only the
+    // head of an over-budget prompt, so identity content placed late is
+    // silently dropped on the direct (cron/CLI/headless) path. This
+    // mirrors the channel `SystemPromptBuilder`, which renders
+    // `IdentitySection` second. Emitted in both compact and full modes.
+    append_project_context(
+        &mut prompt,
+        workspace_dir,
+        identity_config,
+        bootstrap_max_chars,
+        inject_memory,
+    );
+
     // ── 0b. Tool Honesty ───────────────────────────────────────
     if has_tools {
         prompt.push_str(
@@ -470,16 +485,6 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
-    if compact_context {
-        append_project_context(
-            &mut prompt,
-            workspace_dir,
-            identity_config,
-            bootstrap_max_chars,
-            inject_memory,
-        );
-    }
-
     if !skills.is_empty() {
         prompt.push_str(&crate::skills::skills_to_prompt_with_mode_and_availability(
             skills,
@@ -497,22 +502,11 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         workspace_dir.display()
     );
 
-    // ── 5. Bootstrap files (injected into context) ──────────────
-    if !compact_context {
-        append_project_context(
-            &mut prompt,
-            workspace_dir,
-            identity_config,
-            bootstrap_max_chars,
-            inject_memory,
-        );
-    }
-
     // Date is NOT injected here: wall-clock values bust
     // the prompt cache across midnight. The interactive agent::run loop
     // already prefixes each user message with [YYYY-MM-DD HH:MM:SS TZ].
 
-    // ── 6. Runtime ──────────────────────────────────────────────
+    // ── 5. Runtime ──────────────────────────────────────────────
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
     // The shell is reported next to the OS because the OS alone does not
@@ -537,7 +531,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         }
     }
 
-    // ── 8. Channel Capabilities (full copy skipped in compact_context
+    // ── 6. Channel Capabilities (full copy skipped in compact_context
     //       mode; the timestamp orientation below emits in both modes) ──
     if !compact_context {
         prompt.push_str("## Channel Capabilities\n\n");
@@ -592,11 +586,17 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
 /// Apply the final model-visible prompt budget in Unicode scalar values.
 pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
     if max_chars > 0 && prompt.chars().count() > max_chars {
+        let identity_zone = project_context_zone(&prompt);
+        let dropped_sections = identity_zone.map_or_else(Vec::new, |(_, zone_end)| {
+            section_headers_after(&prompt, zone_end)
+        });
+        let assembled_chars = prompt.chars().count();
         // The orientation is runtime-critical, so it must land inside the
         // budget. Reserve room at the head-retained portion, then re-append it
         // so it always survives even when the assembled prompt overflows.
         let orientation_chars = TIMESTAMP_ORIENTATION.chars().count();
-        if max_chars >= orientation_chars {
+        let retain_content = max_chars >= orientation_chars;
+        if retain_content {
             // Keep the top portion (identity + safety) minus the required tail.
             let end = max_chars - orientation_chars;
             let byte_end = prompt
@@ -604,7 +604,6 @@ pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
                 .nth(end)
                 .map_or(prompt.len(), |(index, _)| index);
             prompt.truncate(byte_end);
-            append_timestamp_orientation(&mut prompt);
         } else {
             // When the budget cannot hold both retained content and the
             // critical tail, prioritize as much of the orientation as fits.
@@ -618,8 +617,101 @@ pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
             prompt.clear();
             prompt.push_str(&TIMESTAMP_ORIENTATION[..byte_end]);
         }
+        // Measure the identity zone on the retained content alone, before the
+        // orientation is re-appended, so `retained_chars` counts only prompt
+        // bytes and the full-retained early return stays exact.
+        note_identity_zone_truncation(
+            &prompt,
+            identity_zone,
+            &dropped_sections,
+            assembled_chars,
+            max_chars,
+        );
+        if retain_content {
+            append_timestamp_orientation(&mut prompt);
+        }
     }
     prompt
+}
+
+/// Headers of the sections the direct builder can emit immediately after the
+/// identity zone (the zone renders first, so one of these always follows when
+/// any section does). Used to bound the zone instead of the first `## ` line:
+/// bootstrap files are markdown and commonly carry their own `## ` headings,
+/// which would shorten the measured zone and silence the stop-crane exactly
+/// when a large workspace file is cut. A workspace file that itself uses one
+/// of these exact headings still shortens the zone — a conservative miss,
+/// never a false alarm.
+const POST_IDENTITY_SECTION_MARKERS: &[&str] = &[
+    "\n## CRITICAL: Tool Honesty",
+    "\n## Tools",
+    "\n## Your Task",
+];
+
+/// Locate the `## Project Context` identity zone as byte offsets: the section
+/// header through the start of the next builder-owned section, or the end of
+/// the prompt when no later section exists.
+fn project_context_zone(prompt: &str) -> Option<(usize, usize)> {
+    let start = prompt.find("## Project Context")?;
+    let end = POST_IDENTITY_SECTION_MARKERS
+        .iter()
+        .filter_map(|marker| prompt[start..].find(marker).map(|offset| start + offset))
+        .min()
+        .unwrap_or(prompt.len());
+    Some((start, end))
+}
+
+/// Section headers (`## ` lines) at or after the byte offset, in order.
+fn section_headers_after(prompt: &str, offset: usize) -> Vec<String> {
+    prompt[offset.min(prompt.len())..]
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .map(str::trim_end)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Stop-crane for silent identity loss: when the whole-prompt budget cut into
+/// the `## Project Context` zone (or removed it entirely), the agent runs
+/// without part or all of its bootstrap identity files. That must never be
+/// silent, so emit a WARN with the zone sizes and the sections the cut
+/// dropped. Called only when truncation actually ran.
+fn note_identity_zone_truncation(
+    finalized: &str,
+    zone_before: Option<(usize, usize)>,
+    dropped_sections: &[String],
+    assembled_chars: usize,
+    max_chars: usize,
+) {
+    let Some((zone_start, zone_end)) = zone_before else {
+        return;
+    };
+    let total_chars = zone_end - zone_start;
+    let (present, retained_chars) = match project_context_zone(finalized) {
+        Some((start, end)) if start == zone_start => (true, end - start),
+        _ => (false, 0),
+    };
+    if present && retained_chars >= total_chars {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "error_key": "agent.system_prompt_identity_truncated",
+                "present": present,
+                "retained_chars": retained_chars,
+                "total_chars": total_chars,
+                "assembled_chars": assembled_chars,
+                "max_chars": max_chars,
+                "dropped_sections": dropped_sections,
+            })),
+        &format!(
+            "system prompt budget {max_chars} cut into the Project Context identity zone (retained {retained_chars} of {total_chars} chars); the agent runs with truncated or missing bootstrap identity"
+        )
+    );
 }
 
 /// Render only the skills section against an assembled effective tool surface.
@@ -1433,8 +1525,9 @@ mod tests {
             None,
         );
 
-        let safety = prompt.find("## Safety").expect("safety framing");
         let project = prompt.find("## Project Context").expect("project context");
+        let tools = prompt.find("## Tools").expect("tool catalog");
+        let safety = prompt.find("## Safety").expect("safety framing");
         let bootstrap = prompt
             .find("BOOTSTRAP_CONTRACT_REQUIRED")
             .expect("bootstrap contract");
@@ -1442,7 +1535,11 @@ mod tests {
         let workspace = prompt.find("## Workspace").expect("workspace metadata");
         let runtime = prompt.find("## Runtime").expect("runtime metadata");
 
-        assert!(safety < project);
+        // Identity renders at the top of the direct builder, before the
+        // tool catalog and skill metadata, so it survives head-retained
+        // budget truncation (parity with the channel SystemPromptBuilder).
+        assert!(project < tools);
+        assert!(tools < safety);
         assert!(project < bootstrap);
         assert!(bootstrap < skills);
         assert!(skills < workspace);
@@ -1489,8 +1586,12 @@ mod tests {
         );
 
         assert_eq!(prompt.chars().count(), 8_000);
-        assert!(prompt.contains("## Safety"));
+        // Identity renders first and is retained; the workspace/runtime tail
+        // falls to the cut.
+        assert!(prompt.contains("## Project Context"));
         assert!(prompt.contains("BOOTSTRAP_CONTRACT_REQUIRED"));
+        assert!(!prompt.contains("## Workspace"));
+        assert!(!prompt.contains("## Runtime"));
         assert!(!prompt.contains("System prompt truncated"));
         assert!(prompt.ends_with(TIMESTAMP_ORIENTATION));
         assert!(!prompt.contains("LOW_PRIORITY_SKILL_METADATA"));
@@ -1757,6 +1858,122 @@ mod tests {
             message.contains("per-file cap retained 6000 of 13985 chars"),
             "unexpected message: {message:?}"
         );
+    }
+
+    #[test]
+    fn identity_zone_truncation_warn_reaches_the_log_pipeline() {
+        // Same child-process isolation as assert_bootstrap_warn_capture: the
+        // process-global hook cannot exclude ordinary emitters that do not
+        // take the test guard.
+        let test_name = std::thread::current()
+            .name()
+            .expect("named lib test")
+            .to_owned();
+        const CHILD: &str = "ZEROCLAW_TEST_IDENTITY_CAPTURE_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok(test_name.as_str()) {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("lib test executable"))
+                    .args(["--exact", &test_name, "--test-threads=1", "--nocapture"])
+                    .env(CHILD, &test_name)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .expect("run isolated identity capture");
+            assert!(
+                output.status.success(),
+                "isolated capture failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        zeroclaw_log::set_broadcast_hook(tx);
+
+        // Control: an assembled prompt inside the budget truncates nothing
+        // and must not warn.
+        let fits = "## Project Context\n\nSHORT_IDENTITY\n\n## Tools\n\n- **shell**: run\n";
+        let finalized = super::finalize_system_prompt(fits.to_string(), 10_000);
+        assert_eq!(finalized, fits, "under-budget prompt is returned as-is");
+
+        // Case 1: the budget cuts inside the identity zone — partial loss.
+        let zone = format!("## Project Context\n\n{}", "i".repeat(2_000));
+        let assembled =
+            format!("{zone}\n\n## Tools\n\n- **shell**: run\n\n## Safety\n\n- be safe\n");
+        // The measured zone spans through the newline that separates the next
+        // section header.
+        let total_zone_chars = zone.chars().count() + 1;
+        let finalized = super::finalize_system_prompt(assembled.clone(), 900);
+        assert!(
+            finalized.contains("## Project Context"),
+            "partial cut retains the zone head"
+        );
+        assert!(
+            !finalized.contains("## Tools"),
+            "tail sections fall to the cut"
+        );
+
+        // Case 2: the budget cannot retain the zone at all — full loss.
+        let finalized = super::finalize_system_prompt(assembled, 40);
+        assert!(
+            !finalized.contains("## Project Context"),
+            "a below-orientation budget keeps only the orientation prefix"
+        );
+
+        zeroclaw_log::clear_broadcast_hook();
+
+        let mut partial = None;
+        let mut full = None;
+        loop {
+            let frame = match rx.try_recv() {
+                Ok(frame) => frame,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => break,
+            };
+            let attrs = &frame["attributes"];
+            if attrs["error_key"] != "agent.system_prompt_identity_truncated" {
+                continue;
+            }
+            assert_eq!(frame["severity_text"], "WARN");
+            match attrs["present"].as_bool() {
+                Some(true) => partial = Some(frame),
+                Some(false) => full = Some(frame),
+                other => panic!("unexpected present attr: {other:?}"),
+            }
+        }
+
+        let partial = partial.expect("partial identity-cut WARN frame reached the hook");
+        let attrs = &partial["attributes"];
+        assert_eq!(attrs["total_chars"].as_u64(), Some(total_zone_chars as u64));
+        let retained = attrs["retained_chars"].as_u64().expect("retained_chars");
+        assert!(
+            retained > 0 && retained < total_zone_chars as u64,
+            "partial cut retains only a prefix of the zone: {retained}"
+        );
+        assert_eq!(attrs["max_chars"].as_u64(), Some(900));
+        assert_eq!(
+            attrs["dropped_sections"].as_array().map(|sections| {
+                sections
+                    .iter()
+                    .map(|section| section.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>()
+            }),
+            Some(vec!["Tools".to_string(), "Safety".to_string()]),
+        );
+
+        let full = full.expect("full identity-loss WARN frame reached the hook");
+        let attrs = &full["attributes"];
+        assert_eq!(attrs["present"], false);
+        assert_eq!(attrs["retained_chars"].as_u64(), Some(0));
+        assert_eq!(attrs["total_chars"].as_u64(), Some(total_zone_chars as u64));
+        assert_eq!(attrs["max_chars"].as_u64(), Some(40));
     }
 
     #[test]
