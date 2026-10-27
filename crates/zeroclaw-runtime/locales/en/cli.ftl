@@ -522,6 +522,31 @@ cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gate
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+cli-config-lifecycle-dir-not-directory =
+    Config lifecycle path {$path} is not a directory. ZeroClaw creates it as a directory, so something else replaced it. Check what it is, remove it, then retry:
+    {$command}
+cli-config-lifecycle-dir-root-owner =
+    Config lifecycle directory {$path} belongs to root, usually because ZeroClaw was run with sudo. Run ZeroClaw as {$user}, not with sudo. Other files written during that run may belong to root too. Check the directory's contents, then give it back and retry:
+    {$command}
+    If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-lifecycle-dir-running-as-root = Config lifecycle directory {$path} belongs to {$owner}, but ZeroClaw is running as root. Run ZeroClaw as {$owner}, without sudo.
+cli-config-lifecycle-dir-foreign-owner =
+    Config lifecycle directory {$path} belongs to {$owner}, but ZeroClaw is running as {$user}. If it should belong to {$user}, check its contents first, because chown -R also hands over anything another user hard-linked into it (ZeroClaw's .lifecycle holds only config-lifecycle.lock, with a link count of 1). Then take it over and retry:
+    {$command}
+    Otherwise run ZeroClaw as {$owner}. If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-lifecycle-dir-writable =
+    Config lifecycle directory {$path} is writable by its group or by other users (mode {$mode}), so they could replace its config lock. ZeroClaw creates it owner-only and does not change the permissions of an existing directory. Check its contents, then restrict it and retry:
+    {$command}
+    If chmod has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-data-dir-root-owner =
+    Data directory {$path} belongs to root, so ZeroClaw cannot create its config lock directory there. If an earlier run with sudo created it, give it back and retry:
+    {$command}
+    If it belongs to root on purpose, run ZeroClaw as its owner or point data_dir elsewhere.
+cli-config-data-dir-running-as-root = Data directory {$path} belongs to {$owner}, but ZeroClaw is running as root. Run ZeroClaw as {$owner}, without sudo.
+cli-config-data-dir-foreign-owner =
+    Data directory {$path} belongs to {$owner}, so ZeroClaw, running as {$user}, cannot create its config lock directory there. Run ZeroClaw as {$owner}, or point data_dir at a directory of your own. If the directory really is yours, check its contents first, because chown -R also hands over anything another user hard-linked into it, then take it over and retry:
+    {$command}
+    If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
 cli-standalone-daemon-owned = Cannot run `zeroclaw {$command}` while another ZeroClaw process owns the config state at {$path}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.
 
 # ── peripherals (zeroclaw peripheral) ──
@@ -564,6 +589,10 @@ cli-sop-logs-row = {$timestamp} {$severity} {$category}.{$action} {$message}
 cli-sop-logs-disabled = Log persistence is not enabled.
 cli-sop-logs-incomplete = Some retained log segments could not be read; this history may be incomplete.
 cli-sop-status-failure-reason = Failure reason: {$reason}
+cli-sop-run-copy-stale = Run {$run_id} changed in the store since this engine last read it (revision {$seen_revision} -> {$stored_revision}, now {$status} on step {$step}); this engine adopted the stored record and did not apply the transition
+cli-sop-run-copy-revision-unknown = unknown
+cli-sop-run-copy-changed = Run {$run_id} changed in the store since this engine last read it
+cli-sop-run-copy-reload-failed = Run {$run_id} changed in the store since this engine last read it, and reloading it failed: {$error}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}

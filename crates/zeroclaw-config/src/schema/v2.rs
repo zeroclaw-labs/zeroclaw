@@ -3167,10 +3167,10 @@ pub fn migrate_v2_to_v3_install_filesystem(
 
     // The split is done only when nothing in the legacy workspace is left to
     // move. Whether the V3 targets already hold *something* is no evidence:
-    // startup creates and locks `data/config-lifecycle.lock` before the
-    // config is loaded, and a split interrupted part way leaves both targets
-    // partly filled with entries still waiting in `workspace/`. Those must
-    // move now, or the databases among them are stranded.
+    // startup creates and locks `data/.lifecycle/config-lifecycle.lock`
+    // before the config is loaded, and a split interrupted part way leaves
+    // both targets partly filled with entries still waiting in `workspace/`.
+    // Those must move now, or the databases among them are stranded.
     let entries = legacy_split_entries(&legacy, install_root)?;
     if entries.iter().all(|(_, target)| target.exists()) {
         // Nothing to move, but anything still here was refused because its
@@ -4453,9 +4453,10 @@ mod fs_db_migration_tests {
         );
     }
     /// A split interrupted after moving an identity file and the sessions
-    /// directory, with startup's `config-lifecycle.lock` already in `data/`,
-    /// still has `devices.db` and the memory databases waiting in the legacy
-    /// workspace. Both targets hold entries, but the split must resume.
+    /// directory, with startup's `.lifecycle/config-lifecycle.lock` already
+    /// in `data/`, still has `devices.db` and the memory databases waiting in
+    /// the legacy workspace. Both targets hold entries, but the split must
+    /// resume.
     #[test]
     fn an_interrupted_split_resumes_even_when_both_targets_hold_entries() {
         let tmp = TempDir::new().unwrap();
@@ -4474,7 +4475,8 @@ mod fs_db_migration_tests {
             install.join("data/sessions"),
         )
         .unwrap();
-        fs::write(install.join("data/config-lifecycle.lock"), b"").unwrap();
+        fs::create_dir(install.join("data/.lifecycle")).unwrap();
+        fs::write(install.join("data/.lifecycle/config-lifecycle.lock"), b"").unwrap();
 
         let report = migrate_v2_to_v3_install_filesystem(install).expect("resume must succeed");
 
