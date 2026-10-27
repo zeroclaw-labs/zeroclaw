@@ -468,26 +468,52 @@ pub(crate) struct CoreCredential {
     pub(crate) pin: zeroclaw_runtime::rpc::auth::OidcBinding,
 }
 
+/// What a core connection holds while the core may still be verifying its
+/// token: a caller that goes away, or a handshake the gateway stops waiting
+/// for, must not free room for more verifications than the limits allow.
+#[derive(Clone)]
+enum Kept {
+    /// A request's connection slot, held until the core is done with the
+    /// connection.
+    Slot(Arc<Auxiliary>),
+    /// A chat's place, held until the handshake succeeds, after which the
+    /// chat holds its place itself, or, when it fails or its caller goes
+    /// away first, until the core is done with the connection.
+    Place(Place),
+}
+
 /// One handshake through `connector`, presenting `credential` and, when there
 /// is one, the TUI identity, on a connection bound to the credential's
 /// provider, and what resolves once the core is done with that connection.
-/// The connection keeps `slot`, when there is one, until then.
+/// The connection holds `kept`, when there is one, as [`Kept`] says.
 async fn handshake(
     connector: &zeroclaw_runtime::rpc::inproc::InprocConnector,
     provider: &str,
     credential: &CoreCredential,
     identity: Option<&TuiIdentity>,
-    slot: Option<&Arc<Auxiliary>>,
+    kept: Option<&Kept>,
 ) -> Result<(Result<RpcClient, ClientError>, Served), CoreFailure> {
     let (stream, served) = connector
         .connect_bound(credential.pin.clone())
         .await
         .ok_or(CoreFailure::Unavailable)?;
-    if let Some(slot) = slot {
-        let (slot, served) = (Arc::clone(slot), served.clone());
+    let succeeded = CancellationToken::new();
+    if let Some(kept) = kept {
+        let (kept, served, succeeded) = (kept.clone(), served.clone(), succeeded.clone());
         zeroclaw_spawn::spawn!(async move {
-            served.wait().await;
-            drop(slot);
+            match kept {
+                Kept::Slot(slot) => {
+                    served.wait().await;
+                    drop(slot);
+                }
+                Kept::Place(place) => {
+                    tokio::select! {
+                        () = served.wait() => {}
+                        () = succeeded.cancelled() => {}
+                    }
+                    drop(place);
+                }
+            }
         });
     }
     let options = ConnectOptions {
@@ -497,7 +523,11 @@ async fn handshake(
         tui_sig: identity.map(|identity| identity.sig.clone()),
         ..ConnectOptions::default()
     };
-    Ok((RpcClient::connect_over(stream, options).await, served))
+    let outcome = RpcClient::connect_over(stream, options).await;
+    if outcome.is_ok() {
+        succeeded.cancel();
+    }
+    Ok((outcome, served))
 }
 
 /// A refusal at the handshake: the core no longer takes this token.
@@ -1135,23 +1165,23 @@ impl CoreCaller {
     /// provider again, unless a policy was published during the handshake:
     /// that fails it closed, as it should, and is no reason to sign anybody
     /// out, so the token is presented once more, as the session's own
-    /// re-verification does. Each connection keeps `slot`, when there is
-    /// one, until the core is done with it.
+    /// re-verification does. Each connection holds `kept`, when there is
+    /// one, as [`Kept`] says.
     async fn connect(
         &self,
         credential: &CoreCredential,
         identity: Option<&TuiIdentity>,
-        slot: Option<&Arc<Auxiliary>>,
+        kept: Option<&Kept>,
     ) -> Result<RpcClient, CoreFailure> {
         let connector = self.core.connector().ok_or(CoreFailure::Unavailable)?;
         let provider = self.session.alias.as_str();
         let published = self.auth.inbound.generation();
         let (mut outcome, served) =
-            handshake(connector, provider, credential, identity, slot).await?;
+            handshake(connector, provider, credential, identity, kept).await?;
         if refuses_token(&outcome) && self.auth.inbound.generation() != published {
             // One connection at a time: the refused one is over first.
             served.wait().await;
-            outcome = handshake(connector, provider, credential, identity, slot)
+            outcome = handshake(connector, provider, credential, identity, kept)
                 .await?
                 .0;
         }
@@ -1187,7 +1217,10 @@ impl CoreCaller {
             .auth
             .core_credential(&self.session)
             .ok_or(CoreFailure::SessionEnded)?;
-        let mut client = Arc::new(self.connect(&credential, None, None).await?);
+        // The handshake holds the place too: an open that goes away while
+        // the core is still verifying the token leaves it taken until then.
+        let kept = Kept::Place(Arc::clone(&place));
+        let mut client = Arc::new(self.connect(&credential, None, Some(&kept)).await?);
         let handshake = client.handshake();
         let identity = match (&handshake.tui_id, &handshake.tui_sig) {
             (Some(id), Some(sig)) => TuiIdentity {
@@ -1238,7 +1271,10 @@ impl CoreCaller {
                 {
                     renewed = true;
                     client.shutdown();
-                    client = Arc::new(self.connect(&credential, Some(&identity), None).await?);
+                    client = Arc::new(
+                        self.connect(&credential, Some(&identity), Some(&kept))
+                            .await?,
+                    );
                 }
                 Created::Failed(error) => {
                     client.shutdown();
@@ -1333,7 +1369,7 @@ impl CoreCaller {
                     .auxiliary(self.session.principal().id.as_str())
                     .await
                 {
-                    Ok(slot) => Arc::new(slot),
+                    Ok(slot) => Kept::Slot(Arc::new(slot)),
                     Err(failure) => return failure.into_response(),
                 };
                 match self
@@ -1418,12 +1454,12 @@ impl CoreCaller {
     /// outlives its deadline: the core finishes a verification it started
     /// whether or not anyone still waits.
     async fn list_agents(&self) -> Result<AgentList, CoreFailure> {
-        let slot = Arc::new(
+        let slot = Kept::Slot(Arc::new(
             self.core
                 .accounts
                 .auxiliary(self.session.principal().id.as_str())
                 .await?,
-        );
+        ));
         let credential = self
             .auth
             .core_credential(&self.session)
@@ -5157,6 +5193,56 @@ mod tests {
             let (status, body) = request.await.expect("joins");
             assert_eq!(status, StatusCode::OK, "{body}");
         }
+    }
+
+    #[tokio::test]
+    async fn opens_given_up_in_their_handshake_keep_their_places_while_the_core_verifies() {
+        let fixture = Fixture::new().await;
+        let (_, alice_session) = fixture.sign_in("alice").await;
+        let caller = core_caller_for(&fixture, &alice_session);
+        // Each open's handshake waits on the identity provider, and its caller
+        // gives up first, as an aborted upgrade does.
+        let attempts = 2 * MAX_LIVE_CONVERSATIONS;
+        slow_introspections(
+            &fixture,
+            "alice",
+            "chatters",
+            Duration::from_secs(3),
+            (attempts as u64, 1),
+        )
+        .await;
+        let before = introspections_of(&fixture._idp, "tok-alice").await;
+        for _ in 0..attempts {
+            let given_up = tokio::time::timeout(
+                Duration::from_millis(300),
+                caller.open_chat("support", None),
+            )
+            .await;
+            assert!(
+                matches!(given_up, Err(_) | Ok(Err(CoreFailure::ConversationLimit))),
+                "each open is given up in its handshake or refused at the limit"
+            );
+        }
+        assert_eq!(
+            caller.binding.places_taken(),
+            MAX_LIVE_CONVERSATIONS,
+            "the handshakes the core is still verifying keep their places"
+        );
+        assert_eq!(
+            introspections_of(&fixture._idp, "tok-alice").await - before,
+            MAX_LIVE_CONVERSATIONS,
+            "no more verifications at once than the session has places"
+        );
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while caller.binding.places_taken() != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the places are let go once the core is done with the connections");
+        fixture
+            .assert_nothing_live("no conversation was created")
+            .await;
     }
 
     #[tokio::test]
