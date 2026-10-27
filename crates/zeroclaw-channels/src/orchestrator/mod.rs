@@ -3842,6 +3842,24 @@ fn system_prompt_for_channel_turn(
     }
 }
 
+/// Re-apply the agent's `max_system_prompt_chars` budget to a channel system
+/// prompt that was modified after its startup-time finalization.
+///
+/// The cached channel prompt is finalized once at startup, but the turn path
+/// splices refreshed skill bodies (`system_prompt_for_channel_turn`) and
+/// appends per-message sections (channel signal, peer map, thinking prefix)
+/// without re-applying the cap. An agent whose skill catalogue overflows the
+/// cap therefore blew the context-budget guard on fresh sessions while
+/// established sessions kept using the in-cap cached prompt.
+/// `finalize_system_prompt` is a no-op when the prompt already fits and treats
+/// `max_chars == 0` as unlimited, so the established-session path is unchanged.
+fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -> String {
+    zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(
+        prompt,
+        ctx.agent_cfg.resolved.max_system_prompt_chars,
+    )
+}
+
 fn callable_protocol_exposed_for_channel_turn(
     native_tool_specs_present: bool,
     strict_tool_parsing: bool,
@@ -3895,7 +3913,7 @@ fn refresh_channel_history_skills(
     // has no room in scope, so re-deriving would drop the section entirely.
     let rendered_purpose =
         rendered_channel_purpose(system_message.content.as_str()).map(str::to_string);
-    system_message.content = system_prompt_for_channel_turn(
+    let refreshed = system_prompt_for_channel_turn(
         ctx,
         system_message.content.as_str(),
         force_refresh,
@@ -3903,6 +3921,9 @@ fn refresh_channel_history_skills(
         excluded_tools,
         rendered_purpose.as_deref(),
     );
+    // The splice above can exceed the agent's prompt cap the same way the
+    // fresh-session turn path can; re-apply it (no-op when within the cap).
+    system_message.content = finalize_channel_system_prompt(ctx, refreshed);
 }
 
 fn effective_non_cli_tool_names<'a>(
@@ -9823,6 +9844,11 @@ async fn process_channel_message_body(
     if let Some(ref prefix) = thinking.params.system_prompt_prefix {
         system_prompt = format!("{prefix}\n\n{system_prompt}");
     }
+    // Re-apply the agent's prompt cap after every post-startup modification
+    // (skill refresh splice, channel signal, peer map, thinking prefix). The
+    // startup prompt is finalized once, but the splices above can grow it far
+    // past the cap on fresh sessions; finalize is a no-op when it still fits.
+    let system_prompt = finalize_channel_system_prompt(ctx.as_ref(), system_prompt);
     // Captured before the tool-call loop can drop whole turns, so the
     // post-loop resync below can detect that a trim happened.
     let prior_turns_len_before_loop = prior_turns.len();
@@ -17406,6 +17432,13 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         {
             system_prompt.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
+        // The builder finalized the prompt before the appends above, so
+        // re-apply the cap to keep the cached channel prompt within budget
+        // from the start (no-op when it still fits; 0 is unlimited).
+        let system_prompt = zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(
+            system_prompt,
+            agent.resolved.max_system_prompt_chars,
+        );
 
         if channels_by_name_shared.is_none() {
             if !skills.is_empty() {
@@ -47307,6 +47340,275 @@ BTC is currently around $65,000 based on latest tool output."#
     fn process_channel_message_refreshes_available_skills_after_new_session() {
         run_channel_dispatch_test(|| {
             Box::pin(assert_process_channel_message_refreshes_available_skills_after_new_session())
+        });
+    }
+
+    async fn assert_process_channel_message_reapplies_prompt_cap_after_skill_refresh() {
+        const PROMPT_CAP: usize = 4_000;
+
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+
+        // Startup state: no skills on disk yet, so the cached prompt is built
+        // under the cap and finalized once, exactly like a running daemon.
+        let initial_skills =
+            zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+        let initial_system_prompt = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &[],
+            |_| false,
+            &initial_skills,
+            None,
+            None,
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            false,
+            PROMPT_CAP,
+            true,
+            false,
+            None,
+        );
+        assert!(
+            initial_system_prompt.chars().count() <= PROMPT_CAP,
+            "startup prompt must respect the cap"
+        );
+        assert_eq!(
+            initial_system_prompt
+                .matches("This is an interactive conversation with a user")
+                .count(),
+            1,
+            "startup prompt must carry exactly one timestamp orientation"
+        );
+
+        // After startup, a skill lands whose inlined Full-mode body far
+        // exceeds the cap — the 27.10.2026 incident shape: a fresh session
+        // splices all skill bodies into the cached prompt without re-applying
+        // the cap and the context-budget guard rejects the turn.
+        let skill_dir = workspace.path().join("skills").join("oversized");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let bulky_instructions = format!(
+            "Oversized skill instructions.\n{}",
+            "detail line ".repeat(2_000)
+        );
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "prompts = [{bulky_instructions:?}]\n\
+                 [skill]\n\
+                 name = \"oversized\"\n\
+                 description = \"A skill whose body exceeds the prompt cap\"\n\
+                 version = \"1\"\n"
+            ),
+        )
+        .unwrap();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig {
+                resolved: zeroclaw_config::schema::ResolvedRuntime {
+                    max_system_prompt_chars: PROMPT_CAP,
+                    ..zeroclaw_config::schema::ResolvedRuntime::default()
+                },
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            }),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(NamedMockTool("read_skill")),
+                ]),
+            ),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new(initial_system_prompt),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(config.data_dir.clone()),
+            prompt_config: Arc::new(config.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(config.clone()).handle(),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(vec!["read_skill".to_string()]),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
+        });
+
+        // Reproduce the incident shape: the per-turn refresh splices the
+        // oversized skill body into the cached prompt and the result exceeds
+        // the agent's cap — this is the prompt that previously reached the
+        // provider unchecked.
+        let refreshed = refreshed_skills_system_prompt(
+            runtime_ctx.as_ref(),
+            runtime_ctx.system_prompt.as_str(),
+            false,
+            &[],
+        );
+        assert!(
+            refreshed.contains("Oversized skill instructions."),
+            "the refresh must splice the oversized skill body"
+        );
+        assert!(
+            refreshed.chars().count() > PROMPT_CAP,
+            "scenario setup: the refreshed prompt ({} chars) must exceed the cap",
+            refreshed.chars().count()
+        );
+
+        // Provider-switch re-splices (refresh_channel_history_skills) must
+        // respect the cap too, not only the fresh-turn assembly path.
+        let mut switched_history = vec![ChatMessage::system(
+            runtime_ctx.system_prompt.as_str().to_string(),
+        )];
+        refresh_channel_history_skills(
+            runtime_ctx.as_ref(),
+            &mut switched_history,
+            true,
+            false,
+            &[],
+        );
+        let switched_prompt = &switched_history[0].content;
+        assert!(
+            switched_prompt.chars().count() <= PROMPT_CAP,
+            "provider-switch refresh must re-apply the prompt cap; got {} chars",
+            switched_prompt.chars().count()
+        );
+        assert_eq!(
+            switched_prompt
+                .matches("This is an interactive conversation with a user")
+                .count(),
+            1,
+            "the provider-switch-refreshed prompt must carry exactly one timestamp orientation"
+        );
+
+        // Fresh sender: the turn path splices the oversized skill section and
+        // must hand the provider a capped system prompt.
+        Box::pin(process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-fresh".to_string(),
+                sender: "new-sender".to_string(),
+                reply_target: "chat-cap".to_string(),
+                content: "hello".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        ))
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            calls.len(),
+            1,
+            "the fresh turn should reach the provider once"
+        );
+        assert_eq!(calls[0][0].0, "system");
+        let delivered_prompt = &calls[0][0].1;
+        assert!(
+            delivered_prompt.chars().count() <= PROMPT_CAP,
+            "system prompt delivered to the provider ({} chars) must respect the \
+             {PROMPT_CAP}-char cap after the skill refresh splice",
+            delivered_prompt.chars().count()
+        );
+        assert_eq!(
+            delivered_prompt
+                .matches("This is an interactive conversation with a user")
+                .count(),
+            1,
+            "the capped prompt must carry exactly one timestamp orientation"
+        );
+    }
+
+    #[test]
+    fn process_channel_message_reapplies_prompt_cap_after_skill_refresh() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_reapplies_prompt_cap_after_skill_refresh())
         });
     }
 

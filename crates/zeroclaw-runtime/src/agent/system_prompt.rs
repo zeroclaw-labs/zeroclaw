@@ -592,6 +592,13 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
 /// Apply the final model-visible prompt budget in Unicode scalar values.
 pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
     if max_chars > 0 && prompt.chars().count() > max_chars {
+        // A prompt that was already finalized once (e.g. the cached channel
+        // prompt) carries its orientation block inside the head-retained
+        // portion below; re-appending would duplicate it. Strip every existing
+        // copy first so re-finalizing an over-cap prompt is idempotent.
+        while let Some(index) = prompt.find(TIMESTAMP_ORIENTATION) {
+            prompt.replace_range(index..index + TIMESTAMP_ORIENTATION.len(), "");
+        }
         // The orientation is runtime-critical, so it must land inside the
         // budget. Reserve room at the head-retained portion, then re-append it
         // so it always survives even when the assembled prompt overflows.
@@ -1392,6 +1399,35 @@ mod tests {
         assert!(!finalized.contains("System prompt truncated"));
         assert!(finalized.ends_with(TIMESTAMP_ORIENTATION));
         assert!(!finalized.contains("TAIL"));
+    }
+
+    #[test]
+    fn refinalizing_an_over_cap_prompt_keeps_a_single_timestamp_orientation() {
+        let reserved = TIMESTAMP_ORIENTATION.chars().count();
+        let max_chars = reserved + 200;
+        // Simulate the channel path: a finalized cached prompt (head + one
+        // orientation block) that a per-turn skill splice then grows past the
+        // cap before the turn re-applies it.
+        let cached = super::finalize_system_prompt(
+            format!(
+                "Identity and operating rules.\n{}",
+                "skill body.\n".repeat(400)
+            ),
+            max_chars,
+        );
+        assert!(cached.chars().count() <= max_chars);
+        assert_eq!(cached.matches(TIMESTAMP_ORIENTATION).count(), 1);
+
+        let regrown = format!("{cached}\n\n{}", "refreshed skill body.\n".repeat(400));
+        assert!(regrown.chars().count() > max_chars);
+        let recapped = super::finalize_system_prompt(regrown, max_chars);
+
+        assert!(recapped.chars().count() <= max_chars);
+        assert!(
+            recapped.matches(TIMESTAMP_ORIENTATION).count() == 1,
+            "re-finalization must not duplicate the orientation block: {recapped}"
+        );
+        assert!(recapped.ends_with(TIMESTAMP_ORIENTATION));
     }
 
     #[test]
