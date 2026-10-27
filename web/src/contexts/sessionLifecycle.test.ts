@@ -1840,6 +1840,47 @@ test('a conversation refused at the limit keeps its message, and Retry sends it'
   });
 });
 
+for (const code of [1006, 1001, 4410]) {
+  test(`a close (${code}) before the conversation starts gives the message back to the composer`, async () => {
+    await withSession(scopedSession, async () => {
+      const runtime = new FakeSessionRuntime();
+      const mounted = await mountChat(runtime, true);
+      await typeInComposer(mounted.renderer, 'hello');
+      const send = mounted.renderer.root.findAllByType('button')
+        .find((button) => button.props['aria-label'] === 'Send');
+      assert.ok(send);
+      await act(async () => { send.props.onClick(); });
+      assert.equal(textarea(mounted.renderer).props.value, '');
+      const socket = runtime.sockets[0]!;
+      await act(async () => { socket.emitOpen(); });
+      await act(async () => { socket.emitClose(code); });
+      await settle();
+
+      // Never sent, so not shown as sent: it is back in the composer.
+      assert.deepEqual(socket.sent, []);
+      assert.equal(mounted.context().messages.some((m) => m.content === 'hello'), false);
+      assert.equal(endedNotice(mounted).length, 0);
+      assert.equal(textarea(mounted.renderer).props.value, 'hello');
+      assert.equal(mounted.context().error, 'Failed to send message. Please try again.');
+      assert.equal(mounted.context().startsConversationOnSend, true);
+      assert.equal(socket.connectCalls, 1);
+
+      // Sending it again starts a conversation on a new socket.
+      const again = mounted.renderer.root.findAllByType('button')
+        .find((button) => button.props['aria-label'] === 'Send');
+      assert.ok(again);
+      await act(async () => { again.props.onClick(); });
+      assert.equal(runtime.sockets.length, 2);
+      const second = runtime.sockets[1]!;
+      await act(async () => { second.emitOpen(); });
+      await act(async () => { second.emitMessage(conversationStart('core-1')); });
+      assert.deepEqual(second.sent, ['hello']);
+      assert.equal(mounted.context().error, null);
+      await unmount(mounted.renderer);
+    });
+  });
+}
+
 test('a new conversation closes this one, clears the page, and deletes nothing', async () => {
   await withSession(scopedSession, async () => {
     const runtime = new FakeSessionRuntime();

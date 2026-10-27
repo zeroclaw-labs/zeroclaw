@@ -94,6 +94,10 @@ export interface AgentContextValue {
   conversationPerSocket: boolean;
   /** No conversation is open: the next message starts one on a new socket. */
   startsConversationOnSend: boolean;
+  /** A message whose socket closed before its conversation started, so it
+   * never left the page: the composer takes it back (`takeUnsentMessage`). */
+  unsentMessage: string | null;
+  takeUnsentMessage: () => void;
   error: string | null;
   typing: boolean;
   streamingContent: string;
@@ -303,6 +307,7 @@ export function AgentProvider({
   // A message that starts a conversation, shown at once and sent once the
   // conversation exists, so a refusal at the limit can't lose it.
   const pendingSendRef = useRef<string | null>(null);
+  const [unsentMessage, setUnsentMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
   const [streamingContent, setStreamingContent] = useState('');
@@ -913,12 +918,33 @@ export function AgentProvider({
         // Refused at the limit, no conversation was created: the waiting
         // message goes out after Retry.
         if (ev.code === WS_CLOSE_CONVERSATION_LIMIT) return;
-        // Whatever closed it (a reload, the session ending, the network), the
-        // conversation is over. Its messages stay, marked; the next message
-        // starts a new one. A message still waiting never reached it.
+        const unsent = pendingSendRef.current;
         pendingSendRef.current = null;
         setStartsConversationOnSend(true);
         localMessageMutationVersionRef.current += 1;
+        if (unsent !== null) {
+          // Closed before its conversation started (a restart, the network):
+          // the message never left the page. It goes back to the composer
+          // instead of staying on screen as if it had been sent.
+          setMessages((prev) => {
+            for (let i = prev.length - 1; i >= 0; i -= 1) {
+              const m = prev[i]!;
+              if (m.local && m.role === 'user' && m.content === unsent) {
+                return [...prev.slice(0, i), ...prev.slice(i + 1)];
+              }
+            }
+            return prev;
+          });
+          setUnsentMessage(unsent);
+          // A signed-in session's end is the auth layer's to explain.
+          if (ev.code !== WS_CLOSE_SESSION_ENDED && ev.code !== WS_CLOSE_ACCESS_LOST) {
+            setError(t('agent.send_error'));
+          }
+          return;
+        }
+        // Whatever closed it (a reload, the session ending, the network), the
+        // conversation is over. Its messages stay, marked; the next message
+        // starts a new one.
         setMessages((prev) => {
           const last = prev[prev.length - 1];
           if (!prev.some((m) => !m.ephemeral) || (last?.notice && last.content === t('agent.conversation_ended'))) {
@@ -1501,6 +1527,8 @@ export function AgentProvider({
     });
   }, []);
 
+  const takeUnsentMessage = useCallback(() => setUnsentMessage(null), []);
+
   const retryConnection = useCallback(() => {
     setConversationLimited(false);
     wsRef.current?.connect();
@@ -1514,6 +1542,8 @@ export function AgentProvider({
     retryConnection,
     conversationPerSocket: perSocket,
     startsConversationOnSend,
+    unsentMessage,
+    takeUnsentMessage,
     error,
     typing,
     streamingContent,

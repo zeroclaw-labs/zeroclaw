@@ -143,6 +143,8 @@ export function AgentChatInner({
     retryConnection,
     conversationPerSocket,
     startsConversationOnSend,
+    unsentMessage,
+    takeUnsentMessage,
     error,
     typing,
     streamingContent,
@@ -242,6 +244,14 @@ export function AgentChatInner({
   useEffect(() => {
     writeInput(draft);
   }, [draftKey, draft, writeInput]);
+
+  // A message that never reached a conversation comes back to the composer,
+  // ahead of anything typed since.
+  useEffect(() => {
+    if (unsentMessage === null) return;
+    applyInput((typed) => (typed ? `${unsentMessage}\n${typed}` : unsentMessage));
+    takeUnsentMessage();
+  }, [unsentMessage, applyInput, takeUnsentMessage]);
 
   // Report live status (typing + message count) up to the host workspace so it
   // can render streaming / unread indicators in the tab bar. Fires on every
