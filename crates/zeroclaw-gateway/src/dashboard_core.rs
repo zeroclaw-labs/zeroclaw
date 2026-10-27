@@ -4745,6 +4745,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_chat_whose_reply_end_cannot_be_written_ends() {
+        // No pings, which would otherwise find the stuck socket later.
+        let fixture = Fixture::with_config(|config| {
+            config.gateway.websocket_ping_interval_secs = 0;
+        })
+        .await;
+        mount_flood(&fixture).await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &alice, "support", "web-1")
+            .await
+            .expect("the account may chat");
+        let _ = await_frame(&mut socket, "session_start").await;
+        let flood = json!({ "type": "message", "content": "flood please" });
+        socket
+            .send(ClientMessage::Text(flood.to_string().into()))
+            .await
+            .unwrap();
+        // The browser takes the reply's chunk, then stops reading: only the
+        // turn's end is left stuck in the write.
+        let _ = await_frame(&mut socket, "chunk").await;
+        fixture
+            .assert_nothing_live(
+                "a chat that could not write its reply's end closes its conversation",
+            )
+            .await;
+        drop(socket);
+    }
+
+    #[tokio::test]
     async fn an_account_holds_few_core_connections_for_its_requests() {
         let fixture = Fixture::new().await;
         let router = fixture.router();

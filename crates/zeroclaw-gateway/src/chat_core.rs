@@ -777,8 +777,8 @@ impl TurnRelay {
                         "code": "AGENT_ERROR",
                     }),
                 };
-                if !self.client_gone {
-                    let _ = send(sender, &frame).await;
+                if !self.client_gone && send(sender, &frame).await.is_err() {
+                    self.disconnect().await;
                 }
                 return Relayed::TurnEnded;
             }
