@@ -1823,6 +1823,8 @@ test('a conversation refused at the limit keeps its message, and Retry sends it'
     assert.equal(mounted.context().conversationLimited, true);
     assert.deepEqual(socket.sent, []);
     assert.equal(endedNotice(mounted).length, 0);
+    // The limit line says it once; no chat bubble repeats it.
+    assert.equal(mounted.context().messages.some((m) => m.content.startsWith('[Error]')), false);
     const line = mounted.renderer.root.findAll((node) =>
       node.type === 'div' && node.props['data-conversation-limit'] !== undefined);
     assert.equal(line.length, 1);
