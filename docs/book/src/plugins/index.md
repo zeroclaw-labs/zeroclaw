@@ -133,6 +133,14 @@ because verifying compiles and instantiates every component. A skill bundle
 ships no component, so it is reported as not applicable rather than as a
 failure.
 
+For a tool plugin whose component instantiates, both commands also apply the
+check the runtime makes on the tool's configuration before it registers the
+tool. `plugin remove` keeps the package's `[[plugins.entries]]` row and its
+values, so a reinstall can meet values its manifest does not accept: any value
+at all when the new package declares no `config_schema`. The runtime skips such
+a tool, so the verdict is that it does not load, with the runtime's reason and
+the row that holds the values.
+
 ### Recovering an incomplete installation
 
 `zeroclaw plugin install` builds a package in a unique hidden transaction
@@ -166,6 +174,28 @@ Discovery skips such a directory, so it is not an installed package, yet it
 still holds the name. `zeroclaw plugin install` never overwrites anything
 already at a package name: it refuses and names
 `zeroclaw plugin remove <name>` as the recovery.
+
+For a package the host has loaded, `plugin remove` deletes the directory the
+package was loaded from, which need not carry the package's name, for example
+after a manual move. It claims that directory in a hidden recovery transaction,
+checks that it still holds the manifest and component the host loaded, and
+deletes it through the claim. A directory that only sits at the package's name
+is not touched. A package replaced on disk since the host loaded it is put back
+and the remove is refused. Like recovery, this needs the atomic no-replace move
+described above, and refuses where the platform or filesystem cannot provide
+one.
+
+A remove that stops after claiming the directory but before deleting it, or
+that cannot put back a directory that changed since it was loaded (it reports
+the retained files), leaves what it claimed in a hidden recovery transaction
+that records only the package name. The next `plugin remove <name>` puts that
+back at `<plugins_dir>/<name>`, not in the directory it was loaded from, and
+refuses for as long as something else occupies `<name>`. To finish, move
+whatever is at `<name>` aside and run `zeroclaw plugin remove <name>` twice:
+the first run puts the package back at `<name>` and leaves it there, because
+the host did not load it from there, and the second run removes it. Then move
+the other directory back if you still need it. A delete that had already begun
+is finished by the next remove instead.
 
 For a name the host has not loaded, `plugin remove` claims the selected
 directory generation in a hidden recovery transaction and applies the same
@@ -362,6 +392,15 @@ materializes and validates the resulting typed object before using tool or
 channel guest code; unknown, malformed, or out-of-range values fail instead of
 reaching the plugin. Memory plugins do not yet have a config import and must
 not request `config_read` until that ABI is added.
+
+Every value in an instance's `config` map is encrypted at rest, whatever the
+schema says. `zeroclaw config set plugins.entries.<key>.config.<name>` asks for
+an `x-secret` value with masked input and, unless `--no-interactive` is given,
+does not take one from the command line. A property the installed package
+declares without `x-secret` takes the value given on the command line, or
+prompts with echo when none is given. A name `config set` cannot match to an
+installed package's schema, for example on a row whose package is not installed,
+is treated as secret.
 
 Tool and channel components can request `state_read` and/or `state_write` for
 the `state` import. The host, not the guest, supplies the admitted package,

@@ -250,7 +250,7 @@ Registry entries use this shape:
   "plugins": [
     {
       "name": "team-calendar",
-      "version": "0.8.6",
+      "version": "0.8.7",
       "description": "Schedule meetings on a team calendar",
       "author": "Example Team",
       "capabilities": ["tool"],
@@ -1135,8 +1135,13 @@ update displaced open that root and its lock, so a host that only discovers
 plugins, such as one the daemon keeps, holds nothing in the plugins directory. On Windows an open root pins the plugins directory and
 its ancestors against rename until its host drops. A process that cannot take
 the lock within 60 seconds gives up and names the lock file. Any account that
-can read that file can hold the lock, and where the operating system or
-filesystem offers no file locking, install, update and remove refuse. New
+can read that file can hold the lock, so the plugins directory is treated as
+one account's state: on Unix the lock and each transaction lease are created
+readable and writable by their owner only (mode `0600`). A lock another
+account created, for example with `sudo`, cannot be opened, so install,
+update and remove fail at once and name it; remove that file while nothing is
+installing. Where the operating
+system or filesystem offers no file locking, install, update and remove refuse. New
 staging directories use unique generations and an OS-held lease, rather than a
 PID as ownership evidence. Recovery cleans an abandoned protocol stage only
 while recovering an actual final package, or while finishing the delete of one

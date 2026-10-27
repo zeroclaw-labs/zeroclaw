@@ -679,6 +679,59 @@ pub fn required_keys(
         .collect()
 }
 
+/// Whether `manifest`'s `config_schema` declares the top-level property `name`
+/// and no `x-secret` marker is reachable from it: a setting whose value is not
+/// a secret, though it is encrypted at rest like every value in an instance's
+/// `config` map. `false` for a name the schema does not declare and for a
+/// manifest without a schema.
+///
+/// Admission accepts the marker only as `true` on a direct top-level property,
+/// so for an admitted schema this is "declared without `x-secret`". The wider
+/// rule keeps a schema admission would refuse from passing a secret as plain.
+#[must_use]
+pub fn declares_plain_property(manifest: &PluginManifest, name: &str) -> bool {
+    let Some(schema) = manifest.config_schema.as_ref() else {
+        return false;
+    };
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(name))
+        .is_some_and(|property| !reaches_secret_marker(schema, property))
+}
+
+/// Whether `node`, any schema nested in it, or any schema it reaches through
+/// a local `$ref` carries an `x-secret` key, whatever its value. A `$ref` that
+/// does not resolve inside `schema` counts as reaching one.
+fn reaches_secret_marker<'a>(schema: &'a Value, node: &'a Value) -> bool {
+    let mut pending = vec![node];
+    let mut followed = HashSet::new();
+    while let Some(node) = pending.pop() {
+        match node {
+            Value::Object(object) => {
+                if object.contains_key("x-secret") {
+                    return true;
+                }
+                if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                    let Some(target) = reference
+                        .strip_prefix('#')
+                        .and_then(|pointer| schema.pointer(pointer))
+                    else {
+                        return true;
+                    };
+                    if followed.insert(reference) {
+                        pending.push(target);
+                    }
+                }
+                pending.extend(object.values());
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The runtime's own verdict on the configuration of `alias`'s instance.
 ///
 /// Runs `zeroclaw_plugins::config::resolve_plugin_config` over the config map
@@ -720,7 +773,7 @@ pub fn config_verdict(
 /// override alike, so publisher text in it can neither steer the terminal nor
 /// reorder what it shows. Quotes and backslashes print as themselves, since
 /// the resolver's messages quote the names and paths they cite.
-fn escape_unprintable(text: &str) -> String {
+pub(crate) fn escape_unprintable(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for character in text.chars() {
         if matches!(character, '\'' | '"' | '\\') {
@@ -863,8 +916,8 @@ pub fn plugin_bind_decision_commands_for(
 mod tests {
     use super::{
         ALIAS_PLACEHOLDER, ShellDialect, config_set_command_for,
-        config_set_command_to_complete_for, config_verdict, plugin_bind_command_for,
-        plugin_bind_decision_commands_for, required_keys,
+        config_set_command_to_complete_for, config_verdict, declares_plain_property,
+        plugin_bind_command_for, plugin_bind_decision_commands_for, required_keys,
     };
     use serde_json::{Value, json};
     use std::path::Path;
@@ -916,6 +969,50 @@ mod tests {
             .config
             .insert("api_token".into(), "fixture-secret-value".into());
         assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
+    }
+
+    #[test]
+    fn only_a_declared_property_without_x_secret_is_plain() {
+        let mut schema = secret_schema();
+        schema["properties"]["guild_ids"] = json!({"type": "array"});
+        let manifest = schema_manifest(schema);
+        zeroclaw_plugins::config::validate_manifest_config(&manifest).expect("admitted schema");
+
+        assert!(declares_plain_property(&manifest, "guild_ids"));
+        assert!(!declares_plain_property(&manifest, "api_token"));
+        assert!(!declares_plain_property(&manifest, "undeclared"));
+        let mut schemaless = manifest.clone();
+        schemaless.config_schema = None;
+        assert!(!declares_plain_property(&schemaless, "guild_ids"));
+    }
+
+    /// A property from which any `x-secret` marker is reachable is never
+    /// plain: below it, behind a local `$ref`, in a `oneOf` branch, or written
+    /// as something other than `true`. Admission refuses each of these
+    /// schemas; the check does not rely on that. A `$ref` that does not
+    /// resolve counts as reaching a marker.
+    #[test]
+    fn a_property_that_reaches_a_secret_marker_is_never_plain() {
+        let mut schema = secret_schema();
+        schema["properties"]["guild_ids"] = json!({"type": "array"});
+        schema["properties"]["auth"] = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"token": {"type": "string", "x-secret": true}},
+        });
+        schema["properties"]["creds"] = json!({"$ref": "#/$defs/creds"});
+        schema["$defs"] = json!({"creds": {"type": "string", "x-secret": true}});
+        schema["properties"]["login"] =
+            json!({"oneOf": [{"type": "string", "x-secret": true}, {"type": "integer"}]});
+        schema["properties"]["token"] = json!({"type": "string", "x-secret": "true"});
+        schema["properties"]["remote"] = json!({"$ref": "https://example.com/schema"});
+        let manifest = schema_manifest(schema);
+
+        assert!(declares_plain_property(&manifest, "guild_ids"));
+        for name in ["auth", "creds", "login", "token", "remote"] {
+            assert!(!declares_plain_property(&manifest, name), "{name}");
+        }
+        assert!(zeroclaw_plugins::config::validate_manifest_config(&manifest).is_err());
     }
 
     #[test]

@@ -3660,7 +3660,9 @@ fn with_update_pointer(
 /// This is the verdict that separates the two, and it comes from the same
 /// `verify_component_loads` check `plugin install` gates on: a plugin that
 /// predates that gate, was installed with `--no-verify`, or outlived a host
-/// upgrade is exactly the case the install gate cannot cover.
+/// upgrade is exactly the case the install gate cannot cover. For a tool, the
+/// runtime also refuses an instance whose configuration does not resolve, so
+/// the verdict asks the runtime's own config check as well.
 #[cfg(feature = "plugins-wasm")]
 #[derive(Debug)]
 enum PluginLoadStatus {
@@ -3669,6 +3671,14 @@ enum PluginLoadStatus {
     /// It does not. Carries the full wasmtime cause chain, including the
     /// WIT-drift rebuild hint when instantiation was what failed.
     Fails(String),
+    /// The component instantiates, but the runtime refuses the configuration
+    /// of the package's tool instance and skips the tool.
+    ConfigRefused {
+        /// The `[[plugins.entries]]` row the configuration is read from.
+        instance_key: String,
+        /// The runtime's reason, escaped for the terminal.
+        reason: String,
+    },
     /// A skill-only package ships no component, so there is nothing to load.
     NoComponent,
 }
@@ -3679,17 +3689,22 @@ impl PluginLoadStatus {
     /// it. Only a real load failure qualifies: a skill-only package has
     /// nothing to instantiate, which is not evidence that anything is broken.
     const fn is_load_failure(&self) -> bool {
-        matches!(self, Self::Fails(_))
+        matches!(self, Self::Fails(_) | Self::ConfigRefused { .. })
     }
 }
 
-/// Run the load-check for one installed plugin.
+/// Run the load-check for one installed plugin: the component against this
+/// host's WIT world, then, for a component that instantiates, the runtime's
+/// check of the tool instance's configuration in `config`.
 #[cfg(feature = "plugins-wasm")]
 async fn installed_plugin_load_status(
     host: &zeroclaw::plugins::host::PluginHost,
     info: &zeroclaw::plugins::PluginInfo,
     limits: zeroclaw::plugins::component::PluginLimits,
+    config: &crate::config::schema::Config,
 ) -> Result<PluginLoadStatus> {
+    use zeroclaw_runtime::plugin_runtime::ToolConfigVerdict;
+
     // The host's admitted bytes, not a reread of `wasm_path`: these are what
     // the daemon compiles, so the verdict describes what will actually run.
     let Some(component) = host.admitted_component(&info.name) else {
@@ -3698,10 +3713,31 @@ async fn installed_plugin_load_status(
     let manifest = host
         .manifest(&info.name)
         .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
-    match zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await {
-        Ok(()) => Ok(PluginLoadStatus::Loads),
-        Err(error) => Ok(PluginLoadStatus::Fails(format!("{error:#}"))),
+    if let Err(error) =
+        zeroclaw::plugins::validate::verify_component_loads(component, manifest, limits).await
+    {
+        return Ok(PluginLoadStatus::Fails(format!("{error:#}")));
     }
+    // An admitted manifest always forms its instance key, so the verdict
+    // cannot fail in practice. If it ever does, that is this plugin's load
+    // failure, never the whole command's.
+    Ok(
+        match zeroclaw_runtime::plugin_runtime::tool_instance_config_verdict(config, manifest) {
+            Ok(ToolConfigVerdict::Accepted | ToolConfigVerdict::NotATool) => {
+                PluginLoadStatus::Loads
+            }
+            Ok(ToolConfigVerdict::Refused {
+                instance_key,
+                error,
+            }) => PluginLoadStatus::ConfigRefused {
+                instance_key,
+                // The resolver's message can quote publisher text, such as a
+                // schema property name.
+                reason: crate::plugins::channel_instance::escape_unprintable(&error.to_string()),
+            },
+            Err(error) => PluginLoadStatus::Fails(format!("{error:#}")),
+        },
+    )
 }
 
 /// The first line of a diagnostic. A list row annotates each plugin with just
@@ -3748,7 +3784,8 @@ fn plugin_list_lines(
                 &args,
                 format!("{identity} [loads]"),
             ),
-            PluginLoadStatus::Fails(error) => {
+            PluginLoadStatus::Fails(error)
+            | PluginLoadStatus::ConfigRefused { reason: error, .. } => {
                 let cause = first_line(error);
                 let mut args = args.to_vec();
                 args.push(("error", cause));
@@ -3871,12 +3908,72 @@ fn plugin_info_lines(
                 "Loads: no. {error}\nRebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it."
             ),
         ),
+        PluginLoadStatus::ConfigRefused {
+            instance_key,
+            reason,
+        } => ta(
+            "cli-plugin-info-load-config-refused",
+            &[("error", reason), ("key", instance_key)],
+            format!(
+                "Loads: no. The component instantiates against this host's WIT world, but the runtime refuses its configuration: {reason}\nThe configuration is the `config` map of the [[plugins.entries]] row named '{instance_key}'. Make it match the installed package's config_schema, or remove its values if the package declares none."
+            ),
+        ),
         PluginLoadStatus::NoComponent => t(
             "cli-plugin-info-load-not-applicable",
             "Loads: not applicable. This is a skill-only plugin, so there is no component to instantiate.",
         ),
     });
     lines
+}
+
+/// Whether `config set` takes `path` as a plain plugin setting rather than as
+/// secret input: `path` is `plugins.entries.<key>.config.<name>`, `<key>` is
+/// the row of an instance of an installed package, as `plugin info` lists
+/// them, that package's `config_schema` passes config admission, and it
+/// declares `<name>` with no `x-secret` marker reachable from it. Anything
+/// that cannot be established that way, including a plugins directory that
+/// is missing or cannot be read, is `false`, and the value stays secret input.
+///
+/// Discovery only reads the plugins directory: it is skipped when the
+/// directory is missing, since it would create one, and it takes no package
+/// lock.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_setting_is_plain(config: &crate::config::schema::Config, path: &str) -> bool {
+    let Some((key, name)) = path
+        .strip_prefix("plugins.entries.")
+        .and_then(|rest| rest.split_once(".config."))
+    else {
+        return false;
+    };
+    if !config.plugins.resolved_plugins_dir().is_dir() {
+        return false;
+    }
+    let host = match plugin_host_with_configured_security(config) {
+        Ok(host) => host,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{error:#}")})),
+                "Installed plugins could not be read; config set keeps masked input"
+            );
+            return false;
+        }
+    };
+    // The one installed package whose instance owns the row decides.
+    let Some(owner) = host
+        .list_plugins()
+        .iter()
+        .filter_map(|info| host.manifest(&info.name))
+        .find(|manifest| {
+            crate::plugins::channel_instance::instance_rows(config, manifest)
+                .is_ok_and(|rows| rows.iter().any(|row| row.key == key))
+        })
+    else {
+        return false;
+    };
+    zeroclaw::plugins::config::validate_manifest_config(owner).is_ok()
+        && crate::plugins::channel_instance::declares_plain_property(owner, name)
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -12668,6 +12765,14 @@ Add pricing to the active provider profile or supply a catalog entry."
                         config.prop_fields().into_iter().map(|f| f.name).collect();
                     path = zeroclaw_config::helpers::resolve_field_path(&known_paths, &path);
                 }
+                // Every value in a plugin instance's `config` map is stored
+                // encrypted, but only a property the installed package marks
+                // `x-secret` is secret input.
+                #[cfg(feature = "plugins-wasm")]
+                let plain_plugin_setting =
+                    !no_interactive && plugin_setting_is_plain(&config, &path);
+                #[cfg(not(feature = "plugins-wasm"))]
+                let plain_plugin_setting = false;
                 let selected_value = if no_interactive {
                     value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
@@ -12681,7 +12786,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                             "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         ))
                     })?
-                } else if Config::prop_is_secret(&path) {
+                } else if Config::prop_is_secret(&path) && !plain_plugin_setting {
                     if value.is_some() {
                         eprintln!(
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
@@ -12699,6 +12804,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                     secret_value
                 } else if let Some(val) = value {
                     val
+                } else if plain_plugin_setting {
+                    dialoguer::Input::<String>::new()
+                        .with_prompt(format!("Enter value for {path}"))
+                        .interact_text()?
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
                     let provider_ref = path
@@ -13537,7 +13646,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     for info in &plugins {
                         entries.push((
                             info.clone(),
-                            Some(installed_plugin_load_status(&host, info, limits).await?),
+                            Some(installed_plugin_load_status(&host, info, limits, &config).await?),
                         ));
                     }
                     for line in plugin_list_lines(&entries) {
@@ -13810,7 +13919,8 @@ Add pricing to the active provider profile or supply a catalog entry."
                         // The load-check always runs here. "Why does my plugin
                         // not show up?" is the question this command is reached
                         // for, and discovery metadata cannot answer it.
-                        let status = installed_plugin_load_status(&host, &info, limits).await?;
+                        let status =
+                            installed_plugin_load_status(&host, &info, limits, &config).await?;
                         for line in plugin_info_lines(
                             &info,
                             &instance_rows,
@@ -22006,9 +22116,14 @@ type = "string"
             )
             .unwrap();
 
-            let status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .unwrap();
+            let status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(status, PluginLoadStatus::Loads),
                 "the in-tree tool fixture must load against this host; got {status:?}"
@@ -22054,6 +22169,7 @@ type = "string"
                 &host,
                 &info,
                 zeroclaw_runtime::plugin_runtime::plugin_limits(&constrained),
+                &constrained,
             )
             .await
             .expect("the load verdict is reported, not raised");
@@ -22062,9 +22178,14 @@ type = "string"
                 "a limit below the component's required instances must not report loads: {constrained_status:?}"
             );
 
-            let default_status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .expect("the load verdict is reported, not raised");
+            let default_status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .expect("the load verdict is reported, not raised");
             assert!(
                 matches!(default_status, PluginLoadStatus::Loads),
                 "the same component must load under the default runtime limits: {default_status:?}"
@@ -22102,9 +22223,14 @@ type = "string"
                 "discovery still calls the package loaded, which is why the check is needed"
             );
 
-            let status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .unwrap();
+            let status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .unwrap();
             let PluginLoadStatus::Fails(cause) = &status else {
                 panic!("a non-component artifact must not report as loading; got {status:?}");
             };
@@ -22223,9 +22349,14 @@ type = "string"
                 .expect("the skill bundle is discovered");
             assert!(info.wasm_path.is_none(), "the fixture ships no component");
 
-            let status = installed_plugin_load_status(&host, &info, verifier_limits())
-                .await
-                .unwrap();
+            let status = installed_plugin_load_status(
+                &host,
+                &info,
+                verifier_limits(),
+                &crate::config::schema::Config::default(),
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(status, PluginLoadStatus::NoComponent),
                 "a component-less package is not applicable, not broken; got {status:?}"
@@ -22233,11 +22364,190 @@ type = "string"
             assert!(!status.is_load_failure(), "and must not fail the exit code");
         }
 
+        /// The fixture as a release that stopped reading config ships it: no
+        /// permission and no `config_schema`.
+        const FIXTURE_MANIFEST_WITHOUT_CONFIG: &str = r#"name = "tool-fixture"
+version = "0.0.0"
+wasm_path = "tool-fixture.wasm"
+capabilities = ["tool"]
+permissions = []
+"#;
+
+        /// The runtime's reason for refusing values handed to a package without
+        /// a `config_schema`. Like a load failure's cause, it is not translated.
+        const NO_SCHEMA_REFUSAL: &str = "has configured values but declares no config_schema";
+
+        /// Install the fixture under `manifest` through `plugin install`'s own
+        /// path: the load check, the publish and the row seeding.
+        async fn install_fixture_with(
+            host: &mut PluginHost,
+            config: &mut crate::config::schema::Config,
+            source: &Path,
+            manifest: &str,
+        ) {
+            std::fs::create_dir_all(source).unwrap();
+            std::fs::copy(
+                super::tool_component_fixture::wasm(),
+                source.join("tool-fixture.wasm"),
+            )
+            .unwrap();
+            std::fs::write(source.join("manifest.toml"), manifest).unwrap();
+            let admitted = host
+                .admit_source(source.to_str().expect("utf-8 temp path"))
+                .expect("admit the fixture");
+            Box::pin(install_admitted_source(
+                host,
+                config,
+                admitted,
+                None,
+                verifier_limits(),
+                false,
+                |_| {},
+            ))
+            .await
+            .expect("install the fixture");
+        }
+
+        /// In the order an operator meets it: a value set for the package that
+        /// reads config stays on its row after `plugin remove`, and a
+        /// reinstall without a `config_schema` meets it. The runtime refuses
+        /// that tool instance, so `plugin info` and `plugin list --verify` say
+        /// it does not load. With the value removed it loads.
+        #[tokio::test]
+        async fn values_left_for_a_reinstall_without_a_config_schema_do_not_load() {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut config = super::config_in_dir(workspace.path());
+            let mut host = PluginHost::new(workspace.path()).expect("throwaway plugin host");
+
+            install_fixture_with(
+                &mut host,
+                &mut config,
+                &workspace.path().join("source/with-config"),
+                FIXTURE_MANIFEST,
+            )
+            .await;
+            let key = installed_instance_rows(&config, &host, "tool-fixture")
+                .unwrap()
+                .into_iter()
+                .find(|row| !row.is_channel())
+                .expect("install seeds the tool row")
+                .key;
+            // `config set plugins.entries.<key>.config.label masked`
+            config
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key)
+                .expect("the seeded row")
+                .config
+                .insert("label".to_string(), "masked".to_string());
+            let info = host.get_plugin("tool-fixture").unwrap();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits(), &config)
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::Loads),
+                "the package whose schema declares the value loads with it: {status:?}"
+            );
+
+            host.remove_with_report("tool-fixture")
+                .expect("remove the package");
+            install_fixture_with(
+                &mut host,
+                &mut config,
+                &workspace.path().join("source/without-config"),
+                FIXTURE_MANIFEST_WITHOUT_CONFIG,
+            )
+            .await;
+
+            let info = host.get_plugin("tool-fixture").unwrap();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits(), &config)
+                .await
+                .unwrap();
+            let PluginLoadStatus::ConfigRefused {
+                instance_key,
+                reason,
+            } = &status
+            else {
+                panic!("the runtime skips this tool, so it must not report as loading: {status:?}");
+            };
+            assert_eq!(instance_key, &key, "the verdict names the row it read");
+            assert!(reason.contains(NO_SCHEMA_REFUSAL), "{reason}");
+            assert!(status.is_load_failure(), "plugin info exits non-zero");
+
+            let rows = installed_instance_rows(&config, &host, &info.name).unwrap();
+            let info_lines = plugin_info_lines(&info, &rows, &[], &[], &status);
+            let verdict = info_lines.last().unwrap();
+            assert!(
+                verdict.contains(&key) && verdict.contains(NO_SCHEMA_REFUSAL),
+                "the info verdict carries the row and the reason: {info_lines:#?}"
+            );
+            let listed = plugin_list_lines(&[(info.clone(), Some(status))]);
+            let loads = plugin_list_lines(&[(info.clone(), Some(PluginLoadStatus::Loads))]);
+            assert!(
+                listed[1].contains("tool-fixture") && listed[1].contains(NO_SCHEMA_REFUSAL),
+                "the verified row names the refusal: {listed:#?}"
+            );
+            assert_ne!(listed[1], loads[1], "and is not the [loads] row");
+
+            // The remedy the verdict names: remove the values from the row.
+            config
+                .plugins
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == key)
+                .unwrap()
+                .config
+                .clear();
+            let status = installed_plugin_load_status(&host, &info, verifier_limits(), &config)
+                .await
+                .unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::Loads),
+                "with the values removed the reinstalled package loads: {status:?}"
+            );
+        }
+
+        /// The issue's other shape, `config_read` without a `config_schema`, is
+        /// refused when the package is admitted, so neither `plugin install`
+        /// nor the runtime ever meets it.
+        #[test]
+        fn a_package_requesting_config_read_without_a_schema_is_refused_at_install() {
+            let workspace = tempfile::tempdir().unwrap();
+            let source = workspace.path().join("source/readless");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(
+                source.join("manifest.toml"),
+                FIXTURE_MANIFEST_WITHOUT_CONFIG
+                    .replace("permissions = []", "permissions = [\"config_read\"]"),
+            )
+            .unwrap();
+            std::fs::write(source.join("tool-fixture.wasm"), b"\0asm").unwrap();
+            let host = PluginHost::new(workspace.path()).expect("throwaway plugin host");
+
+            let Err(error) = host.admit_source(source.to_str().expect("utf-8 temp path")) else {
+                panic!("a config_read package without a schema must not be admitted");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("requests config_read but declares no config_schema"),
+                "{error}"
+            );
+        }
+
         #[test]
         fn only_a_real_load_failure_makes_plugin_info_exit_non_zero() {
             // The exit code is the scriptable part of the contract. A package
             // with no component must not be reported as broken.
             assert!(PluginLoadStatus::Fails("boom".to_string()).is_load_failure());
+            assert!(
+                PluginLoadStatus::ConfigRefused {
+                    instance_key: "zpi1_key".to_string(),
+                    reason: "refused".to_string(),
+                }
+                .is_load_failure()
+            );
             assert!(!PluginLoadStatus::Loads.is_load_failure());
             assert!(!PluginLoadStatus::NoComponent.is_load_failure());
         }
@@ -22409,6 +22719,167 @@ type = "string"
                 ..crate::config::schema::PluginChannelConfig::default()
             },
         );
+    }
+
+    /// `config set` takes a plugin setting as typed only for a property the
+    /// installed package declares without `x-secret`, on a row one of its
+    /// instances owns: the tool row, or a bound channel alias's row. Anything
+    /// else stays secret input.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn only_a_declared_non_secret_plugin_setting_is_plain_input() {
+        let tmp = tempfile::tempdir().expect("plugins dir");
+        let package = tmp.path().join("chat-bridge");
+        std::fs::create_dir_all(&package).expect("package dir");
+        std::fs::write(
+            package.join("manifest.toml"),
+            r#"name = "chat-bridge"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool", "channel"]
+permissions = ["config_read"]
+
+[config_schema]
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.guild_ids]
+type = "array"
+
+[config_schema.properties.bot_token]
+type = "string"
+x-secret = true
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(package.join("plugin.wasm"), b"\0asm").expect("write component");
+        // A second package that declares `bot_token` plainly: only the
+        // package that owns a row decides for it.
+        let relay = tmp.path().join("relay-bridge");
+        std::fs::create_dir_all(&relay).expect("package dir");
+        std::fs::write(
+            relay.join("manifest.toml"),
+            r#"name = "relay-bridge"
+version = "1.0.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.bot_token]
+type = "string"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(relay.join("plugin.wasm"), b"\0asm").expect("write component");
+        let mut config = crate::config::schema::Config::default();
+        config.plugins.plugins_dir = tmp.path().display().to_string();
+        bind_channel_alias(&mut config, "acceptance", "chat-bridge", true);
+        let host = plugin_host_with_configured_security(&config).expect("plugin host");
+        let manifest = host
+            .manifest("chat-bridge")
+            .expect("the package is installed");
+        let tool_key = expected_instance_key(manifest);
+        let channel_key = expected_channel_instance_key(manifest, "acceptance");
+        let setting = |key: &str, name: &str| format!("plugins.entries.{key}.config.{name}");
+
+        for key in [&tool_key, &channel_key] {
+            assert!(plugin_setting_is_plain(&config, &setting(key, "guild_ids")));
+            assert!(
+                !plugin_setting_is_plain(&config, &setting(key, "bot_token")),
+                "an x-secret property stays secret input"
+            );
+            assert!(!plugin_setting_is_plain(
+                &config,
+                &setting(key, "undeclared")
+            ));
+        }
+        let unbound = expected_channel_instance_key(manifest, "unbound");
+        assert!(
+            !plugin_setting_is_plain(&config, &setting(&unbound, "guild_ids")),
+            "no instance owns the row of an alias nothing binds"
+        );
+        assert!(!plugin_setting_is_plain(
+            &config,
+            &format!("plugins.entries.{tool_key}.egress_hosts")
+        ));
+
+        let relay_key = expected_instance_key(host.manifest("relay-bridge").expect("installed"));
+        assert!(plugin_setting_is_plain(
+            &config,
+            &setting(&relay_key, "bot_token")
+        ));
+
+        let missing = tmp.path().join("missing");
+        config.plugins.plugins_dir = missing.display().to_string();
+        assert!(
+            !plugin_setting_is_plain(&config, &setting(&tool_key, "guild_ids")),
+            "without the installed package the schema is unknown"
+        );
+        assert!(
+            !missing.exists(),
+            "config set never creates the plugins directory"
+        );
+    }
+
+    /// A package whose schema puts a secret marker below a top-level
+    /// property, behind a `$ref`, in a `oneOf` branch, or writes it as
+    /// something other than `true`, never has a setting taken as plain, even
+    /// placed in the plugins directory by hand.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn a_hand_placed_schema_that_hides_a_secret_marker_keeps_masked_input() {
+        let tmp = tempfile::tempdir().expect("plugins dir");
+        let shapes = [
+            (
+                "nested-secret",
+                "auth",
+                "[config_schema.properties.auth]\ntype = \"object\"\nadditionalProperties = false\n\n\
+                 [config_schema.properties.auth.properties.token]\ntype = \"string\"\nx-secret = true\n",
+            ),
+            (
+                "ref-secret",
+                "creds",
+                "[config_schema.properties.creds]\n\"$ref\" = \"#/$defs/creds\"\n\n\
+                 [config_schema.\"$defs\".creds]\ntype = \"string\"\nx-secret = true\n",
+            ),
+            (
+                "oneof-secret",
+                "login",
+                "[config_schema.properties.login]\n\
+                 oneOf = [{ type = \"string\", x-secret = true }, { type = \"integer\" }]\n",
+            ),
+            (
+                "string-secret",
+                "token",
+                "[config_schema.properties.token]\ntype = \"string\"\nx-secret = \"true\"\n",
+            ),
+        ];
+        let mut config = crate::config::schema::Config::default();
+        config.plugins.plugins_dir = tmp.path().display().to_string();
+        for (package, property, schema) in shapes {
+            let manifest = format!(
+                "name = \"{package}\"\nversion = \"1.0.0\"\nwasm_path = \"plugin.wasm\"\n\
+                 capabilities = [\"tool\"]\npermissions = [\"config_read\"]\n\n\
+                 [config_schema]\ntype = \"object\"\nadditionalProperties = false\n\n{schema}"
+            );
+            let dir = tmp.path().join(package);
+            std::fs::create_dir_all(&dir).expect("package dir");
+            std::fs::write(dir.join("manifest.toml"), &manifest).expect("write manifest");
+            std::fs::write(dir.join("plugin.wasm"), b"\0asm").expect("write component");
+            let key = expected_instance_key(&manifest_from_toml(&manifest));
+
+            assert!(
+                !plugin_setting_is_plain(
+                    &config,
+                    &format!("plugins.entries.{key}.config.{property}")
+                ),
+                "{package}: {property} stays secret input"
+            );
+        }
     }
 
     /// The entries `plugin install` seeds for `manifest` under `config`,

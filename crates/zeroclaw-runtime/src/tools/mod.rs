@@ -448,6 +448,9 @@ pub(crate) fn reserve_deferred_host_names(
     if config.pipeline.enabled {
         reserved_host_names.insert(PipelineTool::NAME.to_string());
     }
+    // The generic MCP capability tools ([`build_mcp_capability_tools`]) are
+    // minted during assembly, after plugin tools.
+    reserved_host_names.extend(["mcp_resources", "mcp_prompts"].map(String::from));
 }
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
@@ -1154,6 +1157,44 @@ fn plugin_config_values(
         })
 }
 
+/// Resolve one plugin instance's configuration from canonical config: the row
+/// under `config_entry_key`, validated by
+/// [`zeroclaw_plugins::config::resolve_plugin_config_from`] under `scope`, with
+/// the instance's TLS secret material reserved for the host and the TLS
+/// coherence witness of the same config view.
+///
+/// This is the runtime's whole per-instance config check. The host services'
+/// resolver runs it for every instance the runtime constructs, and
+/// [`crate::plugin_runtime::tool_instance_config_verdict`] runs it for a
+/// report, so the two cannot disagree. `read` yields the config view; it is
+/// called at most once, after the schema and grant checks that need no values.
+#[cfg(feature = "plugins-wasm")]
+pub(crate) fn resolve_instance_config<C: std::ops::Deref<Target = Config>>(
+    manifest: &zeroclaw_plugins::PluginManifest,
+    scope: &zeroclaw_plugins::instance::PluginInstanceScope,
+    config_entry_key: &str,
+    read: impl FnOnce() -> C,
+) -> Result<zeroclaw_plugins::config::ResolvedPluginConfig, zeroclaw_plugins::error::PluginError> {
+    let package = scope.id().package();
+    // Filled from the same config view the values come from, so the reserved
+    // set and the secrets it withholds share one revision.
+    let mut host_only = Vec::new();
+    let mut witness = None;
+    let resolved = zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+        let config = read();
+        witness = Some(plugin_tls_config_witness(&config, config_entry_key)?);
+        host_only = plugin_tls_secret_properties(&config, config_entry_key);
+        plugin_config_values(&config, config_entry_key, package)
+    })?;
+    let resolved = resolved.reserve_for_host(host_only);
+    // A schema permitted to withhold config does not invoke the source
+    // closure. Preserve that empty view; it cannot materialize TLS secrets.
+    Ok(match witness {
+        Some(witness) => resolved.with_tls_config_witness(witness),
+        None => resolved,
+    })
+}
+
 #[cfg(feature = "plugins-wasm")]
 pub(crate) fn plugin_host_services(
     host: Arc<zeroclaw_plugins::host::PluginHost>,
@@ -1175,41 +1216,18 @@ pub(crate) fn plugin_host_services(
         let manifest = host
             .manifest(package)
             .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
-        // Filled from the same config view the values come from, so the
-        // reserved set and the secrets it withholds share one revision.
-        let mut host_only = Vec::new();
-        let mut witness = None;
-        let resolved = if let Some(live_config) = &live_config {
-            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
-                // Transient per-call view: schema/grant checks happen before
-                // this access, and the global lock is released before guest
-                // setup.
-                let config = live_config.read();
-                witness = Some(plugin_tls_config_witness(&config, &config_entry_key)?);
-                host_only = plugin_tls_secret_properties(&config, &config_entry_key);
-                plugin_config_values(&config, &config_entry_key, package)
-            })
+        if let Some(live_config) = &live_config {
+            // Transient per-call view: schema/grant checks happen before this
+            // access, and the global lock is released before guest setup.
+            resolve_instance_config(manifest, scope, &config_entry_key, || live_config.read())
         } else {
             let config = fallback_config.as_ref().ok_or_else(|| {
                 zeroclaw_plugins::error::PluginError::InvalidConfig(
                     "plugin config source is unavailable".to_string(),
                 )
             })?;
-            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
-                witness = Some(plugin_tls_config_witness(config, &config_entry_key)?);
-                host_only = plugin_tls_secret_properties(config, &config_entry_key);
-                plugin_config_values(config, &config_entry_key, package)
-            })
-        };
-        resolved.map(|resolved| {
-            let resolved = resolved.reserve_for_host(host_only);
-            // A schema permitted to withhold config does not invoke the source
-            // closure. Preserve that empty view; it cannot materialize TLS secrets.
-            match witness {
-                Some(witness) => resolved.with_tls_config_witness(witness),
-                None => resolved,
-            }
-        })
+            resolve_instance_config(manifest, scope, &config_entry_key, || &**config)
+        }
     });
     let state = zeroclaw_plugins::services::PluginStateService::new(
         crate::plugin_state::PluginStateStore::new(&data_dir, &config_dir),
@@ -3551,6 +3569,27 @@ mod tests {
         assert!(!names.contains(&"mcp_prompts".to_string()));
     }
 
+    /// The capability tools register during assembly, after plugin tools, so
+    /// their names are reserved up front for the plugin loader.
+    #[tokio::test]
+    async fn mcp_capability_tool_names_are_reserved_before_plugins_load() {
+        let registry = std::sync::Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
+        let mut reserved = std::collections::HashSet::new();
+        reserve_deferred_host_names(&Config::default(), &mut reserved);
+
+        let built: Vec<String> = build_mcp_capability_tools(&registry, None)
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let mut names = built.clone();
+        names.sort();
+        assert_eq!(names, ["mcp_prompts", "mcp_resources"]);
+        // Every capability tool, including one added later, must be reserved.
+        for name in &built {
+            assert!(reserved.contains(name), "{name}");
+        }
+    }
+
     /// The Serply resolver only honours `ZEROCLAW_web_search__serply_api_key`
     /// if the runtime hands it the loader's override state. Pin the mapping for
     /// the three states the loader can produce (no override, non-empty
@@ -4685,6 +4724,230 @@ permissions = ["http_client"]
             registered,
             vec!["config-echo".to_string()],
             "a plugin tool named like an MCP tool must not be registered"
+        );
+    }
+
+    /// Stands in for a tool a connected peripheral registers.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    struct PeripheralGpioRead;
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    zeroclaw_api::mock_tool_attribution!(PeripheralGpioRead);
+
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[async_trait::async_trait]
+    impl Tool for PeripheralGpioRead {
+        fn name(&self) -> &str {
+            "gpio_read"
+        }
+
+        fn description(&self) -> &str {
+            "Read a GPIO pin on a connected board"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "peripheral".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Peripheral and skill tools register during assembly, after plugin
+    /// tools, so the loader cannot reserve their names. Assembly does: a guest
+    /// that declares a connected peripheral's tool name, or a skill tool's name
+    /// shortened past its `__` separator, is refused there and the host tool
+    /// keeps the name. The guest with an ordinary name is the control.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    #[tokio::test]
+    async fn colliding_plugin_tools_taking_late_host_tool_names_are_refused_in_assembly() {
+        use crate::tools::scoped::{ScopedAssembly, ScopedToolRegistry};
+
+        let skill_name = "release-notes-assistant-for-the-quarterly-plugin-review-board";
+        let skill_tool_name = skill_tool::composed_tool_name(skill_name, "invoke");
+        assert!(
+            !skill_tool_name.contains(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR),
+            "the shortened skill tool name falls outside the MCP separator rule: \
+             {skill_tool_name}"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let plugins = tmp.path().join("plugins");
+        install_tool_component(
+            &plugins,
+            "echo-tool",
+            &tool_fixture_component("default", &[]),
+        );
+        install_tool_component(
+            &plugins,
+            "peripheral-shaped-tool",
+            &tool_fixture_component("namespace-peripheral-tool", &["namespace-peripheral-tool"]),
+        );
+        install_tool_component(
+            &plugins,
+            "skill-shaped-tool",
+            &tool_fixture_component("namespace-skill-tool", &["namespace-skill-tool"]),
+        );
+        let mut config = plugin_activation_config(&plugins);
+        config.data_dir = tmp.path().join("data");
+        config.config_path = tmp.path().join("config.toml");
+        config
+            .agents
+            .insert("late".into(), AliasedAgentConfig::default());
+        config
+            .providers
+            .models
+            .openai
+            .insert("late".into(), Default::default());
+        config.agents.get_mut("late").unwrap().model_provider = "openai.late".into();
+        config.memory.backend = "none".into();
+        config.peripherals.enabled = true;
+        config.peripherals.boards = vec![zeroclaw_config::schema::PeripheralBoardConfig {
+            board: "late-name-probe".into(),
+            ..Default::default()
+        }];
+        // The factory is process-wide; it answers only for this test's board.
+        crate::agent::loop_::register_peripheral_tools_fn(Box::new(|peripherals| {
+            let tools: anyhow::Result<Vec<Box<dyn Tool>>> = Ok(
+                if peripherals
+                    .boards
+                    .iter()
+                    .any(|board| board.board == "late-name-probe")
+                {
+                    vec![Box::new(PeripheralGpioRead)]
+                } else {
+                    Vec::new()
+                },
+            );
+            Box::pin(std::future::ready(tools))
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<Output = anyhow::Result<Vec<Box<dyn Tool>>>> + Send,
+                    >,
+                >
+        }));
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().into(),
+            ..Default::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("late"));
+        let built = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "late",
+            Arc::clone(&runtime),
+            memory,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            tmp.path(),
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let is_guest = |tool: &dyn Tool| {
+            matches!(
+                tool.role(),
+                zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::WasmPlugin
+                )
+            )
+        };
+        let mut loaded: Vec<String> = built
+            .tools
+            .iter()
+            .filter(|tool| is_guest(tool.as_ref()))
+            .map(|tool| tool.name().to_string())
+            .collect();
+        loaded.sort();
+        let mut expected = vec![
+            "config-echo".to_string(),
+            "gpio_read".to_string(),
+            skill_tool_name.clone(),
+        ];
+        expected.sort();
+        assert_eq!(
+            loaded, expected,
+            "the loader registers all three guests: neither late name is registered yet"
+        );
+
+        let skill = crate::skills::Skill {
+            name: skill_name.into(),
+            description: "Drafts release notes".into(),
+            description_localizations: Default::default(),
+            version: "0.1.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![crate::skills::SkillTool {
+                name: "invoke".into(),
+                description: "Draft the notes".into(),
+                kind: "shell".into(),
+                command: "true".into(),
+                args: Default::default(),
+                target: None,
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "late",
+            security: &security,
+            built,
+            skills: std::slice::from_ref(&skill),
+            runtime,
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: true,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: true,
+            mcp_registry: None,
+        })
+        .await;
+
+        // For each late name, whether each registered owner is a guest.
+        let owners = |name: &str| -> Vec<bool> {
+            assembled
+                .registry
+                .iter()
+                .filter(|tool| tool.name() == name)
+                .map(|tool| is_guest(tool.as_ref()))
+                .collect()
+        };
+        assert_eq!(
+            [owners("gpio_read"), owners(&skill_tool_name)],
+            [vec![false], vec![false]],
+            "each late name has exactly one owner, the host tool, not the guest \
+             that declared it"
+        );
+        assert!(
+            assembled
+                .registry
+                .iter()
+                .any(|tool| tool.name() == "config-echo" && is_guest(tool.as_ref())),
+            "a guest with an unrelated name still registers"
         );
     }
 

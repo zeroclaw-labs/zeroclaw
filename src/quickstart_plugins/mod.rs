@@ -615,8 +615,11 @@ impl CreatePhase {
 async fn load_failure_line(config: &Config, host: &PluginHost, name: &str) -> Option<String> {
     let info = host.get_plugin(name)?;
     let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(config);
-    match crate::installed_plugin_load_status(host, &info, limits).await {
+    match crate::installed_plugin_load_status(host, &info, limits, config).await {
         Ok(status) if !status.is_load_failure() => None,
+        // The readiness lines report a refused configuration themselves: the
+        // resolver's reason, then any required settings the row lacks.
+        Ok(crate::PluginLoadStatus::ConfigRefused { .. }) => None,
         // An installed package name is lowercase letters, digits, `.`, `-`
         // and `_`, which every supported shell passes as written.
         Ok(_) => Some(qta(
@@ -4127,6 +4130,52 @@ permissions = ["http_client"]
         assert!(
             row_on_disk(&workspace.config_on_disk(), name).is_some(),
             "the legacy row is on disk"
+        );
+    }
+
+    /// A package whose row the runtime refuses is reported once, by the
+    /// readiness lines with the resolver's reason, and not also as a package
+    /// that does not load, so `load_failure_line` stays silent for it.
+    #[tokio::test]
+    async fn a_refused_configuration_is_not_reported_as_a_load_failure() {
+        let mut workspace = Workspace::new();
+        let manifest = "name = \"tool-fixture\"\nversion = \"0.1.0\"\n\
+                        wasm_path = \"tool-fixture.wasm\"\ncapabilities = [\"tool\"]\n\
+                        permissions = []\n";
+        install_with_manifest(&workspace, FIXTURE_NAME, manifest);
+        workspace
+            .config
+            .plugins
+            .entries
+            .push(crate::config::schema::PluginEntryConfig {
+                name: instance_key_of(manifest),
+                config: HashMap::from([("label".to_string(), "masked".to_string())]),
+                ..Default::default()
+            });
+        let host =
+            crate::plugin_host_with_configured_security(&workspace.config).expect("plugin host");
+        let info = host
+            .get_plugin(FIXTURE_NAME)
+            .expect("the package is installed");
+        let limits = zeroclaw_runtime::plugin_runtime::plugin_limits(&workspace.config);
+
+        let status = crate::installed_plugin_load_status(&host, &info, limits, &workspace.config)
+            .await
+            .expect("the verdict is reported");
+        assert!(
+            matches!(status, crate::PluginLoadStatus::ConfigRefused { .. }),
+            "{status:?}"
+        );
+        assert_eq!(
+            Box::pin(load_failure_line(&workspace.config, &host, FIXTURE_NAME)).await,
+            None
+        );
+        let lines = package_readiness(&workspace.config, &host, FIXTURE_NAME, None);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("has configured values but declares no config_schema")),
+            "the readiness lines report the refusal: {lines:#?}"
         );
     }
 

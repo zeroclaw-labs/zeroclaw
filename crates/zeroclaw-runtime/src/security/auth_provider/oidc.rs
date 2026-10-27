@@ -18,7 +18,8 @@
 //!   operation must re-verify or fail closed.
 //! - JWKS refresh is bounded: an unknown `kid` may trigger at most one
 //!   fetch per cooldown window, so a stream of bad tokens cannot hammer
-//!   the IdP.
+//!   the IdP. One fetch runs at a time: a check that needs the keys while
+//!   a fetch is in flight waits for that fetch and gets its result.
 //! - Actor class (human vs. service) is declared, never inferred from the
 //!   `sub`/`client_id` relationship: `service_clients` and
 //!   `interactive_clients` classify by verified `client_id`, and
@@ -29,6 +30,7 @@
 //!   claims, unmatched audience — is a denial, never a fallback.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -36,6 +38,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
+use tokio::sync::watch;
 use zeroclaw_api::principal::{
     AuthMethod, AuthOutcome, AuthenticatedIdentity, DenyReason, IdentitySubject,
 };
@@ -439,19 +442,83 @@ fn verify_signature(header: &JwtHeader, jwk: &Jwk, signed: &str, sig: &[u8]) -> 
     }
 }
 
+async fn discover(
+    http: &reqwest::Client,
+    issuer: &str,
+    alias: &str,
+    cache: &RwLock<Option<Discovery>>,
+) -> anyhow::Result<Discovery> {
+    if let Some(d) = cache.read().clone() {
+        return Ok(d);
+    }
+    let url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
+    let response = http.get(&url).send().await?.error_for_status()?;
+    let body = read_response_limited(response).await?;
+    let d: Discovery = serde_json::from_slice(&body)?;
+    // The document must assert the issuer we configured, or we fetched
+    // somebody else's metadata (or a spoofed/misrouted endpoint).
+    if d.issuer.as_deref() != Some(issuer) {
+        anyhow::bail!(
+            "discovery document issuer does not match the configured issuer for oidc.{alias}"
+        );
+    }
+    if let Some(uri) = d.jwks_uri.as_deref() {
+        validate_discovered_endpoint(uri, "jwks_uri")?;
+    }
+    if let Some(endpoint) = d.introspection_endpoint.as_deref() {
+        validate_discovered_endpoint(endpoint, "introspection_endpoint")?;
+    }
+    *cache.write() = Some(d.clone());
+    Ok(d)
+}
+
+async fn fetch_jwks(
+    http: &reqwest::Client,
+    issuer: &str,
+    alias: &str,
+    discovery: &RwLock<Option<Discovery>>,
+) -> anyhow::Result<HashMap<String, Jwk>> {
+    let discovery = discover(http, issuer, alias, discovery).await?;
+    let uri = discovery
+        .jwks_uri
+        .ok_or_else(|| anyhow::Error::msg("issuer discovery has no jwks_uri"))?;
+    let response = http.get(&uri).send().await?.error_for_status()?;
+    let body = read_response_limited(response).await?;
+    let set: JwkSet = serde_json::from_slice(&body)?;
+    select_verification_keys(set)
+}
+
+/// Test-only hold point: the next check that finds the key cache stale stops
+/// there until the test releases it.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct StalePause {
+    reached: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
 pub struct OidcAuthProvider {
     /// Registry selection key: `oidc.<alias>`.
     name: String,
     alias: String,
     config: OidcConfig,
     http: reqwest::Client,
-    discovery: RwLock<Option<Discovery>>,
-    jwks: RwLock<HashMap<String, Jwk>>,
+    discovery: Arc<RwLock<Option<Discovery>>>,
+    jwks: Arc<RwLock<HashMap<String, Jwk>>>,
     /// Earliest moment the next unknown-`kid` JWKS refresh may run.
     jwks_refresh_after: Mutex<Option<Instant>>,
     /// A cached key set becomes stale after this deadline even when its
     /// current token `kid` is known.
-    jwks_fresh_until: Mutex<Option<Instant>>,
+    jwks_fresh_until: Arc<Mutex<Option<Instant>>>,
+    /// The latest JWKS fetch. It holds `None` while the fetch is in flight
+    /// and `Some(fetched)` once it has ended.
+    jwks_fetch: Mutex<Option<watch::Receiver<Option<bool>>>>,
+    /// Test-only: see [`StalePause`].
+    #[cfg(test)]
+    stale_check_pause: Mutex<Option<StalePause>>,
 }
 
 impl OidcAuthProvider {
@@ -466,10 +533,13 @@ impl OidcAuthProvider {
             alias,
             config,
             http,
-            discovery: RwLock::new(None),
-            jwks: RwLock::new(HashMap::new()),
+            discovery: Arc::new(RwLock::new(None)),
+            jwks: Arc::new(RwLock::new(HashMap::new())),
             jwks_refresh_after: Mutex::new(None),
-            jwks_fresh_until: Mutex::new(None),
+            jwks_fresh_until: Arc::new(Mutex::new(None)),
+            jwks_fetch: Mutex::new(None),
+            #[cfg(test)]
+            stale_check_pause: Mutex::new(None),
         })
     }
 
@@ -484,59 +554,88 @@ impl OidcAuthProvider {
     }
 
     async fn discovery(&self) -> anyhow::Result<Discovery> {
-        if let Some(d) = self.discovery.read().clone() {
-            return Ok(d);
-        }
-        let url = format!(
-            "{}/.well-known/openid-configuration",
-            self.config.issuer.trim_end_matches('/')
-        );
-        let response = self.http.get(&url).send().await?.error_for_status()?;
-        let body = read_response_limited(response).await?;
-        let d: Discovery = serde_json::from_slice(&body)?;
-        // The document must assert the issuer we configured, or we fetched
-        // somebody else's metadata (or a spoofed/misrouted endpoint).
-        if d.issuer.as_deref() != Some(self.config.issuer.as_str()) {
-            anyhow::bail!(
-                "discovery document issuer does not match the configured issuer for oidc.{}",
-                self.alias
-            );
-        }
-        if let Some(uri) = d.jwks_uri.as_deref() {
-            validate_discovered_endpoint(uri, "jwks_uri")?;
-        }
-        if let Some(endpoint) = d.introspection_endpoint.as_deref() {
-            validate_discovered_endpoint(endpoint, "introspection_endpoint")?;
-        }
-        *self.discovery.write() = Some(d.clone());
-        Ok(d)
+        discover(
+            &self.http,
+            &self.config.issuer,
+            &self.alias,
+            &self.discovery,
+        )
+        .await
     }
 
     /// Refresh the JWKS cache, rate-limited to one fetch per cooldown
     /// window. Returns whether a refresh actually ran.
+    ///
+    /// Only one fetch runs at a time. A check that arrives while one is in
+    /// flight waits for it and gets its result, whatever the cooldown says.
+    /// The fetch runs on its own task, so it ends even when the check that
+    /// started it is dropped, and a waiter waits no longer than the fetch's
+    /// own HTTP timeouts allow.
     async fn refresh_jwks_bounded(&self) -> anyhow::Result<bool> {
-        {
-            let mut after = self.jwks_refresh_after.lock();
-            if let Some(after) = *after
-                && Instant::now() < after
-            {
-                return Ok(false);
+        let mut fetch = {
+            let mut latest = self.jwks_fetch.lock();
+            let in_flight = latest
+                .as_ref()
+                .filter(|fetch| fetch.borrow().is_none())
+                .cloned();
+            match in_flight {
+                Some(fetch) => fetch,
+                None => {
+                    {
+                        let mut after = self.jwks_refresh_after.lock();
+                        if let Some(after) = *after
+                            && Instant::now() < after
+                        {
+                            return Ok(false);
+                        }
+                        // Claim the slot before the network call, so a failed
+                        // or slow fetch still counts against the cooldown.
+                        *after = Some(Instant::now() + JWKS_REFRESH_COOLDOWN);
+                    }
+                    let fetch = self.spawn_jwks_fetch();
+                    *latest = Some(fetch.clone());
+                    fetch
+                }
             }
-            // Claim the slot before the network call so concurrent bad
-            // tokens cannot trigger parallel fetch storms.
-            *after = Some(Instant::now() + JWKS_REFRESH_COOLDOWN);
+        };
+        match fetch.wait_for(Option::is_some).await.map(|ended| *ended) {
+            Ok(Some(true)) => Ok(true),
+            _ => Err(anyhow::Error::msg("the JWKS fetch failed")),
         }
-        let discovery = self.discovery().await?;
-        let uri = discovery
-            .jwks_uri
-            .ok_or_else(|| anyhow::Error::msg("issuer discovery has no jwks_uri"))?;
-        let response = self.http.get(&uri).send().await?.error_for_status()?;
-        let body = read_response_limited(response).await?;
-        let set: JwkSet = serde_json::from_slice(&body)?;
-        let next = select_verification_keys(set)?;
-        *self.jwks.write() = next;
-        *self.jwks_fresh_until.lock() = Some(Instant::now() + JWKS_CACHE_TTL);
-        Ok(true)
+    }
+
+    /// Start a JWKS fetch on its own task. The receiver reports whether it
+    /// replaced the cached keys; a fetch that ends early, for example at
+    /// shutdown, reports nothing and counts as failed.
+    fn spawn_jwks_fetch(&self) -> watch::Receiver<Option<bool>> {
+        let (report, fetch) = watch::channel(None);
+        let http = self.http.clone();
+        let issuer = self.config.issuer.clone();
+        let alias = self.alias.clone();
+        let discovery = Arc::clone(&self.discovery);
+        let jwks = Arc::clone(&self.jwks);
+        let fresh_until = Arc::clone(&self.jwks_fresh_until);
+        ::zeroclaw_spawn::spawn!(async move {
+            let fetched = match fetch_jwks(&http, &issuer, &alias, &discovery).await {
+                Ok(next) => {
+                    *jwks.write() = next;
+                    *fresh_until.lock() = Some(Instant::now() + JWKS_CACHE_TTL);
+                    true
+                }
+                Err(_) => false,
+            };
+            report.send_replace(Some(fetched));
+        });
+        fetch
+    }
+
+    #[cfg(test)]
+    async fn hold_after_stale_check(&self) {
+        let pause = self.stale_check_pause.lock().take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     fn cached_key(&self, kid: &str) -> Option<Jwk> {
@@ -570,8 +669,13 @@ impl OidcAuthProvider {
             return deny(DenyReason::BadCredential);
         };
         if !self.jwks_is_fresh() {
+            #[cfg(test)]
+            self.hold_after_stale_check().await;
             match self.refresh_jwks_bounded().await {
                 Ok(true) => {}
+                // A fetch that ended after this check found the cache stale
+                // may have refreshed it; its cooldown is no reason to refuse.
+                Ok(false) if self.jwks_is_fresh() => {}
                 Ok(false) => return deny(DenyReason::Misconfigured),
                 Err(_) => return deny(DenyReason::Misconfigured),
             };
@@ -2138,6 +2242,417 @@ mod tests {
             .filter(|request| request.url.path() == "/jwks")
             .count();
         assert_eq!(after, before + 1, "a stale known kid must refresh");
+    }
+
+    /// How the JWKS gate answers a request it holds.
+    enum GateAnswer {
+        /// The fixture's key set, with this status.
+        Keys(u16),
+        /// Nothing at all.
+        Stall,
+        /// The headers and half the body, then nothing more.
+        StallBody,
+    }
+
+    /// A JWKS endpoint under the test's control: it reports each request as
+    /// it arrives and answers only when the test says how.
+    struct JwksGate {
+        arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+        answers: tokio::sync::mpsc::UnboundedSender<GateAnswer>,
+        fetches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl JwksGate {
+        /// Serve `idp`'s key set from the gate, and point its discovery there.
+        async fn start(idp: &TestIdp) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let jwks_uri = format!("http://{}/jwks", listener.local_addr().unwrap());
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": idp.issuer,
+                    "jwks_uri": jwks_uri,
+                })))
+                .with_priority(1)
+                .mount(&idp.server)
+                .await;
+            let body = serde_json::json!({"keys": [public_jwk(&idp.key, "test-key")]}).to_string();
+            let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
+            let (answers, mut answer) = tokio::sync::mpsc::unbounded_channel();
+            let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&fetches);
+            ::zeroclaw_spawn::spawn!(async move {
+                // Stalled connections stay open for as long as the gate runs.
+                let mut held = Vec::new();
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(count) => request.extend_from_slice(&buf[..count]),
+                        }
+                    }
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = arrived.send(());
+                    let Some(answer) = answer.recv().await else {
+                        return;
+                    };
+                    let response = match answer {
+                        GateAnswer::Keys(status) => format!(
+                            "HTTP/1.1 {status} Gate\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        GateAnswer::Stall => String::new(),
+                        GateAnswer::StallBody => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            &body[..body.len() / 2]
+                        ),
+                    };
+                    // The client may have gone already; its test checks that.
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    held.push(socket);
+                }
+            });
+            Self {
+                arrivals,
+                answers,
+                fetches,
+            }
+        }
+
+        /// Wait until the gate holds a request.
+        async fn arrival(&mut self) {
+            tokio::time::timeout(Duration::from_secs(5), self.arrivals.recv())
+                .await
+                .expect("a JWKS request reaches the gate")
+                .unwrap();
+        }
+
+        fn answer(&self, answer: GateAnswer) {
+            self.answers.send(answer).unwrap();
+        }
+
+        fn fetches(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    type Check<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = AuthOutcome> + Send + 'a>>;
+
+    /// Drive `check` until its JWKS request is held at the gate.
+    async fn hold_at_gate(check: &mut Check<'_>, gate: &mut JwksGate) {
+        tokio::select! {
+            outcome = check.as_mut() => panic!("the check ended before its fetch was answered: {outcome:?}"),
+            () = gate.arrival() => {}
+        }
+    }
+
+    /// Poll each check once. A check waiting for the fetch in flight is
+    /// still pending; one that was answered at once is returned.
+    async fn ended_at_once(checks: &mut [Check<'_>]) -> Vec<AuthOutcome> {
+        let mut ended = Vec::new();
+        for check in checks {
+            if let std::task::Poll::Ready(outcome) = futures_util::poll!(check.as_mut()) {
+                ended.push(outcome);
+            }
+        }
+        ended
+    }
+
+    /// Check `credential` once, answering its fetch through the gate.
+    async fn prime(provider: &OidcAuthProvider, credential: &Credential, gate: &mut JwksGate) {
+        let mut check = provider.verify(credential);
+        hold_at_gate(&mut check, gate).await;
+        gate.answer(GateAnswer::Keys(200));
+        assert!(check.await.is_allowed());
+    }
+
+    fn denied(outcome: &AuthOutcome, expected: DenyReason) -> bool {
+        matches!(outcome, AuthOutcome::Denied { reason } if *reason == expected)
+    }
+
+    #[tokio::test]
+    async fn verifications_during_a_jwks_fetch_are_not_refused() {
+        // A fresh provider (every daemon start and config reload builds one)
+        // or an expired cache has to fetch the JWKS. A check made while that
+        // fetch is in flight waits for it instead of being refused, and starts
+        // no fetch of its own.
+        for primed in [false, true] {
+            let idp = start_idp().await;
+            let mut gate = JwksGate::start(&idp).await;
+            let provider = idp.provider(OidcValidation::Jwks);
+            let credential = bearer(idp.mint(idp.good_claims()));
+            if primed {
+                prime(&provider, &credential, &mut gate).await;
+                expire_jwks(&provider);
+            }
+            let mut first = provider.verify(&credential);
+            hold_at_gate(&mut first, &mut gate).await;
+            let mut second = vec![provider.verify(&credential)];
+            let ended = ended_at_once(&mut second).await;
+            assert!(
+                ended.is_empty(),
+                "primed={primed}: the second check did not wait: {ended:?}"
+            );
+            gate.answer(GateAnswer::Keys(200));
+            let (first, second) = tokio::join!(first, second.pop().unwrap());
+            assert!(first.is_allowed(), "primed={primed}: {first:?}");
+            assert!(second.is_allowed(), "primed={primed}: {second:?}");
+            assert_eq!(
+                gate.fetches(),
+                if primed { 2 } else { 1 },
+                "primed={primed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_checks_shares_one_jwks_fetch() {
+        let idp = start_idp().await;
+        let mut gate = JwksGate::start(&idp).await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let credential = bearer(idp.mint(idp.good_claims()));
+        let mut first = provider.verify(&credential);
+        hold_at_gate(&mut first, &mut gate).await;
+        let mut burst: Vec<_> = (0..31).map(|_| provider.verify(&credential)).collect();
+        let ended = ended_at_once(&mut burst).await;
+        assert!(
+            ended.is_empty(),
+            "{} of 31 did not wait: {:?}",
+            ended.len(),
+            ended[0]
+        );
+        gate.answer(GateAnswer::Keys(200));
+        let (first, mut outcomes) = tokio::join!(first, futures_util::future::join_all(burst));
+        outcomes.push(first);
+        assert!(outcomes.iter().all(AuthOutcome::is_allowed), "{outcomes:?}");
+        assert_eq!(gate.fetches(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_jwks_fetch_denies_every_check_waiting_for_it() {
+        // The expired cache still holds the token's key; no check may fall
+        // back to it when the refresh fails.
+        let idp = start_idp().await;
+        let mut gate = JwksGate::start(&idp).await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let credential = bearer(idp.mint(idp.good_claims()));
+        prime(&provider, &credential, &mut gate).await;
+        expire_jwks(&provider);
+        let mut first = provider.verify(&credential);
+        hold_at_gate(&mut first, &mut gate).await;
+        let mut waiting: Vec<_> = (0..15).map(|_| provider.verify(&credential)).collect();
+        let ended = ended_at_once(&mut waiting).await;
+        assert!(
+            ended.is_empty(),
+            "{} of 15 did not wait: {:?}",
+            ended.len(),
+            ended[0]
+        );
+        gate.answer(GateAnswer::Keys(503));
+        let (first, mut outcomes) = tokio::join!(first, futures_util::future::join_all(waiting));
+        outcomes.push(first);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| denied(outcome, DenyReason::Misconfigured)),
+            "{outcomes:?}"
+        );
+        assert_eq!(gate.fetches(), 2, "the priming fetch and one refresh");
+    }
+
+    #[tokio::test]
+    async fn unknown_kids_share_the_fetch_in_flight_then_the_cooldown_holds() {
+        let idp = start_idp().await;
+        let mut gate = JwksGate::start(&idp).await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        prime(&provider, &bearer(idp.mint(idp.good_claims())), &mut gate).await;
+        // Past the priming fetch's cooldown, an unknown kid may fetch once.
+        *provider.jwks_refresh_after.lock() = None;
+        let unknown = bearer(idp.mint_with_header(
+            r#"{"alg":"ES256","kid":"rotated-away","typ":"at+jwt"}"#,
+            &idp.good_claims(),
+        ));
+        let mut first = provider.verify(&unknown);
+        hold_at_gate(&mut first, &mut gate).await;
+        let mut waiting: Vec<_> = (0..15).map(|_| provider.verify(&unknown)).collect();
+        let ended = ended_at_once(&mut waiting).await;
+        assert!(
+            ended.is_empty(),
+            "{} of 15 did not wait: {:?}",
+            ended.len(),
+            ended[0]
+        );
+        gate.answer(GateAnswer::Keys(200));
+        let (first, mut outcomes) = tokio::join!(first, futures_util::future::join_all(waiting));
+        outcomes.push(first);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| denied(outcome, DenyReason::BadCredential)),
+            "{outcomes:?}"
+        );
+        assert_eq!(gate.fetches(), 2, "the priming fetch and one refresh");
+        // Within the cooldown that fetch claimed, more unknown kids are denied
+        // without a fetch. An answer is queued so a fetch made anyway is
+        // counted rather than stuck.
+        gate.answer(GateAnswer::Keys(200));
+        let outcomes =
+            futures_util::future::join_all((0..16).map(|_| provider.verify(&unknown))).await;
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| denied(outcome, DenyReason::BadCredential)),
+            "{outcomes:?}"
+        );
+        assert_eq!(gate.fetches(), 2, "no fetch during the cooldown");
+    }
+
+    #[tokio::test]
+    async fn a_jwks_fetch_outlives_the_check_that_started_it() {
+        // The check that starts a fetch can be dropped mid-fetch, as when its
+        // client goes away. Checks already waiting and checks arriving after
+        // the drop must neither hang nor be refused, and no second fetch
+        // starts.
+        let idp = start_idp().await;
+        let mut gate = JwksGate::start(&idp).await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let credential = bearer(idp.mint(idp.good_claims()));
+        let mut starter = provider.verify(&credential);
+        hold_at_gate(&mut starter, &mut gate).await;
+        let mut waiting = vec![provider.verify(&credential)];
+        let ended = ended_at_once(&mut waiting).await;
+        assert!(ended.is_empty(), "an earlier check did not wait: {ended:?}");
+        drop(starter);
+        waiting.push(provider.verify(&credential));
+        let ended = ended_at_once(&mut waiting[1..]).await;
+        assert!(ended.is_empty(), "a later check did not wait: {ended:?}");
+        gate.answer(GateAnswer::Keys(200));
+        let outcomes = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(waiting),
+        )
+        .await
+        .expect("checks waiting on a dropped starter's fetch must not hang");
+        assert!(outcomes.iter().all(AuthOutcome::is_allowed), "{outcomes:?}");
+        assert_eq!(gate.fetches(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_check_that_saw_the_cache_stale_as_a_fetch_ended_is_not_refused() {
+        // A check finds the cache stale; before it reaches the fetch, another
+        // check's fetch ends and refreshes the cache. It must use the fresh
+        // cache, not be refused by the cooldown that fetch claimed.
+        for primed in [false, true] {
+            let idp = start_idp().await;
+            let mut gate = JwksGate::start(&idp).await;
+            let provider = idp.provider(OidcValidation::Jwks);
+            let credential = bearer(idp.mint(idp.good_claims()));
+            if primed {
+                prime(&provider, &credential, &mut gate).await;
+                expire_jwks(&provider);
+            }
+            let pause = StalePause::default();
+            *provider.stale_check_pause.lock() = Some(pause.clone());
+            let mut late = provider.verify(&credential);
+            assert!(
+                futures_util::poll!(late.as_mut()).is_pending(),
+                "primed={primed}: the late check is held after finding the cache stale"
+            );
+            pause.reached.notified().await;
+            let mut first = provider.verify(&credential);
+            hold_at_gate(&mut first, &mut gate).await;
+            gate.answer(GateAnswer::Keys(200));
+            let first = first.await;
+            assert!(first.is_allowed(), "primed={primed}: {first:?}");
+            // An answer is queued so a second fetch is counted rather than stuck.
+            gate.answer(GateAnswer::Keys(200));
+            pause.release.notify_one();
+            let late = tokio::time::timeout(Duration::from_secs(5), late)
+                .await
+                .expect("the late check must not hang");
+            assert!(late.is_allowed(), "primed={primed}: {late:?}");
+            assert_eq!(
+                gate.fetches(),
+                if primed { 2 } else { 1 },
+                "primed={primed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_key_fetch_denies_every_check_within_the_client_timeout() {
+        // A check waits as long as the fetch in flight, and the provider's HTTP
+        // client timeout bounds that fetch (15 s per request, so about 30 s
+        // when discovery isn't cached yet). The test shortens it to 300 ms.
+        for stall in ["jwks headers", "jwks body", "discovery"] {
+            let idp = start_idp().await;
+            let mut gate = None;
+            if stall == "discovery" {
+                Mock::given(method("GET"))
+                    .and(path("/.well-known/openid-configuration"))
+                    .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+                    .with_priority(1)
+                    .mount(&idp.server)
+                    .await;
+            } else {
+                gate = Some(JwksGate::start(&idp).await);
+            }
+            let provider = OidcAuthProvider {
+                http: reqwest::Client::builder()
+                    .timeout(Duration::from_millis(300))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+                ..idp.provider(OidcValidation::Jwks)
+            };
+            let credential = bearer(idp.mint(idp.good_claims()));
+            let mut first = provider.verify(&credential);
+            if let Some(gate) = gate.as_mut() {
+                hold_at_gate(&mut first, gate).await;
+                gate.answer(if stall == "jwks body" {
+                    GateAnswer::StallBody
+                } else {
+                    GateAnswer::Stall
+                });
+            } else {
+                assert!(futures_util::poll!(first.as_mut()).is_pending(), "{stall}");
+            }
+            let mut waiting: Vec<_> = (0..7).map(|_| provider.verify(&credential)).collect();
+            let ended = ended_at_once(&mut waiting).await;
+            assert!(ended.is_empty(), "{stall}: did not wait: {ended:?}");
+            let (first, mut outcomes) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(first, futures_util::future::join_all(waiting))
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{stall}: a stalled fetch must end at the client timeout"));
+            outcomes.push(first);
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| denied(outcome, DenyReason::Misconfigured)),
+                "{stall}: {outcomes:?}"
+            );
+            let requests = idp.server.received_requests().await.unwrap();
+            let discoveries = requests
+                .iter()
+                .filter(|request| request.url.path() == "/.well-known/openid-configuration")
+                .count();
+            assert_eq!(discoveries, 1, "{stall}: one discovery request");
+            let jwks_fetches = gate.as_ref().map_or(0, JwksGate::fetches)
+                + requests
+                    .iter()
+                    .filter(|request| request.url.path() == "/jwks")
+                    .count();
+            assert_eq!(
+                jwks_fetches,
+                usize::from(stall != "discovery"),
+                "{stall}: JWKS requests"
+            );
+        }
     }
 
     #[test]

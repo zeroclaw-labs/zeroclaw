@@ -1049,6 +1049,9 @@ cli-plugin-info-load-failed =
     このホストに同梱された WIT（wit/v0 を参照）でプラグインを再ビルドし、再インストールしてください。
 cli-plugin-info-load-not-applicable = 読み込み: 対象外。スキルのみのプラグインのため、インスタンス化するコンポーネントはありません。
 cli-plugin-info-load-failed-exit = プラグイン '{$name}' はこのホストで読み込めません
+cli-plugin-info-load-config-refused =
+    読み込み: 不可。コンポーネントはこのホストの WIT ワールドでインスタンス化できますが、ランタイムがその設定を拒否しています: {$error}
+    設定は '{$key}' という名前の [[plugins.entries]] 行の `config` マップです。インストールされたパッケージの config_schema に合わせるか、パッケージが config_schema を宣言していない場合はその値を削除してください。
 cli-estop-domains-none = {"  "}domain_blocks:  (なし)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (なし)

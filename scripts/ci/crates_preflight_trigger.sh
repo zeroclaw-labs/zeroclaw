@@ -39,6 +39,14 @@ if [[ -z "$base" ]] || ! git rev-parse -q --verify "${base}^{commit}" >/dev/null
   exit 1
 fi
 
+# A pull request is checked out as GitHub's test merge, whose first parent is
+# the base branch as it is now. The event's base is the pull request's merge
+# base, which predates any version bump the base branch gained after the
+# branch forked; compared with it, that bump would count as this change's.
+if [[ "$event" == "pull_request" ]] && git rev-parse -q --verify 'HEAD^2^{commit}' >/dev/null; then
+  base="$(git rev-parse 'HEAD^1')"
+fi
+
 before="$(git show "${base}:Cargo.toml" | workspace_version)"
 after="$(workspace_version <Cargo.toml)"
 
