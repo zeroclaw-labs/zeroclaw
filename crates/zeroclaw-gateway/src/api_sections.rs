@@ -158,7 +158,7 @@ fn quickstart_missing_requirements(cfg: &zeroclaw_config::schema::Config) -> Vec
     missing
 }
 
-fn quickstart_agent_missing_requirements(
+pub(crate) fn quickstart_agent_missing_requirements(
     cfg: &zeroclaw_config::schema::Config,
     alias: &str,
     agent: &zeroclaw_config::schema::AliasedAgentConfig,

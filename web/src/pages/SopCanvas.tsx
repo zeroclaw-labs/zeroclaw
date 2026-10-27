@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Plus, Undo2 } from 'lucide-react';
+import { Maximize, Minus, Plus, Undo2 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import {
   runStateTone,
@@ -236,6 +236,7 @@ interface Props {
   onMoveNode?: (step: number, x: number, y: number) => void;
   onUndo?: () => void;
   canUndo?: boolean;
+  fill?: boolean;
 }
 
 type ContextMenu = { x: number; y: number; step: number | null };
@@ -345,6 +346,7 @@ export default function SopCanvas({
   onMoveNode,
   onUndo,
   canUndo = false,
+  fill = false,
 }: Props) {
   const [pos, setPos] = useState<Map<number, XY>>(() => seedPositions(graph));
   const [drag, setDrag] = useState<{ step: number; dx: number; dy: number } | null>(null);
@@ -357,6 +359,8 @@ export default function SopCanvas({
   const [menu, setMenu] = useState<ContextMenu | null>(null);
   const [toolsOpen, setToolsOpen] = useState<Set<number>>(() => new Set());
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const contentRef = useRef<SVGGElement | null>(null);
+  const [zoom, setZoom] = useState(1);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const panRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
   const [panning, setPanning] = useState(false);
@@ -421,15 +425,10 @@ export default function SopCanvas({
     [flowRoleLabel],
   );
 
-  // Reseed from the backend layout when the projection changes, preserving any
-  // positions the user has dragged for nodes that still exist.
+  // The projected draft owns saved positions; local positions only follow a
+  // pointer gesture until the next projection arrives (including undo/reset).
   useEffect(() => {
-    setPos((prev) => {
-      const seeded = seedPositions(graph);
-      const merged = new Map(seeded);
-      for (const [k, v] of prev) if (seeded.has(k)) merged.set(k, v);
-      return merged;
-    });
+    setPos(seedPositions(graph));
   }, [graph]);
 
   const stepByNum = useMemo(() => new Map(draft.steps.map((s) => [s.number, s])), [draft.steps]);
@@ -456,8 +455,9 @@ export default function SopCanvas({
   );
 
   const toLocal = useCallback((clientX: number, clientY: number): XY => {
-    const rect = svgRef.current?.getBoundingClientRect();
-    return { x: clientX - (rect?.left ?? 0), y: clientY - (rect?.top ?? 0) };
+    const matrix = contentRef.current?.getScreenCTM();
+    const point = new DOMPoint(clientX, clientY);
+    return matrix ? point.matrixTransform(matrix.inverse()) : point;
   }, []);
 
   const onPointerMove = useCallback(
@@ -514,10 +514,14 @@ export default function SopCanvas({
       if (readOnly) return;
       e.preventDefault();
       e.stopPropagation();
-      const p = toLocal(e.clientX, e.clientY);
-      setMenu({ x: p.x, y: p.y, step });
+      const rect = scrollRef.current?.getBoundingClientRect();
+      setMenu({
+        x: Math.max(0, Math.min(e.clientX - (rect?.left ?? 0), (rect?.width ?? 176) - 176)),
+        y: Math.max(0, Math.min(e.clientY - (rect?.top ?? 0), (rect?.height ?? 240) - 240)),
+        step,
+      });
     },
-    [readOnly, toLocal],
+    [readOnly],
   );
 
   const startLink = useCallback((step: number, kind: FlowRole, port?: number) => {
@@ -565,7 +569,41 @@ export default function SopCanvas({
   }, [pos]);
 
   return (
-    <div ref={scrollRef} className="relative overflow-auto rounded-[var(--radius-lg)] border border-pc-border bg-pc-bg-base">
+    <div className={`relative overflow-hidden rounded-[var(--radius-lg)] border border-pc-border bg-pc-bg-base ${fill ? 'min-h-64 flex-1' : ''}`} style={fill ? { backgroundImage: 'radial-gradient(var(--pc-border) 1px, transparent 1px)', backgroundSize: '20px 20px' } : undefined}>
+      {fill && (
+        <div className="absolute bottom-2 right-2 z-10 flex items-center gap-1 rounded-lg border border-pc-border bg-pc-surface p-1 text-xs">
+          <button
+            type="button"
+            aria-label={t('sop_workspace.zoom_out')}
+            disabled={zoom <= 0.2}
+            onClick={() => setZoom((value) => Math.max(0.2, value - 0.2))}
+            className="rounded p-1.5 hover:bg-pc-elevated disabled:opacity-40"
+          ><Minus className="h-3.5 w-3.5" /></button>
+          <button
+            type="button"
+            aria-label={t('sop_workspace.zoom_reset')}
+            onClick={() => setZoom(1)}
+            className="w-10 rounded py-1.5 tabular-nums hover:bg-pc-elevated"
+          >{Math.round(zoom * 100)}%</button>
+          <button
+            type="button"
+            aria-label={t('sop_workspace.zoom_in')}
+            disabled={zoom >= 2}
+            onClick={() => setZoom((value) => Math.min(2, value + 0.2))}
+            className="rounded p-1.5 hover:bg-pc-elevated disabled:opacity-40"
+          ><Plus className="h-3.5 w-3.5" /></button>
+          <button
+            type="button"
+            onClick={() => {
+              const viewport = scrollRef.current;
+              if (!viewport) return;
+              setZoom(Math.max(0.2, Math.min(1, (viewport.clientWidth - 16) / extent.w, (viewport.clientHeight - 48) / extent.h)));
+              viewport.scrollTo(0, 0);
+            }}
+            className="inline-flex items-center gap-1 rounded px-2 py-1.5 hover:bg-pc-elevated"
+          ><Maximize className="h-3.5 w-3.5" />{t('sop_workspace.fit_view')}</button>
+        </div>
+      )}
       {readOnly ? null : (
         <div className="absolute right-2 top-2 z-10 flex gap-1">
           {onUndo ? (
@@ -660,10 +698,12 @@ export default function SopCanvas({
           )}
         </div>
       ) : null}
+      <div ref={scrollRef} className={fill ? "h-full overflow-auto" : "overflow-auto"}>
       <svg
         ref={svgRef}
-        width={extent.w}
-        height={extent.h}
+        width={extent.w * zoom}
+        height={extent.h * zoom}
+        style={fill ? { minWidth: '100%', minHeight: '100%' } : undefined}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerLeave={endDrag}
@@ -684,6 +724,7 @@ export default function SopCanvas({
             <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke" />
           </marker>
         </defs>
+        <g ref={contentRef} transform={`scale(${zoom})`}>
         {graph.wires
           .filter((w) => w.class === 'flow')
           .map((w, i) => {
@@ -931,7 +972,9 @@ export default function SopCanvas({
           if (node.kind === 'trigger') return renderTrigger(node, p);
           return renderStep(node);
         })}
+        </g>
       </svg>
+      </div>
     </div>
   );
 

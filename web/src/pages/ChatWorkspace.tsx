@@ -1,12 +1,16 @@
+import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
-import { basePath } from '@/lib/basePath';
+import { useWorkspaceVisible } from '@/components/layout/WorkspaceOutlet';
+import { useNavigate } from 'react-router-dom';
+import AgentSidebar from '@/components/AgentSidebar';
 import {
   applySessionChange,
   loadPersisted,
   makeTab,
+  matchesChatRequest,
   reservationsByKey,
   STORAGE_KEY,
   tabForOpenRequest,
@@ -30,6 +34,7 @@ export interface ChatWorkspaceProps {
    * whenever it changes (deep links / "Open chat"), without remounting the
    * workspace. */
   initialAlias: string;
+  initialSessionId?: string;
 }
 
 /**
@@ -41,16 +46,19 @@ export interface ChatWorkspaceProps {
  * so background chats stay connected and keep streaming. A pane only unmounts —
  * and its socket only closes — when its tab is explicitly closed.
  */
-export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
+export default function ChatWorkspace({ initialAlias, initialSessionId }: ChatWorkspaceProps) {
+  const { layout: presentation } = useLayoutPreference();
+  const visible = useWorkspaceVisible();
+  const navigate = useNavigate();
   const persisted = useRef<Partial<PersistedState>>(loadPersisted());
 
   const [tabs, setTabs] = useState<ChatTab[]>(() => {
     const stored = persisted.current.tabs ?? [];
     // The route's agent is always open, but only add it when it is not already
     // there — a deep link should land on the existing pane, not fork a new one.
-    return stored.some((tb) => tb.alias === initialAlias)
+    return stored.some((tb) => matchesChatRequest(tb, initialAlias, initialSessionId))
       ? stored
-      : [...stored, makeTab(initialAlias)];
+      : [...stored, makeTab(initialAlias, initialSessionId)];
   });
   // Resolved up front rather than in an effect: an empty first commit would
   // activate tabs[0] and replaceState the URL to the wrong agent before the
@@ -59,8 +67,8 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   const [activeKey, setActiveKey] = useState<string>(() => {
     const preferred = persisted.current.activeKey;
     const match =
-      tabs.find((tb) => tb.key === preferred && tb.alias === initialAlias) ??
-      tabs.find((tb) => tb.alias === initialAlias);
+      tabs.find((tb) => tb.key === preferred && matchesChatRequest(tb, initialAlias, initialSessionId)) ??
+      tabs.find((tb) => matchesChatRequest(tb, initialAlias, initialSessionId));
     return match?.key ?? tabs[0]?.key ?? '';
   });
   const [layout, setLayout] = useState<WorkspaceLayout>(persisted.current.layout ?? 'tabs');
@@ -103,11 +111,12 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
 
   // Keys of the panes currently visible (so background panes can be `hidden`).
   const visibleKeys = useMemo<Set<string>>(() => {
+    if (!visible) return new Set();
     if (effectiveLayout === 'split') {
       return new Set([resolvedSplit[0], resolvedSplit[1]].filter(Boolean) as string[]);
     }
     return new Set(activeTab ? [activeTab.key] : []);
-  }, [effectiveLayout, resolvedSplit, activeTab]);
+  }, [effectiveLayout, resolvedSplit, activeTab, visible]);
 
   // Recompute the rendered indicator map from the status ref. An alias that is
   // currently visible is never shown as unread.
@@ -176,18 +185,19 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     // above resolved it. Bailing keeps this idempotent under StrictMode's
     // double-invoked effects, which would otherwise re-activate the agent's
     // first pane and undo the restored selection.
+    if (!visible) return;
     const current = tabsRef.current.find((tb) => tb.key === activeKeyRef.current);
-    if (current?.alias === initialAlias) return;
+    if (current && matchesChatRequest(current, initialAlias, initialSessionId)) return;
 
-    const existing = tabsRef.current.find((tb) => tb.alias === initialAlias);
+    const existing = tabsRef.current.find((tb) => matchesChatRequest(tb, initialAlias, initialSessionId));
     if (existing) {
       setActiveKey(existing.key);
       return;
     }
-    const tab = makeTab(initialAlias);
-    setTabs((prev) => (prev.some((tb) => tb.alias === initialAlias) ? prev : [...prev, tab]));
+    const tab = makeTab(initialAlias, initialSessionId);
+    setTabs((prev) => (prev.some((tb) => matchesChatRequest(tb, initialAlias, initialSessionId)) ? prev : [...prev, tab]));
     setActiveKey(tab.key);
-  }, [initialAlias]);
+  }, [initialAlias, initialSessionId, visible]);
 
   // Persist workspace shape on any structural change.
   useEffect(() => {
@@ -205,7 +215,11 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   /** Record the conversation a pane moved to, so a reload restores it there. */
   const handleSessionChange = useCallback((key: string, sessionId: string) => {
     setTabs((prev) => applySessionChange(prev, key, sessionId));
-  }, []);
+    const tab = tabsRef.current.find((item) => item.key === key);
+    if (tab && activeKeyRef.current === key && visibleKeysRef.current.has(key)) {
+      void navigate(`/agent/${encodeURIComponent(tab.alias)}?session=${encodeURIComponent(sessionId)}`, { replace: true });
+    }
+  }, [navigate]);
 
   /**
    * Conversations held by the *other* panes.
@@ -232,26 +246,12 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     return fn;
   }, [handleSessionChange]);
 
-  // Mirror the active alias to the URL via history.replaceState only — never a
-  // React Router navigate, which would remount AgentChat and kill connections.
-  useEffect(() => {
-    // Include the reverse-proxy prefix so `target` matches the real
-    // `window.location.pathname` under a gateway base path (e.g. "/zeroclaw").
-    // Without it the comparison would never match, firing replaceState every
-    // render and rewriting the bar to a prefix-less path that breaks
-    // reload/deep-link (Router's basename no longer matches). basePath is
-    // already normalized to "" (root) or a no-trailing-slash prefix, so plain
-    // concatenation can't produce a double slash.
-    const target = `${basePath}/agent/${activeTab?.alias ?? initialAlias}`;
-    if (window.location.pathname !== target) {
-      try { window.history.replaceState(window.history.state, '', target); } catch { /* noop */ }
-    }
-  }, [activeTab, initialAlias]);
-
   // ── Tab bar handlers ──────────────────────────────────────────────────
   const selectTab = useCallback((key: string) => {
     setActiveKey(key);
-  }, []);
+    const tab = tabsRef.current.find((tab) => tab.key === key);
+    if (tab) void navigate(`/agent/${encodeURIComponent(tab.alias)}?session=${encodeURIComponent(tab.sessionId)}`, { replace: true });
+  }, [navigate]);
 
   /**
    * Open another pane for `alias`, even when one is already open — that is the
@@ -265,7 +265,8 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     const tab = tabForOpenRequest(tabsRef.current, alias);
     setTabs((prev) => [...prev, tab]);
     setActiveKey(tab.key);
-  }, []);
+    void navigate(`/agent/${encodeURIComponent(tab.alias)}?session=${encodeURIComponent(tab.sessionId)}`, { replace: true });
+  }, [navigate]);
 
   const closeChat = useCallback((key: string) => {
     const prev = tabsRef.current;
@@ -273,18 +274,20 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     const next = prev.filter((tb) => tb.key !== key);
     setTabs(next);
 
-    // If we closed the active pane, move activation to a neighbour.
-    setActiveKey((cur) => {
-      if (cur !== key) return cur;
+    if (activeKeyRef.current === key) {
       const idx = prev.findIndex((tb) => tb.key === key);
-      return next[Math.min(idx, next.length - 1)]?.key ?? next[0]?.key ?? cur;
-    });
+      const selected = next[Math.min(idx, next.length - 1)] ?? next[0];
+      if (selected) {
+        setActiveKey(selected.key);
+        void navigate(`/agent/${encodeURIComponent(selected.alias)}?session=${encodeURIComponent(selected.sessionId)}`, { replace: true });
+      }
+    }
 
     delete statusRef.current[key];
     delete onStatusCacheRef.current[key];
     delete onSessionChangeCacheRef.current[key];
     syncIndicators();
-  }, [syncIndicators]);
+  }, [syncIndicators, navigate]);
 
   const toggleLayout = useCallback(() => {
     setLayout((l) => (l === 'split' ? 'tabs' : 'split'));
@@ -316,9 +319,10 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     });
   }, [tabs]);
 
+  const Navigation = presentation === 'classic' ? ChatTabBar : AgentSidebar;
   return (
-    <div translate="no" className="notranslate flex flex-col h-full min-h-0">
-      <ChatTabBar
+    <div translate="no" className={`notranslate relative flex h-full min-h-0 ${presentation === 'classic' ? 'flex-col' : ''}`}>
+      <Navigation
         tabs={labelledTabs}
         activeKey={activeTab?.key ?? ''}
         indicators={indicators}
@@ -333,7 +337,7 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
       {/* Content area. Every open chat is mounted here at all times; only CSS
           visibility changes between tab/layout switches, so background sockets
           stay alive. In split layout the two visible panes share the width. */}
-      <div className={effectiveLayout === 'split' ? 'flex flex-col md:flex-row flex-1 min-h-0 divide-y md:divide-y-0 md:divide-x divide-pc-border' : 'flex-1 min-h-0'}>
+      <div className={effectiveLayout === 'split' ? 'flex flex-col md:flex-row flex-1 min-h-0 divide-y md:divide-y-0 md:divide-x divide-pc-border' : 'flex-1 min-w-0 min-h-0'}>
         {tabs.map((tab) => {
           const visible = visibleKeys.has(tab.key);
           // In split, each visible pane takes an equal share of the row.

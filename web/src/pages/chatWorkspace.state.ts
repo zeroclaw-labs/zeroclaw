@@ -50,6 +50,11 @@ export function makeTab(alias: string, sessionId?: string): ChatTab {
   return { key: generateUUID(), alias, sessionId: sessionId ?? getActiveSessionId(alias) };
 }
 
+/** A session deep link selects its existing owner, even with a stale alias. */
+export function matchesChatRequest(tab: ChatTab, alias: string, sessionId?: string): boolean {
+  return sessionId ? tab.sessionId === sessionId : tab.alias === alias;
+}
+
 /**
  * Guarantee no two panes claim the same conversation.
  *

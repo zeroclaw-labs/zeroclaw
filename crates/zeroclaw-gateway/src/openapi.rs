@@ -109,6 +109,7 @@ pub fn build_spec() -> serde_json::Value {
             "TriggerSourceRegistry": schema_value::<zeroclaw_runtime::sop::TriggerSourceRegistry>(),
             "SlashOptionKindsResult": schema_value::<crate::api_skills::SlashOptionKindsResult>(),
             "StatusResponse": response_schema_value::<StatusResponse>(),
+            "WorkspaceAvailability": response_schema_value::<crate::api::WorkspaceAvailability>(),
             "InstalledPluginPackage": schema_value::<crate::api_plugins::InstalledPluginPackage>(),
             "AvailablePluginPackage": schema_value::<crate::api_plugins::AvailablePluginPackage>(),
             "PluginCatalogEntry": schema_value::<crate::api_plugins::PluginCatalogEntry>(),
@@ -226,6 +227,20 @@ pub fn build_spec() -> serde_json::Value {
     });
 
     let paths = serde_json::json!({
+        "/api/workspace": {
+            "get": {
+                "operationId": "workspaceAvailability",
+                "summary": "Read live workspace availability",
+                "security": [{ "bearerAuth": [] }],
+                "responses": {
+                    "200": {
+                        "description": "Dispatchable agents and connected capabilities",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkspaceAvailability" } } }
+                    },
+                    "401": { "description": "Unauthorized" }
+                }
+            }
+        },
         "/api/status": {
             "get": {
                 "tags": ["status"],

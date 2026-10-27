@@ -1,3 +1,4 @@
+import LayoutChoice from '@/components/LayoutChoice';
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -250,6 +251,7 @@ export default function Quickstart() {
         }
       />
 
+      <Card><LayoutChoice /></Card>
       <Stepper steps={steps} />
 
       <Section

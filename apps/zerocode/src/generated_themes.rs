@@ -31,6 +31,34 @@ pub(crate) const GENERATED_THEMES: &[(&str, Theme)] = &[
         },
     ),
     (
+        "calm_dark",
+        Theme {
+            title: Color::Rgb(147, 201, 187),
+            heading: Color::Rgb(175, 220, 208),
+            body: Color::Rgb(237, 242, 239),
+            dim: Color::Rgb(157, 175, 168),
+            accent: Color::Rgb(147, 201, 187),
+            warn: Color::Rgb(189, 203, 197),
+            selection_bg: Color::Rgb(43, 55, 61),
+            tool: Color::Rgb(175, 220, 208),
+            background: Color::Rgb(23, 30, 34),
+        },
+    ),
+    (
+        "calm_light",
+        Theme {
+            title: Color::Rgb(40, 120, 107),
+            heading: Color::Rgb(36, 107, 96),
+            body: Color::Rgb(35, 52, 46),
+            dim: Color::Rgb(101, 118, 109),
+            accent: Color::Rgb(40, 120, 107),
+            warn: Color::Rgb(76, 98, 89),
+            selection_bg: Color::Rgb(232, 238, 233),
+            tool: Color::Rgb(36, 107, 96),
+            background: Color::Rgb(244, 245, 242),
+        },
+    ),
+    (
         "ayu_dark",
         Theme {
             title: Color::Rgb(57, 186, 230),

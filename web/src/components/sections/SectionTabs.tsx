@@ -5,7 +5,7 @@
 // component is presentation-only — tab content is supplied by callers.
 
 import { useMemo } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useConfigLocation, useConfigNavigate } from '@/lib/configLocation';
 import type { ReactNode } from 'react';
 
 export interface SectionTabSpec {
@@ -25,8 +25,8 @@ interface SectionTabsProps {
 }
 
 export default function SectionTabs({ tabs, defaultKey }: SectionTabsProps) {
-  const location = useLocation();
-  const navigate = useNavigate();
+  const location = useConfigLocation();
+  const navigate = useConfigNavigate();
 
   const activeKey = useMemo(() => {
     const params = new URLSearchParams(location.search);

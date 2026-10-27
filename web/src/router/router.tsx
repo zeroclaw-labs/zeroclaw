@@ -1,15 +1,21 @@
+import { useLayoutPreference } from '@/contexts/LayoutPreference';
 import { Suspense } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
+import AgentLanding from '../pages/AgentLanding';
 import Layout from '../components/layout/Layout';
 import {
   AcpConsole,
+  Admin,
   AgentChat,
   AgentWorkspaceExplorer,
   AgentsList,
   Canvas,
+  Code,
   Config,
   Cron,
   Dashboard,
+  Home,
+  Sessions,
   Doctor,
   Integrations,
   Logs,
@@ -19,9 +25,7 @@ import {
   RunDetail,
   Runs,
   Skills,
-  SopEditor,
-  SopView,
-  SopsList,
+  SopWorkspace,
   Tools,
 } from './lazyPages';
 
@@ -36,27 +40,37 @@ function RouteFallback() {
   );
 }
 
+function Landing() {
+  const { layout } = useLayoutPreference();
+  // Loading the other landing page must not suspend the shell or its open Appearance dialog.
+  return <Suspense fallback={<RouteFallback />}>{layout === 'classic' ? <Dashboard /> : <Home />}</Suspense>;
+}
+
 export const Router = () => (
   <Suspense fallback={<RouteFallback />}>
     <Routes>
       <Route element={<Layout />}>
-        <Route path="/" element={<Dashboard />} />
-        <Route path="/agent" element={<Navigate to="/agents" replace />} />
+        <Route path="/" element={<Landing />} />
+        <Route path="/admin" element={<Admin />} />
+        <Route path="/system" element={<Dashboard />} />
+        <Route path="/sessions" element={<Sessions />} />
+        <Route path="/code" element={<Code />} />
+        <Route path="/agent" element={<AgentLanding />} />
         <Route path="/agents" element={<AgentsList />} />
         <Route path="/agent/:alias" element={<AgentChat />} />
         <Route path="/agent/:alias/workspace" element={<AgentWorkspaceExplorer />} />
         <Route path="/tools" element={<Tools />} />
         <Route path="/cron" element={<Cron />} />
         <Route path="/skills" element={<Skills />} />
-        <Route path="/sops" element={<SopsList />} />
-        <Route path="/sops/new" element={<SopEditor />} />
-        <Route path="/sops/:name" element={<SopView />} />
-        <Route path="/sops/:name/edit" element={<SopEditor />} />
+        <Route path="/sops" element={<SopWorkspace />} />
+        <Route path="/sops/new" element={<SopWorkspace />} />
+        <Route path="/sops/:name" element={<SopWorkspace />} />
+        <Route path="/sops/:name/edit" element={<SopWorkspace />} />
         <Route path="/runs" element={<Runs />} />
         <Route path="/runs/:sop/:runId" element={<RunDetail />} />
         <Route path="/integrations" element={<Integrations />} />
         <Route path="/plugins" element={<Plugins />} />
-        <Route path="/memory" element={<Navigate to="/?tab=memories" replace />} />
+        <Route path="/memory" element={<Navigate to="/system?tab=memories" replace />} />
         <Route path="/config" element={<Config />} />
         <Route path="/config/:section" element={<Config />} />
         <Route path="/config/:section/:type" element={<Config />} />

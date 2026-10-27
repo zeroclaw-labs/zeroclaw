@@ -5,6 +5,10 @@ domain socket on Unix and a named pipe on Windows. This is the primary
 transport for local clients like zerocode. The HTTP/WS gateway remains for
 webhooks, the web dashboard, and remote REST consumers.
 
+The dashboard's Code workspace uses a restricted authenticated gateway bridge
+to this same listener; see [Code workspace WebSocket](../gateway/api.md#code-workspace-websocket).
+It does not expose the complete local RPC method catalogue over HTTP.
+
 ## Endpoint resolution
 
 Each data directory gets its own endpoint, so multiple daemon instances on the
@@ -87,6 +91,12 @@ the operating system:
 - Windows: named pipe ACL defaults to the creating user and `SYSTEM`.
 
 ## Methods
+
+`session/list-acp` projects each persisted session's `interaction_surface` and
+current `state` (`running` or `idle`). Running state is resolved from the
+canonical in-flight turn and session queue, including admitted queued work;
+it is not persisted as a second activity flag. `session/state` uses the same
+activity resolver. Existing clients can ignore these additive list fields.
 
 | Method | Direction | Description |
 |---|---|---|

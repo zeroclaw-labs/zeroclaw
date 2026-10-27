@@ -24,6 +24,8 @@ export function useRunOverlay(sop: string, runId: string): RunOverlayState {
   const [overlay, setOverlayState] = useState<RunOverlay | null>(null);
   const [error, setError] = useState<string | null>(null);
   const timerRef = useRef(0);
+  const selectionRef = useRef({ sop, runId });
+  selectionRef.current = { sop, runId };
   const writeGateRef = useRef<LatestOverlayWriteGate | null>(null);
   if (!writeGateRef.current) writeGateRef.current = new LatestOverlayWriteGate();
 
@@ -36,6 +38,7 @@ export function useRunOverlay(sop: string, runId: string): RunOverlayState {
 
   const setOverlay = useCallback(
     (o: RunOverlay) => {
+      if (o.sop_name !== selectionRef.current.sop || o.run_id !== selectionRef.current.runId) return;
       writeGateRef.current?.supersedePendingRequests();
       setOverlayState(o);
       setError(null);
@@ -45,6 +48,7 @@ export function useRunOverlay(sop: string, runId: string): RunOverlayState {
   );
 
   useEffect(() => {
+    setError(null);
     if (!sop || !runId) return;
     let active = true;
     const poll = () => {
@@ -71,5 +75,9 @@ export function useRunOverlay(sop: string, runId: string): RunOverlayState {
     };
   }, [sop, runId, stop]);
 
-  return { overlay, error, setOverlay };
+  return {
+    overlay: overlay?.sop_name === sop && overlay.run_id === runId ? overlay : null,
+    error,
+    setOverlay,
+  };
 }

@@ -59,6 +59,40 @@ for commit or rollback instead of being acknowledged prematurely.
 
 ## Discovering the surface
 
+`GET /api/workspace` is an authenticated view of current workspace availability:
+dispatchable `agents`, `session_persistence`, `workflows`, and `code`. These are
+resolved from the live config and runtime owners for each request. In particular,
+`code` requires a paired daemon with a reachable local RPC listener. This view
+does not grant authority; each action retains its own authentication and runtime
+permission checks.
+
+### Code workspace WebSocket
+
+`/ws/code` bridges code-session JSON-RPC to the daemon's local IPC listener.
+Unlike pairing-optional HTTP surfaces, it always requires pairing to be enabled
+and a valid issued token. Browser clients supply subprotocols
+`zeroclaw.code.v1` and `bearer.<token>`; non-browser clients may use an
+`Authorization: Bearer ...` header. Query-string tokens are not accepted.
+Standalone gateways without the daemon return an unavailable response.
+
+The bridge admits `initialize`, `session/new`, `session/prompt`, `session/cancel`,
+`session/approve`, `session/messages`, `session/state`, and `session/list-acp`,
+plus responses to daemon-initiated elicitation. Configuration writes,
+certificates, session deletion, and other RPC methods are unavailable here.
+Initialization strips forwarded environment variables. Session creation uses
+the configured agent workspace, ACP mode, and the `zerocode_code` interaction
+surface, excludes conversational memory, and preserves sibling sessions.
+The browser cannot choose a local endpoint, working directory, or TUI owner.
+Runtime tools, live policies, approval handling, and persisted history remain
+owned by the existing daemon dispatcher.
+
+WebSocket and NDJSON frames are bounded to 8 MiB. Closing the connection invokes
+the existing RPC teardown and cancellation behavior. The dashboard keeps its
+Code connection mounted during internal navigation, but a reload or closed
+window still disconnects it.
+
+### Configuration capabilities
+
 Two endpoints answer the question "what can I do here?":
 
 - `OPTIONS /api/config` returns the JSON Schema for the whole-config type.

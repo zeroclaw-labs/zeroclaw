@@ -1,55 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import {
-  Activity,
-  Bot,
-  Clock,
-  CornerDownLeft,
-  FolderTree,
-  LayoutDashboard,
-  MessageSquare,
-  Monitor,
-  Puzzle,
-  Search,
-  Settings,
-  SlidersHorizontal,
-  Sparkles,
-  Stethoscope,
-  Terminal,
-  Wrench,
-} from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { CornerDownLeft, FolderTree, History, Search, SlidersHorizontal, type LucideIcon } from 'lucide-react';
+import { destinations, featureSettingsPath } from '@/lib/navigation';
+import { useWorkspaceSettings } from '@/components/WorkspaceSettings';
+import { useCodeSessions } from '@/hooks/useCodeSessions';
+import { getSessions, getWorkspaceAvailability, listProps } from '@/lib/api';
+import { referenceConfigPrefix } from '@/lib/configReferences';
+import { sessionTarget } from '@/lib/sessionNavigation';
+import type { Session } from '@/types/api';
 import { t } from '@/lib/i18n';
 import { loadConfigSearchItems, type ConfigSearchItem } from '@/lib/configSearch';
 
-// Navigation destinations mirror the Sidebar's grouped nav. They're
-// re-declared locally (rather than imported from Sidebar) to keep the palette
-// self-contained and avoid coupling the two files — the destination list is a
-// flat projection of the same routes/labels the sidebar renders.
-interface Destination {
-  to: string;
-  icon: typeof LayoutDashboard;
-  labelKey: string;
-  groupKey: string;
-}
-
-const DESTINATIONS: Destination[] = [
-  { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard', groupKey: 'nav.group.home' },
-  { to: '/agents', icon: MessageSquare, labelKey: 'nav.agents', groupKey: 'nav.group.chat' },
-  { to: '/config', icon: Settings, labelKey: 'nav.config', groupKey: 'nav.group.configure' },
-  { to: '/config/agents', icon: Bot, labelKey: 'nav.agent', groupKey: 'nav.group.configure' },
-  { to: '/tools', icon: Wrench, labelKey: 'nav.tools', groupKey: 'nav.group.configure' },
-  { to: '/skills', icon: Sparkles, labelKey: 'nav.skills', groupKey: 'nav.group.configure' },
-  { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations', groupKey: 'nav.group.configure' },
-  { to: '/cron', icon: Clock, labelKey: 'nav.cron', groupKey: 'nav.group.configure' },
-  { to: '/logs', icon: Activity, labelKey: 'nav.logs', groupKey: 'nav.group.operations' },
-  { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor', groupKey: 'nav.group.operations' },
-  { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas', groupKey: 'nav.group.operations' },
-  { to: '/acp-console', icon: Terminal, labelKey: 'nav.acp', groupKey: 'nav.group.operations' },
-];
-
-// The three result buckets, rendered in this order with their own headers.
-// "page" = static nav destinations; "section"/"entry" come from configSearch.
-type ResultKind = 'page' | 'section' | 'entry';
+// Navigation, session history, and schema-derived settings share one search.
+type ResultKind = 'page' | 'session' | 'section' | 'entry' | 'field';
 
 // A unified, keyboard-navigable result row. Nav destinations and config items
 // are normalized into this single shape so the filter / selection / render
@@ -64,7 +27,8 @@ interface PaletteItem {
   sublabel: string;
   /** Extra match text (the url/path) — searched but not displayed. */
   searchExtra: string;
-  icon: typeof LayoutDashboard;
+  icon: LucideIcon;
+  path?: string;
 }
 
 // Cap on rendered rows so a large config tree (100s of entities) stays snappy.
@@ -72,19 +36,23 @@ interface PaletteItem {
 const MAX_RESULTS = 50;
 
 // Section headers + the bucket order they render in.
-const KIND_ORDER: ResultKind[] = ['page', 'section', 'entry'];
+const KIND_ORDER: ResultKind[] = ['field', 'entry', 'section', 'page', 'session'];
 // Resolved at render time so the locale catalog is consulted on each render.
 function kindHeader(kind: ResultKind): string {
   switch (kind) {
     case 'page':
       return t('nav.cmdk.header.pages');
+    case 'session': return t('home.sessions');
+    case 'field': return t('nav.cmdk.header.fields');
     case 'section':
       return t('nav.cmdk.header.sections');
     case 'entry':
       return t('nav.cmdk.header.entries');
   }
 }
-const KIND_ICON: Record<Exclude<ResultKind, 'page'>, typeof LayoutDashboard> = {
+const KIND_ICON: Record<Exclude<ResultKind, 'page'>, LucideIcon> = {
+  session: History,
+  field: SlidersHorizontal,
   section: FolderTree,
   entry: SlidersHorizontal,
 };
@@ -92,13 +60,14 @@ const KIND_ICON: Record<Exclude<ResultKind, 'page'>, typeof LayoutDashboard> = {
 // Map a configSearch item into a PaletteItem. Config sections and entries get
 // distinct icons + buckets; the section/owning-section label is the sublabel.
 function toPaletteItem(c: ConfigSearchItem): PaletteItem {
-  const kind: ResultKind = c.group === 'Config section' ? 'section' : 'entry';
+  const kind: ResultKind = c.group === 'Config section' ? 'section' : c.group === 'Config field' ? 'field' : 'entry';
   return {
     kind,
+    path: c.path,
     to: c.url,
     label: c.label,
     sublabel: c.sublabel,
-    searchExtra: c.url,
+    searchExtra: `${c.path ?? ''} ${c.url}`,
     icon: KIND_ICON[kind],
   };
 }
@@ -114,6 +83,8 @@ function matchScore(item: PaletteItem, q: string): number | null {
   if (label.includes(q)) return 2;
   if (sub.includes(q)) return 1;
   if (extra.includes(q)) return 0;
+  const words = q.split(/\s+/);
+  if (words.every((word) => `${label} ${sub} ${extra}`.replace(/[_./]/g, ' ').includes(word))) return 0;
   return null;
 }
 
@@ -137,10 +108,19 @@ interface CommandPaletteProps {
  */
 export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const navigate = useNavigate();
+  const location = useLocation();
+  const openSettings = useWorkspaceSettings();
+  const codeAgent = location.pathname === '/code' ? new URLSearchParams(location.search).get('agent') : null;
+  const scope = codeAgent ? `/config/agents/${encodeURIComponent(codeAgent)}` : featureSettingsPath(location.pathname);
+  const [currentOnly, setCurrentOnly] = useState(true);
+  const [relatedPrefixes, setRelatedPrefixes] = useState<string[]>([]);
   const [query, setQuery] = useState('');
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [codeEnabled, setCodeEnabled] = useState(false);
+  const code = useCodeSessions(open && codeEnabled);
   const [selected, setSelected] = useState(0);
-  // Config search items, loaded lazily on open (cached for the session by
-  // configSearch). `loadingConfig` drives the subtle "loading settings…" hint;
+  // Config search items refresh on open. `loadingConfig` drives the subtle
+  // "loading settings…" hint;
   // nav destinations are usable the whole time regardless.
   const [configItems, setConfigItems] = useState<ConfigSearchItem[]>([]);
   const [loadingConfig, setLoadingConfig] = useState(false);
@@ -149,6 +129,17 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
+  useEffect(() => {
+    setRelatedPrefixes([]);
+    if (!open || !scope?.startsWith('/config/agents/')) return;
+    let cancelled = false;
+    const alias = decodeURIComponent(scope.slice('/config/agents/'.length));
+    void listProps(`agents.${alias}`).then(({ entries }) => {
+      if (!cancelled) setRelatedPrefixes(entries.map(referenceConfigPrefix).filter((path): path is string => path !== null));
+    }).catch(() => { /* Direct agent settings remain searchable. */ });
+    return () => { cancelled = true; };
+  }, [open, scope]);
+
   // Load config search items on open. Nav destinations render immediately;
   // config items fold in once resolved. Errors are already swallowed by the
   // loader (resolves to []), so the palette never breaks on a config failure.
@@ -156,6 +147,10 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
     if (!open) return;
     let cancelled = false;
     setLoadingConfig(true);
+    void getWorkspaceAvailability().then((value) => { if (!cancelled) setCodeEnabled(value.code); }).catch(() => { if (!cancelled) setCodeEnabled(false); });
+    void getSessions().then((items) => {
+      if (!cancelled) setSessions(items.sort((a, b) => b.last_activity.localeCompare(a.last_activity)));
+    }).catch(() => { if (!cancelled) setSessions([]); });
     void loadConfigSearchItems()
       .then((items) => {
         if (!cancelled) setConfigItems(items);
@@ -171,7 +166,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
   // All searchable items in one flat list: static pages first, then config
   // sections, then config entries (toPaletteItem assigns the bucket/icon).
   const allItems = useMemo<PaletteItem[]>(() => {
-    const pages: PaletteItem[] = DESTINATIONS.map((d) => ({
+    const pages: PaletteItem[] = destinations.map((d) => ({
       kind: 'page',
       to: d.to,
       label: t(d.labelKey),
@@ -179,8 +174,13 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
       searchExtra: d.to,
       icon: d.icon,
     }));
-    return [...pages, ...configItems.map(toPaletteItem)];
-  }, [configItems]);
+    const history: PaletteItem[] = [...sessions, ...code.sessions].map((session) => ({
+      kind: 'session', to: sessionTarget(session), label: session.name || ('surface' in session ? `${t('nav.code')} · ${session.agent_alias}` : session.session_id),
+      sublabel: session.agent_alias ?? session.channel_id ?? t('home.sessions'),
+      searchExtra: `${session.session_key} ${session.channel_id ?? ''}`, icon: History,
+    }));
+    return [...pages, ...history, ...configItems.map(toPaletteItem)];
+  }, [configItems, sessions, code.sessions]);
 
   // Filter + sort + bucket + cap. The flat `results` list (header rows
   // interleaved) is what we render; `items` (no headers) is the keyboard-
@@ -189,13 +189,17 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
     const q = query.trim().toLowerCase();
 
     // Score + filter, preserving each item's natural order as a tiebreak.
-    const scored = allItems
+    const candidates = currentOnly && scope
+      ? allItems.filter((item) => item.to === scope || item.to.startsWith(`${scope}?`) || item.to.startsWith(`${scope}/`) || relatedPrefixes.some((prefix) => item.path === prefix || item.path?.startsWith(`${prefix}.`)))
+      : allItems;
+    const scored = candidates
       .map((item, idx) => ({ item, idx, score: q ? matchScore(item, q) : 0 }))
       .filter((s): s is { item: PaletteItem; idx: number; score: number } => s.score !== null);
-    scored.sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
+    const localRank = (item: PaletteItem) => scope && (item.to === scope || item.to.startsWith(`${scope}?`) || item.to.startsWith(`${scope}/`)) ? 1 : 0;
+    scored.sort((a, b) => (b.score - a.score) || (localRank(b.item) - localRank(a.item)) || (a.idx - b.idx));
 
     const matched = scored.map((s) => s.item);
-    const capped = matched.slice(0, MAX_RESULTS);
+    const capped = matched.slice(0, q ? MAX_RESULTS : 12);
     const extra = matched.length - capped.length;
 
     // Interleave bucket headers. `rows` carries either a header or an item with
@@ -218,7 +222,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
     // it from the same traversal rather than from `capped` directly.
     const ordered = out.flatMap((r) => (r.type === 'item' ? [r.item] : []));
     return { rows: out, items: ordered, extraCount: Math.max(0, extra) };
-  }, [allItems, query]);
+  }, [allItems, query, scope, currentOnly, relatedPrefixes]);
 
   const results = flatItems;
 
@@ -237,6 +241,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
     if (open) {
       restoreFocusRef.current = document.activeElement as HTMLElement | null;
       setQuery('');
+      setCurrentOnly(true);
       setSelected(0);
       // Defer to ensure the input is mounted before focusing.
       const id = window.setTimeout(() => inputRef.current?.focus(), 0);
@@ -252,9 +257,10 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const commit = useCallback(
     (to: string) => {
       onClose();
-      navigate(to);
+      if (to.startsWith('/config')) openSettings(to);
+      else navigate(to);
     },
-    [navigate, onClose],
+    [navigate, onClose, openSettings],
   );
 
   // Keep the highlighted row scrolled into view.
@@ -342,7 +348,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={t('nav.cmdk.placeholder')}
+            placeholder={t(scope && currentOnly ? 'workspace.search_settings' : 'nav.cmdk.placeholder')}
             aria-label={t('nav.cmdk.placeholder')}
             autoComplete="off"
             spellCheck={false}
@@ -355,6 +361,10 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
           )}
         </div>
 
+        {scope && <div className="flex items-center gap-2 border-b border-pc-border px-3.5 py-2 text-xs">
+          <button type="button" aria-pressed={currentOnly} onClick={() => { setCurrentOnly(true); setSelected(0); }} className={`rounded-md px-2 py-1 ${currentOnly ? 'bg-pc-elevated text-pc-text' : 'text-pc-text-muted'}`}>{t('workspace.current_settings')} · {scope === '/config' ? t('workspace.admin') : decodeURIComponent(scope.split('/').slice(-1)[0] ?? '')}</button>
+          <button type="button" aria-pressed={!currentOnly} onClick={() => { setCurrentOnly(false); setSelected(0); }} className={`rounded-md px-2 py-1 ${!currentOnly ? 'bg-pc-elevated text-pc-text' : 'text-pc-text-muted'}`}>{t('workspace.search_all')}</button>
+        </div>}
         {/* Results */}
         <div
           ref={listRef}
@@ -452,6 +462,7 @@ export function useCommandPalette() {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
         e.preventDefault();
+        if (document.querySelector('dialog[open]')) return;
         setOpen((v) => !v);
       }
     };
