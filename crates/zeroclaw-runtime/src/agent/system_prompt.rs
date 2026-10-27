@@ -587,6 +587,8 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
 pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
     if max_chars > 0 && prompt.chars().count() > max_chars {
         let identity_zone = project_context_zone(&prompt);
+        let total_zone_chars = identity_zone
+            .map(|(zone_start, zone_end)| prompt[zone_start..zone_end].chars().count());
         let dropped_sections = identity_zone.map_or_else(Vec::new, |(_, zone_end)| {
             section_headers_after(&prompt, zone_end)
         });
@@ -619,10 +621,11 @@ pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
         }
         // Measure the identity zone on the retained content alone, before the
         // orientation is re-appended, so `retained_chars` counts only prompt
-        // bytes and the full-retained early return stays exact.
+        // text and the full-retained early return stays exact.
         note_identity_zone_truncation(
             &prompt,
             identity_zone,
+            total_zone_chars,
             &dropped_sections,
             assembled_chars,
             max_chars,
@@ -634,18 +637,22 @@ pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
     prompt
 }
 
-/// Headers of the sections the direct builder can emit immediately after the
+/// Headers of the sections the builders can emit immediately after the
 /// identity zone (the zone renders first, so one of these always follows when
 /// any section does). Used to bound the zone instead of the first `## ` line:
 /// bootstrap files are markdown and commonly carry their own `## ` headings,
 /// which would shorten the measured zone and silence the stop-crane exactly
 /// when a large workspace file is cut. A workspace file that itself uses one
 /// of these exact headings still shortens the zone — a conservative miss,
-/// never a false alarm.
+/// never a false alarm. `## Safety` bounds the no-tools channel layout:
+/// `SystemPromptBuilder` skips the Tool Honesty/Tools sections when empty and
+/// has no "Your Task" section, so Safety directly follows identity there; in
+/// the direct builder one of the earlier markers always matches first.
 const POST_IDENTITY_SECTION_MARKERS: &[&str] = &[
     "\n## CRITICAL: Tool Honesty",
     "\n## Tools",
     "\n## Your Task",
+    "\n## Safety",
 ];
 
 /// Locate the `## Project Context` identity zone as byte offsets: the section
@@ -674,21 +681,22 @@ fn section_headers_after(prompt: &str, offset: usize) -> Vec<String> {
 /// Stop-crane for silent identity loss: when the whole-prompt budget cut into
 /// the `## Project Context` zone (or removed it entirely), the agent runs
 /// without part or all of its bootstrap identity files. That must never be
-/// silent, so emit a WARN with the zone sizes and the sections the cut
-/// dropped. Called only when truncation actually ran.
+/// silent, so emit a WARN with the zone sizes (in Unicode scalar values, the
+/// same unit as the budget) and the sections the cut dropped. Called only
+/// when truncation actually ran.
 fn note_identity_zone_truncation(
     finalized: &str,
     zone_before: Option<(usize, usize)>,
+    total_zone_chars: Option<usize>,
     dropped_sections: &[String],
     assembled_chars: usize,
     max_chars: usize,
 ) {
-    let Some((zone_start, zone_end)) = zone_before else {
+    let (Some((zone_start, _)), Some(total_chars)) = (zone_before, total_zone_chars) else {
         return;
     };
-    let total_chars = zone_end - zone_start;
     let (present, retained_chars) = match project_context_zone(finalized) {
-        Some((start, end)) if start == zone_start => (true, end - start),
+        Some((start, end)) if start == zone_start => (true, finalized[start..end].chars().count()),
         _ => (false, 0),
     };
     if present && retained_chars >= total_chars {
@@ -1974,6 +1982,113 @@ mod tests {
         assert_eq!(attrs["retained_chars"].as_u64(), Some(0));
         assert_eq!(attrs["total_chars"].as_u64(), Some(total_zone_chars as u64));
         assert_eq!(attrs["max_chars"].as_u64(), Some(40));
+    }
+
+    #[test]
+    fn identity_zone_bounds_safety_without_tools_and_counts_chars() {
+        // Same child-process isolation as identity_zone_truncation_warn_reaches_the_log_pipeline.
+        let test_name = std::thread::current()
+            .name()
+            .expect("named lib test")
+            .to_owned();
+        const CHILD: &str = "ZEROCLAW_TEST_IDENTITY_NO_TOOLS_CAPTURE_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok(test_name.as_str()) {
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("lib test executable"))
+                    .args(["--exact", &test_name, "--test-threads=1", "--nocapture"])
+                    .env(CHILD, &test_name)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .expect("run isolated identity capture");
+            assert!(
+                output.status.success(),
+                "isolated capture failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        zeroclaw_log::set_broadcast_hook(tx);
+
+        // Case 1 (no-tools channel layout): SystemPromptBuilder skips the
+        // Tool Honesty/Tools sections when empty and has no "Your Task"
+        // section, so `## Safety` directly follows the identity zone. The
+        // zone must be bounded by that Safety header, not by the end of the
+        // prompt — otherwise cutting a later section reports identity loss
+        // that never happened.
+        let zone = format!("## Project Context\n\n{}", "i".repeat(2_000));
+        let head = format!(
+            "## Interaction\n\n- telegram group chat\n\n{zone}\n\n## Safety\n\n- be safe\n"
+        );
+        let assembled = format!("{head}\n\n## Workspace\n\n{}", "w".repeat(3_000));
+        let head_chars = head.chars().count();
+        let budget = head_chars + TIMESTAMP_ORIENTATION.chars().count() + 5;
+        let finalized = super::finalize_system_prompt(assembled, budget);
+        assert!(
+            finalized.contains("## Project Context"),
+            "identity survives the tail cut"
+        );
+        assert!(finalized.contains("## Safety"), "safety survives");
+        assert!(
+            !finalized.contains("## Workspace"),
+            "the workspace tail falls to the cut"
+        );
+        zeroclaw_log::clear_broadcast_hook();
+        while let Ok(frame) = rx.try_recv() {
+            assert_ne!(
+                frame["attributes"]["error_key"], "agent.system_prompt_identity_truncated",
+                "identity survived, so no truncation warning may fire"
+            );
+        }
+
+        // Case 2 (char-exact counts): a non-ASCII identity must report zone
+        // sizes in Unicode scalar values, the same unit as the budget — not
+        // in UTF-8 bytes.
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        zeroclaw_log::set_broadcast_hook(tx);
+        let wide_zone = format!("## Project Context\n\n{}", "界".repeat(1_000));
+        let assembled_wide = format!("{wide_zone}\n\n## Tools\n\n- **shell**: run\n");
+        let expected_total = wide_zone.chars().count() + 1;
+        let expected_bytes = wide_zone.len() + 1;
+        let finalized_wide = super::finalize_system_prompt(assembled_wide, 700);
+        assert!(
+            finalized_wide.contains("## Project Context"),
+            "partial cut retains the zone head"
+        );
+        zeroclaw_log::clear_broadcast_hook();
+        let mut partial = None;
+        loop {
+            let frame = match rx.try_recv() {
+                Ok(frame) => frame,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(
+                    tokio::sync::broadcast::error::TryRecvError::Empty
+                    | tokio::sync::broadcast::error::TryRecvError::Closed,
+                ) => break,
+            };
+            if frame["attributes"]["error_key"] == "agent.system_prompt_identity_truncated" {
+                partial = Some(frame);
+            }
+        }
+        let partial = partial.expect("partial identity-cut WARN frame reached the hook");
+        let attrs = &partial["attributes"];
+        assert_eq!(attrs["total_chars"].as_u64(), Some(expected_total as u64));
+        assert_ne!(
+            attrs["total_chars"].as_u64(),
+            Some(expected_bytes as u64),
+            "byte counts would triple this mostly-CJK zone; chars and bytes must differ here"
+        );
+        let retained = attrs["retained_chars"].as_u64().expect("retained_chars");
+        assert!(
+            retained > 0 && retained < expected_total as u64,
+            "partial cut retains only a prefix of the zone: {retained}"
+        );
     }
 
     #[test]
