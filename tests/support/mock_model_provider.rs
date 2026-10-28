@@ -146,7 +146,7 @@ impl TraceLlmModelProvider {
     pub fn from_trace(trace: &LlmTrace) -> Self {
         let mut steps = Vec::new();
         for turn in &trace.turns {
-            for step in &turn.steps {
+            for step in turn.steps.as_deref().unwrap_or_default() {
                 steps.push(step.response.clone());
             }
         }
