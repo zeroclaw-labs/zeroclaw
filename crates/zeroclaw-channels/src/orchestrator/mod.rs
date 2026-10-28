@@ -3869,6 +3869,35 @@ fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -
     )
 }
 
+/// Finalize `base_prompt` against `max_system_prompt_chars` with enough budget
+/// reserved for `additions`, then append them intact.
+///
+/// The startup channel prompt appends text tool-call instructions, the
+/// deferred built-in section, and the tool-receipts addendum after the base
+/// prompt builder has already finalized. Capping after the append would let
+/// the head-retaining truncation land inside those instructions, and the
+/// channel turn path never re-adds them — the model would silently lose the
+/// tool-call format. Reserving their length caps the base first so the
+/// additions survive whole. When the additions alone meet the cap no
+/// reservation can help and the base keeps the full-budget cap; the result
+/// may then exceed the cap, as it did before any capping existed.
+/// `max_chars == 0` is unlimited.
+fn finalize_base_reserving_additions(
+    base_prompt: String,
+    additions: &str,
+    max_chars: usize,
+) -> String {
+    let reserved = additions.chars().count();
+    let base_cap = max_chars.saturating_sub(reserved);
+    let capped = zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(
+        base_prompt,
+        if base_cap > 0 { base_cap } else { max_chars },
+    );
+    let mut prompt = capped;
+    prompt.push_str(additions);
+    prompt
+}
+
 fn callable_protocol_exposed_for_channel_turn(
     native_tool_specs_present: bool,
     strict_tool_parsing: bool,
@@ -17493,7 +17522,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             &pinned_section,
         );
         let callable_protocol_exposed = native_tools || expose_text_tool_protocol;
-        let mut system_prompt = build_system_prompt_with_mode_and_effective_tools(
+        let system_prompt = build_system_prompt_with_mode_and_effective_tools(
             &workspace,
             &model,
             &tool_descs,
@@ -17510,25 +17539,30 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             config.channels.show_tool_calls,
             runtime.shell_profile().as_ref(),
         );
+        // Sections appended after the builder's internal finalization. The
+        // base is capped with their length reserved (below) so this truncation
+        // never lands inside them — the channel turn path does not re-add
+        // them, and losing the text tool-call format would leave a
+        // non-native-spec provider without any call syntax.
+        let mut post_builder_additions = String::new();
         if expose_text_tool_protocol {
-            system_prompt.push_str(&build_channel_text_tool_instructions(
+            post_builder_additions.push_str(&build_channel_text_tool_instructions(
                 tools_registry.as_ref(),
                 &effective_tool_names,
             ));
         }
         if !deferred_section.is_empty() {
-            system_prompt.push('\n');
-            system_prompt.push_str(&deferred_section);
+            post_builder_additions.push('\n');
+            post_builder_additions.push_str(&deferred_section);
         }
         if agent.resolved.tool_receipts.enabled && agent.resolved.tool_receipts.inject_system_prompt
         {
-            system_prompt.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+            post_builder_additions
+                .push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
-        // The builder finalized the prompt before the appends above, so
-        // re-apply the cap to keep the cached channel prompt within budget
-        // from the start (no-op when it still fits; 0 is unlimited).
-        let system_prompt = zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(
+        let system_prompt = finalize_base_reserving_additions(
             system_prompt,
+            &post_builder_additions,
             agent.resolved.max_system_prompt_chars,
         );
 
@@ -48135,6 +48169,98 @@ BTC is currently around $65,000 based on latest tool output."#
         run_channel_dispatch_test(|| {
             Box::pin(assert_process_channel_message_reapplies_prompt_cap_after_skill_refresh())
         });
+    }
+
+    #[test]
+    fn startup_prompt_cap_reserves_post_builder_tool_instructions() {
+        const PROMPT_CAP: usize = 2_000;
+        const TOOL_FORMAT_OPEN: &str = "TOOL_FORMAT_OPEN";
+        const TOOL_FORMAT_CLOSE: &str = "TOOL_FORMAT_CLOSE";
+
+        // A finalized base prompt that already fills the cap, like the startup
+        // builder produces for a heavy Full-mode skill catalogue.
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let skill_dir = workspace.path().join("skills").join("cap-filler");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let bulky_instructions = format!(
+            "Cap filler skill instructions.\n{}",
+            "filler line ".repeat(2_000)
+        );
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "prompts = [{bulky_instructions:?}]\n\
+                 [skill]\n\
+                 name = \"cap-filler\"\n\
+                 description = \"Fills the prompt cap\"\n\
+                 version = \"1\"\n"
+            ),
+        )
+        .unwrap();
+        let skills = zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+        let base = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &[],
+            |_| false,
+            &skills,
+            None,
+            None,
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            false,
+            PROMPT_CAP,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(
+            base.chars().count(),
+            PROMPT_CAP,
+            "scenario setup: the finalized base prompt must fill the cap"
+        );
+
+        // What the startup path appends after the builder: the text tool-call
+        // format instructions for a provider without native tool specs.
+        let additions = format!(
+            "{TOOL_FORMAT_OPEN}\nCall tools as **tool_name**: {{\"arg\": \"value\"}}\n\
+             Every call must use this exact format.\n{TOOL_FORMAT_CLOSE}"
+        );
+        assert!(
+            base.chars().count() > PROMPT_CAP - additions.chars().count(),
+            "scenario setup: appending the instructions must exceed the cap"
+        );
+
+        let prompt = finalize_base_reserving_additions(base, &additions, PROMPT_CAP);
+
+        assert!(
+            prompt.chars().count() <= PROMPT_CAP,
+            "assembled prompt ({} chars) must stay within the cap",
+            prompt.chars().count()
+        );
+        assert!(
+            prompt.contains(TOOL_FORMAT_OPEN) && prompt.contains(TOOL_FORMAT_CLOSE),
+            "the tool-call format instructions must survive the cap whole"
+        );
+        assert!(
+            prompt.ends_with(&additions),
+            "the additions must be appended intact after the capped base"
+        );
+        assert_eq!(
+            prompt
+                .matches("This is an interactive conversation with a user")
+                .count(),
+            1,
+            "the capped prompt must carry exactly one timestamp orientation"
+        );
     }
 
     #[tokio::test]
