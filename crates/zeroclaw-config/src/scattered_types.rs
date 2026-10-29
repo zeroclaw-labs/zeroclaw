@@ -623,6 +623,14 @@ pub struct EmailConfig {
     /// When true, the daemon observes new mail but never modifies any IMAP flag.
     #[serde(default)]
     pub observer_mode: bool,
+    /// When true, a reply quotes the message it answers below the agent's
+    /// text, the way mail clients do: an `On <date>, <sender> wrote:` line,
+    /// then the original as `>` lines in the plain-text part and as a
+    /// blockquote in the HTML part. Only messages this channel has received
+    /// since it started can be quoted; a reply to anything else goes out
+    /// without a quote.
+    #[serde(default)]
+    pub quote_original: bool,
 }
 
 impl ChannelConfig for EmailConfig {
@@ -657,6 +665,7 @@ impl Default for EmailConfig {
             html_body: true,
             oauth2: None,
             observer_mode: false,
+            quote_original: false,
         }
     }
 }
