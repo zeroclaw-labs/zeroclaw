@@ -5,9 +5,34 @@
 //! without turning ordinary prose into links. Opening hands the path to the
 //! platform launcher, which would also *run* executables, app bundles and
 //! scripts, so those are revealed in the file manager instead.
+//!
+//! Paths are not restricted to the workspace. This launch gate is not a
+//! filesystem sandbox. Links are enabled only for local sessions and are
+//! disabled on Windows. Remote session paths must never be resolved against
+//! the client's files.
+//!
+//! # Security
+//!
+//! Detection runs background `metadata` probes without a click. Known
+//! host-keyed automount roots (`/net`, `/Network`, `/automount`) are excluded
+//! before any probe. Other mounted filesystems, custom automount maps and
+//! symlinks into them can still cause filesystem or network I/O during a
+//! probe. No opener is spawned until an explicit user action.
+//!
+//! Opening and revealing canonicalize the target first. The launch check and
+//! opener use that same canonical path, so a harmless symlink name cannot
+//! conceal a launching extension. Finder aliases are not filesystem symlinks;
+//! canonicalization does not resolve them, and alias handling remains a
+//! follow-up. File replacement between validation and launch remains possible.
+//!
+//! # Rollback
+//!
+//! This high-risk interaction is confined to ZeroCode and changes no wire
+//! protocol or configuration. Reverting the feature's squash commit restores
+//! URL-only links without a data migration.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -34,6 +59,8 @@ const LAUNCHING_EXTENSIONS: &[&str] = &[
     "action",
     "pkg",
     "mpkg",
+    "mobileconfig",
+    "dmg",
     "scpt",
     "scptd",
     "applescript",
@@ -50,12 +77,19 @@ const LAUNCHING_EXTENSIONS: &[&str] = &[
     "fish",
     "csh",
     "py",
+    "pyw",
+    "pyz",
+    "jnlp",
     "rb",
     "pl",
     // Linux
     "desktop",
     "appimage",
     "run",
+    "deb",
+    "rpm",
+    "flatpakref",
+    "snap",
     // Windows
     "exe",
     "bat",
@@ -90,6 +124,9 @@ pub(crate) fn recognized_path_ranges(
     text: &str,
     taken: &[(usize, usize, String)],
 ) -> Vec<(usize, usize, String)> {
+    if cfg!(target_os = "windows") {
+        return Vec::new();
+    }
     recognized_path_ranges_with(text, taken, home_dir().as_deref(), &|path| {
         EXISTS_PROBE.lookup(path)
     })
@@ -124,6 +161,7 @@ fn recognized_path_ranges_with(
     home: Option<&str>,
     exists: &dyn Fn(&str) -> bool,
 ) -> Vec<(usize, usize, String)> {
+    let probe_exists = |path: &str| !is_automount_path(path) && exists(path);
     let mut ranges: Vec<(usize, usize, String)> = Vec::new();
     let mut search_from = 0;
     while let Some(found) = text[search_from..].find(['/', '~']) {
@@ -169,7 +207,7 @@ fn recognized_path_ranges_with(
             // A real name may end in punctuation (`report!`), so the exact
             // word wins over its sentence-trimmed form.
             let exact = &text[start..word_end];
-            if end < word_end && !exact.contains('\u{2026}') && exists(&expand(exact)) {
+            if end < word_end && !exact.contains('\u{2026}') && probe_exists(&expand(exact)) {
                 best = Some((word_end, expand(exact)));
                 continue;
             }
@@ -177,10 +215,10 @@ fn recognized_path_ranges_with(
             if candidate.len() < 2 || candidate.contains('\u{2026}') {
                 continue;
             }
-            if exists(&expand(candidate)) {
+            if probe_exists(&expand(candidate)) {
                 best = Some((end, expand(candidate)));
             } else if let Some(stripped) = strip_line_suffix(candidate)
-                && exists(&expand(stripped))
+                && probe_exists(&expand(stripped))
             {
                 best = Some((end, expand(stripped)));
             }
@@ -191,6 +229,31 @@ fn recognized_path_ranges_with(
         }
     }
     ranges
+}
+
+/// Inspect components without filesystem access. Check every root-level
+/// component reached by `..` too; the kernel traverses it before moving back.
+fn is_automount_path(path: &str) -> bool {
+    let mut depth = 0usize;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(name) => {
+                if depth == 0
+                    && name.to_str().is_some_and(|name| {
+                        ["net", "network", "automount"]
+                            .iter()
+                            .any(|root| name.eq_ignore_ascii_case(root))
+                    })
+                {
+                    return true;
+                }
+                depth += 1;
+            }
+            Component::ParentDir => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Byte offsets where successive whitespace-separated words end, starting at
@@ -291,6 +354,9 @@ impl ExistsProbe {
     }
 
     fn lookup(&'static self, path: &str) -> bool {
+        if is_automount_path(path) {
+            return false;
+        }
         let Ok(mut state) = self.state.lock() else {
             return false;
         };
@@ -396,39 +462,46 @@ pub(crate) struct LaunchSpec {
     pub(crate) args: Vec<String>,
 }
 
-fn validate(path: &str) -> anyhow::Result<&Path> {
+fn validate(path: &str) -> anyhow::Result<PathBuf> {
+    if cfg!(target_os = "windows") {
+        anyhow::bail!("opening transcript paths is unsupported on Windows");
+    }
     if !is_path_target(path) {
         anyhow::bail!("only absolute paths can be opened");
     }
     if path.chars().any(char::is_control) {
         anyhow::bail!("path contains control characters");
     }
-    let path = Path::new(path);
-    if std::fs::metadata(path).is_err() {
-        anyhow::bail!("{} does not exist", path.display());
+    let canonical = std::fs::canonicalize(path)?;
+    if canonical.to_str().is_none() || canonical.to_string_lossy().chars().any(char::is_control) {
+        anyhow::bail!("canonical path is not valid display text");
     }
-    Ok(path)
+    Ok(canonical)
 }
 
 pub(crate) fn open_spec(path: &str) -> anyhow::Result<(LaunchSpec, OpenOutcome)> {
     let checked = validate(path)?;
-    if may_launch(checked) {
-        return Ok((reveal_spec(path)?, OpenOutcome::Revealed));
+    if may_launch(&checked) {
+        return Ok((reveal_checked_spec(&checked)?, OpenOutcome::Revealed));
     }
     let spec = LaunchSpec {
         program: platform_program()?,
-        args: vec![path.to_string()],
+        args: vec![checked.to_string_lossy().into_owned()],
     };
     Ok((spec, OpenOutcome::Opened))
 }
 
 pub(crate) fn reveal_spec(path: &str) -> anyhow::Result<LaunchSpec> {
     let checked = validate(path)?;
+    reveal_checked_spec(&checked)
+}
+
+fn reveal_checked_spec(checked: &Path) -> anyhow::Result<LaunchSpec> {
     let program = platform_program()?;
     #[cfg(target_os = "macos")]
-    let args = vec!["-R".to_string(), path.to_string()];
+    let args = vec!["-R".to_string(), checked.to_string_lossy().into_owned()];
     #[cfg(target_os = "windows")]
-    let args = vec![format!("/select,{path}")];
+    let args = vec![format!("/select,{}", checked.display())];
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let args = {
         // xdg-open has no "select" mode; open the containing folder.
@@ -439,8 +512,6 @@ pub(crate) fn reveal_spec(path: &str) -> anyhow::Result<LaunchSpec> {
         };
         vec![folder.to_string_lossy().into_owned()]
     };
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let _ = checked;
     Ok(LaunchSpec { program, args })
 }
 
@@ -512,6 +583,45 @@ mod tests {
         assert_eq!(found, vec![(5, 17, "/tmp/report!".to_string())]);
         let found = ranges("open /tmp/report! now", &["/tmp/report"]);
         assert_eq!(found, vec![(5, 16, "/tmp/report".to_string())]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn automount_candidates_never_reach_the_existence_check() {
+        for path in [
+            "/net/host/file",
+            "/Network/host/file",
+            "/automount/host/file",
+            "/net",
+            "//net/host/file",
+            "/./Network/host/file",
+            "/tmp/../net/host/file",
+            "/net/../tmp/file",
+            "/NETWORK/host/file:42",
+        ] {
+            let found = recognized_path_ranges_with(path, &[], None, &|candidate| {
+                panic!("automount candidate was probed: {candidate}")
+            });
+            assert!(found.is_empty(), "automount path linked: {path}");
+        }
+        assert!(
+            recognized_path_ranges_with("~/file", &[], Some("/net/host"), &|_| {
+                panic!("home-relative automount candidate was probed")
+            })
+            .is_empty()
+        );
+        assert_eq!(ranges("/networking/file", &["/networking/file"]).len(), 1);
+    }
+
+    #[test]
+    fn automount_lookup_never_schedules_a_background_probe() {
+        let probe: &'static ExistsProbe = Box::leak(Box::new(ExistsProbe::new(Box::new(|path| {
+            panic!("automount lookup scheduled a check: {path}")
+        }))));
+        assert!(!probe.lookup("/net/host/file"));
+        let state = probe.state.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.entries.is_empty());
     }
 
     #[test]
@@ -644,7 +754,7 @@ mod tests {
             assert!(may_launch(&bin));
         }
 
-        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let (_, outcome) = open_spec(doc.to_str().unwrap()).unwrap();
             assert_eq!(outcome, OpenOutcome::Opened);
@@ -654,6 +764,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn interpreter_and_installer_extensions_are_launching_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        for extension in [
+            "pyw",
+            "pyz",
+            "jnlp",
+            "mobileconfig",
+            "dmg",
+            "deb",
+            "rpm",
+            "flatpakref",
+            "snap",
+        ] {
+            for extension in [extension.to_string(), extension.to_uppercase()] {
+                let target = dir.path().join(format!("file.{extension}"));
+                std::fs::write(&target, "fixture").unwrap();
+                assert!(may_launch(&target));
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                assert_eq!(
+                    open_spec(target.to_str().unwrap()).unwrap().1,
+                    OpenOutcome::Revealed
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn symlink_launch_checks_and_opener_use_the_canonical_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("notes.md");
+        for extension in ["command", "terminal", "fileloc", "webloc", "inetloc"] {
+            let target = dir.path().join(format!("launch.{extension}"));
+            std::fs::write(&target, "fixture").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+            symlink(&target, &link).unwrap();
+
+            let (spec, outcome) = open_spec(link.to_str().unwrap()).unwrap();
+            assert_eq!(outcome, OpenOutcome::Revealed, "extension: {extension}");
+            let canonical = std::fs::canonicalize(&target).unwrap();
+            assert_eq!(spec, reveal_checked_spec(&canonical).unwrap());
+            assert_eq!(spec, reveal_spec(link.to_str().unwrap()).unwrap());
+            std::fs::remove_file(&link).unwrap();
+        }
+
+        let doc = dir.path().join("document.md");
+        std::fs::write(&doc, "fixture").unwrap();
+        symlink(&doc, &link).unwrap();
+        let (spec, outcome) = open_spec(link.to_str().unwrap()).unwrap();
+        assert_eq!(outcome, OpenOutcome::Opened);
+        assert_eq!(
+            spec.args,
+            vec![
+                std::fs::canonicalize(&doc)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_never_links_or_opens_transcript_paths() {
+        assert!(recognized_path_ranges("/net/host/file /Windows", &[]).is_empty());
+        assert!(open_spec("/Windows").is_err());
+        assert!(reveal_spec("/Windows").is_err());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_reveal_uses_finder_select() {
@@ -661,7 +844,17 @@ mod tests {
         let path = dir.path().to_str().unwrap().to_string();
         let spec = reveal_spec(&path).unwrap();
         assert_eq!(spec.program, "/usr/bin/open");
-        assert_eq!(spec.args, vec!["-R".to_string(), path]);
+        assert_eq!(
+            spec.args,
+            vec![
+                "-R".to_string(),
+                std::fs::canonicalize(path)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            ]
+        );
     }
 
     #[test]
