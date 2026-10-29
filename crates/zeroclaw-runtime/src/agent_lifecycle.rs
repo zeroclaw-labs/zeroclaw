@@ -627,6 +627,8 @@ mod tests {
                 delivered: true,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-08-26T00:00:00Z".into(),
                 finished_at: Some("2026-08-26T00:00:01Z".into()),
             })
@@ -639,5 +641,100 @@ mod tests {
 
         assert_eq!(report.control_plane_tasks_removed, 1);
         assert_eq!(store.count_by_agent("victim").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn owned_state_cascade_retains_terminal_goal_history() {
+        use crate::control_plane::{GoalTaskRegistry, SqliteTaskStore, TaskRegistry};
+
+        let directory = tempfile::tempdir().expect("create cascade fixture directory");
+        let config = Config {
+            data_dir: directory.path().join("data"),
+            ..Config::default()
+        };
+        let store = SqliteTaskStore::new(&config.data_dir).expect("initialize cascade store");
+        let connection = rusqlite::Connection::open(config.data_dir.join("control_plane.db"))
+            .expect("open cascade fixture connection");
+        connection
+            .execute_batch(
+                "INSERT INTO tasks
+                     (id, kind, agent, status, session_id, execution_epoch,
+                      started_at, finished_at, error)
+                 VALUES
+                     ('cascade-goal', 'goal', 'cascade', 'cancelled', 'cascade-session', 2,
+                      '2026-08-30T00:00:00Z', '2026-08-30T00:00:01Z', 'policy_revoked'),
+                     ('cascade-delegate-one', 'delegate', 'cascade', 'completed', NULL, 0,
+                      '2026-08-30T00:00:00Z', '2026-08-30T00:00:01Z', NULL),
+                     ('cascade-delegate-two', 'delegate', 'cascade', 'completed', NULL, 0,
+                      '2026-08-30T00:00:00Z', '2026-08-30T00:00:01Z', NULL),
+                     ('cascade-other-agent', 'delegate', 'other', 'completed', NULL, 0,
+                      '2026-08-30T00:00:00Z', '2026-08-30T00:00:01Z', NULL);
+                 INSERT INTO goal_tasks (task_id, objective)
+                 VALUES ('cascade-goal', 'produce a verified result');",
+            )
+            .expect("seed terminal Goal and ordinary cascade rows");
+        let task_before = serde_json::to_value(
+            store
+                .get("cascade-goal")
+                .await
+                .expect("read Goal before cascade"),
+        )
+        .expect("snapshot Goal task");
+        let extension_before = serde_json::to_value(
+            store
+                .get_goal_task("cascade-goal")
+                .await
+                .expect("read Goal extension"),
+        )
+        .expect("snapshot Goal extension");
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let report = cascade_owned_state(
+            &config,
+            &memory,
+            None,
+            "cascade",
+            &directory.path().join("archive"),
+        )
+        .await;
+
+        assert_eq!(report.control_plane_tasks_removed, 2);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("control-plane")),
+            "{:?}",
+            report.warnings
+        );
+        assert_eq!(
+            store
+                .count_by_agent("cascade")
+                .expect("count retained Goal"),
+            1
+        );
+        assert_eq!(store.count_by_agent("other").expect("count other agent"), 1);
+        assert_eq!(
+            serde_json::to_value(store.get("cascade-goal").await.expect("read retained Goal"))
+                .expect("snapshot retained Goal"),
+            task_before
+        );
+        assert_eq!(
+            serde_json::to_value(
+                store
+                    .get_goal_task("cascade-goal")
+                    .await
+                    .expect("read retained extension"),
+            )
+            .expect("snapshot retained extension"),
+            extension_before
+        );
+        assert_eq!(
+            store
+                .terminal_reason_for_session_goal("cascade-goal", "cascade-session")
+                .await
+                .expect("read retained terminal reason")
+                .as_deref(),
+            Some("policy_revoked")
+        );
     }
 }

@@ -7,6 +7,8 @@ pub mod v2;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
+use crate::edit_validation::{ValidationPass, retainable_bail};
+use crate::goal::GoalConfigError;
 use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
 use crate::traits::{ApplicationCapability, ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
@@ -545,6 +547,13 @@ pub struct Config {
     #[nested]
     #[group = "Operations"]
     pub cost: CostConfig,
+
+    /// Experimental Goal Mode admission inputs (`[goal]`). This stage only
+    /// stores and validates the configuration; runtime admission is deferred.
+    #[serde(default)]
+    #[nested]
+    #[group = "Agent"]
+    pub goal: crate::goal::GoalConfig,
 
     /// Peripheral board configuration for hardware integration (`[peripherals]`).
     #[serde(default)]
@@ -21244,6 +21253,7 @@ impl Default for Config {
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             cost: CostConfig::default(),
+            goal: crate::goal::GoalConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
@@ -24272,12 +24282,17 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        self.validate_with(&mut ValidationPass::strict())
+    }
+
+    pub(crate) fn validate_with(&self, pass: &mut ValidationPass<'_>) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
-        self.cost.rates.validate()?;
+        pass.helper(self.cost.rates.validate(), &["cost.rates".to_string()])?;
 
         for (profile_alias, profile) in &self.runtime_profiles {
             if profile.max_execution_tree_iterations == Some(0) {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     format!("runtime_profiles.{profile_alias}.max_execution_tree_iterations"),
                     "runtime_profiles.{profile_alias}.max_execution_tree_iterations must be greater than 0"
@@ -24285,40 +24300,50 @@ impl Config {
             }
             if let Some(policy) = &profile.effort_routing {
                 if profile.auto_classify.is_some() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("runtime_profiles.{profile_alias}.effort_routing"),
+                        related = &[format!("runtime_profiles.{profile_alias}.auto_classify")],
                         "runtime_profiles.{profile_alias}.effort_routing cannot be combined with runtime_profiles.{profile_alias}.auto_classify"
                     );
                 }
                 let local_hint = policy.local_hint.trim();
                 let cloud_hint = policy.cloud_hint.trim();
                 if local_hint.is_empty() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         RequiredFieldEmpty,
                         format!("runtime_profiles.{profile_alias}.effort_routing.local_hint"),
                         "runtime_profiles.{profile_alias}.effort_routing.local_hint must not be empty"
                     );
                 }
                 if cloud_hint.is_empty() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         RequiredFieldEmpty,
                         format!("runtime_profiles.{profile_alias}.effort_routing.cloud_hint"),
                         "runtime_profiles.{profile_alias}.effort_routing.cloud_hint must not be empty"
                     );
                 }
                 if local_hint.eq_ignore_ascii_case(cloud_hint) {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("runtime_profiles.{profile_alias}.effort_routing.cloud_hint"),
+                        related = &[format!(
+                            "runtime_profiles.{profile_alias}.effort_routing.local_hint"
+                        )],
                         "runtime_profiles.{profile_alias}.effort_routing local_hint and cloud_hint must name distinct model_routes"
                     );
                 }
                 for (field, hint) in [("local_hint", local_hint), ("cloud_hint", cloud_hint)] {
                     if !self.model_routes.iter().any(|route| route.hint == hint) {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!("runtime_profiles.{profile_alias}.effort_routing.{field}"),
+                            related = &["model_routes".to_string()],
                             "runtime_profiles.{profile_alias}.effort_routing.{field} = {hint:?} but no model_routes entry has that hint"
                         );
                     }
@@ -24329,7 +24354,8 @@ impl Config {
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
             let path = "gateway.websocket_ping_interval_secs";
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 path,
                 "{path} = {websocket_ping_interval_secs} is out of range; must be 0..={GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS}"
@@ -24342,7 +24368,8 @@ impl Config {
         let pairing_code_length = self.gateway.pairing_code.length;
         if self.gateway.pairing_code.validate().is_err() {
             let path = "gateway.pairing_code.length";
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 path,
                 "{path} = {pairing_code_length} is out of range; must be \
@@ -24363,16 +24390,20 @@ impl Config {
             })?;
 
             if openvpn.config_file.trim().is_empty() {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     "tunnel.openvpn.config_file",
+                    related = &["tunnel.tunnel_provider".to_string()],
                     "tunnel.openvpn.config_file must not be empty"
                 );
             }
             if openvpn.connect_timeout_secs == 0 {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     "tunnel.openvpn.connect_timeout_secs",
+                    related = &["tunnel.tunnel_provider".to_string()],
                     "tunnel.openvpn.connect_timeout_secs must be greater than 0"
                 );
             }
@@ -24387,21 +24418,24 @@ impl Config {
                 .as_ref()
                 .is_some_and(|path| path.trim().is_empty())
             {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("storage.lucid.{alias}.binary_path"),
                     "storage.lucid.{alias}.binary_path must not be empty"
                 );
             }
             if matches!(lucid.recall_timeout_ms, Some(0)) {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     format!("storage.lucid.{alias}.recall_timeout_ms"),
                     "storage.lucid.{alias}.recall_timeout_ms must be greater than 0"
                 );
             }
             if matches!(lucid.store_timeout_ms, Some(0)) {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     format!("storage.lucid.{alias}.store_timeout_ms"),
                     "storage.lucid.{alias}.store_timeout_ms must be greater than 0"
@@ -24416,7 +24450,8 @@ impl Config {
             let secs = cfg.reply_min_interval_secs();
             if secs > REPLY_MIN_INTERVAL_MAX_SECS {
                 let path = format!("{path_prefix}.reply_min_interval_secs");
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     path,
                     "{path} = {secs} is out of range; must be 0..={REPLY_MIN_INTERVAL_MAX_SECS}"
@@ -24425,7 +24460,8 @@ impl Config {
             let depth = cfg.reply_queue_depth_max();
             if depth > REPLY_QUEUE_DEPTH_CEILING {
                 let path = format!("{path_prefix}.reply_queue_depth_max");
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     path,
                     "{path} = {depth} is out of range; must be 0..={REPLY_QUEUE_DEPTH_CEILING}"
@@ -24434,10 +24470,16 @@ impl Config {
         }
 
         for (alias, tg) in &self.channels.telegram {
-            tg.validate_bot_token(alias)?;
-            validate_http_base_url(
-                &format!("channels.telegram.{alias}.api_base_url"),
-                &tg.api_base_url,
+            pass.helper(
+                tg.validate_bot_token(alias),
+                &[format!("channels.telegram.{alias}.enabled")],
+            )?;
+            pass.helper(
+                validate_http_base_url(
+                    &format!("channels.telegram.{alias}.api_base_url"),
+                    &tg.api_base_url,
+                ),
+                &[],
             )?;
         }
 
@@ -24451,7 +24493,8 @@ impl Config {
             let max_messages = slack.effective_thread_context_max_messages();
             if max_messages > MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES {
                 let path = format!("channels.slack.{alias}.thread_context_max_messages");
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     path,
                     "{path} = {max_messages} is out of range; must be 0..={MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES}"
@@ -24460,7 +24503,10 @@ impl Config {
         }
 
         for (alias, dc) in &self.channels.discord {
-            dc.validate_bot_token(alias)?;
+            pass.helper(
+                dc.validate_bot_token(alias),
+                &[format!("channels.discord.{alias}.enabled")],
+            )?;
         }
 
         // Signal and Voice Call: like Telegram/Discord's bot_token, these
@@ -24469,28 +24515,40 @@ impl Config {
         // its per-channel supervisor restarts it forever (crashloop), so
         // reject at config-load time instead.
         for (alias, sig) in &self.channels.signal {
-            sig.validate_required(alias)?;
+            pass.helper(
+                sig.validate_required(alias),
+                &[format!("channels.signal.{alias}")],
+            )?;
         }
 
         for (alias, vc) in &self.channels.voice_call {
             let enabled_path = format!("channels.voice_call.{alias}.enabled");
-            validate_required_field(
-                &format!("channels.voice_call.{alias}.account_id"),
-                &enabled_path,
-                vc.enabled,
-                &vc.account_id,
+            pass.helper(
+                validate_required_field(
+                    &format!("channels.voice_call.{alias}.account_id"),
+                    &enabled_path,
+                    vc.enabled,
+                    &vc.account_id,
+                ),
+                &[format!("channels.voice_call.{alias}.enabled")],
             )?;
-            validate_required_field(
-                &format!("channels.voice_call.{alias}.auth_token"),
-                &enabled_path,
-                vc.enabled,
-                &vc.auth_token,
+            pass.helper(
+                validate_required_field(
+                    &format!("channels.voice_call.{alias}.auth_token"),
+                    &enabled_path,
+                    vc.enabled,
+                    &vc.auth_token,
+                ),
+                &[format!("channels.voice_call.{alias}.enabled")],
             )?;
-            validate_required_field(
-                &format!("channels.voice_call.{alias}.from_number"),
-                &enabled_path,
-                vc.enabled,
-                &vc.from_number,
+            pass.helper(
+                validate_required_field(
+                    &format!("channels.voice_call.{alias}.from_number"),
+                    &enabled_path,
+                    vc.enabled,
+                    &vc.from_number,
+                ),
+                &[format!("channels.voice_call.{alias}.enabled")],
             )?;
         }
 
@@ -24505,15 +24563,26 @@ impl Config {
             if git.enabled && matches!(provider.as_str(), "gitea" | "forgejo") {
                 let path = format!("channels.git.{alias}.api_base_url");
                 match git.api_base_url.as_deref() {
-                    None => validation_bail!(
+                    None => retainable_bail!(
+                        pass,
                         RequiredFieldEmpty,
                         path,
+                        related = &[
+                            format!("channels.git.{alias}.enabled"),
+                            format!("channels.git.{alias}.provider")
+                        ],
                         "{path} is required when provider = \"{provider}\": set the \
                          instance's API base URL including /api/v1 (e.g. \
                          https://git.example.org/api/v1); no default host is assumed \
                          because API requests carry the access token"
                     ),
-                    Some(url) => validate_http_base_url(&path, url)?,
+                    Some(url) => pass.helper(
+                        validate_http_base_url(&path, url),
+                        &[
+                            format!("channels.git.{alias}.enabled"),
+                            format!("channels.git.{alias}.provider"),
+                        ],
+                    )?,
                 }
             }
         }
@@ -24525,7 +24594,8 @@ impl Config {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidFormat,
                     format!("http_request.secrets.{name}"),
                     "http_request.secrets key {name:?} must contain 1..=64 ASCII letters, numbers, underscores, or hyphens"
@@ -24535,49 +24605,57 @@ impl Config {
 
         // Gateway
         if self.gateway.host.trim().is_empty() {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 RequiredFieldEmpty,
                 "gateway.host",
                 "gateway.host must not be empty"
             );
         }
         if self.nodes.mdns.max_peers == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "nodes.mdns.max_peers",
                 "nodes.mdns.max_peers must be greater than 0"
             );
         }
         if self.nodes.mdns.announce_interval_secs == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "nodes.mdns.announce_interval_secs",
                 "nodes.mdns.announce_interval_secs must be greater than 0"
             );
         }
         if self.nodes.mdns.peer_ttl_secs == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "nodes.mdns.peer_ttl_secs",
                 "nodes.mdns.peer_ttl_secs must be greater than 0"
             );
         }
         if self.nodes.mdns.peer_ttl_secs <= self.nodes.mdns.announce_interval_secs {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "nodes.mdns.peer_ttl_secs",
+                related = &["nodes.mdns.announce_interval_secs".to_string()],
                 "nodes.mdns.peer_ttl_secs must be greater than nodes.mdns.announce_interval_secs"
             );
         }
         if matches!(self.transcription.max_audio_bytes, Some(0)) {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "transcription.max_audio_bytes",
                 "transcription.max_audio_bytes must be greater than zero"
             );
         }
         if self.channels.max_concurrent_per_channel == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "channels.max_concurrent_per_channel",
                 "channels.max_concurrent_per_channel must be greater than 0"
@@ -24607,9 +24685,15 @@ impl Config {
                 .unwrap_or_default()
                 .to_ascii_lowercase();
             if backend_kind != "sqlite" {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidFormat,
                     flag_path,
+                    related = &[
+                        "memory.backend".to_string(),
+                        "memory.types.enabled".to_string(),
+                        "memory.consolidation_extract_facts".to_string()
+                    ],
                     "{flag_path} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
                     self.memory.backend
                 );
@@ -24617,9 +24701,14 @@ impl Config {
             for (alias, agent) in &self.agents {
                 if agent.memory.backend != crate::multi_agent::MemoryBackendKind::Sqlite {
                     let agent_backend = agent.memory.backend;
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.memory.backend"),
+                        related = &[
+                            "memory.types.enabled".to_string(),
+                            "memory.consolidation_extract_facts".to_string()
+                        ],
                         "{flag_path} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{alias}.memory.backend = {agent_backend:?}",
                     );
                 }
@@ -24627,7 +24716,8 @@ impl Config {
         }
         for (alias, agent) in &self.agents {
             if agent.precheck.timeout_secs == 0 {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     format!("agents.{alias}.precheck.timeout_secs"),
                     "agents.{alias}.precheck.timeout_secs must be greater than 0"
@@ -24639,16 +24729,23 @@ impl Config {
         if self.heartbeat.enabled {
             let hb_agent = self.heartbeat.agent.trim();
             if hb_agent.is_empty() {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     "heartbeat.agent",
+                    related = &["heartbeat.enabled".to_string()],
                     "heartbeat.agent must reference a configured agent when heartbeat.enabled = true"
                 );
             }
             if !self.agents.contains_key(hb_agent) {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     DanglingReference,
                     "heartbeat.agent",
+                    related = &[
+                        "heartbeat.enabled".to_string(),
+                        format!("agents.{hb_agent}")
+                    ],
                     "heartbeat.agent = {hb_agent:?} but no [agents.{hb_agent}] entry is configured"
                 );
             }
@@ -24658,14 +24755,16 @@ impl Config {
             // value is exactly what was validated.
             if !prefix.is_empty() {
                 if !prefix.starts_with('/') {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         "gateway.path_prefix",
                         "gateway.path_prefix must start with '/'"
                     );
                 }
                 if prefix.ends_with('/') {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         "gateway.path_prefix",
                         "gateway.path_prefix must not end with '/' (including bare '/')"
@@ -24721,7 +24820,7 @@ impl Config {
                 }
             }
             if let Err(e) = crate::skill_bundles::validate_uniqueness(self, &install_root) {
-                validation_bail!(InvalidFormat, "skill_bundles", "{e}");
+                retainable_bail!(pass, InvalidFormat, "skill_bundles", "{e}");
             }
         }
 
@@ -24739,7 +24838,11 @@ impl Config {
             // no-op and surprises operators upgrading from <0.8.3. Warn
             // once at startup so this surfaces via `doctor` and the
             // standard startup warning stream.
-            if self.mcp.enabled && !self.mcp.servers.is_empty() && self.mcp_bundles.is_empty() {
+            if pass.emit_notices
+                && self.mcp.enabled
+                && !self.mcp.servers.is_empty()
+                && self.mcp_bundles.is_empty()
+            {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
@@ -24755,7 +24858,7 @@ impl Config {
                 self.mcp.servers.iter().map(|s| s.name.as_str()).collect();
             for (bundle_alias, bundle) in &self.mcp_bundles {
                 for server in bundle.servers.iter().chain(bundle.exclude.iter()) {
-                    if !known_servers.contains(server.as_str()) {
+                    if pass.emit_notices && !known_servers.contains(server.as_str()) {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -24777,7 +24880,7 @@ impl Config {
                     continue;
                 };
                 for bundle_alias in &agent.mcp_bundles {
-                    if !self.mcp_bundles.contains_key(bundle_alias) {
+                    if pass.emit_notices && !self.mcp_bundles.contains_key(bundle_alias) {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -24838,30 +24941,39 @@ impl Config {
             && self.gateway.paired_tokens.is_empty()
             && !self.gateway.require_pairing
         {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 ValidationFailed,
                 "wss.enabled",
+                related = &[
+                    "oidc".to_string(),
+                    "gateway.paired_tokens".to_string(),
+                    "gateway.require_pairing".to_string()
+                ],
                 "wss.enabled requires a remote credential path: configure [oidc.<alias>], enable gateway.require_pairing (then pair a device), or keep an existing paired token",
             );
         }
 
         // Security OTP / estop
         if self.security.otp.challenge_max_attempts == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "security.otp.challenge_max_attempts",
                 "security.otp.challenge_max_attempts must be greater than 0"
             );
         }
         if self.security.otp.token_ttl_secs == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "security.otp.token_ttl_secs",
                 "security.otp.token_ttl_secs must be greater than 0"
             );
         }
         if self.security.otp.cache_valid_secs == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "security.otp.cache_valid_secs",
                 "security.otp.cache_valid_secs must be greater than 0"
@@ -24873,7 +24985,8 @@ impl Config {
             );
         }
         if self.security.otp.challenge_max_attempts == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "security.otp.challenge_max_attempts",
                 "security.otp.challenge_max_attempts must be greater than 0"
@@ -24882,7 +24995,8 @@ impl Config {
         for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
             let normalized = action.trim();
             if normalized.is_empty() {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("security.otp.gated_actions[{i}]"),
                     "security.otp.gated_actions[{i}] must not be empty"
@@ -24896,9 +25010,10 @@ impl Config {
                     "security.otp.gated_actions[{i}] contains invalid characters: {normalized}"
                 );
             }
-            if !default_otp_gated_actions()
-                .iter()
-                .any(|known| known == normalized)
+            if pass.emit_notices
+                && !default_otp_gated_actions()
+                    .iter()
+                    .any(|known| known == normalized)
             {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -24920,14 +25035,16 @@ impl Config {
             || "Invalid security.otp.gated_domains or security.otp.gated_domain_categories",
         )?;
         if self.security.estop.state_file.trim().is_empty() {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 RequiredFieldEmpty,
                 "security.estop.state_file",
                 "security.estop.state_file must not be empty"
             );
         }
         if !(0.0..=1.0).contains(&self.security.leak_detection.sensitivity) {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "security.leak_detection.sensitivity",
                 "security.leak_detection.sensitivity must be between 0.0 and 1.0"
@@ -24936,14 +25053,16 @@ impl Config {
 
         // Scheduler
         if self.scheduler.max_concurrent == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "scheduler.max_concurrent",
                 "scheduler.max_concurrent must be greater than 0"
             );
         }
         if self.scheduler.max_tasks == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "scheduler.max_tasks",
                 "scheduler.max_tasks must be greater than 0"
@@ -24958,7 +25077,8 @@ impl Config {
                 &route.model,
             );
             if required.hint.missing {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].hint"),
                     "model_routes[{i}].hint must not be empty"
@@ -24966,7 +25086,8 @@ impl Config {
             }
             let mp = route.model_provider.trim();
             if required.model_provider.missing {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model_provider"),
                     "model_routes[{i}].model_provider must not be empty"
@@ -24979,21 +25100,25 @@ impl Config {
             match mp.split_once('.') {
                 Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
                     if self.providers.models.find(ty, inner).is_none() {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!("model_routes[{i}].model_provider"),
+                            related = &[format!("providers.models.{ty}.{inner}")],
                             "model_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
                 }
-                _ => validation_bail!(
+                _ => retainable_bail!(
+                    pass,
                     InvalidFormat,
                     format!("model_routes[{i}].model_provider"),
                     "model_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
             if required.model.missing {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("model_routes[{i}].model"),
                     "model_routes[{i}].model must not be empty"
@@ -25009,7 +25134,8 @@ impl Config {
                 &route.model,
             );
             if required.hint.missing {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].hint"),
                     "embedding_routes[{i}].hint must not be empty"
@@ -25017,7 +25143,8 @@ impl Config {
             }
             let mp = route.model_provider.trim();
             if required.model_provider.missing {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model_provider"),
                     "embedding_routes[{i}].model_provider must not be empty"
@@ -25028,21 +25155,25 @@ impl Config {
             match mp.split_once('.') {
                 Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
                     if self.providers.models.find(ty, inner).is_none() {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!("embedding_routes[{i}].model_provider"),
+                            related = &[format!("providers.models.{ty}.{inner}")],
                             "embedding_routes[{i}].model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
                 }
-                _ => validation_bail!(
+                _ => retainable_bail!(
+                    pass,
                     InvalidFormat,
                     format!("embedding_routes[{i}].model_provider"),
                     "embedding_routes[{i}].model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
                 ),
             }
             if required.model.missing {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("embedding_routes[{i}].model"),
                     "embedding_routes[{i}].model must not be empty"
@@ -25078,9 +25209,11 @@ impl Config {
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty());
             if !has_uri && !has_api_key && !has_model {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models. is empty (no uri / api_key / model). \
-                     Skipping at runtime; run `zeroclaw quickstart` (or use the dashboard) \
-                     to make this model_provider usable.");
+                if pass.emit_notices {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": profile_name, "profile_name": profile_name})), "providers.models. is empty (no uri / api_key / model). \
+                         Skipping at runtime; run `zeroclaw quickstart` (or use the dashboard) \
+                         to make this model_provider usable.");
+                }
                 continue;
             }
 
@@ -25131,30 +25264,32 @@ impl Config {
         // structured to dashboard callers). Single source of truth lives in
         // collect_warnings; emit them to tracing here so the existing log
         // behavior is preserved, with the single documented exception below.
-        for w in self.collect_warnings() {
-            // One code is held back from this loop on purpose. The runtime
-            // already records the withheld-capability notice itself, with an
-            // explicit `System` category and the same code and path, once at
-            // every config application. Records emitted here carry no category
-            // and are stored as `internal`, which the dashboard Logs view hides
-            // by default, so tracing it here as well leaves a hidden second copy
-            // of a notice an operator is supposed to read. Every command that
-            // loads config a second time inside a live process writes that pair.
-            //
-            // `collect_warnings` still returns it, so `zeroclaw doctor` and the
-            // config API report it exactly as before; only this tracing copy is
-            // dropped. The change that re-registers the tool retires this skip
-            // together with the runtime record it defers to.
-            if w.code == crate::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD {
-                continue;
+        if pass.emit_notices {
+            for w in self.collect_warnings() {
+                // One code is held back from this loop on purpose. The runtime
+                // already records the withheld-capability notice itself, with an
+                // explicit `System` category and the same code and path, once at
+                // every config application. Records emitted here carry no category
+                // and are stored as `internal`, which the dashboard Logs view hides
+                // by default, so tracing it here as well leaves a hidden second copy
+                // of a notice an operator is supposed to read. Every command that
+                // loads config a second time inside a live process writes that pair.
+                //
+                // `collect_warnings` still returns it, so `zeroclaw doctor` and the
+                // config API report it exactly as before; only this tracing copy is
+                // dropped. The change that re-registers the tool retires this skip
+                // together with the runtime record it defers to.
+                if w.code == crate::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD {
+                    continue;
+                }
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"path": w.path, "code": w.code})),
+                    &format!("{}", w.message)
+                );
             }
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"path": w.path, "code": w.code})),
-                &format!("{}", w.message)
-            );
         }
 
         // Ollama cloud-routing safety checks
@@ -25241,16 +25376,20 @@ impl Config {
         // Knowledge graph
         if self.knowledge.enabled {
             if self.knowledge.max_nodes == 0 {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     "knowledge.max_nodes",
+                    related = &["knowledge.enabled".to_string()],
                     "knowledge.max_nodes must be greater than 0"
                 );
             }
             if self.knowledge.db_path.trim().is_empty() {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     "knowledge.db_path",
+                    related = &["knowledge.enabled".to_string()],
                     "knowledge.db_path must not be empty"
                 );
             }
@@ -25264,7 +25403,8 @@ impl Config {
             for (i, service) in self.google_workspace.allowed_services.iter().enumerate() {
                 let normalized = service.trim();
                 if normalized.is_empty() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         RequiredFieldEmpty,
                         format!("google_workspace.allowed_services[{i}]"),
                         "google_workspace.allowed_services[{i}] must not be empty"
@@ -25306,7 +25446,8 @@ impl Config {
                 let resource = operation.resource.trim();
 
                 if service.is_empty() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         RequiredFieldEmpty,
                         format!("google_workspace.allowed_operations[{i}].service"),
                         "google_workspace.allowed_operations[{i}].service must not be empty"
@@ -25362,7 +25503,8 @@ impl Config {
                 }
 
                 if operation.methods.is_empty() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         RequiredFieldEmpty,
                         format!("google_workspace.allowed_operations[{i}].methods"),
                         "google_workspace.allowed_operations[{i}].methods must not be empty"
@@ -25481,37 +25623,47 @@ impl Config {
                 anyhow::bail!("notion.database_id must not be empty when notion.enabled = true");
             }
             if self.notion.poll_interval_secs == 0 {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     "notion.poll_interval_secs",
+                    related = &["notion.enabled".to_string()],
                     "notion.poll_interval_secs must be greater than 0"
                 );
             }
             if self.notion.max_concurrent == 0 {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     InvalidNumericRange,
                     "notion.max_concurrent",
+                    related = &["notion.enabled".to_string()],
                     "notion.max_concurrent must be greater than 0"
                 );
             }
             if self.notion.status_property.trim().is_empty() {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     "notion.status_property",
+                    related = &["notion.enabled".to_string()],
                     "notion.status_property must not be empty"
                 );
             }
             if self.notion.input_property.trim().is_empty() {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     "notion.input_property",
+                    related = &["notion.enabled".to_string()],
                     "notion.input_property must not be empty"
                 );
             }
             if self.notion.result_property.trim().is_empty() {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     "notion.result_property",
+                    related = &["notion.enabled".to_string()],
                     "notion.result_property must not be empty"
                 );
             }
@@ -25566,7 +25718,7 @@ impl Config {
         }
 
         // Nevis IAM was removed; the table is tolerated but inert.
-        if self.security.nevis.is_some() {
+        if pass.emit_notices && self.security.nevis.is_some() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -25581,14 +25733,16 @@ impl Config {
 
         // Delegate tool global defaults
         if self.delegate.timeout_secs == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "delegate.timeout_secs",
                 "delegate.timeout_secs must be greater than 0"
             );
         }
         if self.delegate.agentic_timeout_secs == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "delegate.agentic_timeout_secs",
                 "delegate.agentic_timeout_secs must be greater than 0"
@@ -25615,16 +25769,19 @@ impl Config {
                         .get_map_keys(&format!("providers.models.{ty}"))
                         .is_some_and(|keys| keys.iter().any(|k| k == inner));
                     if !exists {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!(
                                 "runtime_profiles.{palias}.context_compression.summary_provider"
                             ),
+                            related = &[format!("providers.models.{ty}.{inner}")],
                             "runtime_profiles.{palias}.context_compression.summary_provider = {value:?} but providers.models.{ty}.{inner} is not configured",
                         );
                     }
                 }
-                _ => validation_bail!(
+                _ => retainable_bail!(
+                    pass,
                     InvalidFormat,
                     format!("runtime_profiles.{palias}.context_compression.summary_provider"),
                     "runtime_profiles.{palias}.context_compression.summary_provider must be dotted form `<type>.<alias>` (got {value:?})",
@@ -25645,7 +25802,8 @@ impl Config {
             // model_providers.<type>.<inner>.
             let mp = agent.model_provider.trim();
             if mp.is_empty() {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("agents.{alias}.model_provider"),
                     "agents.{alias}.model_provider must reference a configured model model_provider (e.g. \"anthropic.default\")",
@@ -25654,7 +25812,8 @@ impl Config {
             match mp.split_once('.') {
                 Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
                     if !crate::providers::ModelProviders::slot_names().contains(&ty) {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
                             "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
@@ -25664,14 +25823,17 @@ impl Config {
                         .get_map_keys(&format!("providers.models.{ty}"))
                         .is_some_and(|keys| keys.iter().any(|k| k == inner));
                     if !exists {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
+                            related = &[format!("providers.models.{ty}.{inner}")],
                             "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
                         );
                     }
                 }
-                _ => validation_bail!(
+                _ => retainable_bail!(
+                    pass,
                     InvalidFormat,
                     format!("agents.{alias}.model_provider"),
                     "agents.{alias}.model_provider must be dotted form `<type>.<alias>` (got {mp:?})",
@@ -25694,14 +25856,17 @@ impl Config {
                             .get_map_keys(&format!("channels.{ty}"))
                             .is_some_and(|keys| keys.iter().any(|k| k == inner));
                         if !exists {
-                            validation_bail!(
+                            retainable_bail!(
+                                pass,
                                 DanglingReference,
                                 format!("agents.{alias}.channels[{i}]"),
+                                related = &[format!("channels.{ty}.{inner}")],
                                 "agents.{alias}.channels[{i}] = {trimmed:?} but channels.{ty}.{inner} is not configured",
                             );
                         }
                     }
-                    _ => validation_bail!(
+                    _ => retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.channels[{i}]"),
                         "agents.{alias}.channels[{i}] must be dotted form `<type>.<alias>` (got {trimmed:?})",
@@ -25746,14 +25911,17 @@ impl Config {
                             .get_map_keys(&format!("{section_prefix}.{ty}"))
                             .is_some_and(|keys| keys.iter().any(|k| k == inner));
                         if !exists {
-                            validation_bail!(
+                            retainable_bail!(
+                                pass,
                                 DanglingReference,
                                 format!("agents.{alias}.{field}"),
+                                related = &[format!("{section_prefix}.{ty}.{inner}")],
                                 "agents.{alias}.{field} = {value:?} but {section_prefix}.{ty}.{inner} is not configured",
                             );
                         }
                     }
-                    _ => validation_bail!(
+                    _ => retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.{field}"),
                         "agents.{alias}.{field} must be dotted form `<type>.<alias>` (got {value:?})",
@@ -25787,9 +25955,11 @@ impl Config {
                         .get_map_keys(section)
                         .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
                     if !exists {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!("agents.{alias}.{field}[{i}]"),
+                            related = &[format!("{section}.{trimmed}")],
                             "agents.{alias}.{field}[{i}] = {trimmed:?} but {section}.{trimmed} is not configured",
                         );
                     }
@@ -25812,9 +25982,11 @@ impl Config {
                     .get_map_keys(section)
                     .is_some_and(|keys| keys.iter().any(|k| k == trimmed));
                 if !exists {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         DanglingReference,
                         format!("agents.{alias}.{field}"),
+                        related = &[format!("{section}.{trimmed}")],
                         "agents.{alias}.{field} = {trimmed:?} but {section}.{trimmed} is not configured",
                     );
                 }
@@ -25825,9 +25997,11 @@ impl Config {
             // gate its actions. Run this check last so the more specific
             // dangling/format errors above surface first.
             if agent.enabled && agent.risk_profile.trim().is_empty() {
-                validation_bail!(
+                retainable_bail!(
+                    pass,
                     RequiredFieldEmpty,
                     format!("agents.{alias}.risk_profile"),
+                    related = &[format!("agents.{alias}.enabled")],
                     "agents.{alias}.risk_profile must reference a configured [risk_profiles.<alias>] entry",
                 );
             }
@@ -25841,30 +26015,36 @@ impl Config {
             for (i, target) in agent.delegates.iter().enumerate() {
                 let target_str = target.agent().trim();
                 if target_str.is_empty() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         RequiredFieldEmpty,
                         format!("agents.{alias}.delegates[{i}].agent"),
                         "agents.{alias}.delegates[{i}].agent is empty; remove it or name a configured agent",
                     );
                 }
                 if target_str == alias.as_str() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.delegates[{i}].agent"),
                         "agents.{alias}.delegates[{i}].agent = {target_str:?} names this agent itself; an agent cannot delegate to itself",
                     );
                 }
                 if !self.agents.contains_key(target_str) {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         DanglingReference,
                         format!("agents.{alias}.delegates[{i}].agent"),
+                        related = &[format!("agents.{target_str}")],
                         "agents.{alias}.delegates[{i}].agent = {target_str:?} but agents.{target_str} is not configured",
                     );
                 }
                 if !seen_delegates.insert(target_str) {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.delegates[{i}].agent"),
+                        related = &[format!("agents.{alias}.delegates")],
                         "agents.{alias}.delegates[{i}].agent = {target_str:?} duplicates an earlier delegate target",
                     );
                 }
@@ -25875,16 +26055,19 @@ impl Config {
             for (target, mode) in &agent.workspace.access {
                 let target_str = target.as_str();
                 if target_str == alias.as_str() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.workspace.access.{target_str}"),
                         "agents.{alias}.workspace.access.{target_str} = {mode:?} but {target_str} is this agent itself; an agent always has full access to its own workspace, so self-references in the cross-agent allowlist are not permitted",
                     );
                 }
                 if !self.agents.contains_key(target_str) {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         DanglingReference,
                         format!("agents.{alias}.workspace.access.{target_str}"),
+                        related = &[format!("agents.{target_str}")],
                         "agents.{alias}.workspace.access.{target_str} = {mode:?} but agents.{target_str} is not configured",
                     );
                 }
@@ -25907,21 +26090,25 @@ impl Config {
                     .categories()
                     .is_some_and(|categories| categories.is_empty())
                 {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
                         "agents.{alias}.workspace.read_memory_from[{i}].categories must contain at least one category when present",
                     );
                 }
                 if !seen_memory_grants.insert(target_str) {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
+                        related = &[format!("agents.{alias}.workspace.read_memory_from")],
                         "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
                     );
                 }
                 if target_str == alias.as_str() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}]"),
                         "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but {target_str} is this agent itself; an agent always sees its own memory rows, so self-references in the cross-agent allowlist are not permitted",
@@ -25940,17 +26127,24 @@ impl Config {
                         crate::multi_agent::MemoryBackendKind::Markdown
                     )
                 {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        related = &[format!("agents.{alias}.memory.backend")],
                         "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
                     );
                 }
                 if target_agent.memory.backend != agent_backend {
                     let target_backend = target_agent.memory.backend;
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("agents.{alias}.workspace.read_memory_from[{i}]"),
+                        related = &[
+                            format!("agents.{alias}.memory.backend"),
+                            format!("agents.{target_str}.memory.backend")
+                        ],
                         "agents.{alias}.workspace.read_memory_from[{i}] points at agents.{target_str} which uses memory backend {target_backend:?}, but agents.{alias} uses {agent_backend:?}; the allowlist must point at same-backend siblings only",
                     );
                 }
@@ -25978,7 +26172,8 @@ impl Config {
             };
             match self.classify_peer_group_channel_ref(group_channel) {
                 PeerGroupChannelRef::Empty => {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         RequiredFieldEmpty,
                         format!("peer_groups.{group_name}.channel"),
                         "peer_groups.{group_name}.channel must name a channel type (e.g. \"discord\") or dotted alias (e.g. \"discord.work\")",
@@ -25989,9 +26184,11 @@ impl Config {
                     configured,
                 } => {
                     if !configured {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
+                            related = &[format!("channels.{channel_type}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
                         );
                     }
@@ -26004,16 +26201,20 @@ impl Config {
                     ..
                 } => {
                     if !type_configured {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
+                            related = &[format!("channels.{channel_type}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but no [channels.{channel_type}.*] block is configured",
                         );
                     }
                     if !exists {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             DanglingReference,
                             format!("peer_groups.{group_name}.channel"),
+                            related = &[format!("channels.{channel_type}.{alias}")],
                             "peer_groups.{group_name}.channel = {group_channel:?} but [channels.{channel_type}.{alias}] is not configured",
                         );
                     }
@@ -26040,9 +26241,14 @@ impl Config {
                         Some(alias) => format!("entry for {group_channel_type}.{alias}"),
                         None => format!("entry of type {group_channel_type:?}"),
                     };
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("peer_groups.{group_name}.agents[{i}]"),
+                        related = &[
+                            format!("agents.{member_str}.channels"),
+                            format!("peer_groups.{group_name}.channel")
+                        ],
                         "peer_groups.{group_name}.agents[{i}] = {member_str:?} but agents.{member_str}.channels has no {needs_msg}",
                     );
                 }
@@ -26050,49 +26256,56 @@ impl Config {
         }
 
         if self.plugins.max_active_instances == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "plugins.max_active_instances",
                 "plugins.max_active_instances must be greater than 0; a zero ceiling rejects every logical plugin instance"
             );
         }
         if self.plugins.limits.call_fuel == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "plugins.limits.call_fuel",
                 "plugins.limits.call_fuel must be greater than 0; a zero budget traps every plugin call before it runs"
             );
         }
         if self.plugins.limits.max_memory_mb == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "plugins.limits.max_memory_mb",
                 "plugins.limits.max_memory_mb must be greater than 0; a zero cap rejects every plugin at instantiation"
             );
         }
         if self.plugins.limits.max_table_elements == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "plugins.limits.max_table_elements",
                 "plugins.limits.max_table_elements must be greater than 0; a zero ceiling rejects every plugin that allocates a table"
             );
         }
         if self.plugins.limits.max_instances == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "plugins.limits.max_instances",
                 "plugins.limits.max_instances must be greater than 0; a zero ceiling rejects every plugin at instantiation"
             );
         }
         if self.plugins.limits.call_timeout_ms == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "plugins.limits.call_timeout_ms",
                 "plugins.limits.call_timeout_ms must be greater than 0; a zero deadline aborts every plugin call before it runs"
             );
         }
         if self.plugins.limits.max_connections_per_instance == 0 {
-            validation_bail!(
+            retainable_bail!(
+                pass,
                 InvalidNumericRange,
                 "plugins.limits.max_connections_per_instance",
                 "plugins.limits.max_connections_per_instance must be greater than 0; a zero ceiling rejects every plugin network connection"
@@ -26134,9 +26347,11 @@ impl Config {
                     .iter()
                     .any(|grant| zeroclaw_infra::net_guard::egress_pattern_contains(grant, private))
                 {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("plugins.entries.{}.egress_allow_private", entry.name),
+                        related = &[format!("plugins.entries.{}.egress_hosts", entry.name)],
                         "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one. A wildcard carveout ('*.host') needs an equal-or-broader wildcard grant, not an exact one",
                         entry.name
                     );
@@ -26150,7 +26365,8 @@ impl Config {
             for (index, profile) in entry.tls_profiles.iter().enumerate() {
                 let path = format!("plugins.entries.{}.tls_profiles[{index}]", entry.name);
                 if !zeroclaw_api::plugin_egress::is_valid_tls_profile_name(&profile.name) {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("{path}.name"),
                         "{path}.name {:?} must be a 1-64 byte lowercase slug of letters, digits, '-' or '_'",
@@ -26158,16 +26374,19 @@ impl Config {
                     );
                 }
                 if !profile_names.insert(profile.name.as_str()) {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         format!("{path}.name"),
+                        related = &[format!("plugins.entries.{}.tls_profiles", entry.name)],
                         "plugins.entries.{}.tls_profiles has more than one profile named {:?}",
                         entry.name,
                         profile.name
                     );
                 }
                 if profile.hosts.is_empty() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         RequiredFieldEmpty,
                         format!("{path}.hosts"),
                         "{path}.hosts must name at least one destination"
@@ -26184,16 +26403,19 @@ impl Config {
                     if !hosts.iter().any(|grant| {
                         zeroclaw_infra::net_guard::egress_pattern_contains(grant, host)
                     }) {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             InvalidFormat,
                             format!("{path}.hosts"),
+                            related = &[format!("plugins.entries.{}.egress_hosts", entry.name)],
                             "{path}.hosts lists {host:?}, which is not granted by plugins.entries.{}.egress_hosts; a TLS profile selects certificates for a granted destination, it does not grant one",
                             entry.name
                         );
                     }
                 }
                 if !profile.system_roots && profile.custom_ca_secret.is_none() {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         path.clone(),
                         "{path} trusts nothing: enable system_roots or set custom_ca_secret"
@@ -26214,7 +26436,8 @@ impl Config {
                         zeroclaw_api::plugin_key::SecretPropertyRef::parse(secret.to_owned())
                             .is_err()
                     }) {
-                        validation_bail!(
+                        retainable_bail!(
+                            pass,
                             InvalidFormat,
                             format!("{path}.{field}"),
                             "{path}.{field} must name a top-level secret property of the plugin's config schema"
@@ -26224,7 +26447,8 @@ impl Config {
                 if profile.client_certificate_secret.is_some()
                     != profile.client_private_key_secret.is_some()
                 {
-                    validation_bail!(
+                    retainable_bail!(
+                        pass,
                         InvalidFormat,
                         path.clone(),
                         "{path} must set both client_certificate_secret and client_private_key_secret, or neither"
@@ -26233,7 +26457,102 @@ impl Config {
             }
         }
 
+        // Goal validation stays last, matching strict first-error order. Its scope
+        // is every Goal input, so an edit to any of them cannot retain a Goal error.
+        pass.helper(
+            self.validate_goal_config(),
+            &self.goal_validation_input_paths(),
+        )?;
         Ok(())
+    }
+
+    /// Validate local `[goal]` configuration and, when Goal Mode is enabled,
+    /// resolve its verifier through `providers.models`.
+    ///
+    /// This returns the same structured error used by [`Config::validate`].
+    /// Goal execution admission calls this against the current config at each
+    /// Start, Resume, and execution acquisition. Do not cache its result.
+    pub fn validate_goal_config(&self) -> Result<()> {
+        if let Err(error) = self.goal.validate() {
+            match error {
+                GoalConfigError::MissingVerifierProvider => validation_bail!(
+                    RequiredFieldEmpty,
+                    "goal.verifier.model_provider",
+                    "goal.verifier.model_provider is required when goal.enabled is true"
+                ),
+                GoalConfigError::TokenLimitOutOfRange => validation_bail!(
+                    InvalidNumericRange,
+                    "goal.default_token_limit",
+                    "goal.default_token_limit must be less than or equal to {}",
+                    i64::MAX
+                ),
+                GoalConfigError::InvalidCostLimit => validation_bail!(
+                    InvalidNumericRange,
+                    "goal.default_cost_limit_usd",
+                    "goal.default_cost_limit_usd must be finite and non-negative"
+                ),
+                GoalConfigError::EmptyVerifierModel => validation_bail!(
+                    RequiredFieldEmpty,
+                    "goal.verifier.model",
+                    "goal.verifier.model must not be empty when provided"
+                ),
+            }
+        }
+        if !self.goal.enabled {
+            return Ok(());
+        }
+
+        let (verifier, components) = self.goal_verifier_reference();
+        let Some((provider_type, provider_alias)) = components else {
+            validation_bail!(
+                InvalidFormat,
+                "goal.verifier.model_provider",
+                "goal.verifier.model_provider must use `<type>.<alias>` format (got {verifier:?})"
+            );
+        };
+        if provider_type.is_empty() || provider_alias.is_empty() {
+            validation_bail!(
+                InvalidFormat,
+                "goal.verifier.model_provider",
+                "goal.verifier.model_provider must use non-empty `<type>.<alias>` components (got {verifier:?})"
+            );
+        }
+        if self
+            .providers
+            .models
+            .find(provider_type, provider_alias)
+            .is_none()
+        {
+            validation_bail!(
+                DanglingReference,
+                "goal.verifier.model_provider",
+                "goal.verifier.model_provider = {verifier:?} but no matching providers.models entry is configured"
+            );
+        }
+        Ok(())
+    }
+
+    fn goal_verifier_reference(&self) -> (&str, Option<(&str, &str)>) {
+        let verifier = self.goal.verifier.model_provider.as_str().trim();
+        (verifier, verifier.split_once('.'))
+    }
+
+    /// Return the paths whose values decide [`Config::validate_goal_config`].
+    /// A Goal error is reported at a `goal.*` path even when another of these
+    /// paths caused it, so callers classifying errors by changed paths must
+    /// compare against all of them.
+    pub fn goal_validation_input_paths(&self) -> Vec<String> {
+        let mut paths = vec!["goal".to_owned()];
+        if self.goal.enabled {
+            let (_, components) = self.goal_verifier_reference();
+            if let Some((provider_type, provider_alias)) = components
+                && !provider_type.is_empty()
+                && !provider_alias.is_empty()
+            {
+                paths.push(format!("providers.models.{provider_type}.{provider_alias}"));
+            }
+        }
+        paths
     }
 
     pub fn mark_dirty(&mut self, path: &str) {
@@ -26551,7 +26870,7 @@ impl Config {
         // operator's actual choices (no hundreds of lines of struct
         // defaults the operator never touched). The schema's
         // `#[serde(default = "...")]` annotations re-supply the
-        // defaults on load, so the pruned file round-trips identically.
+        // defaults on load.
         let mut new_table: toml::Table = toml::Value::try_from(&config_to_save)
             .context("Failed to serialize config to TOML value")?
             .try_into()
@@ -26665,7 +26984,6 @@ impl Config {
         let mut doc: toml_edit::DocumentMut = existing
             .parse()
             .context("Failed to parse existing config for incremental save")?;
-
         for path in &self.dirty_paths {
             apply_dirty_path(doc.as_table_mut(), path, &full_table, &default_table)?;
         }
@@ -27489,7 +27807,7 @@ fn apply_dirty_map_key_path(
 
 /// Shared tail of the generic and map-key dirty-path walkers: reconcile
 /// the resolved `segs` against the doc — delete the leaf when the
-/// in-memory value is absent or equals the schema default, otherwise
+/// in-memory value is absent or equals the schema default. Otherwise
 /// write the pruned in-memory value. One copy so a future fix to the
 /// delete-vs-write rule cannot land in one walker only.
 fn write_or_delete_leaf(
@@ -33865,6 +34183,7 @@ auto_save = true
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
             cost: CostConfig::default(),
+            goal: crate::goal::GoalConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
@@ -35183,6 +35502,324 @@ default_temperature = 0.7
         let _ = fs::remove_dir_all(&dir).await;
     }
 
+    fn goal_budget_defaults_config(temp: &tempfile::TempDir) -> Config {
+        Config {
+            config_path: temp.path().join("config.toml"),
+            data_dir: temp.path().join("data"),
+            ..Config::default()
+        }
+    }
+
+    fn assert_goal_budget_defaults_round_trip(
+        raw: &str,
+        enabled: bool,
+        token_limit: Option<u64>,
+        cost_limit_usd: Option<f64>,
+    ) {
+        let value: toml::Value = toml::from_str(raw).expect("saved TOML parses");
+        let goal = value.get("goal").and_then(toml::Value::as_table);
+        assert_eq!(
+            goal.and_then(|table| table.get("default_token_limit"))
+                .is_some(),
+            token_limit.is_some()
+        );
+        assert_eq!(
+            goal.and_then(|table| table.get("default_cost_limit_usd"))
+                .is_some(),
+            cost_limit_usd.is_some()
+        );
+
+        let loaded =
+            crate::migration::migrate_to_current(raw).expect("saved config strictly migrates");
+        assert_eq!(loaded.goal.enabled, enabled);
+        assert_eq!(loaded.goal.default_token_limit, token_limit);
+        assert_eq!(loaded.goal.default_cost_limit_usd, cost_limit_usd);
+
+        let salvaged = crate::migration::migrate_to_current_salvaged(raw);
+        assert!(
+            salvaged.dropped.is_empty(),
+            "valid saved [goal] must not be salvage-dropped: {:?}",
+            salvaged.dropped
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_budget_defaults_unrelated_saves_keep_absence_and_tool_selection() {
+        for selected in [
+            Vec::new(),
+            vec!["calculator".to_owned()],
+            vec!["*".to_owned()],
+        ] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let mut config = goal_budget_defaults_config(&temp);
+            config.tools.optional = selected.clone();
+            config.save().await.unwrap();
+
+            for dirty_save in [false, true] {
+                if dirty_save {
+                    config
+                        .set_prop_persistent("observability.backend", "log")
+                        .unwrap();
+                    config.save_dirty().await.unwrap();
+                }
+                let raw = fs::read_to_string(&config.config_path).await.unwrap();
+                assert!(!raw.contains("default_token_limit"), "got:\n{raw}");
+                assert!(!raw.contains("default_cost_limit_usd"), "got:\n{raw}");
+                assert_goal_budget_defaults_round_trip(&raw, false, None, None);
+                let value: toml::Value = toml::from_str(&raw).unwrap();
+                assert_eq!(
+                    value["tools"]["optional"],
+                    toml::Value::Array(selected.iter().cloned().map(toml::Value::String).collect()),
+                    "tool selection after dirty_save={dirty_save}"
+                );
+                let loaded = crate::migration::migrate_to_current(&raw).unwrap();
+                assert_eq!(loaded.tools.optional, selected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_budget_defaults_full_save_of_enabled_goal_writes_no_budget_keys() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = goal_budget_defaults_config(&temp);
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.default".into();
+
+        config.save().await.unwrap();
+
+        let raw = fs::read_to_string(&config.config_path).await.unwrap();
+        assert!(!raw.contains("default_token_limit"), "got:\n{raw}");
+        assert!(!raw.contains("default_cost_limit_usd"), "got:\n{raw}");
+        assert_goal_budget_defaults_round_trip(&raw, true, None, None);
+        assert_eq!(
+            crate::migration::migrate_to_current(&raw)
+                .unwrap()
+                .goal
+                .default_budget(),
+            Ok(crate::goal::GoalDefaultBudget::Unconfigured)
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_budget_defaults_dirty_save_creating_goal_writes_no_budget_keys() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut config = goal_budget_defaults_config(&temp);
+        config.save().await.unwrap();
+        let initial = fs::read_to_string(&config.config_path).await.unwrap();
+        assert!(
+            !initial.contains("[goal]"),
+            "fixture must start without Goal:\n{initial}"
+        );
+
+        config.set_prop_persistent("goal.enabled", "true").unwrap();
+        config.save_dirty().await.unwrap();
+
+        let raw = fs::read_to_string(&config.config_path).await.unwrap();
+        assert!(!raw.contains("default_token_limit"), "got:\n{raw}");
+        assert!(!raw.contains("default_cost_limit_usd"), "got:\n{raw}");
+        assert_goal_budget_defaults_round_trip(&raw, true, None, None);
+    }
+
+    #[tokio::test]
+    async fn goal_budget_defaults_explicit_values_survive_full_dirty_and_force_saves() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let _env_lock = env_override_lock().await;
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", temp.path());
+        let _data_guard = EnvValueGuard::remove("ZEROCLAW_DATA_DIR");
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        for (token, cost) in [
+            (Some(0), Some(0.0)),
+            (Some(500), Some(2.5)),
+            (Some(500), Some(0.0)),
+            (Some(500), None),
+        ] {
+            let mut seed = format!(
+                "schema_version = {}\n\n[goal]\nenabled = true\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            );
+            if let Some(value) = token {
+                seed.push_str(&format!("default_token_limit = {value}\n"));
+            }
+            if let Some(value) = cost {
+                seed.push_str(&format!("default_cost_limit_usd = {value:?}\n"));
+            }
+            seed.push_str("\n[goal.verifier]\nmodel_provider = \"openai.default\"\n");
+            fs::write(&config_path, &seed).await.unwrap();
+
+            let mut loaded = Box::pin(Config::load_or_init()).await.unwrap();
+            assert_eq!(loaded.goal.default_token_limit, token);
+            assert_eq!(loaded.goal.default_cost_limit_usd, cost);
+            loaded
+                .set_prop_persistent("observability.backend", "log")
+                .unwrap();
+            loaded.save_dirty().await.unwrap();
+            let raw_dirty = fs::read_to_string(&config_path).await.unwrap();
+            for line in seed.lines().filter(|line| line.starts_with("default_")) {
+                assert!(
+                    raw_dirty.lines().any(|candidate| candidate == line),
+                    "missing {line:?}:\n{raw_dirty}"
+                );
+            }
+            assert_goal_budget_defaults_round_trip(&raw_dirty, true, token, cost);
+
+            loaded.save().await.unwrap();
+            let raw_save = fs::read_to_string(&config_path).await.unwrap();
+            for line in seed.lines().filter(|line| line.starts_with("default_")) {
+                assert!(
+                    raw_save.lines().any(|candidate| candidate == line),
+                    "missing {line:?}:\n{raw_save}"
+                );
+            }
+            assert_goal_budget_defaults_round_trip(&raw_save, true, token, cost);
+
+            let mut force = goal_budget_defaults_config(&temp);
+            force.goal.enabled = true;
+            force.goal.verifier.model_provider = "openai.default".into();
+            force.goal.default_token_limit = token;
+            force.goal.default_cost_limit_usd = cost;
+            force.force_save().await.unwrap();
+            let raw_force = fs::read_to_string(&config_path).await.unwrap();
+            for line in seed.lines().filter(|line| line.starts_with("default_")) {
+                assert!(
+                    raw_force.lines().any(|candidate| candidate == line),
+                    "missing {line:?}:\n{raw_force}"
+                );
+            }
+            assert_goal_budget_defaults_round_trip(&raw_force, true, token, cost);
+            let reloaded = crate::migration::migrate_to_current(&raw_force).unwrap();
+            assert_eq!(reloaded.goal.default_budget(), loaded.goal.default_budget());
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_budget_defaults_dirty_set_zero_and_unset_persist_presence() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n[goal]\nenabled = true\ndefault_token_limit = 500\ndefault_cost_limit_usd = 2.5\n\n[goal.verifier]\nmodel_provider = \"openai.default\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        fs::write(&config_path, &seed).await.unwrap();
+
+        let mut config = goal_budget_defaults_config(&temp);
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.default".into();
+        config
+            .set_prop_persistent("goal.default_token_limit", "0")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            raw.lines().any(|line| line == "default_token_limit = 0"),
+            "got:\n{raw}"
+        );
+        assert_goal_budget_defaults_round_trip(&raw, true, Some(0), Some(2.5));
+
+        config
+            .set_prop_persistent("goal.default_cost_limit_usd", "")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert!(!raw.contains("default_cost_limit_usd"), "got:\n{raw}");
+        assert_goal_budget_defaults_round_trip(&raw, true, Some(0), None);
+        assert_eq!(
+            crate::migration::migrate_to_current(&raw)
+                .unwrap()
+                .goal
+                .default_budget(),
+            Ok(crate::goal::GoalDefaultBudget::Unconfigured)
+        );
+
+        config
+            .set_prop_persistent("goal.default_cost_limit_usd", "2.5")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            raw.lines()
+                .any(|line| line == "default_cost_limit_usd = 2.5"),
+            "got:\n{raw}"
+        );
+        assert_goal_budget_defaults_round_trip(&raw, true, Some(0), Some(2.5));
+        config
+            .set_prop_persistent("goal.default_token_limit", crate::traits::UNSET_DISPLAY)
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let raw = fs::read_to_string(&config_path).await.unwrap();
+        assert!(!raw.contains("default_token_limit"), "got:\n{raw}");
+        assert_goal_budget_defaults_round_trip(&raw, true, None, Some(2.5));
+    }
+
+    #[tokio::test]
+    async fn goal_budget_defaults_all_default_goal_is_still_omitted() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config = goal_budget_defaults_config(&temp);
+        config.save().await.unwrap();
+
+        let raw = fs::read_to_string(&config.config_path).await.unwrap();
+        assert!(
+            !raw.contains("[goal]"),
+            "all-default Goal must stay omitted:\n{raw}"
+        );
+        let loaded = crate::migration::migrate_to_current(&raw)
+            .expect("config without [goal] loads with Goal defaults");
+        assert!(!loaded.goal.enabled);
+        assert_eq!(loaded.goal.default_token_limit, None);
+        assert_eq!(loaded.goal.default_cost_limit_usd, None);
+    }
+
+    #[tokio::test]
+    async fn goal_budget_defaults_malformed_existing_section_is_not_repaired() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n[observability]\nbackend = \"none\"\n\n[goal]\nenabled = true\ndefault_token_limit = \"unbounded\"\n\n[goal.verifier]\nmodel_provider = \"openai.default\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        fs::write(&config_path, &seed).await.unwrap();
+
+        let mut config = goal_budget_defaults_config(&temp);
+        config.goal.enabled = true;
+        config.set_prop_persistent("goal.enabled", "true").unwrap();
+        config.save_dirty().await.unwrap();
+
+        let after_goal_save = fs::read_to_string(&config_path).await.unwrap();
+        assert!(after_goal_save.contains("default_token_limit = \"unbounded\""));
+        let error = crate::migration::migrate_to_current(&after_goal_save)
+            .expect_err("writer must not repair a malformed pre-existing [goal]");
+        assert!(
+            format!("{error:#}").contains("default_token_limit"),
+            "strict load should name the malformed budget: {error:#}"
+        );
+        let salvaged = crate::migration::migrate_to_current_salvaged(&after_goal_save);
+        assert!(
+            salvaged.dropped.iter().any(|path| path == "goal"),
+            "salvage should report malformed Goal as dropped: {:?}",
+            salvaged.dropped
+        );
+
+        let goal_bytes = after_goal_save
+            .split("[goal]")
+            .nth(1)
+            .expect("Goal table remains present")
+            .to_owned();
+        config
+            .set_prop_persistent("observability.backend", "otel")
+            .unwrap();
+        config.save_dirty().await.unwrap();
+        let after_unrelated_save = fs::read_to_string(&config_path).await.unwrap();
+        assert_eq!(
+            after_unrelated_save
+                .split("[goal]")
+                .nth(1)
+                .expect("Goal table remains present"),
+            goal_bytes,
+            "non-Goal dirty save must preserve existing Goal bytes"
+        );
+    }
+
     #[tokio::test]
     async fn config_save_keeps_operator_set_non_default_fields() {
         let dir =
@@ -35302,6 +35939,7 @@ default_temperature = 0.7
             proxy: ProxyConfig::default(),
             pacing: PacingConfig::default(),
             cost: CostConfig::default(),
+            goal: crate::goal::GoalConfig::default(),
             peripherals: PeripheralsConfig::default(),
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),

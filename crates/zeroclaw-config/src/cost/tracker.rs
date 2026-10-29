@@ -596,6 +596,7 @@ impl CostTracker {
             usage,
             agent_alias,
             task_id,
+            None,
             conversation_id,
             true,
             File::sync_all,
@@ -611,6 +612,114 @@ impl CostTracker {
         self.record_usage_with_owned_task_attribution_inner(usage, agent_alias, task_id, false)
     }
 
+    /// Persist a task-scoped event with the actual configured provider route,
+    /// even when ordinary cost tracking is disabled.
+    pub fn record_scoped_usage_with_owned_task_and_provider_attribution(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        provider_ref: impl Into<String>,
+    ) -> Result<()> {
+        let provider_ref = provider_ref.into();
+        anyhow::ensure!(
+            !provider_ref.trim().is_empty(),
+            "Task-scoped usage provider reference must be nonblank"
+        );
+        self.record_usage_with_owned_task_attribution_inner_with_provider(
+            usage,
+            agent_alias,
+            task_id,
+            Some(provider_ref),
+            false,
+        )
+    }
+
+    /// Persist ordered task-scoped usage events with their actual provider
+    /// routes in one ledger append and one durable sync. This is for one
+    /// already-admitted logical operation whose provider path surfaced more
+    /// than one billed event; it does not coalesce or reattribute events.
+    /// Each event updates every derived total and inherited ancestor exactly
+    /// as the single scoped writer would.
+    pub fn record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+        &self,
+        events: Vec<(TokenUsage, String)>,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+    ) -> Result<()> {
+        self.record_scoped_usage_batch_with_owned_task_and_provider_attribution_with_sync(
+            events,
+            agent_alias,
+            task_id,
+            File::sync_all,
+        )
+    }
+
+    fn record_scoped_usage_batch_with_owned_task_and_provider_attribution_with_sync(
+        &self,
+        events: Vec<(TokenUsage, String)>,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let (_, track_per_agent) = self.mode();
+        let effective_alias = track_per_agent
+            .then(|| agent_alias.map(str::to_string))
+            .flatten();
+        let recorded_alias = effective_alias.clone();
+        let mut records = Vec::with_capacity(events.len());
+        let mut totals = Vec::with_capacity(events.len());
+        let mut record_days_and_costs = Vec::with_capacity(events.len());
+
+        for (usage, provider_ref) in events {
+            anyhow::ensure!(
+                !provider_ref.trim().is_empty(),
+                "Task-scoped usage provider reference must be nonblank"
+            );
+            anyhow::ensure!(
+                usage.cost_usd.is_finite() && usage.cost_usd >= 0.0,
+                "Token usage cost must be a finite, non-negative value"
+            );
+            totals.push((usage.cost_usd, usage.total_tokens));
+            record_days_and_costs.push((usage.timestamp.naive_utc().date(), usage.cost_usd));
+            records.push(CostRecord::with_attribution_and_provider(
+                &self.session_id,
+                effective_alias.clone(),
+                task_id.clone(),
+                Some(provider_ref),
+                usage,
+            ));
+        }
+
+        let mut storage = self.lock_storage();
+        let append_outcome = storage.add_records_with_sync(records, sync_file)?;
+
+        {
+            let mut session_totals = self.lock_session_totals();
+            let entry = session_totals.entry(effective_alias).or_default();
+            for (cost_usd, total_tokens) in totals {
+                entry.cost_usd += cost_usd;
+                entry.total_tokens += total_tokens;
+                entry.request_count += 1;
+            }
+        }
+
+        drop(storage);
+        for (record_day, cost_usd) in record_days_and_costs {
+            self.credit_inherited_descendant_spend(
+                track_per_agent,
+                recorded_alias.as_deref(),
+                record_day,
+                cost_usd,
+            );
+        }
+        append_outcome.into_result()
+    }
+
     fn record_usage_with_owned_task_attribution_inner(
         &self,
         usage: TokenUsage,
@@ -618,10 +727,28 @@ impl CostTracker {
         task_id: Option<String>,
         honor_enabled: bool,
     ) -> Result<()> {
+        self.record_usage_with_owned_task_attribution_inner_with_provider(
+            usage,
+            agent_alias,
+            task_id,
+            None,
+            honor_enabled,
+        )
+    }
+
+    fn record_usage_with_owned_task_attribution_inner_with_provider(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        provider_ref: Option<String>,
+        honor_enabled: bool,
+    ) -> Result<()> {
         self.record_usage_with_owned_task_attribution_inner_with_sync(
             usage,
             agent_alias,
             task_id,
+            provider_ref,
             None,
             honor_enabled,
             File::sync_all,
@@ -633,6 +760,7 @@ impl CostTracker {
         usage: TokenUsage,
         agent_alias: Option<&str>,
         task_id: Option<String>,
+        provider_ref: Option<String>,
         conversation_id: Option<String>,
         honor_enabled: bool,
         sync_file: fn(&File) -> std::io::Result<()>,
@@ -663,9 +791,14 @@ impl CostTracker {
         // Kept past the session-totals move below: the ancestor
         // accumulator loop compares it against each ancestor's alias.
         let recorded_alias = effective_alias.clone();
-        let record =
-            CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage)
-                .with_conversation_id(conversation_id);
+        let record = CostRecord::with_attribution_and_provider(
+            &self.session_id,
+            effective_alias.clone(),
+            task_id,
+            provider_ref,
+            usage,
+        )
+        .with_conversation_id(conversation_id);
         // The UTC day this record belongs to. The ledger's rebuild folds
         // the row into this day's aggregates and no other day's, so the
         // descendant accumulator keys on the same day and the two agree
@@ -685,6 +818,23 @@ impl CostTracker {
 
         drop(storage);
 
+        self.credit_inherited_descendant_spend(
+            track_per_agent,
+            recorded_alias.as_deref(),
+            record_day,
+            cost_usd,
+        );
+
+        append_outcome.into_result()
+    }
+
+    fn credit_inherited_descendant_spend(
+        &self,
+        track_per_agent: bool,
+        recorded_alias: Option<&str>,
+        record_day: NaiveDate,
+        cost_usd: f64,
+    ) {
         // Delegation-chain accounting: usage recorded through an
         // agent-scoped tracker with an inherited chain lands on the ledger
         // under this tracker's own alias, so the ancestors' per-alias daily
@@ -702,14 +852,12 @@ impl CostTracker {
         // against that ancestor's ceiling.
         if track_per_agent && let BudgetScope::Agent { inherited, .. } = &self.budget_scope {
             for entry in inherited {
-                if recorded_alias.as_deref() == Some(entry.alias.as_str()) {
+                if recorded_alias == Some(entry.alias.as_str()) {
                     continue;
                 }
                 entry.add_descendant_spend(record_day, cost_usd);
             }
         }
-
-        append_outcome.into_result()
     }
 
     /// Get the current cost summary. When `[cost].track_per_agent` is
@@ -812,6 +960,19 @@ impl CostTracker {
     ) -> Result<(u64, f64, bool)> {
         let mut storage = self.lock_storage();
         storage.usage_totals_for_task_with_pricing(task_id)
+    }
+
+    /// Derive task-attributed totals from a structurally valid canonical ledger.
+    ///
+    /// Unlike the reporting API, this rejects malformed JSONL and invalid task
+    /// usage records. Callers which use the result to admit further work must
+    /// fail closed instead of treating an unreadable record as zero usage.
+    pub fn get_strict_usage_totals_for_task_with_pricing(
+        &self,
+        task_id: &str,
+    ) -> Result<(u64, f64, bool)> {
+        let storage = self.lock_storage();
+        storage.strict_usage_totals_for_task_with_pricing(task_id)
     }
 
     fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
@@ -928,6 +1089,42 @@ impl CostTracker {
     pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
         let trackers = GLOBAL_COST_TRACKERS.get_or_init(|| RwLock::new(HashMap::new()));
         Self::resolve_global(trackers, config, workspace_dir)
+    }
+
+    /// Obtain the process-global tracker for the canonical ledger under
+    /// `workspace_dir`, even when ordinary cost tracking is disabled.
+    /// Trackers are keyed by ledger path, so this returns the tracker ordinary
+    /// resolution uses for that ledger and never one bound to another ledger.
+    /// Unlike `get_or_init_global`, path-resolution or construction failure is
+    /// an error: durable task accounting fails closed.
+    pub fn get_or_init_global_required(
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Result<Arc<Self>> {
+        let trackers = GLOBAL_COST_TRACKERS.get_or_init(|| RwLock::new(HashMap::new()));
+        Self::resolve_global_required(trackers, config, workspace_dir)
+    }
+
+    fn resolve_global_required(
+        trackers: &RwLock<HashMap<PathBuf, Arc<CostTracker>>>,
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Result<Arc<Self>> {
+        let storage_path = resolve_storage_path(workspace_dir)?;
+        if let Some(tracker) = trackers.read().get(&storage_path).cloned() {
+            tracker.update_config(config);
+            return Ok(tracker);
+        }
+
+        let mut guard = trackers.write();
+        if let Some(tracker) = guard.get(&storage_path).cloned() {
+            tracker.update_config(config);
+            return Ok(tracker);
+        }
+
+        let tracker = Arc::new(Self::new(config, workspace_dir)?);
+        guard.insert(storage_path, Arc::clone(&tracker));
+        Ok(tracker)
     }
 
     fn resolve_global(
@@ -1333,6 +1530,42 @@ impl CostStorage {
         Ok(rejected_records)
     }
 
+    fn for_each_record_strict<F>(&self, mut on_record: F) -> Result<()>
+    where
+        F: FnMut(CostRecord) -> Result<()>,
+    {
+        if !self.path.exists() {
+            return Ok(());
+        }
+
+        let file = File::open(&self.path)
+            .with_context(|| format!("Failed to read cost storage from {}", self.path.display()))?;
+        for (line_number, line) in BufReader::new(file).lines().enumerate() {
+            let raw_line = line.with_context(|| {
+                format!(
+                    "Failed to read line {} from cost storage {}",
+                    line_number + 1,
+                    self.path.display()
+                )
+            })?;
+            anyhow::ensure!(
+                !raw_line.trim().is_empty(),
+                "empty cost record at line {} in {}",
+                line_number + 1,
+                self.path.display()
+            );
+            let record = serde_json::from_str::<CostRecord>(&raw_line).with_context(|| {
+                format!(
+                    "Invalid cost record at line {} in {}",
+                    line_number + 1,
+                    self.path.display()
+                )
+            })?;
+            on_record(record)?;
+        }
+        Ok(())
+    }
+
     fn rebuild_aggregates(&mut self, day: NaiveDate, year: i32, month: u32) -> Result<()> {
         let mut daily_cost = 0.0;
         let mut monthly_cost = 0.0;
@@ -1408,6 +1641,24 @@ impl CostStorage {
             )
         })?;
 
+        self.fold_appended_record(&record);
+
+        let sync_result = sync_file(&file).with_context(|| {
+            format!(
+                "Failed to sync cost storage at {}",
+                self.path.display().to_string()
+            )
+        });
+
+        Ok(match sync_result {
+            Ok(()) => AppendOutcome::Synced,
+            Err(error) => AppendOutcome::AppendedButSyncFailed(error),
+        })
+    }
+
+    /// Fold each record from either append path so its derived totals match a
+    /// rebuild from the ledger.
+    fn fold_appended_record(&mut self, record: &CostRecord) {
         let timestamp = record.usage.timestamp.naive_utc();
         if timestamp.date() == self.cached_day {
             self.daily_cost_usd += record.usage.cost_usd;
@@ -1426,6 +1677,46 @@ impl CostStorage {
         if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
             self.monthly_cost_usd += record.usage.cost_usd;
         }
+    }
+
+    fn add_records_with_sync(
+        &mut self,
+        records: Vec<CostRecord>,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<AppendOutcome> {
+        self.ensure_period_cache_current()?;
+        let mut encoded = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut encoded, record)?;
+            encoded.push(b'\n');
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| {
+                format!(
+                    "Failed to open cost storage at {}",
+                    self.path.display().to_string()
+                )
+            })?;
+        if let Err(error) = file.write_all(&encoded) {
+            // A short append may have reached the file but is not represented
+            // by process-local aggregates. Rebuild before any later summary
+            // rather than treating those aggregates as authoritative.
+            self.aggregates_current = false;
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to write cost records to {}",
+                    self.path.display().to_string()
+                )
+            });
+        }
+
+        for record in &records {
+            self.fold_appended_record(record);
+        }
 
         let sync_result = sync_file(&file).with_context(|| {
             format!(
@@ -1433,7 +1724,6 @@ impl CostStorage {
                 self.path.display().to_string()
             )
         });
-
         Ok(match sync_result {
             Ok(()) => AppendOutcome::Synced,
             Err(error) => AppendOutcome::AppendedButSyncFailed(error),
@@ -1453,7 +1743,7 @@ impl CostStorage {
     }
 
     /// Per-alias spend for the cached current day. Reads only the in-memory
-    /// bucket maintained by the append path / rebuild, so per-agent budget
+    /// bucket maintained by both append paths / rebuild, so per-agent budget
     /// checks never rescan the ledger.
     fn get_daily_cost_for_agent(&self, agent_alias: &str) -> f64 {
         self.daily_cost_by_agent
@@ -1537,6 +1827,53 @@ impl CostStorage {
         Ok((total_tokens, cost_usd, pricing_available))
     }
 
+    fn strict_usage_totals_for_task_with_pricing(&self, task_id: &str) -> Result<(u64, f64, bool)> {
+        let mut total_tokens = 0_u64;
+        let mut cost_usd = 0.0_f64;
+        let mut pricing_available = true;
+        self.for_each_record_strict(|record| {
+            if record.task_id.as_deref() != Some(task_id) {
+                return Ok(());
+            }
+
+            let expected_total = record
+                .usage
+                .input_tokens
+                .checked_add(record.usage.output_tokens)
+                .context("task usage token total overflow")?;
+            anyhow::ensure!(
+                record.usage.total_tokens == expected_total && expected_total > 0,
+                "task usage total is missing, zero, or inconsistent"
+            );
+            anyhow::ensure!(
+                record.usage.cached_input_tokens <= record.usage.input_tokens,
+                "task usage cached input exceeds input tokens"
+            );
+            anyhow::ensure!(
+                record.usage.cache_creation_input_tokens
+                    <= record
+                        .usage
+                        .input_tokens
+                        .saturating_sub(record.usage.cached_input_tokens),
+                "task usage cache-write input exceeds uncached input tokens"
+            );
+            anyhow::ensure!(
+                record.usage.cost_usd.is_finite() && record.usage.cost_usd >= 0.0,
+                "task usage cost is not finite and non-negative"
+            );
+            total_tokens = total_tokens
+                .checked_add(record.usage.total_tokens)
+                .context("task usage total overflow while aggregating ledger records")?;
+            cost_usd += record.usage.cost_usd;
+            anyhow::ensure!(cost_usd.is_finite(), "task usage cost total is not finite");
+            if !record.usage.pricing_available {
+                pricing_available = false;
+            }
+            Ok(())
+        })?;
+        Ok((total_tokens, cost_usd, pricing_available))
+    }
+
     /// Get cost for a specific date.
     fn get_cost_for_date(&self, date: NaiveDate) -> Result<f64> {
         let mut cost = 0.0;
@@ -1569,6 +1906,7 @@ impl CostStorage {
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone, Utc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn enabled_config() -> CostConfig {
@@ -1761,6 +2099,7 @@ mod tests {
                 None,
                 Some("task-a".to_string()),
                 None,
+                None,
                 true,
                 fail_sync,
             )
@@ -1923,6 +2262,603 @@ mod tests {
         assert_eq!(tokens, 2_250);
         assert!(cost > 0.0);
         assert!(!pricing_available);
+    }
+
+    #[test]
+    fn strict_task_usage_totals_reject_malformed_task_ledger_rows() {
+        let tmp = TempDir::new().unwrap();
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{not-json}\n").unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        assert!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .is_err(),
+            "Goal admission must fail closed rather than treating malformed JSONL as no usage"
+        );
+    }
+
+    #[test]
+    fn strict_task_usage_totals_reject_inconsistent_task_usage() {
+        let tmp = TempDir::new().unwrap();
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut usage = TokenUsage::new("test/model", 2, 1, 0, 1.0, 1.0, 0.0);
+        usage.total_tokens = 2;
+        let record = CostRecord::with_attribution(
+            "session-a",
+            Some("agent-a".into()),
+            Some("goal-a".into()),
+            usage,
+        );
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        assert!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .is_err(),
+            "Goal admission must reject a task ledger row whose total disagrees with its components"
+        );
+    }
+
+    #[test]
+    fn strict_task_usage_totals_reject_cache_writes_outside_uncached_input() {
+        let tmp = TempDir::new().unwrap();
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut usage =
+            TokenUsage::new_with_cache_write("test/model", 5, 4, 0, 1, 1.0, 1.0, 1.0, 1.0);
+        usage.cache_creation_input_tokens = 2;
+        let record = CostRecord::with_attribution(
+            "session-a",
+            Some("agent-a".into()),
+            Some("goal-a".into()),
+            usage,
+        );
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        assert!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .is_err(),
+            "Goal admission must reject a cache-write band outside the uncached input band"
+        );
+    }
+
+    #[test]
+    fn strict_task_usage_totals_accept_nonzero_usage_with_explicit_zero_cost() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        tracker
+            .record_usage_with_task_attribution(
+                TokenUsage::new("test/free-model", 2, 1, 0, 0.0, 0.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .unwrap(),
+            (3, 0.0, true),
+            "a resolved zero-dollar route remains complete when its token usage is nonzero"
+        );
+    }
+
+    #[test]
+    fn required_global_tracker_opens_the_canonical_ledger_while_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let trackers = RwLock::new(HashMap::new());
+        let tracker = CostTracker::resolve_global_required(
+            &trackers,
+            CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .expect("Goal accounting requires a tracker even when ordinary tracking is disabled");
+
+        tracker
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/model", 1, 1, 0, 1.0, 1.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            tracker
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .unwrap()
+                .0,
+            2
+        );
+    }
+
+    #[test]
+    fn scoped_task_usage_retains_the_actual_provider_route() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        tracker
+            .record_scoped_usage_with_owned_task_and_provider_attribution(
+                TokenUsage::new("served-model", 2, 1, 0, 0.0, 0.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+                "openai.fallback",
+            )
+            .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let record: CostRecord = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(record.task_id.as_deref(), Some("goal-a"));
+        assert_eq!(record.provider_ref.as_deref(), Some("openai.fallback"));
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_retains_event_order_and_actual_routes() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+
+        tracker
+            .record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+                vec![
+                    (
+                        TokenUsage::new("first-model", 2, 1, 0, 0.0, 0.0, 0.0),
+                        "openai.primary".to_owned(),
+                    ),
+                    (
+                        TokenUsage::new("second-model", 3, 2, 0, 0.0, 0.0, 0.0),
+                        "openai.fallback".to_owned(),
+                    ),
+                ],
+                Some("agent-a"),
+                Some("goal-a".to_owned()),
+            )
+            .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let records: Vec<CostRecord> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].usage.model, "first-model");
+        assert_eq!(records[0].provider_ref.as_deref(), Some("openai.primary"));
+        assert_eq!(records[1].usage.model, "second-model");
+        assert_eq!(records[1].provider_ref.as_deref(), Some("openai.fallback"));
+        assert_eq!(tracker.get_summary().unwrap().request_count, 2);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_syncs_once_after_every_event_is_appended() {
+        static SYNC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        fn count_sync(_: &File) -> std::io::Result<()> {
+            SYNC_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        SYNC_CALLS.store(0, Ordering::SeqCst);
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        tracker
+            .record_scoped_usage_batch_with_owned_task_and_provider_attribution_with_sync(
+                vec![
+                    (
+                        TokenUsage::new("first-model", 2, 1, 0, 0.0, 0.0, 0.0),
+                        "openai.primary".to_owned(),
+                    ),
+                    (
+                        TokenUsage::new("second-model", 3, 2, 0, 0.0, 0.0, 0.0),
+                        "openai.fallback".to_owned(),
+                    ),
+                ],
+                Some("agent-a"),
+                Some("goal-a".to_owned()),
+                count_sync,
+            )
+            .unwrap();
+
+        assert_eq!(SYNC_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_counts_toward_agent_daily_ceiling() {
+        // A scoped batch must count against the attributed agent's ceiling.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![
+                (usage_costing_at(1.25, now), "provider.primary".to_owned()),
+                (usage_costing_at(0.75, now), "provider.fallback".to_owned()),
+            ],
+            Some("main"),
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+
+        match base
+            .derived_for_agent("main", 1.0)
+            .check_budget(0.0)
+            .unwrap()
+        {
+            BudgetCheck::Exceeded {
+                current_usd,
+                agent_alias,
+                ..
+            } => {
+                assert_eq!(agent_alias.as_deref(), Some("main"));
+                assert!((current_usd - 2.0).abs() < 1e-9);
+            }
+            other => panic!("expected main's $1 ceiling to be exceeded, got {other:?}"),
+        }
+        assert!(!matches!(
+            base.derived_for_agent("other", 1.0)
+                .check_budget(0.0)
+                .unwrap(),
+            BudgetCheck::Exceeded { .. }
+        ));
+        assert!((base.get_summary().unwrap().daily_cost_usd - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_per_agent_cache_matches_ledger_and_rebuild() {
+        // Batch, single, and unattributed appends must agree with the ledger oracle.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![(usage_costing_at(1.0, now), "provider.batch".to_owned())],
+            Some("main"),
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+        base.record_usage_with_agent(usage_costing_at(2.0, now), Some("other"))
+            .unwrap();
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![(usage_costing_at(3.0, now), "provider.unassigned".to_owned())],
+            None,
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let mut storage = base.lock_storage();
+        assert!(storage.aggregates_current);
+        assert_eq!(storage.daily_cost_by_agent, ledger_daily_by_agent(&path));
+        let before_rebuild = storage.daily_cost_by_agent.clone();
+        let period = ReportingPeriod::current();
+        storage
+            .rebuild_aggregates(period.day, period.year, period.month)
+            .unwrap();
+        assert_eq!(storage.daily_cost_by_agent, before_rebuild);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_prior_day_record_invalidates_day_cache() {
+        // An off-day batch row invalidates the day cache before later reads.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let today_cost = 0.75;
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![
+                (
+                    usage_costing_at(1.25, now - Duration::days(2)),
+                    "provider.prior".to_owned(),
+                ),
+                (
+                    usage_costing_at(today_cost, now),
+                    "provider.today".to_owned(),
+                ),
+            ],
+            Some("main"),
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+
+        {
+            let storage = base.lock_storage();
+            assert!(!storage.aggregates_current);
+        }
+        let expected = HashMap::from([("main".to_owned(), today_cost)]);
+        let mut storage = base.lock_storage();
+        storage.ensure_period_cache_current().unwrap();
+        assert_eq!(
+            storage.daily_cost_by_agent,
+            ledger_daily_by_agent(&storage.path)
+        );
+        assert_eq!(storage.daily_cost_by_agent, expected);
+        assert!((storage.daily_cost_usd - today_cost).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_without_per_agent_tracking_stays_unattributed() {
+        // A disabled per-agent mode must discard the supplied batch alias.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: false,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        base.record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+            vec![
+                (usage_costing_at(1.25, now), "provider.one".to_owned()),
+                (usage_costing_at(0.75, now), "provider.two".to_owned()),
+            ],
+            Some("main"),
+            Some("goal-a".to_owned()),
+        )
+        .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let records: Vec<CostRecord> = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(records.iter().all(|record| record.agent_alias.is_none()));
+        let storage = base.lock_storage();
+        assert!(storage.daily_cost_by_agent.is_empty());
+        assert!((storage.daily_cost_usd - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_sync_failure_keeps_per_agent_totals_consistent() {
+        // An appended batch remains visible to every total when sync fails.
+        fn fail_sync(_: &File) -> std::io::Result<()> {
+            Err(std::io::Error::other("forced sync failure"))
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let error = base
+            .record_scoped_usage_batch_with_owned_task_and_provider_attribution_with_sync(
+                vec![
+                    (usage_costing_at(1.0, now), "provider.one".to_owned()),
+                    (usage_costing_at(1.0, now), "provider.two".to_owned()),
+                ],
+                Some("main"),
+                Some("goal-a".to_owned()),
+                fail_sync,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Failed to sync cost storage"));
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let records: Vec<CostRecord> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.agent_alias.as_deref() == Some("main"))
+        );
+        let storage = base.lock_storage();
+        assert_eq!(storage.daily_cost_by_agent, ledger_daily_by_agent(&path));
+        assert!((storage.daily_cost_by_agent["main"] - 2.0).abs() < 1e-9);
+        drop(storage);
+        match base
+            .derived_for_agent("main", 1.0)
+            .check_budget(0.0)
+            .unwrap()
+        {
+            BudgetCheck::Exceeded { current_usd, .. } => {
+                assert!((current_usd - 2.0).abs() < 1e-9);
+            }
+            other => panic!("expected main's $1 ceiling to be exceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_task_usage_batch_on_frozen_chain_scope_matches_single_writer() {
+        // A frozen descendant mode must credit ancestors for every batch event.
+        let tmp = TempDir::new().unwrap();
+        let base = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                daily_limit_usd: 100.0,
+                monthly_limit_usd: 500.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .unwrap();
+        let now = Utc::now();
+        base.record_usage_with_agent(usage_costing_at(6.0, now), Some("parent"))
+            .unwrap();
+        let parent_scope = base.derived_for_agent("parent", 5.0);
+        let child = base.derived_for_agent_in_chain(
+            "child",
+            8.0,
+            parent_scope.subtree_chain_for_children(),
+        );
+
+        let mut reloaded = base.config();
+        reloaded.track_per_agent = false;
+        base.update_config(reloaded);
+        child
+            .record_scoped_usage_batch_with_owned_task_and_provider_attribution(
+                vec![
+                    (usage_costing_at(0.5, now), "provider.one".to_owned()),
+                    (usage_costing_at(0.5, now), "provider.two".to_owned()),
+                ],
+                Some("child"),
+                Some("goal-a".to_owned()),
+            )
+            .unwrap();
+
+        assert!((base.get_summary_for_agent("child").unwrap().daily_cost_usd - 1.0).abs() < 1e-9);
+        for tracker in [&parent_scope, &child] {
+            match tracker.check_budget(0.0).unwrap() {
+                BudgetCheck::Exceeded {
+                    current_usd,
+                    agent_alias,
+                    ..
+                } => {
+                    assert_eq!(agent_alias.as_deref(), Some("parent"));
+                    assert!((current_usd - 7.0).abs() < 1e-9);
+                }
+                other => panic!("expected parent's $5 ceiling to be exceeded, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn required_global_tracker_binds_each_ledger_to_its_own_tracker() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let trackers = RwLock::new(HashMap::new());
+
+        let tracker_a =
+            CostTracker::resolve_global_required(&trackers, enabled_config(), first.path())
+                .expect("first required tracker opens its canonical ledger");
+        let tracker_b =
+            CostTracker::resolve_global_required(&trackers, enabled_config(), second.path())
+                .expect("second required tracker opens its own canonical ledger");
+
+        assert!(!Arc::ptr_eq(&tracker_a, &tracker_b));
+
+        tracker_b
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/model", 1, 1, 0, 1.0, 1.0, 0.0),
+                Some("agent-b"),
+                Some("goal-b".into()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            tracker_b
+                .get_strict_usage_totals_for_task_with_pricing("goal-b")
+                .unwrap()
+                .0,
+            2
+        );
+        assert_eq!(
+            tracker_a
+                .get_strict_usage_totals_for_task_with_pricing("goal-b")
+                .unwrap()
+                .0,
+            0
+        );
+
+        let tracker_a_again =
+            CostTracker::resolve_global_required(&trackers, enabled_config(), first.path())
+                .expect("re-resolving ledger A returns its existing tracker");
+        assert!(Arc::ptr_eq(&tracker_a, &tracker_a_again));
+    }
+
+    #[test]
+    fn ordinary_and_required_resolution_share_one_tracker_per_ledger() {
+        let tmp = TempDir::new().unwrap();
+        let trackers = RwLock::new(HashMap::new());
+        let disabled = CostConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let required =
+            CostTracker::resolve_global_required(&trackers, disabled.clone(), tmp.path())
+                .expect("required resolution opens the ledger while ordinary tracking is disabled");
+        let ordinary = CostTracker::resolve_global(&trackers, disabled, tmp.path())
+            .expect("ordinary resolution reuses the resident tracker");
+
+        assert!(Arc::ptr_eq(&required, &ordinary));
+        assert!(matches!(
+            required.check_budget(1.0).unwrap(),
+            BudgetCheck::Allowed
+        ));
+
+        required
+            .record_scoped_usage_with_owned_task_attribution(
+                TokenUsage::new("test/model", 1, 1, 0, 1.0, 1.0, 0.0),
+                Some("agent-a"),
+                Some("goal-a".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            required
+                .get_strict_usage_totals_for_task_with_pricing("goal-a")
+                .unwrap()
+                .0,
+            2,
+            "required accounting persists task usage while ordinary budgeting stays disabled"
+        );
     }
 
     #[test]
