@@ -303,6 +303,9 @@ impl BuildRegistry {
 pub struct ScopedToolRegistry(
     Vec<Box<dyn Tool>>,
     Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    /// The session memory route the registry's memory-starting tools share;
+    /// see [`ScopedToolRegistry::pin_session_memory`].
+    Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
 );
 
 impl std::ops::Deref for ScopedToolRegistry {
@@ -354,6 +357,44 @@ impl ScopedToolRegistry {
             // surviving executable tools usable through their eager schemas.
             state.set_deferred_builtin_specs(Vec::new());
         }
+    }
+
+    /// Pin the session memory route this registry's memory-starting tools
+    /// share to `memory`, the session owner's routed handle. The pipeline's
+    /// memory steps, `spawn_subagent`'s child runs and the SOP tools' audit
+    /// then use it; the memory tools the pipeline captured, the memory a
+    /// child would build for itself and the SOP audit logger the tools were
+    /// built with all point at the shared plane.
+    ///
+    /// Skill wrappers that captured either tool at assembly hold the same
+    /// instances, so they follow the pin too. Fails closed: a registry that
+    /// holds either tool but carries no route was not assembled from the
+    /// factory's tool set, and pinning it would leave those tools on the
+    /// shared plane, so it is refused.
+    pub(crate) fn pin_session_memory(
+        &self,
+        memory: Arc<dyn zeroclaw_memory::Memory>,
+        security: Arc<SecurityPolicy>,
+    ) -> anyhow::Result<()> {
+        if let Some(route) = &self.2 {
+            return route.pin(memory, security);
+        }
+        let starts_memory_work = self.0.iter().any(|tool| {
+            matches!(
+                tool.name(),
+                tools::SpawnSubagentTool::NAME
+                    | tools::PipelineTool::NAME
+                    | "sop_execute"
+                    | "sop_advance"
+                    | "sop_approve"
+            )
+        });
+        if starts_memory_work {
+            anyhow::bail!(
+                "this session's tools cannot carry its owner's memory plane; refusing to pin it"
+            );
+        }
+        Ok(())
     }
 
     /// Rebind the memory-backed tools of an ALREADY-sealed registry to a new
@@ -411,7 +452,7 @@ impl ScopedToolRegistry {
     /// in shipped builds and the seal holds where it matters.
     #[cfg(any(test, feature = "test-util"))]
     pub fn from_raw_for_test(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self(tools, None)
+        Self(tools, None, None)
     }
 }
 
@@ -576,6 +617,7 @@ impl ScopedToolRegistry {
             reaction_handle,
             poll_handle,
             escalate_handle,
+            session_memory,
             channel_room_handle,
             mut unfiltered_tool_arcs,
             // Test-only capture of the concrete delegate instance; `assemble`
@@ -710,6 +752,10 @@ impl ScopedToolRegistry {
                     caller_allowed,
                 ),
             );
+            let tool = match &session_memory {
+                Some(route) => tool.with_session_memory(Arc::clone(route)),
+                None => tool,
+            };
             #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
             tools::late_tool_search_observer::record("constructor-return", "pipeline", 0, 0);
             builtin_names.insert(tool.name().to_string());
@@ -1326,7 +1372,11 @@ impl ScopedToolRegistry {
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         tools::late_tool_search_observer::record("phase", "seal", 7, 0);
         ScopedAssembled {
-            registry: ScopedToolRegistry(tools_registry.seal(pipeline_id), builtin_schema_handle),
+            registry: ScopedToolRegistry(
+                tools_registry.seal(pipeline_id),
+                builtin_schema_handle,
+                session_memory,
+            ),
             delegate_handle,
             ask_user_handle,
             reaction_handle,
@@ -1421,6 +1471,7 @@ mod tests {
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs: Vec::new(),
@@ -1453,6 +1504,7 @@ mod tests {
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             poll_handle: None,
+            session_memory: None,
             escalate_handle: None,
             channel_room_handle: None,
             unfiltered_tool_arcs,
@@ -2618,7 +2670,7 @@ mod tests {
 
     fn assembled_with_sections(deferred: &str, pinned: &str) -> ScopedAssembled {
         ScopedAssembled {
-            registry: ScopedToolRegistry(Vec::new(), None),
+            registry: ScopedToolRegistry(Vec::new(), None, None),
             delegate_handle: None,
             ask_user_handle: None,
             reaction_handle: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),

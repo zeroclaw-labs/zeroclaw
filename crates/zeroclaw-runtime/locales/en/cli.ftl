@@ -1683,3 +1683,4 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 skill-http-request-timeout = HTTP request timed out
+cli-sop-run-unavailable = SOP run unavailable in this session.
