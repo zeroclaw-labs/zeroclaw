@@ -42,10 +42,12 @@ use crate::theme;
 use crate::turn_status::TurnStatus;
 
 mod context_menu;
+#[cfg(all(test, not(windows)))]
+use context_menu::PATH_CONTEXT_ACTIONS;
 #[cfg(test)]
 use context_menu::{
-    CHARACTER_SELECTION_CONTEXT_ACTIONS, PATH_CONTEXT_ACTIONS, QUEUE_CONTEXT_ACTIONS,
-    TRANSCRIPT_CONTEXT_ACTIONS, URL_WITH_COPY_CONTEXT_ACTIONS,
+    CHARACTER_SELECTION_CONTEXT_ACTIONS, QUEUE_CONTEXT_ACTIONS, TRANSCRIPT_CONTEXT_ACTIONS,
+    URL_WITH_COPY_CONTEXT_ACTIONS,
 };
 use context_menu::{
     ChatContextMenu, ChatContextMenuAction, ChatContextMenuRequest, ChatContextMenuTarget,
@@ -3450,6 +3452,19 @@ impl Chat {
     }
 
     async fn execute_context_menu_request(&mut self, request: ChatContextMenuRequest) {
+        if self.rpc.transport() != crate::client::Transport::Local
+            && match &request {
+                ChatContextMenuRequest::OpenUrl(target)
+                | ChatContextMenuRequest::CopyUrl(target) => {
+                    crate::path_open::is_path_target(target)
+                }
+                ChatContextMenuRequest::RevealPath(_)
+                | ChatContextMenuRequest::AddPathToChat(_) => true,
+                _ => false,
+            }
+        {
+            return;
+        }
         match request {
             ChatContextMenuRequest::AddToChat(target) => {
                 let ChatPhase::Active(ref mut state) = self.phase else {
@@ -3482,7 +3497,11 @@ impl Chat {
                 }
             }
             ChatContextMenuRequest::OpenUrl(url) => {
-                let notice = open_link_target(&url).await;
+                let notice = open_link_target(
+                    &url,
+                    self.rpc.transport() == crate::client::Transport::Local,
+                )
+                .await;
                 if let ChatPhase::Active(ref mut state) = self.phase
                     && let Some(notice) = notice
                 {
@@ -4031,7 +4050,14 @@ impl Chat {
                 explorer.render(frame, area);
             }
             ChatPhase::Active(state) => {
-                render_with_plan_placement(frame, state, area, self.pane_kind, plan_placement);
+                render_with_plan_placement(
+                    frame,
+                    state,
+                    area,
+                    self.pane_kind,
+                    plan_placement,
+                    self.rpc.transport() == crate::client::Transport::Local,
+                );
             }
             ChatPhase::Error(msg) => {
                 draw_error(frame, area, msg, &self.pane_kind.name());
@@ -5706,7 +5732,12 @@ impl Chat {
             if state.in_browse_mode() {
                 match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
                     UrlPointerAction::Open(url) => {
-                        if let Some(notice) = open_link_target(&url).await {
+                        if let Some(notice) = open_link_target(
+                            &url,
+                            self.rpc.transport() == crate::client::Transport::Local,
+                        )
+                        .await
+                        {
                             state.set_info_notice(notice);
                         }
                         return;
@@ -5786,7 +5817,12 @@ impl Chat {
                     MouseEventKind::Up(MouseButton::Left) => {
                         match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
                             UrlPointerAction::Open(url) => {
-                                if let Some(notice) = open_link_target(&url).await {
+                                if let Some(notice) = open_link_target(
+                                    &url,
+                                    self.rpc.transport() == crate::client::Transport::Local,
+                                )
+                                .await
+                                {
                                     state.set_info_notice(notice);
                                 }
                             }
@@ -6547,7 +6583,7 @@ enum PlanPlacement {
 
 #[cfg(test)]
 fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind) {
-    render_with_plan_placement(f, state, area, pane_kind, PlanPlacement::Legacy);
+    render_with_plan_placement(f, state, area, pane_kind, PlanPlacement::Legacy, false);
 }
 
 fn render_with_plan_placement(
@@ -6556,6 +6592,7 @@ fn render_with_plan_placement(
     area: Rect,
     pane_kind: PaneKind,
     plan_placement: PlanPlacement,
+    path_links: bool,
 ) {
     // The shell owns the dock split in production. Keep the old in-pane carve
     // only for narrow widget tests that exercise the tracker in isolation.
@@ -6665,7 +6702,7 @@ fn render_with_plan_placement(
         conv_area
     };
 
-    render_conversation(f, state, actual_conv);
+    render_conversation_with_path_links(f, state, actual_conv, path_links);
     #[cfg(test)]
     if matches!(plan_placement, PlanPlacement::Legacy) {
         render_context_menu(f, state);
@@ -7873,7 +7910,16 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
+#[cfg(test)]
 fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLineRegion> {
+    url_line_regions_with_path_links(lines, width, true)
+}
+
+fn url_line_regions_with_path_links(
+    lines: &[Line<'static>],
+    width: u16,
+    path_links: bool,
+) -> Vec<UrlLineRegion> {
     use ratatui::style::Color;
 
     if width == 0 {
@@ -7883,7 +7929,7 @@ fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLin
     let mut screen_row = 0u16;
     for line in lines {
         let rows = wrapped_rows(line, width);
-        let (text, urls) = actionable_url_ranges(line);
+        let (text, urls) = actionable_url_ranges(line, path_links);
         if !urls.is_empty() {
             // Private color tags carry occurrence identity through Paragraph's
             // actual wrapping and alignment; these colors are never displayed.
@@ -7914,8 +7960,13 @@ fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLin
     regions
 }
 
-fn finalize_url_line_regions(lines: &mut [Line<'static>], width: u16) -> Vec<UrlLineRegion> {
-    let regions = url_line_regions_for_lines(lines, width);
+fn finalize_url_line_regions(
+    lines: &mut [Line<'static>],
+    width: u16,
+    path_links: bool,
+) -> Vec<UrlLineRegion> {
+    style_recognized_links(lines, path_links);
+    let regions = url_line_regions_with_path_links(lines, width, path_links);
     for span in lines.iter_mut().flat_map(|line| &mut line.spans) {
         if disables_url_actions(span) {
             span.style.underline_color = None;
@@ -8228,10 +8279,20 @@ type ConversationRenderResult = ConversationRenderWork;
 #[cfg(not(test))]
 type ConversationRenderResult = ();
 
+#[cfg(test)]
 fn render_conversation(
     f: &mut Frame,
     state: &mut ChatState,
     area: Rect,
+) -> ConversationRenderResult {
+    render_conversation_with_path_links(f, state, area, false)
+}
+
+fn render_conversation_with_path_links(
+    f: &mut Frame,
+    state: &mut ChatState,
+    area: Rect,
+    path_links: bool,
 ) -> ConversationRenderResult {
     state.refresh_title_hit_rects(area);
     state.expire_copy_feedback();
@@ -8243,11 +8304,12 @@ fn render_conversation(
     // ── Rebuild cached lines only when entries changed ────────
     if state.transcript_layout.view().dirty != LinesDirty::Clean
         || state.transcript_layout.view().cached_render_width != inner_width
+        || state.transcript_layout.view().cached_path_links != path_links
     {
         // Selection endpoints belong to one stable rendered-content geometry.
         // Viewport movement preserves them, but a cache rebuild does not.
         state.clear_transcript_selection_for_render_change();
-        state.rebuild_lines(inner_width);
+        state.rebuild_lines_with_path_links(inner_width, path_links);
     }
 
     // Determine transient overlays (live streaming / approval) up front from
@@ -8310,7 +8372,7 @@ fn render_conversation(
         Vec::new()
     };
     let transient_url_regions = if transient {
-        let mut regions = finalize_url_line_regions(&mut overlay_lines, inner_width);
+        let mut regions = finalize_url_line_regions(&mut overlay_lines, inner_width, path_links);
         offset_url_line_regions(
             &mut regions,
             state.transcript_layout.view().cached_total_rows,
@@ -9417,8 +9479,11 @@ fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
 
 /// Open a transcript link target and return the notice to show, if any.
 /// Paths that could run code when opened are revealed instead.
-async fn open_link_target(target: &str) -> Option<String> {
+async fn open_link_target(target: &str, path_links: bool) -> Option<String> {
     if crate::path_open::is_path_target(target) {
+        if !path_links {
+            return None;
+        }
         match crate::path_open::open(target).await {
             Ok(crate::path_open::OpenOutcome::Opened) => None,
             Ok(crate::path_open::OpenOutcome::Revealed) => {
@@ -9439,9 +9504,9 @@ async fn open_link_target(target: &str) -> Option<String> {
 /// HTTP(S) URLs plus existing local file paths, ordered by start. Both kinds
 /// share one hit map; path targets are absolute and start with `/`, URL
 /// targets carry their scheme, so consumers can tell them apart.
-fn recognized_link_ranges(text: &str) -> Vec<(usize, usize, String)> {
+fn recognized_link_ranges(text: &str, path_links: bool) -> Vec<(usize, usize, String)> {
     let mut ranges = recognized_url_ranges(text);
-    if text.contains('/') {
+    if path_links && text.contains('/') {
         let paths = crate::path_open::recognized_path_ranges(text, &ranges);
         if !paths.is_empty() {
             ranges.extend(paths);
@@ -9452,8 +9517,12 @@ fn recognized_link_ranges(text: &str) -> Vec<(usize, usize, String)> {
 }
 
 fn style_recognized_urls(lines: &mut [Line<'static>]) {
+    style_recognized_links(lines, false);
+}
+
+fn style_recognized_links(lines: &mut [Line<'static>], path_links: bool) {
     for line in lines {
-        let (_, ranges) = actionable_url_ranges(line);
+        let (_, ranges) = actionable_url_ranges(line, path_links);
         if ranges.is_empty() {
             continue;
         }
@@ -9509,7 +9578,10 @@ fn disabled_url_actions_style() -> Style {
     }
 }
 
-fn actionable_url_ranges(line: &Line<'static>) -> (String, Vec<(usize, usize, String)>) {
+fn actionable_url_ranges(
+    line: &Line<'static>,
+    path_links: bool,
+) -> (String, Vec<(usize, usize, String)>) {
     let text = line
         .spans
         .iter()
@@ -9524,7 +9596,7 @@ fn actionable_url_ranges(line: &Line<'static>) -> (String, Vec<(usize, usize, St
         }
         offset = end;
     }
-    let urls = recognized_link_ranges(&text)
+    let urls = recognized_link_ranges(&text, path_links)
         .into_iter()
         .filter(|(start, end, _)| {
             !disabled_ranges
@@ -11197,7 +11269,14 @@ impl ChatState {
     }
 
     fn rebuild_lines(&mut self, width: u16) {
-        if self.transcript_layout.view().cached_render_width != width {
+        // Geometry-only callers have no transport context and must not probe files.
+        self.rebuild_lines_with_path_links(width, false);
+    }
+
+    fn rebuild_lines_with_path_links(&mut self, width: u16, path_links: bool) {
+        if self.transcript_layout.view().cached_render_width != width
+            || self.transcript_layout.view().cached_path_links != path_links
+        {
             self.pending_url_activation = None;
         }
         let range = self.transcript_layout.render_range(
@@ -11238,8 +11317,13 @@ impl ChatState {
                         disclosure,
                     }
                 });
-        self.transcript_layout
-            .rebuild(width, range.clone(), self.show_thoughts, inputs);
+        self.transcript_layout.rebuild(
+            width,
+            range.clone(),
+            self.show_thoughts,
+            path_links,
+            inputs,
+        );
     }
 
     /// Resolve the ordered cached-entry indices whose screen rows overlap the
@@ -13458,6 +13542,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn wrapped_path_with_space_is_one_link_on_every_row() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -13527,6 +13612,77 @@ mod tests {
             };
             assert_eq!(menu.into_request(), Some(expected));
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn remote_transcripts_keep_local_paths_plain_and_urls_actionable() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("remote-document.md");
+        std::fs::write(&file, "document").unwrap();
+        let path = file.to_str().unwrap().to_string();
+        let url = "https://example.com/docs";
+        let text = format!("{path} {url}");
+        // Warm the shared existence cache as a preceding local pane could.
+        let lines = vec![Line::from(text.clone())];
+        let _ = url_line_regions_for_lines(&lines, 100);
+        crate::path_open::wait_for_path_checks();
+
+        for transport in [
+            crate::client::Transport::Local,
+            crate::client::Transport::Wss,
+        ] {
+            let (mut chat, _rx) = test_chat_with_transport(transport);
+            let mut active = state();
+            active.push_user_message(Some(text.clone()), Vec::new());
+            active.streaming_text = text.clone();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    chat.draw(frame, area);
+                })
+                .unwrap();
+            let ChatPhase::Active(active) = &chat.phase else {
+                panic!("active");
+            };
+            assert!(active.url_hit_regions.iter().any(|hit| hit.url == url));
+            assert_eq!(
+                active.url_hit_regions.iter().any(|hit| hit.url == path),
+                transport == crate::client::Transport::Local,
+                "path actions must follow the pane's live transport",
+            );
+            assert!(
+                active
+                    .transcript_layout
+                    .view()
+                    .cached_url_regions
+                    .iter()
+                    .flat_map(|region| &region.urls)
+                    .all(
+                        |(_, _, target)| transport == crate::client::Transport::Local
+                            || target == url
+                    )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_context_menu_rejects_local_path_actions() {
+        let (mut chat, _rx) = test_chat_with_transport(crate::client::Transport::Wss);
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.execute_context_menu_request(ChatContextMenuRequest::AddPathToChat(
+            "/tmp/document.md".to_string(),
+        ))
+        .await;
+        let ChatPhase::Active(active) = &chat.phase else {
+            panic!("active");
+        };
+        assert!(active.input_bar.input().is_empty());
+        assert_eq!(open_link_target("/tmp/document.md", false).await, None);
     }
 
     #[test]
