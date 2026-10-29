@@ -1,7 +1,7 @@
 use super::traits::{Memory, MemoryCategory};
 use super::{
     MemoryBackendKind, backend_kind_from_dotted, classify_memory_backend,
-    create_memory_for_migration, create_memory_from_config,
+    create_memory_for_migration, create_memory_from_config, validate_memory_backend_reference,
 };
 use crate::config::Config;
 use anyhow::{Result, bail};
@@ -56,6 +56,7 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
 }
 
 fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
+    validate_memory_backend_reference(&config.memory.backend)?;
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         bail!("Memory backend is 'none' (disabled). No entries to manage.");
@@ -87,6 +88,7 @@ async fn handle_reindex(config: &Config) -> Result<()> {
 }
 
 fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
+    validate_memory_backend_reference(&config.memory.backend)?;
     let backend = backend_kind_from_dotted(&config.memory.backend);
 
     match classify_memory_backend(&backend) {
@@ -471,6 +473,29 @@ fn truncate_content(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn cli_memory_rejects_blank_backend_instead_of_reporting_none() {
+        let tmp = TempDir::new().unwrap();
+        for raw in ["", "   "] {
+            let mut config = Config::default();
+            config.data_dir = tmp.path().to_path_buf();
+            config.memory.backend = raw.into();
+            for (path, result) in [
+                ("create_cli_memory", create_cli_memory(&config)),
+                (
+                    "create_memory_with_embedder",
+                    create_memory_with_embedder(&config),
+                ),
+            ] {
+                let msg = match result {
+                    Ok(_) => panic!("{path}: blank backend {raw:?} must not construct"),
+                    Err(err) => err.to_string(),
+                };
+                assert!(msg.contains("blank"), "{path} {raw:?}: {msg}");
+            }
+        }
+    }
 
     #[cfg(feature = "agent-runtime")]
     #[tokio::test]

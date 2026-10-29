@@ -859,6 +859,7 @@ cli-status-web-ui-missing = 🌐 Web UI:        未検出
 cli-status-heartbeat = 💓 ハートビート:      {$v}
 cli-status-heartbeat-every-minutes = {$minutes}分ごと
 cli-status-memory = 🧠 メモリ:         {$backend} (自動保存: {$auto_save})
+cli-status-memory-invalid = 無効 (memory.backend を確認)
 cli-status-security-noprofile = セキュリティ ({$alias}): <risk_profile なし>
 cli-status-security = セキュリティ ({$alias}):
 cli-status-workspace-only = {"  "}ワークスペースのみ:    {$v}

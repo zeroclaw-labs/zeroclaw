@@ -864,6 +864,7 @@ cli-status-web-ui-missing = 🌐 Web UI :        MANQUANT
 cli-status-heartbeat = 💓 Battement de cœur :      {$v}
 cli-status-heartbeat-every-minutes = toutes les {$minutes}min
 cli-status-memory = 🧠 Mémoire :         {$backend} (sauvegarde auto : {$auto_save})
+cli-status-memory-invalid = invalide (voir memory.backend)
 cli-status-security-noprofile = Sécurité ({$alias}) : <aucun risk_profile>
 cli-status-security = Sécurité ({$alias}) :
 cli-status-workspace-only = {"  "}Espace de travail uniquement :    {$v}

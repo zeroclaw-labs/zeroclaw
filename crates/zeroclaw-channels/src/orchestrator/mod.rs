@@ -17480,7 +17480,8 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
 
             println!("🦀 ZeroClaw Channel Server");
             println!("  🤖 Model:    {model} (agent: {agent_alias})");
-            let effective_backend = config.resolve_active_storage().kind();
+            let effective_backend =
+                zeroclaw_memory::reportable_memory_backend(&config).unwrap_or("invalid");
             println!(
                 "  🧠 Memory:   {} (auto-save: {})",
                 effective_backend,

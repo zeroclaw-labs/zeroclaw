@@ -12708,7 +12708,9 @@ pub struct MemoryConfig {
     /// (e.g. `"sqlite.default"`, `"postgres.work"`). Resolves through
     /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
     /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
-    /// disable persistence entirely.
+    /// disable persistence entirely. A blank value, or a value outside the
+    /// built-in backends, is rejected when memory is constructed; it does not
+    /// fall back to another backend.
     #[serde(default = "default_memory_backend")]
     pub backend: String,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.

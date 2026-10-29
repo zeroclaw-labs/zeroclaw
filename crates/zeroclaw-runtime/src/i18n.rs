@@ -1731,6 +1731,35 @@ mod tests {
     }
 
     #[test]
+    fn status_memory_invalid_label_is_translated_in_every_locale() {
+        // `zeroclaw status` shows this when memory.backend names no backend.
+        // It must exist in every catalogue and be localized, not English.
+        const KEY: &str = "cli-status-memory-invalid";
+
+        let english = format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", KEY, &[])
+            .unwrap_or_else(|| panic!("{KEY} should format in en"));
+        assert!(english.contains("memory.backend"), "en: {english:?}");
+
+        for (source, locale) in [
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let value = format_ftl_message(source, locale, KEY, &[])
+                .unwrap_or_else(|| panic!("{KEY} should format in {locale}"));
+            assert!(
+                value.contains("memory.backend"),
+                "{KEY} in {locale} must keep the literal config key; got {value:?}"
+            );
+            assert_ne!(
+                value, english,
+                "{KEY} in {locale} is the English string verbatim"
+            );
+        }
+    }
+
+    #[test]
     fn channel_approval_group_visibility_warning_is_translated_in_every_locale() {
         // This warning is what tells an operator why a stranger's reply to a
         // group approval token will bounce, so a catalogue that omits it ships

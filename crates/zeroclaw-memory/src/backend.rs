@@ -100,6 +100,9 @@ pub fn default_memory_backend_key() -> &'static str {
 }
 
 pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
+    // Only the explicit "none" disables memory. A blank value is not a
+    // choice someone wrote down, so it classifies as unknown and fails
+    // construction like any other unrecognised name.
     match backend {
         "sqlite" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
@@ -194,6 +197,12 @@ mod tests {
                 .any(|b| b.key == "qdrant"),
             "qdrant is configurable but not an onboarding option"
         );
+    }
+
+    #[test]
+    fn classify_treats_a_blank_backend_as_unknown_not_disabled() {
+        assert_eq!(classify_memory_backend(""), MemoryBackendKind::Unknown);
+        assert_eq!(classify_memory_backend("   "), MemoryBackendKind::Unknown);
     }
 
     #[test]

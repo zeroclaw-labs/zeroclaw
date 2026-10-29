@@ -11653,7 +11653,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     }
                 }
             }
-            let effective_memory_backend = config.resolve_active_storage().kind();
+            let effective_memory_backend = zeroclaw_memory::reportable_memory_backend(&config);
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
                 let heartbeat_every_fallback = format!("every {}min", interval_minutes);
@@ -11674,7 +11674,10 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     &heartbeat_fallback
                 )
             );
-            let memory_backend = effective_memory_backend.to_string();
+            let memory_backend = match effective_memory_backend {
+                Some(kind) => kind.to_string(),
+                None => t("cli-status-memory-invalid", "invalid (see memory.backend)"),
+            };
             let memory_auto_save = if config.memory.auto_save {
                 t("cli-status-word-on", "on")
             } else {

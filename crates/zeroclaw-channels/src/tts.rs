@@ -2131,6 +2131,14 @@ mod tests {
         // Fake `edge-tts`: records the `--write-media` output path, writes an
         // unreadable artifact there, and exits successfully, forcing the
         // output-read failure path.
+        //
+        // Root ignores file-permission bits, so `chmod 000` does not produce
+        // an unreadable file when the test runs as uid 0 (e.g. inside the CI
+        // container). Skip rather than producing a false-positive `Ok` result.
+        // SAFETY: getuid() is always safe to call; no pointer arguments.
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
         let temp_dir = std::env::temp_dir();
         let script_path =
             temp_dir.join(format!("zeroclaw_edgetts_test_{}.sh", uuid::Uuid::new_v4()));

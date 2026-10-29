@@ -1119,6 +1119,11 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn native_with_shell_bash() {
+        // bash is not present in the minimal StageX container image; skip
+        // rather than failing on a host-tool absence.
+        if crate::platform::resolve_executable(std::ffi::OsStr::new("bash")).is_err() {
+            return;
+        }
         let runtime = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
         let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
@@ -1145,6 +1150,11 @@ mod tests {
 
     #[test]
     fn native_with_shell_passes_c_flag() {
+        // bash is not present in the minimal StageX container image; skip
+        // rather than failing on a host-tool absence.
+        if crate::platform::resolve_executable(std::ffi::OsStr::new("bash")).is_err() {
+            return;
+        }
         let runtime = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
         let cmd = runtime
