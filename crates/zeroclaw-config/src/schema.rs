@@ -44485,6 +44485,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
         let email = crate::scattered_types::EmailConfig::default().prop_fields();
         assert_description(&email, ".observer_mode", "never modifies any IMAP flag");
+        assert_description(&email, ".html_image_domains", "reduced to its alt text");
 
         let model_provider = ModelProviderConfig::default().prop_fields();
         assert_description(
