@@ -452,6 +452,7 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = 未设置（使用自动检测）
 cli-self-test-web-dist-dir-pass-literal = {$path}（字面路径）
 cli-self-test-web-dist-dir-fail-expansion = 警告：{$path} — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
+cli-self-test-gateway-not-in-build = 未包含在此构建中（仅 CLI）
 cli-service-systemd-linger-disabled-warning = systemd 用户 linger 已禁用。ZeroClaw 的用户服务可能会在注销后停止。启用命令：loginctl enable-linger {$user}
 cli-peripherals-none = 未配置外设。
 cli-peripherals-add-hint = 使用以下命令添加: zeroclaw peripheral add <board> <path>

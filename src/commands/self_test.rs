@@ -376,7 +376,10 @@ fn format_probe_url(scheme: &str, configured_host: &str, port: u16, path: &str) 
 async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
     // A CLI-only build has no gateway to probe; that is its expected shape.
     if !cfg!(feature = "gateway") {
-        return CheckResult::pass("gateway", "not included in this build (CLI-only)");
+        return CheckResult::pass(
+            "gateway",
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-gateway-not-in-build"),
+        );
     }
     let port = config.gateway.port;
     let (probe_host, _) = resolve_probe_host(&config.gateway.host);
@@ -792,6 +795,9 @@ fi
         let config = zeroclaw_config::schema::Config::default();
         let result = super::check_gateway_health(&config).await;
         assert!(result.passed, "{}", result.detail);
+        let expected_detail =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-gateway-not-in-build");
+        assert_eq!(result.detail, expected_detail);
         assert!(result.detail.contains("not included in this build"));
     }
 }

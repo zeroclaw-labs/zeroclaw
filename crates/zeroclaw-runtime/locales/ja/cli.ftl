@@ -451,6 +451,7 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = 未設定（自動検出を使用）
 cli-self-test-web-dist-dir-pass-literal = {$path}（リテラルパス）
 cli-self-test-web-dist-dir-fail-expansion = 警告: {$path} — {$reason}。gateway.web_dist_dir はそのまま読み込まれるため、値を自分で展開してください（例: 絶対パス）
+cli-self-test-gateway-not-in-build = このビルドには含まれていません（CLI専用）
 cli-service-systemd-linger-disabled-warning = systemd ユーザー linger は無効です。ZeroClaw のユーザーサービスはログアウト後に停止する可能性があります。有効化: loginctl enable-linger {$user}
 cli-peripherals-none = 周辺機器が設定されていません。
 cli-peripherals-add-hint = 次のコマンドで追加します: zeroclaw peripheral add <board> <path>

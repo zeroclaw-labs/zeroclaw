@@ -453,6 +453,7 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = no establecido (usando detección automática)
 cli-self-test-web-dist-dir-pass-literal = {$path} (ruta literal)
 cli-self-test-web-dist-dir-fail-expansion = ADVERTENCIA: {$path} — {$reason}; gateway.web_dist_dir se lee literalmente, así que expande el valor tú mismo (p. ej., una ruta absoluta)
+cli-self-test-gateway-not-in-build = no incluido en esta compilación (solo CLI)
 cli-service-systemd-linger-disabled-warning = la permanencia de usuario de systemd está deshabilitada. El servicio de usuario de ZeroClaw puede detenerse tras cerrar sesión. Habilítala con: loginctl enable-linger {$user}
 cli-peripherals-none = No hay periféricos configurados.
 cli-peripherals-add-hint = Agregue uno con: zeroclaw peripheral add <board> <path>
