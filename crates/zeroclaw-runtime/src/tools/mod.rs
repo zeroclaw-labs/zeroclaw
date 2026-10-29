@@ -138,7 +138,7 @@ pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 #[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::send_via::{
-    AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
+    AgentPeerGroupResolver, SendViaLimitsResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
     AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
@@ -2845,13 +2845,18 @@ fn all_tools_with_runtime_on_thread(
             let snapshot = filter_agent_peer_groups(root_config, agent_alias);
             Arc::new(move || snapshot.clone())
         };
+        let attachment_limits: SendViaLimitsResolver = if let Some(live) = live_config.clone() {
+            Arc::new(move || live.read().tools.send_via.clone())
+        } else {
+            let snapshot = root_config.tools.send_via.clone();
+            Arc::new(move || snapshot.clone())
+        };
         register_tool!(
             "send_via",
-            Arc::new(SendViaTool::new(
-                security.clone(),
-                ask_user_tool_handle,
-                agent_peer_groups,
-            ))
+            Arc::new(
+                SendViaTool::new(security.clone(), ask_user_tool_handle, agent_peer_groups)
+                    .with_attachment_limits(attachment_limits)
+            )
         );
     }
 
@@ -3625,6 +3630,7 @@ mod tests {
     fn optional_builtin_is_not_constructed_or_exposed_until_selected() {
         let mut selection = zeroclaw_config::builtin_tools::BuiltinToolsConfig {
             optional: Vec::new(),
+            ..zeroclaw_config::builtin_tools::BuiltinToolsConfig::default()
         };
         let constructions = std::cell::Cell::new(0);
         let mut registry = Vec::new();
@@ -3664,6 +3670,7 @@ mod tests {
         let mut config = Config {
             tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
                 optional: Vec::new(),
+                ..zeroclaw_config::builtin_tools::BuiltinToolsConfig::default()
             },
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
@@ -3750,6 +3757,7 @@ mod tests {
         Config {
             tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
                 optional: vec!["*".into()],
+                ..zeroclaw_config::builtin_tools::BuiltinToolsConfig::default()
             },
             data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
@@ -7602,6 +7610,87 @@ permissions = ["http_client"]
                 .error
                 .unwrap_or_default()
                 .contains("file_download.allowed_private_hosts")
+        );
+    }
+
+    /// The registered send_via reads its attachment limits from the live
+    /// config, so a reload reaches the same tool instance without a rebuild.
+    /// Enforcement shares that resolver with the schema.
+    #[test]
+    fn send_via_attachment_limits_follow_live_config_reload() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let root_config = test_config(&tmp);
+        let live_config = zeroclaw_config::live::LiveConfig::new(root_config.clone());
+
+        let tools = all_tools_with_runtime(
+            Arc::new(root_config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live_config.handle()),
+        )
+        .expect("tool registry should build")
+        .tools;
+        let send_via = tools
+            .iter()
+            .find(|tool| tool.name() == "send_via")
+            .expect("send_via must be registered when selected");
+        let advertised = || {
+            send_via.spec().parameters["properties"]["attachments"]["description"]
+                .as_str()
+                .expect("attachments must carry a description")
+                .to_string()
+        };
+
+        let defaults = &root_config.tools.send_via;
+        let initial = format!(
+            "At most {} files, {} bytes per file, {} bytes in total",
+            defaults.max_attachments,
+            defaults.max_attachment_bytes,
+            defaults.max_total_attachment_bytes
+        );
+        assert!(advertised().contains(&initial), "{}", advertised());
+
+        let mut reloaded = live_config.snapshot();
+        reloaded.tools.send_via = zeroclaw_config::schema::SendViaToolConfig {
+            max_attachments: 1,
+            max_attachment_bytes: 5,
+            max_total_attachment_bytes: 5,
+        };
+        live_config
+            .publish(live_config.next_revision().unwrap(), reloaded)
+            .unwrap();
+
+        assert!(
+            advertised().contains("At most 1 files, 5 bytes per file, 5 bytes in total"),
+            "the registered tool must advertise the reloaded limits: {}",
+            advertised()
         );
     }
 

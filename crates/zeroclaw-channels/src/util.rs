@@ -664,6 +664,24 @@ pub(crate) fn build_yesno_approval_prompt(
     )
 }
 
+/// The outbound message for a text approval prompt sent through the
+/// channel's own `send`. Inline attachments are off: the prompt quotes the
+/// tool's arguments, and a file or media marker in them must be shown to the
+/// operator as written, never uploaded or fetched before the call is decided.
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    test
+))]
+pub(crate) fn approval_prompt_message(
+    prompt: String,
+    recipient: &str,
+) -> zeroclaw_api::channel::SendMessage {
+    zeroclaw_api::channel::SendMessage::new(prompt, recipient).with_inline_attachments(false)
+}
+
 /// Localized `Tool call 2 of 3` line for an approval prompt, already
 /// newline-terminated, or empty when there is no counter to show.
 ///
@@ -1524,6 +1542,19 @@ mod tests {
         assert!(
             counter_at < tool_at,
             "counter should precede the tool line; got {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn approval_prompt_message_turns_inline_attachments_off() {
+        let prompt =
+            super::build_yesno_approval_prompt("ab12cd", "send_via", "body: [FILE:/ws/a]", None);
+        let message = super::approval_prompt_message(prompt.clone(), "C123");
+        assert_eq!(message.content, prompt);
+        assert_eq!(message.recipient, "C123");
+        assert!(
+            !message.inline_attachments,
+            "an approval prompt must not upload files named in its arguments"
         );
     }
 

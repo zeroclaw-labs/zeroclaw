@@ -781,6 +781,9 @@ fn from_wit_media(a: WitMediaAttachment) -> MediaAttachment {
     }
 }
 
+// `inline_attachments` is not carried: the WIT send-message record has no
+// such field, and adding one is an ABI change. A plugin receives the content
+// as written and decides itself whether markers in it become media.
 fn to_wit_send(msg: &SendMessage) -> WitSendMessage {
     WitSendMessage {
         content: msg.content.clone(),

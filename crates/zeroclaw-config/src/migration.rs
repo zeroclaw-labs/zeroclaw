@@ -239,10 +239,13 @@ pub fn migrate_to_current_resilient(input: &str) -> Config {
     migrate_to_current_salvaged(input).config
 }
 
-/// Top-level keys whose silent loss could *weaken* security posture: dropping
+/// Section paths whose silent loss could *weaken* security posture: dropping
 /// a malformed one to its `Default` may grant a broader posture than intended.
 /// Salvage still drops them (so the daemon boots) but logs ERROR and reports
 /// them in [`ResilientLoad::dropped_security`] for exposure gating.
+/// `tools.send_via` is here because its defaults are looser than a tightened
+/// limit, such as `max_attachments = 0`. Dropping a parent, such as the whole
+/// `[tools]` table, counts as dropping a nested path the document had set.
 pub const SECURITY_CRITICAL_KEYS: &[&str] = &[
     "security",
     "risk_profiles",
@@ -250,6 +253,7 @@ pub const SECURITY_CRITICAL_KEYS: &[&str] = &[
     "users",
     "oidc",
     "permission_profiles",
+    "tools.send_via",
 ];
 
 pub const WHOLE_CONFIG_SENTINEL: &str = "<entire-config>";
@@ -354,11 +358,13 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
         };
     }
 
+    let nested_security = present_nested_security_paths(&value);
     let mut salvaged = value;
     let mut dropped: Vec<String> = Vec::new();
     prune_bad_channel_aliases(&mut salvaged, &mut dropped);
     prune_bad_channel_types(&mut salvaged, &mut dropped);
     prune_bad_provider_aliases(&mut salvaged, &mut dropped);
+    prune_bad_tools_subsections(&mut salvaged, &mut dropped);
     prune_bad_top_level_sections(&mut salvaged, &mut dropped);
 
     let mut whole_config_lost = false;
@@ -385,7 +391,11 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
         dropped_security.push(WHOLE_CONFIG_SENTINEL.to_string());
     }
     for path in dropped {
-        if SECURITY_CRITICAL_KEYS.contains(&path.as_str()) {
+        let loses_nested = nested_security.iter().any(|key| {
+            key.strip_prefix(path.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
+        });
+        if SECURITY_CRITICAL_KEYS.contains(&path.as_str()) || loses_nested {
             dropped_security.push(path);
         } else {
             dropped_plain.push(path);
@@ -426,6 +436,21 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
         dropped: dropped_plain,
         dropped_security,
     }
+}
+
+/// Nested [`SECURITY_CRITICAL_KEYS`] paths, such as `tools.send_via`, that the
+/// document sets before salvage. Dropping their parent section loses them too.
+fn present_nested_security_paths(value: &toml::Value) -> Vec<&'static str> {
+    SECURITY_CRITICAL_KEYS
+        .iter()
+        .copied()
+        .filter(|key| key.contains('.'))
+        .filter(|key| {
+            key.split('.')
+                .try_fold(value, |node, part| node.get(part))
+                .is_some()
+        })
+        .collect()
 }
 
 /// Drop top-level `[section]`s that block deserialization (each → `Default`).
@@ -473,6 +498,38 @@ fn prune_bad_top_level_sections(value: &mut toml::Value, dropped: &mut Vec<Strin
             dropped.push(key);
         }
     }
+}
+
+/// Drop per-tool `[tools.<name>]` tables that fail to deserialize (each →
+/// `Default`), so one malformed tool limit does not take the whole `[tools]`
+/// table, and with it the `optional` selection, down to its default.
+fn prune_bad_tools_subsections(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    let Some(tools) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("tools"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+
+    let invalid: Vec<String> = tools
+        .iter()
+        .filter(|(name, section)| section.is_table() && tools_subsection_is_invalid(name, section))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in invalid {
+        tools.remove(&name);
+        dropped.push(format!("tools.{name}"));
+    }
+}
+
+/// True when `[tools.<name>]`, wrapped alone, fails to deserialize.
+fn tools_subsection_is_invalid(name: &str, section: &toml::Value) -> bool {
+    let mut tools = toml::value::Table::new();
+    tools.insert(name.to_string(), section.clone());
+    let mut root = toml::value::Table::new();
+    root.insert("tools".to_string(), toml::Value::Table(tools));
+    toml::Value::Table(root).try_into::<Config>().is_err()
 }
 
 /// True when top-level `[<key>]`, wrapped alone, fails to deserialize.
@@ -1019,6 +1076,49 @@ mod tests {
                 assert!(salvaged.dropped.iter().any(|path| path == "tools"));
             }
         }
+    }
+
+    #[test]
+    fn malformed_tool_limits_are_salvaged_without_losing_the_selection() {
+        for limits in [
+            "max_attachments = \"x\"\n",
+            "max_attachment_bytes = \"10MiB\"\n",
+            "max_total_attachment_bytes = -1\n",
+            "max_attachment_byte = 1048576\n",
+            "max_attachments = 0\nmax_attachment_byte = 1048576\n",
+        ] {
+            let raw =
+                format!("schema_version = 3\n[tools]\noptional = []\n[tools.send_via]\n{limits}");
+            assert!(migrate_to_current(&raw).is_err(), "{raw}");
+            let salvaged = migrate_to_current_salvaged(&raw);
+            assert!(salvaged.config.tools.optional.is_empty(), "{raw}");
+            assert!(salvaged.dropped.is_empty(), "{raw}");
+            assert_eq!(salvaged.dropped_security, ["tools.send_via"], "{raw}");
+            assert_eq!(
+                salvaged.config.tools.send_via.max_attachments,
+                crate::schema::SendViaToolConfig::default().max_attachments
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_the_tools_table_with_send_via_set_is_degraded_security() {
+        for tools in [
+            "[tools]\noptional = \"bad\"\n[tools.send_via]\nmax_attachments = 0\n",
+            "[tools]\noptional = []\nsend_via = 5\n",
+            "[tools]\nsend_via = \"off\"\n",
+        ] {
+            let raw = format!("schema_version = 3\n{tools}");
+            assert!(migrate_to_current(&raw).is_err(), "{raw}");
+            let salvaged = migrate_to_current_salvaged(&raw);
+            assert!(salvaged.dropped.is_empty(), "{raw}");
+            assert_eq!(salvaged.dropped_security, ["tools"], "{raw}");
+        }
+
+        let raw = "schema_version = 3\n[tools]\noptional = \"bad\"\n";
+        let salvaged = migrate_to_current_salvaged(raw);
+        assert_eq!(salvaged.dropped, ["tools"]);
+        assert!(salvaged.dropped_security.is_empty());
     }
 
     #[test]
