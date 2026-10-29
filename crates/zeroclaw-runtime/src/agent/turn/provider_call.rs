@@ -330,7 +330,7 @@ pub(crate) async fn call_provider(
                         active_model_provider,
                         original_request,
                         active_dispatch_model,
-                        ctx.temperature,
+                        ctx.temperature.clone(),
                         ctx.cancellation_token,
                         ctx.on_delta,
                         ctx.event_tx,
@@ -503,10 +503,10 @@ pub(crate) async fn call_provider(
                                         match streamed_refusal {
                                             Some(refusal) => {
                                                 dispatcher
-                                                    .chat_after_stream_refusal_with_tool_round_policy(
+                                                    .chat_after_stream_refusal_with_sampling_and_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
-                                                        ctx.temperature,
+                                                        ctx.temperature.clone(),
                                                         refusal,
                                                         policy,
                                                     )
@@ -514,10 +514,10 @@ pub(crate) async fn call_provider(
                                             }
                                             None => {
                                                 dispatcher
-                                                    .chat_with_tool_round_policy(
+                                                    .chat_with_sampling_and_tool_round_policy(
                                                         request,
                                                         active_dispatch_model,
-                                                        ctx.temperature,
+                                                        ctx.temperature.clone(),
                                                         policy,
                                                     )
                                                     .await
@@ -595,10 +595,10 @@ pub(crate) async fn call_provider(
                 .scope(Box::pin(with_exact_dispatch_route(
                     active_model_provider_name.to_string(),
                     active_model.to_string(),
-                    dispatcher.chat_with_tool_round_policy(
+                    dispatcher.chat_with_sampling_and_tool_round_policy(
                         original_request,
                         active_dispatch_model,
-                        ctx.temperature,
+                        ctx.temperature.clone(),
                         policy,
                     ),
                 )))
@@ -616,7 +616,7 @@ pub(crate) async fn call_provider(
                             scope.scope(with_exact_dispatch_route(
                                 active_model_provider_name.to_string(),
                                 active_model.to_string(),
-                                dispatcher.chat_with_tool_round_policy(
+                                dispatcher.chat_with_sampling_and_tool_round_policy(
                                     ChatRequest {
                                         messages: image_recovery_messages
                                             .unwrap_or(prepared_messages),
@@ -624,7 +624,7 @@ pub(crate) async fn call_provider(
                                         thinking: original_request.thinking,
                                     },
                                     active_dispatch_model,
-                                    ctx.temperature,
+                                    ctx.temperature.clone(),
                                     policy,
                                 ),
                             )),
@@ -758,7 +758,7 @@ mod payload_capture_tests {
                 model_context_window_source:
                     zeroclaw_config::schema::ModelContextWindowSource::Configured,
             },
-            temperature: None,
+            temperature: None.into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -1237,7 +1237,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -1922,7 +1922,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2038,7 +2038,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2101,7 +2101,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2245,7 +2245,7 @@ mod streaming_fallback_tests {
                 provider_name: "test-provider",
                 model: "test-model",
                 context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-                temperature: Some(0.0),
+                temperature: Some(0.0).into(),
                 approval: None,
                 channel_name: "test",
                 channel_reply_target: None,
@@ -2465,7 +2465,7 @@ mod streaming_fallback_tests {
             provider_name: "requested-provider",
             model: "requested-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2578,7 +2578,7 @@ mod streaming_fallback_tests {
             provider_name: "test-provider",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2657,7 +2657,7 @@ mod streaming_fallback_tests {
             provider_name: "requested-provider",
             model: "requested-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -2737,7 +2737,7 @@ mod streaming_fallback_tests {
             provider_name: "requested-provider",
             model: "requested-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -3528,7 +3528,7 @@ mod streaming_fallback_tests {
             provider_name: "router-test",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -3642,7 +3642,7 @@ mod streaming_fallback_tests {
             provider_name: "router-test",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -3909,7 +3909,7 @@ mod streaming_fallback_tests {
             provider_name: "router-test",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -3994,7 +3994,7 @@ mod streaming_fallback_tests {
             provider_name: "router-test",
             model: "test-model",
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
-            temperature: Some(0.0),
+            temperature: Some(0.0).into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,

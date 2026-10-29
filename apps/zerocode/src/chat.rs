@@ -4938,13 +4938,36 @@ impl Chat {
     /// (`providers.models.<family>.<alias>.model`), used to pre-select the
     /// current model in the picker.
     async fn configured_model(rpc: &RpcClient, model_provider_ref: &str) -> Option<String> {
-        let prop = format!("providers.models.{model_provider_ref}.model");
-        let entries = rpc.config_list(Some(&prop)).await.ok()?;
-        entries.into_iter().find(|e| e.path == prop).and_then(|e| {
-            e.value
-                .as_ref()
-                .and_then(|v| v.as_str().map(str::to_string))
-        })
+        let (family, tail) = model_provider_ref.trim().split_once('.')?;
+        let aliases = rpc
+            .config_map_keys(&format!("providers.models.{family}"))
+            .await
+            .ok()?;
+        let alias = aliases
+            .iter()
+            .filter(|alias| tail == alias.as_str() || tail.starts_with(&format!("{alias}.")))
+            .max_by_key(|alias| alias.len())?;
+        let profile = format!("providers.models.{family}.{alias}");
+        let models = rpc
+            .config_map_keys(&format!("{profile}.models"))
+            .await
+            .ok()?;
+        let selected = match tail.strip_prefix(alias.as_str())?.strip_prefix('.') {
+            Some(model) => Some(models.iter().find(|key| key.as_str() == model)?.as_str()),
+            None if models.iter().any(|key| key == "default") => Some("default"),
+            None if models.len() == 1 => Some(models[0].as_str()),
+            None => None,
+        };
+        let entries = rpc.config_list(Some(&profile)).await.ok()?;
+        let read = |prop: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.path == prop)
+                .and_then(|entry| entry.value.as_ref()?.as_str().map(str::to_string))
+        };
+        selected
+            .and_then(|model| read(&format!("{profile}.models.{model}.id")))
+            .or_else(|| read(&format!("{profile}.model")))
     }
 
     /// Fetch the model catalog for a configured model_provider reference while
@@ -12745,6 +12768,63 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn configured_model_uses_complete_profile_keys_and_nested_inheritance() {
+        for (reference, models, nested, expected) in [
+            ("custom.gw.v2", vec![], None, "legacy-id"),
+            (
+                "custom.gw.v2",
+                vec!["default", "fast.v1"],
+                Some(("default", "default-id")),
+                "default-id",
+            ),
+            (
+                "custom.gw.v2",
+                vec!["fast.v1"],
+                Some(("fast.v1", "sole-id")),
+                "sole-id",
+            ),
+            (
+                "custom.gw.v2.fast.v1",
+                vec!["default", "fast.v1"],
+                Some(("fast.v1", "fast-id")),
+                "fast-id",
+            ),
+            ("custom.gw.v2.fast.v1", vec!["fast.v1"], None, "legacy-id"),
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let client = RpcClient::with_rpc(Arc::clone(&rpc));
+            let task =
+                tokio::spawn(async move { Chat::configured_model(&client, reference).await });
+            let request = next_rpc_request(&mut rx, "profile keys").await;
+            assert_eq!(request["method"], crate::client::method::CONFIG_MAP_KEYS);
+            assert_eq!(request["params"]["path"], "providers.models.custom");
+            respond_ok(&rpc, &request, serde_json::json!({"keys": ["gw", "gw.v2"]}));
+            let request = next_rpc_request(&mut rx, "nested model keys").await;
+            assert_eq!(
+                request["params"]["path"],
+                "providers.models.custom.gw.v2.models"
+            );
+            respond_ok(&rpc, &request, serde_json::json!({"keys": models}));
+            let request = next_rpc_request(&mut rx, "profile fields").await;
+            let mut entries = vec![serde_json::json!({
+                "path": "providers.models.custom.gw.v2.model", "value": "legacy-id",
+                "description": "", "type_hint": "String", "kind": "string", "populated": true,
+                "category": "", "is_secret": false
+            })];
+            if let Some((alias, id)) = nested {
+                entries.push(serde_json::json!({
+                    "path": format!("providers.models.custom.gw.v2.models.{alias}.id"), "value": id,
+                    "description": "", "type_hint": "String", "kind": "string", "populated": true,
+                    "category": "", "is_secret": false
+                }));
+            }
+            respond_ok(&rpc, &request, serde_json::json!({"entries": entries}));
+            assert_eq!(task.await.unwrap().as_deref(), Some(expected));
+        }
     }
 
     #[tokio::test]

@@ -3,101 +3,120 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+use zeroclaw_config::schema::Config;
 use zeroclaw_providers::ProviderDispatch;
+
+/// Reads the configuration generation admitted by the owning session. The
+/// resolver borrows the owner's authority; tools do not maintain another store.
+pub type ModelConfigResolver = Arc<dyn Fn() -> Arc<Config> + Send + Sync>;
+
+tokio::task_local! {
+    static ADMITTED_MODEL_CONFIG: Arc<AdmittedModelConfig>;
+}
+
+struct AdmittedModelConfig {
+    agent_alias: String,
+    config: Arc<Config>,
+    parent: Option<Arc<AdmittedModelConfig>>,
+}
+
+/// Bind model tools to the same configuration generation as their owning turn.
+/// Nested turns establish their own binding; unrelated agents use their owner.
+pub fn scope_model_config<F: std::future::Future>(
+    config: Arc<Config>,
+    agent_alias: impl Into<String>,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    // Keep task-local wrappers from embedding the complete caller state
+    // machine again at each nested delegation hop.
+    let future = Box::pin(future);
+    let agent_alias = agent_alias.into();
+    async move {
+        let parent = ADMITTED_MODEL_CONFIG.try_with(Arc::clone).ok();
+        ADMITTED_MODEL_CONFIG
+            .scope(
+                Arc::new(AdmittedModelConfig {
+                    agent_alias,
+                    config,
+                    parent,
+                }),
+                future,
+            )
+            .await
+    }
+}
+
+/// Capture before spawning so pipeline workers and bounded delegates retain
+/// the admission of the registry owner whose tools they borrow.
+/// Evaluate this function in the parent task before passing its future to a
+/// spawn macro, which may evaluate its body only in the child task.
+pub fn inherit_model_config_scope<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let admitted = ADMITTED_MODEL_CONFIG.try_with(Arc::clone).ok();
+    let future = Box::pin(future);
+    async move {
+        match admitted {
+            Some(admitted) => ADMITTED_MODEL_CONFIG.scope(admitted, future).await,
+            None => future.await,
+        }
+    }
+}
+
+/// Prefer the current turn's admission over a long-lived registry's fallback.
+pub fn model_config_for_agent(
+    fallback: ModelConfigResolver,
+    agent_alias: impl Into<String>,
+) -> ModelConfigResolver {
+    let agent_alias = agent_alias.into();
+    Arc::new(move || {
+        ADMITTED_MODEL_CONFIG
+            .try_with(|admitted| {
+                let mut current = Some(admitted.as_ref());
+                while let Some(admitted) = current {
+                    if admitted.agent_alias == agent_alias {
+                        return Some(Arc::clone(&admitted.config));
+                    }
+                    current = admitted.parent.as_deref();
+                }
+                None
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fallback())
+    })
+}
 
 /// Tool that runs a single prompt through an LLM and optionally validates
 /// the response against a JSON Schema. No tools are provided to the LLM —
 /// this is a pure text-in, text-out (or JSON-out) call.
 pub struct LlmTaskTool {
     security: Arc<SecurityPolicy>,
-    /// Root config snapshot for alias-aware provider construction.
-    /// Required so that `create_model_provider_for_alias` can look up
-    /// typed alias-specific fields (e.g. `requires_openai_auth`).
-    config: Arc<zeroclaw_config::schema::Config>,
-    /// Provider family name (e.g. "openai", "openrouter").
-    family: String,
-    /// Provider alias within the family (e.g. "codex", "primary").
-    /// Together with `family` and `config`, this enables alias-aware
-    /// provider construction that preserves alias-specific configuration.
-    alias: String,
-    /// Default model from root config.
-    default_model: String,
-    /// Default temperature from root config. `None` means no temperature
-    /// is sent on the wire; provider applies its own default.
-    default_temperature: Option<f64>,
-    /// API key for model_provider authentication.
-    api_key: Option<String>,
-    /// ModelProvider runtime options inherited from root config.
-    provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+    config: ModelConfigResolver,
+    agent_alias: String,
 }
 
 impl LlmTaskTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
-        config: Arc<zeroclaw_config::schema::Config>,
-        family: String,
-        alias: String,
-        default_model: String,
-        default_temperature: Option<f64>,
-        api_key: Option<String>,
-        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+        config: Arc<Config>,
+        agent_alias: impl Into<String>,
+    ) -> Self {
+        Self::with_config_resolver(security, Arc::new(move || Arc::clone(&config)), agent_alias)
+    }
+
+    pub fn with_config_resolver(
+        security: Arc<SecurityPolicy>,
+        config: ModelConfigResolver,
+        agent_alias: impl Into<String>,
     ) -> Self {
         Self {
             security,
             config,
-            family,
-            alias,
-            default_model,
-            default_temperature,
-            api_key,
-            provider_runtime_options,
-        }
-    }
-
-    /// Construct the model provider using the alias-aware factory so that
-    /// typed alias-specific configuration is preserved.
-    ///
-    /// Runs on a blocking worker because the factory may synchronously
-    /// drive `reqwest::blocking::Client` (e.g. for Qwen / MiniMax
-    /// `oauth_refresh_token` exchange).  Calling that directly on a
-    /// Tokio async worker is a prohibited blocking operation that may
-    /// panic instead of returning a normal tool error.
-    async fn build_model_provider(&self) -> anyhow::Result<Box<dyn ModelProvider>> {
-        // Clone owned data so the blocking closure does not borrow `self`.
-        let config = Arc::clone(&self.config);
-        let family = self.family.clone();
-        let alias = self.alias.clone();
-        let api_key = self.api_key.clone();
-        let options = self.provider_runtime_options.clone();
-
-        let result = tokio::task::spawn_blocking(move || {
-            zeroclaw_providers::create_model_provider_for_alias(
-                &config,
-                &family,
-                &alias,
-                api_key.as_deref(),
-                &options,
-            )
-        })
-        .await;
-
-        match result {
-            Ok(provider_result) => provider_result,
-            Err(join_error) => {
-                if join_error.is_cancelled() {
-                    anyhow::bail!("Provider construction task cancelled: {join_error}");
-                } else {
-                    // The blocking task panicked — surface the panic provenance
-                    // rather than disguising it as an authentication error.
-                    anyhow::bail!(
-                        "Provider construction panicked on the blocking worker: {join_error}"
-                    );
-                }
-            }
+            agent_alias: agent_alias.into(),
         }
     }
 }
@@ -170,14 +189,11 @@ impl Tool for LlmTaskTool {
 
         // Extract optional overrides
         let schema = args.get("schema").and_then(|v| v.as_object());
-        let model = args
+        let model_override = args
             .get("model")
             .and_then(|v| v.as_str())
-            .unwrap_or(&self.default_model);
-        let temperature = args
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .or(self.default_temperature);
+            .map(str::to_owned);
+        let temperature_override = args.get("temperature").and_then(|v| v.as_f64());
 
         // Build the effective prompt, adding JSON schema instructions when needed
         let effective_prompt = if let Some(schema_obj) = schema {
@@ -194,12 +210,53 @@ impl Tool for LlmTaskTool {
             prompt.to_string()
         };
 
-        // Create model_provider via the alias-aware factory.
-        // The factory is dispatched on a blocking worker (see `build_model_provider`)
-        // because it may synchronously drive `reqwest::blocking::Client`.
-        let model_provider: Box<dyn ModelProvider> = match self.build_model_provider().await {
-            Ok(p) => p,
+        let config = (self.config)();
+        let agent_alias = self.agent_alias.clone();
+        let built = zeroclaw_providers::model::build_nonblocking(move || {
+            let reference = &config
+                .agents
+                .get(&agent_alias)
+                .ok_or_else(|| {
+                    anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+                        "tool-llm-task-agent-missing",
+                        &[("agent", agent_alias.as_str())],
+                    ))
+                })?
+                .model_provider;
+            let selection = config.resolve_model_selection(reference).ok_or_else(|| {
+                anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+                    "tool-llm-task-provider-invalid",
+                    &[("provider", reference.as_str())],
+                ))
+            })?;
+            let temperature = temperature_override.or_else(|| selection.temperature());
+            let resolved = zeroclaw_providers::model::build_raw_provider(
+                &config,
+                reference,
+                zeroclaw_providers::model::ProviderOverrides {
+                    model: model_override.as_deref(),
+                    ..Default::default()
+                },
+            )?;
+            let model = resolved.model.ok_or_else(|| {
+                anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+                    "tool-llm-task-model-missing",
+                    &[("provider", reference.as_str())],
+                ))
+            })?;
+            Ok((resolved.provider, model, temperature))
+        })
+        .await;
+        let (model_provider, model, temperature) = match built {
+            Ok(built) => built,
             Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(json!({"reason": "provider_construction_failed"})),
+                    "llm_task: failed to construct selected provider"
+                );
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -212,7 +269,7 @@ impl Tool for LlmTaskTool {
         // already Option<f64>; pass straight through. None omits the field
         // on the wire so the provider applies its own default.
         let response = match ProviderDispatch::from_ref(&*model_provider)
-            .simple_chat(&effective_prompt, model, temperature)
+            .simple_chat(&effective_prompt, &model, temperature)
             .await
         {
             Ok(text) => text,
@@ -327,6 +384,46 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn model_config_scope_isolates_concurrent_and_nested_turns() {
+        let fallback = Arc::new(Config::default());
+        let fallback_resolver: ModelConfigResolver = {
+            let fallback = Arc::clone(&fallback);
+            Arc::new(move || Arc::clone(&fallback))
+        };
+        let parent = model_config_for_agent(Arc::clone(&fallback_resolver), "parent");
+        let child = model_config_for_agent(fallback_resolver, "child");
+        let first = Arc::new(Config::default());
+        let second = Arc::new(Config::default());
+        let nested = Arc::new(Config::default());
+
+        tokio::join!(
+            scope_model_config(Arc::clone(&first), "parent", async {
+                tokio::task::yield_now().await;
+                assert!(Arc::ptr_eq(&parent(), &first));
+                assert!(Arc::ptr_eq(&child(), &fallback));
+                scope_model_config(Arc::clone(&nested), "child", async {
+                    assert!(Arc::ptr_eq(&child(), &nested));
+                    assert!(Arc::ptr_eq(&parent(), &first));
+                    let parent = Arc::clone(&parent);
+                    let child = Arc::clone(&child);
+                    let inherited = inherit_model_config_scope(async move { (parent(), child()) });
+                    let (inherited_parent, inherited_child) =
+                        zeroclaw_spawn::spawn!(inherited).await.unwrap();
+                    assert!(Arc::ptr_eq(&inherited_parent, &first));
+                    assert!(Arc::ptr_eq(&inherited_child, &nested));
+                })
+                .await;
+                assert!(Arc::ptr_eq(&parent(), &first));
+            }),
+            scope_model_config(Arc::clone(&second), "parent", async {
+                tokio::task::yield_now().await;
+                assert!(Arc::ptr_eq(&parent(), &second));
+            }),
+        );
+        assert!(Arc::ptr_eq(&parent(), &fallback));
+    }
 
     // ── Schema validation tests ──────────────────────────────────────
 
@@ -463,12 +560,7 @@ mod tests {
         LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
             Arc::new(zeroclaw_config::schema::Config::default()),
-            "openrouter".to_string(),
-            "default".to_string(),
-            "test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            "test",
         )
     }
 
@@ -511,15 +603,18 @@ mod tests {
 
     #[tokio::test]
     async fn execute_with_invalid_provider_returns_error() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "test".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "nonexistent_provider_xyz.default".into(),
+                ..Default::default()
+            },
+        );
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
-            Arc::new(zeroclaw_config::schema::Config::default()),
-            "nonexistent_provider_xyz".to_string(),
-            "default".to_string(),
-            "test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            Arc::new(config),
+            "test",
         );
 
         let result = tool
@@ -528,6 +623,71 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("model_provider"));
+    }
+
+    #[tokio::test]
+    async fn execution_uses_admitted_generation_for_model_options_and_credentials() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{AliasedAgentConfig, ModelEntryConfig};
+
+        let server = MockServer::start().await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "local").unwrap();
+        profile.uri = Some(format!("{}/v1/chat/completions", server.uri()));
+        profile.api_key = Some("old-test-key".into());
+        profile.model = Some("legacy-model".into());
+        profile.models.insert(
+            "default".into(),
+            ModelEntryConfig {
+                id: Some("nested-old".into()),
+                temperature: Some(0.2),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "test".into(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                ..Default::default()
+            },
+        );
+        let generation = Arc::new(std::sync::RwLock::new(Arc::new(config)));
+        let source = Arc::clone(&generation);
+        let tool = LlmTaskTool::with_config_resolver(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(move || Arc::clone(&source.read().unwrap())),
+            "test",
+        );
+        let mut next = (**generation.read().unwrap()).clone();
+        let profile = next.providers.models.ensure("custom", "local").unwrap();
+        profile.api_key = Some("next-test-key".into());
+        let entry = profile.models.get_mut("default").unwrap();
+        entry.id = Some("nested-next".into());
+        entry.temperature = Some(0.6);
+        *generation.write().unwrap() = Arc::new(next);
+
+        for (args, model, temperature) in [
+            (json!({"prompt": "test"}), "nested-next", 0.6),
+            (
+                json!({"prompt": "test", "model": "explicit", "temperature": 0.0}),
+                "explicit",
+                0.0,
+            ),
+        ] {
+            let guard = Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .and(header("authorization", "Bearer next-test-key"))
+                .and(body_partial_json(json!({"model": model, "temperature": temperature})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+                })))
+                .expect(1)
+                .mount_as_scoped(&server).await;
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "{:?}", result.error);
+            assert_eq!(guard.received_requests().await.len(), 1);
+        }
     }
 
     // ── Regression: alias-specific provider config ───────────────────
@@ -611,127 +771,146 @@ mod tests {
 
         let _lock = OAUTH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // ── 1. Local mock server for both OAuth and chat ───────────
-        let mock_server = MockServer::start().await;
-        let local_base = mock_server.uri();
+        for endpoint_source in ["refreshed_resource", "profile_uri", "oauth_resource"] {
+            // ── 1. Local mock server for both OAuth and chat ───────────
+            let mock_server = MockServer::start().await;
+            let local_base = mock_server.uri();
 
-        // OAuth token exchange — returns the LOCAL server URL as
-        // resource_url so the provider's chat request also lands here.
-        let token_guard = Mock::given(method("POST"))
-            .and(path("/oauth2/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "test-access-token-from-mock",
-                "refresh_token": "new-refresh-token",
-                "expires_in": 3600,
-                "resource_url": format!("{local_base}/v1")
-            })))
-            .expect(1)
-            .mount_as_scoped(&mock_server)
-            .await;
+            // OAuth token exchange — returns the LOCAL server URL as
+            // resource_url so the provider's chat request also lands here.
+            let token_guard = Mock::given(method("POST"))
+                .and(path("/oauth2/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "test-access-token-from-mock",
+                    "refresh_token": "new-refresh-token",
+                    "expires_in": 3600,
+                    "resource_url": if endpoint_source == "refreshed_resource" {
+                        format!("{local_base}/v1")
+                    } else {
+                        format!("{local_base}/ignored/v1")
+                    }
+                })))
+                .expect(1)
+                .mount_as_scoped(&mock_server)
+                .await;
 
-        // Chat completions endpoint — returns a deterministic success.
-        let chat_guard = Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "mock-chatcmpl-001",
-                "object": "chat.completion",
-                "model": "qwen-test-model",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "mock-qwen-response"
+            // Chat completions endpoint — returns a deterministic success.
+            let chat_guard = Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "mock-chatcmpl-001",
+                    "object": "chat.completion",
+                    "model": "qwen-test-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "mock-qwen-response"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                })))
+                .expect(1)
+                .mount_as_scoped(&mock_server)
+                .await;
+
+            let mock_endpoint = format!("{local_base}/oauth2/token");
+
+            // Point the Qwen OAuth refresh function at the controlled mock.
+            // Guard ensures the override is removed even on panic.
+            let _endpoint_guard = scopeguard::guard((), |_| {
+                zeroclaw_providers::set_qwen_oauth_endpoint_for_test(None);
+            });
+            zeroclaw_providers::set_qwen_oauth_endpoint_for_test(Some(mock_endpoint));
+
+            // ── 2. Config with Qwen alias carrying oauth_refresh_token ─
+            let mut config = Config::default();
+            let mut qwen_map = HashMap::new();
+            qwen_map.insert(
+                "test-alias".to_string(),
+                QwenModelProviderConfig {
+                    base: ModelProviderConfig {
+                        uri: (endpoint_source == "profile_uri").then(|| format!("{local_base}/v1")),
+                        ..Default::default()
                     },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-            })))
-            .expect(1)
-            .mount_as_scoped(&mock_server)
-            .await;
+                    endpoint: Default::default(),
+                    auth_mode: None,
+                    oauth_refresh_token: Some("test-refresh-token".to_string()),
+                    oauth_client_id: None,
+                    oauth_resource_url: (endpoint_source == "oauth_resource")
+                        .then(|| format!("{local_base}/v1")),
+                },
+            );
+            config.providers.models.qwen = qwen_map;
+            config
+                .providers
+                .models
+                .ensure("qwen", "test-alias")
+                .unwrap()
+                .model = Some("qwen-test-model".into());
+            config.agents.insert(
+                "test".into(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    model_provider: "qwen.test-alias".into(),
+                    ..Default::default()
+                },
+            );
 
-        let mock_endpoint = format!("{local_base}/oauth2/token");
+            // ── 3. Build LlmTaskTool targeting the Qwen OAuth alias ───
+            let tool = LlmTaskTool::new(
+                Arc::new(SecurityPolicy::default()),
+                Arc::new(config),
+                "test",
+            );
 
-        // Point the Qwen OAuth refresh function at the controlled mock.
-        // Guard ensures the override is removed even on panic.
-        let _endpoint_guard = scopeguard::guard((), |_| {
-            zeroclaw_providers::set_qwen_oauth_endpoint_for_test(None);
-        });
-        zeroclaw_providers::set_qwen_oauth_endpoint_for_test(Some(mock_endpoint));
+            // ── 4. Execute on the async runtime ────────────────────────
+            // Under the old code this would run `reqwest::blocking::Client`
+            // directly on the Tokio worker — a prohibited blocking operation
+            // that may panic.  Under the fix the construction runs on a
+            // `spawn_blocking` worker and completes normally.
+            //
+            // Both OAuth and chat are served by the local Wiremock server.
+            // The tool must succeed end-to-end: OAuth → provider → chat.
+            let result = tool
+                .execute(serde_json::json!({ "prompt": "test-prompt" }))
+                .await
+                .unwrap();
 
-        // ── 2. Config with Qwen alias carrying oauth_refresh_token ─
-        let mut config = Config::default();
-        let mut qwen_map = HashMap::new();
-        qwen_map.insert(
-            "test-alias".to_string(),
-            QwenModelProviderConfig {
-                base: ModelProviderConfig::default(),
-                endpoint: Default::default(),
-                auth_mode: None,
-                oauth_refresh_token: Some("test-refresh-token".to_string()),
-                oauth_client_id: None,
-                oauth_resource_url: None,
-            },
-        );
-        config.providers.models.qwen = qwen_map;
+            // ── 5. Assert deterministic success ────────────────────────
+            // Token exchange happened exactly once.
+            assert_eq!(
+                token_guard.received_requests().await.len(),
+                1,
+                "OAuth token endpoint must be called exactly once"
+            );
 
-        // ── 3. Build LlmTaskTool targeting the Qwen OAuth alias ───
-        let tool = LlmTaskTool::new(
-            Arc::new(SecurityPolicy::default()),
-            Arc::new(config),
-            "qwen".to_string(),
-            "test-alias".to_string(),
-            "qwen-test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-        );
+            // Chat endpoint was reached — proves provider construction
+            // succeeded and the LLM call was dispatched to the local mock.
+            assert_eq!(
+                chat_guard.received_requests().await.len(),
+                1,
+                "chat/completions must use {endpoint_source}; tool error: {:?}",
+                result.error
+            );
 
-        // ── 4. Execute on the async runtime ────────────────────────
-        // Under the old code this would run `reqwest::blocking::Client`
-        // directly on the Tokio worker — a prohibited blocking operation
-        // that may panic.  Under the fix the construction runs on a
-        // `spawn_blocking` worker and completes normally.
-        //
-        // Both OAuth and chat are served by the local Wiremock server.
-        // The tool must succeed end-to-end: OAuth → provider → chat.
-        let result = tool
-            .execute(serde_json::json!({ "prompt": "test-prompt" }))
-            .await
-            .unwrap();
-
-        // ── 5. Assert deterministic success ────────────────────────
-        // Token exchange happened exactly once.
-        assert_eq!(
-            token_guard.received_requests().await.len(),
-            1,
-            "OAuth token endpoint must be called exactly once"
-        );
-
-        // Chat endpoint was reached — proves provider construction
-        // succeeded and the LLM call was dispatched to the local mock.
-        assert_eq!(
-            chat_guard.received_requests().await.len(),
-            1,
-            "chat/completions endpoint must be called exactly once"
-        );
-
-        // Tool reports success with the exact mocked content.
-        assert!(
-            result.success,
-            "execute must succeed end-to-end — got error: {:?}",
-            result.error
-        );
-        assert!(
-            result.error.is_none(),
-            "no error expected on successful path — got: {:?}",
-            result.error
-        );
-        let output = result.output.to_string();
-        assert_eq!(
-            output, "mock-qwen-response",
-            "output must match the deterministic mock response"
-        );
+            // Tool reports success with the exact mocked content.
+            assert!(
+                result.success,
+                "execute must succeed end-to-end — got error: {:?}",
+                result.error
+            );
+            assert!(
+                result.error.is_none(),
+                "no error expected on successful path — got: {:?}",
+                result.error
+            );
+            let output = result.output.to_string();
+            assert_eq!(
+                output, "mock-qwen-response",
+                "output must match the deterministic mock response"
+            );
+        }
     }
 
     /// Controlled failure: the external token exchange returns an HTTP
@@ -782,16 +961,24 @@ mod tests {
             },
         );
         config.providers.models.qwen = qwen_map;
+        config
+            .providers
+            .models
+            .ensure("qwen", "test-alias")
+            .unwrap()
+            .model = Some("qwen-test-model".into());
+        config.agents.insert(
+            "test".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "qwen.test-alias".into(),
+                ..Default::default()
+            },
+        );
 
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
             Arc::new(config),
-            "qwen".to_string(),
-            "test-alias".to_string(),
-            "qwen-test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            "test",
         );
 
         let result = tool

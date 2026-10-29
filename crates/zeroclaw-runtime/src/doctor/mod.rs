@@ -105,6 +105,13 @@ pub fn diagnose(config: &Config) -> Vec<DiagResult> {
     items.into_iter().map(DiagItem::into_result).collect()
 }
 
+/// Run synchronous diagnostics outside the async executor. Provider validation
+/// can perform a blocking OAuth exchange while materializing a configured slot.
+pub async fn diagnose_nonblocking(config: &Config) -> Result<Vec<DiagResult>> {
+    let config = config.clone();
+    Ok(tokio::task::spawn_blocking(move || diagnose(&config)).await?)
+}
+
 /// Outcome of probing one configured provider entry's live catalog.
 #[derive(Clone, PartialEq)]
 enum ModelProbe {
@@ -236,11 +243,11 @@ async fn check_codex_auth_wiring(config: &Config) -> Vec<DiagResult> {
 }
 
 /// Run the full Doctor suite and return the structured result used by CLI and RPC.
-pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
-    let mut results = diagnose(config);
+pub async fn run_structured(config: &Config) -> Result<Vec<DiagResult>> {
+    let mut results = diagnose_nonblocking(config).await?;
     results.extend(check_codex_auth_wiring(config).await);
     results.extend(probe_models(config).await);
-    results
+    Ok(results)
 }
 
 /// Run Doctor with a per-phase timeout for the network-dependent probe phase.
@@ -253,7 +260,7 @@ pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
 pub async fn run_structured_with_timeout(
     config: &Config,
     probe_timeout: std::time::Duration,
-) -> (Vec<DiagResult>, Option<String>) {
+) -> Result<(Vec<DiagResult>, Option<String>)> {
     run_structured_with_probe(config, probe_timeout, Box::pin(probe_models(config))).await
 }
 
@@ -265,8 +272,8 @@ pub(crate) async fn run_structured_with_probe(
     config: &Config,
     probe_timeout: std::time::Duration,
     probe: std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DiagResult>> + Send + '_>>,
-) -> (Vec<DiagResult>, Option<String>) {
-    let mut results = diagnose(config);
+) -> Result<(Vec<DiagResult>, Option<String>)> {
+    let mut results = diagnose_nonblocking(config).await?;
     results.extend(check_codex_auth_wiring(config).await);
 
     let (probe_results, timed_out) = match tokio::time::timeout(probe_timeout, probe).await {
@@ -282,12 +289,12 @@ pub(crate) async fn run_structured_with_probe(
         }
     };
     results.extend(probe_results);
-    (results, timed_out)
+    Ok((results, timed_out))
 }
 
 /// Run diagnostics and print human-readable report to stdout.
 pub async fn run(config: &Config) -> Result<()> {
-    let results = run_structured(config).await;
+    let results = run_structured(config).await?;
 
     println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
@@ -415,40 +422,30 @@ fn doctor_model_targets(config: &Config, provider_override: Option<&str>) -> Vec
         .collect()
 }
 
-fn configured_model_provider_api_key<'a>(
-    config: &'a Config,
-    provider_name: &str,
-) -> Option<&'a str> {
-    let (family, alias) = provider_name
-        .split_once('.')
-        .unwrap_or((provider_name, "default"));
-
-    config
-        .providers
-        .models
-        .find(family, alias)
-        .and_then(|entry| entry.api_key.as_deref())
-}
-
 fn create_doctor_model_provider(
     config: &Config,
     provider_name: &str,
 ) -> anyhow::Result<Box<dyn zeroclaw_api::model_provider::ModelProvider>> {
-    let api_key = configured_model_provider_api_key(config, provider_name);
-    let options = zeroclaw_providers::options_for_provider_ref(
+    let provider_name = provider_name.trim();
+    let default_ref;
+    let reference = if !provider_name.contains(['.', ':'])
+        && config
+            .providers
+            .models
+            .find(provider_name, "default")
+            .is_some()
+    {
+        default_ref = format!("{provider_name}.default");
+        default_ref.as_str()
+    } else {
+        provider_name
+    };
+    zeroclaw_providers::model::build_raw_provider(
         config,
-        provider_name,
-        &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-    );
-
-    match provider_name.split_once('.') {
-        Some((family, alias)) => zeroclaw_providers::create_model_provider_for_alias(
-            config, family, alias, api_key, &options,
-        ),
-        None => {
-            zeroclaw_providers::create_model_provider_with_options(provider_name, api_key, &options)
-        }
-    }
+        reference,
+        zeroclaw_providers::model::ProviderOverrides::default(),
+    )
+    .map(|resolved| resolved.provider)
 }
 
 /// Persist the fetched model catalog to the shared cache location so that
@@ -768,21 +765,77 @@ pub async fn update_context_windows(
         Option<String>,
         Option<String>,
         Option<usize>,
+        Option<String>,
     );
 
-    // Collect all the data we need first to avoid borrow conflicts
-    let targets: Vec<ProviderTarget> = if let Some(model_provider) = provider_override {
-        // Single provider - use find_by_name to look up by "type.alias" format
-        if let Some((t, a, entry)) = config.providers.models.find_by_name(model_provider) {
-            vec![(
-                model_provider.to_string(),
-                t.to_string(),
-                a.to_string(),
+    // One target per model a profile hosts: nested entries carry their own
+    // model id and context window, and their write path lands inside the
+    // `models.<alias>` subtable. A profile hosting only nested models is no
+    // longer skipped as "no model configured".
+    fn expand_profile_targets(
+        ty: &str,
+        alias: &str,
+        entry: &zeroclaw_config::schema::ModelProviderConfig,
+        selected_model_alias: Option<&str>,
+    ) -> Vec<ProviderTarget> {
+        let profile_ref = format!("{ty}.{alias}");
+        if entry.models.is_empty() {
+            if selected_model_alias.is_some() {
+                return Vec::new();
+            }
+            return vec![(
+                profile_ref,
+                ty.to_string(),
+                alias.to_string(),
                 entry.model.clone().unwrap_or_default(),
                 entry.uri.clone(),
                 entry.api_key.clone(),
                 entry.context_window,
-            )]
+                None,
+            )];
+        }
+        let mut model_aliases: Vec<&str> = entry.models.keys().map(String::as_str).collect();
+        model_aliases.sort_unstable();
+        model_aliases
+            .into_iter()
+            .filter(|model_alias| {
+                selected_model_alias.is_none_or(|selected| selected == *model_alias)
+            })
+            .map(|model_alias| {
+                let nested = &entry.models[model_alias];
+                (
+                    format!("{profile_ref}.{model_alias}"),
+                    ty.to_string(),
+                    alias.to_string(),
+                    nested
+                        .id
+                        .clone()
+                        .or_else(|| entry.model.clone())
+                        .unwrap_or_default(),
+                    entry.uri.clone(),
+                    entry.api_key.clone(),
+                    nested.context_window,
+                    Some(model_alias.to_string()),
+                )
+            })
+            .collect()
+    }
+
+    // Collect all the data we need first to avoid borrow conflicts
+    let targets: Vec<ProviderTarget> = if let Some(model_provider) = provider_override {
+        // A suffix after the resolved profile selects one nested model;
+        // a profile ref expands all entries, including dotted profile aliases.
+        if let Some((t, a, entry)) = config.providers.models.find_by_name(model_provider) {
+            let model_alias = model_provider
+                .trim()
+                .strip_prefix(&format!("{t}.{a}"))
+                .and_then(|suffix| suffix.strip_prefix('.'))
+                .filter(|segment| !segment.is_empty());
+            let targets = expand_profile_targets(t, &a, entry, model_alias);
+            if targets.is_empty() {
+                anyhow::bail!("Model provider '{model_provider}' not found in config");
+            }
+            targets
         } else {
             anyhow::bail!("Model provider '{model_provider}' not found in config");
         }
@@ -792,22 +845,20 @@ pub async fn update_context_windows(
             .providers
             .models
             .iter_entries()
-            .map(|(t, a, e)| {
-                (
-                    format!("{t}.{a}"),
-                    t.to_string(),
-                    a.to_string(),
-                    e.model.clone().unwrap_or_default(),
-                    e.uri.clone(),
-                    e.api_key.clone(),
-                    e.context_window,
-                )
-            })
+            .flat_map(|(t, a, e)| expand_profile_targets(t, a, e, None))
             .collect()
     };
 
-    for (provider_ref, provider_type, alias, model, uri, api_key, existing_context_window) in
-        targets
+    for (
+        provider_ref,
+        provider_type,
+        alias,
+        model,
+        uri,
+        api_key,
+        existing_context_window,
+        model_alias,
+    ) in targets
     {
         // Skip if already has context_window set
         if let Some(ctx) = existing_context_window {
@@ -857,7 +908,15 @@ pub async fn update_context_windows(
                         )
                     );
                 } else {
-                    let path = format!("providers.models.{provider_type}.{alias}.context_window");
+                    // A nested model entry's window lands inside its
+                    // `models.<alias>` subtable — the profile-level path
+                    // would shadow nothing and silently do nothing.
+                    let path = match &model_alias {
+                        Some(model_alias) => format!(
+                            "providers.models.{provider_type}.{alias}.models.{model_alias}.context_window"
+                        ),
+                        None => format!("providers.models.{provider_type}.{alias}.context_window"),
+                    };
                     match config.set_prop_persistent(&path, &ctx.to_string()) {
                         Ok(_) => {
                             updated += 1;
@@ -928,7 +987,12 @@ pub async fn update_context_windows(
 /// --check` (configured-model verification) and future interactive flows (the
 /// `quickstart` model picker, which also wants pricing) share one fetch path.
 pub async fn fetch_provider_catalog(config: &Config, provider_ref: &str) -> Result<Vec<String>> {
-    let provider = create_doctor_model_provider(config, provider_ref)?;
+    let config = Box::new(config.clone());
+    let provider_ref = provider_ref.to_string();
+    let provider = zeroclaw_providers::model::build_nonblocking(move || {
+        create_doctor_model_provider(&config, &provider_ref)
+    })
+    .await?;
     zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
         .list_models()
         .await
@@ -936,21 +1000,16 @@ pub async fn fetch_provider_catalog(config: &Config, provider_ref: &str) -> Resu
 
 /// Collect the configured `(provider_ref, model)` pairs from config, optionally
 /// narrowed to a single target (matched by full `type.alias` ref or by bare
-/// family name).
+/// family name). Delegates to the shared config-level enumeration so the CLI
+/// surfaces and the doctor can never disagree about what a profile hosts.
 fn configured_model_entries(
     config: &Config,
     provider_override: Option<&str>,
 ) -> Vec<(String, Option<String>)> {
-    let filter = provider_override.map(str::trim).filter(|p| !p.is_empty());
     config
-        .providers
-        .models
-        .iter_entries()
-        .map(|(ty, alias, entry)| (format!("{ty}.{alias}"), entry.model.clone()))
-        .filter(|(provider_ref, _)| match filter {
-            Some(f) => provider_ref == f || provider_ref.split('.').next() == Some(f),
-            None => true,
-        })
+        .configured_model_entries(provider_override)
+        .into_iter()
+        .map(|e| (e.provider_ref, e.model_id))
         .collect()
 }
 
@@ -1211,11 +1270,72 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 }
             }
 
-            // Model configured
-            if let Some(model) = entry.model.as_deref() {
+            // Model configured — a profile hosting a `models` map reports one
+            // line per nested entry (its resolved id), so a nested-only
+            // profile is no longer misreported as "no model configured".
+            if !entry.models.is_empty() {
+                let mut nested_aliases: Vec<&str> =
+                    entry.models.keys().map(String::as_str).collect();
+                nested_aliases.sort_unstable();
+                for model_alias in nested_aliases {
+                    let model_id = config
+                        .resolve_model_selection(&format!("{label}.{model_alias}"))
+                        .and_then(|s| s.model_id);
+                    match model_id {
+                        Some(model) => items.push(DiagItem::ok(
+                            cat,
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-doctor-nested-model",
+                                &[
+                                    ("provider_ref", &label),
+                                    ("model", &model),
+                                    ("model_alias", model_alias),
+                                ],
+                            ),
+                        )),
+                        None => items.push(DiagItem::warn(
+                            cat,
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-doctor-nested-model-id-missing",
+                                &[("provider_ref", &label), ("model_alias", model_alias)],
+                            ),
+                        )),
+                    }
+                }
+            } else if let Some(model) = entry.model.as_deref() {
                 items.push(DiagItem::ok(cat, format!("{label}: model: {model}")));
             } else {
                 items.push(DiagItem::warn(cat, format!("{label}: no model configured")));
+            }
+
+            // Nested model entries carry their own tuning; surface only the
+            // invalid values (a per-entry "unset" line would be noise — the
+            // profile-level lines above already summarize the unset state).
+            for (model_alias, model_entry) in &entry.models {
+                let entry_label = format!("{label}.{model_alias}");
+                if model_entry.context_window == Some(0) {
+                    items.push(DiagItem::error(
+                        cat,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-doctor-context-window-zero",
+                            &[("provider_ref", &entry_label)],
+                        ),
+                    ));
+                }
+                if let Some(temperature) = model_entry.temperature
+                    && !(0.0..=2.0).contains(&temperature)
+                {
+                    items.push(DiagItem::error(
+                        cat,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-doctor-temperature-out-of-range",
+                            &[
+                                ("provider_ref", &entry_label),
+                                ("temperature", &format!("{temperature:.1}")),
+                            ],
+                        ),
+                    ));
+                }
             }
 
             // A missing value remains unknown until this profile is selected;
@@ -1371,7 +1491,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ),
             ));
         }
-        if route.model.is_empty() {
+        if route.effective_model(config).trim().is_empty() {
             items.push(DiagItem::warn(
                 cat,
                 format!("model route \"{}\" has empty model", route.hint),
@@ -2604,21 +2724,102 @@ mod tests {
         );
     }
 
-    #[test]
-    fn configured_model_provider_api_key_uses_alias_profile() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn doctor_catalog_uses_model_less_profile_connection() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer catalog-test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "catalog-model"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
         let mut config = Config::default();
-        config
+        let profile = config
             .providers
             .models
             .ensure("custom", "local")
-            .expect("known model_provider type")
-            .api_key = Some("redacted-test-key".to_string());
+            .expect("known model_provider type");
+        profile.api_key = Some("catalog-test-key".into());
+        profile.uri = Some(format!("{}/v1", server.uri()));
 
         assert_eq!(
-            configured_model_provider_api_key(&config, "custom.local"),
-            Some("redacted-test-key")
+            fetch_provider_catalog(&config, "custom.local")
+                .await
+                .unwrap(),
+            vec!["catalog-model"]
         );
-        assert_eq!(configured_model_provider_api_key(&config, "custom"), None);
+        let profile = config.providers.models.custom.remove("local").unwrap();
+        config
+            .providers
+            .models
+            .custom
+            .insert("default".into(), profile);
+        assert_eq!(
+            fetch_provider_catalog(&config, "custom").await.unwrap(),
+            vec!["catalog-model"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn doctor_catalog_and_diagnostics_construct_oauth_off_runtime() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::QwenModelProviderConfig;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "catalog-test-access-token",
+                "refresh_token": "catalog-test-refresh-token",
+                "expires_in": 3600,
+                "resource_url": format!("{}/v1", server.uri())
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer catalog-test-access-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "qwen-catalog-model"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // This is the only endpoint override in the runtime test binary.
+        let _endpoint = scopeguard::guard((), |_| {
+            zeroclaw_providers::set_qwen_oauth_endpoint_for_test(None);
+        });
+        zeroclaw_providers::set_qwen_oauth_endpoint_for_test(Some(format!(
+            "{}/oauth2/token",
+            server.uri()
+        )));
+        let mut config = Config::default();
+        config.providers.models.qwen.insert(
+            "oauth".into(),
+            QwenModelProviderConfig {
+                oauth_refresh_token: Some("catalog-test-refresh-token".into()),
+                oauth_resource_url: Some(format!("{}/v1", server.uri())),
+                ..Default::default()
+            },
+        );
+
+        let diagnostics = diagnose_nonblocking(&config).await.unwrap();
+        assert!(diagnostics.iter().any(|item| {
+            item.message == "model_provider \"qwen.oauth\" is valid"
+                && item.severity == Severity::Ok
+        }));
+        assert_eq!(
+            fetch_provider_catalog(&config, "qwen.oauth").await.unwrap(),
+            vec!["qwen-catalog-model"]
+        );
     }
 
     #[test]
@@ -2655,7 +2856,7 @@ mod tests {
                 .any(|item| item.category == "providers.models")
         );
 
-        let full = run_structured(&config).await;
+        let full = run_structured(&config).await.unwrap();
         assert!(
             full.iter().any(|item| item.category == "providers.models"),
             "shared structured runner should include the same model probe rows as the CLI"
@@ -2886,7 +3087,8 @@ mod tests {
             Duration::from_millis(100),
             Box::pin(std::future::pending::<Vec<DiagResult>>()),
         )
-        .await;
+        .await
+        .unwrap();
 
         // Pre-probe diagnostics (config, workspace, daemon, environment, CLI tools)
         // must survive the timeout.
@@ -2961,7 +3163,8 @@ mod tests {
             Duration::from_secs(5),
             Box::pin(async move { vec![probe_result] }),
         )
-        .await;
+        .await
+        .unwrap();
 
         // The probe result must survive to the output.
         assert!(
@@ -3117,6 +3320,40 @@ mod tests {
         let route_item = items.iter().find(|i| i.message.contains("empty model"));
         assert!(route_item.is_some());
         assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_accepts_implicit_nested_model_route() {
+        let mut config = Config::default();
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .expect("known model provider");
+        provider.models.insert(
+            "fast".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("gpt-4o-mini".into()),
+                ..Default::default()
+            },
+        );
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                model_provider: "openai.default.fast".into(),
+                model: String::new(),
+                api_key: None,
+            });
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        assert!(
+            !items.iter().any(|item| item
+                .message
+                .contains("model route \"fast\" has empty model")),
+            "a route with an effective nested model must not be reported as empty"
+        );
     }
 
     #[test]
@@ -3930,7 +4167,7 @@ mod tests {
             let entry2 = config
                 .providers
                 .models
-                .ensure("groq", "alias2")
+                .ensure("groq", "alias2.v2")
                 .expect("groq provider type exists");
             entry2.model = Some("llama-3.1-8b-instant".into());
         }
@@ -3944,7 +4181,7 @@ mod tests {
             },
         );
         let updated =
-            update_context_windows(&mut config, Some("groq.alias2"), false, Some(mock_fetch))
+            update_context_windows(&mut config, Some("groq.alias2.v2"), false, Some(mock_fetch))
                 .await
                 .expect("update_context_windows should succeed");
 
@@ -3968,13 +4205,203 @@ mod tests {
         let alias2_ctx = config
             .providers
             .models
-            .find("groq", "alias2")
+            .find("groq", "alias2.v2")
             .expect("alias2 should exist")
             .context_window;
         assert_eq!(
             alias2_ctx,
             Some(4096),
             "alias2 context_window should be set to mock fetch value"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_context_windows_targets_nested_model_entries() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let mut config = Config {
+            config_path: temp_dir.path().join("config.toml"),
+            ..Default::default()
+        };
+
+        // A profile hosting only nested entries and no profile-level model:
+        // previously skipped wholesale as "no model configured". One entry
+        // already carries a window and must be skipped; the other must get
+        // its window written INSIDE the `models.<alias>` subtable — the
+        // profile-level path would shadow nothing and silently do nothing.
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("openai", "gw")
+                .expect("openai provider type exists");
+            entry.models.insert(
+                "big".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o".into()),
+                    context_window: Some(64_000),
+                    ..Default::default()
+                },
+            );
+            entry.models.insert(
+                "cheap".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o-mini".into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // The fetch reports a per-model value so the test can observe WHICH
+        // model each probe (and therefore each write) targeted.
+        let mock_fetch: FetchContextWindowFn = Box::new(
+            |_type: &str, cfg: &zeroclaw_config::schema::ModelProviderConfig| {
+                Box::pin(async move { cfg.model.as_deref().map(|m| m.chars().count() * 1000) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send>>
+            },
+        );
+        let updated = update_context_windows(&mut config, None, false, Some(mock_fetch))
+            .await
+            .expect("update_context_windows should succeed");
+
+        assert_eq!(updated, 1, "only the window-less nested entry is updated");
+
+        let entry = config
+            .providers
+            .models
+            .find("openai", "gw")
+            .expect("profile exists");
+        let cheap_ctx = entry.models.get("cheap").and_then(|e| e.context_window);
+        let big_ctx = entry.models.get("big").and_then(|e| e.context_window);
+        // "gpt-4o-mini" is 11 chars → the probe saw the nested entry's model.
+        assert_eq!(
+            cheap_ctx,
+            Some(11_000),
+            "the write must land on the nested entry's own context_window"
+        );
+        assert_eq!(
+            big_ctx,
+            Some(64_000),
+            "an entry that already has a window must be skipped"
+        );
+        assert_eq!(
+            entry.context_window, None,
+            "the profile-level window must not be touched when all models are nested"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_context_windows_targets_only_selected_nested_model_in_dotted_profile() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let mut config = Config {
+            config_path: temp_dir.path().join("config.toml"),
+            ..Default::default()
+        };
+        let entry = config
+            .providers
+            .models
+            .ensure("openai", "gw.v2")
+            .expect("openai provider type exists");
+        entry.models.insert(
+            "cheap".to_string(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("gpt-4o-mini".into()),
+                ..Default::default()
+            },
+        );
+        entry.models.insert(
+            "big".to_string(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("gpt-4o".into()),
+                ..Default::default()
+            },
+        );
+
+        let mock_fetch: FetchContextWindowFn = Box::new(
+            |_type: &str, cfg: &zeroclaw_config::schema::ModelProviderConfig| {
+                Box::pin(async move { cfg.model.as_deref().map(|m| m.len() * 1000) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send>>
+            },
+        );
+        let updated = update_context_windows(
+            &mut config,
+            Some("openai.gw.v2.cheap"),
+            false,
+            Some(mock_fetch),
+        )
+        .await
+        .expect("update_context_windows should succeed");
+
+        assert_eq!(updated, 1);
+        let entry = config
+            .providers
+            .models
+            .find("openai", "gw.v2")
+            .expect("profile exists");
+        assert_eq!(entry.models["cheap"].context_window, Some(11_000));
+        assert_eq!(entry.models["big"].context_window, None);
+    }
+
+    #[test]
+    fn check_config_semantics_reports_nested_entries_as_configured() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let mut config = Config {
+            config_path: temp_dir.path().join("config.toml"),
+            ..Default::default()
+        };
+        // Nested-only profile: no profile-level model, both entries carry
+        // ids. Previously this warned "no model configured".
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("openai", "gw")
+                .expect("openai provider type exists");
+            entry.models.insert(
+                "cheap".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o-mini".into()),
+                    ..Default::default()
+                },
+            );
+            // Entry with an invalid tuning value — surfaced per entry.
+            entry.models.insert(
+                "broken".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o".into()),
+                    context_window: Some(0),
+                    temperature: Some(3.0),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
+        let expected_temperature_error = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-temperature-out-of-range",
+            &[("provider_ref", "openai.gw.broken"), ("temperature", "3.0")],
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message == expected_temperature_error
+                    && item.severity == Severity::Error)
+        );
+
+        assert!(
+            !messages.iter().any(|m| m.contains("no model configured")),
+            "a nested-only profile is not 'no model configured': {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("model: gpt-4o-mini (entry cheap)")),
+            "each nested entry's id is reported: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("openai.gw.broken")),
+            "invalid nested-entry tuning is reported against the entry: {messages:?}"
         );
     }
 }

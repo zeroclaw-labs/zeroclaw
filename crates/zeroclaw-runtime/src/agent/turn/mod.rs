@@ -92,7 +92,7 @@ use crate::agent::tool_execution::{
 use crate::live_config_authority::AgentExecutionAdmission;
 use crate::security::ingress::{IngressPolicy, ingress_policy, steering_policy};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::collections::{HashSet, VecDeque};
 use std::io::Write as _;
 use std::sync::Arc;
@@ -1602,14 +1602,14 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     p: ToolLoop<'a>,
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
-) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage)
+) -> futures_util::future::BoxFuture<'a, Result<String>> {
+    Box::pin(run_tool_call_loop_impl(p, Some(subject), reported_usage))
 }
 
-pub fn run_tool_call_loop(
-    p: ToolLoop<'_>,
-) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None)
+pub fn run_tool_call_loop(p: ToolLoop<'_>) -> futures_util::future::BoxFuture<'_, Result<String>> {
+    // Bound the future stored by every transport and delegated turn. The turn
+    // state machine is large even when its nested provider calls are boxed.
+    Box::pin(run_tool_call_loop_impl(p, None, None))
 }
 
 async fn run_tool_call_loop_impl<'a>(
@@ -1690,6 +1690,20 @@ async fn run_tool_call_loop_impl<'a>(
         knobs,
     } = exec;
 
+    let temperature_input = temperature;
+    // Legacy CLI bare-family overrides inherit the configured agent selection.
+    let sampling_ref = config
+        .and_then(|config| {
+            (config.resolve_model_selection(provider_name).is_none()
+                && !provider_name.contains('.'))
+            .then(|| agent_alias.and_then(|alias| config.agent(alias)))
+            .flatten()
+            .map(|agent| agent.model_provider.as_str())
+        })
+        .unwrap_or(provider_name);
+    let temperature = temperature_input.resolve(config, sampling_ref);
+    // Admit one generation for this turn; retries and streams share the Arc.
+    let sampling_config = config.map(|config| Arc::new(config.clone()));
     // Config-backed loops resolve the executing alias; configless Agent turns
     // already carry this cap in their transient protocol context. Zero is unlimited.
     let max_system_prompt_chars = config
@@ -1844,7 +1858,7 @@ async fn run_tool_call_loop_impl<'a>(
         provider_name,
         model,
         context_limits,
-        temperature,
+        temperature: temperature_input.for_call(sampling_config.clone(), sampling_ref),
         approval,
         channel_name,
         channel_reply_target,
@@ -1994,6 +2008,7 @@ async fn run_tool_call_loop_impl<'a>(
                         provider_name,
                         model,
                         dispatch_model,
+                        temperature_input,
                         temperature,
                         pacing,
                         cancellation_token.as_ref(),
@@ -2221,10 +2236,18 @@ async fn run_tool_call_loop_impl<'a>(
         let model_context_window = active_context_limits.model_context_window;
         // Zero disables proactive trimming, but model capacity still applies.
         let trim_budget = dispatch_trim_budget(active_context_limits);
-        let ctx = base_ctx.for_route(
+        let mut ctx = base_ctx.for_route(
             active_model_provider_name,
             provider_request_model,
             active_context_limits,
+        );
+        ctx.temperature = temperature_input.for_call(
+            sampling_config.clone(),
+            if vision_model_provider_box.is_some() {
+                active_model_provider_name
+            } else {
+                sampling_ref
+            },
         );
         if let Some(sink) = served_route_sink.as_ref() {
             *sink.lock().expect("served-route sink lock") = Some(outcome::ServedRoute {
@@ -2780,40 +2803,46 @@ async fn run_tool_call_loop_impl<'a>(
                 )
             });
 
-        // A reliable fallback can serve a DIFFERENT configured alias than the
-        // one this iteration resolved limits for at dispatch time. Capacity and
-        // budget are properties of the route that actually answered, so re-key
-        // them through the same canonical resolver rather than reporting the
-        // pre-dispatch pair against a post-dispatch identity. `AcceptedRoute`
-        // deliberately carries identity only — capacity lives in config, which
-        // the provider layer must not know about — so the pair is re-resolved
-        // here instead of being threaded through dispatch.
-        //
-        // Gated on the served ROUTE differing from the dispatched one, in
-        // either component. Two distinct fallback shapes reach here:
-        //
-        //   - `fallback` (cross-alias): the accepted route names a different
-        //     configured alias, so the alias comparison catches it.
-        //   - `fallback_models` (same-alias): `push_pinned_entries` builds the
-        //     primary and every fallback under ONE alias, differing only in the
-        //     pinned model, and `served_model()` reports that pinned model. The
-        //     alias is unchanged, so only the model comparison catches it.
-        //
-        // The model comparison ignores a `hint:` selector. A direct call
-        // through a router reports an accepted route whose `model()` is the
-        // dispatch-facing wire selector, which is neither an attribution name
-        // nor a valid resolver key; comparing it raw would fire on every hinted
-        // call even though the route never changed. Pinned-fallback models from
-        // the reliable layer are never `hint:`-prefixed, so stripping the
-        // prefix keeps this branch closed for hint routing while leaving it
-        // open for a real pinned-model fallback.
+        // Resolve capacity from the accepted construction selection, while
+        // keeping physical provider/model identity for billing and telemetry.
+        // A wire model ID alone cannot distinguish nested entries. Legacy
+        // direct providers without a selection report retain route-based
+        // resolution below; a hint selector is not a capacity lookup key.
         let served_model_key = served_model
             .strip_prefix("hint:")
             .map(|_| provider_request_model)
             .unwrap_or(served_model.as_str());
         let served_route_changed = served_provider != active_model_provider_name
             || served_model_key != provider_request_model;
-        let served_context_limits = if served_route_changed {
+        // Reliable dispatch attributes its primary to the shared profile.
+        // If only the nested suffix was normalized, the selected entry's
+        // capacity still applies; the same model ID cannot identify an entry.
+        let same_selected_model = served_model_key == provider_request_model
+            && config.is_some_and(|config| {
+                match (
+                    config
+                        .providers
+                        .models
+                        .profile_ref(active_model_provider_name),
+                    config.providers.models.profile_ref(&served_provider),
+                ) {
+                    (Some(active), Some(served)) => active == served,
+                    _ => false,
+                }
+            });
+        let accepted_selection = accepted_route
+            .as_ref()
+            .and_then(|route| route.selection_ref());
+        let served_context_limits = if let Some(selection_ref) = accepted_selection {
+            resolve_context_limits_for_call(
+                context_limits_resolver.as_ref(),
+                config,
+                agent_alias,
+                selection_ref,
+                served_model_key,
+                active_context_limits,
+            )
+        } else if served_route_changed && !same_selected_model {
             resolve_context_limits_for_call(
                 context_limits_resolver.as_ref(),
                 config,
@@ -2825,10 +2854,8 @@ async fn run_tool_call_loop_impl<'a>(
         } else {
             active_context_limits
         };
-        // Rebind so everything downstream of acceptance — the per-call usage
-        // frame, recovery arithmetic, and the terminal snapshot — reads limits
-        // for the route that actually answered. A no-op when the alias did not
-        // change, since `served_context_limits` is then the pair already bound.
+        // Usage frames, recovery arithmetic and the terminal snapshot all
+        // consume the accepted selection's freshly resolved limits.
         let ctx = base_ctx.for_route(&served_provider, served_model_key, served_context_limits);
 
         // Reliable providers classify this before retries and fallback. Keep
@@ -3289,8 +3316,12 @@ async fn run_tool_call_loop_impl<'a>(
             parallel_tools && should_execute_tools_in_parallel(&executable_calls, approval);
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
-        let execution =
-            crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
+        // Each task-local scope otherwise embeds the tool batch's entire
+        // future in both scoped/unscoped branches. Keep one heap allocation
+        // across the admission wrappers, especially for nested delegates.
+        let execution = Box::pin(crate::sop::executor::scope_live_action_queue(
+            live_sop_queue.clone(),
+            async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
                     let dispatch = ToolDispatchContext {
@@ -3328,7 +3359,23 @@ async fn run_tool_call_loop_impl<'a>(
                     )
                     .await
                 }
-            });
+            },
+        ));
+        // Parallel tool calls are joined in this task. Registry, pipeline, and
+        // nested skill calls therefore share this admission without a live read.
+        let execution = async {
+            match (sampling_config.as_ref(), agent_alias) {
+                (Some(config), Some(alias)) => {
+                    zeroclaw_tools::llm_task::scope_model_config(
+                        Arc::clone(config),
+                        alias,
+                        execution,
+                    )
+                    .await
+                }
+                _ => execution.await,
+            }
+        };
         let execution = scope_model_switch_provider_allowlist(
             knobs.provider_attempt_allowlist.clone(),
             execution,
@@ -3503,7 +3550,7 @@ async fn run_tool_call_loop_impl<'a>(
                 provider_name,
                 model,
                 dispatch_model,
-                temperature,
+                temperature_input,
                 tools_registry,
                 observer,
                 silent,
@@ -3570,6 +3617,7 @@ async fn run_tool_call_loop_impl<'a>(
         provider_name,
         model,
         dispatch_model,
+        temperature_input,
         temperature,
         pacing,
         cancellation_token.as_ref(),
@@ -3741,9 +3789,6 @@ pub(crate) struct OwnedAgentExecution {
     model_provider: Box<dyn ModelProvider>,
     provider_name: String,
     model: String,
-    /// The step agent's own configured provider temperature — the same source
-    /// the headless driver hands `crate::agent::run`.
-    temperature: Option<f64>,
     /// The step agent's sealed tool set. A [`crate::tools::scoped::ScopedToolRegistry`]
     /// so the nested loop's `ResolvedIo.tools_registry` can be fed the scoped
     /// registry directly (coerces to `&[Box<dyn Tool>]` at leaf sites via `Deref`).
@@ -3951,21 +3996,15 @@ pub(crate) async fn assemble_owned_execution_with_admission(
     // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
     let tools_registry = registry;
 
-    let provider_ref = config
-        .resolved_model_provider_for_agent(alias)
-        .map(|(ty, al, _)| format!("{ty}.{al}"))
-        .ok_or_else(|| {
-            anyhow::Error::msg(format!(
-                "SOP step agent '{alias}' has no resolved model provider"
-            ))
-        })?;
-    let (model_provider, provider_name, model, _model_route_resolver) =
-        crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
-    // The step agent's own configured temperature — the same source the
-    // headless driver reads for `crate::agent::run`.
-    let temperature = config
-        .model_provider_for_agent(alias)
-        .and_then(|e| e.temperature);
+    let model_binding = zeroclaw_providers::model::build_model_nonblocking(
+        Arc::new(config.clone()),
+        alias,
+        agent.model_provider.as_str(),
+        None,
+    )
+    .await
+    .with_context(|| format!("SOP step agent '{alias}' has no resolved model provider"))?;
+    let (model_provider, identity, _) = model_binding.into_parts();
 
     // The step agent's risk profile under the PARENT surface's interactivity
     // mode: an operator approval route available to the outer turn stays
@@ -3977,9 +4016,8 @@ pub(crate) async fn assemble_owned_execution_with_admission(
 
     Ok(OwnedAgentExecution {
         model_provider,
-        provider_name,
-        model,
-        temperature,
+        provider_name: identity.provider_ref(),
+        model: identity.model_id,
         tools_registry,
         approval,
         activated_tools: activated_handle,
@@ -4056,7 +4094,7 @@ async fn drive_live_sop_actions(
     provider_name: &str,
     model: &str,
     dispatch_model: &str,
-    temperature: Option<f64>,
+    temperature: zeroclaw_providers::temperature::Temperature,
     tools_registry: &crate::tools::scoped::ScopedToolRegistry,
     observer: &dyn crate::observability::Observer,
     silent: bool,
@@ -4269,6 +4307,15 @@ async fn drive_live_sop_actions(
                             .and_then(|owned| owned.execution_admission.as_ref())
                             .map(AgentExecutionAdmission::config)
                             .or(execution_config);
+                        // Cross-agent calls resolve model defaults from the same
+                        // generation that assembled the child's provider/tools.
+                        let step_config = if owned.is_some() {
+                            execution_config
+                                .as_deref()
+                                .or_else(|| sop_reassembly.as_ref().map(|handle| handle.config))
+                        } else {
+                            config
+                        };
                         let (
                             eff_model_provider,
                             eff_provider_name,
@@ -4314,7 +4361,7 @@ async fn drive_live_sop_actions(
                             eff_pacing,
                         ) = match owned {
                             Some(o) => (
-                                o.temperature,
+                                zeroclaw_providers::temperature::Temperature::default(),
                                 o.agent.resolved.max_tool_iterations,
                                 o.agent.resolved.strict_tool_parsing,
                                 o.agent.resolved.parallel_tools,
@@ -4465,17 +4512,8 @@ async fn drive_live_sop_actions(
                                                 Some(o) => Some(o.security.as_ref()),
                                                 None => security,
                                             },
-                                            multimodal_config,
-                                            config: if owned.is_some() {
-                                                Some(execution_config.as_deref().unwrap_or(
-                                                    sop_reassembly
-                                                        .as_ref()
-                                                        .expect("owned implies a reassembly handle")
-                                                        .config,
-                                                ))
-                                            } else {
-                                                config
-                                            },
+                                            multimodal_config: step_config.map_or(multimodal_config, |config| &config.multimodal),
+                                            config: step_config,
                                             hooks,
                                             activated_tools: eff_activated,
                                             // Deliberately NOT the outer round's
@@ -6345,7 +6383,7 @@ mod active_route_context_tests {
             provider_name: "custom.text",
             model: "text-model",
             context_limits: text_limits,
-            temperature: None,
+            temperature: None.into(),
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
@@ -6723,7 +6761,7 @@ vision_model_provider = "custom.vision"
                     provider_name: "custom.text",
                     model: "text-model",
                     dispatch_model: "text-model",
-                    temperature: None,
+                    temperature: None.into(),
                 },
                 ResolvedIo {
                     tools_registry: &tools_registry,
@@ -6979,8 +7017,8 @@ mod sop_step_reassembly_tests {
     async fn reassembly_yields_the_named_agents_own_scope() {
         use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
-            RiskProfileConfig, SopConfig,
+            AliasedAgentConfig, Config, ModelEntryConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig, SopConfig,
         };
 
         let root =
@@ -7010,7 +7048,25 @@ mod sop_step_reassembly_tests {
             "p".to_string(),
             OllamaModelProviderConfig {
                 base: ModelProviderConfig {
-                    model: Some("test-model".to_string()),
+                    model: Some("legacy-model".to_string()),
+                    models: std::collections::HashMap::from([
+                        (
+                            "default".to_string(),
+                            ModelEntryConfig {
+                                id: Some("default-model".to_string()),
+                                temperature: Some(0.1),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "fast".to_string(),
+                            ModelEntryConfig {
+                                id: Some("fast-model".to_string()),
+                                temperature: Some(0.42),
+                                ..Default::default()
+                            },
+                        ),
+                    ]),
                     ..ModelProviderConfig::default()
                 },
                 ..OllamaModelProviderConfig::default()
@@ -7021,7 +7077,7 @@ mod sop_step_reassembly_tests {
                 alias.to_string(),
                 AliasedAgentConfig {
                     enabled: true,
-                    model_provider: "ollama.p".into(),
+                    model_provider: "ollama.p.fast".into(),
                     risk_profile: profile.into(),
                     memory: AgentMemoryConfig {
                         backend: MemoryBackendKind::Markdown,
@@ -7044,6 +7100,18 @@ mod sop_step_reassembly_tests {
                 .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
+
+        for owned in [&reader, &writer] {
+            assert_eq!(owned.provider_name, "ollama.p.fast");
+            assert_eq!(owned.model, "fast-model");
+            assert_eq!(
+                config
+                    .resolve_model_selection(&owned.provider_name)
+                    .unwrap()
+                    .temperature(),
+                Some(0.42)
+            );
+        }
 
         assert!(
             reader_names.contains(&"file_read".to_string())
@@ -7841,7 +7909,7 @@ mod sop_step_reassembly_tests {
                     provider_name: "budget-test",
                     model: "budget-test-model",
                     dispatch_model: "hint:budget-test",
-                    temperature: None,
+                    temperature: None.into(),
                 },
                 ResolvedIo {
                     tools_registry: tools,
@@ -8240,16 +8308,14 @@ mod sop_step_reassembly_tests {
         tools: Vec<Box<dyn crate::tools::Tool>>,
         mcp_tool_names: std::collections::HashSet<String>,
         tool_filter_groups: Vec<zeroclaw_config::schema::ToolFilterGroup>,
-        temperature: Option<f64>,
     ) -> OwnedAgentExecution {
         let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
         agent.resolved.tool_filter_groups = tool_filter_groups;
         agent.resolved.max_tool_iterations = 3;
         OwnedAgentExecution {
             model_provider: Box::new(CaptureProvider { requests }),
-            provider_name: "capture".into(),
+            provider_name: "custom.capture".into(),
             model: "capture-model".into(),
-            temperature,
             tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
             approval: crate::approval::ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -8386,7 +8452,7 @@ mod sop_step_reassembly_tests {
             "mock",
             "mock-model",
             "mock-model",
-            None,
+            None.into(),
             parent_tools,
             observer,
             true,
@@ -8514,7 +8580,13 @@ mod sop_step_reassembly_tests {
     #[tokio::test]
     async fn cross_agent_step_never_sends_parent_history_to_child_provider() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
-        let config = zeroclaw_config::schema::Config::default();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "capture")
+            .unwrap()
+            .temperature = Some(0.42);
         let handle = SopStepReassembly {
             config: &config,
             live_config: None,
@@ -8530,7 +8602,6 @@ mod sop_step_reassembly_tests {
                 Vec::new(),
                 std::collections::HashSet::new(),
                 Vec::new(),
-                Some(0.42),
             ),
         );
 
@@ -8644,7 +8715,7 @@ mod sop_step_reassembly_tests {
         let mut exec_cache = std::collections::HashMap::new();
         exec_cache.insert(
             "stepper".to_string(),
-            seeded_owned(Arc::clone(&requests), tools, mcp_names, groups, None),
+            seeded_owned(Arc::clone(&requests), tools, mcp_names, groups),
         );
 
         let parent_provider = TextProvider;
@@ -8730,7 +8801,6 @@ mod sop_step_reassembly_tests {
                 Vec::new(),
                 std::collections::HashSet::new(),
                 Vec::new(),
-                None,
             ),
         );
 
@@ -9180,7 +9250,6 @@ mod sop_step_reassembly_tests {
                 model_provider: Box::new(ChildSwitchProvider),
                 provider_name: "child-original-provider".into(),
                 model: "child-original-model".into(),
-                temperature: None,
                 tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
                     Box::new(ChildModelSwitchTool),
                 ]),
@@ -9679,7 +9748,7 @@ mod tool_lifecycle_abandonment_tests {
                     provider_name: "scripted",
                     model: "scripted-model",
                     dispatch_model: "scripted-model",
-                    temperature: Some(0.0),
+                    temperature: Some(0.0).into(),
                 },
                 tools_registry,
                 observer,

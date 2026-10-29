@@ -83,7 +83,7 @@ pub(crate) async fn consume_provider_streaming_response(
     messages: &[ChatMessage],
     request_tools: Option<&[crate::tools::ToolSpec]>,
     model: &str,
-    temperature: Option<f64>,
+    temperature: impl Into<zeroclaw_api::model_provider::CallSampling> + Send,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
@@ -122,7 +122,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     model_provider: &dyn ModelProvider,
     request: ChatRequest<'_>,
     model: &str,
-    temperature: Option<f64>,
+    temperature: impl Into<zeroclaw_api::model_provider::CallSampling> + Send,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
@@ -133,10 +133,10 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
 ) -> Result<StreamedChatOutcome> {
     let request_tools = request.tools;
     let mut provider_stream = ProviderDispatch::from_ref(model_provider)
-        .stream_chat_with_tool_round_policy(
+        .stream_chat_with_sampling_and_tool_round_policy(
             request,
             model,
-            temperature,
+            temperature.into(),
             zeroclaw_providers::traits::StreamOptions::new(true),
             policy,
         );

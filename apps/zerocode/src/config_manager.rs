@@ -56,15 +56,14 @@ fn is_direct_child_path(path: &str, prefix: &str) -> bool {
 }
 
 fn model_field_catalog_reference(path: &str) -> Option<String> {
-    let segments: Vec<&str> = path.split('.').collect();
-    match segments.as_slice() {
-        ["providers", "models", family, alias, "model"]
-            if !family.is_empty() && !alias.is_empty() =>
-        {
-            Some(format!("{family}.{alias}"))
-        }
-        _ => None,
+    let profile = path.strip_prefix("providers.models.")?;
+    if let Some(reference) = profile.strip_suffix(".model") {
+        return reference.contains('.').then(|| reference.to_string());
     }
+    let nested = profile.strip_suffix(".id")?;
+    nested
+        .rsplit_once(".models.")
+        .map(|(reference, _)| reference.to_string())
 }
 
 fn retain_direct_children(fields: &mut Vec<ConfigFieldEntry>, prefix: &str) {
@@ -6226,6 +6225,18 @@ mod tests {
     }
 
     #[test]
+    fn model_field_catalog_reference_supports_nested_id_and_dotted_profile() {
+        assert_eq!(
+            model_field_catalog_reference("providers.models.openai.edge.v2.models.fast.id"),
+            Some("openai.edge.v2".into())
+        );
+        assert_eq!(
+            model_field_catalog_reference("providers.models.openai.edge.v2.model"),
+            Some("openai.edge.v2".into())
+        );
+    }
+
+    #[test]
     fn model_field_catalog_reference_preserves_typed_alias() {
         assert_eq!(
             model_field_catalog_reference("providers.models.hailo_ollama.edge.model"),
@@ -9124,6 +9135,95 @@ mod tests {
             "the restored cursor must be visible on the active tab"
         );
         assert_eq!(manager.fields[1].value, Some(serde_json::json!(["x", "y"])));
+    }
+
+    #[tokio::test]
+    async fn nested_model_reference_picker_preserves_selection_in_rpc_and_renderer() {
+        use crate::jsonrpc::RpcOutbound;
+        use ratatui::{Terminal, backend::TestBackend};
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let mut manager = App::new(rpc, std::path::Path::new("."));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorded = Arc::clone(&calls);
+        tokio::spawn(async move {
+            let mut saved = "openai.fixture.default".to_string();
+            while let Some(raw) = rx.recv().await {
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let id = request["id"].as_str().unwrap().to_string();
+                recorded.lock().unwrap().push(request.clone());
+                let result = if request["method"] == "config/set" {
+                    assert_eq!(request["params"]["prop"], "agents.worker.model_provider");
+                    saved = request["params"]["value"].as_str().unwrap().into();
+                    serde_json::json!({})
+                } else {
+                    assert_eq!(request["method"], "config/list");
+                    let mut selected = field("agents.worker.model_provider");
+                    selected.value = Some(serde_json::json!(saved));
+                    selected.populated = true;
+                    serde_json::json!({"entries": [selected]})
+                };
+                outbound.dispatch_response(&id, Some(result), None);
+            }
+        });
+        manager.sections = vec![entry_with_cost("agents", "")];
+        manager.loaded_section = Some(0);
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        let mut selected = field("agents.worker.model_provider");
+        selected.value = Some(serde_json::json!("openai.fixture.default"));
+        selected.populated = true;
+        manager.fields = vec![selected];
+        manager.tab_names = vec![ConfigTab::None];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "agents.worker".into(),
+            breadcrumb: vec!["agents".into(), "worker".into()],
+            field_idx: 0,
+        };
+        manager.select_items = vec![
+            "openai.fixture.default".into(),
+            "openai.fixture.fast".into(),
+        ];
+        manager.select_cursor = 1;
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal
+            .draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+        let before = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(before.contains("openai.fixture.fast"));
+        assert!(
+            manager
+                .select_items
+                .iter()
+                .any(|item| item == "openai.fixture.fast")
+        );
+        manager.commit_select(1).await.unwrap();
+        terminal
+            .draw(|frame| manager.draw_into(frame, frame.area()))
+            .unwrap();
+        let after = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(after.contains("openai.fixture.fast"));
+        assert_eq!(
+            manager.fields[0].value,
+            Some(serde_json::json!("openai.fixture.fast"))
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["params"]["value"], "openai.fixture.fast");
     }
 
     #[tokio::test]

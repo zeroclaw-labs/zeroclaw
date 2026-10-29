@@ -1165,20 +1165,19 @@ async fn run_agent_job(
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(
-                crate::agent::run(
-                    config.clone(),
-                    agent_alias,
-                    Some(prefixed_prompt),
-                    None,
-                    model_override,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path.clone()),
-                    job.allowed_tools.clone(),
-                    zeroclaw_api::ingress::TurnOrigin::Cron,
+                crate::agent::run_with_request(
+                    Arc::new(config.clone()),
+                    crate::agent::AgentRunRequest {
+                        message: Some(prefixed_prompt),
+                        model: crate::agent::agent::ModelOverrides {
+                            model: model_override.as_deref(),
+                            ..Default::default()
+                        },
+                        session_state_file: Some(session_path.clone()),
+                        allowed_tools: job.allowed_tools.clone(),
+                        origin: zeroclaw_api::ingress::TurnOrigin::Cron,
+                        ..crate::agent::AgentRunRequest::new(agent_alias)
+                    },
                     run_overrides,
                 )
                 .instrument(subagent_span),

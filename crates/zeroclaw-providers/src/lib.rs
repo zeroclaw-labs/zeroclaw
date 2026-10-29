@@ -16,6 +16,7 @@ pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;
+pub mod model;
 pub mod model_pin;
 pub mod models_dev;
 pub mod multimodal;
@@ -32,6 +33,7 @@ pub mod router;
 pub mod safeguard_notice;
 pub(crate) mod stream_guard;
 pub mod telnyx;
+pub mod temperature;
 pub mod traits;
 pub mod vision_override;
 
@@ -136,8 +138,6 @@ const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113";
 const GLM_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const MOONSHOT_INTL_BASE_URL: &str = "https://api.moonshot.ai/v1";
-const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
 
@@ -681,7 +681,7 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
     /// Explicit provider implementation from `[providers.models.<family>.<alias>].kind`.
@@ -708,6 +708,9 @@ pub struct ModelProviderRuntimeOptions {
     /// Maximum output tokens for LLM model_provider API requests.
     /// `None` uses the model_provider's built-in default.
     pub provider_max_tokens: Option<u32>,
+    /// Construction-time projection of the selected model capacity.
+    /// Config remains canonical; rebuilt bindings rematerialize this value.
+    pub provider_context_window: Option<usize>,
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
@@ -786,6 +789,7 @@ impl Default for ModelProviderRuntimeOptions {
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
+            provider_context_window: None,
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
@@ -808,31 +812,8 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
     config: &zeroclaw_config::schema::Config,
     entry: Option<&zeroclaw_config::schema::ModelProviderConfig>,
 ) -> ModelProviderRuntimeOptions {
-    // Resolve merge_system_into_user from the active model model_provider profile
-    // by matching api_url — providers.models retains all profiles. We keep
-    // this lookup based on URL match rather than identity because the entry
-    // we were given may itself originate from any of those profiles.
-    let merge_system_into_user = entry
-        .and_then(|e| e.uri.as_deref())
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .and_then(|active_uri| {
-            config
-                .providers
-                .models
-                .iter_entries()
-                .map(|(_, _, base)| base)
-                .find(|p| {
-                    p.uri
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|u: &&str| !u.is_empty())
-                        .map(|u: &str| u.trim_end_matches('/'))
-                        == Some(active_uri.trim_end_matches('/'))
-                })
-        })
-        .map(|p| p.merge_system_into_user)
-        .unwrap_or(false);
+    // The selected profile owns this policy, even when profiles share a URI.
+    let merge_system_into_user = entry.is_some_and(|entry| entry.merge_system_into_user);
 
     let tls_ca_cert_path = entry.and_then(|e| e.tls_ca_cert_path.clone());
 
@@ -855,6 +836,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
         api_path: None,
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
+        provider_context_window: entry.and_then(|e| e.context_window),
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
@@ -874,6 +856,58 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
     }
 }
 
+/// Overlay a selected model entry's model-side tuning onto options already
+/// built from its enclosing provider profile. Only fields the entry sets
+/// override the profile-derived value; connection-side options (URL, headers,
+/// TLS, kind, wire) are left untouched. No-op when `model_entry` is `None`.
+pub fn apply_model_entry_options(
+    options: &mut ModelProviderRuntimeOptions,
+    model_entry: Option<&zeroclaw_config::schema::ModelEntryConfig>,
+) {
+    // Exhaustive destructuring makes new model fields require an explicit
+    // inheritance decision here. Identity and temperature are resolved by
+    // ModelSelection; capacity also feeds adapters with a local input budget.
+    let Some(zeroclaw_config::schema::ModelEntryConfig {
+        id: _,
+        temperature: _,
+        context_window,
+        max_tokens,
+        think,
+        vision,
+        native_tools,
+        replay_assistant_reasoning,
+        provider_extra,
+        chat_template_kwargs,
+    }) = model_entry
+    else {
+        return;
+    };
+    if let Some(v) = *context_window {
+        options.provider_context_window = Some(v);
+    }
+    if let Some(v) = *max_tokens {
+        options.provider_max_tokens = Some(v);
+    }
+    if let Some(v) = *think {
+        options.think = Some(v);
+    }
+    if let Some(v) = *vision {
+        options.vision = Some(v);
+    }
+    if let Some(v) = *native_tools {
+        options.native_tools = Some(v);
+    }
+    if let Some(v) = *replay_assistant_reasoning {
+        options.replay_assistant_reasoning = Some(v);
+    }
+    if provider_extra.is_some() {
+        options.provider_extra = provider_extra.clone();
+    }
+    if chat_template_kwargs.is_some() {
+        options.chat_template_kwargs = chat_template_kwargs.clone();
+    }
+}
+
 /// Resolve `ModelProviderRuntimeOptions` from an agent's `model_provider` alias
 /// (`"<type>.<alias>"`). Returns safe defaults when the agent alias doesn't
 /// exist, doesn't have a `model_provider` set, or names a non-existent entry.
@@ -881,23 +915,19 @@ pub fn provider_runtime_options_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> ModelProviderRuntimeOptions {
-    let entry = config.model_provider_for_agent(agent_alias);
-    let mut options = model_provider_runtime_options_from_model_provider_entry(config, entry);
-
-    if let Some(agent) = config.agents.get(agent_alias)
-        && let Some((family, alias)) = agent.model_provider.split_once('.')
-    {
-        // Multi-endpoint families: pre-resolve the URI via the centralized
-        // `resolved_endpoint_uri` dispatch (driven by
-        // `for_each_model_provider_slot!`). Operator-set `base.uri` already
-        // populated above wins over the family default.
-        if options.provider_api_url.is_none()
-            && let Some(uri) = config.providers.models.resolved_endpoint_uri(family, alias)
-        {
-            options.provider_api_url = Some(uri.to_string());
-        }
-    }
-
+    let selection = config
+        .agent(agent_alias)
+        .and_then(|agent| config.resolve_model_selection(&agent.model_provider));
+    let mut options = selection.as_ref().map_or_else(
+        || model_provider_runtime_options_from_model_provider_entry(config, None),
+        |selection| provider_runtime_options_for_alias(config, selection.family, selection.alias),
+    );
+    apply_model_entry_options(
+        &mut options,
+        selection
+            .as_ref()
+            .and_then(|selection| selection.model_entry),
+    );
     options
 }
 pub fn provider_runtime_options_for_alias(
@@ -907,7 +937,10 @@ pub fn provider_runtime_options_for_alias(
 ) -> ModelProviderRuntimeOptions {
     let entry = config.providers.models.find(family, alias);
     let mut options = model_provider_runtime_options_from_model_provider_entry(config, entry);
-    if options.provider_api_url.is_none()
+    // Qwen resolves its OAuth resource before falling back to the region enum.
+    // A synthesized region URL here would masquerade as an explicit override.
+    if family != "qwen"
+        && options.provider_api_url.is_none()
         && let Some(uri) = config.providers.models.resolved_endpoint_uri(family, alias)
     {
         options.provider_api_url = Some(uri.to_string());
@@ -924,9 +957,11 @@ pub fn options_for_provider_ref(
     name: &str,
     fallback: &ModelProviderRuntimeOptions,
 ) -> ModelProviderRuntimeOptions {
-    match name.split_once('.') {
-        Some((family, alias)) => provider_runtime_options_for_alias(config, family, alias),
-        None => {
+    match config.providers.models.profile_ref(name) {
+        Some((family, alias)) if !family.contains(':') => {
+            provider_runtime_options_for_alias(config, family, alias)
+        }
+        _ => {
             let mut options = fallback.clone();
             options.provider_kind = None;
             options.provider_api_url = None;
@@ -1118,11 +1153,11 @@ fn mentions_tools_token(message: &str) -> bool {
         let preceded_by_word_char = message[..start]
             .chars()
             .next_back()
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
         let followed_by_word_char = bytes
             .get(end)
             .map(|byte| *byte as char)
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
 
         if !preceded_by_word_char && !followed_by_word_char {
             return true;
@@ -1687,10 +1722,9 @@ pub fn create_resilient_model_provider_with_options(
     Ok(Box::new(reliable))
 }
 
-/// Wrap the primary model_provider in a retry/backoff harness with full
-/// alias context. Production callers (gateway, orchestrator) use this so
-/// the dispatch sees the typed alias config and routes Azure/Codex/Gemini
-/// extras correctly.
+/// Low-level compatibility API with explicit connection and retry overrides.
+/// Configured consumers should use [`model::build_reliable_provider`], which
+/// derives these inputs from one selection and prevents conflicting policy.
 pub fn create_resilient_model_provider_for_alias(
     config: &zeroclaw_config::schema::Config,
     family: &str,
@@ -1700,10 +1734,9 @@ pub fn create_resilient_model_provider_for_alias(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    create_resilient_model_provider_for_alias_with_model_override(
+    create_resilient_model_provider_from_ref_with_model_override(
         config,
-        family,
-        alias,
+        &format!("{family}.{alias}"),
         api_key,
         api_url,
         reliability,
@@ -1721,6 +1754,7 @@ fn create_resilient_model_provider_for_alias_with_model_override(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
     primary_model_override: Option<&str>,
+    selection_ref: &str,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let primary_model_provider =
         create_model_provider_inner(Some(config), family, alias, api_key, api_url, options)?;
@@ -1733,6 +1767,7 @@ fn create_resilient_model_provider_for_alias_with_model_override(
         alias,
         primary_model_provider,
         primary_model_override,
+        selection_ref,
     );
 
     let mut visited: Vec<String> = vec![format!("{family}.{alias}")];
@@ -1764,6 +1799,7 @@ fn push_pinned_entries(
     alias: &str,
     built: Box<dyn ModelProvider>,
     primary_model_override: Option<&str>,
+    selection_ref: &str,
 ) {
     let entry = config.providers.models.find(family, alias);
     let primary_model = primary_model_override
@@ -1776,34 +1812,43 @@ fn push_pinned_entries(
     let cooldown_key = format!("{family}.{alias}");
 
     let Some(primary_model) = primary_model else {
-        out.push(ReliableModelProviderEntry::new_with_candidate(
-            family,
-            cooldown_key.clone(),
-            cooldown_key,
-            built,
-        ));
+        out.push(
+            ReliableModelProviderEntry::new_with_candidate(
+                family,
+                cooldown_key.clone(),
+                cooldown_key,
+                built,
+            )
+            .with_selection_ref(selection_ref),
+        );
         return;
     };
 
     let built: std::sync::Arc<dyn ModelProvider> = std::sync::Arc::from(built);
-    out.push(ReliableModelProviderEntry::new_pinned(
-        family,
-        cooldown_key.clone(),
-        alias,
-        primary_model,
-        Box::new(std::sync::Arc::clone(&built)),
-    ));
+    out.push(
+        ReliableModelProviderEntry::new_pinned(
+            family,
+            cooldown_key.clone(),
+            alias,
+            primary_model,
+            Box::new(std::sync::Arc::clone(&built)),
+        )
+        .with_selection_ref(selection_ref),
+    );
     for model in extra_models {
         if model.trim().is_empty() || model == primary_model {
             continue;
         }
-        out.push(ReliableModelProviderEntry::new_pinned(
-            family,
-            cooldown_key.clone(),
-            alias,
-            model,
-            Box::new(std::sync::Arc::clone(&built)),
-        ));
+        out.push(
+            ReliableModelProviderEntry::new_pinned(
+                family,
+                cooldown_key.clone(),
+                alias,
+                model,
+                Box::new(std::sync::Arc::clone(&built)),
+            )
+            .with_selection_ref(selection_ref),
+        );
     }
 }
 
@@ -1841,7 +1886,21 @@ fn append_fallback_chain(
             );
             continue;
         };
+        if ensure_known_model_entry_ref(config, raw).is_err() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"fallback": raw})),
+                "fallback model entry does not resolve; skipping"
+            );
+            continue;
+        }
         let resolved = format!("{family}.{alias}");
+        let selection_ref = if config.providers.models.profile_ref(raw).is_some() {
+            raw
+        } else {
+            resolved.as_str()
+        };
         if visited.iter().any(|v| v == &resolved) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1853,7 +1912,12 @@ fn append_fallback_chain(
             continue;
         }
 
-        let opts = provider_runtime_options_for_alias(config, family, &alias);
+        let mut opts = provider_runtime_options_for_alias(config, family, &alias);
+        // A three-segment fallback ref names a nested model entry; its
+        // per-model tuning applies on top of the profile options. The
+        // selection also yields the named entry's model id below.
+        let selection = config.resolve_model_selection(selection_ref);
+        apply_model_entry_options(&mut opts, selection.as_ref().and_then(|s| s.model_entry));
         if !factory::fallback_auth_ready_for_alias(
             config,
             family,
@@ -1869,6 +1933,13 @@ fn append_fallback_chain(
             );
         }
 
+        // A three-segment ref pins the fallback to the named entry's model id;
+        // an implicit profile ref follows the default/sole-entry selection (push_pinned_entries
+        // falls back to the entry's `model`).
+        let model_override = selection
+            .as_ref()
+            .filter(|s| s.model_alias.is_some())
+            .and_then(|s| s.model_id.clone());
         match create_model_provider_inner(
             Some(config),
             family,
@@ -1877,7 +1948,15 @@ fn append_fallback_chain(
             entry.uri.as_deref(),
             &opts,
         ) {
-            Ok(built) => push_pinned_entries(out, config, family, &alias, built, None),
+            Ok(built) => push_pinned_entries(
+                out,
+                config,
+                family,
+                &alias,
+                built,
+                model_override.as_deref(),
+                selection_ref,
+            ),
             Err(e) => {
                 let profile = format!("[providers.models.{family}.{alias}]");
                 anyhow::bail!(
@@ -1894,6 +1973,8 @@ fn append_fallback_chain(
     Ok(())
 }
 
+/// Low-level compatibility API. Prefer [`model::build_reliable_provider`] for
+/// configured consumers; supplied options here intentionally override Config.
 pub fn create_resilient_model_provider_from_ref(
     config: &zeroclaw_config::schema::Config,
     name: &str,
@@ -1947,47 +2028,7 @@ pub fn create_model_provider_from_ref_with_model(
     config: &zeroclaw_config::schema::Config,
     name: &str,
 ) -> anyhow::Result<ResolvedModelProviderRef> {
-    // A dotted `<family>.<alias>` that names a REAL configured entry resolves
-    // through the alias factory (honoring the alias's `vision` override, endpoint
-    // URI and credentials). Two exclusions keep the intact name flowing to the
-    // factory instead:
-    //   * a `custom:<url>` / `anthropic-custom:<url>` colon ref whose host carries
-    //     dots (the pre-dot segment holds the scheme colon, e.g. `custom:https://api`
-    //     from `custom:https://api.example.com/v1`) - splitting would truncate it;
-    //   * a dotted ref to a NON-existent alias - splitting it and building the bare
-    //     family would silently fall OPEN to a family-default provider (e.g. a
-    //     typoed `vision_model_provider = "llamacpp.typo"` would route images to a
-    //     default llama.cpp instead of erroring).
-    // In both cases the intact name reaches `create_model_provider_inner`, which
-    // applies family defaults or errors on an unknown provider - keeping a bad ref
-    // fail-closed, exactly as the legacy `create_model_provider(vp, None)` did.
-    if let Some((family, alias)) = name.split_once('.')
-        && !family.contains(':')
-        && let Some(entry) = config.providers.models.find(family, alias)
-    {
-        let options = provider_runtime_options_for_alias(config, family, alias);
-        let provider = create_model_provider_inner(
-            Some(config),
-            family,
-            alias,
-            entry.api_key.as_deref(),
-            entry.uri.as_deref(),
-            &options,
-        )?;
-        let model = entry
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .map(ToString::to_string);
-        return Ok(ResolvedModelProviderRef { provider, model });
-    }
-    let options = provider_runtime_options_for_bare_family(config);
-    let provider = create_model_provider_inner(None, name, "default", None, None, &options)?;
-    Ok(ResolvedModelProviderRef {
-        provider,
-        model: None,
-    })
+    model::build_raw_provider(config, name, model::ProviderOverrides::default())
 }
 
 /// Runtime options for a **bare family** reference (e.g. `ollama`), which has no
@@ -2033,27 +2074,65 @@ fn create_resilient_model_provider_from_ref_with_model_override(
     options: &ModelProviderRuntimeOptions,
     primary_model_override: Option<&str>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    match name.split_once('.') {
-        Some((family, alias)) => create_resilient_model_provider_for_alias_with_model_override(
-            config,
-            family,
-            alias,
-            api_key,
-            api_url,
-            reliability,
-            options,
-            primary_model_override,
-        ),
-        None => create_resilient_model_provider_with_options(
+    let name = name.trim();
+    ensure_known_model_entry_ref(config, name)?;
+    let selection = config.resolve_model_selection(name);
+    let selected_model = selection
+        .as_ref()
+        .filter(|selection| selection.model_entry.is_some())
+        .and_then(|selection| selection.model_id.as_deref());
+    let mut options = options.clone();
+    apply_model_entry_options(
+        &mut options,
+        selection
+            .as_ref()
+            .and_then(|selection| selection.model_entry),
+    );
+    match config.providers.models.profile_ref(name) {
+        Some((family, alias))
+            if !family.contains(':') && config.providers.models.find(family, alias).is_some() =>
+        {
+            create_resilient_model_provider_for_alias_with_model_override(
+                config,
+                family,
+                alias,
+                api_key,
+                api_url,
+                reliability,
+                &options,
+                primary_model_override.or(selected_model),
+                name,
+            )
+        }
+        _ => create_resilient_model_provider_with_options(
             name,
             api_key,
             api_url,
             reliability,
-            options,
+            &options,
         ),
     }
 }
 
+/// A configured profile may have a dotted alias, but any suffix beyond that
+/// alias selects a model entry. Never turn a missing entry into a profile call.
+pub(crate) fn ensure_known_model_entry_ref(
+    config: &zeroclaw_config::schema::Config,
+    name: &str,
+) -> anyhow::Result<()> {
+    if let Some((family, alias)) = config.providers.models.profile_ref(name)
+        && !family.contains(':')
+        && config.providers.models.find(family, alias).is_some()
+        && name.trim() != format!("{family}.{alias}")
+        && config.resolve_model_selection(name.trim()).is_none()
+    {
+        anyhow::bail!("model_provider `{name}` names an unknown model entry");
+    }
+    Ok(())
+}
+
+/// Low-level compatibility API with explicit route and retry overrides.
+/// Prefer [`model::build_model`] to bind provider, identity and resolver.
 pub fn create_routed_model_provider_with_options(
     config: &zeroclaw_config::schema::Config,
     primary_name: &str,
@@ -2077,9 +2156,10 @@ pub fn create_routed_model_provider_with_options(
     .map(|(provider, _)| provider)
 }
 
-/// Build the routed provider together with the exact immutable route resolver
+/// Low-level composition API. Build the routed provider with the exact resolver
 /// it uses. Agent turn metadata can therefore resolve the serving profile and
 /// model without maintaining a second hint table.
+/// Configured consumers should use [`model::build_model`].
 pub fn create_routed_model_provider_with_options_and_resolver(
     config: &zeroclaw_config::schema::Config,
     primary_name: &str,
@@ -2092,15 +2172,17 @@ pub fn create_routed_model_provider_with_options_and_resolver(
 ) -> anyhow::Result<(Box<dyn ModelProvider>, Arc<router::ModelRouteResolver>)> {
     // Config map editing creates a default route entry and then fills its
     // required fields through separate writes. Such a staged entry is not yet
-    // a routing fact: omit it from the materialized provider/resolver until all
-    // three identity fields are present. `Config::validate` remains the
-    // canonical persisted-config gate and still rejects incomplete routes.
+    // a routing fact: omit it from the materialized provider/resolver until the
+    // hint, provider ref, and effective model are present. The effective model
+    // may come from a three-segment provider ref when `model` is omitted.
+    // `Config::validate` remains the canonical persisted-config gate and still
+    // rejects incomplete routes.
     let materialized_routes: Vec<_> = model_routes
         .iter()
         .filter(|route| {
             !route.hint.trim().is_empty()
                 && !route.model_provider.trim().is_empty()
-                && !route.model.trim().is_empty()
+                && !route.effective_model(config).trim().is_empty()
         })
         .collect();
 
@@ -2148,7 +2230,10 @@ pub fn create_routed_model_provider_with_options_and_resolver(
             });
         let key = routed_credential
             .or_else(|| {
-                name.split_once('.')
+                config
+                    .providers
+                    .models
+                    .profile_ref(name)
                     .and_then(|(family, alias)| {
                         config
                             .providers
@@ -2168,6 +2253,11 @@ pub fn create_routed_model_provider_with_options_and_resolver(
         } else {
             options_for_provider_ref(config, name, options)
         };
+        let model_override = if is_primary {
+            Some(default_model)
+        } else {
+            None
+        };
 
         match create_resilient_model_provider_from_ref_with_model_override(
             config,
@@ -2176,7 +2266,7 @@ pub fn create_routed_model_provider_with_options_and_resolver(
             url,
             reliability,
             &entry_options,
-            is_primary.then_some(default_model),
+            model_override,
         ) {
             Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
             Err(e) => {
@@ -2193,7 +2283,10 @@ pub fn create_routed_model_provider_with_options_and_resolver(
                 r.hint.clone(),
                 router::Route {
                     provider_name: r.model_provider.clone(),
-                    model: r.model.clone(),
+                    // An unset route model resolves through the selection
+                    // contract so a three-segment route ref names its nested
+                    // model entry instead of dispatching with an empty model.
+                    model: r.effective_model(config),
                 },
             )
         })
@@ -3008,6 +3101,36 @@ mod tests {
     }
 
     #[test]
+    fn profile_policy_is_owned_by_entry_even_with_shared_or_missing_uri() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "first")
+            .unwrap()
+            .uri = Some("https://shared.invalid/v1".into());
+        let entry = ModelProviderConfig {
+            uri: Some("https://shared.invalid/v1".into()),
+            merge_system_into_user: true,
+            ..Default::default()
+        };
+        assert!(
+            model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry))
+                .merge_system_into_user
+        );
+        let without_uri = ModelProviderConfig { uri: None, ..entry };
+        assert!(
+            model_provider_runtime_options_from_model_provider_entry(&config, Some(&without_uri))
+                .merge_system_into_user
+        );
+        assert!(
+            !model_provider_runtime_options_from_model_provider_entry(&config, None)
+                .merge_system_into_user
+        );
+    }
+
+    #[test]
     fn vision_config_field_maps_into_runtime_options() {
         use zeroclaw_config::schema::{Config, ModelProviderConfig};
         let entry = ModelProviderConfig {
@@ -3547,6 +3670,385 @@ mod tests {
             .take()
             .expect("server should capture request");
         assert_eq!(model, "new-model");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn hailo_nested_context_window_controls_actual_factory_request_budget() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, ModelEntryConfig};
+        type Requests = Arc<Mutex<Vec<serde_json::Value>>>;
+        async fn capture(
+            State(requests): State<Requests>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            requests.lock().unwrap().push(body);
+            Json(serde_json::json!({
+                "model": "hailo-id", "message": {"role": "assistant", "content": "done"}, "done": true
+            }))
+        }
+        let requests: Requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/api/chat", post(capture))
+            .with_state(Arc::clone(&requests));
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("hailo_ollama", "edge")
+            .unwrap();
+        profile.uri = Some(endpoint);
+        profile.model = Some("hailo-id".into());
+        profile.context_window = Some(64);
+        profile.models.insert(
+            "large".into(),
+            ModelEntryConfig {
+                context_window: Some(128),
+                max_tokens: Some(1),
+                ..Default::default()
+            },
+        );
+        profile.models.insert(
+            "inherited".into(),
+            ModelEntryConfig {
+                max_tokens: Some(1),
+                ..Default::default()
+            },
+        );
+        let messages = [ChatMessage::user("x".repeat(300))];
+        for reliable in [false, true] {
+            for (selection, accepted) in [("large", true), ("inherited", false)] {
+                let reference = format!("hailo_ollama.edge.{selection}");
+                let provider = if reliable {
+                    model::build_model(&config, "worker", &reference, None)
+                        .unwrap()
+                        .into_provider()
+                } else {
+                    create_model_provider_from_ref(&config, &reference).unwrap()
+                };
+                let result = ProviderDispatch::from_ref(provider.as_ref())
+                    .chat_with_history(&messages, "hailo-id", None)
+                    .await;
+                if accepted {
+                    assert_eq!(result.unwrap(), "done");
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(
+                        format!("{error:#}").contains("local context budget"),
+                        "reliable={reliable}: {error:#}",
+                    );
+                }
+            }
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "inherited profile budget must still reject before transport"
+        );
+        for body in requests.iter() {
+            assert!(
+                body["options"].get("num_ctx").is_none(),
+                "capacity remains a local budget"
+            );
+            assert_eq!(body["options"]["num_predict"], 1);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn implicit_nested_routes_share_model_tuning_and_fallback_selection() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, ModelEntryConfig, ModelRouteConfig};
+
+        type Requests = Arc<Mutex<Vec<serde_json::Value>>>;
+        async fn capture(
+            State(requests): State<Requests>,
+            Json(body): Json<serde_json::Value>,
+        ) -> (StatusCode, Json<serde_json::Value>) {
+            let reject = body["model"] == "nested-id";
+            requests.lock().unwrap().push(body);
+            if reject {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": {"message": "model unavailable"}})),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"choices": [{"message": {"content": "ok"}}]})),
+                )
+            }
+        }
+
+        let requests = Requests::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture))
+            .with_state(Arc::clone(&requests));
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        for alias in ["target", "target.v2"] {
+            for entry_alias in ["default", "sole"] {
+                for legacy_model in [None, Some("legacy-id")] {
+                    let mut config = Config::default();
+                    config.reliability.provider_retries = 0;
+                    let source = config.providers.models.ensure("custom", "source").unwrap();
+                    source.uri = Some(endpoint.clone());
+                    source.model = Some("source-id".into());
+                    let target = config.providers.models.ensure("custom", alias).unwrap();
+                    target.uri = Some(endpoint.clone());
+                    target.model = legacy_model.map(str::to_string);
+                    target.fallback_models = vec!["backup-id".into()];
+                    target.models.insert(
+                        entry_alias.into(),
+                        ModelEntryConfig {
+                            id: Some("nested-id".into()),
+                            max_tokens: Some(123),
+                            ..Default::default()
+                        },
+                    );
+                    if entry_alias == "default" {
+                        target
+                            .models
+                            .insert("other".into(), ModelEntryConfig::default());
+                    }
+                    for explicit in [false, true] {
+                        let reference = if explicit {
+                            format!("custom.{alias}.{entry_alias}")
+                        } else {
+                            format!("custom.{alias}")
+                        };
+                        config.model_routes = vec![ModelRouteConfig {
+                            hint: "fast".into(),
+                            model_provider: reference,
+                            ..Default::default()
+                        }];
+                        let built =
+                            model::build_model(&config, "worker", "custom.source", None).unwrap();
+                        assert_eq!(
+                            built.route_resolver().resolve("hint:fast").model,
+                            "nested-id"
+                        );
+                        built
+                            .provider()
+                            .chat_with_system(None, "hello", "hint:fast", None)
+                            .await
+                            .unwrap();
+                        let actual = std::mem::take(&mut *requests.lock().unwrap());
+                        assert_eq!(
+                            actual.len(),
+                            2,
+                            "{alias}/{entry_alias}/{legacy_model:?}/{explicit}"
+                        );
+                        assert_eq!(actual[0]["model"], "nested-id");
+                        assert_eq!(actual[1]["model"], "backup-id");
+                        assert!(actual.iter().all(|body| body["max_tokens"] == 123));
+
+                        for reliable in [false, true] {
+                            let reference = format!(" {} ", config.model_routes[0].model_provider);
+                            let overrides = model::ProviderOverrides::default();
+                            let resolved = if reliable {
+                                model::build_reliable_provider(&config, &reference, overrides)
+                            } else {
+                                model::build_raw_provider(&config, &reference, overrides)
+                            }
+                            .unwrap();
+                            assert_eq!(resolved.model.as_deref(), Some("nested-id"));
+                            let result = resolved
+                                .provider
+                                .chat_with_system(None, "hello", "nested-id", None)
+                                .await;
+                            assert_eq!(result.is_ok(), reliable);
+                            let actual = std::mem::take(&mut *requests.lock().unwrap());
+                            assert_eq!(actual.len(), if reliable { 2 } else { 1 });
+                            assert_eq!(actual[0]["model"], "nested-id");
+                            assert!(actual.iter().all(|body| body["max_tokens"] == 123));
+                        }
+                    }
+                }
+            }
+        }
+        for fallback_ref in ["backup", "custom.backup", "custom.backup.default"] {
+            let mut config = Config::default();
+            config.reliability.provider_retries = 0;
+            let source = config.providers.models.ensure("custom", "source").unwrap();
+            source.uri = Some(endpoint.clone());
+            source.model = Some("nested-id".into());
+            source.temperature = Some(0.2);
+            source.fallback = vec![fallback_ref.into()];
+            let backup = config.providers.models.ensure("custom", "backup").unwrap();
+            backup.uri = Some(endpoint.clone());
+            backup.model = Some("legacy-id".into());
+            backup.temperature = Some(0.4);
+            backup.models.insert(
+                "default".into(),
+                ModelEntryConfig {
+                    id: Some("backup-id".into()),
+                    max_tokens: Some(321),
+                    temperature: Some(0.8),
+                    ..Default::default()
+                },
+            );
+            backup
+                .models
+                .insert("other".into(), ModelEntryConfig::default());
+            let built = model::build_model(&config, "worker", "custom.source", None).unwrap();
+            let sampling = crate::temperature::Temperature::default()
+                .for_call(Some(Arc::new(config)), "custom.source");
+            built
+                .provider()
+                .chat_with_system_with_sampling(None, "hello", "nested-id", sampling)
+                .await
+                .unwrap();
+            let actual = std::mem::take(&mut *requests.lock().unwrap());
+            assert_eq!(actual.len(), 2, "{fallback_ref}");
+            assert_eq!(actual[0]["model"], "nested-id");
+            assert_eq!(actual[0]["temperature"], 0.2);
+            assert_eq!(actual[1]["model"], "backup-id");
+            assert_eq!(actual[1]["max_tokens"], 321);
+            assert_eq!(actual[1]["temperature"], 0.8);
+        }
+
+        let mut unpinned = Config::default();
+        unpinned
+            .providers
+            .models
+            .ensure("custom", "unpinned")
+            .unwrap()
+            .uri = Some(endpoint);
+        let resolved = model::build_reliable_provider(
+            &unpinned,
+            "custom.unpinned",
+            model::ProviderOverrides::default(),
+        )
+        .unwrap();
+        assert!(resolved.model.is_none());
+        resolved
+            .provider
+            .chat_with_system(None, "hello", "caller-id", None)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap()[0]["model"], "caller-id");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn routed_nested_alias_with_implicit_model_pins_the_selected_entry() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{
+            CustomModelProviderConfig, ModelEntryConfig, ModelProviderConfig, ModelRouteConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        type Capture = Arc<Mutex<Option<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            *capture.lock().expect("capture lock poisoned") = body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(capture.clone());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "source".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-source".to_string()),
+                    model: Some("source-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.custom.insert(
+            "primary".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("sk-route".to_string()),
+                    uri: Some(format!("http://{addr}/v1")),
+                    model: Some("legacy-profile-model".to_string()),
+                    models: std::collections::HashMap::from([(
+                        "fast".to_string(),
+                        ModelEntryConfig {
+                            id: Some("nested-fast-model".to_string()),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        let routes = [ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "custom.primary.fast".to_string(),
+            model: String::new(),
+            api_key: None,
+        }];
+        let provider = create_routed_model_provider_with_options(
+            &config,
+            "openai.source",
+            Some("sk-source"),
+            None,
+            &config.reliability,
+            &routes,
+            "source-model",
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("routed provider should build");
+        let messages = vec![ChatMessage::user("hello")];
+
+        provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:fast",
+                None,
+            )
+            .await
+            .expect("routed chat should succeed");
+
+        assert_eq!(
+            capture.lock().expect("capture lock poisoned").as_deref(),
+            Some("nested-fast-model"),
+            "the routed provider must pin the nested entry, not the legacy profile model"
+        );
         server.abort();
     }
 
@@ -4188,6 +4690,74 @@ mod tests {
         );
         // Same fail-closed behavior as the legacy factory the vision route used.
         assert!(create_model_provider("llamacpp.typo", None).is_err());
+    }
+
+    #[test]
+    fn model_factories_reject_missing_nested_entry_without_rejecting_dotted_profiles() {
+        use zeroclaw_config::schema::{Config, ModelEntryConfig};
+        let mut config = Config::default();
+        for alias in ["gw", "gw.v2"] {
+            let profile = config.providers.models.ensure("custom", alias).unwrap();
+            profile.uri = Some("http://127.0.0.1:9999/v1".into());
+            profile.model = Some("legacy-id".into());
+            profile.models.insert(
+                "selected".into(),
+                ModelEntryConfig {
+                    id: Some("selected-id".into()),
+                    ..Default::default()
+                },
+            );
+            let reference = format!("custom.{alias}.typo");
+            assert!(crate::model::build_model(&config, "worker", &reference, None).is_err());
+            assert!(
+                crate::model::build_model(&config, "worker", &reference, Some("explicit-id"))
+                    .is_err()
+            );
+            assert!(create_model_provider_from_ref_with_model(&config, &reference).is_err());
+            assert!(
+                create_resilient_model_provider_from_ref(
+                    &config,
+                    &reference,
+                    None,
+                    None,
+                    &config.reliability,
+                    &ModelProviderRuntimeOptions::default(),
+                )
+                .is_err()
+            );
+            assert!(
+                crate::model::build_model(&config, "worker", &format!("custom.{alias}"), None)
+                    .is_ok()
+            );
+            assert!(
+                crate::model::build_model(
+                    &config,
+                    "worker",
+                    &format!("custom.{alias}.selected"),
+                    None
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_nested_fallback_is_pruned_instead_of_using_the_profile_model() {
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        let primary = config.providers.models.ensure("custom", "primary").unwrap();
+        primary.uri = Some("http://127.0.0.1:9999/v1".into());
+        primary.model = Some("primary-id".into());
+        primary.fallback = vec!["custom.target.typo".into()];
+        let target = config.providers.models.ensure("custom", "target").unwrap();
+        target.uri = Some("http://127.0.0.1:9999/v1".into());
+        target.model = Some("legacy-id".into());
+        target.api_key = Some("fixture-key".into());
+        let binding = crate::model::build_model(&config, "worker", "custom.primary", None).unwrap();
+        assert!(
+            binding.provider().has_stable_request_identity("primary-id"),
+            "a dangling nested fallback must not materialize another physical candidate"
+        );
     }
 
     #[test]
@@ -5021,6 +5591,63 @@ mod tests {
             "unknown agent must not silently inherit any configured provider; got `{:?}`",
             opts.provider_api_url
         );
+    }
+
+    #[test]
+    fn qwen_options_defer_region_resolution_and_preserve_explicit_uri() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, QwenEndpoint, QwenModelProviderConfig};
+
+        for endpoint in [
+            QwenEndpoint::Cn,
+            QwenEndpoint::Intl,
+            QwenEndpoint::Us,
+            QwenEndpoint::Code,
+        ] {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.providers.models.qwen.insert(
+                "oauth".into(),
+                QwenModelProviderConfig {
+                    endpoint,
+                    oauth_refresh_token: Some("test-refresh-token".into()),
+                    ..Default::default()
+                },
+            );
+            config.agents.insert(
+                "worker".into(),
+                AliasedAgentConfig {
+                    model_provider: "qwen.oauth".into(),
+                    ..Default::default()
+                },
+            );
+            for options in [
+                provider_runtime_options_for_alias(&config, "qwen", "oauth"),
+                provider_runtime_options_for_agent(&config, "worker"),
+            ] {
+                assert!(
+                    options.provider_api_url.is_none(),
+                    "a synthesized {endpoint:?} URI must not override the OAuth resource URL"
+                );
+            }
+
+            config
+                .providers
+                .models
+                .qwen
+                .get_mut("oauth")
+                .unwrap()
+                .base
+                .uri = Some("http://127.0.0.1:1/explicit/v1".into());
+            for options in [
+                provider_runtime_options_for_alias(&config, "qwen", "oauth"),
+                provider_runtime_options_for_agent(&config, "worker"),
+            ] {
+                assert_eq!(
+                    options.provider_api_url.as_deref(),
+                    Some("http://127.0.0.1:1/explicit/v1"),
+                    "an explicit profile URI remains a genuine construction override"
+                );
+            }
+        }
     }
 
     #[test]

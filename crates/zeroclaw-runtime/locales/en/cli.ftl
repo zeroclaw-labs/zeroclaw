@@ -979,6 +979,7 @@ cli-status-config = Config:      {$v}
 cli-status-provider-indent = {"   "}ModelProvider:      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider:      {$family}.{$alias}
 cli-status-model = {"   "}Model:         {$model}
+cli-status-model-entry = {"   "}Model [{$alias}]: {$model}
 cli-status-observability = 📊 Observability:  {$v}
 cli-status-trace-storage = 🧾 Trace storage:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents:        {$v}
@@ -1683,3 +1684,14 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 skill-http-request-timeout = HTTP request timed out
+
+# Named model selection diagnostics.
+cli-model-switch-invalid-reference = model_provider must be a dotted `<type>.<alias>` or `<type>.<alias>.<model>` provider profile reference, got `{ $provider_ref }`
+cli-model-switch-no-profiles = no configured provider profiles
+cli-model-switch-profile-missing = model_provider `{ $provider_ref }` is not a configured provider profile. Add a [providers.models.{ $family }.{ $alias }] entry or use one of: { $available }
+cli-model-switch-model-id-missing = model entry `{ $provider_ref }` has no `id` and its provider profile has no `model`
+cli-model-switch-entry-missing = model_provider `{ $provider_ref }` names model `{ $model_alias }` but [providers.models.{ $family }.{ $alias }.models.{ $model_alias }] is not configured
+cli-model-switch-model-required = Missing 'model' parameter for 'set' action (or use a `<type>.<alias>.<model>` model_provider ref)
+cli-doctor-nested-model = { $provider_ref }: model: { $model } (entry { $model_alias })
+cli-doctor-nested-model-id-missing = { $provider_ref }: entry { $model_alias } has no model id (set its `id` or the profile `model`)
+cli-doctor-temperature-out-of-range = { $provider_ref }: temperature { $temperature } is out of range (expected 0.0–2.0)

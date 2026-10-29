@@ -80,30 +80,48 @@ impl std::fmt::Display for ProbeFailure {
 }
 
 pub struct ModelRoutingConfigTool {
-    config: Arc<Config>,
+    config: crate::llm_task::ModelConfigResolver,
     security: Arc<SecurityPolicy>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ModelProbeOutcome {
+    Verified,
+    SkippedNoModel,
+    SkippedNoCredentials,
+    SkippedDecryption,
+    DeferredRetryableFailure,
 }
 
 impl ModelRoutingConfigTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+        Self::with_config_resolver(security, Arc::new(move || Arc::clone(&config)))
+    }
+
+    pub fn with_config_resolver(
+        security: Arc<SecurityPolicy>,
+        config: crate::llm_task::ModelConfigResolver,
+    ) -> Self {
         Self { config, security }
     }
 
     fn load_config_without_env(&self) -> anyhow::Result<Config> {
-        let contents = fs::read_to_string(&self.config.config_path).map_err(|error| {
+        let config = (self.config)();
+        let contents = fs::read_to_string(&config.config_path).map_err(|error| {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
-                        "path": self.config.config_path.display().to_string(),
+                        "path": config.config_path.display().to_string(),
                         "error": format!("{}", error),
                     })),
                 "model_routing_config: failed to read config file"
             );
             anyhow::Error::msg(format!(
                 "Failed to read config file {}: {error}",
-                self.config.config_path.display()
+                config.config_path.display()
             ))
         })?;
 
@@ -114,18 +132,18 @@ impl ModelRoutingConfigTool {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
-                            "path": self.config.config_path.display().to_string(),
+                            "path": config.config_path.display().to_string(),
                             "error": format!("{}", error),
                         })),
                     "model_routing_config: failed to parse config file"
                 );
                 anyhow::Error::msg(format!(
                     "Failed to parse config file {}: {error}",
-                    self.config.config_path.display()
+                    config.config_path.display()
                 ))
             })?;
-        parsed.config_path = self.config.config_path.clone();
-        parsed.data_dir = self.config.data_dir.clone();
+        parsed.config_path = config.config_path.clone();
+        parsed.data_dir = config.data_dir.clone();
         // This value was parsed from the file at `config_path`; it holds
         // save-over provenance for the guard in `Config::save`.
         parsed.loaded_from = Some(parsed.config_path.clone());
@@ -662,10 +680,47 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
+        // Resolve the configured profile boundary before extracting a model
+        // suffix: both profile keys and model keys can contain literal dots.
+        let explicit_model_alias = match &provider_update {
+            MaybeSet::Set(model_provider) => {
+                match cfg.providers.models.profile_ref(model_provider) {
+                    None => None,
+                    Some((family, alias)) => {
+                        let profile = format!("{family}.{alias}");
+                        let model_alias = model_provider
+                            .trim()
+                            .strip_prefix(&profile)
+                            .and_then(|suffix| suffix.strip_prefix('.'));
+                        if model_alias == Some("") {
+                            anyhow::bail!(
+                                "model_provider `{model_provider}` must use `<type>.<alias>` or `<type>.<alias>.<model>` form"
+                            );
+                        }
+                        model_alias.map(str::to_string)
+                    }
+                }
+            }
+            MaybeSet::Null | MaybeSet::Unset => None,
+        };
+
+        // A three-segment reference carries no meaning on its own — there is
+        // no separate "selected model" pointer, so nothing would be written.
+        if explicit_model_alias.is_some()
+            && matches!(model_update, MaybeSet::Unset)
+            && matches!(temperature_update, MaybeSet::Unset)
+        {
+            anyhow::bail!(
+                "a `<type>.<alias>.<model>` model_provider requires `model` or `temperature` to set on that model entry"
+            );
+        }
+
         // Determine which models entry to update.
         let (type_k, alias_k) = match &provider_update {
-            MaybeSet::Set(model_provider) => model_provider
-                .split_once('.')
+            MaybeSet::Set(model_provider) => cfg
+                .providers
+                .models
+                .profile_ref(model_provider)
                 .map(|(t, a)| (t.to_string(), a.to_string()))
                 .unwrap_or_else(|| (model_provider.clone(), "default".to_string())),
             MaybeSet::Null | MaybeSet::Unset => {
@@ -678,6 +733,22 @@ impl ModelRoutingConfigTool {
                     .unwrap_or_else(|| ("custom".to_string(), "default".to_string()))
             }
         };
+
+        // Keep writes aligned with `Config::resolve_model_selection`: a
+        // two-segment profile ref resolves `models.default`, then a sole
+        // nested entry, before falling back to the legacy profile fields.
+        // Updating those legacy fields while a nested entry is selected would
+        // persist a value the runtime never reads.
+        let target_model_alias = explicit_model_alias.or_else(|| {
+            let entry = cfg.providers.models.find(&type_k, &alias_k)?;
+            if entry.models.contains_key("default") {
+                Some("default".to_string())
+            } else if entry.models.len() == 1 {
+                entry.models.keys().next().cloned()
+            } else {
+                None
+            }
+        });
 
         // Capture previous provider entry for rollback on probe failure.
         let previous_provider_entry = cfg.providers.models.find(&type_k, &alias_k).cloned();
@@ -701,130 +772,123 @@ impl ModelRoutingConfigTool {
                 ))
             })?;
 
-        match model_update {
-            MaybeSet::Set(model) => entry.model = Some(model),
-            MaybeSet::Null => entry.model = None,
-            MaybeSet::Unset => {}
+        if let Some(model_alias) = target_model_alias.as_deref() {
+            let model_entry = entry.models.entry(model_alias.to_string()).or_default();
+            match model_update {
+                MaybeSet::Set(model) => model_entry.id = Some(model),
+                MaybeSet::Null => model_entry.id = None,
+                MaybeSet::Unset => {}
+            }
+
+            match temperature_update {
+                MaybeSet::Set(temperature) => {
+                    if !(0.0..=2.0).contains(&temperature) {
+                        anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+                    }
+                    model_entry.temperature = Some(temperature);
+                }
+                MaybeSet::Null => model_entry.temperature = None,
+                MaybeSet::Unset => {}
+            }
+        } else {
+            match model_update {
+                MaybeSet::Set(model) => entry.model = Some(model),
+                MaybeSet::Null => entry.model = None,
+                MaybeSet::Unset => {}
+            }
+
+            match temperature_update {
+                MaybeSet::Set(temperature) => {
+                    if !(0.0..=2.0).contains(&temperature) {
+                        anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+                    }
+                    entry.temperature = Some(temperature);
+                }
+                MaybeSet::Null => entry.temperature = None,
+                MaybeSet::Unset => {}
+            }
         }
 
-        match temperature_update {
-            MaybeSet::Set(temperature) => {
-                if !(0.0..=2.0).contains(&temperature) {
-                    anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+        let provider_name = match target_model_alias.as_deref() {
+            Some(model_alias) => format!("{type_k}.{alias_k}.{model_alias}"),
+            None => format!("{type_k}.{alias_k}"),
+        };
+        let current_model = cfg
+            .resolve_model_selection(&provider_name)
+            .and_then(|selection| selection.model_id);
+        // Hydrate and probe even for temperature-only edits: environment
+        // overrides may supply the only effective model or change its identity.
+        let probe = match self.probe_model(&cfg, &provider_name).await {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                let model_name = failure
+                    .model()
+                    .or(current_model.as_deref())
+                    .unwrap_or("environment-effective model");
+                let probe_error = zeroclaw_providers::sanitize_api_error(&failure.to_string());
+                if failure.is_fatal() {
+                    let reverted_model = if let Some(model_alias) = target_model_alias.as_deref() {
+                        previous_provider_entry
+                            .as_ref()
+                            .and_then(|e| e.models.get(model_alias))
+                            .and_then(|m| m.id.as_deref())
+                            .unwrap_or("(none)")
+                            .to_string()
+                    } else {
+                        previous_provider_entry
+                            .as_ref()
+                            .and_then(|e| e.model.as_deref())
+                            .unwrap_or("(none)")
+                            .to_string()
+                    };
+
+                    let rollback = if previous_provider_entry.is_some() {
+                        crate::i18n::get_required_tool_string_with_args(
+                            "tool-model-routing-config-reverted",
+                            &[("model", &reverted_model)],
+                        )
+                    } else {
+                        crate::i18n::get_required_tool_string(
+                            "tool-model-routing-config-removed-new-alias",
+                        )
+                    };
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "Model '{model_name}' is not available: {probe_error}. {rollback}",
+                        )
+                        .into(),
+                        error: Some(probe_error),
+                    });
                 }
-                entry.temperature = Some(temperature);
+                // Retryable errors (e.g. transient network issues) — keep the
+                // new config and let the resilient wrapper handle retries.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"model": model_name, "probe_err": probe_error})
+                        ),
+                    "Model probe returned retryable error (keeping new config)"
+                );
+                ModelProbeOutcome::DeferredRetryableFailure
             }
-            MaybeSet::Null => {
-                entry.temperature = None;
-            }
-            MaybeSet::Unset => {}
-        }
+        };
 
         cfg.save().await?;
-
-        // Probe the effective model with a minimal API call to catch invalid
-        // model IDs before the channel hot-reload picks up the change. The
-        // saved model is read only to name something in diagnostics when the
-        // probe failed before it resolved the effective one.
-        let current_model = cfg
-            .providers
-            .models
-            .find(&type_k, &alias_k)
-            .and_then(|e| e.model.clone());
-        let provider_name = format!("{type_k}.{alias_k}");
-        if let Err(probe_err) = self.probe_model(&cfg, &provider_name).await {
-            // Name the model the probe actually validated. Only a failure
-            // that happened before the effective model was resolved falls
-            // back to the saved model, since nothing else exists to name.
-            let model_name = probe_err
-                .model()
-                .or(current_model.as_deref())
-                .unwrap_or("environment-effective model");
-            if probe_err.is_fatal() {
-                let reverted_model = previous_provider_entry
-                    .as_ref()
-                    .and_then(|e| e.model.as_deref())
-                    .unwrap_or("(none)")
-                    .to_string();
-
-                // Restore the previous entry when there was one. When there
-                // was not, this `set_default` call is what created the alias,
-                // so leaving it behind would persist an alias that just failed
-                // validation — and report `Reverted to '(none)'` while doing
-                // it. Remove it instead, so the rollback claim holds for a
-                // newly added alias as well.
-                let reverted_to = match previous_provider_entry {
-                    Some(prev_entry) => {
-                        if let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k) {
-                            *slot = prev_entry;
-                        }
-                        format!("Reverted to '{reverted_model}'.")
-                    }
-                    None => {
-                        cfg.providers.models.remove_alias(&type_k, &alias_k);
-                        format!("Removed the newly created '{provider_name}' alias.")
-                    }
-                };
-                cfg.save().await?;
-
-                let safe_probe_err = zeroclaw_providers::sanitize_api_error(&probe_err.to_string());
-
-                return Ok(ToolResult {
-                    success: false,
-                    output: format!(
-                        "Model '{model_name}' is not available: {safe_probe_err}. {reverted_to}"
-                    )
-                    .into(),
-                    error: Some(safe_probe_err),
-                });
-            }
-            // Retryable request errors (e.g. transient network issues) — keep
-            // the new config and let the resilient wrapper handle retries.
-            // Construction failures never reach here; they are fatal above.
-            let safe_probe_err = zeroclaw_providers::sanitize_api_error(&probe_err.to_string());
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"model": model_name, "probe_err": safe_probe_err})
-                    ),
-                "Model probe returned retryable error (keeping new config)"
-            );
-        }
-
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
                 "message": "Default model_provider/model settings updated",
                 "config": Self::snapshot(&cfg),
+                "probe": probe,
             }))?
             .into(),
             error: None,
         })
     }
 
-    /// Build the configuration the probe validates against, using the same
-    /// precedence a post-save reload applies.
-    ///
-    /// `cfg` was just loaded via `load_config_without_env`, which parses the
-    /// on-disk TOML as-is and never decrypts `#[secret]` fields — so any
-    /// persisted API key is still `enc2:`-ciphertext at this point, exactly
-    /// as `save()` last wrote it. `load_or_init` decrypts and *then* applies
-    /// the `ZEROCLAW_*` override layer, which is the final in-memory
-    /// authority (see `docs/book/src/reference/env-vars.md`, persistence
-    /// boundary). Reproducing only the decrypt half would validate the model
-    /// against whatever is on disk while the reloaded runtime uses the
-    /// environment values — the probe could then authenticate against the
-    /// wrong account, or send an environment-provided credential to the
-    /// stored URI rather than the effective one. Overrides also reach sibling
-    /// fields the probe depends on (`uri`, OAuth material, headers, timeouts,
-    /// and every runtime option resolved by
-    /// `provider_runtime_options_for_alias`), so the layer is applied whole
-    /// rather than field by field.
-    ///
-    /// This is a private working copy; the caller's `cfg` — and therefore
-    /// what reaches disk — is untouched.
     async fn effective_config_for_probe(cfg: &Config) -> Result<Config, ProbeConfigFailure> {
         let effective = cfg.clone();
         tokio::task::spawn_blocking(move || Self::build_effective_config_for_probe(effective))
@@ -856,7 +920,7 @@ impl ModelRoutingConfigTool {
     /// The model is taken from the effective alias entry alone, so it is
     /// always the one a reload would serve.
     ///
-    /// Returns `Ok(())` if the probe succeeds **or** if no API key or model
+    /// Returns an explicit outcome if the probe succeeds or if no credential or model
     /// resolves for the effective alias, or the saved config's secrets cannot
     /// be decrypted. Those skips let an operator configure an alias while
     /// offline without turning an unrelated auth/decryption condition into
@@ -868,36 +932,59 @@ impl ModelRoutingConfigTool {
     ///
     /// Errors are classified via [`ProbeFailure`] so the caller can tell a
     /// local construction failure from a request failure.
-    async fn probe_model(&self, cfg: &Config, provider_name: &str) -> Result<(), ProbeFailure> {
+    async fn probe_model(
+        &self,
+        cfg: &Config,
+        provider_name: &str,
+    ) -> Result<ModelProbeOutcome, ProbeFailure> {
         // Resolve alias identity, endpoint, credentials, and runtime options
         // from the effective post-reload view of what was just saved — disk
         // decrypted, then the `ZEROCLAW_*` layer applied on top — rather than
         // from the pre-update runtime snapshot or from disk alone.
         let effective = match Self::effective_config_for_probe(cfg).await {
             Ok(effective) => effective,
-            Err(ProbeConfigFailure::Decryption) => return Ok(()),
+            Err(ProbeConfigFailure::Decryption) => return Ok(ModelProbeOutcome::SkippedDecryption),
             Err(
                 ProbeConfigFailure::EnvironmentOverride(error) | ProbeConfigFailure::Task(error),
             ) => {
                 return Err(ProbeFailure::Construction { model: None, error });
             }
         };
-        let (family, alias) = provider_name
-            .split_once('.')
-            .unwrap_or((provider_name, "default"));
-
         // The freshly reconstructed configuration is the sole credential
         // authority, including current environment overrides. A missing key
         // must stay missing: the startup snapshot may retain a credential the
         // operator has since removed from disk or the environment.
-        if effective
-            .providers
-            .models
-            .find(family, alias)
-            .and_then(|entry| entry.api_key.as_deref())
-            .is_none_or(|key| key.trim().is_empty())
+        let selection = match effective.resolve_model_selection(provider_name) {
+            Some(selection) => selection,
+            None if effective
+                .providers
+                .models
+                .find_by_name(provider_name)
+                .is_none()
+                && effective
+                    .providers
+                    .models
+                    .profile_ref(provider_name)
+                    .and_then(|(family, alias)| effective.providers.models.find(family, alias))
+                    .is_none() =>
+            {
+                return Ok(ModelProbeOutcome::SkippedNoCredentials);
+            }
+            None => {
+                return Err(ProbeFailure::Construction {
+                    model: None,
+                    error: anyhow::Error::msg("model probe selection does not exist"),
+                });
+            }
+        };
+        // The factory knows which endpoint families allow keyless/local or
+        // OAuth authentication. A URI alone does not replace a required key;
+        // configured headers can supply authentication for a compatible API.
+        if selection.entry.extra_headers.is_empty()
+            && !zeroclaw_providers::model::selection_auth_ready(&effective, provider_name)
+                .map_err(|error| ProbeFailure::Construction { model: None, error })?
         {
-            return Ok(());
+            return Ok(ModelProbeOutcome::SkippedNoCredentials);
         }
 
         // Probe the model the post-reload runtime will actually serve, and
@@ -913,23 +1000,20 @@ impl ModelRoutingConfigTool {
         // alias (such an entry is only usable through routes that carry their
         // own model), so there is nothing to validate and the probe stops
         // before dispatch instead of failing the update.
-        let Some(probe_model_name) = effective
-            .providers
-            .models
-            .find(family, alias)
-            .and_then(|e| e.model.clone())
-            .filter(|value| !value.trim().is_empty())
+        let Some(probe_model_name) = selection.model_id.filter(|value| !value.trim().is_empty())
         else {
-            return Ok(());
+            return Ok(ModelProbeOutcome::SkippedNoModel);
         };
 
-        let model_provider =
-            zeroclaw_providers::create_model_provider_from_ref(&effective, provider_name).map_err(
-                |error| ProbeFailure::Construction {
-                    model: Some(probe_model_name.clone()),
-                    error,
-                },
-            )?;
+        let selection_ref = provider_name.to_string();
+        let model_provider = zeroclaw_providers::model::build_nonblocking(move || {
+            zeroclaw_providers::create_model_provider_from_ref(&effective, &selection_ref)
+        })
+        .await
+        .map_err(|error| ProbeFailure::Construction {
+            model: Some(probe_model_name.clone()),
+            error,
+        })?;
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
@@ -946,7 +1030,7 @@ impl ModelRoutingConfigTool {
                 error,
             })?;
 
-        Ok(())
+        Ok(ModelProbeOutcome::Verified)
     }
 
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
@@ -1198,7 +1282,7 @@ impl ModelRoutingConfigTool {
             || agentic_update.is_some();
         let delegates_update_requested = delegates_update.is_some();
 
-        zeroclaw_config::migration::ensure_disk_at_current_version(&self.config.config_path)?;
+        zeroclaw_config::migration::ensure_disk_at_current_version(&(self.config)().config_path)?;
         let mut cfg = self.load_config_without_env()?;
         let existing_agent = cfg.agents.get(&name).cloned();
 
@@ -1616,7 +1700,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "model_provider": {
                     "type": "string",
-                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent"
+                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent. For set_default, `<type>.<alias>` targets the profile (legacy `model` field) while `<type>.<alias>.<model>` targets that nested model entry's id/temperature"
                 },
                 "model": {
                     "type": "string",
@@ -1722,6 +1806,21 @@ impl Tool for ModelRoutingConfigTool {
                     return Ok(blocked);
                 }
 
+                // A running RPC turn owns its session guard. A config writer
+                // can own this gate while waiting for that turn to finish.
+                let Ok(_config_write_guard) =
+                    zeroclaw_config::write_lock::shared_config_write_lock().try_lock_owned()
+                else {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: json!({"code": "config_write_in_progress", "retryable": true})
+                            .to_string()
+                            .into(),
+                        error: Some(crate::i18n::get_required_tool_string(
+                            "tool-model-routing-config-write-busy",
+                        )),
+                    });
+                };
                 match action.as_str() {
                     "set_default" => Box::pin(self.handle_set_default(&args)).await,
                     "upsert_scenario" => Box::pin(self.handle_upsert_scenario(&args)).await,
@@ -1756,6 +1855,8 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
     use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig};
+
+    static CONFIG_EDIT_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -1818,11 +1919,7 @@ mod tests {
     }
 
     async fn env_override_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await
+        CONFIG_EDIT_TESTS.lock().await
     }
 
     /// Panic-safe owner for one process-wide environment mutation. Requiring
@@ -1864,8 +1961,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_edit_refuses_busy_writer_without_waiting_or_mutating_config() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+        let path = tmp.path().join("config.toml");
+        let before = std::fs::read(&path).unwrap();
+        let guard = zeroclaw_config::write_lock::shared_config_write_lock()
+            .lock_owned()
+            .await;
+        let args = json!({
+            "action": "set_default", "model_provider": "openai.default", "temperature": 0.2
+        });
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            tool.execute(args.clone()),
+        )
+        .await
+        .expect("a turn must not wait for a writer that could be waiting for the turn")
+        .unwrap();
+        assert!(!blocked.success);
+        let output: Value = serde_json::from_str(&blocked.output).unwrap();
+        assert_eq!(output["code"], "config_write_in_progress");
+        assert_eq!(output["retryable"], true);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(guard);
+        assert!(tool.execute(args).await.unwrap().success);
+        assert_eq!(
+            read_saved_provider_entry(&path, "openai", "default")
+                .unwrap()
+                .temperature,
+            Some(0.2)
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_verifies_keyless_endpoint() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"model": "local-model"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "OK"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "keyless").unwrap();
+        profile.uri = Some(format!("{}/v1", server.uri()));
+        profile.model = Some("local-model".into());
+        let tool = ModelRoutingConfigTool::new(Arc::new(config.clone()), test_security());
+        assert_eq!(
+            tool.probe_model(&config, "custom.keyless").await.unwrap(),
+            ModelProbeOutcome::Verified
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_probe_uses_nested_model_and_profile_headers() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, header, method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("x-probe-key", "configured"))
+            .and(body_partial_json(
+                json!({"model": "nested-wire-id", "temperature": 0.0}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"role": "assistant", "content": "OK"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        let profile = config.providers.models.ensure("custom", "probe").unwrap();
+        profile.uri = Some(format!("{}/v1", server.uri()));
+        profile.api_key = Some("test-key".into());
+        profile
+            .extra_headers
+            .insert("x-probe-key".into(), "configured".into());
+        profile.models.insert(
+            "nested".into(),
+            zeroclaw_config::schema::ModelEntryConfig {
+                id: Some("nested-wire-id".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ModelRoutingConfigTool::new(Arc::new(config.clone()), test_security())
+                .probe_model(&config, "custom.probe.nested")
+                .await
+                .unwrap(),
+            ModelProbeOutcome::Verified
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_construction_does_not_publish_model() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let profile = config.providers.models.ensure("custom", "probe").unwrap();
+        profile.api_key = Some("test-key".into());
+        profile.model = Some("old-model".into());
+        config.save().await.unwrap();
+        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default", "model_provider": "custom.probe", "model": "new-model"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            read_saved_provider_entry(&tmp.path().join("config.toml"), "custom", "probe")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("old-model")
+        );
+    }
+
+    #[tokio::test]
     async fn set_default_updates_provider_model_and_temperature() {
-        let _env_guard = env_override_test_lock().await;
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1888,7 +2120,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_default_nested_model_ref_updates_model_entry() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai.gateway.reasoning",
+                "model": "gpt-5.3-mini",
+                "temperature": 0.1
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let entry = read_saved_provider_entry(&cfg_path, "openai", "gateway")
+            .expect("set_default must materialize the openai.gateway slot");
+        // The write lands on the nested model entry, not the legacy
+        // profile-level `model` field.
+        assert_eq!(entry.model, None);
+        let nested = entry
+            .models
+            .get("reasoning")
+            .expect("nested reasoning model entry must exist");
+        assert_eq!(nested.id.as_deref(), Some("gpt-5.3-mini"));
+        assert_eq!(nested.temperature, Some(0.1));
+    }
+
+    #[tokio::test]
+    async fn set_default_dotted_profile_ref_updates_the_selected_nested_default() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
+        use zeroclaw_config::schema::{
+            ModelEntryConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: cfg_path.clone(),
+            ..Config::default()
+        };
+        config.providers.models.openai.insert(
+            "gateway.v2".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("legacy-shadowed".to_string()),
+                    models: std::collections::HashMap::from([(
+                        "default".to_string(),
+                        ModelEntryConfig {
+                            id: Some("old-default".to_string()),
+                            temperature: Some(0.8),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.save().await.unwrap();
+        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai.gateway.v2",
+                "model": "new-default",
+                "temperature": 0.3
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let entry = read_saved_provider_entry(&cfg_path, "openai", "gateway.v2").unwrap();
+        assert_eq!(entry.model.as_deref(), Some("legacy-shadowed"));
+        let selected = entry.models.get("default").unwrap();
+        assert_eq!(selected.id.as_deref(), Some("new-default"));
+        assert_eq!(selected.temperature, Some(0.3));
+    }
+
+    #[tokio::test]
+    async fn set_default_nested_model_ref_without_updates_is_rejected() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai.gateway.reasoning"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a bare three-segment ref has nothing to set"
+        );
+        let entry = read_saved_provider_entry(&cfg_path, "openai", "gateway");
+        assert!(
+            entry.is_none(),
+            "a rejected nested set_default must not materialize the profile slot"
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_scenario_creates_route_and_rule() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -1924,6 +2266,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_scenario_also_removes_rule() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -1956,6 +2299,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_and_remove_delegate_agent() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -2512,6 +2856,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_agent_reuses_configured_dotted_provider_ref() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -2562,6 +2907,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_agent_rejects_invalid_provider_requests_without_mutation() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let cases = [
             ("unknown family", json!("unknown"), true),
             ("unknown dotted family", json!("unknown.alias"), false),
@@ -2605,6 +2951,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_agent_rejects_provider_mutations_on_reused_ref() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -2659,6 +3006,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_agent_allowed_tools_null_and_empty_clear_to_unrestricted() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -2740,6 +3088,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_agent_deny_all_tools_flag_and_contradiction_check() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -2811,6 +3160,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_agent_writes_delegate_roster_fields() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -2853,6 +3203,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_mode_blocks_mutating_actions() {
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let tool =
             ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, readonly_security());
@@ -2871,7 +3222,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_default_skips_probe_without_api_key() {
-        let _env_guard = env_override_test_lock().await;
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -2886,6 +3237,8 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["probe"], "skipped_no_credentials");
         let entry = read_saved_provider_entry(&cfg_path, "anthropic", "default")
             .expect("set_default must materialize the anthropic.default slot");
         assert_eq!(entry.model.as_deref(), Some("totally-fake-model-12345"));
@@ -2893,7 +3246,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_default_temperature_only_skips_probe() {
-        let _env_guard = env_override_test_lock().await;
+        let _test_serial = CONFIG_EDIT_TESTS.lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -2925,7 +3278,10 @@ mod tests {
         let against_stale = tool
             .probe_model(stale_snapshot.as_ref(), "openai.default")
             .await;
-        assert!(against_stale.is_ok(), "{against_stale:?}");
+        assert_eq!(
+            against_stale.unwrap(),
+            ModelProbeOutcome::SkippedNoCredentials
+        );
 
         // A config that has since been saved carries a credential the stale
         // snapshot never had (mismatched on purpose, so construction fails

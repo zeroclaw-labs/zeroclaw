@@ -10,7 +10,7 @@ use crate::policy_gate;
 use crate::traits::{
     Memory, MemoryCategory, MemoryEntry, MemoryKind, SemanticSubtype, StoreOptions,
 };
-use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_api::model_provider::{CallSampling, ModelProvider};
 use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
 use zeroclaw_providers::multimodal::strip_media_markers;
@@ -66,6 +66,27 @@ pub async fn consolidate_turn(
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
+    consolidate_turn_with_sampling(
+        model_provider,
+        model,
+        temperature.into(),
+        memory,
+        memory_config,
+        user_message,
+        assistant_response,
+    )
+    .await
+}
+
+pub async fn consolidate_turn_with_sampling(
+    model_provider: &dyn ModelProvider,
+    model: &str,
+    sampling: CallSampling,
+    memory: &dyn Memory,
+    memory_config: &MemoryConfig,
+    user_message: &str,
+    assistant_response: &str,
+) -> anyhow::Result<()> {
     let turn_text = format!(
         "User: {}\nAssistant: {}",
         strip_media_markers(user_message),
@@ -96,7 +117,7 @@ pub async fn consolidate_turn(
     };
 
     let raw = ProviderDispatch::from_ref(model_provider)
-        .chat_with_system(Some(system_prompt), &truncated, model, temperature)
+        .chat_with_system_with_sampling(Some(system_prompt), &truncated, model, sampling)
         .await?;
 
     let result: ConsolidationResult = parse_consolidation_response(&raw, &turn_text);
@@ -682,6 +703,7 @@ mod tests {
     struct ScriptedProvider {
         response: &'static str,
         system_prompts: Mutex<Vec<String>>,
+        sampling: Mutex<Vec<CallSampling>>,
     }
 
     impl ScriptedProvider {
@@ -689,12 +711,26 @@ mod tests {
             Self {
                 response,
                 system_prompts: Mutex::new(Vec::new()),
+                sampling: Mutex::new(Vec::new()),
             }
         }
     }
 
     #[async_trait]
     impl ModelProvider for ScriptedProvider {
+        async fn chat_with_system_with_sampling(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            sampling: CallSampling,
+        ) -> anyhow::Result<String> {
+            let temperature = sampling.resolve_for(None);
+            self.sampling.lock().push(sampling);
+            self.chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
         async fn chat_with_system(
             &self,
             system_prompt: Option<&str>,
@@ -751,6 +787,36 @@ mod tests {
             "We use a staged rollout.",
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn consolidation_preserves_candidate_sampling_and_explicit_omission() {
+        let provider = ScriptedProvider::new(TYPED_RESPONSE);
+        let memory = RecordingMemory::default();
+        let config = MemoryConfig::default();
+        consolidate_turn_with_sampling(
+            &provider,
+            "test-model",
+            CallSampling::for_selection(Some(0.2), |reference| {
+                (reference == "custom.fallback").then_some(0.8)
+            }),
+            &memory,
+            &config,
+            "How do we deploy?",
+            "Use a staged rollout.",
+        )
+        .await
+        .unwrap();
+        run_consolidation(&provider, &memory, &config)
+            .await
+            .unwrap();
+
+        let sampling = provider.sampling.lock();
+        assert_eq!(sampling.len(), 2);
+        assert_eq!(sampling[0].resolve_for(None), Some(0.2));
+        assert_eq!(sampling[0].resolve_for(Some("custom.fallback")), Some(0.8));
+        assert_eq!(sampling[1].resolve_for(None), None);
+        assert_eq!(sampling[1].resolve_for(Some("custom.fallback")), None);
     }
 
     #[tokio::test]
