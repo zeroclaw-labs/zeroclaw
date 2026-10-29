@@ -1,5 +1,9 @@
 //! Shared baseline environment for shell child processes.
 
+use crate::security::SecurityPolicy;
+use std::collections::HashSet;
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
+
 /// One immutable, session-scoped client environment shared by shell execution
 /// and RPC admission. Only the handles are cloned; values are neither copied
 /// into admission state nor persisted. Eligibility is resolved from live grants.
@@ -34,6 +38,54 @@ pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
     "LANG",
     "USERNAME",
 ];
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+pub(crate) fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for key in SAFE_SHELL_ENV_VARS
+        .iter()
+        .copied()
+        .chain(security.shell_env_passthrough.iter().map(|s| s.as_str()))
+    {
+        let candidate = key.trim();
+        if candidate.is_empty() || !is_valid_env_var_name(candidate) {
+            continue;
+        }
+        if seen.insert(candidate.to_string()) {
+            out.push(candidate.to_string());
+        }
+    }
+    out
+}
+
+/// Resolve allowed host values when executing, after any sandbox wrapping.
+/// Guest environment forwarding remains the command builder's explicit contract.
+pub(crate) fn apply_shell_environment(
+    command: &mut tokio::process::Command,
+    security: &SecurityPolicy,
+    runtime: &dyn RuntimeAdapter,
+) {
+    command.env_clear();
+    for key in collect_allowed_shell_env_vars(security) {
+        if let Ok(value) = std::env::var(&key) {
+            command.env(key, value);
+        }
+    }
+    for key in runtime.shell_launcher_env_vars() {
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
