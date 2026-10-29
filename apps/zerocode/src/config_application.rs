@@ -475,7 +475,10 @@ mod tests {
                 |sequence| json!({"revision": revision(sequence)}),
             );
             self.outbound.dispatch_response(&id, Some(result), None);
-            feedback.record_saved("agents.a.b.model".into(), call.await.unwrap().unwrap());
+            feedback.record_saved(
+                "agents.a.b.model".into(),
+                call.await.unwrap().unwrap().revision,
+            );
         }
 
         async fn status(&mut self, feedback: &mut ApplicationFeedback, result: Value) {
