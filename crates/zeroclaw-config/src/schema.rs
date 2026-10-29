@@ -16816,6 +16816,16 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Visibility of the model's reasoning in the Telegram streaming draft.
+    ///
+    /// Only effective when `stream_mode = "partial"`: the other modes have no
+    /// editable draft to carry it. `off` (default) leaves the draft unchanged,
+    /// `status` shows a liveness-only thinking line, and `full` renders the raw
+    /// reasoning text as a collapsed blockquote above the in-progress answer.
+    /// Reasoning is never included in the finalized reply.
+    #[tab(Behavior)]
+    #[serde(default = "default_stream_reasoning_off")]
+    pub stream_reasoning: StreamReasoningMode,
     /// Minimum delay (ms) between successive multi_message narration messages
     /// (and before the approval prompt) for one recipient. Does not apply to the
     /// fixed pacing between physical fragments of a single over-4096-character
@@ -16911,6 +16921,13 @@ pub struct TelegramConfig {
     pub reply_queue_depth_max: u16,
 }
 
+/// Default reasoning visibility for the channels that must not surface
+/// reasoning unless an operator opts in. `StreamReasoningMode` itself
+/// defaults to `Status` for Matrix, so these configs need their own default.
+fn default_stream_reasoning_off() -> StreamReasoningMode {
+    StreamReasoningMode::Off
+}
+
 impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
@@ -16922,6 +16939,7 @@ impl Default for TelegramConfig {
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            stream_reasoning: StreamReasoningMode::Off,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -17269,6 +17287,16 @@ pub struct SlackConfig {
     #[tab(Behavior)]
     #[serde(default = "default_slack_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Visibility of the model's reasoning in the Slack streaming draft.
+    ///
+    /// Only effective when `stream_drafts = true`; otherwise there is no draft
+    /// to carry it. `off` (default) leaves the draft unchanged, `status` shows a
+    /// liveness-only thinking line, and `full` renders the raw reasoning text as
+    /// a quoted block above the in-progress answer. Reasoning is never included
+    /// in the finalized reply.
+    #[tab(Behavior)]
+    #[serde(default = "default_stream_reasoning_off")]
+    pub stream_reasoning: StreamReasoningMode,
     /// Emoji reaction name (without colons) that cancels an in-flight request.
     /// For example, `"x"` means reacting with `:x:` cancels the task.
     /// Leave unset to disable reaction-based cancellation.
@@ -33780,6 +33808,7 @@ auto_save = true
                         api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
+                        stream_reasoning: StreamReasoningMode::Off,
                         multi_message_delay_ms: default_multi_message_delay_ms(),
                         debounce_ms: None,
                         interrupt_on_new_message: false,
@@ -35820,6 +35849,7 @@ default_temperature = 0.7
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            stream_reasoning: StreamReasoningMode::Off,
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
@@ -42584,6 +42614,7 @@ high_entropy_tokens = false
                 api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
+                stream_reasoning: StreamReasoningMode::Off,
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
@@ -44791,6 +44822,55 @@ stream_tool_arguments = [
         mx.set_prop("channels.matrix.stream_reasoning", "full")
             .unwrap();
         assert_eq!(mx.stream_reasoning, StreamReasoningMode::Full);
+    }
+
+    #[test]
+    async fn stream_reasoning_defaults_to_off_on_telegram_and_slack() {
+        assert_eq!(
+            TelegramConfig::default().stream_reasoning,
+            StreamReasoningMode::Off
+        );
+        assert_eq!(
+            SlackConfig::default().stream_reasoning,
+            StreamReasoningMode::Off
+        );
+    }
+
+    #[test]
+    async fn set_prop_stream_reasoning_telegram_and_slack() {
+        let mut tg = TelegramConfig::default();
+        tg.set_prop("channels.telegram.stream_reasoning", "full")
+            .unwrap();
+        assert_eq!(tg.stream_reasoning, StreamReasoningMode::Full);
+
+        let mut sl = SlackConfig::default();
+        sl.set_prop("channels.slack.stream_reasoning", "status")
+            .unwrap();
+        assert_eq!(sl.stream_reasoning, StreamReasoningMode::Status);
+
+        let err = sl
+            .set_prop("channels.slack.stream_reasoning", "raw")
+            .unwrap_err();
+        assert!(err.to_string().contains("expected one of"));
+    }
+
+    #[test]
+    async fn telegram_and_slack_expose_stream_reasoning_as_an_enum_property() {
+        let tg = TelegramConfig::default();
+        let fields = tg.prop_fields();
+        let by_name: std::collections::HashMap<&str, &crate::traits::PropFieldInfo> =
+            fields.iter().map(|f| (f.name.as_str(), f)).collect();
+        let field = by_name["channels.telegram.stream_reasoning"];
+        assert!(field.is_enum());
+        assert_eq!(field.display_value, "off");
+
+        let sl = SlackConfig::default();
+        let fields = sl.prop_fields();
+        let by_name: std::collections::HashMap<&str, &crate::traits::PropFieldInfo> =
+            fields.iter().map(|f| (f.name.as_str(), f)).collect();
+        let field = by_name["channels.slack.stream_reasoning"];
+        assert!(field.is_enum());
+        assert_eq!(field.display_value, "off");
     }
 
     #[test]

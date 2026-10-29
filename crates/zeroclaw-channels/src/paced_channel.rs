@@ -413,6 +413,24 @@ impl Channel for PacedChannel {
         self.inner.update_draft(recipient, message_id, text).await
     }
 
+    /// Forward the reasoning-bearing draft edit unchanged.
+    ///
+    /// Drafts are streaming UX, not paced outbound replies. Without this the
+    /// trait default would call the wrapper's plain `update_draft`, silently
+    /// dropping the reasoning (and the thinking line) whenever pacing wraps a
+    /// channel that opted into reasoning disclosure.
+    async fn update_draft_with_reasoning(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        answer: &str,
+        reasoning: &str,
+    ) -> Result<()> {
+        self.inner
+            .update_draft_with_reasoning(recipient, message_id, answer, reasoning)
+            .await
+    }
+
     async fn update_draft_progress(
         &self,
         recipient: &str,
@@ -675,6 +693,46 @@ mod tests {
             _suppress_voice: bool,
         ) -> Result<()> {
             self.finalize_drafts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// Records reasoning-draft edits so the pacing wrapper's delegation of
+    /// `update_draft_with_reasoning` is observable.
+    struct ReasoningForwardingChannel {
+        reasoning_updates: AtomicUsize,
+        last: std::sync::Mutex<(String, String)>,
+    }
+
+    impl Attributable for ReasoningForwardingChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Telegram)
+        }
+        fn alias(&self) -> &str {
+            "reasoning-forwarding"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ReasoningForwardingChannel {
+        fn name(&self) -> &str {
+            "reasoning-forwarding"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        async fn update_draft_with_reasoning(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            answer: &str,
+            reasoning: &str,
+        ) -> Result<()> {
+            self.reasoning_updates.fetch_add(1, Ordering::SeqCst);
+            *self.last.lock().expect("last lock") = (answer.to_string(), reasoning.to_string());
             Ok(())
         }
     }
@@ -1004,6 +1062,37 @@ mod tests {
             counting.sends.load(Ordering::SeqCst),
             0,
             "final response policy must survive the pacing wrapper"
+        );
+    }
+
+    #[tokio::test]
+    async fn paced_wrapper_forwards_reasoning_draft_updates() {
+        let inner_ch = Arc::new(ReasoningForwardingChannel {
+            reasoning_updates: AtomicUsize::new(0),
+            last: std::sync::Mutex::new((String::new(), String::new())),
+        });
+        let inner: Arc<dyn Channel> = inner_ch.clone();
+        // 1h floor: the first op fires immediately, so no real time elapses.
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+
+        paced
+            .update_draft_with_reasoning("alice", "msg-1", "the answer", "the reasoning")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            inner_ch.reasoning_updates.load(Ordering::SeqCst),
+            1,
+            "the pacing wrapper must forward update_draft_with_reasoning to the inner channel",
+        );
+        assert_eq!(
+            *inner_ch.last.lock().expect("last lock"),
+            ("the answer".to_string(), "the reasoning".to_string()),
+            "the reasoning draft edit must reach the inner channel intact",
         );
     }
 
