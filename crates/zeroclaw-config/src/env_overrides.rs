@@ -1,8 +1,9 @@
 //! V0.8.0 env-var override mechanism.
 
+use crate::alias_refs::CreateError;
 use crate::schema::Config;
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
 
 const PREFIX: &str = "ZEROCLAW_";
@@ -36,16 +37,36 @@ fn is_recognized_legacy_todotracker(tail: &str) -> bool {
 static NON_OVERRIDABLE_PATHS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| HashSet::from(["schema_version"]));
 
+/// A new agent the environment named that config load refused to create.
+/// None of its `ZEROCLAW_agents__<alias>__*` variables is applied, so the
+/// loaded config has no such agent; the daemon still starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WithheldAgentOverride {
+    pub reason: String,
+    /// Every env var that named the alias, in application order.
+    pub env_vars: Vec<String>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AppliedOverrides {
     pub paths: HashSet<String>,
     pub snapshots: HashMap<String, String>,
+    /// New agents named by the environment that load withheld, by alias.
+    pub withheld_agents: BTreeMap<String, WithheldAgentOverride>,
 }
 
 /// Apply every `ZEROCLAW_<lowercase>` env var to `config`. Returns the set of
 /// dotted prop-paths that were overridden plus the pre-override raw values
 /// for each. Hard-errors on any env var that doesn't resolve to a known
 /// schema path or whose alias fails validation.
+///
+/// A variable that would create a new `agents` entry is admitted first: the
+/// reserved `default` agent is never created from the environment. A refusal
+/// does not fail the load: the alias and every variable naming it are
+/// withheld, reported in [`AppliedOverrides::withheld_agents`] and as a `WARN`
+/// with `error_key` `config.env_agent_override_refused`. `admit_env_agent`
+/// says why the retired-knowledge rule of the other creation paths does not
+/// apply at load.
 pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
     let mut entries: Vec<(String, String, String)> = std::env::vars()
         .filter_map(|(k, v)| {
@@ -61,6 +82,7 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
 
     let mut paths: HashSet<String> = HashSet::with_capacity(entries.len());
     let mut snapshots: HashMap<String, String> = HashMap::with_capacity(entries.len());
+    let mut withheld_agents: BTreeMap<String, WithheldAgentOverride> = BTreeMap::new();
     for (env_name, value, tail) in entries {
         // Recognized legacy `[todotracker]` vars are accepted and ignored so an
         // upgrade cannot turn a previously working deployment into a daemon
@@ -76,8 +98,45 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             );
             continue;
         }
-        let path = resolve_path(&tail, config)
-            .with_context(|| format!("{env_name} did not resolve to a schema path"))?;
+        if let Some(alias) = env_agent_alias(&tail)
+            && let Some(withheld) = withheld_agents.get_mut(alias)
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_attrs(::serde_json::json!({"env_var": env_name, "alias": alias})),
+                "env override withheld with its refused agent"
+            );
+            withheld.env_vars.push(env_name);
+            continue;
+        }
+        let path = match resolve_path(&tail, config)
+            .with_context(|| format!("{env_name} did not resolve to a schema path"))?
+        {
+            Resolved::Path(path) => path,
+            Resolved::WithheldAgent { alias, reason } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "config.env_agent_override_refused",
+                            "env_var": env_name,
+                            "alias": alias,
+                            "reason": reason,
+                        })),
+                    "env override withheld: it would create an agent config load refuses; the daemon starts without this agent"
+                );
+                withheld_agents.insert(
+                    alias,
+                    WithheldAgentOverride {
+                        reason,
+                        env_vars: vec![env_name],
+                    },
+                );
+                continue;
+            }
+        };
         if NON_OVERRIDABLE_PATHS.contains(path.as_str()) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -124,13 +183,64 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             "Applied env-var config overrides"
         );
     }
-    Ok(AppliedOverrides { paths, snapshots })
+    Ok(AppliedOverrides {
+        paths,
+        snapshots,
+        withheld_agents,
+    })
+}
+
+/// The alias an `agents__<alias>...` env tail names, if it names one.
+fn env_agent_alias(tail: &str) -> Option<&str> {
+    let rest = tail.strip_prefix("agents")?.strip_prefix(SEP)?;
+    rest.split(SEP).next().filter(|alias| !alias.is_empty())
+}
+
+/// What an env-var tail resolved to.
+enum Resolved {
+    /// The dotted prop-path to set.
+    Path(String),
+    /// The tail would create a new agent that config load refuses; nothing
+    /// was created.
+    WithheldAgent { alias: String, reason: String },
+}
+
+/// Admission for an `agents` key the environment would create. `None`
+/// admits: the section is not `agents`, the key already exists, or the alias
+/// is allowed. `Some(..)` withholds the alias.
+///
+/// Only the reserved-alias rule applies here. The retired-knowledge rule that
+/// explicit creation and property-path auto-creation share
+/// (`alias_refs::admit_map_key`) refuses an alias absent from config whose
+/// knowledge rows remain, because in those paths absence means an agent is
+/// being created or recreated. At load, an agent the environment defines is
+/// absent from the file on every boot and legitimately owns the knowledge it
+/// captured in earlier runs, and no durable record distinguishes that from a
+/// retired alias whose purge failed. Applying the rule here would withhold
+/// every env-defined agent after its first run. Retirement evidence durable
+/// enough for load-time admission is separate work.
+///
+/// A malformed alias is left to `create_map_key`, whose validator message the
+/// caller propagates as a hard error, as before.
+fn admit_env_agent(config: &Config, section: &str, alias: &str) -> Option<Resolved> {
+    if section != "agents"
+        || !crate::alias_refs::is_reserved_agent_alias(alias)
+        || config
+            .get_map_keys(section)
+            .is_some_and(|keys| keys.iter().any(|key| key == alias))
+    {
+        return None;
+    }
+    Some(Resolved::WithheldAgent {
+        alias: alias.to_string(),
+        reason: CreateError::Reserved(alias.to_string()).to_string(),
+    })
 }
 
 /// Walk an env-var tail against the schema. Map-keyed positions consume one
 /// `__`-delimited alias token (which may contain single `_` per the alias
 /// validator); everything else resolves via `prop_fields()` lookup.
-fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
+fn resolve_path(tail: &str, config: &mut Config) -> Result<Resolved> {
     let mut sections = Config::map_key_sections();
     sections.sort_by_key(|s| std::cmp::Reverse(s.path.len()));
     for section in sections {
@@ -151,6 +261,9 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
             anyhow::Error::msg(format!("missing alias after `{}`", section.path))
         })?;
         let inner = parts.next().unwrap_or("");
+        if let Some(withheld) = admit_env_agent(config, section.path, alias) {
+            return Ok(withheld);
+        }
         // Propagate the alias-validator's specific error so operators see
         // *why* their alias was rejected (leading underscore, uppercase, …)
         // instead of the generic "Unknown property" that would surface from
@@ -180,7 +293,7 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
             let inner_path = inner.split(SEP).collect::<Vec<_>>().join(".");
             format!("{}.{}.{}", section.path, alias, inner_path)
         };
-        return Ok(path);
+        return Ok(Resolved::Path(path));
     }
 
     // Non-map path: prop_fields() entries are dotted snake-case field
@@ -189,7 +302,7 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
         .prop_fields()
         .into_iter()
         .find(|f| f.name.replace('.', SEP) == tail)
-        .map(|f| f.name)
+        .map(|f| Resolved::Path(f.name))
         .ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -429,6 +542,125 @@ mod tests {
             msg.contains("invalid alias") && msg.contains("_invalid"),
             "error must surface the alias validator's message: {msg}",
         );
+    }
+
+    /// Seed a knowledge store with the `owner_agent` column the admission
+    /// probe reads, holding one node per owner in `owners`.
+    fn seed_knowledge(path: &std::path::Path, owners: &[&str]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE nodes (owner_agent TEXT); CREATE TABLE edges (owner_agent TEXT);",
+        )
+        .unwrap();
+        for owner in owners {
+            conn.execute("INSERT INTO nodes VALUES (?1)", [owner])
+                .unwrap();
+        }
+        conn
+    }
+
+    /// The reserved `default` agent is never created from the environment:
+    /// every variable naming it is withheld and reported, the load still
+    /// succeeds, and the rest of the environment applies. Once the entry
+    /// exists (a migration synthesizes it) the same variables apply to it.
+    /// A malformed agent alias still fails the load with the validator's
+    /// message.
+    #[tokio::test]
+    async fn walker_withholds_reserved_default_agent() {
+        let _guard = super::env_test_lock().await;
+        let _default_enabled = EnvVarGuard::set("ZEROCLAW_agents__default__enabled", "false");
+        let _default_grant = EnvVarGuard::set(
+            "ZEROCLAW_agents__default__workspace__read_memory_from",
+            r#"["alpha"]"#,
+        );
+        let _alpha_enabled = EnvVarGuard::set("ZEROCLAW_agents__alpha__enabled", "false");
+        let _timeout = EnvVarGuard::set("ZEROCLAW_gateway__request_timeout_secs", "120");
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("alpha".into(), AliasedAgentConfig::default());
+        let applied =
+            apply_env_overrides(&mut config).expect("a withheld agent must not fail the load");
+
+        assert!(
+            !config.agents.contains_key("default"),
+            "the reserved agent must not be created"
+        );
+        let withheld = applied
+            .withheld_agents
+            .get("default")
+            .expect("the withheld alias is reported");
+        assert!(withheld.reason.contains("reserved"), "{}", withheld.reason);
+        assert_eq!(
+            withheld.env_vars,
+            [
+                "ZEROCLAW_agents__default__enabled",
+                "ZEROCLAW_agents__default__workspace__read_memory_from",
+            ]
+        );
+        assert!(
+            !applied
+                .paths
+                .iter()
+                .any(|path| path.starts_with("agents.default.")),
+            "{:?}",
+            applied.paths
+        );
+        assert!(
+            !applied
+                .snapshots
+                .keys()
+                .any(|path| path.starts_with("agents.default.")),
+            "a withheld variable must not be masked at save"
+        );
+        assert!(applied.paths.contains("agents.alpha.enabled"));
+        assert!(!config.agents["alpha"].enabled);
+        assert_eq!(config.gateway.request_timeout_secs, 120);
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("default".into(), AliasedAgentConfig::default());
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+        assert!(applied.withheld_agents.is_empty());
+        assert!(applied.paths.contains("agents.default.enabled"));
+        assert!(!config.agents["default"].enabled);
+        assert_eq!(config.agents["default"].workspace.read_memory_from.len(), 1);
+
+        let _bad = EnvVarGuard::set("ZEROCLAW_agents___bad__enabled", "true");
+        let mut config = Config::default();
+        let err = apply_env_overrides(&mut config).expect_err("must hard-error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid alias") && msg.contains("_bad"),
+            "a malformed alias must fail with the validator's message: {msg}",
+        );
+    }
+
+    /// An agent the environment defines is live. It is absent from the file
+    /// on every boot and owns the knowledge it captured in earlier runs, so
+    /// load admits it; the retired-knowledge rule of explicit creation would
+    /// otherwise withhold every env-defined agent after its first run.
+    #[tokio::test]
+    async fn walker_admits_env_defined_agent_that_owns_knowledge() {
+        let _guard = super::env_test_lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let graph = tmp.path().join("knowledge.db");
+        let _conn = seed_knowledge(&graph, &["envonly"]);
+        let _envonly = EnvVarGuard::set("ZEROCLAW_agents__envonly__enabled", "true");
+
+        let mut config = Config::default();
+        config.knowledge.db_path = graph.to_string_lossy().into_owned();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(
+            applied.withheld_agents.is_empty(),
+            "{:?}",
+            applied.withheld_agents
+        );
+        assert!(config.agents["envonly"].enabled);
+        assert!(applied.paths.contains("agents.envonly.enabled"));
     }
 
     #[tokio::test]

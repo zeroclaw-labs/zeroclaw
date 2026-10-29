@@ -1767,6 +1767,45 @@ mod tests {
     }
 
     #[test]
+    fn retired_knowledge_alias_refusals_are_translated_in_every_locale() {
+        // These refusals tell an operator why an agent alias cannot be
+        // recreated yet. A missing key would print the raw `{key}` marker, and
+        // a dropped placeable would hide which alias or failure is meant.
+        let args = [("alias", "retired"), ("reason", "database is locked")];
+        let cases = [
+            ("cli-alias-create-knowledge-retained", &["retired"][..]),
+            (
+                "cli-alias-create-knowledge-uninspectable",
+                &["retired", "database is locked"][..],
+            ),
+        ];
+        for (key, needles) in cases {
+            let english =
+                format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, &args)
+                    .unwrap_or_else(|| panic!("{key} should format in en"));
+            for needle in needles {
+                assert!(english.contains(needle), "{key} in en: {english:?}");
+            }
+            for (source, locale) in [
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, &args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for needle in needles {
+                    assert!(value.contains(needle), "{key} in {locale}: {value:?}");
+                }
+                assert_ne!(
+                    value, english,
+                    "{key} in {locale} is the English string verbatim"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn daemon_startup_cli_strings_format_in_all_locales() {
         let url = "http://127.0.0.1:42617";
         let path = "/tmp/zeroclaw-test/daemon.sock";

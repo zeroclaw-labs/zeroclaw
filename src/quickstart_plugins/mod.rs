@@ -4962,7 +4962,10 @@ capabilities = ["tool"]
             .replace('/', ".");
         assert_eq!(path, egress_path);
         assert!(
-            !workspace.config.ensure_map_or_list_key_for_path(&path),
+            workspace
+                .config
+                .ensure_map_or_list_key_for_path(&path)
+                .is_ok(),
             "the row key is creatable: {path}"
         );
         let value = crate::json_value_to_setprop_string(

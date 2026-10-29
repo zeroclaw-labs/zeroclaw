@@ -183,6 +183,7 @@ tool-model-routing-config-error-risk-profile-collision = risk profile `{$profile
 tool-model-routing-config-error-missing-runtime-profile = agent `{$agent}` references missing runtime profile `{$profile}`
 tool-model-routing-config-error-shared-runtime-profile = runtime profile `{$profile}` is shared by another agent; refusing an agent-scoped mutation
 tool-model-routing-config-error-runtime-profile-collision = runtime profile `{$profile}` already exists; refusing to overwrite it while isolating agent `{$agent}`
+tool-model-routing-config-error-remove-agent-unsupported = cannot remove agent `{$agent}` from model_routing_config: agent deletion runs only through the lifecycle surfaces, `zeroclaw agents delete {$agent}`, the dashboard's agent controls (DELETE /api/config/map-key?path=agents&key={$agent}), or RPC `agents/delete`; they refuse hard references, scrub soft references, and archive and purge the agent's memory, knowledge, cron, and ACP state, which this tool cannot do
 
 tool-notion = Interact with Notion: query databases, read/create/update pages, and search the workspace.
 
