@@ -1022,7 +1022,9 @@ mod tests {
         assert!(!cli_only.contains("daemon"));
         assert!(!cli_only.contains("browser"));
         let script = std::fs::read_to_string(root().join("install.sh")).unwrap();
-        assert!(script.contains("features --selection cli-only"));
+        let resolve = "cli_only_features=$(cargo run --quiet -p xtask --bin generate -- \
+                       features --selection cli-only ";
+        assert!(script.contains(resolve));
     }
 
     #[test]
