@@ -13615,8 +13615,8 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
-    fn remote_transcripts_keep_local_paths_plain_and_urls_actionable() {
+    #[tokio::test]
+    async fn remote_transcripts_keep_local_paths_plain_and_urls_actionable() {
         use ratatui::{Terminal, backend::TestBackend};
 
         let dir = tempfile::tempdir().unwrap();
