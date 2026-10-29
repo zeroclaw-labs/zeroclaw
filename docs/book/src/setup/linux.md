@@ -72,8 +72,9 @@ CLI-only build:
   standard build, and `zeroclaw status` shows the web UI as not included.
 - Channels that receive webhooks, such as `webhook` and Lark, keep their own
   listeners.
-- `zeroclaw update` never replaces it with the standard build. Re-run the
-  installer with `--cli-only` to update.
+- To update, re-run the installer with `--cli-only`. Releases don't publish a
+  CLI-only archive yet, so `zeroclaw update` stops and says so; it never
+  replaces a CLI-only build with the standard build.
 - There is no gateway pairing for remote clients. Run zerocode on the server
   over SSH, or connect with an OIDC token; see
   [Remote setup](../zerocode/remote.md#bearer-token-required-for-every-connection).
