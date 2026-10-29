@@ -211,7 +211,7 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
 
     let download_url = update_info
         .download_url
-        .context("no suitable binary found for this platform")?;
+        .with_context(no_release_archive_message)?;
 
     let current_exe =
         std::env::current_exe().context("cannot determine current executable path")?;
@@ -368,6 +368,17 @@ fn is_sha256sums_asset(name: &str) -> bool {
 }
 
 fn is_installable_release_asset(name: &str, target: &str) -> bool {
+    release_asset_matches(name, target, !cfg!(feature = "gateway"))
+}
+
+/// Whether `name` is the archive this build installs for `target`. Releases
+/// publish only the standard build, with the dashboard and web gateway, so a
+/// CLI-only build (no gateway) installs none of them and an update never
+/// replaces it with the standard build.
+fn release_asset_matches(name: &str, target: &str, cli_only: bool) -> bool {
+    if cli_only {
+        return false;
+    }
     // .tar.gz and .tgz are universal across all platforms
     if name == format!("zeroclaw-{target}.tar.gz") || name == format!("zeroclaw-{target}.tgz") {
         return true;
@@ -377,6 +388,17 @@ fn is_installable_release_asset(name: &str, target: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Why `run` found nothing to install. A CLI-only build installs no release
+/// archive, because releases publish only the standard build.
+fn no_release_archive_message() -> String {
+    if cfg!(feature = "gateway") {
+        return "no suitable binary found for this platform".to_string();
+    }
+    "releases publish only the standard build, and a CLI-only build is never updated to it. \
+     Reinstall it with install.sh --cli-only."
+        .to_string()
 }
 
 fn current_target_triple() -> Option<&'static str> {
@@ -1443,6 +1465,7 @@ mod tests {
         serde_json::json!({ "assets": assets })
     }
 
+    #[cfg(feature = "gateway")]
     #[test]
     fn find_asset_url_picks_correct_gnu_over_android() {
         let release = make_release(&[
@@ -1465,6 +1488,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gateway")]
     #[test]
     fn find_asset_url_ignores_non_installable_assets() {
         let target = current_target_triple().expect("supported test platform");
@@ -1484,6 +1508,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gateway")]
     #[test]
     fn find_asset_url_skips_matching_asset_with_unusable_url() {
         let target = current_target_triple().expect("supported test platform");
@@ -1508,6 +1533,7 @@ mod tests {
         assert_eq!(url, format!("https://example.com/zeroclaw-{target}.tar.gz"));
     }
 
+    #[cfg(feature = "gateway")]
     #[test]
     fn find_asset_url_ignores_non_zeroclaw_assets() {
         let target = current_target_triple().expect("supported test platform");
@@ -1521,6 +1547,43 @@ mod tests {
             url.contains(&format!("zeroclaw-{target}.tar.gz")),
             "should select zeroclaw archive, got: {url}"
         );
+    }
+
+    #[test]
+    fn cli_only_builds_install_no_release_archive() {
+        for target in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ] {
+            for name in [
+                format!("zeroclaw-{target}.tar.gz"),
+                format!("zeroclaw-{target}.tgz"),
+                format!("zeroclaw-{target}.zip"),
+            ] {
+                assert!(!release_asset_matches(&name, target, true), "{name}");
+            }
+        }
+        assert!(release_asset_matches(
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+            "x86_64-unknown-linux-gnu",
+            false
+        ));
+    }
+
+    #[cfg(not(feature = "gateway"))]
+    #[test]
+    fn this_cli_only_build_never_selects_a_release_archive() {
+        let release = make_release(&[
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+            "zeroclaw-aarch64-unknown-linux-gnu.tar.gz",
+            "zeroclaw-aarch64-apple-darwin.tar.gz",
+            "zeroclaw-x86_64-apple-darwin.tar.gz",
+            "zeroclaw-x86_64-pc-windows-msvc.zip",
+        ]);
+        assert!(find_asset_url(&release).is_none());
+        assert!(no_release_archive_message().contains("install.sh --cli-only"));
     }
 
     #[test]
