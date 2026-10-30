@@ -1750,6 +1750,74 @@ test('the first message opens one socket, which never reconnects, and goes out o
   });
 });
 
+for (const [label, session] of [['a scoped account', scopedSession], ['an administrator on the core path', coreAdminSession]] as const) {
+  test(`${label}: transport open cannot send ahead of the pending first message`, async () => {
+    await withSession(session, async () => {
+      const runtime = new FakeSessionRuntime();
+      const mounted = await mountChat(runtime, true);
+      const sendButton = () => {
+        const button = mounted.renderer.root.findAllByType('button')
+          .find((item) => item.props['aria-label'] === 'Send');
+        assert.ok(button);
+        return button;
+      };
+      await typeInComposer(mounted.renderer, 'first');
+      await act(async () => { sendButton().props.onClick(); });
+      const socket = runtime.sockets[0]!;
+      // The transport is open, but the initial application frame is delayed.
+      await act(async () => { socket.emitOpen(); });
+      // Even a draft update and submit handler invoked while disabled must
+      // preserve the unsent text instead of sending it ahead or clearing it.
+      await typeInComposer(mounted.renderer, 'second draft');
+      const disabled = textarea(mounted.renderer).props.disabled;
+      const sendDisabled = sendButton().props.disabled;
+      await act(async () => { sendButton().props.onClick(); });
+      assert.deepEqual({
+        disabled,
+        sendDisabled,
+        sent: socket.sent,
+        input: textarea(mounted.renderer).props.value,
+        draft: mounted.drafts.get('agent-chat.ops.A'),
+      }, {
+        disabled: true,
+        sendDisabled: true,
+        sent: [],
+        input: 'second draft',
+        draft: 'second draft',
+      });
+      // Context callers cannot bypass the same pending-message boundary.
+      await act(async () => { mounted.context().sendMessage('overtake'); });
+      assert.deepEqual(socket.sent, []);
+      assert.equal(mounted.context().messages.some((m) => m.content === 'overtake'), false);
+
+      await act(async () => { socket.emitMessage(conversationStart('core-1')); });
+      assert.deepEqual(socket.sent, ['first']);
+      assert.equal(mounted.context().typing, true);
+      assert.equal(textarea(mounted.renderer).props.value, 'second draft');
+      await answer(socket, 'first answer');
+      assert.equal(sendButton().props.disabled, false);
+      await act(async () => { sendButton().props.onClick(); });
+      assert.deepEqual(socket.sent, ['first', 'second draft']);
+      assert.deepEqual(mounted.context().messages.filter((m) => m.local).map((m) => m.content), ['first', 'second draft']);
+      await unmount(mounted.renderer);
+    });
+  });
+}
+
+test('a legacy socket still accepts a hydrated composer message on transport open', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+  await typeInComposer(mounted.renderer, 'legacy first');
+  const send = mounted.renderer.root.findAllByType('button')
+    .find((button) => button.props['aria-label'] === 'Send');
+  assert.ok(send);
+  await act(async () => { send.props.onClick(); });
+  assert.deepEqual(runtime.sockets[0]!.sent, ['legacy first']);
+  await unmount(mounted.renderer);
+});
+
 for (const code of [1001, 4410, 4401, 4403, 1006]) {
   test(`a close (${code}) ends the conversation: the transcript stays with a notice, and nothing reconnects`, async () => {
     await withSession(scopedSession, async () => {
@@ -1835,6 +1903,9 @@ test('a conversation refused at the limit keeps its message, and Retry sends it'
     await act(async () => { retry.props.onClick(); });
     assert.equal(socket.connectCalls, 2);
     await act(async () => { socket.emitOpen(); });
+    assert.equal(textarea(mounted.renderer).props.disabled, true);
+    await act(async () => { mounted.context().sendMessage('overtake retry'); });
+    assert.deepEqual(socket.sent, []);
     await act(async () => { socket.emitMessage(conversationStart('core-1')); });
     assert.deepEqual(socket.sent, ['hello']);
     assert.equal(mounted.context().conversationLimited, false);

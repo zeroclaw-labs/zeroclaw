@@ -84,6 +84,7 @@ export interface ChatMessage {
 export interface AgentContextValue {
   messages: ChatMessage[];
   sendMessage: (content: string) => void;
+  /** Ready to send; a per-socket conversation first waits for `session_start`. */
   connected: boolean;
   /** The gateway refused this conversation at the account's conversation limit;
    * the socket stays closed until `retryConnection`. */
@@ -492,6 +493,7 @@ export function AgentProvider({
       case 'session_start': {
         if (perSocket) {
           conversationIdRef.current = msg.session_id ?? null;
+          setConnected(true);
           const pending = pendingSendRef.current;
           if (pending !== null) {
             pendingSendRef.current = null;
@@ -835,7 +837,8 @@ export function AgentProvider({
 
     ws.onOpen = () => {
       if (version !== wsVersionRef.current) return;
-      setConnected(true);
+      // The transport alone cannot send ahead of a queued first message.
+      setConnected(!perSocket);
       setConversationLimited(false);
       setError(null);
       if (resyncOnOpenRef.current) {
@@ -1123,9 +1126,9 @@ export function AgentProvider({
   }, [modelInfoVersion, agentAlias]);
 
   const sendMessage = useCallback((content: string) => {
+    if (perSocket && pendingSendRef.current !== null) return;
     if (perSocket && !wsRef.current?.connected) {
       // No conversation is open: this message starts one on a new socket.
-      if (pendingSendRef.current !== null) return;
       pendingSendRef.current = content;
       setError(null);
       setConversationLimited(false);
