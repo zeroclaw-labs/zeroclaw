@@ -6249,6 +6249,8 @@ impl Channel for SlackChannel {
         self.pending_approvals.lock().await.insert(
             token.clone(),
             crate::util::PendingApproval {
+                #[cfg(any(feature = "channel-matrix", test))]
+                prompt_binding: None,
                 sender: tx,
                 destination: recipient.to_string(),
                 tool_name: request.tool_name.clone(),
@@ -6944,6 +6946,8 @@ mod tests {
         channel.pending_approvals.lock().await.insert(
             "abc123".to_string(),
             crate::util::PendingApproval {
+                #[cfg(any(feature = "channel-matrix", test))]
+                prompt_binding: None,
                 sender: tx,
                 destination: "C_TEST".to_string(),
                 tool_name: "shell".to_string(),
@@ -7003,6 +7007,8 @@ mod tests {
         channel.pending_approvals.lock().await.insert(
             "abc123".to_string(),
             crate::util::PendingApproval {
+                #[cfg(any(feature = "channel-matrix", test))]
+                prompt_binding: None,
                 sender: tx,
                 destination: "C_TEST".to_string(),
                 tool_name: "shell".to_string(),
@@ -9497,6 +9503,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "abc123".to_string(),
             crate::util::PendingApproval {
+                #[cfg(any(feature = "channel-matrix", test))]
+                prompt_binding: None,
                 sender: tx,
                 destination: "C_ORIGIN".to_string(),
                 tool_name: "tool".to_string(),
@@ -9551,6 +9559,8 @@ mod tests {
         ch.pending_approvals.lock().await.insert(
             "def456".to_string(),
             crate::util::PendingApproval {
+                #[cfg(any(feature = "channel-matrix", test))]
+                prompt_binding: None,
                 sender: approve_tx,
                 destination: "C_ORIGIN".to_string(),
                 tool_name: "tool".to_string(),
@@ -9614,6 +9624,8 @@ mod tests {
             approvals.insert(
                 "auth01".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-matrix", test))]
+                    prompt_binding: None,
                     sender: approved_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
@@ -9622,6 +9634,8 @@ mod tests {
             approvals.insert(
                 "wrong1".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-matrix", test))]
+                    prompt_binding: None,
                     sender: wrong_tx,
                     destination: "C_OTHER".into(),
                     tool_name: "tool".to_string(),
@@ -9630,6 +9644,8 @@ mod tests {
             approvals.insert(
                 "other1".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-matrix", test))]
+                    prompt_binding: None,
                     sender: unauthorized_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
@@ -10030,6 +10046,8 @@ mod tests {
             approvals.insert(
                 "auth01".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-matrix", test))]
+                    prompt_binding: None,
                     sender: approved_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
@@ -10038,6 +10056,8 @@ mod tests {
             approvals.insert(
                 "wrong1".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-matrix", test))]
+                    prompt_binding: None,
                     sender: wrong_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
@@ -10046,6 +10066,8 @@ mod tests {
             approvals.insert(
                 "other1".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-matrix", test))]
+                    prompt_binding: None,
                     sender: unauthorized_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),

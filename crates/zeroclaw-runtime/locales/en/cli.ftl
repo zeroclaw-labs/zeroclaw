@@ -1654,6 +1654,7 @@ channel-approval-args-label = Args
 channel-approval-btn-approve = Approve
 channel-approval-btn-deny = Deny
 channel-approval-btn-always = Always
+channel-approval-react-instruction = React ✅ to approve once or ❌ to deny.
 channel-approval-tap-instruction = Tap a button below:
 channel-approval-position = Tool call { $index } of { $total }
 channel-approval-reply-instruction-yesno = Reply: "{ $yes_command }", "{ $no_command }", or "{ $always_command }"
