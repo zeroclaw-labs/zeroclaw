@@ -9600,6 +9600,11 @@ pub struct KnowledgeConfig {
     /// Maximum number of knowledge nodes. Default: 100000.
     #[serde(default = "default_knowledge_max_nodes")]
     pub max_nodes: usize,
+    /// Agent that receives unattributed rows from a pre-attribution database.
+    /// Required only when more than one agent is enabled and legacy rows exist;
+    /// a sole enabled agent is selected automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_owner_agent: Option<crate::multi_agent::AgentAlias>,
     /// Automatically capture knowledge from conversations. Default: false.
     #[serde(default)]
     pub auto_capture: bool,
@@ -9622,6 +9627,7 @@ impl Default for KnowledgeConfig {
             enabled: false,
             db_path: default_knowledge_db_path(),
             max_nodes: default_knowledge_max_nodes(),
+            legacy_owner_agent: None,
             auto_capture: false,
             suggest_on_query: true,
         }
@@ -25264,6 +25270,23 @@ impl Config {
                     "knowledge.db_path must not be empty"
                 );
             }
+            if let Some(owner) = self.knowledge.legacy_owner_agent.as_ref() {
+                let owner = owner.as_str();
+                let Some(agent) = self.agents.get(owner) else {
+                    validation_bail!(
+                        DanglingReference,
+                        "knowledge.legacy_owner_agent",
+                        "knowledge.legacy_owner_agent points at agents.{owner}, which is not configured"
+                    );
+                };
+                if !agent.enabled {
+                    validation_bail!(
+                        InvalidFormat,
+                        "knowledge.legacy_owner_agent",
+                        "knowledge.legacy_owner_agent points at agents.{owner}, which is disabled"
+                    );
+                }
+            }
         }
 
         // Google Workspace allowed_services / allowed_operations. Checked
@@ -25965,6 +25988,28 @@ impl Config {
                     );
                 }
             }
+
+            // workspace.read_knowledge_from: every alias must exist as a
+            // configured agent. No backend compatibility check applies:
+            // the knowledge graph is one install-wide store shared by
+            // all agents.
+            for (i, target) in agent.workspace.read_knowledge_from.iter().enumerate() {
+                let target_str = target.as_str();
+                if target_str == alias.as_str() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_knowledge_from[{i}]"),
+                        "agents.{alias}.workspace.read_knowledge_from[{i}] = {target_str:?} but {target_str} is this agent itself; an agent always sees its own knowledge rows, so self-references in the cross-agent allowlist are not permitted",
+                    );
+                }
+                if !self.agents.contains_key(target_str) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.workspace.read_knowledge_from[{i}]"),
+                        "agents.{alias}.workspace.read_knowledge_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
+                    );
+                }
+            }
         }
 
         // Peer groups: every member alias must exist as a configured
@@ -26254,12 +26299,18 @@ impl Config {
     /// not yet exist, so a `set_prop` on a brand-new alias's field materializes
     /// the entry first.
     ///
-    /// Returns `true` iff it REFUSED to create the reserved `default` agent: a
-    /// set-prop surface should then surface a reserved-name error rather than the
-    /// generic "not configured" that the still-missing entry would otherwise
-    /// produce. Returns `false` in every other case (created, already existed, or
-    /// the path is not a map-keyed entry). The bool is advisory; statement-callers
-    /// that do not distinguish the reserved case may ignore it.
+    /// Creation goes through the same admission rule as explicit creation
+    /// ([`crate::alias_refs::create_map_key_checked`]). It returns
+    /// `Err(CreateError::Reserved)` when the path would create the reserved
+    /// `default` agent, and `Err(CreateError::Retirement)` when it would create
+    /// an agent alias whose retired knowledge is still in the knowledge store
+    /// or cannot be inspected. A set-prop surface must report that refusal
+    /// rather than the generic "not configured" the still-missing entry would
+    /// otherwise produce. It returns `Ok(())` in every other case: created,
+    /// already existed, or the path is not a map-keyed entry. A raw creation
+    /// failure (an invalid key) is not reported here; the caller's later
+    /// property lookup reports the unknown path. Only a brand-new key is
+    /// checked, so edits to an existing alias never touch the knowledge store.
     ///
     /// When it newly creates the alias, it also guarantees no phantom is left
     /// behind: if `path` still doesn't resolve afterward (e.g. an unknown tail
@@ -26281,7 +26332,10 @@ impl Config {
     /// `validate_alias_key` for those sections so nothing else rejects it.
     /// Rate rows are created explicitly through `POST /api/config/map-key`
     /// instead.
-    pub fn ensure_map_key_for_path(&mut self, path: &str) -> bool {
+    pub fn ensure_map_key_for_path(
+        &mut self,
+        path: &str,
+    ) -> Result<(), crate::alias_refs::CreateError> {
         self.ensure_key_for_path(path, false)
     }
 
@@ -26304,11 +26358,18 @@ impl Config {
     ///
     /// The same guarantees apply: an existing entry is left alone, and a new
     /// entry whose trailing field does not resolve is rolled back.
-    pub fn ensure_map_or_list_key_for_path(&mut self, path: &str) -> bool {
+    pub fn ensure_map_or_list_key_for_path(
+        &mut self,
+        path: &str,
+    ) -> Result<(), crate::alias_refs::CreateError> {
         self.ensure_key_for_path(path, true)
     }
 
-    fn ensure_key_for_path(&mut self, path: &str, include_lists: bool) -> bool {
+    fn ensure_key_for_path(
+        &mut self,
+        path: &str,
+        include_lists: bool,
+    ) -> Result<(), crate::alias_refs::CreateError> {
         use crate::traits::MapKeyKind;
         let mut best: Option<&'static str> = None;
         for s in Self::map_key_sections()
@@ -26328,41 +26389,65 @@ impl Config {
             }
         }
         let Some(section) = best else {
-            return false;
+            return Ok(());
         };
         let rest = &path[section.len() + 1..];
         let Some(alias) = rest.split('.').next().filter(|a| !a.is_empty()) else {
-            return false;
+            return Ok(());
         };
         if self
             .get_map_keys(section)
             .is_some_and(|keys| keys.iter().any(|k| k == alias))
         {
-            return false;
+            return Ok(());
         }
-        // Never auto-vivify the reserved `default` agent from a set-prop path: a
-        // prop write under a nonexistent `agents.default` must not materialize the
-        // reserved runtime fallback (the operator would get an agent the rename
-        // guard then traps). This is the set-prop analogue of the create guard in
-        // `create_map_key_checked`. The migration that legitimately synthesizes
-        // `agents.default` calls `create_map_key` directly, not this path, and an
-        // already-present `default` is left untouched by the existence check above.
-        if section == "agents" && crate::alias_refs::is_reserved_agent_alias(alias) {
-            // Make the refusal observable: callers that check the return surface a
-            // reserved-name error, and this WARN with a stable `error_key` lets an
-            // operator see why a set-prop on a fresh `agents.default` was dropped.
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "error_key": "config.reserved_agent_vivify_refused",
-                        "alias": alias,
-                        "path": path,
-                    })),
-                "refused to auto-create the reserved `default` agent from a set-prop path"
-            );
-            return true;
+        // Admit the new key through the rule explicit creation uses. Never
+        // auto-vivify the reserved `default` agent from a set-prop path: the
+        // operator would get an agent the rename guard then traps. The
+        // migration that legitimately synthesizes `agents.default` calls
+        // `create_map_key` directly, not this path. Never recreate an agent
+        // alias whose retired knowledge is still stored or cannot be
+        // inspected: the new agent's trusted scope would read the old rows.
+        // An already-present key returned above, so existing agents are never
+        // probed.
+        if let Err(error) = crate::alias_refs::admit_map_key(self, section, alias) {
+            // Make each refusal observable with a stable `error_key`, so an
+            // operator can see why a set-prop on a fresh agent was refused.
+            match &error {
+                crate::alias_refs::CreateError::Reserved(_) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "config.reserved_agent_vivify_refused",
+                            "alias": alias,
+                            "path": path,
+                        })),
+                    "refused to auto-create the reserved `default` agent from a set-prop path"
+                ),
+                crate::alias_refs::CreateError::Retirement(retirement) => {
+                    let kind = match retirement {
+                        crate::alias_refs::RetiredKnowledgeError::Retained { .. } => "retained",
+                        crate::alias_refs::RetiredKnowledgeError::Uninspectable { .. } => {
+                            "uninspectable"
+                        }
+                    };
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "config.retired_agent_vivify_refused",
+                                "alias": alias,
+                                "path": path,
+                                "kind": kind,
+                            })),
+                        "refused to auto-create an agent whose retired knowledge remains"
+                    );
+                }
+                crate::alias_refs::CreateError::Invalid(_) => {}
+            }
+            return Err(error);
         }
         // Roll back on the same `Ok(true)` == "newly created" signal the CLI
         // helper `ensure_map_key_for_prop_path` (src/main.rs) uses: never gate
@@ -26379,7 +26464,7 @@ impl Config {
         {
             let _ = self.delete_map_key(section, alias);
         }
-        false
+        Ok(())
     }
 
     pub fn clear_dirty(&mut self) {
@@ -43690,7 +43775,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         let path = format!("plugins.entries.{key}.egress_hosts");
         assert!(config.get_prop(&path).is_err(), "no row to begin with");
 
-        assert!(!config.ensure_map_or_list_key_for_path(&path));
+        assert!(config.ensure_map_or_list_key_for_path(&path).is_ok());
         config
             .set_prop(&path, "api.example.com")
             .expect("the created row takes the value");
@@ -43703,7 +43788,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
         assert_eq!(entry.egress_hosts, vec!["api.example.com".to_string()]);
 
         // A second call leaves the existing row, and its value, alone.
-        assert!(!config.ensure_map_or_list_key_for_path(&path));
+        assert!(config.ensure_map_or_list_key_for_path(&path).is_ok());
         assert_eq!(config.plugins.entries.len(), 1);
     }
 
@@ -43711,7 +43796,7 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
     async fn ensure_map_or_list_key_for_path_rolls_back_a_list_row_whose_tail_field_is_unknown() {
         let mut config = Config::default();
         let path = "plugins.entries.zpi1_abc.not_a_real_field";
-        assert!(!config.ensure_map_or_list_key_for_path(path));
+        assert!(config.ensure_map_or_list_key_for_path(path).is_ok());
         assert!(
             config.plugins.entries.is_empty(),
             "a typo'd field must not leave a phantom row"
@@ -43723,7 +43808,9 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
     #[tokio::test]
     async fn ensure_map_key_for_path_still_does_not_create_list_rows() {
         let mut config = Config::default();
-        config.ensure_map_key_for_path("plugins.entries.zpi1_abc.egress_hosts");
+        config
+            .ensure_map_key_for_path("plugins.entries.zpi1_abc.egress_hosts")
+            .unwrap();
         assert!(config.plugins.entries.is_empty());
         assert!(
             config
@@ -44471,6 +44558,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             &workspace,
             ".read_memory_from",
             "Cross-agent memory allowlist",
+        );
+        assert_description(
+            &workspace,
+            ".read_knowledge_from",
+            "Cross-agent knowledge allowlist",
         );
 
         let a2a = crate::multi_agent::A2aServerConfig::default().prop_fields();
@@ -45746,7 +45838,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
                 config.set_prop(path, value).is_err(),
                 "precondition: {path} is unknown on a fresh config"
             );
-            config.ensure_map_key_for_path(path);
+            config.ensure_map_key_for_path(path).unwrap();
             assert!(
                 config.set_prop(path, value).is_ok(),
                 "{path} must be settable after ensure_map_key_for_path"
@@ -45757,8 +45849,8 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     #[test]
     async fn ensure_map_key_for_path_ignores_plain_fields() {
         let mut config = Config::default();
-        config.ensure_map_key_for_path("gateway.port");
-        config.ensure_map_key_for_path("locale");
+        config.ensure_map_key_for_path("gateway.port").unwrap();
+        config.ensure_map_key_for_path("locale").unwrap();
         assert!(config.set_prop("gateway.port", "8080").is_ok());
     }
 
@@ -45800,7 +45892,9 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     #[test]
     async fn set_prop_single_level_map_rejects_invalid_value_not_unknown_property() {
         let mut config = Config::default();
-        config.ensure_map_key_for_path("channels.telegram.default.bot_token");
+        config
+            .ensure_map_key_for_path("channels.telegram.default.bot_token")
+            .unwrap();
         let err = config
             .set_prop("channels.telegram.default.enabled", "notabool")
             .unwrap_err()
@@ -45811,7 +45905,9 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     #[test]
     async fn set_prop_single_level_map_accepts_valid_value() {
         let mut config = Config::default();
-        config.ensure_map_key_for_path("channels.telegram.default.bot_token");
+        config
+            .ensure_map_key_for_path("channels.telegram.default.bot_token")
+            .unwrap();
         config
             .set_prop("channels.telegram.default.enabled", "true")
             .unwrap();
@@ -45828,7 +45924,9 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     #[test]
     async fn set_prop_single_level_map_unknown_leaf_still_unknown_property() {
         let mut config = Config::default();
-        config.ensure_map_key_for_path("channels.telegram.default.bot_token");
+        config
+            .ensure_map_key_for_path("channels.telegram.default.bot_token")
+            .unwrap();
         let err = config
             .set_prop("channels.telegram.default.nonexistent_field", "x")
             .unwrap_err()
@@ -46107,10 +46205,12 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     #[test]
     async fn ensure_map_key_for_path_ignores_resource_keyed_rate_sections() {
         let mut config = Config::default();
-        config.ensure_map_key_for_path("cost.rates.providers.models.openai.gpt-4.1.input_per_mtok");
-        // The return value proves nothing here: it is `true` only for the
-        // reserved-agent refusal, so it is already `false` without the
-        // `resource_key` filter. The emptiness check is the regression signal.
+        config
+            .ensure_map_key_for_path("cost.rates.providers.models.openai.gpt-4.1.input_per_mtok")
+            .unwrap();
+        // The result proves nothing here: it is an error only when an agent
+        // alias is refused, so it is already `Ok` without the `resource_key`
+        // filter. The emptiness check is the regression signal.
         assert!(
             config.cost.rates.providers.models.openai.is_empty(),
             "a leaf write must not auto-create a resource-keyed rate row"
@@ -46124,7 +46224,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
             .create_map_key("cost.rates.providers.models.openai", "gpt-4.1")
             .expect("resource-keyed sections accept dotted model ids");
         let path = "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok";
-        config.ensure_map_key_for_path(path);
+        config.ensure_map_key_for_path(path).unwrap();
         assert_eq!(
             config
                 .get_map_keys("cost.rates.providers.models.openai")
@@ -46141,7 +46241,9 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     #[test]
     async fn ensure_map_key_for_path_ignores_cost_rate_tools() {
         let mut config = Config::default();
-        config.ensure_map_key_for_path("cost.rates.tools.web_search.per_call");
+        config
+            .ensure_map_key_for_path("cost.rates.tools.web_search.per_call")
+            .unwrap();
         assert!(
             config.cost.rates.tools.is_empty(),
             "`cost.rates.tools` is resource-keyed by the tool's registered name"
@@ -46161,7 +46263,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
 
         let refused = config.ensure_map_key_for_path(path);
 
-        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(refused.is_ok(), "not the reserved-agent refusal path");
         assert!(
             config
                 .get_map_keys("providers.models.anthropic")
@@ -46180,7 +46282,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let refused =
             config.ensure_map_key_for_path("providers.models.anthropic.default.not_a_real_field");
 
-        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(refused.is_ok(), "not the reserved-agent refusal path");
         assert!(
             config
                 .get_map_keys("providers.models.anthropic")
@@ -46196,7 +46298,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
 
         let refused = config.ensure_map_key_for_path(path);
 
-        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(refused.is_ok(), "not the reserved-agent refusal path");
         config
             .set_prop(path, "bar")
             .expect("a new dynamic secret-map key must be insertable");
@@ -48435,6 +48537,100 @@ allowed_users = []
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_read_knowledge_from_self_reference() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_knowledge_from
+            .push(crate::multi_agent::AgentAlias::new("alpha"));
+        let err = config
+            .validate()
+            .expect_err("self-reference must fail validation");
+        assert!(
+            err.to_string().contains("read_knowledge_from[0]"),
+            "expected indexed field path, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_read_knowledge_from_dangling_reference() {
+        let mut config = multi_agent_test_config();
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_knowledge_from
+            .push(crate::multi_agent::AgentAlias::new("ghost"));
+        let err = config
+            .validate()
+            .expect_err("dangling target must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read_knowledge_from[0]")
+                && msg.contains("agents.ghost is not configured"),
+            "expected dangling-ref explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_read_knowledge_from_across_memory_backends() {
+        let mut config = multi_agent_test_config();
+
+        // The knowledge graph is one install-wide store, so unlike
+        // read_memory_from the allowlist is valid across differing
+        // per-agent memory backends.
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Postgres,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha
+            .workspace
+            .read_knowledge_from
+            .push(crate::multi_agent::AgentAlias::new("beta"));
+
+        config
+            .validate()
+            .expect("sibling grant must pass validation regardless of memory backend");
+    }
+
+    #[test]
+    async fn validate_rejects_dangling_legacy_knowledge_owner() {
+        let mut config = multi_agent_test_config();
+        config.knowledge.enabled = true;
+        config.knowledge.legacy_owner_agent = Some(crate::multi_agent::AgentAlias::new("ghost"));
+        let err = config
+            .validate()
+            .expect_err("legacy owner must resolve to a configured agent");
+        assert!(err.to_string().contains("knowledge.legacy_owner_agent"));
+    }
+
+    #[test]
+    async fn validate_rejects_disabled_legacy_knowledge_owner() {
+        let mut config = multi_agent_test_config();
+        config.knowledge.enabled = true;
+        config.agents.insert(
+            "sleeping".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.knowledge.legacy_owner_agent = Some(crate::multi_agent::AgentAlias::new("sleeping"));
+        let err = config
+            .validate()
+            .expect_err("legacy owner must be runtime-enabled");
+        assert!(err.to_string().contains("which is disabled"));
     }
 
     #[test]

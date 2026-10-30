@@ -3193,7 +3193,28 @@ fn init_map_alias(config: &mut Config, section_arg: &str) -> Result<Option<Strin
     match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, alias) {
         Ok(true) => Ok(Some(format!("{section_path}.{alias}"))),
         Ok(false) => Ok(None),
-        Err(e) => Err(anyhow::Error::msg(e.to_string())),
+        Err(e) => Err(anyhow::Error::msg(alias_create_refusal_text(&e))),
+    }
+}
+
+/// Operator text for a refused alias creation on the CLI. Retired-knowledge
+/// refusals are localized; the reserved and invalid cases keep their existing
+/// wording. Gated like its callers, which all need the agent runtime.
+#[cfg(any(feature = "agent-runtime", test))]
+fn alias_create_refusal_text(error: &zeroclaw_config::alias_refs::CreateError) -> String {
+    use zeroclaw_config::alias_refs::{CreateError, RetiredKnowledgeError};
+    match error {
+        CreateError::Retirement(RetiredKnowledgeError::Retained { alias }) => ta(
+            "cli-alias-create-knowledge-retained",
+            &[("alias", alias)],
+            error.to_string(),
+        ),
+        CreateError::Retirement(RetiredKnowledgeError::Uninspectable { alias, reason }) => ta(
+            "cli-alias-create-knowledge-uninspectable",
+            &[("alias", alias), ("reason", reason)],
+            error.to_string(),
+        ),
+        CreateError::Reserved(_) | CreateError::Invalid(_) => error.to_string(),
     }
 }
 
@@ -3247,7 +3268,7 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         match zeroclaw_config::alias_refs::create_map_key_checked(config, section_path, key) {
             Ok(created) => created,
             Err(zeroclaw_config::alias_refs::CreateError::Reserved(_)) => return Ok(false),
-            Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+            Err(e) => return Err(anyhow::Error::msg(alias_create_refusal_text(&e))),
         };
     if created {
         // The section matched and the alias was newly materialized, but the
@@ -13336,17 +13357,18 @@ Add pricing to the active provider profile or supply a catalog entry."
                         raw_path.to_string()
                     };
                     if matches!(op_name, "add" | "replace")
-                        && config.ensure_map_or_list_key_for_path(&path)
+                        && let Err(error) = config.ensure_map_or_list_key_for_path(&path)
                     {
-                        let err = ConfigApiError::new(
-                            ConfigApiCode::ValidationFailed,
-                            "alias `default` is reserved and cannot be created",
-                        )
-                        .with_path(&path)
-                        .with_op_index(idx);
+                        // The JSON envelope keeps the gateway's English message;
+                        // the human line uses the localized refusal.
                         let human = format!(
-                            "op[{idx}] `{op_name}` on `{path}`: alias `default` is reserved and cannot be created"
+                            "op[{idx}] `{op_name}` on `{path}`: {}",
+                            alias_create_refusal_text(&error)
                         );
+                        let err =
+                            ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                                .with_path(&path)
+                                .with_op_index(idx);
                         config_patch_fail_json_or_human(json, err, human)?;
                     }
                     let comment = match object.get("comment") {
@@ -18670,7 +18692,7 @@ mod tests {
                 config.set_prop(path, value).is_err(),
                 "precondition: {path} should be unknown on a fresh config"
             );
-            config.ensure_map_key_for_path(path);
+            config.ensure_map_key_for_path(path).unwrap();
             assert!(
                 config.set_prop(path, value).is_ok(),
                 "{path} must be settable after map-key materialization"
@@ -18683,8 +18705,8 @@ mod tests {
     fn ensure_map_key_ignores_non_map_paths() {
         use crate::config::schema::Config;
         let mut config = Config::default();
-        config.ensure_map_key_for_path("gateway.port");
-        config.ensure_map_key_for_path("locale");
+        config.ensure_map_key_for_path("gateway.port").unwrap();
+        config.ensure_map_key_for_path("locale").unwrap();
     }
 
     #[test]
@@ -23310,7 +23332,7 @@ type = "string"
             .expect("a JSON Pointer path")
             .replace('/', ".");
         assert!(
-            !config.ensure_map_or_list_key_for_path(&path),
+            config.ensure_map_or_list_key_for_path(&path).is_ok(),
             "the row key must be creatable: {path}"
         );
         let value = json_value_to_setprop_string(&ops[0]["value"], &config, &path, 0, false)
