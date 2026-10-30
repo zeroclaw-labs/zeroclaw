@@ -15440,6 +15440,72 @@ mod tests {
             })
         }
 
+        /// Subscribe to the captured log records right before the call under
+        /// test, draining what arrived earlier. Returns the receiver and the
+        /// hook it was subscribed through, for [`capture_diagnostics`].
+        fn fresh_records() -> (
+            tokio::sync::broadcast::Receiver<Value>,
+            Option<zeroclaw_log::LogBroadcastSender>,
+        ) {
+            let mut records = zeroclaw_log::subscribe_or_install();
+            let hook = zeroclaw_log::current_broadcast_hook();
+            while records.try_recv().is_ok() {}
+            (records, hook)
+        }
+
+        /// The captured records `keep` accepts. A lagged receiver keeps
+        /// draining rather than stopping early, which is how the old drains
+        /// lost a record under the parallel gate, and an empty drain waits up
+        /// to two seconds for a late one.
+        async fn drain_records(
+            records: &mut tokio::sync::broadcast::Receiver<Value>,
+            keep: impl Fn(&Value) -> bool,
+        ) -> Vec<Value> {
+            use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+            let mut kept = Vec::new();
+            loop {
+                match records.try_recv() {
+                    Ok(record) => {
+                        if keep(&record) {
+                            kept.push(record);
+                        }
+                    }
+                    Err(TryRecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while kept.is_empty() && tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(Duration::from_millis(50), records.recv()).await {
+                    Ok(Ok(record)) => {
+                        if keep(&record) {
+                            kept.push(record);
+                        }
+                    }
+                    Ok(Err(RecvError::Lagged(_))) | Err(_) => {}
+                    Ok(Err(RecvError::Closed)) => break,
+                }
+            }
+            kept
+        }
+
+        /// Why a capture test saw no record: tells a missing capture layer or
+        /// a broadcast hook replaced since the subscription (by a test that
+        /// does not hold the hook lock) apart from a code regression.
+        fn capture_diagnostics(
+            hook_at_subscribe: Option<&zeroclaw_log::LogBroadcastSender>,
+        ) -> String {
+            let layer = zeroclaw_log::__private_test_capture_layer_active();
+            let hook_unchanged = match (hook_at_subscribe, zeroclaw_log::current_broadcast_hook()) {
+                (Some(before), Some(now)) => before.same_channel(&now),
+                (None, None) => true,
+                _ => false,
+            };
+            format!(
+                "capture layer active: {layer}; broadcast hook unchanged since subscribe: {hook_unchanged}"
+            )
+        }
+
         fn line(id: u64, method: &str, params: Value) -> String {
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
         }
@@ -16123,8 +16189,6 @@ mod tests {
             let _writer_guard = zeroclaw_log::__private_test_writer_lock();
             let _hook_guard = zeroclaw_log::__private_test_hook_lock();
             zeroclaw_log::try_install_capture_subscriber();
-            let mut records = zeroclaw_log::subscribe_or_install();
-            while records.try_recv().is_ok() {}
 
             let ingress = test_ingress();
             let mut routes = publish(&ingress, &[ack_route()]);
@@ -16156,6 +16220,7 @@ mod tests {
             .into_iter()
             .enumerate()
             {
+                let (mut records, hook) = fresh_records();
                 let response = call(&mut dispatcher, &mut rx, id as u64, method, request).await;
                 assert_eq!(error_code(&response), i64::from(FORBIDDEN), "{method}");
                 let message = response["error"]["message"].as_str().unwrap_or_default();
@@ -16165,18 +16230,18 @@ mod tests {
                 // Other tests share the log stream and the test principal, so
                 // pick this refusal's record by event, method, principal and
                 // the reason the caller was given.
-                let mut audited = Vec::new();
-                while let Ok(record) = records.try_recv() {
-                    if record["message"] == "RPC authorization denied"
+                let audited = drain_records(&mut records, |record| {
+                    record["message"] == "RPC authorization denied"
                         && record["attributes"]["method"] == method
                         && record["attributes"]["principal_id"] == principal_id
                         && record["attributes"]["reason"] == message
-                    {
-                        audited.push(record);
-                    }
-                }
+                })
+                .await;
                 let [record] = audited.as_slice() else {
-                    panic!("expected one denial record for {method}, got {audited:#?}");
+                    panic!(
+                        "expected one denial record for {method}, got {audited:#?} ({})",
+                        capture_diagnostics(hook.as_ref())
+                    );
                 };
                 assert_eq!(record["severity_text"], "WARN", "{record:#?}");
                 assert_eq!(record["event"]["action"], "reject", "{record:#?}");
@@ -16297,8 +16362,6 @@ mod tests {
             let _writer_guard = zeroclaw_log::__private_test_writer_lock();
             let _hook_guard = zeroclaw_log::__private_test_hook_lock();
             zeroclaw_log::try_install_capture_subscriber();
-            let mut records = zeroclaw_log::subscribe_or_install();
-            while records.try_recv().is_ok() {}
 
             let ingress = test_ingress();
             let (_, plugin, _, depth, worker) = ack_route();
@@ -16335,6 +16398,7 @@ mod tests {
             assert_eq!(response["result"], json!({"outcome": "ack"}), "{response}");
             assert_eq!(next_seen(&mut routes).await.path, "fixture");
 
+            let (mut records, hook) = fresh_records();
             let response = call(
                 &mut caller,
                 &mut rx,
@@ -16351,18 +16415,20 @@ mod tests {
             );
             // Other tests share the log stream and this roster principal, so
             // pick this refusal's record by the channel its reason names.
-            let audited: Vec<Value> = std::iter::from_fn(|| records.try_recv().ok())
-                .filter(|record| {
-                    record["message"] == "RPC authorization denied"
-                        && record["attributes"]["method"] == DISPATCH
-                        && record["attributes"]["principal_id"] == principal_id
-                        && record["attributes"]["reason"]
-                            .as_str()
-                            .is_some_and(|reason| reason.contains("plugin.other-alias"))
-                })
-                .collect();
+            let audited = drain_records(&mut records, |record| {
+                record["message"] == "RPC authorization denied"
+                    && record["attributes"]["method"] == DISPATCH
+                    && record["attributes"]["principal_id"] == principal_id
+                    && record["attributes"]["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("plugin.other-alias"))
+            })
+            .await;
             let [record] = audited.as_slice() else {
-                panic!("expected one denial record, got {audited:#?}");
+                panic!(
+                    "expected one denial record, got {audited:#?} ({})",
+                    capture_diagnostics(hook.as_ref())
+                );
             };
             assert_eq!(record["severity_text"], "WARN", "{record:#?}");
             assert_eq!(record["attributes"]["code"], FORBIDDEN, "{record:#?}");
