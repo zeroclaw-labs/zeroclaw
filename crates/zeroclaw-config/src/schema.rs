@@ -6883,6 +6883,14 @@ pub struct PacingConfig {
     /// caps at Block — it never terminates the turn. Defaults to 5.
     #[serde(default = "default_loop_detection_no_progress_min_calls")]
     pub loop_detection_no_progress_min_calls: usize,
+
+    /// Full A↔B tool-name cycles before the first ping-pong Warning. Block
+    /// escalates at `min + 1`, Break at `min + 2`. Defaults to 8 so ordinary
+    /// multi-file read/write workflows are not aborted at six cycles.
+    /// Runtime raises `loop_detection_window_size` to at least
+    /// `2 * (min + 2)` when needed so Break stays reachable.
+    #[serde(default = "default_loop_detection_ping_pong_min_cycles")]
+    pub loop_detection_ping_pong_min_cycles: usize,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -6901,6 +6909,10 @@ fn default_loop_detection_no_progress_min_calls() -> usize {
     5
 }
 
+fn default_loop_detection_ping_pong_min_cycles() -> usize {
+    8
+}
+
 impl Default for PacingConfig {
     fn default() -> Self {
         Self {
@@ -6912,6 +6924,7 @@ impl Default for PacingConfig {
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
             loop_detection_no_progress_min_calls: default_loop_detection_no_progress_min_calls(),
+            loop_detection_ping_pong_min_cycles: default_loop_detection_ping_pong_min_cycles(),
         }
     }
 }
@@ -43782,12 +43795,17 @@ bot_token = "enc:v1:UNRELATED-CIPHERTEXT-THAT-MUST-SURVIVE"
             from_toml.loop_detection_no_progress_min_calls,
             manual.loop_detection_no_progress_min_calls
         );
+        assert_eq!(
+            from_toml.loop_detection_ping_pong_min_cycles,
+            manual.loop_detection_ping_pong_min_cycles
+        );
 
         // Verify concrete values so a silent change to the defaults is caught.
         assert!(from_toml.loop_detection_enabled, "default should be true");
         assert_eq!(from_toml.loop_detection_window_size, 20);
         assert_eq!(from_toml.loop_detection_max_repeats, 3);
         assert_eq!(from_toml.loop_detection_no_progress_min_calls, 5);
+        assert_eq!(from_toml.loop_detection_ping_pong_min_cycles, 8);
     }
 
     // ── Docker baked config template ────────────────────────────
