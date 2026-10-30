@@ -179,7 +179,8 @@ runtime_profile = "default"
             .last()
             .expect("newest user message")["content"]
             .as_str()
-            .is_some_and(|text| text.ends_with("next text-only turn")),
+            // The follow-up also carries the note that no new image is attached.
+            .is_some_and(|text| text.contains("next text-only turn")),
         "the third request must be the next user turn, not another recovery attempt"
     );
     let saved: serde_json::Value =
