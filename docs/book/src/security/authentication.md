@@ -369,7 +369,9 @@ pending reasons listed there, such as a Windows named pipe, which the CLI
 never sends an edit over. When the daemon identifies the caller and then
 refuses the edit, because its principal lacks the config grant the method
 needs (`update` for `add` and `passwd`, `delete` for `disable-password`
-and `remove`), or rejects it, the command fails and writes nothing.
+and `remove`), or rejects it, the command fails and writes nothing. `add`,
+`passwd`, and `disable-password` also need `read`, to compare the daemon's
+roster first, as described next.
 
 The command decides from `config.toml` whether the entry exists, but the
 daemon applies the edit to the roster it holds, and the two differ while a
@@ -378,7 +380,9 @@ for a password, the command compares the two: `add` of a name the daemon
 holds, and `passwd` or `disable-password` of an entry the daemon has not
 loaded, are refused until the daemon is restarted. It compares again just
 before it commits, and refuses, to be run again, an edit whose entry another
-writer added or removed through the daemon while the prompt was open.
+writer added or removed through the daemon while the prompt was open. A
+daemon that identifies the caller but will not show it the roster refuses
+the edit too, since it could take the commit unseen.
 `remove` of an entry the daemon never loaded leaves the daemon nothing to
 delete, so the command removes it from the file itself.
 

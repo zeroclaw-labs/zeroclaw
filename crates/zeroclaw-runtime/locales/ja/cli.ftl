@@ -198,6 +198,7 @@ cli-user-config-changed = このコマンドの実行中に { $path } が変更�
 cli-user-live-entry-exists = users.{ $name } は config.toml にありませんが、実行中のデーモンはまだ保持しています。変更がリロード待ちです。デーモンを再起動してから、コマンドを再実行してください。
 cli-user-live-entry-missing = users.{ $name } は config.toml にありますが、実行中のデーモンはまだ読み込んでいません。変更がリロード待ちです。デーモンを再起動してから、コマンドを再実行してください。
 cli-user-live-entry-changed = このコマンドの実行中に、実行中のデーモンのユーザー名簿で users.{ $name } が変更されたため、何も書き込まれていません。コマンドを再実行してください。
+cli-user-live-roster-unread = 実行中のデーモンがこのコマンドにユーザー名簿の参照を許可しなかったため ({ $detail })、そこで users.{ $name } を確認できず、何も書き込まれていません。デーモンが設定の読み取りを許可しているアカウントでコマンドを実行してください。
 cli-user-password-unassigned = パスワードに Unicode でまだ割り当てられていない文字が含まれているため、正規化の結果が変わる可能性があります。別の文字を選んでください。
 cli-user-env-overrides = 環境変数が { $paths } を変更しているため、ユーザー名簿の検査が { $path } と一致しません。環境変数を解除してから、コマンドを再実行してください。
 cli-user-password-stdin-terminal = --password-stdin はパイプまたはファイルから読み取ります。ここでターミナルに入力するとパスワードが表示されます。非表示のプロンプトで入力するには、add では --password を指定し、passwd と hash-password では --password-stdin を省略してください。

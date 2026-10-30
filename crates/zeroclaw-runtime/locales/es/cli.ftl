@@ -200,6 +200,7 @@ cli-user-config-changed = { $path } cambió mientras se ejecutaba este comando, 
 cli-user-live-entry-exists = users.{ $name } no está en config.toml, pero el daemon en ejecución todavía la tiene: hay un cambio pendiente de recarga. Reinicia el daemon y vuelve a ejecutar el comando.
 cli-user-live-entry-missing = users.{ $name } está en config.toml, pero el daemon en ejecución todavía no la ha cargado: hay un cambio pendiente de recarga. Reinicia el daemon y vuelve a ejecutar el comando.
 cli-user-live-entry-changed = La lista de usuarios del daemon en ejecución cambió para users.{ $name } mientras se ejecutaba este comando, así que no se escribió nada. Vuelve a ejecutar el comando.
+cli-user-live-roster-unread = El daemon en ejecución no permitió a este comando ver su lista de usuarios ({ $detail }), así que no se pudo comprobar users.{ $name } allí y no se escribió nada. Ejecuta el comando con una cuenta a la que el daemon conceda lectura de la configuración.
 cli-user-password-unassigned = La contraseña contiene un carácter que Unicode aún no tiene asignado, así que su normalización podría cambiar. Elige otro carácter.
 cli-user-env-overrides = Hay variables de entorno que cambian { $paths }, así que la comprobación de usuarios no coincidiría con { $path }. Elimínalas y vuelve a ejecutar el comando.
 cli-user-password-stdin-terminal = --password-stdin lee de una tubería o un archivo; escribir aquí en una terminal mostraría la contraseña. Para escribirla sin que se muestre, pasa --password a add, u omite --password-stdin en passwd y hash-password.

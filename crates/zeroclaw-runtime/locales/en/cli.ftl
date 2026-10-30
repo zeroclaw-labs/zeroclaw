@@ -214,6 +214,7 @@ cli-user-config-changed = { $path } changed while this command ran, so nothing w
 cli-user-live-entry-exists = users.{ $name } is not in config.toml, but the running daemon still holds it: a change waits for a reload. Restart the daemon, then run the command again.
 cli-user-live-entry-missing = users.{ $name } is in config.toml, but the running daemon has not loaded it: a change waits for a reload. Restart the daemon, then run the command again.
 cli-user-live-entry-changed = The running daemon's roster changed for users.{ $name } while this command ran, so nothing was written. Run the command again.
+cli-user-live-roster-unread = The running daemon would not show this command its roster ({ $detail }), so users.{ $name } could not be checked there and nothing was written. Run the command as an account the daemon grants config read.
 cli-user-password-unassigned = The password contains a character Unicode does not assign yet, so how it is normalized could change. Choose another character.
 cli-user-env-overrides = Environment overrides change { $paths }, so the roster check would not match { $path }. Unset them and run the command again.
 cli-user-password-stdin-terminal = --password-stdin reads a pipe or a file; typing into a terminal here would show the password. To type it at a hidden prompt, pass --password to add, or leave --password-stdin out of passwd and hash-password.

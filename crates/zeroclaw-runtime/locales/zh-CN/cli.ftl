@@ -199,6 +199,7 @@ cli-user-config-changed = 此命令运行期间 { $path } 已被修改，因此�
 cli-user-live-entry-exists = users.{ $name } 不在 config.toml 中，但正在运行的守护进程仍持有它：有一项更改正在等待重新加载。请重启守护进程，然后重新运行该命令。
 cli-user-live-entry-missing = users.{ $name } 在 config.toml 中，但正在运行的守护进程尚未加载它：有一项更改正在等待重新加载。请重启守护进程，然后重新运行该命令。
 cli-user-live-entry-changed = 此命令运行期间，正在运行的守护进程的用户名册中 users.{ $name } 发生了变化，因此未写入任何内容。请重新运行该命令。
+cli-user-live-roster-unread = 正在运行的守护进程不允许此命令查看其用户名册（{ $detail }），因此无法在那里检查 users.{ $name }，也未写入任何内容。请使用守护进程授予配置读取权限的账户运行该命令。
 cli-user-password-unassigned = 密码包含 Unicode 尚未分配的字符，因此其规范化结果可能会改变。请改用其他字符。
 cli-user-env-overrides = 环境变量修改了 { $paths }，因此用户名册检查与 { $path } 不一致。请取消这些环境变量，然后重新运行该命令。
 cli-user-password-stdin-terminal = --password-stdin 从管道或文件读取；在此处的终端中输入会显示密码。要在隐藏的提示中输入，请在 add 中使用 --password，或在 passwd 和 hash-password 中省略 --password-stdin。

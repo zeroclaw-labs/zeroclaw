@@ -576,21 +576,56 @@ pub(crate) async fn commit_map_key_delete(
     .await
 }
 
-/// The entry names under the map section `section` that the daemon serving
-/// `config` holds live, when a recent heartbeat names a running daemon and it
-/// answers this caller. `None` when no heartbeat names one, or it could not
-/// be asked or refused the read; a commit that follows then reports why.
-/// Unlike a commit, this never probes the ownership lock.
-pub(crate) async fn live_map_keys(config: &Config, section: &str) -> Option<Vec<String>> {
-    let pid = running_daemon(config)?;
-    let params = serde_json::to_value(ConfigMapKeysParams {
+/// What the daemon serving a configuration showed of a map section's entries.
+#[derive(Debug)]
+pub(crate) enum LiveMapKeys {
+    /// No daemon would take an edit from this command: no recent heartbeat
+    /// names one, its endpoint is unreachable or not this configuration's, it
+    /// runs another release, its handshake failed, or it refused this caller
+    /// at the handshake (and off Unix the CLI never sends to it). A commit
+    /// that follows reports why, and reaches no daemon's roster.
+    NoDaemon,
+    /// The entry names the daemon holds.
+    Keys(Vec<String>),
+    /// The daemon bound this caller but did not show the entries: it refused
+    /// or rejected the read, never answered, or answered something else. A
+    /// commit could still reach its roster unseen.
+    Unread { detail: String },
+}
+
+/// The entries under the map section `section` that the daemon serving
+/// `config` holds live, asked of the daemon a recent heartbeat names. Unlike
+/// a commit, this never probes the ownership lock.
+pub(crate) async fn live_map_keys(config: &Config, section: &str) -> LiveMapKeys {
+    let Some(pid) = running_daemon(config) else {
+        return LiveMapKeys::NoDaemon;
+    };
+    let params = match serde_json::to_value(ConfigMapKeysParams {
         path: section.to_owned(),
-    })
-    .ok()?;
-    let answer = send(config, pid, "config/map-keys", params).await.ok()?;
-    serde_json::from_value::<ConfigMapKeysResult>(answer)
-        .ok()
-        .map(|result| result.keys)
+    }) {
+        Ok(params) => params,
+        Err(error) => {
+            return LiveMapKeys::Unread {
+                detail: error.to_string(),
+            };
+        }
+    };
+    match send(config, pid, "config/map-keys", params).await {
+        Ok(answer) => match serde_json::from_value::<ConfigMapKeysResult>(answer) {
+            Ok(result) => LiveMapKeys::Keys(result.keys),
+            Err(error) => LiveMapKeys::Unread {
+                detail: error.to_string(),
+            },
+        },
+        #[cfg(unix)]
+        Err(
+            DaemonCallError::RequestRefused { message, .. }
+            | DaemonCallError::Rejected { message, .. },
+        ) => LiveMapKeys::Unread { detail: message },
+        #[cfg(unix)]
+        Err(DaemonCallError::NoAnswer { detail }) => LiveMapKeys::Unread { detail },
+        Err(_) => LiveMapKeys::NoDaemon,
+    }
 }
 
 /// The property a notice that a batch's outcome is unknown points at. The
@@ -1635,7 +1670,10 @@ mod tests {
             "{publication:?}"
         );
         assert!(
-            live_map_keys(&with_bob, "users").await.is_none(),
+            matches!(
+                live_map_keys(&with_bob, "users").await,
+                LiveMapKeys::NoDaemon
+            ),
             "no heartbeat names a daemon to ask"
         );
     }

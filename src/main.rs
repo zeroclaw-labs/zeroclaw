@@ -16056,8 +16056,10 @@ impl RosterEdit {
     /// pending waits for a reload. Asked before any password is typed, and
     /// again by `save` just before the commit, since another writer can
     /// change the daemon's roster while the prompt is open. With no daemon
-    /// running, or one that cannot be asked, there is nothing to compare, and
-    /// the commit reports what became of the edit.
+    /// that would take the edit, there is nothing to compare, and the commit
+    /// reports what became of the edit. A daemon that binds this caller but
+    /// will not show it the roster could still take the commit unseen, so the
+    /// edit refuses.
     async fn refuse_if_the_daemon_disagrees(&mut self, name: &str, in_file: bool) -> Result<()> {
         self.daemon_premise = Some((name.to_owned(), in_file));
         Box::pin(self.check_daemon_premise(false)).await
@@ -16070,9 +16072,16 @@ impl RosterEdit {
         let Some((name, in_file)) = &self.daemon_premise else {
             return Ok(());
         };
-        let Some(live) = Box::pin(config_publication::live_map_keys(&self.config, "users")).await
-        else {
-            return Ok(());
+        let live = match Box::pin(config_publication::live_map_keys(&self.config, "users")).await {
+            config_publication::LiveMapKeys::NoDaemon => return Ok(()),
+            config_publication::LiveMapKeys::Keys(keys) => keys,
+            config_publication::LiveMapKeys::Unread { detail } => bail!(ta(
+                "cli-user-live-roster-unread",
+                &[("name", name), ("detail", &detail)],
+                format!(
+                    "The running daemon would not show this command its roster ({detail}), so users.{name} could not be checked there and nothing was written. Run the command as an account the daemon grants config read."
+                ),
+            )),
         };
         let live_has_it = live.iter().any(|key| key == name);
         if live_has_it == *in_file {
@@ -19363,6 +19372,58 @@ mod tests {
         });
         std::fs::write(heartbeat, state.to_string()).expect("the state file is writable");
         cancel.drop_guard()
+    }
+
+    /// A daemon that binds this caller but will not show it the roster, as for
+    /// a principal granted config `update` without `read`, could still take a
+    /// commit the roster check never saw, so the edit refuses.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[tokio::test]
+    async fn roster_edit_refuses_when_the_daemon_will_not_show_its_roster() {
+        let dir = tempfile::Builder::new()
+            .prefix("zc")
+            .tempdir_in("/tmp")
+            .expect("a scratch directory under /tmp");
+        let mut config = Config {
+            data_dir: dir.path().to_path_buf(),
+            config_path: dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.security.trust_daemon_uid = false;
+        let mut writer = zeroclaw_config::schema::PermissionProfileConfig::default();
+        writer.grants.insert(
+            zeroclaw_api::grants::Resource::Config,
+            vec![zeroclaw_api::grants::Verb::Update],
+        );
+        writer.config_write_paths = vec!["users.*".into()];
+        config.permission_profiles.insert("writer".into(), writer);
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let own_uid = unsafe { libc::geteuid() };
+        config.users.insert(
+            "me".into(),
+            zeroclaw_config::schema::UserConfig {
+                principal_id: None,
+                uid: Some(own_uid),
+                password_hash: None,
+                permission_profiles: vec!["writer".into()],
+            },
+        );
+        std::fs::write(
+            &config.config_path,
+            format!(
+                "schema_version = {}\n",
+                zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .expect("write config");
+        let _daemon = serve_roster_daemon(&config).await;
+
+        let mut edit = RosterEdit::begin(&config).expect("begin an edit");
+        let refused = Box::pin(edit.refuse_if_the_daemon_disagrees("bob", false)).await;
+        let message = refused
+            .expect_err("an edit whose roster could not be read must not go ahead")
+            .to_string();
+        assert!(message.contains("users.bob"), "{message}");
     }
 
     /// The daemon's roster is checked before the password prompt, and
