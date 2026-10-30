@@ -25,6 +25,7 @@ mod direct_cli_terminal_completion;
 mod dockerignore_test;
 #[cfg(feature = "gateway")]
 mod gateway;
+mod gateway_get_paircode_cli;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
 mod oidc_enrollment_cli;
