@@ -33,7 +33,15 @@ pub fn bounded_pool_cap(final_limit: usize, candidate_pool_cap: usize) -> usize 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RerankStrategy {
     None,
-    Mmr { lambda: f64 },
+    Mmr {
+        lambda: f64,
+    },
+    /// Order the prepared pool by an operator-configured rerank endpoint.
+    /// The call is async, so it runs in
+    /// [`ExternalRerankSettings::rerank_pool`](crate::ExternalRerankSettings::rerank_pool):
+    /// [`run`] treats this strategy as [`RerankStrategy::None`], which is
+    /// exactly the result that path falls back to when the endpoint fails.
+    External,
 }
 
 /// Rerank stage configuration, materialized from canonical memory config.
@@ -74,6 +82,81 @@ impl RerankConfig {
 /// cannot shadow an eligible fact with the same content, and before the final
 /// trim so it cannot consume a selection slot.
 pub fn run(
+    pool: Vec<MemoryEntry>,
+    config: &RerankConfig,
+    is_eligible: impl Fn(&MemoryEntry) -> bool,
+) -> Vec<MemoryEntry> {
+    let mut candidates = prepare_candidates(pool, config, is_eligible);
+
+    if candidates.len() >= config.threshold {
+        candidates = match config.strategy {
+            RerankStrategy::None | RerankStrategy::External => candidates,
+            RerankStrategy::Mmr { lambda } => mmr_rerank(candidates, lambda),
+        };
+    }
+
+    apply_floor(&mut candidates, config);
+    finish(candidates, config)
+}
+
+/// The deterministic half of the external path: everything [`run`] does
+/// before its advanced strategy, then the relevance floor. Candidates below
+/// `min_relevance_score` are dropped here, so they are never sent to the
+/// endpoint. `finish` on this result is exactly what [`run`] returns for the
+/// `None` strategy, which is the fallback when the endpoint fails.
+pub(crate) fn prepare_for_external(
+    pool: Vec<MemoryEntry>,
+    config: &RerankConfig,
+    is_eligible: impl Fn(&MemoryEntry) -> bool,
+) -> Vec<MemoryEntry> {
+    let mut candidates = prepare_candidates(pool, config, is_eligible);
+    apply_floor(&mut candidates, config);
+    candidates
+}
+
+/// Reorder the head of `candidates` that was sent to the endpoint. `order`
+/// lists positions within that head, most relevant first, as validated by
+/// the caller (in range, no repeats). Head entries the order leaves out
+/// follow in their prepared order, and the unsent tail keeps its order after
+/// them. Scores are left untouched.
+#[must_use]
+pub(crate) fn apply_external_order(
+    candidates: Vec<MemoryEntry>,
+    sent: usize,
+    order: &[usize],
+) -> Vec<MemoryEntry> {
+    let sent = sent.min(candidates.len());
+    let mut slots: Vec<Option<MemoryEntry>> = candidates.into_iter().map(Some).collect();
+    let mut reordered = Vec::with_capacity(slots.len());
+    for &index in order {
+        if index < sent
+            && let Some(entry) = slots[index].take()
+        {
+            reordered.push(entry);
+        }
+    }
+    reordered.extend(slots.into_iter().flatten());
+    reordered
+}
+
+/// Trim a prepared or reordered pool to the configured final limit.
+#[must_use]
+pub(crate) fn finish(mut candidates: Vec<MemoryEntry>, config: &RerankConfig) -> Vec<MemoryEntry> {
+    candidates.truncate(bounded_final_limit(config.final_limit));
+    candidates
+}
+
+fn apply_floor(candidates: &mut Vec<MemoryEntry>, config: &RerankConfig) {
+    candidates.retain(|entry| {
+        entry
+            .score
+            .is_none_or(|score| score >= config.min_relevance_score)
+    });
+}
+
+/// Pool bound, blend, eligibility, duplicate collapse and sort: the part of
+/// the stage every strategy shares.
+fn prepare_candidates(
     mut pool: Vec<MemoryEntry>,
     config: &RerankConfig,
     is_eligible: impl Fn(&MemoryEntry) -> bool,
@@ -82,7 +165,6 @@ pub fn run(
     // limit and returns its whole list, never scan more than the configured
     // cap, itself held under an absolute ceiling. Applied to the raw pool in
     // backend order so a scoreless time-only recall keeps its newest-first head.
-    let final_limit = bounded_final_limit(config.final_limit);
     let pool_cap = bounded_pool_cap(config.final_limit, config.candidate_pool_cap);
     if pool.len() > pool_cap {
         pool.truncate(pool_cap);
@@ -110,20 +192,6 @@ pub fn run(
     pool.retain(|entry| is_eligible(entry));
     let mut candidates = collapse_exact_and_near_duplicates(pool, DEFAULT_NEAR_DUPLICATE_THRESHOLD);
     sort_by_score(&mut candidates);
-
-    if candidates.len() >= config.threshold {
-        candidates = match config.strategy {
-            RerankStrategy::None => candidates,
-            RerankStrategy::Mmr { lambda } => mmr_rerank(candidates, lambda),
-        };
-    }
-
-    candidates.retain(|entry| {
-        entry
-            .score
-            .is_none_or(|score| score >= config.min_relevance_score)
-    });
-    candidates.truncate(final_limit);
     candidates
 }
 
@@ -596,5 +664,113 @@ mod tests {
         assert_eq!(results[0].key, "leader");
         assert_eq!(results[1].key, "mid");
         assert_eq!(results[2].key, "tail");
+    }
+
+    fn keys(entries: &[MemoryEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.key.as_str()).collect()
+    }
+
+    fn external_pool() -> Vec<MemoryEntry> {
+        vec![
+            entry("a", "alpha project budget", 0.9, 0.0),
+            entry("b", "bravo supplier invoice", 0.8, 0.0),
+            entry("c", "charlie travel booking", 0.7, 0.0),
+            entry("d", "delta webinar speakers", 0.6, 0.0),
+            entry("e", "echo garden irrigation", 0.2, 0.0),
+        ]
+    }
+
+    #[test]
+    fn external_strategy_runs_as_none_inside_run() {
+        let mut external = config(RerankStrategy::External);
+        external.min_relevance_score = 0.3;
+        external.final_limit = 3;
+        let mut none = external;
+        none.strategy = RerankStrategy::None;
+
+        assert_eq!(
+            keys(&run(external_pool(), &external, all_eligible)),
+            keys(&run(external_pool(), &none, all_eligible))
+        );
+    }
+
+    /// The external path's fallback is `finish(prepare_for_external(..))`; it
+    /// must be the block the `None` strategy produces, entry for entry.
+    #[test]
+    fn prepared_pool_finished_equals_the_none_strategy() {
+        let mut cfg = config(RerankStrategy::External);
+        cfg.min_relevance_score = 0.3;
+        cfg.final_limit = 3;
+        let mut none = cfg;
+        none.strategy = RerankStrategy::None;
+        let eligible = |entry: &MemoryEntry| entry.key != "b";
+
+        let fallback = finish(prepare_for_external(external_pool(), &cfg, eligible), &cfg);
+        let local = run(external_pool(), &none, eligible);
+
+        assert_eq!(keys(&fallback), keys(&local));
+        let scores = |entries: &[MemoryEntry]| entries.iter().map(|e| e.score).collect::<Vec<_>>();
+        assert_eq!(scores(&fallback), scores(&local));
+    }
+
+    #[test]
+    fn prepare_for_external_applies_the_floor_and_eligibility_before_sending() {
+        let mut cfg = config(RerankStrategy::External);
+        cfg.min_relevance_score = 0.3;
+        let prepared = prepare_for_external(external_pool(), &cfg, |entry| entry.key != "c");
+
+        assert_eq!(keys(&prepared), vec!["a", "b", "d"]);
+    }
+
+    #[test]
+    fn external_order_reorders_the_sent_head_and_keeps_the_tail() {
+        let prepared = prepare_for_external(
+            external_pool(),
+            &config(RerankStrategy::External),
+            all_eligible,
+        );
+        let reordered = apply_external_order(prepared, 3, &[2, 0, 1]);
+
+        assert_eq!(keys(&reordered), vec!["c", "a", "b", "d", "e"]);
+    }
+
+    #[test]
+    fn external_order_keeps_unranked_head_entries_after_the_ranked_ones() {
+        let prepared = prepare_for_external(
+            external_pool(),
+            &config(RerankStrategy::External),
+            all_eligible,
+        );
+        let reordered = apply_external_order(prepared, 4, &[3, 1]);
+
+        assert_eq!(keys(&reordered), vec!["d", "b", "a", "c", "e"]);
+    }
+
+    #[test]
+    fn external_order_leaves_scores_untouched() {
+        let prepared = prepare_for_external(
+            external_pool(),
+            &config(RerankStrategy::External),
+            all_eligible,
+        );
+        let before: std::collections::HashMap<String, Option<f64>> = prepared
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.score))
+            .collect();
+        let reordered = apply_external_order(prepared, 5, &[4, 3, 2, 1, 0]);
+
+        for entry in &reordered {
+            assert_eq!(before[&entry.key], entry.score, "{}", entry.key);
+        }
+    }
+
+    #[test]
+    fn finish_trims_after_the_external_order() {
+        let mut cfg = config(RerankStrategy::External);
+        cfg.final_limit = 2;
+        let prepared = prepare_for_external(external_pool(), &cfg, all_eligible);
+        let selected = finish(apply_external_order(prepared, 5, &[4, 3, 2, 1, 0]), &cfg);
+
+        assert_eq!(keys(&selected), vec!["e", "d"]);
     }
 }
