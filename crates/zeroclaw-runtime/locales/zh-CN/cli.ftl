@@ -1040,6 +1040,7 @@ cli-config-review-hint = 运行 `zeroclaw config list` 进行查看，然后设�
 cli-config-catalog-unavailable-manual = {"  "}⚠ 无法使用 {$provider} 的模型目录（{$error}）；请手动输入模型 ID。
 model-switch-catalog-failed = 无法加载已配置提供商配置文件 {$provider} 的模型目录：{$error}
 model-switch-provider-not-allowed = 当前按工作量路由策略不允许切换到提供商 {$provider}。
+skill-tool-target-excluded = 此轮无法使用该工具：{$tool} 会运行 {$target}，而此频道已排除 {$target}。
 cli-config-backed-up = 已备份至 {$path}
 cli-plugin-name-version = 插件：{$name} v{$version}
 cli-plugin-description = 描述：{$desc}

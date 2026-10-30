@@ -42,7 +42,7 @@ This is appropriate for trusted local dev, CI, or SOPs that need to run end-to-e
 
 ## Per-tool overrides
 
-`auto_approve`, `always_ask`, and `excluded_tools` live as flat lists of tool names on the risk profile (not nested tables). `always_ask` outranks Full autonomy, `auto_approve`, and a session-level "Always" grant: a listed tool (or `"*"`) still prompts. `excluded_tools` is also available per-channel (`channels.<type>.<alias>.excluded_tools`) to hide tools from specific surfaces without changing the profile.
+`auto_approve`, `always_ask`, and `excluded_tools` live as flat lists of tool names on the risk profile (not nested tables). `always_ask` outranks Full autonomy, `auto_approve`, and a session-level "Always" grant: a listed tool (or `"*"`) still prompts. `excluded_tools` is also available per-channel (`channels.<type>.<alias>.excluded_tools`) to hide tools from specific surfaces without changing the profile. The per-channel list adds to the profile's and, unlike the profile's, still applies under Full autonomy. It also follows the work a turn starts: a delegate or sub-agent launched from that channel cannot use the excluded tools either. Work the restriction cannot follow (cron and scheduled jobs, SOP steps, peer and A2A messages, external agent CLIs, `execute_pipeline`) is refused on a channel that sets `excluded_tools`, unless `[channels] restricted_channels_allow_detached_work = true`.
 
 ## Cross-channel approval routing
 

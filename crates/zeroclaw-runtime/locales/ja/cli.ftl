@@ -1039,6 +1039,7 @@ cli-config-review-hint = `zeroclaw config list` を実行して確認し、必�
 cli-config-catalog-unavailable-manual = {"  "}⚠ {$provider} のカタログを利用できません（{$error}）。モデル ID を手動で入力してください。
 model-switch-catalog-failed = 設定済みプロバイダープロファイル {$provider} のカタログを読み込めませんでした: {$error}
 model-switch-provider-not-allowed = 有効なエフォートルーティングポリシーでは、{$provider} へのモデル切り替えは許可されていません。
+skill-tool-target-excluded = このターンではツールを使用できません: {$tool} は {$target} を実行しますが、このチャネルでは {$target} が除外されています。
 cli-config-backed-up = {$path} にバックアップしました
 cli-plugin-name-version = プラグイン: {$name} v{$version}
 cli-plugin-description = 説明: {$desc}

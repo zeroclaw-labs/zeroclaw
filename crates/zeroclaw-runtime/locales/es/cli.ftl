@@ -1041,6 +1041,7 @@ cli-config-review-hint = Ejecuta `zeroclaw config list` para revisar y luego est
 cli-config-catalog-unavailable-manual = {"  "}⚠ El catálogo de {$provider} no está disponible ({$error}); introduce manualmente el ID del modelo.
 model-switch-catalog-failed = No se pudo cargar el catálogo del perfil de proveedor configurado {$provider}: {$error}
 model-switch-provider-not-allowed = La política activa de enrutamiento por esfuerzo no permite cambiar al proveedor {$provider}.
+skill-tool-target-excluded = Herramienta no disponible en este turno: {$tool} ejecuta {$target}, que este canal excluye.
 cli-config-backed-up = Copia de seguridad en {$path}
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Descripción: {$desc}
