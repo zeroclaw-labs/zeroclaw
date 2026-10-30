@@ -52,6 +52,15 @@ FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_RUST_SLIM} AS builder
 
 WORKDIR /app
 ARG TARGETARCH
+# The `release` cargo profile's LTO mode and codegen-unit count, overridable per
+# build. The defaults reproduce the committed `[profile.release]` exactly, so a
+# build that passes neither build arg is byte-for-byte the previous behaviour.
+# The dist-broad tag overrides them to thin LTO because fat LTO exceeds the arm64
+# runner memory while linking zeroclaw (rustc is SIGKILLed at ~16 GB).
+ARG ZEROCLAW_RELEASE_LTO="fat"
+ARG ZEROCLAW_RELEASE_CODEGEN_UNITS="1"
+ENV CARGO_PROFILE_RELEASE_LTO=${ZEROCLAW_RELEASE_LTO} \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${ZEROCLAW_RELEASE_CODEGEN_UNITS}
 # >>> generated:docker-features-arg by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,plugins-wasm-cranelift,schema-export,tool-claude-code,tool-claude-code-runner,tool-codex-cli,tool-composio,tool-gemini-cli,tool-google-workspace,tool-jira,tool-linkedin,tool-microsoft365,tool-notion,tool-opencode-cli,tool-project-intel,tools-external,whatsapp-web"
 # >>> end generated:docker-features-arg <<<
