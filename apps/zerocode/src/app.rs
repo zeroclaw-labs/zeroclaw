@@ -1232,6 +1232,25 @@ where
     Ok((input_event, PostPollDispatchState::new(connection_state())))
 }
 
+/// Drop type-ahead only after the new Config dialog has reached the terminal.
+/// The decoder can hold both complete events and an unfinished mouse sequence,
+/// independently of the events still buffered by crossterm.
+fn discard_buffered_input<P, R>(
+    input_decoder: &mut SgrMouseEventDecoder,
+    mut poll: P,
+    mut read: R,
+) -> Result<()>
+where
+    P: FnMut(Duration) -> Result<bool>,
+    R: FnMut() -> Result<Event>,
+{
+    *input_decoder = SgrMouseEventDecoder::default();
+    while poll(Duration::ZERO)? {
+        read()?;
+    }
+    Ok(())
+}
+
 /// Wait up to `timeout` for terminal input, returning early (as a timeout)
 /// once transport events are pending so the loop redraws them.
 ///
@@ -1916,6 +1935,7 @@ pub async fn run(
                             chat_pane.commit_reconnect_handoff();
                             acp_pane.commit_reconnect_handoff();
                             let previous_flushed = inbound_router.cancel_pending().await;
+                            config_app.hand_off_mutation_outcome(&mut panes.1);
                             // Assigned as one tuple: every pane the builder
                             // produces is adopted, and a later pane addition
                             // cannot stay bound to the old client silently.
@@ -2141,6 +2161,21 @@ pub async fn run(
             }
         })?;
 
+        if mode == Mode::Config
+            && help_overlay.is_none()
+            && !reload_confirm
+            && !quit_confirm
+            && !sidebar.picker_open()
+        {
+            config_app.arm_mutation_dialog_after_draw(|| {
+                discard_buffered_input(
+                    &mut input_decoder,
+                    |timeout| Ok(event::poll(timeout)?),
+                    || Ok(event::read()?),
+                )
+            })?;
+        }
+
         // Restore the base palette so the override never leaks into the next
         // frame, a different pane, or live theme changes from the Config pane.
         if frame_theme.is_some() {
@@ -2354,6 +2389,31 @@ pub async fn run(
         if confirmation_modal_owns_event(&input_event, reload_confirm, quit_confirm) {
             // The visible confirmation modal is the authoritative input
             // owner; discard paste instead of forwarding it underneath.
+            continue;
+        }
+
+        // Config confirmation owns input before global pane/sidebar navigation.
+        // Paste cannot fall through and edit or confirm the underlying row.
+        if mode == Mode::Config
+            && config_app.has_mutation_dialog()
+            && matches!(
+                input_event,
+                Event::Key(_) | Event::Mouse(_) | Event::Paste(_)
+            )
+        {
+            if dispatch_state.rpc_allowed() || !config_app.has_pending_mutation() {
+                match input_event {
+                    Event::Key(key) => {
+                        config_app.handle_key(key, term).await?;
+                    }
+                    Event::Mouse(mouse) => {
+                        config_app.handle_mouse(mouse, content_area, term).await?;
+                    }
+                    _ => {}
+                }
+            } else {
+                config_app.cancel_mutation_dialog();
+            }
             continue;
         }
 
@@ -4677,6 +4737,55 @@ mod tests {
 
     fn key_event(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn config_dialog_input_barrier_discards_decoder_and_terminal_type_ahead() {
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(key_event(KeyCode::Esc));
+        decoder.feed(key_event(KeyCode::Char('[')));
+        decoder.push_front(key_event(KeyCode::Enter));
+        assert!(!decoder.candidate.is_empty());
+        assert!(decoder.candidate_started_at.is_some());
+        let queued = std::cell::RefCell::new(VecDeque::from([
+            key_event(KeyCode::Enter),
+            Event::Paste("buffered paste".into()),
+            Event::Resize(80, 24),
+        ]));
+        discard_buffered_input(
+            &mut decoder,
+            |timeout| {
+                assert_eq!(timeout, Duration::ZERO);
+                Ok(!queued.borrow().is_empty())
+            },
+            || Ok(queued.borrow_mut().pop_front().unwrap()),
+        )
+        .unwrap();
+        assert!(queued.borrow().is_empty());
+        assert_eq!(decoder.next(), None);
+        assert!(decoder.candidate.is_empty());
+        assert!(decoder.candidate_started_at.is_none());
+
+        // Input arriving after the barrier is available for deliberate action.
+        decoder.feed(key_event(KeyCode::Enter));
+        assert_eq!(decoder.next(), Some(key_event(KeyCode::Enter)));
+    }
+
+    #[test]
+    fn config_dialog_input_barrier_propagates_poll_and_read_errors() {
+        let mut decoder = SgrMouseEventDecoder::default();
+        let error = discard_buffered_input(
+            &mut decoder,
+            |_| anyhow::bail!("poll failed"),
+            || panic!("must not read after a failed poll"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "poll failed");
+
+        let error =
+            discard_buffered_input(&mut decoder, |_| Ok(true), || anyhow::bail!("read failed"))
+                .unwrap_err();
+        assert_eq!(error.to_string(), "read failed");
     }
 
     fn decode_sgr_sequence(sequence: &str) -> Vec<Event> {
