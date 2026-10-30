@@ -716,6 +716,13 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         false
     }
 
+    /// Whether this model's reachable routes honor `TOOL_CHOICE_OVERRIDE = "any"`
+    /// with one native tool and no native thinking. Schema compatibility still
+    /// needs to be established by the caller for its tool contract.
+    fn supports_forced_tool_choice(&self, _model: &str) -> bool {
+        false
+    }
+
     /// Explicit per-request policy. Unsupported adapters retain their batch path.
     async fn chat_with_tool_round_policy(
         &self,
@@ -1019,6 +1026,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 /// boilerplate in test and production code.
 #[async_trait]
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
+    fn supports_forced_tool_choice(&self, model: &str) -> bool {
+        self.as_ref().supports_forced_tool_choice(model)
+    }
+
     fn supports_single_tool_rounds(&self, model: &str) -> bool {
         self.as_ref().supports_single_tool_rounds(model)
     }

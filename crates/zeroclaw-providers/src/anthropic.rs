@@ -2837,6 +2837,10 @@ impl AnthropicModelProvider {
 
 #[async_trait]
 impl ModelProvider for AnthropicModelProvider {
+    fn supports_forced_tool_choice(&self, model: &str) -> bool {
+        self.single_tool_rounds_supported && self.server_fallbacks_for(model, None).is_none()
+    }
+
     fn supports_single_tool_rounds(&self, _model: &str) -> bool {
         self.single_tool_rounds_supported
     }

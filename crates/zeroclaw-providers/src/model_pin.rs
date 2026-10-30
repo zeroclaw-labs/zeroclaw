@@ -77,6 +77,10 @@ impl ModelPinnedProvider {
 
 #[async_trait]
 impl ModelProvider for ModelPinnedProvider {
+    fn supports_forced_tool_choice(&self, _model: &str) -> bool {
+        self.inner.supports_forced_tool_choice(&self.pinned_model)
+    }
+
     fn supports_exact_request_replay(&self, request: ChatRequest<'_>, _model: &str) -> bool {
         self.inner
             .supports_exact_request_replay(request, &self.pinned_model)
@@ -325,6 +329,9 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ModelAwareCapabilityProvider {
+        fn supports_forced_tool_choice(&self, model: &str) -> bool {
+            model == "pinned-model"
+        }
         fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
             model == "pinned-model" && request.tools.is_none()
         }
@@ -361,6 +368,8 @@ mod tests {
             .pinned_model("pinned-model")
             .inner(Box::new(ModelAwareCapabilityProvider))
             .build();
+
+        assert!(provider.supports_forced_tool_choice("ignored-request-model"));
 
         assert!(
             provider

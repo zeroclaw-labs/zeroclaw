@@ -647,6 +647,13 @@ impl ModelProvider for RouterModelProvider {
             .supports_single_tool_rounds(&resolved_model)
     }
 
+    fn supports_forced_tool_choice(&self, model: &str) -> bool {
+        let (index, resolved_model) = self.resolve(model);
+        self.model_providers[index]
+            .1
+            .supports_forced_tool_choice(&resolved_model)
+    }
+
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
         // Mirror `supports_vision()`'s delegation to the default provider so the
         // wrapped surface's `capabilities().vision` stays consistent with
@@ -770,6 +777,9 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for MockModelProvider {
+        fn supports_forced_tool_choice(&self, model: &str) -> bool {
+            self.vision && model == "replay-model"
+        }
         fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
             self.vision && model == "replay-model" && request.tools.is_none()
         }
@@ -1215,8 +1225,10 @@ mod tests {
             thinking: None,
         };
         assert!(router.supports_exact_request_replay(request, "hint:safe"));
+        assert!(router.supports_forced_tool_choice("hint:safe"));
         for model in ["hint:unsafe", "hint:unknown", "replay-model"] {
             assert!(!router.supports_exact_request_replay(request, model));
+            assert!(!router.supports_forced_tool_choice(model));
         }
         assert!(!router.supports_exact_request_replay(
             ChatRequest {

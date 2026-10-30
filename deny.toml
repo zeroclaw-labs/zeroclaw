@@ -36,6 +36,11 @@ allow = [
 ]
 unused-allowed-license = "allow"
 
+# Limit this validator dependency's license allowance to the reviewed version.
+[[licenses.exceptions]]
+crate = "borrow-or-share@0.2.4"
+allow = ["MIT-0"]
+
 [bans]
 # Reject multiple versions of the same crate in the resolved dependency graph.
 # This prevents silent version splits that inflate compile times, binary size,
