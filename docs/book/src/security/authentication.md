@@ -23,7 +23,8 @@ importantly, what changes for existing remote connections.
    carries the credential itself, and `cert/renew` is authenticated by the
    mutual-TLS client certificate that presents it, not by a principal.
    Fine-grained selectors compose on top:
-   - config writes check `config_write_paths`;
+   - config writes check `config_write_paths`, for every entry a rename or
+     delete cascade rewrites as well as the one named;
    - `plugin-webhook/dispatch` and `plugin-webhook/routes` check the
      channel selector `allowed_channels` against the route's channel
      instance;
