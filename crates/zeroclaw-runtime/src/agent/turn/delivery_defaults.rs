@@ -346,6 +346,19 @@ mod tests {
     }
 
     #[test]
+    fn originating_channel_tools_are_inventoried() {
+        let missing: Vec<&str> = super::ORIGINATING_CHANNEL_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !zeroclaw_tools::inventory::is_builtin_tool_name(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "ORIGINATING_CHANNEL_TOOLS names tools missing from the built-in inventory: {missing:?}"
+        );
+    }
+
+    #[test]
     fn poll_and_escalate_also_get_originating_channel() {
         for tool in ["poll", "escalate_to_human"] {
             let mut args = serde_json::json!({ "question": "q" });

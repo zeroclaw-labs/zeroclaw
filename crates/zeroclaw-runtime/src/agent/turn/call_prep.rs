@@ -237,8 +237,13 @@ pub(crate) async fn prepare_tool_calls(
             .unwrap_or(false);
         let reentrant_agent_tool =
             crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
+        // Signature this call holds in the turn-scoped guard while its
+        // approval is pending. It is released once the operator approves, so
+        // an identical rerun later in the turn asks again instead of aborting.
+        let mut pending_prompt_signature: Option<(String, String)> = None;
         if requires_prompt && tool_name == "shell" && !reentrant_agent_tool {
             let prompt_signature = tool_call_signature(&tool_name, &tool_args);
+            pending_prompt_signature = Some(prompt_signature.clone());
             if !prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone()) {
                 let duplicate =
                     record_duplicate_tool_call(ctx, &tool_name, &tool_args, iteration).await;
@@ -321,6 +326,16 @@ pub(crate) async fn prepare_tool_calls(
                     return Err(ToolLoopCancelled.into());
                 }
             };
+        // An approved call is not an approval loop: drop its signature from
+        // the turn-scoped guard so a later identical call (a rerun the user
+        // asked for, a re-check after an edit) gets a fresh approval prompt.
+        // A denied or unanswered call keeps its signature, so repeating it
+        // still aborts the turn before the operator is asked again. The
+        // same-round set keeps its entry, so an identical call in this same
+        // batch is still deduplicated instead of prompting twice.
+        if approved && let Some(signature) = pending_prompt_signature.as_ref() {
+            prompt_approval_tool_signatures.remove(signature);
+        }
         let runtime_command_approved = approved
             && ctx
                 .approval

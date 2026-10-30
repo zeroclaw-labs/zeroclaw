@@ -58,4 +58,21 @@ if bash "$script" pull_request >/dev/null 2>&1; then
   exit 1
 fi
 
+# A pull request runs on GitHub's test merge, and its event base is the merge
+# base. A bump the base branch gained after the branch forked is not this
+# pull request's change; a bump the pull request makes on top of it is.
+fork="$(commit 2.0.0)"
+bumped="$(commit 2.0.1)"
+git checkout -q -b feature "$fork"
+commit 2.0.0 "# feature edit" >/dev/null
+git checkout -q --detach "$bumped"
+git merge -q --no-ff --no-edit feature
+expect "run=false" pull_request "$fork"
+
+git checkout -q -b release "$bumped"
+commit 2.0.2 >/dev/null
+git checkout -q --detach "$bumped"
+git merge -q --no-ff --no-edit release
+expect $'run=true\ntag=v2.0.2' pull_request "$bumped"
+
 echo "crates_preflight_trigger: ok"

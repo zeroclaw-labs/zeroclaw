@@ -65,4 +65,47 @@ expect_failure not-a-number "$outdated_json"
 rendered="$(bash "$classifier" render "$outdated_json")"
 grep -F $'zeroclaw\tserde\t1.0.0\t1.0.1\t1.1.0\tNormal\t---' <<< "$rendered" >/dev/null
 
+python3 - "$classifier" "$fixture_dir" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+classifier, fixture_dir = sys.argv[1:]
+run_url = "https://example.test/actions/runs/1"
+artifact_url = "https://example.test/actions/runs/1/artifacts/1"
+reports = {
+    "short": "Workspace crate\tDependency\nzeroclaw\tserde\n",
+    "ascii": "zeroclaw\tdependency\t1.0.0\t1.0.1\t2.0.0\tNormal\t---\n" * 400,
+    "unicode": ("\U0001f980" * 40 + "\n") * 400,
+}
+
+for name, report in reports.items():
+    report_file = Path(fixture_dir) / f"{name}-report.txt"
+    report_file.write_text(report, encoding="utf-8")
+    body_bytes = subprocess.check_output(
+        ["bash", classifier, "issue-body", str(report_file), run_url, artifact_url]
+    )
+    body = body_bytes.decode("utf-8")
+    assert len(body_bytes) < 60000, f"{name}: body exceeds byte budget"
+    assert f"Workflow run: {run_url}" in body, f"{name}: missing run URL"
+    assert f"[Download the complete scan report]({artifact_url})" in body, f"{name}: missing artifact link"
+    preview = body.split("```\n", 1)[1].split("\n```", 1)[0]
+    if name == "short":
+        assert preview == report, "short: report changed"
+        assert "The preview is truncated." not in body, "short: unexpected truncation"
+    else:
+        assert "The preview is truncated." in body, f"{name}: missing truncation notice"
+        assert 0 < len(preview) <= 12000, f"{name}: invalid preview length"
+        assert len(preview) < len(report), f"{name}: report was not truncated"
+        assert report.startswith(preview), f"{name}: preview is not an intact report prefix"
+        assert preview.endswith("\n"), f"{name}: preview ends with a partial line"
+
+over_budget = subprocess.run(
+    ["bash", classifier, "issue-body", str(report_file), "x" * 60000, artifact_url],
+    capture_output=True,
+)
+assert over_budget.returncode != 0, "oversized metadata: expected formatter failure"
+assert b"issue body exceeds the reporting budget" in over_budget.stderr, "oversized metadata: wrong failure"
+PY
+
 echo "monthly outdated result tests passed"

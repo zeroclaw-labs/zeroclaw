@@ -1721,11 +1721,13 @@ mod tests {
         let listener = listen_at_the_endpoint(&config);
         let staged = with_trust_flipped(&config);
         let value = staged.security.trust_daemon_uid.to_string();
-        let lock = config
-            .data_dir
-            .join("config-lifecycle.lock")
-            .display()
-            .to_string();
+        // The lock's path as the probe reports it: a second acquire conflicts
+        // with the one this test holds.
+        let lock = match ConfigOwnershipGuard::acquire(&config.data_dir) {
+            Err(ConfigOwnershipError::AlreadyOwned { path }) => path.display().to_string(),
+            Err(error) => panic!("a second acquire must report the held lock: {error}"),
+            Ok(_) => panic!("a second acquire must not take the lock this test holds"),
+        };
         let unconfirmed = |publication: &Publication| {
             matches!(
                 publication,

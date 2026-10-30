@@ -796,6 +796,10 @@ fn terminal_status_for_connection<'a>(
 
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
+/// Slice of the input wait between checks for pending transport events.
+/// Bounds live-update latency and the redraw rate (~60 fps) while sessions
+/// stream, without spinning when nothing arrives.
+const TRANSPORT_WAKE_SLICE: Duration = Duration::from_millis(16);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
 const ELICITATION_ROUTE_GRACE: Duration = Duration::from_secs(2);
@@ -1228,6 +1232,33 @@ where
     Ok((input_event, PostPollDispatchState::new(connection_state())))
 }
 
+/// Wait up to `timeout` for terminal input, returning early (as a timeout)
+/// once transport events are pending so the loop redraws them.
+///
+/// Input is always polled for at least one slice first: events that arrived
+/// during the previous draw must not make the loop redraw back-to-back.
+fn poll_input_or_transport<P, T>(
+    timeout: Duration,
+    slice: Duration,
+    mut poll: P,
+    mut transport_pending: T,
+) -> Result<bool>
+where
+    P: FnMut(Duration) -> Result<bool>,
+    T: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if poll(remaining.min(slice))? {
+            return Ok(true);
+        }
+        if remaining <= slice || transport_pending() {
+            return Ok(false);
+        }
+    }
+}
+
 /// Ephemeral interaction state for the keybinding overlay. Keybinding
 /// metadata itself stays in the action/help registry and is resolved on draw.
 #[derive(Debug, Default)]
@@ -1434,9 +1465,8 @@ impl ChromeStatus {
                 if let Some(status) = snapshot.status {
                     self.status = Some(status);
                 }
-                if let Some(health) = snapshot.health {
-                    self.health = Some(health);
-                }
+                // A failed poll must not keep an old healthy result visible.
+                self.health = snapshot.health;
                 self.refresh_in_flight = false;
                 self.refresh_rx = None;
             }
@@ -1930,6 +1960,10 @@ pub async fn run(
     }
 
     loop {
+        // Synchronous terminal polls and ready RPC futures can keep this loop
+        // running without yielding to the outer shutdown-signal selector.
+        tokio::task::yield_now().await;
+
         // Draw
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
@@ -1941,6 +1975,9 @@ pub async fn run(
             chrome_status.tick(&rpc);
             sidebar.drain_picker_fetch();
         }
+        config_app.tick_application_status(
+            mode == Mode::Config && !matches!(conn_state, ConnectionState::Disconnected { .. }),
+        );
         inbound_router.drain(&mut chat_pane, &mut acp_pane);
         acp_pane.tick_transport_events();
         chat_pane.tick_transport_events();
@@ -2007,9 +2044,10 @@ pub async fn run(
                     let dock_layout = dock.layout(chunks[1], mode, plan_visible);
                     content_area = dock_layout.conversation;
                     dock.draw_shell(frame);
-                    sidebar.clear_geometry();
                     if let Some(sidebar_area) = dock_layout.sessions {
                         sidebar.draw(frame, sidebar_area, &sidebar_rows, &sidebar_ctx);
+                    } else {
+                        sidebar.clear_geometry();
                     }
 
                     match mode {
@@ -2020,6 +2058,9 @@ pub async fn run(
                             chrome_status.health.as_ref(),
                             acp_pane.current_cwd(),
                             chat_pane.current_cwd(),
+                            acp_pane.focused_runtime_context(),
+                            chat_pane.focused_runtime_context(),
+                            &terminal_candidates,
                         ),
                         Mode::Config => config_app.draw_into(frame, content_area),
                         Mode::Doctor => doctor_pane.draw(frame, content_area),
@@ -2046,10 +2087,10 @@ pub async fn run(
                         Mode::Chat => chat_pane.draw_dock_overlay(frame),
                         _ => {}
                     }
-                    let (ctx_input, ctx_max, ctx_model_window) = match mode {
+                    let (ctx_input, ctx_input_source, ctx_max, ctx_model_window) = match mode {
                         Mode::Chat => chat_pane.ctx_tokens(),
                         Mode::Acp => acp_pane.ctx_tokens(),
-                        _ => (None, None, None),
+                        _ => (None, None, None, None),
                     };
                     let browse_mode = match mode {
                         Mode::Chat => chat_pane.in_browse_mode(),
@@ -2061,7 +2102,7 @@ pub async fn run(
                         chunks[2],
                         &conn_state,
                         rpc.tui_id(),
-                        CtxBar::new(ctx_input, ctx_max, ctx_model_window),
+                        CtxBar::new(ctx_input, ctx_input_source, ctx_max, ctx_model_window),
                         needs_intervention,
                         browse_mode,
                     );
@@ -2268,7 +2309,17 @@ pub async fn run(
         // assembly and drag coalescing finish, or after a genuine timeout.
         let (input_event, dispatch_state) = poll_input_event_and_snapshot(
             &mut input_decoder,
-            |timeout| Ok(event::poll(timeout)?),
+            |timeout| {
+                poll_input_or_transport(
+                    timeout,
+                    TRANSPORT_WAKE_SLICE,
+                    |slice| Ok(event::poll(slice)?),
+                    || {
+                        chat_pane.has_pending_transport_events()
+                            || acp_pane.has_pending_transport_events()
+                    },
+                )
+            },
             || Ok(event::read()?),
             || rpc.connection_state(),
         )?;
@@ -2309,6 +2360,7 @@ pub async fn run(
         match input_event {
             Event::Key(key) => {
                 dock.clear_capture();
+                sidebar.cancel_drag();
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
@@ -2451,6 +2503,43 @@ pub async fn run(
                     continue;
                 }
 
+                if let Some(ordinal) = session_shortcut_ordinal(global) {
+                    let pane_claims_shortcut = match mode {
+                        Mode::Dashboard => {
+                            crate::keymap::DashboardTabAction::from_chord(&key).is_some()
+                                || SearchBoxAction::from_chord(&key).is_some()
+                                || crate::keymap::ConfigEditorAction::from_chord(&key).is_some()
+                        }
+                        Mode::Config => config_app.claims_session_shortcut(&key),
+                        Mode::Doctor => crate::keymap::DoctorTabAction::from_chord(&key).is_some(),
+                        Mode::Acp => acp_pane.claims_session_shortcut(&key),
+                        Mode::Chat => chat_pane.claims_session_shortcut(&key),
+                        Mode::Logs => {
+                            crate::keymap::LogsTabAction::from_chord(&key).is_some()
+                                || SearchBoxAction::from_chord(&key).is_some()
+                        }
+                        Mode::Quickstart => {
+                            crate::keymap::QuickstartTabAction::from_chord(&key).is_some()
+                                || crate::keymap::QuickstartModalAction::from_chord(&key).is_some()
+                        }
+                        Mode::Sop => {
+                            crate::keymap::SopTabAction::from_chord(&key).is_some()
+                                || crate::keymap::SopEditorAction::from_chord(&key).is_some()
+                        }
+                    };
+                    if session_shortcut_is_available(mode, in_text_input, pane_claims_shortcut) {
+                        let sessions = session_summaries_in_sidebar_order(
+                            &sidebar,
+                            acp_pane.session_summaries(),
+                            chat_pane.session_summaries(),
+                        );
+                        if let Some(event) = session_shortcut_event(ordinal, &sessions) {
+                            apply_sidebar_event!(event, dispatch_state);
+                        }
+                        continue;
+                    }
+                }
+
                 let editor_claims_pane_navigation = matches!(
                     global,
                     Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
@@ -2573,6 +2662,7 @@ pub async fn run(
             }
             Event::Mouse(mouse) => {
                 if let Some(state) = help_overlay.as_mut() {
+                    sidebar.cancel_drag();
                     match mouse.kind {
                         MouseEventKind::ScrollUp => {
                             state.scroll = state.scroll.saturating_sub(3);
@@ -2615,6 +2705,19 @@ pub async fn run(
                     .unwrap_or(menu_open);
                 if menu_consumed {
                     dock.clear_capture();
+                    sidebar.cancel_drag();
+                    continue;
+                }
+                // A row drag owns its release, including over another dock
+                // section or the transcript. Do not start another gesture there.
+                if sidebar.captures_mouse(&mouse) {
+                    route_agent_sidebar_mouse(
+                        mode,
+                        &mut chat_pane,
+                        &mut acp_pane,
+                        &mut sidebar,
+                        &mouse,
+                    );
                     continue;
                 }
                 let (dock_consumed, dock_action) =
@@ -2744,7 +2847,7 @@ pub async fn run(
                         match mode {
                             Mode::Chat => chat_pane.handle_paste(&text),
                             Mode::Acp => acp_pane.handle_paste(&text),
-                            Mode::Config => config_app.handle_paste(&text),
+                            Mode::Config => config_app.handle_paste(&text).await,
                             Mode::Doctor => doctor_pane.handle_paste(&text),
                             Mode::Quickstart => quickstart.handle_paste(&text),
                             Mode::Dashboard => dashboard_pane.handle_paste(&text),
@@ -2761,7 +2864,10 @@ pub async fn run(
                     })
                     .await;
             }
-            Event::Resize(_, _) => dock.clear_capture(),
+            Event::Resize(_, _) => {
+                dock.clear_capture();
+                sidebar.cancel_drag();
+            }
             _ => {}
         }
     }
@@ -2805,8 +2911,21 @@ fn global_help_entries() -> Vec<HelpEntry> {
     let cycle_keys = action_key_labels(GlobalAction::PaneNavLeft)
         .into_iter()
         .chain(action_key_labels(GlobalAction::PaneNavRight));
+    let session_keys = [
+        GlobalAction::FocusSession1,
+        GlobalAction::FocusSession2,
+        GlobalAction::FocusSession3,
+        GlobalAction::FocusSession4,
+        GlobalAction::FocusSession5,
+        GlobalAction::FocusSession6,
+        GlobalAction::FocusSession7,
+        GlobalAction::FocusSession8,
+    ]
+    .into_iter()
+    .flat_map(action_key_labels);
     vec![
         HelpEntry::new(cycle_keys, crate::i18n::t("zc-app-help-cycle-mode")),
+        HelpEntry::new(session_keys, crate::i18n::t("zc-chat-help-switch-session")),
         HelpEntry::new(
             action_key_labels(GlobalAction::Help),
             crate::i18n::t("zc-app-help-help"),
@@ -2840,6 +2959,52 @@ fn pane_switch_delta(
         Some(GlobalAction::PaneNavRight) => Some(1),
         _ => None,
     }
+}
+
+fn session_shortcut_ordinal(action: Option<GlobalAction>) -> Option<usize> {
+    match action? {
+        GlobalAction::FocusSession1 => Some(0),
+        GlobalAction::FocusSession2 => Some(1),
+        GlobalAction::FocusSession3 => Some(2),
+        GlobalAction::FocusSession4 => Some(3),
+        GlobalAction::FocusSession5 => Some(4),
+        GlobalAction::FocusSession6 => Some(5),
+        GlobalAction::FocusSession7 => Some(6),
+        GlobalAction::FocusSession8 => Some(7),
+        _ => None,
+    }
+}
+
+fn session_shortcut_event(
+    ordinal: usize,
+    sessions: &[chat::SidebarSessionSummary],
+) -> Option<crate::agent_sidebar::SidebarEvent> {
+    sessions
+        .get(ordinal)
+        .map(|session| crate::agent_sidebar::SidebarEvent::FocusSession {
+            pane: session.pane_kind,
+            session_id: session.session_id.clone(),
+        })
+}
+
+fn session_shortcut_is_available(
+    mode: Mode,
+    in_text_input: bool,
+    pane_claims_shortcut: bool,
+) -> bool {
+    !pane_claims_shortcut && (!in_text_input || matches!(mode, Mode::Acp | Mode::Chat))
+}
+
+/// Direct session shortcuts count sessions in the order the sidebar shows
+/// them, so a dragged row keeps the number of the position it was dropped in.
+fn session_summaries_in_sidebar_order(
+    sidebar: &crate::agent_sidebar::AgentSidebar,
+    mut acp_sessions: Vec<chat::SidebarSessionSummary>,
+    chat_sessions: Vec<chat::SidebarSessionSummary>,
+) -> Vec<chat::SidebarSessionSummary> {
+    acp_sessions.extend(chat_sessions);
+    sidebar.sort_in_display_order(&mut acp_sessions);
+    acp_sessions
 }
 
 fn copy_disconnected_composer(
@@ -2888,7 +3053,7 @@ fn route_agent_sidebar_mouse(
     sidebar: &mut crate::agent_sidebar::AgentSidebar,
     mouse: &crossterm::event::MouseEvent,
 ) -> (bool, Option<crate::agent_sidebar::SidebarEvent>) {
-    if !sidebar.contains(mouse.column, mouse.row) {
+    if !sidebar.contains(mouse.column, mouse.row) && !sidebar.captures_mouse(mouse) {
         return (false, None);
     }
 
@@ -4134,6 +4299,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sidebar_session_drag_routes_outside_release_and_keeps_order_after_reconnect() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let client = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(tx),
+        )));
+        let mut chat_pane = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut acp_pane = acp::Acp::new(client.clone());
+        chat_pane.activate_session_for_test("chat-session");
+        acp_pane.activate_session_for_test("code-session");
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        let area = Rect::new(70, 0, 30, 10);
+        let ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat::PaneKind::Chat),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut rows = acp_pane.session_summaries();
+        rows.extend(chat_pane.session_summaries());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+
+        let mut mouse = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x + 1,
+            row: area.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(
+            event,
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Acp,
+                session_id: "code-session".into(),
+            })
+        );
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        mouse.kind = MouseEventKind::Drag(MouseButton::Left);
+        mouse.row += 1;
+        assert!(sidebar.captures_mouse(&mouse));
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        mouse.kind = MouseEventKind::Up(MouseButton::Left);
+        mouse.column = 20; // Release over the conversation, outside Sessions.
+        let (consumed, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut chat_pane,
+            &mut acp_pane,
+            &mut sidebar,
+            &mouse,
+        );
+        assert!(consumed);
+        assert_eq!(event, None);
+        assert!(!sidebar.captures_mouse(&mouse));
+
+        // Use the same constructors and handoff as build_panes on reconnect.
+        let mut reconnected_chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        reconnected_chat.set_resume_sessions(chat_pane.resume_entries());
+        let mut reconnected_code = acp::Acp::new(client);
+        reconnected_code.set_resume_sessions(acp_pane.resume_entries());
+        let mut rows = reconnected_code.session_summaries();
+        rows.extend(reconnected_chat.session_summaries());
+        terminal
+            .draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        mouse.kind = MouseEventKind::Down(MouseButton::Left);
+        mouse.column = area.x + 1;
+        mouse.row = area.y + 1;
+        let (_, event) = route_agent_sidebar_mouse(
+            Mode::Chat,
+            &mut reconnected_chat,
+            &mut reconnected_code,
+            &mut sidebar,
+            &mouse,
+        );
+        assert_eq!(
+            event,
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Chat,
+                session_id: "chat-session".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn sidebar_mouse_up_finishes_chat_and_code_transcript_drags() {
         let (tx, _rx) = mpsc::channel::<String>(1);
         let client = Arc::new(RpcClient::with_rpc(Arc::new(
@@ -4865,6 +5133,32 @@ mod tests {
         assert_eq!(request["method"], crate::client::method::STATUS);
     }
 
+    #[test]
+    fn chrome_status_failed_health_refresh_clears_previous_snapshot() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut chrome_status = ChromeStatus {
+            health: Some(serde_json::json!({
+                "components": {"daemon": {"status": "ok"}}
+            })),
+            refresh_in_flight: true,
+            refresh_rx: Some(rx),
+            ..Default::default()
+        };
+        assert!(
+            tx.send(ChromeStatusSnapshot {
+                status: None,
+                health: None,
+            })
+            .is_ok()
+        );
+
+        chrome_status.drain_completed_refresh();
+
+        assert!(chrome_status.health.is_none());
+        assert!(!chrome_status.refresh_in_flight);
+        assert!(chrome_status.refresh_rx.is_none());
+    }
+
     #[tokio::test]
     async fn mode_switch_to_sop_returns_before_a_withheld_list_response() {
         let (tx, mut rx) = mpsc::channel::<String>(1);
@@ -5108,6 +5402,119 @@ mod tests {
         assert_eq!(pane.selected_name(), Some("deploy"));
     }
 
+    /// Render the real status bar through the production renderer and return
+    /// the final terminal cells a user sees. Reaches the outermost TUI
+    /// boundary for the context meter, not a component snapshot.
+    #[cfg(test)]
+    fn render_status_bar_cells(ctx: CtxBar, width: u16) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_status_bar(
+                    frame,
+                    frame.area(),
+                    &ConnectionState::Connected,
+                    Some("tui-1"),
+                    ctx,
+                    false,
+                    false,
+                );
+            })
+            .expect("draw status bar");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// User-boundary proof: an estimated context count reaches the real status
+    /// bar marked approximate, and a measured count does not.
+    #[test]
+    fn status_bar_marks_estimated_context_and_not_measured_context() {
+        let estimated = render_status_bar_cells(
+            CtxBar::new(
+                Some(100_000),
+                Some("estimate".to_string()),
+                Some(180_000),
+                Some(200_000),
+            ),
+            100,
+        );
+        let measured = render_status_bar_cells(
+            CtxBar::new(
+                Some(100_000),
+                Some("provider".to_string()),
+                Some(180_000),
+                Some(200_000),
+            ),
+            100,
+        );
+
+        assert!(
+            estimated.contains("~100,000 / 200,000"),
+            "estimated count must render approximate in the real status bar: {estimated:?}"
+        );
+        assert!(
+            estimated.contains("~50%"),
+            "estimated percentage must render approximate: {estimated:?}"
+        );
+        assert!(
+            measured.contains(" 100,000 / 200,000"),
+            "measured count keeps the reserved marker column blank: {measured:?}"
+        );
+        assert!(
+            !measured.contains('~'),
+            "measured usage must never render approximate: {measured:?}"
+        );
+    }
+
+    /// The marker occupies a reserved column, so enabling provenance must not
+    /// shift any following content in the status bar.
+    #[test]
+    fn approximation_marker_does_not_shift_status_bar_layout() {
+        for width in [80_u16, 100, 120] {
+            let estimated = render_status_bar_cells(
+                CtxBar::new(
+                    Some(100_000),
+                    Some("estimate".to_string()),
+                    Some(180_000),
+                    Some(200_000),
+                ),
+                width,
+            );
+            let measured = render_status_bar_cells(
+                CtxBar::new(
+                    Some(100_000),
+                    Some("provider".to_string()),
+                    Some(180_000),
+                    Some(200_000),
+                ),
+                width,
+            );
+            assert_eq!(
+                estimated.len(),
+                measured.len(),
+                "width {width}: estimated and measured rows must occupy the same cells"
+            );
+            // The only differing cells are the two reserved marker columns.
+            let diffs = estimated
+                .chars()
+                .zip(measured.chars())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                diffs, 2,
+                "width {width}: only the two marker columns may differ\n  est={estimated:?}\n  mea={measured:?}"
+            );
+        }
+    }
+
     #[test]
     fn narrow_mode_bar_keeps_selected_sop_visible_and_summary_non_clickable() {
         use ratatui::{Terminal, backend::TestBackend};
@@ -5232,6 +5639,184 @@ mod tests {
         let expected = action_key_labels(GlobalAction::Help);
 
         assert_eq!(help.keys, expected);
+    }
+
+    #[test]
+    fn session_shortcut_help_groups_all_live_ordinals() {
+        use crate::keymap::{GlobalAction, action_key_labels};
+
+        let entries = global_help_entries();
+        let switch = entries
+            .iter()
+            .find(|entry| entry.action == crate::i18n::t("zc-chat-help-switch-session"))
+            .expect("global Help should advertise direct session switching");
+        let expected = [
+            GlobalAction::FocusSession1,
+            GlobalAction::FocusSession2,
+            GlobalAction::FocusSession3,
+            GlobalAction::FocusSession4,
+            GlobalAction::FocusSession5,
+            GlobalAction::FocusSession6,
+            GlobalAction::FocusSession7,
+            GlobalAction::FocusSession8,
+        ]
+        .into_iter()
+        .flat_map(action_key_labels)
+        .collect::<Vec<_>>();
+
+        assert_eq!(switch.keys, expected);
+    }
+
+    #[test]
+    fn session_shortcut_targets_follow_visible_code_then_chat_order() {
+        let summary = |pane_kind, session_id: &str| chat::SidebarSessionSummary {
+            session_id: session_id.to_string(),
+            agent_alias: "test".to_string(),
+            message_count: 0,
+            status: chat::SidebarStatus::Ready,
+            pane_kind,
+            focused: false,
+        };
+        let acp = vec![
+            summary(chat::PaneKind::Acp, "code-1"),
+            summary(chat::PaneKind::Acp, "code-2"),
+        ];
+        let chat = vec![summary(chat::PaneKind::Chat, "chat-1")];
+        let sessions = session_summaries_in_sidebar_order(
+            &crate::agent_sidebar::AgentSidebar::new(),
+            acp,
+            chat,
+        );
+
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession2)).unwrap(),
+                &sessions,
+            ),
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Acp,
+                session_id: "code-2".to_string(),
+            })
+        );
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession3)).unwrap(),
+                &sessions,
+            ),
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane: chat::PaneKind::Chat,
+                session_id: "chat-1".to_string(),
+            })
+        );
+        assert_eq!(
+            session_shortcut_event(
+                session_shortcut_ordinal(Some(GlobalAction::FocusSession4)).unwrap(),
+                &sessions,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn session_shortcut_targets_follow_dragged_sidebar_order() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let summary = |pane_kind, session_id: &str| chat::SidebarSessionSummary {
+            session_id: session_id.to_string(),
+            agent_alias: "test".to_string(),
+            message_count: 0,
+            status: chat::SidebarStatus::Ready,
+            pane_kind,
+            focused: false,
+        };
+        let acp = vec![
+            summary(chat::PaneKind::Acp, "code-1"),
+            summary(chat::PaneKind::Acp, "code-2"),
+        ];
+        let chat = vec![summary(chat::PaneKind::Chat, "chat-1")];
+        let mut rows = acp.clone();
+        rows.extend(chat.clone());
+        let mut sidebar = crate::agent_sidebar::AgentSidebar::new();
+        let area = Rect::new(0, 0, 30, 10);
+        let ctx = crate::agent_sidebar::SidebarCtx {
+            active_pane: Some(chat::PaneKind::Acp),
+            quickstart_active: false,
+            connected: true,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+        // Rows start one line inside the panel border: drag the Chat row
+        // (third) to the top.
+        let mouse = |kind, row| MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        sidebar.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 3));
+        sidebar.handle_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 1));
+        sidebar.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 1));
+        term.draw(|frame| sidebar.draw(frame, area, &rows, &ctx))
+            .unwrap();
+
+        let sessions = session_summaries_in_sidebar_order(&sidebar, acp, chat);
+        let target = |action| {
+            session_shortcut_event(session_shortcut_ordinal(Some(action)).unwrap(), &sessions)
+        };
+        let focus = |pane, id: &str| {
+            Some(crate::agent_sidebar::SidebarEvent::FocusSession {
+                pane,
+                session_id: id.to_string(),
+            })
+        };
+        assert_eq!(
+            target(GlobalAction::FocusSession1),
+            focus(chat::PaneKind::Chat, "chat-1")
+        );
+        assert_eq!(
+            target(GlobalAction::FocusSession2),
+            focus(chat::PaneKind::Acp, "code-1")
+        );
+        assert_eq!(
+            target(GlobalAction::FocusSession3),
+            focus(chat::PaneKind::Acp, "code-2")
+        );
+    }
+
+    #[test]
+    fn session_shortcut_dispatch_respects_composer_and_other_input_owners() {
+        assert!(
+            session_shortcut_is_available(Mode::Chat, true, false),
+            "typed composer text must not disable the modified session shortcut"
+        );
+        assert!(
+            !session_shortcut_is_available(Mode::Chat, true, true),
+            "an explicit Chat or input-bar binding must retain the chord"
+        );
+        assert!(
+            !session_shortcut_is_available(Mode::Config, true, false),
+            "non-chat text editors retain their existing input ownership"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn session_shortcut_decoder_preserves_ctrl_command_modifiers() {
+        let original = Event::Key(KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        ));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(original.clone());
+
+        assert_eq!(decoder.next(), Some(original));
+        assert_eq!(
+            GlobalAction::from_chord(&KeyEvent::new(
+                KeyCode::Char('1'),
+                KeyModifiers::CONTROL | KeyModifiers::SUPER,
+            )),
+            Some(GlobalAction::FocusSession1)
+        );
     }
 
     #[test]
@@ -5402,6 +5987,53 @@ mod tests {
                 state.rpc_allowed()
             ),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn input_wait_returns_early_for_pending_transport_events() {
+        // Pending transport work ends the wait after one slice, not the tick.
+        let polls = std::cell::RefCell::new(Vec::new());
+        let woke = poll_input_or_transport(
+            TICK,
+            TRANSPORT_WAKE_SLICE,
+            |slice| {
+                polls.borrow_mut().push(slice);
+                Ok(false)
+            },
+            || true,
+        )
+        .expect("poll");
+        assert!(!woke, "a transport wake is reported as an input timeout");
+        assert_eq!(polls.borrow().as_slice(), &[TRANSPORT_WAKE_SLICE]);
+
+        // Input wins over pending transport work in the same slice.
+        let woke = poll_input_or_transport(TICK, TRANSPORT_WAKE_SLICE, |_| Ok(true), || true)
+            .expect("poll");
+        assert!(woke);
+
+        // Idle: keep slicing until the full timeout, never polling past it.
+        let polls = std::cell::RefCell::new(Vec::new());
+        let started = Instant::now();
+        let woke = poll_input_or_transport(
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+            |slice| {
+                polls.borrow_mut().push(slice);
+                std::thread::sleep(slice);
+                Ok(false)
+            },
+            || false,
+        )
+        .expect("poll");
+        assert!(!woke);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        let polls = polls.borrow();
+        assert!(polls.len() >= 4);
+        assert!(
+            polls
+                .iter()
+                .all(|slice| *slice <= Duration::from_millis(10))
         );
     }
 

@@ -5,6 +5,8 @@ mod acp_retry_stop_notice_stdio;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
 mod agents_export_cli;
+#[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
+mod cli_only_build;
 #[cfg(all(feature = "agent-runtime", unix))]
 mod config_auth_publication_cli;
 #[cfg(feature = "agent-runtime")]
@@ -19,10 +21,11 @@ mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
 mod degraded_config_remediation;
-#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+#[cfg(all(feature = "agent-runtime", feature = "gateway", target_os = "linux"))]
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
+#[cfg(feature = "gateway")]
 mod gateway;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
@@ -41,7 +44,10 @@ mod skills_bundle_cli;
 mod user_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
+#[cfg(feature = "gateway")]
 mod whatsapp_webhook_security;
 
 #[cfg(feature = "plugins-wasm")]
 mod plugin_info_cli;
+#[cfg(feature = "plugins-wasm")]
+mod plugin_update_cli;

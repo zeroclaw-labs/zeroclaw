@@ -1844,7 +1844,7 @@ mod tests {
                 items.push("drift-guard".to_owned());
                 serde_json::to_string(&items).ok()
             }
-            PropKind::Object | PropKind::ObjectArray => None,
+            PropKind::Object | PropKind::ObjectArray | PropKind::SecretMap => None,
         }
     }
 

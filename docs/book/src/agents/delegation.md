@@ -76,6 +76,14 @@ The agent loop applies a per-turn duplicate-call guard: a tool called twice with
 
 When parallel tool execution is enabled (`parallel_tools = true` in the runtime profile), multiple `spawn_subagent` calls in one turn run concurrently and every child's final response is returned to the parent, keyed to its own tool call. `delegate` has its own explicit fan-out via the `parallel: [...]` argument (see the output-strings section); that path spawns each target on its own task and aggregates all results.
 
+## ZeroCode transcript inspection
+
+Foreground `spawn_subagent` and `delegate` calls have expandable transcript cards showing the task, delegate target names when provided, and retained result text. Parallel delegation remains one invocation with the existing per-target result blocks. Additional arguments, such as context, remain visible in the input field. Malformed or oversized arguments fall back to the generic tool card. Expansion retains the tool display limits of 8 KiB or 100 lines per field; Copy uses the original retained entry, whose result may already have been capped at 16 KiB.
+
+Delegate target names appear in the card heading, followed by the task and a **Response** section. For a matching synchronous delegate envelope, the returned answer appears first and the provider/model metadata remains in expanded **Details**. Other result formats stay intact. A missing response says **Result not recorded**. The card does not assert that a child is currently running or that the child succeeded, including in restored history or returned diagnostic text. Background launches and management actions such as `check_result` and `await_sessions` keep generic cards, so a launch acknowledgment is not displayed as child completion.
+
+Live child inspection still needs runtime metadata correlated to the parent tool-call ID: child task/session identity, authoritative lifecycle and outcome, timestamps, and child tool events or an authorized transcript link. Current parent tool notifications do not carry these fields. ZeroCode does not infer them from result text, tracing logs, prompt matching, or target aliases; the runtime control plane remains the lifecycle owner. This is a partial implementation of #8763, not live child supervision.
+
 ## Permission inheritance
 
 A SubAgent inherits the parent's permissions verbatim unless the spawn site supplies a narrowing `SubAgentOverrides`. Today both in-tree spawn sites pass `SubAgentOverrides::default()` (inherit everything). The override surface is shipped and validated; a future caller-supplied narrowing path drops in without runtime changes.
@@ -196,6 +204,30 @@ This policy lives on the target, not the caller. Same-profile peers use the shar
 
 When the target's configured Reliable provider chain mixes native-tool-capable and text-only candidates, `strict_tool_parsing = false` uses one text/XML tool protocol for the whole agentic turn so every reachable fallback can execute tools. If effective tools remain and `strict_tool_parsing = true`, ZeroClaw rejects the mixed chain before making a provider request because strict parsing forbids that text/XML fallback protocol. Uniform chains are unchanged: all-native chains use native tool transport, while deliberately all-text chains follow the configured text-tool policy.
 
+### Independent delegate approvals
+
+An independent agentic target can send tool approval requests to the operator selected by its own risk profile's `approval_route`. Set both `approver_channel` and a non-blank `approver_recipient`, and keep that channel enabled and registered in the running daemon. The caller must already authorize that named target in independent mode; an approval route does not grant delegation reach or additional tools.
+
+For example, a target using the `worker` risk profile can route its approvals to a configured operations channel:
+
+```toml
+[risk_profiles.worker.approval_route]
+approver_channel = "telegram.ops"
+approver_recipient = "operations-room"
+on_no_approver = "deny"
+timeout_secs = 120
+```
+
+Foreground, background, and parallel independent delegates use the same target-route approval gate. The prompt identifies the target and caller, keeps the real tool name and argument summary, and uses the configured recipient. A real approval allows the target-owned call subject to its existing tool and command policy. A denial, missing channel, unsupported approval surface, disconnection, or timeout leaves the tool unexecuted. The child execution timeout also bounds the approval wait and can expire before the route timeout.
+
+A complete target route also applies when the profile was already configured for the target's own channel turns. For a Supervised independent child, shell calls now require an operator decision unless the target explicitly auto-approves `shell`. This includes low-risk commands that previously went directly to the shell tool's command policy. In a process without a channel registry, such as a one-shot CLI run, those prompt-required calls are denied. Full autonomy and explicit `auto_approve` entries retain their existing behavior, while `always_ask` still requires a decision. Remove the route to restore the previous non-interactive shell path only if that matches the intended target policy.
+
+Each child run has a fresh approval manager. An "Always" answer applies only within that child run; it cannot approve the caller's calls, later delegate runs, or parallel siblings. Tools in `always_ask` still require a decision for every call, including under Full autonomy. Explicitly auto-approved tools otherwise retain their target-profile behavior.
+
+Delegates do not inherit the caller's CLI, ACP, RPC, or dashboard approval session. Even `on_no_approver = "inherit-originator"` denies when the configured approver cannot answer, because an independent child has no originating approval channel to fall back to. Pending approval is process-local and is abandoned on child cancellation or timeout; restarting a daemon does not resume that request or restore child approval grants.
+
+Without a complete target route, independent targets with non-empty `always_ask` are refused before execution, including background and parallel admission. Other prompt-required calls still fail closed at tool dispatch. Bounded agentic delegates keep their existing no-operator behavior and caller-owned command policy.
+
 ### `delegate`: output strings the model sees
 
 User-visible failure strings are localized Fluent messages. Their English source
@@ -225,7 +257,7 @@ them as Fluent keys.
 9. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
 10. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
 11. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
-12. Target whose risk profile has `always_ask` entries: an independent target returns `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".` A bounded agentic target returns the same error with `cannot run in bounded agentic mode`.
+12. Target whose risk profile has `always_ask` entries: an independent target without a complete explicit approval route returns `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".` A bounded agentic target returns the same error with `cannot run in bounded agentic mode`.
 13. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
 14. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
 
@@ -234,6 +266,16 @@ them as Fluent keys.
 `delegate` does not emit a dedicated tracing span today. The signal is the **target** agent's loop appearing in the log, which inherits whatever scope the parent's tool-call dispatch was inside. For background mode, use `check_result` or `await_sessions` to read the authoritative lifecycle state and output together. Those actions, listing, and cancellation are limited to delegate rows whose recorded chain contains the caller's alias. The workspace artifact can confirm that output was persisted, but it does not carry status. When tool receipts are enabled, background delegations run with a receipt scope that shares the parent's generator and uses their own collector, so their tool results are signed and verifiable but are not appended to the launching turn's receipts block.
 
 (Cron-launched agent jobs are a separate spawn site and use the explicit `subagent` span described above; `delegate` and cron are not the same path.)
+
+### `delegate`: what stopping the turn cancels
+
+Stopping the turn that called `delegate` (for example `POST /api/sessions/{id}/abort`, or a channel interruption) reaches the work that turn started, even though the children run in their own tasks and outlive the parent's dropped tool future:
+
+- **Agentic children** (bounded or independent) are bound to the launching turn's cancellation and stop with it.
+- **Parallel children** (`parallel: [...]`) that run their own tool loop are bound the same way, at every depth. A parallel child that makes a plain model call without a tool loop is not interrupted mid-call: it ends with that call's own timeout.
+- **Background tasks** (`background: true`) are not bound to the turn at any depth, including one launched by a child that was itself started in the foreground. They outlive the turn by design and stop only through `cancel_task`.
+
+`spawn_subagent` has none of this: it has no background or parallel mode, and its child is cancelled with the parent future.
 
 ### What's not in this page (intentionally)
 
@@ -257,7 +299,7 @@ them as Fluent keys.
 
 1. **Recursion beyond depth 1.** A SubAgent cannot spawn its own SubAgent. The cap is a hard refusal at the tool, not a budget. Cron-launched runs start at depth 0 and may spawn one level; agent-loop-launched SubAgents are at depth 1 and refuse further spawning.
 2. **A separate identity for the child.** SubAgents share the parent's agent UUID. To run under a different identity, use `delegate` to hand off to a configured sibling agent.
-3. **Per-spawn time budget.** There is no `timeout_secs` argument. The parent blocks for the full duration of the child run; cancellation has to flow through the broader interruption scope.
+3. **Per-spawn time budget.** There is no `timeout_secs` argument. The parent blocks for the full duration of the child run; cancellation has to flow through the broader interruption scope (for `delegate`, see [what stopping the turn cancels](#delegate-what-stopping-the-turn-cancels)).
 4. **Streaming progress back to the parent.** The parent sees the child's final response as a single string after completion.
 5. **A `[agents.<alias>].subagent_*` config block.** The validator and override type ship today; the operator-facing config surface that plumbs caller-defined narrowing is not in this release. Both spawn sites pass `SubAgentOverrides::default()` until that surface lands.
-6. **`delegate` targets with `always_ask`.** Independent delegation and bounded agentic delegation are blocked when the target agent's risk profile has non-empty `always_ask` entries. The runtime refuses before starting the target, including background and parallel delegation. Non-agentic bounded delegation remains available because it cannot execute child tools. This blocker remains until approval forwarding for child agent loops is supported by a future ZeroClaw version.
+6. **Origin-session approval forwarding and bounded approvals.** Independent delegates can use an explicit target-owned [approval route](#independent-delegate-approvals), but cannot forward approval to the caller's originating CLI, ACP, RPC, or dashboard session. Bounded agentic targets with non-empty `always_ask` remain blocked before execution, including background and parallel delegation. Non-agentic bounded delegation remains available because it cannot execute child tools.
