@@ -587,6 +587,18 @@ pub struct EmailConfig {
     pub smtp_port: u16,
     #[serde(default = "default_true")]
     pub smtp_tls: bool,
+    /// Absolute path to a PEM-encoded CA certificate or bundle to trust in
+    /// addition to the bundled web PKI roots, for IMAP and for SMTP over TLS
+    /// (a mail server signed by a private CA). Shell expansion (e.g. `~`) is
+    /// not performed.
+    ///
+    /// Certificate and hostname verification remain enabled. The path must
+    /// name a regular file no larger than 1 MiB; a missing, unreadable,
+    /// empty, oversized, non-regular, or invalid file fails the connection
+    /// rather than falling back to the default roots. Plain-text SMTP
+    /// (`smtp_tls = false`) does not use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_cert_path: Option<String>,
     #[serde(default)]
     pub smtp_username: Option<String>,
     #[secret]
@@ -644,6 +656,7 @@ impl Default for EmailConfig {
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             smtp_tls: true,
+            tls_ca_cert_path: None,
             smtp_username: None,
             smtp_password: None,
             username: String::new(),

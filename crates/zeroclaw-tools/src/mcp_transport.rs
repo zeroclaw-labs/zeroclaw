@@ -120,46 +120,31 @@ fn open_tls_ca_file(path: &str) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
-    let file = open_tls_ca_file(path).with_context(|| {
-        format!(
-            "MCP server `{}`: cannot read TLS CA certificate at `{path}`",
-            config.name
-        )
-    })?;
+/// Read an operator-selected PEM CA file for `owner` (used as the error
+/// prefix, e.g. ``MCP server `name` ``). The path must be absolute and name a
+/// regular file of at most [`MAX_TLS_CA_BYTES`]; anything else is an error.
+/// Shared by the MCP transports and the email channel's IMAP/SMTP TLS.
+pub(crate) fn load_tls_ca_pem(owner: &str, path: &str) -> Result<Vec<u8>> {
+    if !std::path::Path::new(path).is_absolute() {
+        bail!("{owner}: TLS CA certificate path must be absolute: `{path}`");
+    }
+    let file = open_tls_ca_file(path)
+        .with_context(|| format!("{owner}: cannot read TLS CA certificate at `{path}`"))?;
     let opened_metadata = file.metadata().with_context(|| {
-        format!(
-            "MCP server `{}`: cannot inspect opened TLS CA certificate at `{path}`",
-            config.name
-        )
+        format!("{owner}: cannot inspect opened TLS CA certificate at `{path}`")
     })?;
     if !opened_metadata.file_type().is_file() {
-        bail!(
-            "MCP server `{}`: TLS CA certificate path must name a regular file: `{path}`",
-            config.name
-        );
+        bail!("{owner}: TLS CA certificate path must name a regular file: `{path}`");
     }
     if opened_metadata.len() > MAX_TLS_CA_BYTES as u64 {
-        bail!(
-            "MCP server `{}`: TLS CA certificate at `{path}` exceeds the {MAX_TLS_CA_BYTES}-byte limit",
-            config.name
-        );
+        bail!("{owner}: TLS CA certificate at `{path}` exceeds the {MAX_TLS_CA_BYTES}-byte limit");
     }
-
     let mut pem = Vec::with_capacity(opened_metadata.len() as usize + 1);
     file.take(MAX_TLS_CA_BYTES as u64 + 1)
         .read_to_end(&mut pem)
-        .with_context(|| {
-            format!(
-                "MCP server `{}`: cannot read TLS CA certificate at `{path}`",
-                config.name
-            )
-        })?;
+        .with_context(|| format!("{owner}: cannot read TLS CA certificate at `{path}`"))?;
     if pem.len() > MAX_TLS_CA_BYTES {
-        bail!(
-            "MCP server `{}`: TLS CA certificate at `{path}` exceeds the {MAX_TLS_CA_BYTES}-byte limit",
-            config.name
-        );
+        bail!("{owner}: TLS CA certificate at `{path}` exceeds the {MAX_TLS_CA_BYTES}-byte limit");
     }
     Ok(pem)
 }
@@ -187,15 +172,7 @@ fn build_remote_http_client(config: &McpServerConfig) -> Result<reqwest::Client>
             }
         }));
 
-        if !std::path::Path::new(path).is_absolute() {
-            bail!(
-                "MCP server `{}`: TLS CA certificate path must be absolute: `{}`",
-                config.name,
-                path
-            );
-        }
-
-        let pem = load_tls_ca_pem(config, path)?;
+        let pem = load_tls_ca_pem(&format!("MCP server `{}`", config.name), path)?;
         let certificates = reqwest::Certificate::from_pem_bundle(&pem).with_context(|| {
             format!(
                 "MCP server `{}`: invalid PEM CA certificate at `{}`",
@@ -2871,26 +2848,18 @@ mod tests {
         let pem = test_ca_file();
         let pem_bytes = std::fs::read(pem.path()).unwrap();
 
-        let config_for = |path: &std::path::Path| McpServerConfig {
-            name: "internal".into(),
-            transport: McpTransport::Http,
-            url: Some("https://localhost/mcp".into()),
-            tls_ca_cert_path: Some(path.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-
         // Alternate the same path between a readable bundle and a FIFO. Each
         // iteration must terminate: the regular file loads, the FIFO is
         // rejected as a non-regular file. A blocking open would hang here
         // forever because nothing ever opens the FIFO for writing.
         for _ in 0..10 {
             std::fs::write(&ca_path, &pem_bytes).unwrap();
-            load_tls_ca_pem(&config_for(&ca_path), &ca_path.to_string_lossy())
+            load_tls_ca_pem("MCP server `internal`", &ca_path.to_string_lossy())
                 .expect("a regular CA bundle must still load");
 
             std::fs::remove_file(&ca_path).unwrap();
             make_test_fifo(&ca_path);
-            let error = load_tls_ca_pem(&config_for(&ca_path), &ca_path.to_string_lossy())
+            let error = load_tls_ca_pem("MCP server `internal`", &ca_path.to_string_lossy())
                 .expect_err("a FIFO must be rejected, not opened for reading");
             assert!(error.to_string().contains("must name a regular file"));
 
@@ -2914,15 +2883,7 @@ mod tests {
         let link = directory.path().join("linked-ca.pem");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let config_for = |path: &std::path::Path| McpServerConfig {
-            name: "internal".into(),
-            transport: McpTransport::Http,
-            url: Some("https://localhost/mcp".into()),
-            tls_ca_cert_path: Some(path.to_string_lossy().into_owned()),
-            ..Default::default()
-        };
-
-        let loaded = load_tls_ca_pem(&config_for(&link), &link.to_string_lossy())
+        let loaded = load_tls_ca_pem("MCP server `internal`", &link.to_string_lossy())
             .expect("a symlink to a bounded regular CA file must load");
         assert_eq!(loaded, pem_bytes);
 
@@ -2931,7 +2892,7 @@ mod tests {
         let fifo_link = directory.path().join("linked-special");
         std::os::unix::fs::symlink(&fifo_target, &fifo_link).unwrap();
 
-        let error = load_tls_ca_pem(&config_for(&fifo_link), &fifo_link.to_string_lossy())
+        let error = load_tls_ca_pem("MCP server `internal`", &fifo_link.to_string_lossy())
             .expect_err("a symlink to a FIFO must be rejected");
         assert!(error.to_string().contains("must name a regular file"));
     }
