@@ -773,6 +773,7 @@ MODIFY_PATH=true # append PATH export to the shell profile; --no-modify-path opt
 PREFIX="$HOME"
 INSTALL_MODE="" # ""=ask, "prebuilt"=force prebuilt, "source"=force source
 PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-features, "cli-only"=--cli-only
+CLI_ONLY=false  # true once --cli-only or --preset cli-only is given, even if a later preset replaces it
 WITH_GATEWAY="" # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 WITHOUT_TUI=""  # ""=unset (default: install TUI), "true"=skip TUI
 USER_APPS=""    # ""=unset (default apps), "none"=skip all, or comma list (e.g. "zerocode")
@@ -797,7 +798,10 @@ while [ $# -gt 0 ]; do
       MINIMAL=true
       ;;
     full) PRESET="full" ;;
-    cli-only) PRESET="cli-only" ;;
+    cli-only)
+      PRESET="cli-only"
+      CLI_ONLY=true
+      ;;
     *) die "Unknown preset '$1'. Expected: minimal, full or cli-only" ;;
     esac
     ;;
@@ -806,7 +810,10 @@ while [ $# -gt 0 ]; do
     PRESET="full"
     FULL_APPS=true
     ;;
-  --cli-only) PRESET="cli-only" ;;
+  --cli-only)
+    PRESET="cli-only"
+    CLI_ONLY=true
+    ;;
   --features)
     if [ $# -lt 2 ]; then
       die "Missing value for --features. Expected: --features X,Y"
@@ -857,6 +864,18 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# `--cli-only` is one complete feature set, resolved from the registry when it
+# builds, so refuse every option that would change it before installing
+# anything. Extra features could turn the gateway back on, directly or through
+# `default`, and another preset would replace the set.
+if [ "$CLI_ONLY" = true ]; then
+  [ "$PRESET" = "cli-only" ] || die "--cli-only and the $PRESET preset are different feature sets; pick one"
+  [ "$FULL_APPS" = true ] && die "--cli-only and --full are different feature sets; pick one"
+  [ "$WITH_GATEWAY" = "true" ] && die "--cli-only builds have no gateway; drop --with-gateway"
+  [ "$MINIMAL" = true ] && die "--cli-only and --minimal are different feature sets; pick one"
+  [ -z "$USER_FEATURES" ] || die "--cli-only is a complete feature set and takes no --features (or ZEROCLAW_CARGO_FEATURES); drop them, or leave out --cli-only to choose the features yourself"
+fi
 
 # ── Derive paths from prefix ─────────────────────────────────────
 
@@ -1038,11 +1057,10 @@ See all available features:
     CARGO_FLAGS="--no-default-features"
   fi
 
-  # `--cli-only` is its own complete feature set (resolved below), so the
-  # gateway toggles and `--minimal` cannot be combined with it.
+  # `--cli-only` is its own complete feature set (resolved below); options
+  # that would change it were refused after parsing, and `--without-gateway`
+  # adds nothing to a set without the gateway.
   if [ "$PRESET" = "cli-only" ]; then
-    [ "$WITH_GATEWAY" = "true" ] && die "--cli-only builds have no gateway; drop --with-gateway"
-    [ "$MINIMAL" = true ] && die "--cli-only and --minimal are different feature sets; pick one"
     WITH_GATEWAY=""
   fi
 

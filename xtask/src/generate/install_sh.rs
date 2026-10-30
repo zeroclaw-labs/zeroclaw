@@ -1027,6 +1027,50 @@ mod tests {
         assert!(script.contains(resolve));
     }
 
+    /// `install.sh` refuses every option that would change the CLI-only
+    /// feature set right after parsing, before it installs anything.
+    #[cfg(unix)]
+    #[test]
+    fn cli_only_refuses_options_that_change_its_feature_set() {
+        let cases: [(&[&str], Option<&str>, &str); 8] = [
+            (
+                &["--cli-only", "--features", "gateway"],
+                None,
+                "takes no --features",
+            ),
+            (
+                &["--cli-only", "--features", "default"],
+                None,
+                "takes no --features",
+            ),
+            (&["--cli-only"], Some("gateway"), "takes no --features"),
+            (&["--cli-only", "--full"], None, "the full preset"),
+            (&["--cli-only", "--preset", "full"], None, "the full preset"),
+            (&["--full", "--cli-only"], None, "and --full are"),
+            (
+                &["--cli-only", "--with-gateway"],
+                None,
+                "builds have no gateway",
+            ),
+            (&["--cli-only", "--minimal"], None, "and --minimal"),
+        ];
+        for (args, env_features, refusal) in cases {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg(root().join("install.sh"))
+                .args(args)
+                .args(["--dry-run", "--skip-quickstart", "--no-modify-path"])
+                .current_dir(root())
+                .env_remove("ZEROCLAW_CARGO_FEATURES");
+            if let Some(features) = env_features {
+                cmd.env("ZEROCLAW_CARGO_FEATURES", features);
+            }
+            let out = cmd.output().expect("run install.sh");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+            assert!(stderr.contains(refusal), "{args:?}: {stderr}");
+        }
+    }
+
     #[test]
     fn real_guided_flow_uses_generated_quickstart_command() {
         let script = std::fs::read_to_string(root().join("install.sh")).unwrap();
