@@ -111,7 +111,7 @@ Some conflicts need an operator, and the rename keeps reporting them until they 
 - `<install>/agents/analyst/workspace/` already exists and is not empty.
 - `analyst` already owns memory rows.
 - `<install>/agents/researcher/workspace/` still holds files while `analyst` has a custom `workspace.path`. The rename never finishes while that directory exists, because an agent created as `researcher` later would adopt it; an empty one is removed for you.
-- `analyst`'s `workspace.path` is `<install>/agents/researcher/workspace/`, lies inside it, or contains it (for example `<install>/agents/researcher/`), whether or not that directory exists. Point it elsewhere first.
+- `analyst`'s `workspace.path` is `<install>/agents/researcher/workspace/`, lies inside it, or contains it (for example `<install>/agents/researcher/`), whether or not that directory exists. Point it elsewhere first. The check sees through symlinks in the part of either path that exists, and on macOS and Windows it ignores letter case. A path whose location cannot be resolved, such as one through a dangling symlink, one that uses `..` after a directory that does not exist yet, or one with an ancestor that cannot be read, also keeps the rename open.
 
 Move or merge that state by hand, then re-run the same rename.
 

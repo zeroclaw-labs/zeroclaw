@@ -1591,11 +1591,11 @@ impl FollowerPlan {
     /// once the workspace follower has left nothing at the old one in this
     /// run. When nothing moves, they follow to the new alias's current
     /// workspace once the old location is gone, as long as that workspace
-    /// does not overlap it. While the old files are still there, or whether
-    /// they are cannot be told, a resumed session belongs with them, and an
-    /// overlapping workspace is the workspace follower's conflict to report.
-    /// Rows left in place keep the record open until a later run can
-    /// re-point them.
+    /// is known not to overlap it. While the old files are still there, or
+    /// whether they are cannot be told, a resumed session belongs with them,
+    /// and a workspace that overlaps it, or may, is the workspace follower's
+    /// to report. Rows left in place keep the record open until a later run
+    /// can re-point them.
     async fn acp_destination(
         &self,
         config: &Config,
@@ -1814,49 +1814,132 @@ async fn same_place(a: &Path, b: &Path) -> std::io::Result<bool> {
 /// Whether the workspaces at `a` and `b` overlap: one is the other, or lies
 /// beneath it. Paths compare component by component once `.` and `..` are
 /// folded, so nothing needs to exist yet, and `workspace2` does not lie
-/// beneath `workspace`. When both exist, one directory reached both ways,
-/// or one beneath the other once symlinks are resolved, overlaps as well.
+/// beneath `workspace`. They are then compared again where each one leads
+/// on disk, so neither a symlink in the part of either path that exists
+/// nor, on macOS and Windows, letter case can hide an overlap, and one
+/// directory reached both ways overlaps as well. A path whose location
+/// cannot be resolved yet is an error: see [`resolved_location`].
 async fn workspaces_overlap(a: &Path, b: &Path) -> std::io::Result<bool> {
     let (lexical_a, lexical_b) = (lexically_normalized(a), lexically_normalized(b));
     if lexical_a.starts_with(&lexical_b) || lexical_b.starts_with(&lexical_a) {
         return Ok(true);
     }
     let (a, b) = (a.to_path_buf(), b.to_path_buf());
-    match tokio::task::spawn_blocking(move || existing_paths_overlap(&a, &b)).await {
+    match tokio::task::spawn_blocking(move || resolved_paths_overlap(&a, &b)).await {
         Ok(overlap) => overlap,
         Err(e) => Err(std::io::Error::other(e)),
     }
 }
 
-/// Whether `a` and `b` both exist and are one file or directory, or one lies
-/// beneath the other once both are canonicalized. Either missing is no
-/// overlap; a path that cannot be inspected for any other reason is an
-/// error.
-fn existing_paths_overlap(a: &Path, b: &Path) -> std::io::Result<bool> {
+/// Whether `a` and `b` are one existing file or directory, or one lies
+/// beneath the other once each is resolved with [`resolved_location`],
+/// whether or not either exists yet. A path that cannot be inspected or
+/// resolved is an error.
+fn resolved_paths_overlap(a: &Path, b: &Path) -> std::io::Result<bool> {
     if same_existing_file(a, b)? {
         return Ok(true);
     }
-    let (Some(a), Some(b)) = (existing_canonical(a)?, existing_canonical(b)?) else {
-        return Ok(false);
-    };
-    Ok(a.starts_with(&b) || b.starts_with(&a))
+    let (a, b) = (resolved_location(a)?, resolved_location(b)?);
+    Ok(is_at_or_beneath(&a, &b) || is_at_or_beneath(&b, &a))
 }
 
-/// `path` with every symlink resolved, or `None` when nothing exists there:
-/// the path is missing, or one of its ancestors is not a directory.
-fn existing_canonical(path: &Path) -> std::io::Result<Option<PathBuf>> {
-    match std::fs::canonicalize(path) {
-        Ok(canonical) => Ok(Some(canonical)),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(None)
+/// Where `path` leads on disk: its deepest existing ancestor with every
+/// symlink resolved, followed by the components beneath it that do not
+/// exist yet, as spelled but without `.`. A relative path none of whose
+/// ancestors exist hangs off the working directory.
+///
+/// Where the path leads cannot be told, and this is an error, when an
+/// ancestor cannot be inspected, when one is a symlink whose target does not
+/// exist, or when `..` follows a component that does not exist yet: whatever
+/// is created there later, a symlink say, decides where `..` leads.
+fn resolved_location(path: &Path) -> std::io::Result<PathBuf> {
+    let components: Vec<Component<'_>> = path.components().collect();
+    let mut existing = components.len();
+    let mut resolved = loop {
+        let ancestor: PathBuf = match &components[..existing] {
+            [] => PathBuf::from("."),
+            part => part.iter().collect(),
+        };
+        match std::fs::canonicalize(&ancestor) {
+            Ok(resolved) => break resolved,
+            Err(e) if !names_nothing(&e) => return Err(e),
+            Err(_) => {}
         }
-        Err(e) => Err(e),
+        // Something that is there but does not resolve is a symlink whose
+        // target is missing.
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "{} is a symlink whose target does not exist",
+                    ancestor.display()
+                )));
+            }
+            Err(e) if !names_nothing(&e) => return Err(e),
+            Err(_) if existing == 0 => {
+                return Err(std::io::Error::other(format!(
+                    "none of the ancestors of {} exist",
+                    path.display()
+                )));
+            }
+            Err(_) => existing -= 1,
+        }
+    };
+    for component in &components[existing..] {
+        match component {
+            Component::Normal(name) => resolved.push(name),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(std::io::Error::other(format!(
+                    "cannot resolve {}: `..` follows a component that is not an existing directory",
+                    path.display()
+                )));
+            }
+            // Only reachable when the path's own root does not exist.
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(std::io::Error::other(format!(
+                    "the root of {} does not exist",
+                    path.display()
+                )));
+            }
+        }
     }
+    Ok(resolved)
+}
+
+/// Whether `e` says nothing exists at a path: it is missing, or one of its
+/// ancestors is not a directory.
+fn names_nothing(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Whether `path` is `base` or lies beneath it, compared component by
+/// component. The default filesystems of macOS and Windows ignore letter
+/// case, and [`resolved_location`] gives existing components their on-disk
+/// case but keeps missing ones as configured, so there components that
+/// differ only in case match. On a volume that is case-sensitive after all,
+/// that can only report an overlap that is not there, which keeps the
+/// rename open.
+fn is_at_or_beneath(path: &Path, base: &Path) -> bool {
+    let mut components = path.components();
+    base.components().all(|expected| {
+        components
+            .next()
+            .is_some_and(|component| same_component(component, expected))
+    })
+}
+
+/// Whether two path components are spelled alike: case-insensitively for
+/// UTF-8 components on macOS and Windows, as [`is_at_or_beneath`] explains,
+/// and exactly otherwise.
+fn same_component(a: Component<'_>, b: Component<'_>) -> bool {
+    #[cfg(any(target_os = "macos", windows))]
+    if let (Some(a), Some(b)) = (a.as_os_str().to_str(), b.as_os_str().to_str()) {
+        return a.to_lowercase() == b.to_lowercase();
+    }
+    a == b
 }
 
 /// `path` with the symlinks in its existing part resolved. A path that no

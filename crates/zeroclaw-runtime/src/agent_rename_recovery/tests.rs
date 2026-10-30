@@ -1076,6 +1076,228 @@ async fn a_custom_workspace_overlapping_the_old_default_keeps_the_record() {
     assert_eq!(retired_alias(&after, FROM).unwrap(), None);
 }
 
+/// Create the install directory `<tmp>/install` and a symlink to it,
+/// `<tmp>/install-link`, and return the default workspace of `FROM` spelled
+/// through each. Nothing beneath the install exists.
+#[cfg(unix)]
+fn workspace_through_a_link(tmp: &TempDir) -> (PathBuf, PathBuf) {
+    let install = tmp.path().join("install");
+    std::fs::create_dir(&install).unwrap();
+    let link = tmp.path().join("install-link");
+    std::os::unix::fs::symlink(&install, &link).unwrap();
+    let workspace = |root: &Path| root.join("agents").join(FROM).join("workspace");
+    (workspace(&install), workspace(&link))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_missing_workspace_beneath_the_old_default_through_a_symlink_keeps_the_record() {
+    let tmp = TempDir::new().unwrap();
+    let (old, linked_old) = workspace_through_a_link(&tmp);
+    let mut before = fixture(&tmp, &[FROM]);
+    before.config_path = tmp.path().join("install").join("config.toml");
+    assert_eq!(before.default_agent_workspace_dir(FROM), old);
+    // The old alias has a custom workspace that does not exist yet, spelled
+    // through the link, beneath where its default workspace would be. The
+    // rename hands it to the new alias unchanged. Neither path exists, so
+    // only resolving the link shows that they overlap.
+    let custom = linked_old.join("project");
+    before.agents.get_mut(FROM).unwrap().workspace.path = Some(custom.clone());
+    let after = arm_and_commit(&before).await;
+    assert_eq!(after.agent_workspace_dir(TO), custom);
+    assert!(!old.exists());
+    assert!(!custom.exists());
+
+    let outcome = converge(&after, FROM, TO, &SurfaceStores::none())
+        .await
+        .unwrap();
+    let issues = outstanding(&outcome);
+    assert_eq!(issues.len(), 1, "{:?}", outcome.warnings());
+    assert_eq!(issues[0].follower, FollowerKind::Workspace);
+    assert_eq!(issues[0].kind, FollowerIssueKind::Conflict);
+    assert_eq!(
+        issues[0].to_string(),
+        format!(
+            "the workspace.path of agent `{TO}` is or overlaps the old default workspace of `{FROM}`; point workspace.path elsewhere, then re-run the rename"
+        )
+    );
+    assert!(!outcome.report().workspace_moved);
+    assert_eq!(records(&after).len(), 1);
+    assert!(retired_alias(&after, FROM).unwrap().is_some());
+    let mut recreated = after.clone();
+    assert!(
+        matches!(
+            alias_refs::create_map_key_checked(&mut recreated, "agents", FROM),
+            Err(alias_refs::CreateError::Retired { .. })
+        ),
+        "the old alias stays retired while the new workspace lies in its default one"
+    );
+    assert!(!old.exists(), "nothing was created");
+
+    // Once the new alias creates its workspace, it lies inside the one an
+    // agent re-created under the old alias would take as its own.
+    std::fs::create_dir_all(&custom).unwrap();
+    assert!(
+        std::fs::canonicalize(&custom)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(&old).unwrap())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_ancestor_cannot_hide_an_overlap_between_missing_paths() {
+    let tmp = TempDir::new().unwrap();
+    let (old, linked_old) = workspace_through_a_link(&tmp);
+    let parent = |path: &Path| path.parent().unwrap().to_path_buf();
+    // At the old default workspace, beneath it, or containing it, with the
+    // link on either side and in either argument.
+    let pairs = [
+        (linked_old.clone(), old.clone()),
+        (linked_old.join("project"), old.clone()),
+        (old.join("project"), linked_old.clone()),
+        (parent(&linked_old), old.clone()),
+        (parent(&old), linked_old.clone()),
+    ];
+    for (a, b) in &pairs {
+        for (a, b) in [(a, b), (b, a)] {
+            assert!(
+                workspaces_overlap(a, b).await.unwrap(),
+                "{} and {}",
+                a.display(),
+                b.display()
+            );
+        }
+    }
+    assert!(!parent(&parent(&old)).exists(), "nothing was created");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_ancestor_keeps_disjoint_missing_paths_apart() {
+    let tmp = TempDir::new().unwrap();
+    let (old, linked_old) = workspace_through_a_link(&tmp);
+    let linked_agents = linked_old.parent().unwrap().parent().unwrap();
+    // Another alias's workspace, and a sibling whose name merely starts
+    // like the old default workspace.
+    for custom in [
+        linked_agents.join(TO).join("workspace"),
+        linked_agents.join(FROM).join("workspace2"),
+    ] {
+        for (a, b) in [(&custom, &old), (&old, &custom)] {
+            assert!(
+                !workspaces_overlap(a, b).await.unwrap(),
+                "{} and {}",
+                a.display(),
+                b.display()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_overlap_past_dotdot_in_the_missing_part_cannot_be_ruled_out() {
+    let tmp = TempDir::new().unwrap();
+    let old = tmp.path().join("agents").join(FROM).join("workspace");
+    // Folded, this is `<tmp>/project`, but on Unix `..` steps out of
+    // whatever `link` turns out to be once it is created.
+    let custom = tmp.path().join("link").join("..").join("project");
+    for (a, b) in [(&custom, &old), (&old, &custom)] {
+        let result = workspaces_overlap(a, b).await;
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    // Created as a symlink into the old default workspace, it leads there.
+    std::fs::create_dir_all(old.join("inner")).unwrap();
+    std::os::unix::fs::symlink(old.join("inner"), tmp.path().join("link")).unwrap();
+    assert!(workspaces_overlap(&custom, &old).await.unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_overlap_through_a_dangling_symlink_cannot_be_ruled_out() {
+    let tmp = TempDir::new().unwrap();
+    let old = tmp.path().join("agents").join(FROM).join("workspace");
+    // A link to the old default workspace, which does not exist yet.
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&old, &link).unwrap();
+    for custom in [link.clone(), link.join("project")] {
+        for (a, b) in [(&custom, &old), (&old, &custom)] {
+            let result = workspaces_overlap(a, b).await;
+            assert!(result.is_err(), "{}: {result:?}", custom.display());
+        }
+    }
+
+    // Once its target exists, the link leads into it.
+    std::fs::create_dir_all(&old).unwrap();
+    assert!(
+        workspaces_overlap(&link.join("project"), &old)
+            .await
+            .unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_overlap_through_an_unreadable_directory_cannot_be_ruled_out() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root can search any directory");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let old = tmp.path().join("agents").join(FROM).join("workspace");
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let custom = locked.join("project");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let overlap = workspaces_overlap(&custom, &old).await;
+    let resolved = resolved_location(&custom);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        overlap.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        resolved.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn paths_differing_only_in_case_overlap_where_the_filesystem_ignores_case() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("Install")).unwrap();
+    let old = tmp
+        .path()
+        .join("Install")
+        .join("agents")
+        .join(FROM)
+        .join("workspace");
+    // Where case is ignored, the existing `INSTALL` resolves to `Install`
+    // and the missing rest keeps the case it is given.
+    let custom = tmp
+        .path()
+        .join("INSTALL")
+        .join("AGENTS")
+        .join("Scout")
+        .join("workspace")
+        .join("project");
+    let overlap = workspaces_overlap(&custom, &old).await.unwrap();
+    #[cfg(any(target_os = "macos", windows))]
+    assert!(overlap, "{} lies in {}", custom.display(), old.display());
+    #[cfg(not(any(target_os = "macos", windows)))]
+    assert!(
+        !overlap,
+        "{} is apart from {}",
+        custom.display(),
+        old.display()
+    );
+}
+
 #[tokio::test]
 async fn a_recorded_workspace_outside_this_install_is_never_moved() {
     let tmp = TempDir::new().unwrap();
@@ -2211,6 +2433,59 @@ async fn saved_sessions_stay_while_the_new_workspace_overlaps_the_old_one() {
         ("other".to_string(), unrelated)
     );
     assert!(records(&after).is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn saved_sessions_stay_while_the_new_workspace_overlaps_the_old_one_through_a_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let (old, linked_old) = workspace_through_a_link(&tmp);
+    let mut before = fixture(&tmp, &[FROM]);
+    before.config_path = tmp.path().join("install").join("config.toml");
+    assert_eq!(before.default_agent_workspace_dir(FROM), old);
+    seed_acp(&before, "at-old", FROM, &old);
+    seed_acp(&before, "under-old", FROM, &old.join("sub"));
+    let mut after = arm_and_commit(&before).await;
+    // Neither workspace exists, and the new one is spelled through the
+    // link, so only resolving the link shows that it lies in the old one.
+    let custom = linked_old.join("proj");
+    after.agents.get_mut(TO).unwrap().workspace.path = Some(custom.clone());
+
+    let outcome = converge(&after, FROM, TO, &SurfaceStores::none())
+        .await
+        .unwrap();
+    let issues: Vec<(FollowerKind, String)> = outstanding(&outcome)
+        .iter()
+        .map(|issue| (issue.follower, issue.to_string()))
+        .collect();
+    assert_eq!(
+        issues,
+        vec![
+            (
+                FollowerKind::Workspace,
+                format!(
+                    "the workspace.path of agent `{TO}` is or overlaps the old default workspace of `{FROM}`; point workspace.path elsewhere, then re-run the rename"
+                ),
+            ),
+            (
+                FollowerKind::Acp,
+                format!(
+                    "saved session working directories still point at the old default workspace of `{FROM}`"
+                ),
+            ),
+        ],
+        "no relocation into the overlapping workspace was attempted"
+    );
+    assert_eq!(outcome.report().acp_sessions, 2, "the owner still follows");
+    assert_eq!(outcome.report().acp_workspaces, 0);
+    assert_eq!(acp_row(&after, "at-old"), (TO.to_string(), old.clone()));
+    assert_eq!(
+        acp_row(&after, "under-old"),
+        (TO.to_string(), old.join("sub"))
+    );
+    assert_eq!(records(&after).len(), 1);
+    assert!(!old.exists());
+    assert!(!custom.exists());
 }
 
 #[tokio::test]
