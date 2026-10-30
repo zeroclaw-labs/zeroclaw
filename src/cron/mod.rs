@@ -112,18 +112,30 @@ fn cron_update_payload_confirmation(
     }
 }
 
-/// Short stable prefix of a job id for compact run-history rows.
-fn short_job_id(job_id: &str) -> &str {
-    job_id.get(..8).unwrap_or(job_id)
+/// Render terminal control characters as harmless visible text (e.g. `\r`,
+/// `\u{1b}`) so retained output from shell jobs cannot move the cursor, erase
+/// rows, or inject ANSI styling into the operator's terminal. Printable text,
+/// including backslashes, passes through unchanged.
+fn escape_terminal_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_control() {
+            out.extend(ch.escape_debug());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
-/// First line of a run's output, capped at 80 chars, with a marker when the
-/// preview had to drop output.
+/// First line of a run's output, with terminal controls escaped, capped at 80
+/// chars, with a marker when the preview had to drop output.
 fn output_preview(output: &str) -> String {
     const PREVIEW_MAX_CHARS: usize = 80;
-    let first_line = output.lines().next().unwrap_or("");
+    let escaped = escape_terminal_controls(output);
+    let first_line = escaped.lines().next().unwrap_or("");
     let truncated =
-        first_line.chars().count() > PREVIEW_MAX_CHARS || output.lines().nth(1).is_some();
+        first_line.chars().count() > PREVIEW_MAX_CHARS || escaped.lines().nth(1).is_some();
     let preview: String = first_line.chars().take(PREVIEW_MAX_CHARS).collect();
     if truncated {
         format!("{preview}…")
@@ -132,8 +144,8 @@ fn output_preview(output: &str) -> String {
     }
 }
 
-/// Render one `cron runs` row: UTC start, short job id, status, duration, and
-/// a one-line output preview. Data-only line, matching `cron list` row style.
+/// Render one `cron runs` row: UTC start, job id, status, duration, and a
+/// one-line output preview. Data-only line, matching `cron list` row style.
 fn format_run_line(run: &CronRun) -> String {
     let duration = run
         .duration_ms
@@ -147,7 +159,7 @@ fn format_run_line(run: &CronRun) -> String {
     format!(
         "- {} | {} | {} | {}ms | {}",
         run.started_at.to_rfc3339(),
-        short_job_id(&run.job_id),
+        run.job_id,
         run.status,
         duration,
         preview,
@@ -1491,12 +1503,11 @@ mod tests {
     }
 
     #[test]
-    fn cron_runs_line_renders_fields_and_short_job_id() {
+    fn cron_runs_line_renders_fields_and_full_job_id() {
         let run = sample_run(Some("first line of output"), Some(1500));
         let line = format_run_line(&run);
         assert!(line.contains("2026-10-19T08:30:00+00:00"), "line: {line}");
-        assert!(line.contains("abcdef12"), "line: {line}");
-        assert!(!line.contains("abcdef1234567890"), "line: {line}");
+        assert!(line.contains("abcdef1234567890"), "line: {line}");
         assert!(line.contains("ok"), "line: {line}");
         assert!(line.contains("1500ms"), "line: {line}");
         assert!(line.contains("first line of output"), "line: {line}");
@@ -1524,8 +1535,30 @@ mod tests {
     }
 
     #[test]
-    fn cron_runs_short_job_id_handles_short_ids() {
-        assert_eq!(short_job_id("abc"), "abc");
-        assert_eq!(short_job_id("123456789"), "12345678");
+    fn cron_runs_preview_escapes_terminal_controls() {
+        // A carriage return from progress-style output must render as visible
+        // text, not move the cursor back over the history row.
+        let preview = output_preview("progress\rfinished");
+        assert!(!preview.contains('\r'), "preview: {preview}");
+        assert!(
+            preview.contains("progress\\rfinished"),
+            "preview: {preview}"
+        );
+
+        // An ANSI colour/reset sequence must not reach the terminal.
+        let preview = output_preview("\u{1b}[31mred\u{1b}[0m");
+        assert!(!preview.contains('\u{1b}'), "preview: {preview}");
+        assert!(preview.contains("\\u{1b}[31m"), "preview: {preview}");
+
+        // The whole row stays a single intact line even with embedded controls.
+        let line = format_run_line(&sample_run(Some("progress\rfinished"), Some(1)));
+        assert!(!line.contains('\r'), "line: {line}");
+        assert!(line.contains("progress\\rfinished"), "line: {line}");
+    }
+
+    #[test]
+    fn cron_runs_preview_keeps_unicode_and_backslashes_unescaped() {
+        let preview = output_preview("Путь C:\\Users\\tmp готов");
+        assert_eq!(preview, "Путь C:\\Users\\tmp готов");
     }
 }
