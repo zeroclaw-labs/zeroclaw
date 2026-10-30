@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use super::reaper;
 use super::task_registry::TaskRegistry;
 use super::task_store_sqlite::SqliteTaskStore;
+use zeroclaw_goal::control::GoalExecutionRestartCoordinator;
 
 /// The live control-plane, shared (cheaply, via `Arc`/clone) across producers and
 /// the reaper.
@@ -17,6 +18,12 @@ use super::task_store_sqlite::SqliteTaskStore;
 pub struct ControlPlaneHandle {
     pub store: Arc<dyn TaskRegistry>,
     pub boot_id: String,
+    /// Process-local Goal executor coordination for this daemon process.
+    ///
+    /// This retains weak executor owners only. It is deliberately separate
+    /// from the durable task store, which remains the sole authority for Goal
+    /// identity, lifecycle, and accounting.
+    pub(crate) goal_execution_restart: Arc<GoalExecutionRestartCoordinator>,
 }
 
 impl ControlPlaneHandle {
@@ -26,7 +33,13 @@ impl ControlPlaneHandle {
         Ok(Self {
             store: Arc::new(SqliteTaskStore::new(data_dir)?),
             boot_id: process_identity().to_string(),
+            goal_execution_restart: Arc::new(GoalExecutionRestartCoordinator::new()),
         })
+    }
+
+    /// Shared process-local coordinator for all transport-owned Goal workers.
+    pub fn goal_execution_restart(&self) -> Arc<GoalExecutionRestartCoordinator> {
+        Arc::clone(&self.goal_execution_restart)
     }
 }
 
@@ -47,8 +60,20 @@ impl ControlPlaneRecoveryOwner {
     /// As [`Self::start`] but with a caller-supplied `boot_id` — lets `DaemonRegistry`
     /// reuse a process-stable run-id across reloads instead of a fresh UUID.
     pub(crate) async fn start_with_boot_id(data_dir: &Path, boot_id: String) -> Result<Self> {
-        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new(data_dir)?);
+        let sqlite_store = SqliteTaskStore::new(data_dir)?;
+        let reconciled_goals = sqlite_store.reconcile_goal_boot_state(&boot_id)?;
+        let store: Arc<dyn TaskRegistry> = Arc::new(sqlite_store);
         let reclaimed = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
+        if reconciled_goals > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({ "reconciled_goals": reconciled_goals, "boot_id": boot_id })
+                    ),
+                "control-plane: reconciled interrupted goals at startup"
+            );
+        }
         if reclaimed > 0 {
             ::zeroclaw_log::record!(
                 INFO,
@@ -60,7 +85,11 @@ impl ControlPlaneRecoveryOwner {
             );
         }
         Ok(Self {
-            handle: ControlPlaneHandle { store, boot_id },
+            handle: ControlPlaneHandle {
+                store,
+                boot_id,
+                goal_execution_restart: Arc::new(GoalExecutionRestartCoordinator::new()),
+            },
         })
     }
 
@@ -156,6 +185,8 @@ mod tests {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-06-18T00:00:00Z".into(),
                 finished_at: None,
             })
@@ -192,6 +223,8 @@ mod tests {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-06-18T00:00:00Z".into(),
                 finished_at: None,
             })
@@ -234,6 +267,8 @@ mod tests {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-06-18T00:00:00Z".into(),
                 finished_at: None,
             })
@@ -341,6 +376,8 @@ mod tests {
                 delivered: false,
                 idem_key: None,
                 principal_id: None,
+                session_id: None,
+                execution_epoch: 0,
                 started_at: "2026-06-18T00:00:00Z".into(),
                 finished_at: None,
             })
