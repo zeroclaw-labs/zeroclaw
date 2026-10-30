@@ -1237,6 +1237,10 @@ impl ScopedToolRegistry {
                 .filter(|(_, tool)| {
                     builtin_names.contains(tool.name())
                         && !EAGER_BUILTINS.contains(&tool.name())
+                        // Session-prompt visibility is admitted per turn. A
+                        // registry-lived discovery catalog cannot carry that
+                        // capability; leave these schemas to the turn filter.
+                        && !tools::SESSION_PROMPT_TOOL_NAMES.contains(&tool.name())
                         && tool.name() != "tool_search"
                 })
                 .map(|(id, tool)| {
@@ -1977,6 +1981,43 @@ mod tests {
         let activated = assembled.activated_handle.as_ref().unwrap().lock().unwrap();
         assert!(activated.get("calendar").is_none());
         assert!(activated.tool_specs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_prompt_schemas_stay_out_of_deferred_discovery() {
+        let config = builtin_deferral_config(true);
+        let security = Arc::new(SecurityPolicy::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let assembled = assemble_builtin_catalog(
+            &config,
+            &security,
+            built_with_counting_tools(
+                calls,
+                &[
+                    "calendar",
+                    "session_prompt_list",
+                    "session_prompt_set",
+                    "session_prompt_delete",
+                ],
+            ),
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(
+            assembled.registry.hidden_builtin_names(),
+            HashSet::from(["calendar".to_string()])
+        );
+        let search = assembled.tool_search_handle.as_ref().unwrap();
+        assert!(!search.deferred_prompt_section().contains("session_prompt_"));
+        for name in tools::SESSION_PROMPT_TOOL_NAMES {
+            assert!(assembled.registry.iter().any(|tool| tool.name() == name));
+            let result = search
+                .execute(serde_json::json!({"query": format!("select:{name}")}))
+                .await
+                .unwrap();
+            assert!(search_schemas(&result).is_empty());
+        }
     }
 
     #[tokio::test]
