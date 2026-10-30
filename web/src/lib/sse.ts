@@ -1,5 +1,6 @@
 import type { SSEEvent } from '../types/api';
-import { getToken } from './auth';
+import { AUTH_EVENTS, getAuthMode, getToken, isReauthPending } from './auth';
+import { failureReason } from './authSession';
 import { apiOrigin, basePath } from './basePath';
 
 export type SSEEventHandler = (event: SSEEvent) => void;
@@ -31,6 +32,9 @@ export class SSEClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private currentDelay: number;
   private intentionallyClosed = false;
+  // Stopped by a signed-in session's 401/403. Reconnecting would only be
+  // refused, so the stream waits for the auth layer to report a usable session.
+  private haltedForAuth = false;
 
   public onEvent: SSEEventHandler | null = null;
   public onError: SSEErrorHandler | null = null;
@@ -52,9 +56,12 @@ export class SSEClient {
   /** Start consuming the event stream. */
   connect(): void {
     this.intentionallyClosed = false;
+    this.haltedForAuth = false;
     this.clearReconnectTimer();
     this.controller = new AbortController();
+    window.addEventListener(AUTH_EVENTS.resumed, this.handleAuthResumed);
 
+    const mode = getAuthMode();
     const token = getToken();
     const headers: Record<string, string> = {
       Accept: 'text/event-stream',
@@ -67,7 +74,11 @@ export class SSEClient {
       headers,
       signal: this.controller.signal,
     })
-      .then((response) => {
+      .then(async (response) => {
+        if (mode === 'oidc' && (response.status === 401 || response.status === 403)) {
+          this.haltForAuth(response.status, await response.text().catch(() => ''));
+          return;
+        }
         if (!response.ok) {
           throw new Error(`SSE connection failed: ${response.status}`);
         }
@@ -92,7 +103,9 @@ export class SSEClient {
   /** Stop consuming events without auto-reconnecting. */
   disconnect(): void {
     this.intentionallyClosed = true;
+    this.haltedForAuth = false;
     this.clearReconnectTimer();
+    window.removeEventListener(AUTH_EVENTS.resumed, this.handleAuthResumed);
     if (this.controller) {
       this.controller.abort();
       this.controller = null;
@@ -168,8 +181,36 @@ export class SSEClient {
   // Reconnection logic
   // ---------------------------------------------------------------------------
 
+  /**
+   * A signed-in session was refused: 401 asks for re-auth (expired) or signs
+   * out, 403 means this account can't read the stream. None of them is retried.
+   */
+  private haltForAuth(status: number, body: string): void {
+    this.haltedForAuth = true;
+    if (status === 401) {
+      window.dispatchEvent(
+        new Event(
+          failureReason(body) === 'session_expired'
+            ? AUTH_EVENTS.reauth
+            : AUTH_EVENTS.unauthorized,
+        ),
+      );
+    }
+  }
+
+  private readonly handleAuthResumed = (): void => {
+    if (!this.haltedForAuth || this.intentionallyClosed) return;
+    this.currentDelay = this.reconnectDelay;
+    this.connect();
+  };
+
   private scheduleReconnect(): void {
     if (this.intentionallyClosed || !this.autoReconnect) return;
+    // Waiting for a new sign-in: resume on `AUTH_EVENTS.resumed` instead.
+    if (isReauthPending()) {
+      this.haltedForAuth = true;
+      return;
+    }
 
     this.reconnectTimer = setTimeout(() => {
       this.currentDelay = Math.min(this.currentDelay * 2, this.maxReconnectDelay);

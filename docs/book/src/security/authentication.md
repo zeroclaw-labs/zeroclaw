@@ -272,9 +272,10 @@ the opening window via `postMessage` (same-origin only) with a manual
 copy fallback. The gateway also sends
 `Cross-Origin-Opener-Policy: same-origin`, which severs `window.opener`
 once the popup has navigated through the identity provider, so in
-current browsers the manual copy on that page is the handoff that works
-today and the `postMessage` contract is in place for the dashboard
-follow-up. These routes are unauthenticated by necessity
+current browsers the manual copy on that page is the handoff that works.
+The dashboard itself does not use that page: its sign-in keeps the token
+in the gateway behind a session cookie (see
+[Dashboard sign-in](#dashboard-sign-in)). These routes are unauthenticated by necessity
 (enrollment precedes authentication), rate limited, and grant nothing:
 they only relay what the IdP grants after the user approves. Design
 rationale and failure-mode table:
@@ -514,7 +515,132 @@ settings, a roster or a profile takes effect on the next request. The
 daemon's own RPC surface holds a separate live configuration and
 reaches the same state through the reload the gateway write flags.
 Other gateway surfaces keep the pairing check per handler and adopt the
-layer in follow-ups.
+layer in follow-ups; a [dashboard sign-in](#dashboard-sign-in) session
+also satisfies that check when its account is an administrator.
+
+## Dashboard sign-in
+
+The web dashboard can offer sign-in through a configured OIDC provider
+instead of, or alongside, a pairing code. It is off by default: an
+install without `[gateway.dashboard_sign_in]` shows the pairing dialog
+exactly as before, and a session cookie sent to it is ignored.
+
+```toml
+[gateway]
+require_pairing = true
+
+[gateway.dashboard_sign_in]
+oidc = ["corp"]                # [oidc.<alias>] entries offered on the sign-in screen
+session_lifetime_secs = 28800  # optional cap on one session (300..=604800, default 8 h)
+```
+
+Turning it on needs:
+
+- `gateway.require_pairing = true`. With pairing off every dashboard
+  route is open to whoever reaches the gateway, so the config is refused.
+  The official Docker image writes `require_pairing = false` into its
+  default config; set it to `true` there, or with
+  `ZEROCLAW_gateway__require_pairing=true`.
+- HTTPS (`[gateway.tls]`, or a reverse proxy with
+  `trust_forwarded_headers`). Sign-in is refused over plain HTTP unless
+  the browser runs on the gateway's own machine.
+- Behind a reverse proxy, the browser's `Host` passed through unchanged
+  (for example `proxy_set_header Host $host;` in nginx). The callback URI
+  and the dashboard's own origin are both taken from it, so a proxy that
+  rewrites `Host` to an internal name breaks sign-in and gets every
+  signed-in change refused as coming from another origin.
+- An identity provider client that uses Authorization Code with PKCE
+  (S256), with `<dashboard origin><path_prefix>/oidc/callback` as a
+  redirect URI (the same URI as the browser enrollment relay above).
+  Its client must be listed in `interactive_clients` (or classified by
+  `actor_claim`), and its access tokens must carry the configured
+  `audience`.
+- An access-token lifetime that suits a working session, such as one to
+  eight hours. The dashboard does not use refresh tokens: when the token
+  expires the user signs in again.
+
+When a user picks a provider, the gateway runs the browser flow and
+binds it to that browser with a short-lived cookie, so a sign-in started
+elsewhere cannot be finished there. The ID token is required and
+validated as evidence of the sign-in (issuer, audience, authorized
+party, expiry, nonce) and then discarded. The access token is verified by
+the provider exactly as an RPC bearer is, and the account is the one it
+resolves to; the ID token's subject is not compared with it, since both
+come from the same back-channel exchange. A service client is never
+given a dashboard session. The token then stays in the gateway's memory:
+the browser holds only an opaque `HttpOnly`, `SameSite=Strict` session
+cookie (`Secure` over HTTPS), and no token reaches browser storage or
+script.
+
+Every request carrying the cookie is checked again against the same
+authority RPC uses: the token's expiry, the introspection revalidation
+deadline, and the grants the account holds under the policy in force
+now. A changed profile mapping, a removed provider, or an alias taken off
+`gateway.dashboard_sign_in.oidc` takes effect on the next request. A
+request that changes state must also send the session's CSRF token in
+`X-ZeroClaw-CSRF`, and requests and WebSocket upgrades that carry the
+cookie must come from the dashboard's own origin. A request with an
+`Authorization` header is judged by that header alone.
+
+What a signed-in account can do follows its permission profile:
+
+- An account whose profile has `admin = true` is operator-equivalent and
+  reaches every dashboard page, as a paired browser does. Each sign-in is
+  logged with the principal it resolved to. Conversations it starts in
+  the dashboard chat belong to the shared operator, as paired browsers'
+  do.
+- Any other account reaches the configuration pages its `Config` grants
+  allow. Other pages answer 403 with `"reason": "operator_required"`, and
+  the dashboard hides them. Use zerocode for that account's own chat
+  sessions.
+
+Sign-out ends the session in this ZeroClaw and drops its cookie, also
+when the session had already ended; it does not sign the user out of the
+identity provider. When a session ends (sign-out, expiry, or a
+check it fails) or loses the access a page needs, that page's sockets and
+event streams close at once. A chat turn already running finishes
+unattended, as when a viewer leaves, and a tool approval it was waiting
+on is refused; nothing the closed socket sent afterwards is acted on. A
+reload also closes the sockets a session opened, and the dashboard
+reconnects them under the new configuration. A request that still reaches
+the gateway generation being replaced, over a connection that stayed
+open, is answered `503` with `"reason": "gateway_restarting"`, and the
+dashboard retries it.
+
+Sessions are held in memory, and a session's token is wiped when the
+session ends. Expired sessions are swept every minute even when no
+request arrives. A daemon restart signs everyone out, while a reload
+keeps sessions and verifies each one again against the new configuration
+before its next use. At most 256 sessions
+are held at once, eight per account; at the cap a new sign-in is refused
+rather than signing somebody else out.
+
+Things to know before turning it on:
+
+- Pairing keeps working alongside sign-in, and stays the way back in if
+  the identity provider is unreachable. The desktop app keeps pairing.
+- An administrator can pair devices from the dashboard like any operator.
+  Removing their access at the identity provider does not revoke devices
+  they paired; revoke those on the pairing page.
+- Conversations and memory created before sign-in belong to the shared
+  operator. Accounts without `admin` never see them.
+- Over plain HTTP on the gateway's own machine, browsers do not keep
+  cookies apart by port, so any other local web server the browser visits
+  is sent the session cookie. Use HTTPS, or sign in only from a browser
+  you don't use for other local development servers.
+- Taking a provider off `gateway.dashboard_sign_in.oidc`, or emptying it,
+  ends the sessions it issued: at the next request, and within a minute
+  if none arrives (at once when a reload applies the change). Offering it
+  again does not bring them back, except when it is offered again within
+  that minute with no request in between. If the `[oidc.<alias>]` entry is pointed at another issuer or
+  client, its sessions end as well, without their tokens being sent to
+  the new provider.
+- `session_lifetime_secs` caps sessions that start after it is set;
+  sessions already signed in keep the cap they started with. To end them
+  sooner, take the provider off `gateway.dashboard_sign_in.oidc`.
+- With introspection, an identity provider that cannot be reached when a
+  session is due for revalidation ends that session (it fails closed);
+  users sign in again once the provider is back.
 
 ## Credential lifecycle
 
@@ -659,8 +785,10 @@ private sessions, and administrative access into another principal's
 private memory has no surfaced pathway yet (deny-by-default).
 `sops/runs` and `sops/run-detail` return the run history of every
 procedure to a principal holding `Sops:Read`, whichever agents it ran as,
-unlike cron history. Gateway HTTP routes keep their existing pairing
-checks, and channel identities do not resolve into this principal model.
+unlike cron history. Gateway HTTP routes outside the configuration
+group keep their existing pairing checks, which a dashboard sign-in
+satisfies only for an administrator, and channel identities do not
+resolve into this principal model.
 
 While `security.trust_daemon_uid = true` (the default) and the policy
 compiles, the daemon's own uid on a Unix socket keeps full access, so a

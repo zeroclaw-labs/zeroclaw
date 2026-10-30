@@ -20,6 +20,8 @@ import {
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import { loadConfigSearchItems, type ConfigSearchItem } from '@/lib/configSearch';
+import { useAuth } from '@/hooks/useAuth';
+import { navAccessFor, pathAccess } from '@/lib/navAccess';
 
 // Navigation destinations mirror the Sidebar's grouped nav. They're
 // re-declared locally (rather than imported from Sidebar) to keep the palette
@@ -168,10 +170,15 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
     };
   }, [open]);
 
+  // Only pages the signed-in account can use; every page when paired.
+  const { session } = useAuth();
+
   // All searchable items in one flat list: static pages first, then config
   // sections, then config entries (toPaletteItem assigns the bucket/icon).
   const allItems = useMemo<PaletteItem[]>(() => {
-    const pages: PaletteItem[] = DESTINATIONS.map((d) => ({
+    const access = navAccessFor(session);
+    const destinations = DESTINATIONS.filter((d) => pathAccess(d.to, access) === 'allowed');
+    const pages: PaletteItem[] = destinations.map((d) => ({
       kind: 'page',
       to: d.to,
       label: t(d.labelKey),
@@ -180,7 +187,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
       icon: d.icon,
     }));
     return [...pages, ...configItems.map(toPaletteItem)];
-  }, [configItems]);
+  }, [configItems, session]);
 
   // Filter + sort + bucket + cap. The flat `results` list (header rows
   // interleaved) is what we render; `items` (no headers) is the keyboard-
