@@ -4061,6 +4061,160 @@ mod tests {
         }
     }
 
+    async fn assert_stalled_initial_feed_releases_watch(fixture: Fixture, path: &str, end: &str) {
+        use axum::serve::ListenerExt as _;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let (cookie, session) = fixture
+            .auth
+            .sign_in("corp", pin_for(&fixture, "corp"), "at-alice".into(), 3600)
+            .await
+            .expect("an administrator signs in");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Small real TCP buffers make the initial snapshot stall without
+        // depending on the host's default buffer sizes.
+        let listener = listener.tap_io(|stream| {
+            socket2::SockRef::from(&*stream)
+                .set_send_buffer_size(1024)
+                .unwrap();
+        });
+        let service = fixture
+            .router
+            .clone()
+            .into_make_service_with_connect_info::<SocketAddr>();
+        let baseline = Arc::strong_count(&fixture.auth);
+        let served = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, service).await.unwrap();
+        });
+        let client_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        client_socket.set_recv_buffer_size(1024).unwrap();
+        let stream = client_socket.connect(addr).await.unwrap();
+        // The request only reaches this test's loopback listener.
+        let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("cookie", cookie_for(&cookie).parse().unwrap());
+        request
+            .headers_mut()
+            .insert("origin", format!("http://{addr}").parse().unwrap());
+        let (client, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .expect("the dashboard opens its feed");
+        // Keep the client alive without consuming the initial frame.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(Arc::strong_count(&fixture.auth) > baseline);
+        if end == "sign-out" {
+            assert!(fixture.auth.end(&session));
+        } else {
+            fixture.state.shutdown_tx.send_replace(true);
+        }
+        let released = tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&fixture.auth) > baseline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok();
+        drop(client);
+        served.abort();
+        assert!(
+            released,
+            "{path}, {end}: the stalled initial frame kept its session watch"
+        );
+    }
+
+    /// The first snapshot can fill the transport before the client starts
+    /// reading. Session cancellation must still release the socket's watch.
+    #[tokio::test]
+    async fn a_stalled_initial_canvas_frame_releases_its_session_watch() {
+        let server = idp(&["admins"], "gw").await;
+        for end in ["sign-out", "reload"] {
+            let fixture = fixture(sign_in_config(&server.uri()));
+            // The accepted content limit is measured before JSON escaping.
+            // Control characters keep this legal while filling the transport.
+            fixture.state.canvas_store.render(
+                "initial",
+                "text",
+                &"\0".repeat(zeroclaw_runtime::tools::MAX_CONTENT_SIZE),
+            );
+            assert_stalled_initial_feed_releases_watch(fixture, "/ws/canvas/initial", end).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_initial_sop_snapshot_releases_its_session_watch() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopEngine, SopEvent, SopExecutionMode, SopPriority, SopRunAction, SopStep,
+            SopTrigger, SopTriggerSource,
+        };
+
+        let server = idp(&["admins"], "gw").await;
+        for end in ["sign-out", "reload"] {
+            let config = sign_in_config(&server.uri());
+            let mut engine = SopEngine::new(zeroclaw_config::schema::SopConfig {
+                max_finished_runs: 0,
+                ..Default::default()
+            });
+            engine.set_sops_for_test(vec![Sop {
+                name: "snapshot".into(),
+                description: String::new(),
+                version: "1.0.0".into(),
+                priority: SopPriority::Normal,
+                execution_mode: SopExecutionMode::Supervised,
+                triggers: vec![SopTrigger::Manual],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "approval".into(),
+                    requires_confirmation: true,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 1,
+                location: None,
+                deterministic: false,
+                admission_policy: Default::default(),
+                max_pending_approvals: 0,
+                agent: Some("default".into()),
+                decision: None,
+            }]);
+            // Retaining all terminal runs is supported. Build the initial
+            // snapshot through ordinary start/cancel transitions.
+            for _ in 0..2048 {
+                let action = engine
+                    .start_run(
+                        "snapshot",
+                        SopEvent {
+                            source: SopTriggerSource::Manual,
+                            topic: None,
+                            payload: None,
+                            timestamp: "2026-01-01T00:00:00Z".into(),
+                        },
+                    )
+                    .unwrap();
+                let SopRunAction::WaitApproval { run_id, .. } = action else {
+                    panic!("the test run must wait for approval");
+                };
+                engine.cancel_run(&run_id).unwrap();
+            }
+            assert!(
+                serde_json::to_vec(&engine.run_summaries(None))
+                    .unwrap()
+                    .len()
+                    > 256 * 1024
+            );
+            let fixture = build_generation(
+                config.clone(),
+                pairing_for(&config),
+                inbound_for(&config),
+                Arc::new(DashboardSessions::default()),
+                None,
+                Some(Arc::new(std::sync::Mutex::new(engine))),
+            );
+            assert_stalled_initial_feed_releases_watch(fixture, "/ws/sop/runs", end).await;
+        }
+    }
+
     /// Each generation's idle sweep stops when that generation's sign-in
     /// state is dropped, and the next generation's sweep carries on over
     /// the same store.

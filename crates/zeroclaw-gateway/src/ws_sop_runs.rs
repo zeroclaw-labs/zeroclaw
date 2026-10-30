@@ -94,50 +94,52 @@ async fn handle_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // The SOP subsystem may be disabled; tell the client and close.
-    let Some(engine) = state.sop_engine.as_ref() else {
-        let msg = serde_json::json!({ "type": "disabled" });
-        let _ = sender.send(Message::Text(msg.to_string().into())).await;
-        return;
-    };
-
-    // Snapshot + subscribe under one lock so no transition is missed between
-    // reading the current set and arming the feed. The guard is dropped before
-    // any await (the WS send) so the future stays Send.
-    let locked: Result<
-        (
-            Vec<SopRunSummary>,
-            Option<tokio::sync::broadcast::Receiver<SopRunSummary>>,
-        ),
-        (),
-    > = {
-        match engine.lock() {
-            Ok(guard) => Ok((guard.run_summaries(None), guard.subscribe_run_changes())),
-            Err(_) => Err(()),
-        }
-    };
-    let (snapshot, rx) = match locked {
-        Ok(v) => v,
-        Err(()) => {
-            let msg = serde_json::json!({ "type": "error", "error": "engine lock poisoned" });
+    // Initial frames share the live feed's cancellation path so a stalled
+    // first send cannot hold the session watch after sign-out or reload.
+    let forward = async {
+        // The SOP subsystem may be disabled; tell the client and close.
+        let Some(engine) = state.sop_engine.as_ref() else {
+            let msg = serde_json::json!({ "type": "disabled" });
             let _ = sender.send(Message::Text(msg.to_string().into())).await;
             return;
+        };
+
+        // Snapshot + subscribe under one lock so no transition is missed between
+        // reading the current set and arming the feed. The guard is dropped before
+        // any await (the WS send) so the future stays Send.
+        let locked: Result<
+            (
+                Vec<SopRunSummary>,
+                Option<tokio::sync::broadcast::Receiver<SopRunSummary>>,
+            ),
+            (),
+        > = {
+            match engine.lock() {
+                Ok(guard) => Ok((guard.run_summaries(None), guard.subscribe_run_changes())),
+                Err(_) => Err(()),
+            }
+        };
+        let (snapshot, rx) = match locked {
+            Ok(v) => v,
+            Err(()) => {
+                let msg = serde_json::json!({ "type": "error", "error": "engine lock poisoned" });
+                let _ = sender.send(Message::Text(msg.to_string().into())).await;
+                return;
+            }
+        };
+
+        let msg = serde_json::json!({ "type": "snapshot", "runs": snapshot });
+        if sender
+            .send(Message::Text(msg.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
         }
-    };
 
-    let msg = serde_json::json!({ "type": "snapshot", "runs": snapshot });
-    if sender
-        .send(Message::Text(msg.to_string().into()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    // Forward run changes. It never completes on its own: with no notifier
-    // attached (headless embedder) the snapshot stands, and the socket stays
-    // open until the client leaves rather than closing abruptly.
-    let forward = async {
+        // Forward run changes. It never completes on its own: with no notifier
+        // attached (headless embedder) the snapshot stands, and the socket stays
+        // open until the client leaves rather than closing abruptly.
         let Some(mut rx) = rx else {
             return std::future::pending::<()>().await;
         };
@@ -174,9 +176,10 @@ async fn handle_socket(
     // A dashboard session that ends, or loses its access, ends the feed with
     // the session's close code, with or without a notifier.
     let lost = tokio::select! {
+        biased;
+        code = crate::dashboard_session::session_lost(&mut session_watch, &state) => Some(code),
         () = read_loop => None,
         () = forward => None,
-        code = crate::dashboard_session::session_lost(&mut session_watch, &state) => Some(code),
     };
     if let Some(code) = lost {
         crate::ws::close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;

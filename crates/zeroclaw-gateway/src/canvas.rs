@@ -233,40 +233,42 @@ async fn handle_canvas_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Subscribe to canvas updates
-    let mut rx = match state.canvas_store.subscribe(&canvas_id) {
-        Some(rx) => rx,
-        None => {
+    // Initial frames share the live feed's cancellation path so a stalled
+    // first send cannot hold the session watch after sign-out or reload.
+    let forward = async {
+        // Subscribe to canvas updates
+        let mut rx = match state.canvas_store.subscribe(&canvas_id) {
+            Some(rx) => rx,
+            None => {
+                let msg = serde_json::json!({
+                    "type": "error",
+                    "error": "Maximum canvas count reached",
+                });
+                let _ = sender.send(Message::Text(msg.to_string().into())).await;
+                return;
+            }
+        };
+
+        // Send current state immediately if available
+        if let Some(frame) = state.canvas_store.snapshot(&canvas_id) {
             let msg = serde_json::json!({
-                "type": "error",
-                "error": "Maximum canvas count reached",
+                "type": "frame",
+                "canvas_id": canvas_id,
+                "frame": frame,
             });
             let _ = sender.send(Message::Text(msg.to_string().into())).await;
-            return;
         }
-    };
 
-    // Send current state immediately if available
-    if let Some(frame) = state.canvas_store.snapshot(&canvas_id) {
-        let msg = serde_json::json!({
-            "type": "frame",
+        // Send a connected acknowledgement
+        let ack = serde_json::json!({
+            "type": "connected",
             "canvas_id": canvas_id,
-            "frame": frame,
         });
-        let _ = sender.send(Message::Text(msg.to_string().into())).await;
-    }
+        let _ = sender.send(Message::Text(ack.to_string().into())).await;
 
-    // Send a connected acknowledgement
-    let ack = serde_json::json!({
-        "type": "connected",
-        "canvas_id": canvas_id,
-    });
-    let _ = sender.send(Message::Text(ack.to_string().into())).await;
-
-    // Forward broadcast updates to the WebSocket. It never completes on its
-    // own: once the feed ends the socket stays open until the client leaves.
-    let canvas_id_clone = canvas_id.clone();
-    let forward = async {
+        // Forward broadcast updates to the WebSocket. It never completes on its
+        // own: once the feed ends the socket stays open until the client leaves.
+        let canvas_id_clone = canvas_id.clone();
         loop {
             match rx.recv().await {
                 Ok(frame) => {
@@ -310,9 +312,10 @@ async fn handle_canvas_socket(
     // A dashboard session that ends, or loses its access, ends the feed with
     // the session's close code.
     let lost = tokio::select! {
+        biased;
+        code = crate::dashboard_session::session_lost(&mut session_watch, &state) => Some(code),
         () = read_loop => None,
         () = forward => None,
-        code = crate::dashboard_session::session_lost(&mut session_watch, &state) => Some(code),
     };
     if let Some(code) = lost {
         crate::ws::close_with(&mut sender, &mut receiver, code, "dashboard session ended").await;
