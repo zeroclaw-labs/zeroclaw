@@ -4445,16 +4445,28 @@ impl RpcDispatcher {
         // Trusted-local reconnect must not wait for an active turn. A deferred
         // installation still checks the original Agent and current authority.
         match Arc::clone(&agent).try_lock_owned() {
-            Ok(guard) => {
-                let _ = install(guard).await;
-            }
+            Ok(guard) => install(guard).await,
             Err(_) => {
                 zeroclaw_spawn::spawn!(async move {
-                    let _ = install(agent.lock_owned().await).await;
+                    if let Err(error) = install(agent.lock_owned().await).await {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Session)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                serde_json::json!({ "code": error.code, "reason": error.message })
+                            ),
+                            "Deferred RPC approval-channel installation refused"
+                        );
+                    }
                 });
+                Ok(())
             }
         }
-        Ok(())
     }
 
     async fn session_generation_for_agent(
@@ -7410,9 +7422,10 @@ impl RpcDispatcher {
             .take();
         if let Some(error) = refused_preparation {
             cancel_registration.finish();
-            if error.code == INTERNAL_ERROR {
-                // Preserve checkpoint storage-failure eviction, but never let a
-                // refused caller remove an incarnation after another wait.
+            if checkpoint_turn_id.is_some() && error.code == INTERNAL_ERROR {
+                // ACP checkpoint failures require eviction before recovery;
+                // a Chat state-write refusal leaves the live session valid.
+                // Never let a refused caller remove an incarnation after a wait.
                 if let Some(generation) = self.ctx.sessions.get_generation(sid).await
                     && matches!(
                         self.ctx
@@ -23100,7 +23113,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn immediate_approval_install_refusal_fails_session_resume() {
+        for chat_mode in ["chat", "acp"] {
+            for (own, demoted) in [(false, true), (true, true), (false, false)] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config = two_user_config_with_administrator_alice(&tmp);
+                let data_dir = config.data_dir.clone();
+                let (fixture, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+                let ctx = Arc::clone(&fixture.ctx);
+                let (owner, _owner_frames) = roster_peer(&ctx, if own { 4242 } else { 4343 }).await;
+                owner
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias": "test-agent", "session_id": "victim",
+                        "chat_mode": chat_mode,
+                    }))
+                    .await
+                    .unwrap();
+                let agent = sessions.get_agent("victim").await.unwrap();
+                let handles = agent.lock().await.channel_handles().clone();
+                let original = handles.get_channel("rpc").unwrap();
+                let generation = sessions.get_generation("victim").await;
+                let (mut alice, mut frames) = roster_peer(&ctx, 4242).await;
+                let (arrived, release) = sessions.set_test_effect_pause("approval-install");
+                let resume = zeroclaw_spawn::spawn!(async move {
+                    rpc(
+                        &mut alice,
+                        &mut frames,
+                        91,
+                        "session/new",
+                        json!({
+                            "agent_alias": "test-agent", "session_id": "victim",
+                            "chat_mode": chat_mode,
+                        }),
+                    )
+                    .await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                    .await
+                    .unwrap();
+                if demoted {
+                    set_alice_administrator(&ctx, false);
+                }
+                release.notify_one();
+                let response = tokio::time::timeout(std::time::Duration::from_secs(10), resume)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let allowed = own || !demoted;
+                if allowed {
+                    assert_eq!(response["result"]["session_id"], "victim", "{response}");
+                    assert!(response.get("error").is_none(), "{response}");
+                } else {
+                    assert_eq!(response["error"]["code"], FORBIDDEN, "{response}");
+                    assert!(response.get("result").is_none(), "{response}");
+                }
+                assert_eq!(sessions.get_generation("victim").await, generation);
+                assert_eq!(
+                    Arc::ptr_eq(&original, &handles.get_channel("rpc").unwrap()),
+                    !allowed,
+                    "{chat_mode}: a refused install must preserve the original channel"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn deferred_approval_install_rechecks_after_agent_wait() {
+        zeroclaw_log::try_install_capture_subscriber();
         for (own, replaced) in [(false, false), (true, false), (false, true)] {
             let tmp = tempfile::TempDir::new().unwrap();
             let config = two_user_config_with_administrator_alice(&tmp);
@@ -23128,6 +23207,7 @@ mod tests {
             let (mut alice, mut alice_frames) = roster_peer(&ctx, 4242).await;
             alice.client_elicitation_caps.form = true;
             let (arrived, release) = sessions.set_test_effect_pause("approval-install");
+            let mut logs = zeroclaw_log::subscribe_or_install();
             // This is the production nonblocking continuation used by resume.
             alice
                 .rebind_rpc_approval_channel(Arc::clone(&agent), "victim".into())
@@ -23153,6 +23233,29 @@ mod tests {
             let _settled = agent.lock().await;
             let channel = handles.get_channel("rpc").unwrap();
             assert_eq!(Arc::ptr_eq(&original, &channel), !own);
+            if !own {
+                let refusal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let event = logs.recv().await.unwrap();
+                        if event["message"] == "Deferred RPC approval-channel installation refused"
+                        {
+                            break event;
+                        }
+                    }
+                })
+                .await
+                .expect("a deferred refusal must be observable");
+                assert_eq!(refusal["severity_text"], "WARN");
+                assert_eq!(refusal["event"]["outcome"], "failure");
+                assert_eq!(
+                    refusal["attributes"]["code"],
+                    if replaced {
+                        SESSION_NOT_FOUND
+                    } else {
+                        FORBIDDEN
+                    }
+                );
+            }
             if replaced {
                 assert!(
                     sessions
@@ -45606,6 +45709,145 @@ mod tests {
             idle.turn_id.is_none(),
             "connection shutdown must clear the durable turn id"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_running_state_write_failure_preserves_session_for_retry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, chat_backend, _) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let (hook, end_count) = EndCountingHook::new();
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(hook));
+        Arc::get_mut(&mut dispatcher.ctx).unwrap().hooks = Some(Arc::new(runner));
+        let sid = "chat-state-write-failure";
+        let session_key = format!("rpc_{sid}");
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent", "exclude_memory": true,
+                "session_id": sid, "chat_mode": "chat",
+            }))
+            .await
+            .unwrap();
+        let agent = sessions.get_agent(sid).await.unwrap();
+        let (provider, mut calls, release_provider) = gated_provider();
+        agent.lock().await.set_model_provider(Box::new(provider));
+        let previous_messages = [
+            ChatMessage::user("previous question"),
+            ChatMessage::assistant("previous answer"),
+        ];
+        agent.lock().await.seed_history(&previous_messages);
+        chat_backend
+            .rewrite_messages(&session_key, &previous_messages)
+            .unwrap();
+        let handles = agent.lock().await.channel_handles().clone();
+        let original_channel = handles.get_channel("rpc").unwrap();
+        let generation = sessions.get_generation(sid).await;
+        let history = serde_json::to_value(agent.lock().await.history()).unwrap();
+        let durable = serde_json::to_value(chat_backend.try_load(&session_key).unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(data_dir.join("sessions/sessions.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_running_state BEFORE UPDATE OF state ON session_metadata
+             WHEN NEW.state = 'running'
+             BEGIN SELECT RAISE(FAIL, 'injected running-state write failure'); END;",
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        dispatcher.rpc = Arc::new(RpcOutbound::new(tx));
+        dispatcher
+            .process_line_for_test(
+                &json!({
+                    "jsonrpc": "2.0", "id": 301, "method": "session/prompt",
+                    "params": {
+                        "session_id": sid, "prompt": "must not reach provider",
+                        "client_turn_generation": 3,
+                    },
+                })
+                .to_string(),
+            )
+            .await;
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut frames = Vec::new();
+            loop {
+                let raw = rx.recv().await.expect("the prompt writer remains open");
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                let is_response = frame["id"] == 301;
+                frames.push(frame);
+                if is_response {
+                    break frames;
+                }
+            }
+        })
+        .await
+        .expect("the refused prompt must finish");
+        let response = frames.last().unwrap();
+        assert_eq!(response["error"]["code"], INTERNAL_ERROR, "{response}");
+        assert_turn_refused(&frames, sid, 3);
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["params"]["type"] == "turn_complete")
+                .count(),
+            1
+        );
+        assert!(calls.try_recv().is_err(), "the refused turn must not run");
+        assert!(!sessions.has_inflight_turn(sid));
+        assert_eq!(sessions.get_generation(sid).await, generation);
+        assert!(Arc::ptr_eq(&agent, &sessions.get_agent(sid).await.unwrap()));
+        assert!(Arc::ptr_eq(
+            &original_channel,
+            &handles.get_channel("rpc").unwrap()
+        ));
+        assert_eq!(
+            serde_json::to_value(agent.lock().await.history()).unwrap(),
+            history
+        );
+        assert_eq!(
+            serde_json::to_value(chat_backend.try_load(&session_key).unwrap()).unwrap(),
+            durable
+        );
+        let state = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state, "idle");
+        assert!(state.turn_id.is_none());
+        assert_eq!(end_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        conn.execute_batch("DROP TRIGGER fail_running_state;")
+            .unwrap();
+        drop(conn);
+        release_provider.send(()).unwrap();
+        let response = rpc(
+            &mut dispatcher,
+            &mut rx,
+            302,
+            "session/prompt",
+            json!({"session_id": sid, "prompt": "retry", "client_turn_generation": 4}),
+        )
+        .await;
+        assert!(
+            calls.try_recv().is_ok(),
+            "the retained session must accept retry"
+        );
+        assert!(
+            calls.try_recv().is_err(),
+            "retry invokes the provider only once"
+        );
+        assert!(response.get("result").is_some(), "{response}");
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(sessions.get_generation(sid).await, generation);
+        assert_eq!(
+            chat_backend
+                .get_session_state(&session_key)
+                .unwrap()
+                .unwrap()
+                .state,
+            "idle"
+        );
+        assert_eq!(end_count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
