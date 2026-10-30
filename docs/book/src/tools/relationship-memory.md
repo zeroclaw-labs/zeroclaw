@@ -59,7 +59,12 @@ runtime logs a warning with the selected alias and row count. After a successful
 multi-agent migration, remove `knowledge.legacy_owner_agent`; leaving it set
 means any future unowned row introduced by an older restore, import, or rollback
 is assigned to that alias on the next startup. Assigned rows obey the same
-directional `read_knowledge_from` rules as newly captured knowledge.
+directional `read_knowledge_from` rules as newly captured knowledge. Deleting
+the agent that `knowledge.legacy_owner_agent` names is refused while unowned
+rows remain or the store cannot be inspected, so the sole-enabled-agent
+fallback can never hand those rows to another agent. Let the knowledge tool
+assign them, which it does whenever it is registered, or change the setting
+before deleting the agent.
 
 Agent rename moves knowledge ownership, while delete archives and purges it.
 Deletion captures its row and affected-edge set before asynchronous archive work.

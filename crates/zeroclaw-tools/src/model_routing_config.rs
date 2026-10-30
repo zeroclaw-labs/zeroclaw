@@ -90,15 +90,14 @@ impl ModelRoutingConfigTool {
         Self { config, security }
     }
 
-    /// Whether the current environment overrides define `name` as an agent on
-    /// top of the freshly loaded file config. Decided from the file plus the
-    /// environment rather than the tool's construction-time snapshot, which
-    /// can still hold an agent deleted since. If the overrides do not apply,
-    /// the agent is treated as not defined, so the retirement probe runs.
-    fn agent_defined_by_env(file_config: &Config, name: &str) -> bool {
-        let mut runtime_view = file_config.clone();
-        zeroclaw_config::env_overrides::apply_env_overrides(&mut runtime_view).is_ok()
-            && runtime_view.agents.contains_key(name)
+    /// The freshly loaded file config as the runtime reads it, with the
+    /// environment overrides applied. `None` when the overrides do not apply.
+    /// Unlike the tool's construction-time snapshot, it reflects edits made
+    /// since, such as a new `knowledge.db_path` or a deleted agent.
+    fn runtime_view(file_config: &Config) -> Option<Config> {
+        let mut view = file_config.clone();
+        zeroclaw_config::env_overrides::apply_env_overrides(&mut view).ok()?;
+        Some(view)
     }
 
     /// Localized refusal for a new agent alias whose retired knowledge remains
@@ -1261,13 +1260,22 @@ impl ModelRoutingConfigTool {
         // A new agent alias must not adopt knowledge that a retired agent of
         // the same name still owns, the admission rule every config creation
         // path applies. Checked before any mutation of the loaded config.
-        // `cfg` is parsed without environment overrides, so probe the store
-        // the runtime opens and the delete purges: the config this tool was
-        // built with. An agent that the environment defines on top of the
-        // file is live, not a recreation, so it is not probed.
-        if existing_agent.is_none() && !Self::agent_defined_by_env(&cfg, &name) {
-            zeroclaw_config::alias_refs::ensure_knowledge_owner_retired(&self.config, &name)
-                .map_err(|error| anyhow::Error::msg(Self::retired_knowledge_refusal(&error)))?;
+        // `cfg` is parsed without environment overrides, so judge the alias
+        // against the current file as the runtime reads it: an agent the
+        // environment defines on top of the file is live, not a recreation,
+        // and the store to probe is the one a recreated agent would open. If
+        // the overrides do not apply, fall back to the construction-time
+        // config rather than skip the probe.
+        if existing_agent.is_none() {
+            let runtime_view = Self::runtime_view(&cfg);
+            let defined_by_env = runtime_view
+                .as_ref()
+                .is_some_and(|view| view.agents.contains_key(&name));
+            if !defined_by_env {
+                let probe_config = runtime_view.as_ref().unwrap_or(self.config.as_ref());
+                zeroclaw_config::alias_refs::ensure_knowledge_owner_retired(probe_config, &name)
+                    .map_err(|error| anyhow::Error::msg(Self::retired_knowledge_refusal(&error)))?;
+            }
         }
 
         // Validate the provider route before mutating any provider, profile, or agent state.
@@ -2230,18 +2238,18 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        // The file names a store that does not exist. The runtime's config,
-        // which an environment override can set, names the seeded store; the
-        // probe must follow the runtime, since that is what a recreated agent
-        // would read.
-        config.knowledge.db_path = tmp
-            .path()
-            .join("file-view.db")
-            .to_string_lossy()
-            .into_owned();
+        // The current file names the seeded store, but the tool was built
+        // before `knowledge.db_path` changed and still names an empty one.
+        // The probe must follow the current file, since that is the store an
+        // agent built from the saved config would read.
+        config.knowledge.db_path = graph_path.to_string_lossy().into_owned();
         config.save().await.unwrap();
         config.loaded_from = Some(config.config_path.clone());
-        config.knowledge.db_path = graph_path.to_string_lossy().into_owned();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("construction-time.db")
+            .to_string_lossy()
+            .into_owned();
         let graph = KnowledgeGraph::new(&graph_path, 100).unwrap();
         graph
             .add_node(
@@ -2290,6 +2298,59 @@ mod tests {
 
     /// An agent defined only by an environment override is live. It owns its
     /// knowledge, so upserting it is an update, not a recreation.
+    /// The runtime reads the file with environment overrides applied, so an
+    /// override that moves the knowledge store moves the probe with it.
+    #[tokio::test]
+    async fn upsert_agent_probes_the_store_an_environment_override_names() {
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
+
+        let env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let graph_path = tmp.path().join("env-named.db");
+        KnowledgeGraph::new(&graph_path, 100)
+            .unwrap()
+            .add_node(
+                &KnowledgeScope::for_agent("retired", Vec::<String>::new()),
+                NodeType::Pattern,
+                "retained",
+                "retired agent knowledge",
+                &[],
+                None,
+            )
+            .unwrap();
+        // The file and the tool both name a store that does not exist.
+        let config = Box::pin(test_config(&tmp)).await;
+        let _store = TestEnvVar::set(
+            &env_guard,
+            "ZEROCLAW_knowledge__db_path",
+            &graph_path.to_string_lossy(),
+        );
+        let tool = ModelRoutingConfigTool::new(config, test_security());
+
+        let refused = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "retired",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex"
+            }))
+            .await
+            .unwrap();
+        assert!(!refused.success, "{refused:?}");
+        assert_eq!(
+            refused.error.as_deref(),
+            Some(
+                ModelRoutingConfigTool::retired_knowledge_refusal(
+                    &zeroclaw_config::alias_refs::RetiredKnowledgeError::Retained {
+                        alias: "retired".to_string(),
+                    }
+                )
+                .as_str()
+            ),
+            "{refused:?}"
+        );
+    }
+
     #[tokio::test]
     async fn upsert_agent_admits_env_defined_agent_that_owns_knowledge() {
         use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType};
