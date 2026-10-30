@@ -33,6 +33,7 @@ import {
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
 import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
+import { uncommittedLocalTail } from '@/contexts/chatHydration.logic';
 import {
   EMPTY_CONTEXT_LIMITS,
   contextLimitsFromDoneFrame,
@@ -300,6 +301,11 @@ export function AgentProvider({
     const sid = sessionId;
     const hydrationStartedAtMutationVersion = localMessageMutationVersionRef.current;
     let cancelled = false;
+    // This conversation's browser copy, read before the mirror effect can
+    // overwrite it: the mirror stays idle until `hydratedSessionId` matches
+    // `sid`. Unlike `messages`, which a session switch has just emptied, it
+    // still holds a prompt the gateway has not committed yet.
+    const browserCopy = persistedToUiMessages(loadChatHistory(sid));
 
     // Session management is a capability, not an optimistic default. Every
     // hydration starts unknown and only an affirmative gateway response opens
@@ -314,7 +320,15 @@ export function AgentProvider({
         setSessionPersistence(res.session_persistence);
         if (res.session_persistence) {
           if (localMessageMutationVersionRef.current === hydrationStartedAtMutationVersion) {
-            setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+            const snapshotUsers = res.messages
+              .filter((row) => row.role === 'user')
+              .map((row) => row.content);
+            const hydrated = persistedToUiMessages(mapServerMessagesToPersisted(res.messages));
+            // The gateway commits a turn's prompt only when the turn ends, so a
+            // reload or a round trip to another conversation mid-turn fetches a
+            // snapshot that predates the prompt this browser already showed.
+            // Keep that uncommitted tail instead of replacing it.
+            setMessages([...hydrated, ...uncommittedLocalTail(snapshotUsers, browserCopy)]);
           }
         } else if (!res.session_persistence) {
           setMessages((prev) => {
