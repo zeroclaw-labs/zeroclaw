@@ -622,7 +622,6 @@ zc-config-footer-action-back-to-files = 返回文件
 zc-config-footer-action-back-to-skills = 返回技能
 zc-config-footer-action-help = 帮助
 zc-config-footer-action-new-line = 换行
-zc-config-field-edit-hint = { $keys } → 按下以编辑
 zc-doctor-log-path = 日志：{ $path }
 
 zc-oidc-enroll-visit = 要登录,请打开 { $uri } 并输入代码 { $code }
@@ -706,3 +705,14 @@ zc-config-section-peer-groups-help = 绑定频道、成员代理和外部对等�
 zc-config-section-cron-help = 将计划与提示、频道和目标绑定的计划任务。
 zc-config-section-tunnel-help = 可选择通过 Cloudflare 或 ngrok 暴露网关，或仅保持本地访问。
 zc-config-section-onboard-state-help = 快速入门生命周期状态及其按分区记录的旧版完成记录。
+
+# Config field details use schema-owned descriptions and values.
+zc-config-footer-action-field-details = 字段详情
+zc-config-field-path = 路径：{ $path }
+zc-config-field-current-value = 当前值：
+zc-config-field-unset = <未设置>
+zc-config-field-secret-set = 已设置（已隐藏）
+zc-config-field-value-unavailable = 不可用
+zc-config-field-environment-override = 环境变量覆盖已生效。
+zc-config-field-precheck-timeout-secs-label = 预检查超时（秒）
+zc-config-field-max-cost-per-day-cents-label = 每日最高费用（美分）
