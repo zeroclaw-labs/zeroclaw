@@ -30,6 +30,7 @@ check() {
 check false pull_request docs/README.md crates/zeroclaw-config/src/policy.rs web/src/main.ts
 for path in crates/zeroclaw-runtime/src/control_plane/authority.rs \
     crates/zeroclaw-runtime/src/control_plane/task_registry.rs \
+    crates/zeroclaw-config/src/platform/job_object.rs \
     crates/zeroclaw-runtime/src/lib.rs Cargo.lock Cargo.toml \
     crates/zeroclaw-runtime/Cargo.toml crates/zeroclaw-runtime/build.rs \
     rust-toolchain.toml .cargo/config.toml .github/actions/rust-cache/action.yml \
