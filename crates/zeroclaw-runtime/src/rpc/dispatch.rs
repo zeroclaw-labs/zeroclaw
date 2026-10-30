@@ -11443,22 +11443,12 @@ impl RpcDispatcher {
         })
     }
 
-    /// Open a subscription on `source` for this connection and start its
-    /// delivery task. Returns the id and the newest sequence number.
-    ///
-    /// The hub holds the frames; the task only moves a cursor. `since_seq`
-    /// replays what is still buffered, and any gap, whether evicted, lost on
-    /// the bus, or from before a restart, is reported as
-    /// `subscription/lagged` before delivery resumes. A subscription outlives
-    /// the call that opened it, so every delivery is held to the connection's
-    /// authority: the credential must still be live and, whenever the
-    /// accepted policy has moved, the principal is resolved again against
-    /// `method`. The first refusal ends the stream. An unbound dispatcher (the
-    /// direct unit-test handlers) has nothing to recheck.
-    /// Refuse the global streams to a scoped principal (neither an
-    /// administrator nor the shared operator), using its current grants
-    /// rather than the bind-time copy. An
-    /// unbound dispatcher (the direct unit-test handlers) is not checked.
+    /// Refuse the daemon-wide log and event reads to a scoped principal
+    /// (neither an administrator nor the shared operator), using its current
+    /// grants rather than the bind-time copy: the global streams, the event
+    /// history, and the persisted log behind `logs/query` and `logs/get`. See
+    /// [`sees_every_principal`]. An unbound dispatcher (the direct unit-test
+    /// handlers) is not checked.
     fn require_global_stream_access(&self, method: Method) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Ok(());
@@ -11472,6 +11462,18 @@ impl RpcDispatcher {
         Err(rpc_err(denied.code, denied.message))
     }
 
+    /// Open a subscription on `source` for this connection and start its
+    /// delivery task. Returns the id and the newest sequence number.
+    ///
+    /// The hub holds the frames; the task only moves a cursor. `since_seq`
+    /// replays what is still buffered, and any gap, whether evicted, lost on
+    /// the bus, or from before a restart, is reported as
+    /// `subscription/lagged` before delivery resumes. A subscription outlives
+    /// the call that opened it, so every delivery is held to the connection's
+    /// authority: the credential must still be live and, whenever the
+    /// accepted policy has moved, the principal is resolved again against
+    /// `method`. The first refusal ends the stream. An unbound dispatcher (the
+    /// direct unit-test handlers) has nothing to recheck.
     fn open_subscription(
         &self,
         source: crate::rpc::subscription::Source,
@@ -11558,6 +11560,7 @@ impl RpcDispatcher {
 
     #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
     async fn handle_logs_query(&self, params: &Value) -> RpcResult {
+        self.require_global_stream_access(Method::LogsQuery)?;
         let p: LogsQueryParams = parse_params(params)?;
 
         let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
@@ -11631,6 +11634,7 @@ impl RpcDispatcher {
     /// retained archives oldest-first, so archive events returned by
     /// `logs/query` are always findable by id.
     async fn handle_logs_get(&self, params: &Value) -> RpcResult {
+        self.require_global_stream_access(Method::LogsGet)?;
         let p: LogsGetParams = parse_params(params)?;
         let Some((active, reads_archives)) = zeroclaw_log::active_log_query_scope() else {
             return Err(rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"));
@@ -13170,14 +13174,17 @@ async fn deliver_subscription(delivery: SubscriptionDelivery) {
     registry.lock().remove(&subscription_id);
 }
 
-/// The daemon-wide log and event streams, and the event history, carry
-/// frames from every principal's work: session messages, cron results, log
-/// lines. Many name no owner, so they cannot be filtered per principal. Until
-/// frames carry reliable ownership they are unscoped-only, with the same
-/// definition session ownership uses ([`RpcDispatcher::scoped_principal_id`]):
-/// an administrator, or the unauthenticated shared operator. Reaching every
-/// agent (the `*` agent selector) is not enough; it addresses every agent
-/// but owns only its own sessions.
+/// The daemon-wide log and event streams, the event history, and the
+/// persisted log behind `logs/query` and `logs/get` carry records of every
+/// principal's work: session messages, cron results, log lines, and other
+/// principals' authorization denials, which can name what a refusal kept
+/// from its client. Many name no owner, so they cannot be filtered per
+/// principal. Until records carry reliable ownership they are unscoped-only,
+/// with the same definition session ownership uses
+/// ([`RpcDispatcher::scoped_principal_id`]): an administrator, or the
+/// unauthenticated shared operator. Reaching every agent (the `*` agent
+/// selector) is not enough; it addresses every agent but owns only its own
+/// sessions.
 fn sees_every_principal(
     auth: &crate::rpc::auth::ConnectionAuth,
     grants: &zeroclaw_api::grants::ResolvedGrants,
@@ -13185,9 +13192,10 @@ fn sees_every_principal(
     grants.admin || !auth.principal.is_authenticated()
 }
 
-const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the daemon-wide log \
-     and event streams: their frames are not attributed to an owning principal, so these \
-     streams and the event history are limited to administrators and the shared operator";
+const GLOBAL_STREAM_SCOPED_DENIAL: &str = "Scoped principals cannot read the daemon-wide logs \
+     and events: their records are not attributed to an owning principal, so the log and event \
+     streams, the event history, and the persisted log are limited to administrators and the \
+     shared operator";
 
 /// Hold one delivery (a frame or a `lagged` notice) to the connection's
 /// authority. The credential must still be live, and whenever the accepted
@@ -24728,6 +24736,244 @@ mod tests {
             .await,
             "a principal that lost Logs:Read must stop receiving log frames"
         );
+    }
+
+    /// A `rolling` log writer persisting under a temporary directory, so
+    /// `logs/query` and `logs/get` read a real log. It holds the writer test
+    /// lock for its whole life. Its `Drop` runs before its fields drop, so the
+    /// disabled writer it installs goes in while the lock is still held, and
+    /// neither a later test nor a failed assertion here leaves a writer on the
+    /// removed directory.
+    struct PersistedLog<G> {
+        dir: tempfile::TempDir,
+        _writer_guard: G,
+    }
+
+    fn persisted_log() -> PersistedLog<impl Drop> {
+        let writer_guard = zeroclaw_log::__private_test_writer_lock();
+        // The capture layer carries `record!`, and with it the RPC denial
+        // records, to the writer.
+        zeroclaw_log::try_install_capture_subscriber();
+        let dir = tempfile::TempDir::new().expect("a temporary log directory");
+        zeroclaw_log::init_from_config(&persisted_log_config("rolling"), dir.path());
+        PersistedLog {
+            dir,
+            _writer_guard: writer_guard,
+        }
+    }
+
+    fn persisted_log_config(log_persistence: &str) -> zeroclaw_log::LogConfig {
+        zeroclaw_log::LogConfig {
+            log_persistence: log_persistence.into(),
+            log_persistence_path: "state/runtime-trace.jsonl".into(),
+            ..Default::default()
+        }
+    }
+
+    impl<G> Drop for PersistedLog<G> {
+        fn drop(&mut self) {
+            zeroclaw_log::init_from_config(&persisted_log_config("none"), self.dir.path());
+        }
+    }
+
+    /// [`cron_roster_config_in`] plus readers of the persisted log: `alice`,
+    /// scoped to `alpha`, also holds `Logs:Read`; `zeroclaw_user` (uid 4747)
+    /// holds `Logs:Read` with every agent (`*`); `zeroclaw_maintainer` (uid
+    /// 4545) is an administrator that also holds `Logs:Read` explicitly, so
+    /// demoting it leaves the grant in place.
+    fn log_reader_roster_in(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use zeroclaw_api::grants::{Resource, Verb, WILDCARD};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let mut config = cron_roster_config_in(tmp, 4242);
+        config
+            .permission_profiles
+            .get_mut("cron-alpha")
+            .expect("the cron fixture profile exists")
+            .grants
+            .insert(Resource::Logs, vec![Verb::Read]);
+        let log_reads = || std::collections::HashMap::from([(Resource::Logs, vec![Verb::Read])]);
+        for (name, uid, profile) in [
+            (
+                "zeroclaw_user",
+                4747,
+                PermissionProfileConfig {
+                    allowed_agents: vec![WILDCARD.into()],
+                    grants: log_reads(),
+                    ..PermissionProfileConfig::default()
+                },
+            ),
+            (
+                "zeroclaw_maintainer",
+                4545,
+                PermissionProfileConfig {
+                    admin: true,
+                    grants: log_reads(),
+                    ..PermissionProfileConfig::default()
+                },
+            ),
+        ] {
+            config.permission_profiles.insert(name.into(), profile);
+            config.users.insert(
+                name.into(),
+                UserConfig {
+                    principal_id: None,
+                    uid: Some(uid),
+                    permission_profiles: vec![name.into()],
+                },
+            );
+        }
+        config
+    }
+
+    /// Persist the audit record of a refusal its client never sees as one:
+    /// `alice` asks `cron/get` for `job_id`, a `beta` job, and is told it was
+    /// not found, the answer a missing job gets, while its cron entitlement
+    /// guard records the owning agent and the job. Returns the record as the
+    /// administrator (`zeroclaw_maintainer`) reads it through `logs/query`, so
+    /// a refusal asserted afterwards cannot pass on an empty log.
+    async fn persisted_cron_denial(ctx: &Arc<RpcContext>, job_id: &str) -> Value {
+        let (mut alice, mut rx) = roster_peer(ctx, 4242).await;
+        let masked = rpc(&mut alice, &mut rx, 1, "cron/get", json!({"id": job_id})).await;
+        assert_eq!(masked["error"]["code"], json!(INVALID_PARAMS), "{masked}");
+        zeroclaw_log::flush_for_test().expect("the log writer flushes");
+
+        let (mut admin, mut rx) = roster_peer(ctx, 4545).await;
+        let page = rpc(&mut admin, &mut rx, 1, "logs/query", json!({"q": job_id})).await;
+        page["result"]["events"]
+            .as_array()
+            .and_then(|events| {
+                events
+                    .iter()
+                    .find(|event| event["attributes"]["method"] == json!("cron/get"))
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("an administrator reads the cron/get denial: {page}"))
+    }
+
+    /// The persisted log holds every principal's records, among them audit
+    /// records naming what a refusal kept from its client, so `logs/query`
+    /// and `logs/get` follow the global streams' rule. A principal scoped to
+    /// one agent or to every agent (`*`) is refused even with `Logs:Read`,
+    /// and cannot learn from the log that the job it was told does not exist
+    /// is `beta`'s. Each refusal is audited like the streams' refusals.
+    #[tokio::test]
+    async fn persisted_log_reads_refuse_a_scoped_principal() {
+        let _log = persisted_log();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = log_reader_roster_in(&tmp);
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config);
+        let record = persisted_cron_denial(&ctx, &beta.id).await;
+
+        for uid in [4242, 4747] {
+            let (mut scoped, mut rx) = roster_peer(&ctx, uid).await;
+            for (id, method, params) in [
+                (1, "logs/query", json!({"q": beta.id})),
+                (2, "logs/get", json!({"id": record["id"]})),
+            ] {
+                let response = rpc(&mut scoped, &mut rx, id, method, params).await;
+                assert_eq!(
+                    response["error"]["code"],
+                    json!(FORBIDDEN),
+                    "uid {uid} {method}: {response}"
+                );
+                assert!(
+                    !response.to_string().contains(&beta.id),
+                    "uid {uid} {method} must not disclose the record: {response}"
+                );
+            }
+        }
+
+        zeroclaw_log::flush_for_test().expect("the log writer flushes");
+        let (mut admin, mut rx) = roster_peer(&ctx, 4545).await;
+        let page = rpc(
+            &mut admin,
+            &mut rx,
+            1,
+            "logs/query",
+            json!({"action": "reject", "q": "logs/", "limit": 100}),
+        )
+        .await;
+        let denials = page["result"]["events"]
+            .as_array()
+            .unwrap_or_else(|| panic!("an administrator reads the denials: {page}"));
+        for principal in ["user:alice", "user:zeroclaw_user"] {
+            for method in ["logs/query", "logs/get"] {
+                assert!(
+                    denials.iter().any(|event| {
+                        event["attributes"]["principal_id"] == json!(principal)
+                            && event["attributes"]["method"] == json!(method)
+                            && event["attributes"]["code"] == json!(FORBIDDEN)
+                    }),
+                    "{principal}'s refused {method} must leave a denial record: {page}"
+                );
+            }
+        }
+    }
+
+    /// An administrator and the shared operator read the persisted log
+    /// through both methods. Demoting the administrator refuses its next read
+    /// on the same connection, although it keeps `Logs:Read` and gains every
+    /// agent: the principal is held to the policy in force, not the one it
+    /// bound under.
+    #[tokio::test]
+    async fn persisted_log_reads_serve_unscoped_principals_until_demoted() {
+        let _log = persisted_log();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = log_reader_roster_in(&tmp);
+        let beta = seed_cron_job(&config, "beta", "beta-job");
+        let ctx = enforcement_ctx(config.clone());
+        let record = persisted_cron_denial(&ctx, &beta.id).await;
+        // What `alice` was not told: the job exists, and `beta` owns it.
+        assert_eq!(
+            record["attributes"]["principal_id"],
+            json!("user:alice"),
+            "{record}"
+        );
+        assert!(record.to_string().contains("beta"), "{record}");
+
+        let (mut admin, mut admin_rx) = roster_peer(&ctx, 4545).await;
+        let (mut operator, mut operator_rx) = local_operator(&ctx).await;
+        for (reader, rx) in [
+            (&mut admin, &mut admin_rx),
+            (&mut operator, &mut operator_rx),
+        ] {
+            let page = rpc(reader, rx, 1, "logs/query", json!({"q": beta.id})).await;
+            assert!(
+                page["result"]["events"]
+                    .as_array()
+                    .is_some_and(|events| events.iter().any(|event| event["id"] == record["id"])),
+                "{page}"
+            );
+            let fetched = rpc(reader, rx, 2, "logs/get", json!({"id": record["id"]})).await;
+            assert_eq!(fetched["result"]["event"]["id"], record["id"], "{fetched}");
+        }
+
+        let mut demoted = config;
+        let maintainer = demoted
+            .permission_profiles
+            .get_mut("zeroclaw_maintainer")
+            .expect("the administrator profile exists");
+        maintainer.admin = false;
+        maintainer.allowed_agents = vec![zeroclaw_api::grants::WILDCARD.into()];
+        ctx.auth
+            .refresh_from_config(&demoted)
+            .expect("the demoted policy compiles");
+        for (id, method, params) in [
+            (3, "logs/query", json!({"q": beta.id})),
+            (4, "logs/get", json!({"id": record["id"]})),
+        ] {
+            let response = rpc(&mut admin, &mut admin_rx, id, method, params).await;
+            assert_eq!(
+                response["error"]["code"],
+                json!(FORBIDDEN),
+                "{method}: {response}"
+            );
+            assert!(
+                !response.to_string().contains(&beta.id),
+                "a demoted administrator's {method} must not disclose the record: {response}"
+            );
+        }
     }
 
     fn make_cost_query_test_dispatcher(data_dir: &std::path::Path) -> RpcDispatcher {
