@@ -39,7 +39,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # in the tree as rustls' crypto provider, so this adds no new transitive root.
 ring = "0.17"
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 # Self-provision the relay's own outer TLS cert (CA + server leaf, SANs, perms) on
 # first run when no --tls-cert is given - the same machinery the daemon uses, so
