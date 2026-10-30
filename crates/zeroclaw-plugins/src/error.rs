@@ -1,5 +1,6 @@
 //! Plugin error types.
 
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -21,6 +22,18 @@ pub enum PluginError {
     #[error("plugin recovery retained bytes at {path}: {reason}")]
     RecoveryRetained { path: String, reason: String },
 
+    /// An update claimed the installed package and could neither publish its
+    /// replacement nor put the claimed generation back. `preserved` holds that
+    /// generation, in a transaction whose lease is released on return, so
+    /// `PluginHost::recover_interrupted_update` can put it back, unless a
+    /// package of that name is installed by then.
+    #[error("plugin '{name}' was not replaced and its previous package could not be moved back ({cause}); it is preserved at {}", preserved.display())]
+    ReplacementInterrupted {
+        name: String,
+        preserved: PathBuf,
+        cause: String,
+    },
+
     /// The platform or filesystem has no rename that refuses an existing
     /// destination, so install removed the copy it staged and installed
     /// nothing; a retry there fails the same way.
@@ -36,6 +49,15 @@ pub enum PluginError {
         "nothing was installed: safe package move unavailable; cleanup could not be confirmed at {path}: {reason}"
     )]
     MoveUnsupportedCleanup { path: String, reason: String },
+
+    /// The install source lies inside a hidden `installing` stage of the
+    /// package it names, which install clears before it stages its own copy.
+    /// Install refused before clearing anything, so the stage at `path` is as
+    /// it was.
+    #[error(
+        "nothing was installed: the source is inside {path}, a hidden stage that installing this package clears once no process holds it; copy the package out of that stage and install from the copy"
+    )]
+    SourceInStage { path: String },
 
     #[error("invalid plugin config: {0}")]
     InvalidConfig(String),

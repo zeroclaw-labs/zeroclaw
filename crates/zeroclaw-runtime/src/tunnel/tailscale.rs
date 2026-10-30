@@ -1,7 +1,4 @@
-use super::{
-    PublishedTcpService, SharedProcess, TcpService, Tunnel, TunnelProcess, kill_shared,
-    new_shared_process,
-};
+use super::{PublishedTcpService, TcpService, Tunnel};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -13,23 +10,28 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use zeroclaw_config::schema::{EnrollConfig, TunnelConfig, WssConfig};
 
-/// Bounds for bringing one `tailscale serve --tcp` forwarder up.
+/// Bounds for bringing one foreground `tailscale serve` process up: the
+/// gateway's `--https` proxy or a `--tcp` forwarder.
 #[derive(Debug, Clone, Copy)]
 struct ForwarderStartup {
-    /// How long a running forwarder has to appear in the serve config.
+    /// How long a running process has to appear in the serve config.
     apply_timeout: Duration,
     /// Poll interval while waiting for it to appear.
     poll: Duration,
-    /// Spawn attempts when tailscaled rejects a concurrent serve-config write.
+    /// Spawn attempts when the write is rejected for a transient reason
+    /// (see [`is_retryable_serve_failure`]).
     conflict_attempts: u32,
-    /// Backoff before conflict retry `n` is `n * conflict_backoff`.
+    /// Backoff before retry `n` is `n * conflict_backoff`.
     conflict_backoff: Duration,
 }
 
+/// Five attempts with linear backoff wait 2.5s in total for a transient
+/// rejection to clear, which covers a previous gateway generation's session
+/// being torn down across a reload.
 const FORWARDER_STARTUP: ForwarderStartup = ForwarderStartup {
     apply_timeout: Duration::from_secs(5),
     poll: Duration::from_millis(100),
-    conflict_attempts: 4,
+    conflict_attempts: 5,
     conflict_backoff: Duration::from_millis(250),
 };
 
@@ -50,6 +52,32 @@ enum ForwarderStartError {
     NotApplied { waited: Duration },
     /// It could not be spawned or polled.
     Io(std::io::Error),
+}
+
+impl std::fmt::Display for ForwarderStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited {
+                status,
+                stderr,
+                attempts,
+            } => write!(
+                f,
+                "exited ({status}) after {attempts} attempt(s): {}",
+                if stderr.is_empty() {
+                    "<no stderr>"
+                } else {
+                    stderr
+                }
+            ),
+            Self::NotApplied { waited } => write!(
+                f,
+                "still running but not in the serve config after {}ms; killed",
+                waited.as_millis()
+            ),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 impl ForwarderStartError {
@@ -75,6 +103,20 @@ impl ForwarderStartError {
 fn is_serve_config_conflict(stderr: &str) -> bool {
     stderr.contains("etag mismatch")
         || stderr.contains("Another client is changing the serve config")
+}
+
+/// A port held by another foreground session makes `tailscale serve` exit at
+/// once (Tailscale 1.104.1: `listener already exists for port N`). Ending the
+/// holding process releases the port within moments, so a session from the
+/// previous gateway generation that is still going down is worth waiting
+/// out. A holder that stays is reported once the attempts run out.
+fn is_port_held(stderr: &str) -> bool {
+    stderr.contains("listener already exists for port")
+}
+
+/// Rejections that a later attempt can succeed past.
+fn is_retryable_serve_failure(stderr: &str) -> bool {
+    is_serve_config_conflict(stderr) || is_port_held(stderr)
 }
 
 /// Foreground serve sessions in `tailscale serve status --json` output that
@@ -110,6 +152,54 @@ fn serve_sessions_forwarding(json: &[u8], target: SocketAddr) -> Option<BTreeSet
 /// Ask tailscaled which foreground sessions raw-forward to `target`; `None`
 /// if it could not be asked.
 async fn serve_sessions_for(target: SocketAddr) -> Option<BTreeSet<String>> {
+    serve_status()
+        .await
+        .and_then(|json| serve_sessions_forwarding(&json, target))
+}
+
+/// Foreground sessions that serve HTTPS on [`GATEWAY_HTTPS_PORT`] and proxy
+/// `/` to the gateway at `127.0.0.1:<local_port>`, or `None` if the output is
+/// unreadable.
+///
+/// Tailscale stores a bare-port target as `http://127.0.0.1:<port>`, under a
+/// `<MagicDNS name>:443` web key. The key is matched on its port only: a
+/// configured hostname override is not the name tailscaled files it under.
+fn serve_sessions_proxying(json: &[u8], local_port: u16) -> Option<BTreeSet<String>> {
+    let config: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let https_port = GATEWAY_HTTPS_PORT.to_string();
+    let web_suffix = format!(":{GATEWAY_HTTPS_PORT}");
+    let proxy = format!("http://127.0.0.1:{local_port}");
+    let proxies = |session: &serde_json::Value| {
+        session["TCP"][&https_port]["HTTPS"].as_bool() == Some(true)
+            && session["Web"].as_object().is_some_and(|web| {
+                web.iter().any(|(host_port, site)| {
+                    host_port.ends_with(&web_suffix)
+                        && site["Handlers"]["/"]["Proxy"].as_str() == Some(proxy.as_str())
+                })
+            })
+    };
+    Some(
+        config["Foreground"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, session)| proxies(session))
+            .map(|(id, _)| id.clone())
+            .collect(),
+    )
+}
+
+/// Ask tailscaled which foreground sessions proxy the gateway; `None` if it
+/// could not be asked.
+async fn serve_sessions_for_gateway(local_port: u16) -> Option<BTreeSet<String>> {
+    serve_status()
+        .await
+        .and_then(|json| serve_sessions_proxying(&json, local_port))
+}
+
+/// `tailscale serve status --json` stdout, or `None` if it could not be run
+/// or failed.
+async fn serve_status() -> Option<Vec<u8>> {
     let output = tokio::time::timeout(
         SERVE_STATUS_TIMEOUT,
         Command::new("tailscale")
@@ -119,9 +209,22 @@ async fn serve_sessions_for(target: SocketAddr) -> Option<BTreeSet<String>> {
     )
     .await;
     match output {
-        Ok(Ok(out)) if out.status.success() => serve_sessions_forwarding(&out.stdout, target),
+        Ok(Ok(out)) if out.status.success() => Some(out.stdout),
         _ => None,
     }
+}
+
+/// Spawn a foreground `tailscale` serve process. stderr is kept for the
+/// startup check and the exit report; stdout (a banner nobody reads) is
+/// discarded so it can never fill a pipe and block the process.
+fn spawn_serve(args: &[String]) -> std::io::Result<Child> {
+    Command::new("tailscale")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
 }
 
 /// Bring one forwarder up and return it only once its own forward is in the
@@ -188,7 +291,7 @@ where
                 .await
                 .ok();
         }
-        if is_serve_config_conflict(&stderr) && attempt < startup.conflict_attempts {
+        if is_retryable_serve_failure(&stderr) && attempt < startup.conflict_attempts {
             tokio::time::sleep(startup.conflict_backoff * attempt).await;
             attempt += 1;
             continue;
@@ -228,41 +331,81 @@ fn gateway_public_url(hostname: &str) -> String {
 /// Tailscale Tunnel — uses `tailscale serve` (tailnet-only) or
 /// `tailscale funnel` (public internet).
 /// Requires Tailscale installed and authenticated (`tailscale up`).
+///
+/// Every process it starts runs in the foreground, where tailscaled keeps a
+/// session's serve config exactly as long as the process lives, and is owned
+/// by a `ServeProcess` watcher: an exit is reaped and reported at once
+/// rather than left as a zombie that still looks alive, and ending the
+/// watcher withdraws what the process published.
 pub struct TailscaleTunnel {
     funnel: bool,
     hostname: Option<String>,
-    proc: SharedProcess,
-    /// Foreground `tailscale serve --tcp` forwarders for the daemon's
-    /// self-TLS listeners. Foreground serve config lives exactly as long as
-    /// the process, so ending these withdraws the forwards.
-    tcp_forwarders: Arc<Mutex<Vec<TcpForwarder>>>,
+    /// The gateway's `serve|funnel --https` proxy, once applied.
+    gateway: Mutex<Option<GatewayServe>>,
+    /// `tailscale serve --tcp` forwarders for the daemon's self-TLS
+    /// listeners.
+    tcp_forwarders: Arc<Mutex<Vec<ServeProcess>>>,
 }
 
-/// Cap on the forwarder stderr kept for an unexpected-exit report.
+/// The gateway's published HTTPS proxy.
+struct GatewayServe {
+    process: ServeProcess,
+    public_url: String,
+}
+
+/// Cap on the serve-process stderr kept for an unexpected-exit report.
 const FORWARDER_STDERR_CAP: u64 = 8 * 1024;
 
-/// A published forwarder, owned by its watcher task.
-struct TcpForwarder {
-    /// Sending, or dropping it, ends the forwarder (see `watch_forwarder`).
+/// What one serve process publishes, for its exit report.
+#[derive(Debug, Clone, Copy)]
+enum Published {
+    /// The gateway's HTTPS proxy to `127.0.0.1:<local_port>`.
+    Gateway { local_port: u16 },
+    /// A raw TCP passthrough for a daemon listener.
+    Tcp(TcpService),
+}
+
+impl Published {
+    fn attrs(&self) -> serde_json::Value {
+        match self {
+            Self::Gateway { local_port } => serde_json::json!({
+                "service": "gateway",
+                "tailnet_port": GATEWAY_HTTPS_PORT,
+                "local_port": local_port,
+            }),
+            Self::Tcp(service) => serde_json::json!({
+                "service": service.name,
+                "target": service.target.to_string(),
+            }),
+        }
+    }
+}
+
+/// A published serve process, owned by its watcher task.
+struct ServeProcess {
+    /// Sending, or dropping it, ends the process (see `watch_serve`).
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
 
-impl TcpForwarder {
-    fn spawn(service: TcpService, child: Child) -> Self {
+impl ServeProcess {
+    fn spawn(published: Published, child: Child) -> Self {
         let (stop, stop_rx) = oneshot::channel();
-        let task = zeroclaw_spawn::spawn!(watch_forwarder(service, child, stop_rx));
+        let task = zeroclaw_spawn::spawn!(watch_serve(published, child, stop_rx));
         Self {
             stop: Some(stop),
             task,
         }
     }
 
+    /// Whether the process is still running. The watcher ends only once it
+    /// has reaped the process, so this cannot mistake a zombie for a live
+    /// process the way `Child::id()` on an unpolled child does.
     fn is_running(&self) -> bool {
         !self.task.is_finished()
     }
 
-    /// Withdraw the forward and wait for the process to be reaped.
+    /// Withdraw what the process published and wait for it to be reaped.
     async fn shutdown(mut self) {
         if let Some(stop) = self.stop.take() {
             stop.send(()).ok();
@@ -271,11 +414,11 @@ impl TcpForwarder {
     }
 }
 
-/// Own one forwarder until it exits or is told to stop. A forwarder that
-/// exits on its own has silently taken its service off the tailnet, so that
-/// is reported; a stop request (or the tunnel being dropped, which drops the
-/// sender) kills it.
-async fn watch_forwarder(service: TcpService, mut child: Child, stop: oneshot::Receiver<()>) {
+/// Own one serve process until it exits or is told to stop. A process that
+/// exits on its own has silently taken what it published off the tailnet, so
+/// it is reaped and reported; a stop request (or the tunnel being dropped,
+/// which drops the sender) kills and reaps it.
+async fn watch_serve(published: Published, mut child: Child, stop: oneshot::Receiver<()>) {
     let stderr = child.stderr.take();
     tokio::select! {
         status = child.wait() => {
@@ -287,20 +430,19 @@ async fn watch_forwarder(service: TcpService, mut child: Child, stop: oneshot::R
                     .await
                     .ok();
             }
+            let mut attrs = published.attrs();
+            attrs["status"] = match status {
+                Ok(status) => status.to_string(),
+                Err(e) => e.to_string(),
+            }
+            .into();
+            attrs["stderr"] = captured.trim().into();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "service": service.name,
-                        "target": service.target.to_string(),
-                        "status": match status {
-                            Ok(status) => status.to_string(),
-                            Err(e) => e.to_string(),
-                        },
-                        "stderr": captured.trim(),
-                    })),
-                "tailscale serve --tcp exited after publication; the service is no longer \
+                    .with_attrs(attrs),
+                "tailscale serve exited after publication; the service is no longer \
                  reachable on the tailnet until the gateway restarts"
             );
         }
@@ -316,7 +458,7 @@ impl TailscaleTunnel {
         Self {
             funnel,
             hostname,
-            proc: new_shared_process(),
+            gateway: Mutex::new(None),
             tcp_forwarders: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -550,25 +692,47 @@ impl Tunnel for TailscaleTunnel {
         "tailscale"
     }
 
+    /// Publish the gateway and return its URL only once tailscaled is
+    /// actually serving it from this process. A process that exits instead
+    /// (port 443 held by another session, a rejected config write) fails the
+    /// start with its stderr, so the gateway falls back to local-only rather
+    /// than advertising a URL nothing serves.
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
-        // Get the tailscale hostname for URL construction
         let hostname = self.resolve_hostname().await?;
 
-        let child = Command::new("tailscale")
-            .args(gateway_serve_args(self.funnel, local_port))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        // A restart within this tunnel must not leave the old proxy behind.
+        if let Some(previous) = self.gateway.lock().await.take() {
+            previous.process.shutdown().await;
+        }
+
+        let args = gateway_serve_args(self.funnel, local_port);
+        let child = start_forwarder(
+            FORWARDER_STARTUP,
+            || spawn_serve(&args),
+            || serve_sessions_for_gateway(local_port),
+        )
+        .await
+        .map_err(|e| {
+            let mut attrs = e.attrs();
+            attrs["command"] = args.join(" ").into();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(attrs),
+                "tailscale did not publish the gateway"
+            );
+            anyhow::Error::msg(format!(
+                "tailscale {} did not publish the gateway: {e}",
+                args.join(" ")
+            ))
+        })?;
 
         let public_url = gateway_public_url(&hostname);
-
-        let mut guard = self.proc.lock().await;
-        *guard = Some(TunnelProcess {
-            child,
+        *self.gateway.lock().await = Some(GatewayServe {
+            process: ServeProcess::spawn(Published::Gateway { local_port }, child),
             public_url: public_url.clone(),
         });
-
         Ok(public_url)
     }
 
@@ -596,16 +760,10 @@ impl Tunnel for TailscaleTunnel {
         // etag, so concurrent spawns make all but one fail.
         let mut published = Vec::with_capacity(services.len());
         for service in services {
+            let args = tcp_serve_args(service);
             let started = start_forwarder(
                 FORWARDER_STARTUP,
-                || {
-                    Command::new("tailscale")
-                        .args(tcp_serve_args(service))
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::piped())
-                        .kill_on_drop(true)
-                        .spawn()
-                },
+                || spawn_serve(&args),
                 || serve_sessions_for(service.target),
             )
             .await;
@@ -618,7 +776,7 @@ impl Tunnel for TailscaleTunnel {
                     self.tcp_forwarders
                         .lock()
                         .await
-                        .push(TcpForwarder::spawn(*service, child));
+                        .push(ServeProcess::spawn(Published::Tcp(*service), child));
                 }
                 Err(e) => {
                     let mut attrs = e.attrs();
@@ -643,34 +801,40 @@ impl Tunnel for TailscaleTunnel {
     /// The node's serve config is never reset: the operator's own `--bg`
     /// entries and other processes' sessions live in it too.
     async fn stop(&self) -> Result<()> {
-        let forwarders: Vec<TcpForwarder> = self.tcp_forwarders.lock().await.drain(..).collect();
+        let forwarders: Vec<ServeProcess> = self.tcp_forwarders.lock().await.drain(..).collect();
         for forwarder in forwarders {
             forwarder.shutdown().await;
         }
-        kill_shared(&self.proc).await
+        if let Some(gateway) = self.gateway.lock().await.take() {
+            gateway.process.shutdown().await;
+        }
+        Ok(())
     }
 
     /// Healthy while the gateway serve process and every published TCP
-    /// forwarder are still running.
+    /// forwarder are still running. A process that exited is reaped by its
+    /// watcher at once, so an exit shows up here instead of hiding as a zombie.
     async fn health_check(&self) -> bool {
-        let gateway_up = {
-            let guard = self.proc.lock().await;
-            guard.as_ref().is_some_and(|tp| tp.child.id().is_some())
-        };
+        let gateway_up = self
+            .gateway
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|g| g.process.is_running());
         gateway_up
             && self
                 .tcp_forwarders
                 .lock()
                 .await
                 .iter()
-                .all(TcpForwarder::is_running)
+                .all(ServeProcess::is_running)
     }
 
     fn public_url(&self) -> Option<String> {
-        self.proc
+        self.gateway
             .try_lock()
             .ok()
-            .and_then(|g| g.as_ref().map(|tp| tp.public_url.clone()))
+            .and_then(|g| g.as_ref().map(|g| g.public_url.clone()))
     }
 }
 
@@ -734,8 +898,36 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Whether `pid`'s process still exists. Linux-only: `/proc` is the
+    /// portable signal on other platforms, so callers pair this with
+    /// `health_check()` to verify reaping cross-platform.
+    #[cfg(target_os = "linux")]
     fn process_exists(pid: u32) -> bool {
         std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    /// Whether `pid`'s process still exists.
+    ///
+    /// Non-Linux Unix fallback: `/proc` is unavailable, so this uses
+    /// `kill(pid, 0)` to check process liveness portably. Callers pair this
+    /// with `health_check()` (which waits for the watcher task to finish) to
+    /// verify reaping cross-platform.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn process_exists(pid: u32) -> bool {
+        // `kill(pid, 0)` returns 0 if the process exists (or we can signal it),
+        // and -1 with ESRCH if it doesn't.
+        let pid = libc::pid_t::try_from(pid).unwrap_or(0);
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Whether `pid`'s process still exists.
+    ///
+    /// Windows fallback: `kill` is unavailable, so this always returns
+    /// `false`. Callers pair this with `health_check()` (which waits for the
+    /// watcher task to finish) to verify reaping portably.
+    #[cfg(windows)]
+    fn process_exists(_pid: u32) -> bool {
+        false
     }
 
     #[tokio::test]
@@ -748,15 +940,11 @@ mod tests {
         let gateway = spawn_stand_in("sleep 30");
         let forwarder = spawn_stand_in("sleep 30");
         let pids = [gateway.id().unwrap(), forwarder.id().unwrap()];
-        *tunnel.proc.lock().await = Some(TunnelProcess {
-            child: gateway,
-            public_url: "https://node.tailnet.ts.net".into(),
-        });
-        tunnel
-            .tcp_forwarders
-            .lock()
-            .await
-            .push(TcpForwarder::spawn(forwarder_service(), forwarder));
+        *tunnel.gateway.lock().await = Some(gateway_serve(gateway));
+        tunnel.tcp_forwarders.lock().await.push(ServeProcess::spawn(
+            Published::Tcp(forwarder_service()),
+            forwarder,
+        ));
 
         tokio::time::timeout(Duration::from_secs(5), tunnel.stop())
             .await
@@ -766,7 +954,7 @@ mod tests {
         for pid in pids {
             assert!(!process_exists(pid), "pid {pid} left behind by stop");
         }
-        assert!(tunnel.proc.lock().await.is_none());
+        assert!(tunnel.gateway.lock().await.is_none());
         assert!(tunnel.tcp_forwarders.lock().await.is_empty());
         assert!(!tunnel.health_check().await);
     }
@@ -1045,8 +1233,10 @@ mod tests {
     #[tokio::test]
     async fn forwarder_exit_after_publication_is_detected() {
         // A forwarder that exits after the startup check must be observed.
-        let forwarder =
-            TcpForwarder::spawn(forwarder_service(), spawn_stand_in("echo gone >&2; exit 3"));
+        let forwarder = ServeProcess::spawn(
+            Published::Tcp(forwarder_service()),
+            spawn_stand_in("echo gone >&2; exit 3"),
+        );
         wait_until(async || !forwarder.is_running()).await;
     }
 
@@ -1054,32 +1244,104 @@ mod tests {
     async fn health_check_fails_when_a_forwarder_has_exited() {
         let tunnel = TailscaleTunnel::new(false, Some("node.tailnet.ts.net".into()));
         // Gateway serve process stand-in, alive for the whole test.
-        *tunnel.proc.lock().await = Some(TunnelProcess {
-            child: spawn_stand_in("sleep 30"),
-            public_url: "https://node.tailnet.ts.net".into(),
-        });
-        tunnel.tcp_forwarders.lock().await.push(TcpForwarder::spawn(
-            forwarder_service(),
+        *tunnel.gateway.lock().await = Some(gateway_serve(spawn_stand_in("sleep 30")));
+        tunnel.tcp_forwarders.lock().await.push(ServeProcess::spawn(
+            Published::Tcp(forwarder_service()),
             spawn_stand_in("sleep 30"),
         ));
         assert!(tunnel.health_check().await);
 
-        tunnel.tcp_forwarders.lock().await.push(TcpForwarder::spawn(
-            forwarder_service(),
+        tunnel.tcp_forwarders.lock().await.push(ServeProcess::spawn(
+            Published::Tcp(forwarder_service()),
             spawn_stand_in("exit 1"),
         ));
         wait_until(async || !tunnel.health_check().await).await;
 
-        kill_shared(&tunnel.proc).await.ok();
-        let forwarders: Vec<TcpForwarder> = tunnel.tcp_forwarders.lock().await.drain(..).collect();
-        for forwarder in forwarders {
-            forwarder.shutdown().await;
+        tunnel.stop().await.unwrap();
+    }
+
+    fn gateway_serve(child: Child) -> GatewayServe {
+        GatewayServe {
+            process: ServeProcess::spawn(Published::Gateway { local_port: 42617 }, child),
+            public_url: "https://node.tailnet.ts.net".into(),
         }
+    }
+
+    /// Whether `pid` is a zombie: exited, but never waited for by its parent.
+    ///
+    /// Only meaningful on Linux, where `/proc` exposes process state. On other
+    /// platforms the watcher's `health_check()` is the portable reaping signal.
+    #[cfg(target_os = "linux")]
+    fn is_zombie(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                // `pid (comm) S ...`: the state follows the last `)`.
+                let rest = &stat[stat.rfind(')')? + 1..];
+                rest.split_whitespace().next().map(|s| s == "Z")
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether `pid` is a zombie: exited, but never waited for by its parent.
+    ///
+    /// Non-Linux fallback: `/proc` is unavailable, so this always returns
+    /// `false`. Callers pair this with `health_check()` (which waits for the
+    /// watcher task to finish) to verify reaping portably.
+    #[cfg(not(target_os = "linux"))]
+    fn is_zombie(_pid: u32) -> bool {
+        false
+    }
+
+    #[tokio::test]
+    async fn gateway_serve_exit_is_reaped_not_left_defunct() {
+        // Regression: the gateway's `tailscale serve --https` child was never
+        // waited for. When it exited (port 443 still held, a lost config
+        // race) it sat as a zombie for the life of the daemon and
+        // health_check still reported it alive, because `Child::id()` stays
+        // `Some` until the child is polled to completion.
+        let tunnel = TailscaleTunnel::new(false, Some("node.tailnet.ts.net".into()));
+        let child =
+            spawn_stand_in("sleep 0.1; echo 'listener already exists for port 443' >&2; exit 1");
+        let pid = child.id().unwrap();
+        *tunnel.gateway.lock().await = Some(gateway_serve(child));
+        assert!(tunnel.health_check().await);
+
+        wait_until(async || !tunnel.health_check().await).await;
+        assert!(!is_zombie(pid), "pid {pid} left defunct");
+        assert!(!process_exists(pid), "pid {pid} not reaped");
+
+        tunnel.stop().await.unwrap();
+        assert!(tunnel.public_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_tunnel_kills_and_reaps_its_gateway_serve() {
+        // An aborted gateway task drops the tunnel without calling stop; the
+        // serve process must still end, or it keeps holding port 443 and the
+        // next gateway generation cannot publish.
+        let tunnel = TailscaleTunnel::new(false, Some("node.tailnet.ts.net".into()));
+        let child = spawn_stand_in("sleep 30");
+        let pid = child.id().unwrap();
+        *tunnel.gateway.lock().await = Some(gateway_serve(child));
+        // The child must be alive before we drop the tunnel; otherwise the
+        // test would pass vacuously on a spawn failure.
+        assert!(
+            tunnel.health_check().await,
+            "gateway serve should be running before drop"
+        );
+        drop(tunnel);
+        // On Linux, /proc confirms the process is gone. On macOS, kill(pid, 0)
+        // checks liveness portably. Both wait for the watcher to kill and reap.
+        wait_until(async || !process_exists(pid)).await;
     }
 
     #[tokio::test]
     async fn forwarder_shutdown_kills_and_reaps_the_process() {
-        let forwarder = TcpForwarder::spawn(forwarder_service(), spawn_stand_in("sleep 30"));
+        let forwarder = ServeProcess::spawn(
+            Published::Tcp(forwarder_service()),
+            spawn_stand_in("sleep 30"),
+        );
         assert!(forwarder.is_running());
         tokio::time::timeout(Duration::from_secs(5), forwarder.shutdown())
             .await
@@ -1115,6 +1377,98 @@ mod tests {
             "Access denied: serve config denied"
         ));
         assert!(!is_serve_config_conflict(""));
+    }
+
+    /// stderr of a serve whose port another foreground session still holds,
+    /// observed on Tailscale 1.104.1.
+    const PORT_HELD_STDERR: &str =
+        "sending serve config: updating config: listener already exists for port 443";
+
+    #[test]
+    fn held_port_is_retryable_but_other_failures_are_not() {
+        assert!(is_port_held(PORT_HELD_STDERR));
+        assert!(is_retryable_serve_failure(PORT_HELD_STDERR));
+        assert!(is_retryable_serve_failure(CONFLICT_STDERR));
+        assert!(!is_retryable_serve_failure(
+            "Access denied: serve config denied"
+        ));
+        assert!(!is_retryable_serve_failure(""));
+    }
+
+    #[tokio::test]
+    async fn start_forwarder_waits_out_a_port_that_is_being_released() {
+        // The previous gateway generation's session still holds the port for
+        // the first attempt, then lets go.
+        let spawns = std::sync::atomic::AtomicUsize::new(0);
+        let child = start_forwarder(
+            quick_startup(),
+            || {
+                Ok(
+                    match spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => exit_with_stderr(PORT_HELD_STDERR),
+                        _ => spawn_stand_in("sleep 30"),
+                    },
+                )
+            },
+            probe_after(&spawns, 2, &["old"], &["mine"]),
+        )
+        .await
+        .expect("the retry after the port is released publishes");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 2);
+        ServeProcess::spawn(Published::Gateway { local_port: 42617 }, child)
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn start_forwarder_reports_a_port_that_stays_held() {
+        // A holder that never lets go (for example a `tailscale serve` left
+        // running by a daemon that crashed) is reported with its stderr after
+        // the bounded attempts, not spun on forever.
+        let spawns = std::sync::atomic::AtomicUsize::new(0);
+        let err = start_forwarder(
+            quick_startup(),
+            || {
+                spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(exit_with_stderr(PORT_HELD_STDERR))
+            },
+            || async { Some(sessions(&["orphan"])) },
+        )
+        .await
+        .expect_err("a port that stays held fails");
+        assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            matches!(err, ForwarderStartError::Exited { attempts: 3, ref stderr, .. } if stderr.contains("listener already exists")),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("listener already exists"), "{err}");
+    }
+
+    #[test]
+    fn gateway_sessions_match_only_an_https_proxy_to_the_local_port() {
+        // Shape from a live 1.104.1 node running `serve --https=443 42617`.
+        let live = br#"{"Foreground":{
+            "25f9":{"TCP":{"443":{"HTTPS":true}},"Web":{"zcnode.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:42617"}}}}},
+            "a968":{"TCP":{"9781":{"TCPForward":"100.101.102.103:9781"}}}}}"#;
+        assert_eq!(
+            serve_sessions_proxying(live, 42617),
+            Some(sessions(&["25f9"]))
+        );
+        // Another local port is someone else's proxy.
+        assert_eq!(serve_sessions_proxying(live, 8080), Some(sessions(&[])));
+        // A raw forward on 443, or a web handler without HTTPS, is not it.
+        let raw = br#"{"Foreground":{"b1":{"TCP":{"443":{"TCPForward":"127.0.0.1:42617"}}}}}"#;
+        assert_eq!(serve_sessions_proxying(raw, 42617), Some(sessions(&[])));
+        // Another tailnet port is not the gateway's.
+        let other_port = br#"{"Foreground":{"c1":{"TCP":{"8443":{"HTTPS":true}},"Web":{"n.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:42617"}}}}}}}"#;
+        assert_eq!(
+            serve_sessions_proxying(other_port, 42617),
+            Some(sessions(&[]))
+        );
+        // The background config is never this process's session.
+        let bg = br#"{"TCP":{"443":{"HTTPS":true}},"Web":{"n.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:42617"}}}}}"#;
+        assert_eq!(serve_sessions_proxying(bg, 42617), Some(sessions(&[])));
+        assert_eq!(serve_sessions_proxying(b"not json", 42617), None);
     }
 
     fn sessions(ids: &[&str]) -> BTreeSet<String> {
@@ -1223,7 +1577,7 @@ mod tests {
         )
         .await
         .expect("the new session is this forwarder's");
-        TcpForwarder::spawn(forwarder_service(), child)
+        ServeProcess::spawn(Published::Tcp(forwarder_service()), child)
             .shutdown()
             .await;
     }
@@ -1275,7 +1629,7 @@ mod tests {
         .await
         .expect("retry should publish");
         assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 2);
-        TcpForwarder::spawn(forwarder_service(), child)
+        ServeProcess::spawn(Published::Tcp(forwarder_service()), child)
             .shutdown()
             .await;
     }
@@ -1387,5 +1741,123 @@ mod tests {
         let published = tunnel.publish_tcp_services(&[]).await.unwrap();
         assert!(published.is_empty());
         assert!(tunnel.tcp_forwarders.lock().await.is_empty());
+    }
+
+    /// Integration test against a live `tailscaled`: exercises the full
+    /// `TailscaleTunnel::start()` path — spawn, readiness probe, and fallback
+    /// when port 443 is already held.
+    ///
+    /// **Ignored by default**: this test publishes a real HTTPS proxy on the
+    /// host's Tailscale port 443. Run only on a disposable test node with
+    /// `cargo test -- --ignored start_gateway_serve_against_live_tailscaled`.
+    #[tokio::test]
+    #[ignore = "publishes a real HTTPS proxy on port 443; run only on a disposable test node"]
+    async fn start_gateway_serve_against_live_tailscaled() {
+        // Skip unless tailscale is available and the node is logged in.
+        let which = std::process::Command::new("which")
+            .arg("tailscale")
+            .output()
+            .ok();
+        if which.is_none_or(|o| !o.status.success()) {
+            eprintln!("skipped: tailscale not on PATH");
+            return;
+        }
+        let status = std::process::Command::new("tailscale")
+            .args(["status", "--json"])
+            .output()
+            .ok();
+        let status = match status {
+            Some(s) if s.status.success() => s,
+            _ => {
+                eprintln!("skipped: tailscale status failed (not logged in?)");
+                return;
+            }
+        };
+        let self_info = parse_tailscale_self(&status.stdout);
+        if !self_info.has_identity() {
+            eprintln!("skipped: tailscale node has no tailnet identity");
+            return;
+        }
+
+        let hostname = self_info.dns_name.as_deref().unwrap_or("localhost");
+        let tunnel = TailscaleTunnel::new(false, Some(hostname.to_string()));
+
+        // Step 1: start the gateway serve with port 443 free. This must
+        // succeed and return a URL — a failure here is a real regression,
+        // not a skip.
+        let url = tunnel
+            .start("127.0.0.1", 42617)
+            .await
+            .expect("start() should succeed when port 443 is free");
+        assert!(url.starts_with("https://"), "url should be https: {url}");
+        assert!(
+            tunnel.health_check().await,
+            "gateway should be healthy after start"
+        );
+
+        // Step 2: stop and verify cleanup — no defunct child, no URL.
+        tunnel.stop().await.unwrap();
+        assert!(
+            !tunnel.health_check().await,
+            "gateway should be unhealthy after stop"
+        );
+        assert!(
+            tunnel.public_url().is_none(),
+            "URL should be cleared after stop"
+        );
+
+        // Step 3: hold port 443 with a real foreground `tailscale serve`, then
+        // start again. This must fail with a port-held error and leave no
+        // defunct child. The holder is owned from the moment it is spawned:
+        // dropping it kills and reaps the process, which is also what
+        // withdraws its serve config. `serve reset` is not used — that would
+        // wipe every serve config on the node, including ones this test did
+        // not publish.
+        let holder = spawn_serve(&gateway_serve_args(false, 19999)).expect("spawn port holder");
+        let holder_pid = holder.id().expect("holder pid");
+        let holder = ServeProcess::spawn(Published::Gateway { local_port: 19999 }, holder);
+        assert!(
+            holder.is_running(),
+            "port holder exited before it could publish"
+        );
+        // The holder must actually own 443 before the conflict is meaningful.
+        // A process that is merely still running may be blocked before applying.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if serve_sessions_for_gateway(19999)
+                    .await
+                    .is_some_and(|sessions| !sessions.is_empty())
+                {
+                    break;
+                }
+                assert!(holder.is_running(), "port holder exited before publishing");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("holder never published an HTTPS proxy on 443");
+
+        let err = tunnel
+            .start("127.0.0.1", 42617)
+            .await
+            .expect_err("start() should fail while another session holds port 443");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("listener already exists for port 443"),
+            "error should mention port 443 conflict, got: {err_msg}"
+        );
+        // No defunct child should remain after the failed start.
+        assert!(
+            !tunnel.health_check().await,
+            "no defunct child after failed start"
+        );
+        // The holder is still the session on 443; ending it is what releases
+        // the port for the next run.
+        assert!(holder.is_running(), "port holder died during the conflict");
+        holder.shutdown().await;
+        assert!(
+            !process_exists(holder_pid),
+            "port holder pid {holder_pid} left running"
+        );
     }
 }

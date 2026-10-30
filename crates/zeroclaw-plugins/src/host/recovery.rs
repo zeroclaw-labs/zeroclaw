@@ -14,12 +14,20 @@ const LOCK: &str = ".zeroclaw-package-lock-v1";
 const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const LEASE: &str = "lease";
 pub(super) const PACKAGE: &str = "package";
-const DELETING: &str = "deleting";
+/// The mark a transaction holds once it is committed to deleting the
+/// generation it claimed: a remove that judged the package incomplete, or an
+/// update that published the replacement in its place. Recovery finishes the
+/// delete of a marked claim and never puts it back.
+pub(super) const DELETING: &str = "deleting";
 
 pub(super) struct Root {
     pub dir: Dir,
     identity: same_file::Handle,
     lock: std::sync::OnceLock<File>,
+    /// Held for as long as a [`Guard`] lives. The package lock is a lock on
+    /// one open file, which a second lock through that same file takes at
+    /// once, so two threads sharing this root would otherwise both hold it.
+    held: std::sync::Mutex<()>,
     path: PathBuf,
     // cap-std's Windows operations reconstruct paths. Pin every canonical
     // ancestor without FILE_SHARE_DELETE, not just the package root, so those
@@ -28,17 +36,42 @@ pub(super) struct Root {
     ancestors: Vec<Dir>,
 }
 
-pub(super) struct Guard<'a>(&'a File);
+pub(super) struct Guard<'a> {
+    file: &'a File,
+    // Released after `drop` has unlocked the file, so the next thread in this
+    // process takes the file lock only once this one has let it go.
+    _thread: std::sync::MutexGuard<'a, ()>,
+}
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
         // Closing the retained descriptor also releases the lock. There is no
         // mutation in this destructor, and unlock errors cannot confer ownership.
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
     }
 }
 
 fn identity(dir: &Dir) -> std::io::Result<same_file::Handle> {
     same_file::Handle::from_file(dir.try_clone()?.into_std_file())
+}
+
+/// On Unix, create the file readable and writable by its owner only. Any
+/// account that can open the package lock or a lease can hold it, and the
+/// plugins directory is one account's state. Other platforms keep their
+/// default.
+fn owner_only(options: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    cap_std::fs::OpenOptionsExt::mode(options, 0o600);
+    options
+}
+
+/// Opening the package lock failed. Names the lock file, such as one another
+/// account created that this one cannot open, and keeps the original error as
+/// its source, so its kind and OS error survive.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot open the package lock {}: {source}", path.display())]
+struct LockOpenError {
+    path: PathBuf,
+    source: std::io::Error,
 }
 
 impl Root {
@@ -51,6 +84,7 @@ impl Root {
             dir,
             identity,
             lock: std::sync::OnceLock::new(),
+            held: std::sync::Mutex::new(()),
             path: path.to_path_buf(),
             #[cfg(windows)]
             ancestors,
@@ -93,9 +127,13 @@ impl Root {
     fn lock_within(&self, wait: std::time::Duration) -> Result<Guard<'_>, PluginError> {
         self.check()?;
         if self.lock.get().is_none() {
+            let named = |source: std::io::Error| {
+                let path = self.path.join(LOCK);
+                std::io::Error::new(source.kind(), LockOpenError { path, source })
+            };
             let lock = match self.dir.open_with(
                 LOCK,
-                OpenOptions::new().read(true).write(true).create_new(true),
+                owner_only(OpenOptions::new().read(true).write(true).create_new(true)),
             ) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -120,12 +158,14 @@ impl Root {
                                     | std::io::ErrorKind::ReadOnlyFilesystem
                             ) =>
                         {
-                            self.dir.open_with(LOCK, OpenOptions::new().read(true))?
+                            self.dir
+                                .open_with(LOCK, OpenOptions::new().read(true))
+                                .map_err(named)?
                         }
-                        Err(error) => return Err(error.into()),
+                        Err(error) => return Err(named(error).into()),
                     }
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(named(error).into()),
             }
             .into_std();
             // Concurrent initialization retains the winner's handle; never a
@@ -138,6 +178,28 @@ impl Root {
             .ok_or_else(|| std::io::Error::other("package lock unavailable"))?;
         let started = std::time::Instant::now();
         let mut pause = std::time::Duration::from_millis(10);
+        // Another thread of this process holding the lock through this root
+        // is waited for first, within the same bound. A thread that panicked
+        // while holding it unlocked the file as its guard dropped.
+        let thread = loop {
+            match self.held.try_lock() {
+                Ok(thread) => break thread,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(std::time::Duration::from_millis(250));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(PluginError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "another operation in this process did not release the package lock at {} within {wait:?}; try again once it finishes",
+                            self.path.join(LOCK).display()
+                        ),
+                    )));
+                }
+            }
+        };
         loop {
             match lock.try_lock() {
                 Ok(()) => break,
@@ -157,7 +219,10 @@ impl Root {
                 Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
         }
-        let guard = Guard(lock);
+        let guard = Guard {
+            file: lock,
+            _thread: thread,
+        };
         self.check()?;
         Ok(guard)
     }
@@ -176,7 +241,7 @@ impl Root {
         let lease = dir
             .open_with(
                 LEASE,
-                OpenOptions::new().read(true).write(true).create_new(true),
+                owner_only(OpenOptions::new().read(true).write(true).create_new(true)),
             )?
             .into_std();
         lease.lock()?;
@@ -264,18 +329,18 @@ impl Transaction {
         Ok(())
     }
 
-    /// Commit to deleting the claimed package. A process that takes this
+    /// Commit to deleting the claimed generation. A process that takes this
     /// transaction over after a stop finds the mark and finishes the delete
-    /// rather than putting the package back.
+    /// rather than putting the generation back.
     pub fn mark_deleting(&self) -> Result<(), PluginError> {
         self.dir
             .open_with(DELETING, OpenOptions::new().write(true).create_new(true))?;
         Ok(())
     }
 
-    /// Whether an earlier remove committed to deleting this claim. The mark is
-    /// a regular file this protocol created; anything else by that name is an
-    /// error rather than a commitment.
+    /// Whether an earlier remove or update committed to deleting this claim.
+    /// The mark is a regular file this protocol created; anything else by that
+    /// name is an error rather than a commitment.
     pub fn is_deleting(&self) -> Result<bool, PluginError> {
         match self.dir.symlink_metadata(DELETING) {
             Ok(metadata) if metadata.is_file() => Ok(true),
@@ -285,8 +350,8 @@ impl Transaction {
         }
     }
 
-    /// Finish a delete an earlier remove committed to: whatever is left of
-    /// the claimed package, through a handle on it, then the mark.
+    /// Finish a delete an earlier remove or update committed to: whatever is
+    /// left of the claimed generation, through a handle on it, then the mark.
     pub fn finish_delete(&self) -> Result<(), PluginError> {
         match self.dir.open_dir(PACKAGE) {
             Ok(package) => {
@@ -446,6 +511,16 @@ pub(super) fn is_transaction(entry: &str, name: &str, kind: &str) -> bool {
         })
 }
 
+/// The package a `kind` transaction entry belongs to, when `entry` is one.
+pub(super) fn transaction_package<'a>(entry: &'a str, kind: &str) -> Option<&'a str> {
+    let (package, _) = entry
+        .strip_prefix('.')?
+        .rsplit_once(&format!(".{kind}-v1-"))?;
+    (crate::instance::validate_package_name(package).is_ok()
+        && is_transaction(entry, package, kind))
+    .then_some(package)
+}
+
 #[cfg(test)]
 pub(super) fn pause(step: &str) {
     use std::io::Write;
@@ -527,6 +602,28 @@ mod lock_wait_tests {
         drop(held);
         drop(waiter.lock_within(Duration::from_millis(300)).unwrap());
     }
+
+    /// Two threads sharing one root do not both hold the package lock. The
+    /// lock is a lock on one open file, which a second lock through that same
+    /// file would take at once, so the second thread waits and then gives up.
+    #[test]
+    fn a_second_thread_sharing_the_root_waits_for_the_package_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::open(temp.path()).unwrap();
+        let held = root.lock().unwrap();
+        let second = std::thread::scope(|scope| {
+            scope
+                .spawn(|| root.lock_within(Duration::from_millis(300)).map(drop))
+                .join()
+                .unwrap()
+        });
+        let Err(error) = second else {
+            panic!("a second thread took a package lock this root already holds");
+        };
+        assert!(error.to_string().contains("did not release"), "{error}");
+        drop(held);
+        drop(root.lock_within(Duration::from_millis(300)).unwrap());
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -543,6 +640,126 @@ mod lock_descriptor_tests {
         let _guard = root.lock().unwrap();
         let flags = rustix::fs::fcntl_getfl(root.lock.get().unwrap()).unwrap();
         assert!(flags.contains(rustix::fs::OFlags::RDWR), "{flags:?}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod owner_only_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Runs only as the child of the test below, under the umask it sets:
+    /// creates the package lock and a transaction lease, then reopens both
+    /// through a second root.
+    #[test]
+    #[ignore = "subprocess helper for package_lock_and_lease_are_created_owner_only"]
+    fn create_lock_and_lease_child() {
+        let Ok(path) = std::env::var("ZC_OWNER_ONLY_ROOT") else {
+            return;
+        };
+        let root = Root::open(Path::new(&path)).unwrap();
+        drop(root.lock().unwrap());
+        let entry = root.transaction("modes", "installing").unwrap().entry;
+        let again = Root::open(Path::new(&path)).unwrap();
+        drop(again.lock().unwrap());
+        drop(again.reopen_transaction(entry).unwrap().unwrap());
+    }
+
+    /// Any account that can open the package lock or a lease can hold it, so
+    /// both are created owner-only whatever the umask, and reopening them
+    /// leaves that mode. The umask is process wide, so each one is set in a
+    /// child rather than in this test runner.
+    #[test]
+    fn package_lock_and_lease_are_created_owner_only() {
+        let mode = |path: &Path| {
+            format!(
+                "{:03o}",
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+            )
+        };
+        let mut modes = Vec::new();
+        for umask in ["002", "022"] {
+            let temp = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new("sh")
+                .args(["-c", &format!("umask {umask} && exec \"$0\" \"$@\"")])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host::recovery::owner_only_tests::create_lock_and_lease_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("ZC_OWNER_ONLY_ROOT", temp.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "umask {umask}: the child must run: {output:?}"
+            );
+            let entry = std::fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.join(LEASE).is_file())
+                .unwrap();
+            // The transaction directory takes the umask, which shows the child
+            // ran under it.
+            modes.push([
+                umask.to_string(),
+                mode(&entry),
+                mode(&temp.path().join(LOCK)),
+                mode(&entry.join(LEASE)),
+            ]);
+        }
+        assert_eq!(
+            modes,
+            [["002", "775", "600", "600"], ["022", "755", "600", "600"]],
+            "[umask, transaction directory, lock, lease]"
+        );
+    }
+
+    /// A lock this account cannot open, as when another account created it
+    /// owner-only, fails at once and names the lock file. The original error
+    /// stays its source, so its kind and OS error survive. Creating the lock
+    /// where this account cannot write names it too.
+    #[test]
+    fn a_lock_this_account_cannot_open_fails_at_once_and_is_named() {
+        let temp = tempfile::tempdir().unwrap();
+        drop(Root::open(temp.path()).unwrap().lock().unwrap());
+        let lock = temp.path().join(LOCK);
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The superuser opens it regardless, so there is nothing to check.
+        let denied = match std::fs::File::open(&lock) {
+            Ok(_) => return,
+            Err(error) => error,
+        };
+        let root = Root::open(temp.path()).unwrap();
+        let started = std::time::Instant::now();
+        let Err(error) = root.lock().map(drop) else {
+            panic!("a lock this account cannot open was taken");
+        };
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let message = error.to_string();
+        assert!(message.contains(&lock.display().to_string()), "{message}");
+        let PluginError::Io(io) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+        let source = std::error::Error::source(io)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("the original error is the source");
+        assert_eq!(source.raw_os_error(), denied.raw_os_error());
+
+        let unwritable = tempfile::tempdir().unwrap();
+        let path = unwritable.path();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = Root::open(path).unwrap().lock().map(drop);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let message = error
+            .expect_err("created a lock where this account cannot write")
+            .to_string();
+        let lock = path.join(LOCK);
+        assert!(message.contains(&lock.display().to_string()), "{message}");
     }
 }
 

@@ -55,6 +55,20 @@ fn recovery_process_child() {
         println!("RESULT:{result:?}");
         return;
     }
+    if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("recover") {
+        let result = host.recover_interrupted_update("race");
+        println!("RESULT:{result:?}");
+        return;
+    }
+    if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("update") {
+        let source = Path::new(&root).join(".source");
+        let admitted = host.admit_update("race", source.to_str().unwrap()).unwrap();
+        let result = host
+            .update_admitted(admitted)
+            .map(|replaced| replaced.previous_version);
+        println!("RESULT:{result:?}");
+        return;
+    }
     if std::env::var("ZC_RECOVERY_ACTION").as_deref() == Ok("healthy-late") {
         tests::write_tool_source(
             &Path::new(&root).join("race"),
@@ -967,6 +981,127 @@ fn an_install_that_published_but_could_not_clear_its_stage_succeeds() {
     );
 }
 
+/// `race` loaded from `legacy-dir`, a directory not named after it.
+fn loaded_elsewhere(root: &Path) {
+    std::fs::create_dir(root.join("legacy-dir")).unwrap();
+    tests::write_tool_source(&root.join("legacy-dir"), "race", b"\0asm loaded");
+}
+
+/// A remove of a loaded package stopped after its claim leaves the package in
+/// the claim. The claim records only the name, so the next remove puts it back
+/// at the name, not in the directory it was loaded from. Back at the name,
+/// that remove refuses it as a package admission accepts, since this host did
+/// not load it, and the remove after that deletes it.
+#[test]
+fn a_loaded_remove_stopped_after_its_claim_is_put_back_at_the_name() {
+    let root = tempfile::tempdir().unwrap();
+    loaded_elsewhere(root.path());
+    Paused::start(root.path(), "loaded-after-claim", "remove").crash();
+    assert!(!root.path().join("legacy-dir").exists());
+
+    let retried = PluginHost::from_plugins_dir(root.path())
+        .unwrap()
+        .remove("race");
+    assert!(
+        matches!(&retried, Err(PluginError::UnadmittedPackage { reason, .. }) if reason == "admission accepts this package"),
+        "{retried:?}"
+    );
+    assert!(root.path().join("race/manifest.toml").is_file());
+    assert!(!root.path().join("legacy-dir").exists());
+
+    PluginHost::from_plugins_dir(root.path())
+        .unwrap()
+        .remove("race")
+        .unwrap();
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [".zeroclaw-package-lock-v1"]
+    );
+}
+
+/// While something occupies the name, the claim a stopped remove of a loaded
+/// package left cannot be put back there, so every remove refuses and keeps
+/// both. Moving the occupant aside lets the next remove put the package back
+/// at the name and refuse it, and the one after that delete it.
+#[test]
+fn a_loaded_remove_stopped_after_its_claim_waits_for_the_name_to_be_free() {
+    let root = tempfile::tempdir().unwrap();
+    loaded_elsewhere(root.path());
+    std::fs::create_dir(root.path().join("race")).unwrap();
+    std::fs::write(root.path().join("race/notes.txt"), b"keep").unwrap();
+    Paused::start(root.path(), "loaded-after-claim", "remove").crash();
+
+    for _ in 0..2 {
+        let retried = PluginHost::from_plugins_dir(root.path())
+            .unwrap()
+            .remove("race");
+        assert!(
+            matches!(&retried, Err(PluginError::RecoveryRetained { .. })),
+            "{retried:?}"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("race/notes.txt")).unwrap(),
+            b"keep"
+        );
+    }
+
+    std::fs::rename(root.path().join("race"), root.path().join("race-notes")).unwrap();
+    let restored = PluginHost::from_plugins_dir(root.path())
+        .unwrap()
+        .remove("race");
+    assert!(
+        matches!(&restored, Err(PluginError::UnadmittedPackage { reason, .. }) if reason == "admission accepts this package"),
+        "{restored:?}"
+    );
+    PluginHost::from_plugins_dir(root.path())
+        .unwrap()
+        .remove("race")
+        .unwrap();
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [".zeroclaw-package-lock-v1", "race-notes"]
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("race-notes/notes.txt")).unwrap(),
+        b"keep"
+    );
+}
+
+/// A claimed generation that is not the loaded one, and cannot go back
+/// because something took its directory meanwhile, stays in the claim and is
+/// reported there. Nothing is deleted.
+#[test]
+fn a_loaded_remove_that_cannot_put_back_a_changed_generation_reports_the_claim() {
+    let root = tempfile::tempdir().unwrap();
+    loaded_elsewhere(root.path());
+    let paused = Paused::start(root.path(), "loaded-after-claim", "remove");
+    let claim = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|p| p.contains("recovering-v1"))
+        .unwrap();
+    std::fs::write(
+        root.path().join(&claim).join("package/plugin.wasm"),
+        b"\0asm changed",
+    )
+    .unwrap();
+    std::fs::create_dir(root.path().join("legacy-dir")).unwrap();
+    std::fs::write(root.path().join("legacy-dir/notes.txt"), b"keep").unwrap();
+
+    let output = paused.resume();
+    assert!(
+        output.contains("RecoveryRetained") && output.contains(&claim),
+        "{output}"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("legacy-dir/notes.txt")).unwrap(),
+        b"keep"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join(&claim).join("package/plugin.wasm")).unwrap(),
+        b"\0asm changed"
+    );
+}
+
 #[test]
 fn crash_after_claim_restores_then_recovers_on_retry() {
     let root = tempfile::tempdir().unwrap();
@@ -1052,6 +1187,119 @@ fn real_active_stage_survives_and_abandoned_protocol_stage_is_cleaned() {
     broken(root.path());
     host.remove("race").unwrap();
     assert!(!root.path().join(name).exists());
+}
+
+/// An install killed after staging its package and before publishing it
+/// leaves the stage behind. The next install of the name clears that stage,
+/// whose lease died with the process, before staging its own.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[test]
+fn the_next_install_clears_the_stage_a_killed_install_left() {
+    let root = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    tests::write_tool_source(source.path(), "race", b"\0asm interrupted");
+    Paused::start_install(root.path(), "rename-before-move", source.path()).crash();
+    let stage = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|name| name.starts_with(".race.installing-v1-"))
+        .expect("the killed install left its stage");
+    assert!(root.path().join(&stage).join("lease").is_file());
+    assert!(
+        root.path()
+            .join(&stage)
+            .join("package/manifest.toml")
+            .is_file()
+    );
+    assert!(!root.path().join("race").exists());
+
+    tests::write_tool_source(source.path(), "race", b"\0asm reinstalled");
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    assert_eq!(
+        host.install(source.path().to_str().unwrap()).unwrap(),
+        "race"
+    );
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [".zeroclaw-package-lock-v1", "race"]
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("race/plugin.wasm")).unwrap(),
+        b"\0asm reinstalled"
+    );
+}
+
+/// An install never clears a stage of its name whose lease is still held:
+/// the process holding it has not finished. The abandoned stage next to it
+/// shows the sweep reached both and kept the held one for its lease.
+#[test]
+fn an_install_keeps_a_stage_whose_lease_is_held() {
+    let root = tempfile::tempdir().unwrap();
+    let stage = Paused::start(root.path(), "stage-owned", "stage");
+    let name = stage
+        .lines
+        .lines()
+        .find_map(|line| line.strip_prefix("STAGE:"))
+        .unwrap()
+        .to_string();
+    let source = tempfile::tempdir().unwrap();
+    tests::write_tool_source(source.path(), "race", b"\0asm installed");
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    {
+        let abandoned = host
+            .root()
+            .unwrap()
+            .transaction("race", "installing")
+            .unwrap();
+        abandoned.dir.create_dir(recovery::PACKAGE).unwrap();
+        abandoned.dir.write("package/bytes", b"abandoned").unwrap();
+    }
+    assert_eq!(
+        host.install(source.path().to_str().unwrap()).unwrap(),
+        "race"
+    );
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [name.as_str(), ".zeroclaw-package-lock-v1", "race"]
+    );
+    assert!(root.path().join(&name).join("lease").is_file());
+    assert_eq!(
+        std::fs::read(root.path().join(&name).join("package/bytes")).unwrap(),
+        b"active owner"
+    );
+    stage.crash();
+}
+
+/// A coordination lock replaced while an install sweeps an abandoned stage
+/// refuses the install before it stages anything of its own.
+#[cfg(unix)]
+#[test]
+fn an_install_whose_sweep_meets_a_replaced_lock_refuses_before_staging() {
+    let root = tempfile::tempdir().unwrap();
+    Paused::start(root.path(), "stage-owned", "stage").crash();
+    let abandoned = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|name| name.starts_with(".race.installing-v1-"))
+        .unwrap();
+    let source = tempfile::tempdir().unwrap();
+    tests::write_tool_source(source.path(), "race", b"\0asm refused");
+    let paused = Paused::start_install(root.path(), "before-stage-delete", source.path());
+    std::fs::rename(
+        root.path().join(".zeroclaw-package-lock-v1"),
+        root.path().join("old-lock"),
+    )
+    .unwrap();
+    std::fs::write(root.path().join(".zeroclaw-package-lock-v1"), b"").unwrap();
+    let output = paused.resume();
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert!(!root.path().join("race").exists());
+    assert_eq!(
+        tests::dir_entries(root.path()),
+        [abandoned.as_str(), ".zeroclaw-package-lock-v1", "old-lock"]
+    );
+    assert_eq!(
+        std::fs::read(root.path().join(&abandoned).join("package/bytes")).unwrap(),
+        b"active owner"
+    );
 }
 
 #[cfg(unix)]
@@ -1266,4 +1514,322 @@ fn directory_to_file_substitution_and_occupied_restore_preserve_both_files() {
         std::fs::read(root.path().join("old-directory/manifest.toml")).unwrap(),
         b"name ="
     );
+}
+
+/// `race` installed with `wasm`, as discovery will load it.
+fn installed(root: &Path, wasm: &[u8]) -> Vec<(String, Vec<u8>)> {
+    std::fs::create_dir(root.join("race")).unwrap();
+    tests::write_tool_source(&root.join("race"), "race", wasm);
+    tests::package_bytes(&root.join("race"))
+}
+
+/// The source the `update` child replaces `race` with. Hidden, so discovery
+/// never loads it.
+fn update_source(root: &Path, wasm: &[u8]) -> Vec<(String, Vec<u8>)> {
+    std::fs::create_dir(root.join(".source")).unwrap();
+    tests::write_tool_source(&root.join(".source"), "race", wasm);
+    tests::package_bytes(&root.join(".source"))
+}
+
+/// Stages and claims left in `root`: hidden entries other than the package
+/// lock and the update source.
+fn leftovers(root: &Path) -> Vec<String> {
+    tests::dir_entries(root)
+        .into_iter()
+        .filter(|name| {
+            name.starts_with('.') && name != ".zeroclaw-package-lock-v1" && name != ".source"
+        })
+        .collect()
+}
+
+#[test]
+fn an_update_stopped_after_its_claim_is_put_back_by_another_process() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = installed(root.path(), b"\0asm previous");
+    update_source(root.path(), b"\0asm replacement");
+    let paused = Paused::start(root.path(), "update-claimed", "update");
+    assert!(!root.path().join("race").exists(), "the claim moved it");
+    paused.crash();
+
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    assert_eq!(
+        host.recover_interrupted_update("race").unwrap(),
+        UpdateRecovery::Restored { kept: Vec::new() }
+    );
+    assert_eq!(tests::package_bytes(&root.path().join("race")), previous);
+    assert!(
+        leftovers(root.path()).is_empty(),
+        "{:?}",
+        leftovers(root.path())
+    );
+}
+
+#[test]
+fn an_update_stopped_after_publishing_is_finished_by_another_process() {
+    let root = tempfile::tempdir().unwrap();
+    installed(root.path(), b"\0asm previous");
+    let replacement = update_source(root.path(), b"\0asm replacement");
+    let paused = Paused::start(root.path(), "update-published", "update");
+    paused.crash();
+
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    assert_eq!(
+        host.recover_interrupted_update("race").unwrap(),
+        UpdateRecovery::Swept {
+            removed: 1,
+            kept: Vec::new()
+        }
+    );
+    assert_eq!(tests::package_bytes(&root.path().join("race")), replacement);
+    assert!(
+        leftovers(root.path()).is_empty(),
+        "{:?}",
+        leftovers(root.path())
+    );
+}
+
+/// A host built before another process's update claimed the package still
+/// judges installation from the plugins directory under the lock: the claim
+/// that process left when it was killed is the only copy, and it is put back.
+#[test]
+fn recovery_by_a_host_built_before_the_claim_puts_the_package_back() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = installed(root.path(), b"\0asm previous");
+    update_source(root.path(), b"\0asm replacement");
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    assert!(
+        host.get_plugin("race").is_some(),
+        "premise: built before the claim"
+    );
+    let paused = Paused::start(root.path(), "update-claimed", "update");
+    paused.crash();
+
+    assert_eq!(
+        host.recover_interrupted_update("race").unwrap(),
+        UpdateRecovery::Restored { kept: Vec::new() }
+    );
+    assert_eq!(tests::package_bytes(&root.path().join("race")), previous);
+    assert!(
+        leftovers(root.path()).is_empty(),
+        "{:?}",
+        leftovers(root.path())
+    );
+}
+
+#[test]
+fn an_update_stopped_before_its_claim_leaves_nothing_to_recover() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = installed(root.path(), b"\0asm previous");
+    update_source(root.path(), b"\0asm replacement");
+    let paused = Paused::start(root.path(), "update-before-claim", "update");
+    paused.crash();
+
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    assert_eq!(
+        host.recover_interrupted_update("race").unwrap(),
+        UpdateRecovery::Nothing
+    );
+    assert_eq!(tests::package_bytes(&root.path().join("race")), previous);
+    assert!(
+        leftovers(root.path()).is_empty(),
+        "{:?}",
+        leftovers(root.path())
+    );
+}
+
+/// The stage of the `update` child paused in `root`.
+#[cfg(unix)]
+fn update_stage(root: &Path) -> PathBuf {
+    root.join(
+        tests::dir_entries(root)
+            .into_iter()
+            .find(|name| name.starts_with(".race.installing-v1-"))
+            .unwrap(),
+    )
+}
+
+/// Move the staged `package` aside and put a directory of the writer's own in
+/// its place; return the file that directory holds.
+#[cfg(unix)]
+fn substitute_staged_package(stage: &Path) -> PathBuf {
+    std::fs::rename(stage.join("package"), stage.join("staged-original")).unwrap();
+    std::fs::create_dir_all(stage.join("package/sentinel-tree")).unwrap();
+    let sentinel = stage.join("package/sentinel-tree/keep");
+    std::fs::write(&sentinel, b"not staged by this update").unwrap();
+    sentinel
+}
+
+/// A writer that swaps the staged `package` for a directory of its own and
+/// replaces the package lock while an update waits: the update refuses the
+/// changed lock, and its cleanup clears neither the substitute nor the stage
+/// it moved aside.
+#[cfg(unix)]
+#[test]
+fn an_update_refused_under_a_replaced_lock_clears_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = installed(root.path(), b"\0asm previous");
+    let replacement = update_source(root.path(), b"\0asm replacement");
+    let paused = Paused::start(root.path(), "update-staged", "update");
+    let stage = update_stage(root.path());
+    let sentinel = substitute_staged_package(&stage);
+    std::fs::rename(
+        root.path().join(".zeroclaw-package-lock-v1"),
+        root.path().join("old-lock"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join(".zeroclaw-package-lock-v1"),
+        b"replacement lock",
+    )
+    .unwrap();
+
+    let output = paused.resume();
+
+    assert!(output.contains("NamespaceChanged"), "{output}");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"not staged by this update",
+        "{output}"
+    );
+    assert_eq!(
+        tests::package_bytes(&stage.join("staged-original")),
+        replacement
+    );
+    assert_eq!(tests::package_bytes(&root.path().join("race")), previous);
+}
+
+/// With the namespace intact, an update that fails after staging clears the
+/// package it staged, through the handle it wrote it with, and never a
+/// directory a writer substituted at `package` meanwhile.
+#[cfg(unix)]
+#[test]
+fn an_update_cleanup_clears_its_staged_package_not_a_substitute() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = installed(root.path(), b"\0asm previous");
+    update_source(root.path(), b"\0asm replacement");
+    let paused = Paused::start(root.path(), "update-staged", "update");
+    let stage = update_stage(root.path());
+    let sentinel = substitute_staged_package(&stage);
+    // The claim then fails: nothing is installed under the name any more.
+    std::fs::rename(root.path().join("race"), root.path().join("race-moved")).unwrap();
+
+    let output = paused.resume();
+
+    assert!(output.contains("RESULT:Err"), "{output}");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"not staged by this update",
+        "{output}"
+    );
+    assert!(
+        tests::dir_entries(&stage.join("staged-original")).is_empty(),
+        "{output}"
+    );
+    assert_eq!(
+        tests::package_bytes(&root.path().join("race-moved")),
+        previous
+    );
+}
+
+/// The window an update holds the previous generation in is its own: a
+/// recovery started in another process meanwhile waits for the package lock
+/// instead of putting the claim back or deleting it, then finds nothing left
+/// to do.
+#[test]
+fn recovery_waits_for_an_update_another_process_is_running() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = installed(root.path(), b"\0asm previous");
+    let replacement = update_source(root.path(), b"\0asm replacement");
+    let paused = Paused::start(root.path(), "update-claimed", "update");
+    let mut host = PluginHost::from_plugins_dir(root.path()).unwrap();
+    assert!(host.get_plugin("race").is_none(), "the claim moved it");
+
+    let (done, finished) = std::sync::mpsc::channel();
+    let recovery = std::thread::spawn(move || {
+        let result = host.recover_interrupted_update("race");
+        done.send(()).unwrap();
+        (result, host)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        finished.try_recv().is_err(),
+        "recovery must wait for the running update"
+    );
+    let claim = tests::dir_entries(root.path())
+        .into_iter()
+        .find(|name| name.starts_with(".race.replacing-v1-"))
+        .expect("the running update's claim");
+    assert_eq!(
+        tests::package_bytes(&root.path().join(claim).join(recovery::PACKAGE)),
+        previous
+    );
+
+    let output = paused.resume();
+    assert!(output.contains("RESULT:Ok(\"0.1.0\")"), "{output}");
+    let (result, host) = recovery.join().unwrap();
+    assert_eq!(result.unwrap(), UpdateRecovery::Nothing);
+    assert!(
+        host.get_plugin("race").is_some(),
+        "the host sees what the update installed while it waited"
+    );
+    assert_eq!(tests::package_bytes(&root.path().join("race")), replacement);
+    assert!(
+        leftovers(root.path()).is_empty(),
+        "{:?}",
+        leftovers(root.path())
+    );
+}
+
+/// Recovery judges installation under the lock, not when its host was built.
+/// A recovery waits before the lock with the package already discovered, while
+/// an update in another process claims the package and is killed: the claim is
+/// the only copy, and the recovery puts it back.
+#[test]
+fn recovery_judges_installation_after_taking_the_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = installed(root.path(), b"\0asm previous");
+    update_source(root.path(), b"\0asm replacement");
+    let recovering = Paused::start(root.path(), "recovery-before-lock", "recover");
+    let updating = Paused::start(root.path(), "update-claimed", "update");
+    assert!(!root.path().join("race").exists(), "the update claimed it");
+    updating.crash();
+
+    let output = recovering.resume();
+    assert!(
+        output.contains("RESULT:Ok(Restored { kept: [] })"),
+        "{output}"
+    );
+    assert_eq!(tests::package_bytes(&root.path().join("race")), previous);
+    assert!(
+        leftovers(root.path()).is_empty(),
+        "{:?}",
+        leftovers(root.path())
+    );
+}
+
+/// Listing displaced packages takes the package lock, so it never holds the
+/// lease of a claim a running update owns while a recovery judges it.
+#[test]
+fn listing_displaced_packages_waits_for_a_running_update() {
+    let root = tempfile::tempdir().unwrap();
+    installed(root.path(), b"\0asm previous");
+    update_source(root.path(), b"\0asm replacement");
+    let paused = Paused::start(root.path(), "update-claimed", "update");
+    let host = PluginHost::from_plugins_dir(root.path()).unwrap();
+
+    let (done, finished) = std::sync::mpsc::channel();
+    let listing = std::thread::spawn(move || {
+        let names = host.displaced_packages();
+        done.send(()).unwrap();
+        names
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        finished.try_recv().is_err(),
+        "the listing must wait for the running update"
+    );
+
+    let output = paused.resume();
+    assert!(output.contains("RESULT:Ok(\"0.1.0\")"), "{output}");
+    assert!(listing.join().unwrap().unwrap().is_empty());
 }

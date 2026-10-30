@@ -644,7 +644,9 @@ impl DelegateTool {
     /// token: they derive from `cancellation_token`, outlive the turn by
     /// design, and are cancelled through `cancel_task`.
     fn turn_bound_child_token(&self) -> CancellationToken {
-        if let Some(turn) = crate::agent::tool_execution::current_turn_cancellation() {
+        if let Some(turn) = zeroclaw_api::tool::ToolExecutionContext::current()
+            .and_then(|context| context.cancellation_token().cloned())
+        {
             return turn.child_token();
         }
         self.turn_token
@@ -5389,6 +5391,14 @@ impl Tool for ToolArcRef {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &zeroclaw_api::tool::ToolExecutionContext,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner.execute_with_context(args, context).await
     }
 }
 
@@ -13086,10 +13096,10 @@ mod tests {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
 
         let turn = CancellationToken::new();
-        let bound = crate::agent::tool_execution::scope_turn_cancellation(turn.clone(), async {
-            tool.turn_bound_child_token()
-        })
-        .await;
+        let bound = zeroclaw_api::tool::ToolExecutionContext::new(Some(turn.clone()))
+            .run(async { Ok(tool.turn_bound_child_token()) })
+            .await
+            .unwrap();
         assert!(!bound.is_cancelled());
         turn.cancel();
         assert!(
@@ -14793,19 +14803,20 @@ mod tests {
             let turn = turn.clone();
             let provider = Arc::clone(&provider);
             zeroclaw_spawn::spawn!(async move {
-                crate::agent::tool_execution::scope_turn_cancellation(turn, async move {
-                    tool.execute_agentic(
-                        "middle",
-                        &middle_config,
-                        "custom.local",
-                        "test-model",
-                        provider.as_ref(),
-                        "fan out, then get stopped",
-                        None,
-                    )
+                zeroclaw_api::tool::ToolExecutionContext::new(Some(turn))
+                    .run(async move {
+                        tool.execute_agentic(
+                            "middle",
+                            &middle_config,
+                            "custom.local",
+                            "test-model",
+                            provider.as_ref(),
+                            "fan out, then get stopped",
+                            None,
+                        )
+                        .await
+                    })
                     .await
-                })
-                .await
             })
         };
 
@@ -14994,7 +15005,7 @@ mod tests {
             &[("cap2", 2, 20)],
         );
         let task_store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
-        let tool = bounded_subdelegation_tool(&config)
+        let mut tool = bounded_subdelegation_tool(&config)
             .with_workspace_dir(workspace.clone())
             .with_task_control_plane(task_control_plane(Arc::clone(&task_store)));
         let reader = bounded_subdelegation_tool(&config)
@@ -15004,22 +15015,21 @@ mod tests {
         let middle_config = bounded_agent_config(&config, "middle");
 
         let turn = CancellationToken::new();
+        // Hand the lineage to the child without wrapping its future in an
+        // outer cancellation select: this must prove the child loop stops.
+        tool.turn_token = Some(turn.clone());
         let foreground = {
-            let turn = turn.clone();
             let provider = Arc::clone(&provider);
             zeroclaw_spawn::spawn!(async move {
-                crate::agent::tool_execution::scope_turn_cancellation(turn, async move {
-                    tool.execute_agentic(
-                        "middle",
-                        &middle_config,
-                        "custom.local",
-                        "test-model",
-                        provider.as_ref(),
-                        "background hop, then hang",
-                        None,
-                    )
-                    .await
-                })
+                tool.execute_agentic(
+                    "middle",
+                    &middle_config,
+                    "custom.local",
+                    "test-model",
+                    provider.as_ref(),
+                    "background hop, then hang",
+                    None,
+                )
                 .await
             })
         };

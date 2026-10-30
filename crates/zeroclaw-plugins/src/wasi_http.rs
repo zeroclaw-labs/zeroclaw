@@ -666,16 +666,21 @@ impl PluginEgressHooks {
     }
 }
 
-/// The timeout `wasi:http` applies to a stage the guest set no timeout for.
+/// The timeout `wasi:http` applies to a response stage the guest set no
+/// timeout for.
 ///
 /// Through wasmtime 47 the `wasi:http` layer filled this in before calling the
 /// hooks; from 48 it hands the guest's `request-options` over as they are and
 /// leaves every timeout to the send path. Keeping the same value here is what
-/// keeps a request with no options bounded exactly as it was.
+/// keeps the response stages of a request with no options bounded as they
+/// were. The connect stage takes
+/// [`DEFAULT_CONNECT_TIMEOUT`](crate::egress::DEFAULT_CONNECT_TIMEOUT)
+/// instead, so a destination nothing answers on fails as a connect error before
+/// the plugin call deadline rather than holding the call to it.
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// The three per-request timeouts, with [`DEFAULT_HTTP_TIMEOUT`] for any the
-/// guest did not set.
+/// The three per-request timeouts, with a default for any the guest did not
+/// set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SendTimeouts {
     connect: Duration,
@@ -687,7 +692,9 @@ impl SendTimeouts {
     fn from_options(options: Option<RequestOptions>) -> Self {
         let options = options.unwrap_or_default();
         Self {
-            connect: options.connect_timeout.unwrap_or(DEFAULT_HTTP_TIMEOUT),
+            connect: options
+                .connect_timeout
+                .unwrap_or(crate::egress::DEFAULT_CONNECT_TIMEOUT),
             first_byte: options.first_byte_timeout.unwrap_or(DEFAULT_HTTP_TIMEOUT),
             between_bytes: options
                 .between_bytes_timeout
@@ -1078,41 +1085,30 @@ fn far_future() -> Instant {
     Instant::now() + Duration::from_secs(86_400 * 365 * 30)
 }
 
-/// Dial the pinned addresses in order and return the first connection that
-/// comes up, under the shared connect deadline.
+/// Dial the pinned addresses and return the first connection that comes up,
+/// under the shared connect deadline.
 ///
 /// Connect by `SocketAddr`, never by name: every candidate comes out of the one
-/// [`crate::egress::AuthorizedEgress`] the boundary validated, so moving to the
-/// next address after a refusal is failover within an already-checked set, not a
-/// second resolution that could substitute a different address class.
+/// [`crate::egress::AuthorizedEgress`] the boundary validated, so trying more
+/// than one address is failover within an already-checked set, not a second
+/// resolution that could substitute a different address class.
 ///
-/// The deadline belongs to the connect as a whole rather than to each attempt.
-/// A destination whose first address is a blackhole therefore spends the budget
-/// the later addresses would have used instead of extending it, which is what
-/// keeps a multi-address answer from multiplying the operator's timeout.
+/// The deadline belongs to the connect as a whole rather than to each attempt,
+/// which keeps a multi-address answer from multiplying the operator's timeout.
+/// The attempts are staggered within it
+/// ([`connect_pinned_addresses`](crate::egress::connect_pinned_addresses)), so
+/// a first address that never answers does not spend the budget the next one
+/// needs.
 async fn dial_pinned(addresses: &[SocketAddr], deadline: Instant) -> Result<TcpStream, ErrorCode> {
-    let mut attempted = false;
-    for address in addresses {
-        attempted = true;
-        // A ready loopback connect can win timeout_at's first poll even after
-        // its deadline has elapsed. Do not let that fast path fund another
-        // attempt from the shared budget.
-        if deadline <= Instant::now() {
-            return Err(ErrorCode::ConnectionTimeout);
-        }
-        match timeout_at(deadline, TcpStream::connect(*address)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            // Refused or unreachable: try the next validated address.
-            Ok(Err(_)) => {}
-            Err(_) => return Err(ErrorCode::ConnectionTimeout),
-        }
-    }
-    if attempted {
-        Err(ErrorCode::ConnectionRefused)
-    } else {
+    use crate::egress::PinnedConnectError;
+
+    match crate::egress::connect_pinned_addresses(addresses, deadline).await {
+        Ok((stream, _)) => Ok(stream),
+        Err(PinnedConnectError::TimedOut) => Err(ErrorCode::ConnectionTimeout),
+        Err(PinnedConnectError::Refused) => Err(ErrorCode::ConnectionRefused),
         // `ResolvedDestination` is never empty, so an empty candidate set is an
         // unreachable state rather than a policy decision.
-        Err(dns_failure())
+        Err(PinnedConnectError::NoAddresses) => Err(dns_failure()),
     }
 }
 
@@ -2015,6 +2011,59 @@ mod tests {
         );
     }
 
+    /// A first address that never answers, as an IPv6 path that loses SYNs,
+    /// does not spend the connect budget the reachable address needs.
+    #[tokio::test]
+    async fn a_blackholed_first_address_does_not_spend_the_connect_budget() {
+        match crate::egress::dial_test_support::blackholed_v6_and_live_v4().await {
+            Ok((blackhole, live)) => assert_the_reachable_address_connects(blackhole, live).await,
+            Err(reason) => eprintln!("skipped: {reason}"),
+        }
+    }
+
+    /// The same over IPv4 alone, so a host without an IPv6 loopback still
+    /// runs it: `dial_pinned` takes raw addresses, so the blackhole can sit on
+    /// a second `127.0.0.1` port.
+    #[tokio::test]
+    async fn a_blackholed_first_address_does_not_spend_the_connect_budget_over_ipv4() {
+        match crate::egress::dial_test_support::blackholed_and_live_v4().await {
+            Ok((blackhole, live)) => assert_the_reachable_address_connects(blackhole, live).await,
+            Err(reason) => eprintln!("skipped: {reason}"),
+        }
+    }
+
+    async fn assert_the_reachable_address_connects(
+        blackhole: crate::egress::dial_test_support::Blackhole,
+        live: std::net::TcpListener,
+    ) {
+        let live_address = live.local_addr().expect("loopback address");
+        let started = Instant::now();
+
+        let stream = dial_pinned(
+            &[blackhole.address, live_address],
+            started + Duration::from_secs(5),
+        )
+        .await
+        .expect("the reachable address must connect within the budget");
+
+        assert_eq!(stream.peer_addr().expect("connected peer"), live_address);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the silent address held the dial for {:?}",
+            started.elapsed()
+        );
+
+        // With only the silent address left, the dial fails as a timeout when
+        // the budget runs out, however short the guest made it.
+        let started = Instant::now();
+        let outcome = dial_pinned(&[blackhole.address], started + Duration::from_millis(500)).await;
+        assert!(
+            matches!(outcome, Err(ErrorCode::ConnectionTimeout)),
+            "{outcome:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     /// The dial is bounded by the shared deadline, not by a fresh timeout per
     /// address: a pin full of stalled addresses cannot buy more time than one.
     #[tokio::test]
@@ -2083,31 +2132,35 @@ mod tests {
         port
     }
 
-    /// A guest that sets no timeout gets the one `wasi:http` applied for it
-    /// through wasmtime 47, stage by stage.
+    /// A guest that sets no timeout gets the shared connect default, well under
+    /// the plugin call deadline, and for the two response stages the one
+    /// `wasi:http` applied for it through wasmtime 47. A timeout the guest sets
+    /// is used as it is, shorter or longer than the default.
     #[test]
-    fn unset_timeouts_default_to_what_wasi_http_applied_before() {
+    fn unset_timeouts_take_the_connect_default_and_the_earlier_stage_timeouts() {
         let default = Duration::from_secs(600);
         assert_eq!(
             SendTimeouts::from_options(None),
             SendTimeouts {
-                connect: default,
+                connect: crate::egress::DEFAULT_CONNECT_TIMEOUT,
                 first_byte: default,
                 between_bytes: default,
             }
         );
-        let connect_only = RequestOptions {
-            connect_timeout: Some(Duration::from_secs(2)),
-            ..RequestOptions::default()
-        };
-        assert_eq!(
-            SendTimeouts::from_options(Some(connect_only)),
-            SendTimeouts {
-                connect: Duration::from_secs(2),
-                first_byte: default,
-                between_bytes: default,
-            }
-        );
+        for connect in [Duration::from_secs(2), Duration::from_secs(60)] {
+            let connect_only = RequestOptions {
+                connect_timeout: Some(connect),
+                ..RequestOptions::default()
+            };
+            assert_eq!(
+                SendTimeouts::from_options(Some(connect_only)),
+                SendTimeouts {
+                    connect,
+                    first_byte: default,
+                    between_bytes: default,
+                }
+            );
+        }
     }
 
     /// A response body that stops arriving fails with `connection-read-timeout`

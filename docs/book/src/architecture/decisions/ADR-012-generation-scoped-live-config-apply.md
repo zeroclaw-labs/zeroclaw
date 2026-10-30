@@ -39,6 +39,8 @@ Every apply target records its own generation-specific result:
 - `QueuedForReload` means the change was saved but that target requires `/admin/reload`; the result includes a concrete reason.
 - `Rejected` means the target refused live application for that generation; the result includes a concrete reason.
 
+An admitted attempt remains visibly `pending` until its consumer acknowledges. Publication, reload signalling and readiness are not acknowledgements. Target identity includes its lifetime: a session ID plus its incarnation, within the authority epoch. Reusing a session ID cannot transfer an earlier instance's result to its successor.
+
 A target completion for an older generation cannot overwrite the status of a newer one. Config status surfaces report the target results rather than inferring one global applied state from changed-path prefixes.
 
 ### Keep the approved security overlay narrow
@@ -71,7 +73,7 @@ This ADR remains proposed until all of these conditions are met:
 
 Canonical publication and the result ledger must ship without new live behavior before the security and channel consumers are enabled. Security live application precedes channel live application.
 
-The canonical publication *foundation* is implemented by [PR #10911](https://github.com/zeroclaw-labs/zeroclaw/pull/10911): one published `Config`-plus-revision pair per authority generation behind a read-only live handle, epoch- and sequence-identified, with participating HTTP/RPC/TUI/Quickstart/pairing/channel-identity writers serialized through admitted, retained config commits. That foundation supplies the serialization half of the first gate only; it does not complete the gate. The generation-scoped applied-state ledger, per-target results, and new live-apply behavior are separate implementation requirements tracked by [#10892](https://github.com/zeroclaw-labs/zeroclaw/issues/10892). This ADR stays proposed until all acceptance gates above are met. Until the new consumers ship, the saved-versus-applied behavior and `/admin/reload` fallback described in [Config lifecycle](../config-lifecycle.md) remain authoritative.
+The canonical publication foundation is implemented by [PR #10911](https://github.com/zeroclaw-labs/zeroclaw/pull/10911): one published `Config`-plus-revision pair per authority generation behind a read-only live handle, epoch- and sequence-identified, with participating HTTP/RPC/TUI/Quickstart/pairing/channel-identity writers serialized through admitted, retained config commits. The result-ledger slice of [#10892](https://github.com/zeroclaw-labs/zeroclaw/issues/10892) adds authority-owned latest application facts, schema-owned conservative capability metadata, daemon reload-required results and real acknowledgements from existing RPC model-provider refreshes. It exposes additive HTTP reload-status and RPC config/status views without enabling new live consumers. Records are bounded and authority-lifetime only; startup, eviction and absent acknowledgements never imply application. These two slices supply the publication/reporting foundation, not the later security overlay or channel transition gates. This ADR remains proposed until all gates above are met. [Config lifecycle](../config-lifecycle.md#application-status) documents the implemented reporting limits and full-reload fallback.
 
 ## Consequences
 

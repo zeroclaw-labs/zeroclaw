@@ -38,6 +38,7 @@ cli-integrations-chat-imessage-transport = Sends messages through AppleScript au
 cli-integrations-chat-imessage-permissions = Grant macOS Automation access to control Messages and Full Disk Access to read the Messages database.
 cli-integrations-chat-generic-setup = Run {$command}, open Config, configure the required fields, routing, and access for {$channel}, review the settings, then enable it.
 cli-skills-about = Manage skills (user-defined capabilities)
+cli-plugin-about = Manage WASM plugins
 cli-sop-about = Manage standard operating procedures (SOPs)
 cli-migrate-about = Migrate data from other agent runtimes
 cli-auth-about = Manage provider subscription authentication profiles
@@ -459,6 +460,8 @@ channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} f
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
+channel-signal-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
+channel-signal-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-line-bind-success = ✅ Paired! You can now chat.
 channel-line-bind-persist-failed = Pairing could not be saved. Ask the bot administrator for a new pairing code and try again.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
@@ -471,6 +474,26 @@ channel-telegram-cmd-stop-desc = Cancel the current in-flight task
 channel-telegram-cmd-model-desc = Show or switch the current model
 channel-telegram-cmd-models-desc = List available model_providers or switch model_provider
 channel-telegram-cmd-config-desc = Show current configuration
+
+# ── Telegram: unauthorized-sender notice ──
+# Sent to a sender who is not on this channel's allowlist. Two variants: the
+# bind form while startup pairing is active, and the allowlist form when the
+# allowlist already resolves peers — that deployment authorizes from
+# configuration, so the sender has no operator terminal to reach.
+# `channels.telegram.<alias>.unauthorized_message` overrides both.
+channel-telegram-unauthorized-bind =
+    🔐 This bot requires operator approval.
+
+    Copy this command to the operator terminal:
+    `{ $bindCommand }`
+
+    After the operator runs it, send your message again.
+channel-telegram-unauthorized-allowlist =
+    🔐 This bot requires operator approval.
+
+    Ask the operator to authorize this Telegram account: { $identity }
+
+    After the operator authorizes it, send your message again.
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
@@ -518,9 +541,35 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = not set (using auto-detect)
 cli-self-test-web-dist-dir-pass-literal = {$path} (literal path)
 cli-self-test-web-dist-dir-fail-expansion = WARNING: {$path} — {$reason}; gateway.web_dist_dir is read verbatim, so expand the value yourself (e.g. an absolute path)
+cli-self-test-gateway-not-in-build = not included in this build (CLI-only)
 
 # Service lifecycle warnings.
 cli-service-systemd-linger-disabled-warning = systemd user lingering is disabled. ZeroClaw's user service may stop after logout. Enable it with: loginctl enable-linger {$user}
+cli-config-lifecycle-dir-not-directory =
+    Config lifecycle path {$path} is not a directory. ZeroClaw creates it as a directory, so something else replaced it. Check what it is, remove it, then retry:
+    {$command}
+cli-config-lifecycle-dir-root-owner =
+    Config lifecycle directory {$path} belongs to root, usually because ZeroClaw was run with sudo. Run ZeroClaw as {$user}, not with sudo. Other files written during that run may belong to root too. Check the directory's contents, then give it back and retry:
+    {$command}
+    If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-lifecycle-dir-running-as-root = Config lifecycle directory {$path} belongs to {$owner}, but ZeroClaw is running as root. Run ZeroClaw as {$owner}, without sudo.
+cli-config-lifecycle-dir-foreign-owner =
+    Config lifecycle directory {$path} belongs to {$owner}, but ZeroClaw is running as {$user}. If it should belong to {$user}, check its contents first, because chown -R also hands over anything another user hard-linked into it (ZeroClaw's .lifecycle holds only config-lifecycle.lock, with a link count of 1). Then take it over and retry:
+    {$command}
+    Otherwise run ZeroClaw as {$owner}. If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-lifecycle-dir-writable =
+    Config lifecycle directory {$path} is writable by its group or by other users (mode {$mode}), so they could replace its config lock. ZeroClaw creates it owner-only and does not change the permissions of an existing directory. Check its contents, then restrict it and retry:
+    {$command}
+    If chmod has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
+cli-config-data-dir-root-owner =
+    Data directory {$path} belongs to root, so ZeroClaw cannot create its config lock directory there. If an earlier run with sudo created it, give it back and retry:
+    {$command}
+    If it belongs to root on purpose, run ZeroClaw as its owner or point data_dir elsewhere.
+cli-config-data-dir-running-as-root = Data directory {$path} belongs to {$owner}, but ZeroClaw is running as root. Run ZeroClaw as {$owner}, without sudo.
+cli-config-data-dir-foreign-owner =
+    Data directory {$path} belongs to {$owner}, so ZeroClaw, running as {$user}, cannot create its config lock directory there. Run ZeroClaw as {$owner}, or point data_dir at a directory of your own. If the directory really is yours, check its contents first, because chown -R also hands over anything another user hard-linked into it, then take it over and retry:
+    {$command}
+    If chown has no effect, the data directory is on a filesystem that does not keep Unix permissions; point data_dir at a local filesystem.
 cli-standalone-daemon-owned = Cannot run `zeroclaw {$command}` while another ZeroClaw process owns the config state at {$path}. Stop the owning process or use its daemon-backed interface, then retry. No agent work was started.
 
 # ── peripherals (zeroclaw peripheral) ──
@@ -563,6 +612,10 @@ cli-sop-logs-row = {$timestamp} {$severity} {$category}.{$action} {$message}
 cli-sop-logs-disabled = Log persistence is not enabled.
 cli-sop-logs-incomplete = Some retained log segments could not be read; this history may be incomplete.
 cli-sop-status-failure-reason = Failure reason: {$reason}
+cli-sop-run-copy-stale = Run {$run_id} changed in the store since this engine last read it (revision {$seen_revision} -> {$stored_revision}, now {$status} on step {$step}); this engine adopted the stored record and did not apply the transition
+cli-sop-run-copy-revision-unknown = unknown
+cli-sop-run-copy-changed = Run {$run_id} changed in the store since this engine last read it
+cli-sop-run-copy-reload-failed = Run {$run_id} changed in the store since this engine last read it, and reloading it failed: {$error}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}
@@ -699,6 +752,7 @@ cli-quickstart-auth-anthropic-skip-hint = {"  "}Finish later with: claude setup-
 cli-quickstart-auth-failed = {"  "}Auth setup didn't complete: {$error}
 cli-quickstart-model-field-missing-warning = WARN: schema produced no `model` field for `{$provider}` — falling back to manual entry. Please report this.
 cli-quickstart-model-id-for = Model id for {$name}
+cli-quickstart-model-type-id = Type a model ID…
 cli-quickstart-risk-profile-prompt = Risk profile
 cli-quickstart-memory-backend-prompt = Memory backend
 cli-quickstart-add-channel = + Add a channel
@@ -830,7 +884,6 @@ cli-quickstart-plugins-missing-row = {$name} has no config entry, so Quickstart 
 cli-quickstart-plugins-row-skipped = {$name} stays installed without a config entry, so it reaches no network destination. To create the entry later, without network access, run: {$command}
 cli-quickstart-plugins-grant-declared-later = To let {$name} reach its {$count} declared destination(s), also run this after creating the entry: {$command}
 cli-quickstart-plugins-no-declared-hosts = {$name} requests network access but declares no destinations, so its config entry grants none. To grant the hosts your deployment uses, append them to this command as one comma-separated value: {$command}
-cli-quickstart-plugins-declared-hosts-not-granted = {$name} declares these destinations: {$hosts}. Quickstart offers to grant declared destinations only to plugins that request http_client, so its config entry grants none of them. To grant them, run: {$command}
 cli-quickstart-plugins-activation-heading = Activating plugins turns on {$settings}, which activates:
 cli-quickstart-plugins-activation-tool = tool plugin {$name}
 cli-quickstart-plugins-activation-skill = skill plugin {$name}
@@ -908,6 +961,11 @@ cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
 cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
+cli-security-status-sandbox-description-firejail-args-rejected = Firejail selected, but firejail_args were rejected; commands are blocked ({$reason})
+cli-security-firejail-args-error-empty = firejail_args rejected: an entry is empty
+cli-security-firejail-args-error-whitespace = firejail_args rejected: {$arg} has leading or trailing whitespace
+cli-security-firejail-args-error-not-option = firejail_args rejected: {$arg} is not a Firejail option; write each option as one `--option` or `--option=value` entry
+cli-security-firejail-args-error-conflict = firejail_args rejected: {$name} conflicts with the options ZeroClaw's Firejail wrapper sets
 cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
 cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
 cli-security-status-credentials-classes-none = none
@@ -952,6 +1010,9 @@ cli-status-agent-no-risk-profile-summary = {$alias}=<no risk_profile>
 cli-status-runtime = ⚙️  Runtime:       {$v}
 cli-status-web-ui-found = 🌐 Web UI:        FOUND ({$path})
 cli-status-web-ui-missing = 🌐 Web UI:        MISSING
+cli-status-web-ui-not-in-build = 🌐 Web UI:        not included in this build (CLI-only)
+# A build without the gateway answers this for `zeroclaw gateway …` and `zeroclaw desktop`.
+cli-no-dashboard-in-build = This ZeroClaw build has no dashboard or web gateway (CLI-only build). To use them, install the standard build: curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 cli-status-heartbeat = 💓 Heartbeat:      {$v}
 cli-status-heartbeat-every-minutes = every {$minutes}min
 cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
@@ -1095,6 +1156,37 @@ cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
 cli-plugin-migrated = Moved {$count} plugin(s) from {$path} to {$target}.
 cli-plugin-migrate-none = Nothing to migrate.
+cli-plugin-install-already-installed = install failed: '{$name}' is already installed, and install never replaces a package. Update it with: {$command}
+cli-plugin-list-displaced = Note: an interrupted update left '{$name}' displaced, so it is not loaded. Run `{$command}` to put it back and update it from the registry, or `{$local}` to put it back and update it from a package directory instead.
+cli-plugin-update-about = Replace installed plugins with another version from the registry, or with a local package directory
+cli-plugin-update-usage-from = --from takes exactly one plugin name, without a version: the package directory decides the version.
+cli-plugin-update-usage-allow = --allow and --allow-token apply to exactly one plugin: name that plugin alone, pinned to the version you approve.
+cli-plugin-update-usage-allow-item = '{$item}' is not an --allow or --allow-token item: use permission:<name>, capability:<name>, provides:<id>, or publisher:<key>.
+cli-plugin-update-checking = Checking the plugin registry for updates...
+cli-plugin-update-restored = Restored '{$name}' {$version}, which an interrupted update had left displaced.
+cli-plugin-update-updated = Updated '{$name}' from {$from} to {$to}.
+cli-plugin-update-downgraded = Replaced '{$name}' {$from} with {$to}, an older version than the one installed.
+cli-plugin-update-reinstalled = Reinstalled '{$name}' {$version}.
+cli-plugin-update-up-to-date = '{$name}' is up to date ({$version}).
+cli-plugin-update-not-listed = Skipped '{$name}': the registry does not list it.
+cli-plugin-update-needs-approval = '{$name}' {$version} requests authority the installed version does not have:
+cli-plugin-update-approval-item = + {$item}
+cli-plugin-update-approval-command = Nothing was changed. To accept it and update, run: {$command}
+cli-plugin-update-not-installed = Could not update '{$name}': it is not installed. Install it with: {$command}
+cli-plugin-update-failed = Could not update '{$name}': {$error}
+cli-plugin-update-failed-kept = Could not update '{$name}': {$error}. Version {$version} is still installed.
+cli-plugin-update-legacy-row = Could not update '{$name}': its config row still uses the pre-1.0 key format. Version {$version} is still installed.
+cli-plugin-update-interrupted = Could not update '{$name}': {$error}. Its previous version was not moved back and is preserved at {$preserved}. Run `{$command}` to put it back and try the update again, unless a package named '{$name}' is installed by then.
+cli-plugin-update-not-in-registry = the registry does not list '{$spec}'
+cli-plugin-update-does-not-load = it does not load against this host: {$error}
+cli-plugin-update-displaced-ambiguous = an interrupted update left several copies of '{$name}' ({$paths}), and which one was installed last is not known. Rename the one to keep to '{$name}' in the plugins directory, then run this command again
+cli-plugin-update-displaced-occupied = an interrupted update left it at {$displaced}, but {$occupant} is in the way. Move that aside, then run this command again
+cli-plugin-update-config-rejected = warning: '{$name}' {$version} rejects the configuration of its instance {$key} ({$error}). That instance will not load until its configuration fits the new version.
+cli-plugin-update-leftover = warning: the replaced version of '{$name}' could not be deleted from {$path} ({$error}). It is not loaded; delete it by hand, or the next update of '{$name}' tries to delete it again.
+cli-plugin-update-restored-not-admitted = the copy an interrupted update left was put back at {$path}, but this host does not admit it; run `zeroclaw plugin list --verbose` to see why
+cli-plugin-update-summary = Updated: {$updated}. Up to date: {$current}. Skipped: {$skipped}. Not updated: {$failed}.
+cli-plugin-update-restart = Restart the daemon so plugin instances it has already started use the new version.
+cli-plugin-update-failed-exit = {$count} plugin(s) not updated.
 cli-estop-resume-done = Estop resume completed.
 cli-estop-engaged = Estop engaged.
 cli-estop-status = Estop status:
@@ -1114,6 +1206,8 @@ cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
 cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
 model-switch-catalog-failed = Could not load catalog for configured provider profile {$provider}: {$error}
+model-switch-provider-not-allowed = Model switch to {$provider} is not allowed by the active effort-routing policy.
+model-switch-route-selector-not-allowed = Model ID cannot be a route selector; provide a provider-local model ID.
 cli-config-backed-up = Backed up to {$path}
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}
@@ -1127,6 +1221,9 @@ cli-plugin-info-load-failed =
     Rebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it.
 cli-plugin-info-load-not-applicable = Loads: not applicable. This is a skill-only plugin, so there is no component to instantiate.
 cli-plugin-info-load-failed-exit = plugin '{$name}' does not load against this host
+cli-plugin-info-load-config-refused =
+    Loads: no. The component instantiates against this host's WIT world, but the runtime refuses its configuration: {$error}
+    The configuration is the `config` map of the [[plugins.entries]] row named '{$key}'. Make it match the installed package's config_schema, or remove its values if the package declares none.
 cli-estop-domains-none = {"  "}domain_blocks:  (none)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (none)
@@ -1201,6 +1298,9 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-single-tool-rounds-prompt = Use at most one tool call in each response. Wait for its result before choosing another tool call.
+turn-single-tool-rounds-unsupported = [Single-tool rounds are unavailable on the current provider route. Continuing with batch tool calls.]
+turn-single-tool-rounds-violation = The provider returned multiple tool calls under single-tool policy. No tools from this response were executed.
 turn-provider-images-quarantined =
     { $count_plural ->
         [one] 1 image that had not previously succeeded with this provider was omitted after the provider rejected the request.
@@ -1297,6 +1397,7 @@ channel-runtime-set-provider-switched =
 channel-runtime-set-provider-init-failed =
     Failed to initialize model_provider `{ $provider }`. Route unchanged.
     Details: { $error }
+channel-runtime-effort-routing-invalid = ⚠️ Effort routing configuration is invalid. Check the configured local and cloud route hints.
 channel-runtime-provider-ambiguous = ModelProvider `{ $family }` has multiple configured aliases. Qualify which one with `/models { $family }.<alias>`: { $list }
 channel-runtime-provider-no-alias = No configured provider entry for `{ $provider }`. Add `[providers.models.{ $provider }]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones.
 channel-runtime-provider-unknown = Unknown model_provider `{ $provider }`. Use `/models` to list valid model_providers.
@@ -1608,3 +1709,9 @@ rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries i
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
 
 skill-http-request-timeout = HTTP request timed out
+
+# Result-aware Agent loop recovery
+turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.
+turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
+turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
+turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.

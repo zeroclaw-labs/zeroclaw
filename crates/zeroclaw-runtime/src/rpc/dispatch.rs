@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::live::LiveConfigHandle;
 use zeroclaw_config::schema::Config;
 
+use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
@@ -860,6 +861,7 @@ impl LiveSessionRefreshScope {
 /// travels with the values until they are published after the config commit.
 struct PreparedLiveSessionRefresh {
     session_id: String,
+    application_paths: Vec<Vec<String>>,
     /// Session-identity generation captured BEFORE the provider box was built.
     /// `apply_model_provider` rejects the write if the session was replaced
     /// under the same ID in the meantime (`session/new`, ACP rehydration), so
@@ -3201,10 +3203,10 @@ impl RpcDispatcher {
     #[allow(clippy::too_many_arguments)]
     async fn save_and_publish_config(
         &self,
-        commit: crate::live_config_authority::ConfigCommit,
+        mut commit: crate::live_config_authority::ConfigCommit,
         snapshot: zeroclaw_config::schema::Config,
         effects: RpcConfigCommitEffects,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<zeroclaw_config::live::ConfigRevision, JsonRpcError> {
         snapshot.validate_auth().map_err(|e| {
             rpc_err(
                 INVALID_PARAMS,
@@ -3223,6 +3225,15 @@ impl RpcDispatcher {
         let revision = commit
             .next_revision()
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config revision unavailable: {e}")))?;
+        for refresh in &effects.prepared_sessions {
+            commit.register_application(
+                crate::config_application::ConfigApplicationTarget::Session {
+                    id: refresh.session_id.clone(),
+                    generation: refresh.session_generation,
+                },
+                refresh.application_paths.clone(),
+            );
+        }
         let ctx = Arc::clone(&self.ctx);
         let sessions = Arc::clone(&ctx.sessions);
         let reload_tx = self.ctx.reload_tx.clone();
@@ -3248,6 +3259,7 @@ impl RpcDispatcher {
                     Arc::clone(&ctx),
                     effects.prepared_sessions,
                     Arc::clone(&accepted),
+                    Some(revision),
                 )
                 .await;
                 drain_channel_generation_without_dispatcher(
@@ -3285,7 +3297,7 @@ impl RpcDispatcher {
                     Self::refresh_memory_embedder_for_model_provider(&ctx, &accepted, &provider);
                 }
             }
-            result
+            result.map(|()| revision)
         }));
         task.await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config commit task failed: {e}")))?
@@ -3673,7 +3685,7 @@ impl RpcDispatcher {
 
             // Config introspection
             Method::ConfigSections => self.handle_config_sections(),
-            Method::ConfigStatus => self.handle_config_status(),
+            Method::ConfigStatus => self.handle_config_status().await,
             Method::ConfigCatalog => self.handle_config_catalog(),
             Method::ConfigCatalogModels => {
                 Box::pin(self.handle_config_catalog_models(params)).await
@@ -4790,9 +4802,7 @@ impl RpcDispatcher {
         // built from the prior generation (or publish midway through Agent
         // construction). Persistence lookup above does not depend on config and
         // deliberately remains outside this boundary.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_generation_guard = self.ctx.config_authority.lock_config_writer().await;
         let config = self.ctx.config.read().clone();
 
         // The wait for the config-generation lock above is also unbounded, and
@@ -5962,9 +5972,7 @@ impl RpcDispatcher {
         // generation. This path cannot block on it: config mutation waits for
         // live-session refresh while holding the same gate. A contended build
         // is therefore published pending and reconciled before prompt dispatch.
-        let config_generation_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .try_lock_owned()
-            .ok();
+        let config_generation_guard = self.ctx.config_authority.try_lock_config_writer();
         let config = Box::new(self.ctx.config.read().clone());
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
@@ -6226,9 +6234,7 @@ impl RpcDispatcher {
     ) -> bool {
         // Acquire the gate (blocking) so we are guaranteed to read a config at
         // least as new as whatever committed while the Agent was being built.
-        let _gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _gate = ctx.config_authority.lock_config_writer().await;
         // Take the per-session ordering boundary for the whole publication,
         // the same guard `prepare_live_sessions_refresh` holds. Without it this
         // repair would be the only live-provider writer in the file that does
@@ -7472,9 +7478,7 @@ impl RpcDispatcher {
         // gate, so parking here with the gate held would block the very
         // task that wait is waiting on (and stall every other config write
         // until the timeout).
-        let _config_write_guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let _config_write_guard = self.ctx.config_authority.lock_config_writer().await;
 
         // Capture the session generation /before/ acquiring the per-session
         // update lock. If the session is replaced while we wait for the lock,
@@ -7747,7 +7751,16 @@ impl RpcDispatcher {
                 crate::agent::SteeringInput::with_admission(req.content, admit)
             }
             None => crate::agent::SteeringInput::new(req.content),
-        };
+        }
+        .with_ingress(IngressContext {
+            message_id: None,
+            source_class: SourceClass::External,
+            sender: self.owner_principal_id(),
+            transport: Transport::Rpc,
+            trust: TrustClass::Untrusted,
+            origin: TurnOrigin::Interactive,
+            internal_principal: None,
+        });
         match self.ctx.sessions.steer_session_for_generation(
             &req.session_id,
             session_generation,
@@ -9296,21 +9309,22 @@ impl RpcDispatcher {
                 }),
             ..RpcConfigCommitEffects::default()
         };
-        if let Some(scope) = refresh_scope.as_ref() {
+        let revision = if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
                 *config,
                 config_commit,
                 scope,
                 effects,
             ))
-            .await?;
+            .await?
         } else {
             self.save_and_publish_config(config_commit, *config, effects)
-                .await?;
-        }
+                .await?
+        };
         to_result(ConfigSetResult {
             prop: req.prop,
             set: true,
+            revision: Some(revision.into()),
         })
     }
 
@@ -9590,7 +9604,7 @@ impl RpcDispatcher {
         config_commit: crate::live_config_authority::ConfigCommit,
         scope: &LiveSessionRefreshScope,
         mut effects: RpcConfigCommitEffects,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<zeroclaw_config::live::ConfigRevision, JsonRpcError> {
         let prepared =
             Self::prepare_live_sessions_refresh(Arc::clone(&self.ctx), &working, scope).await?;
         // Test-only: park after preparation so a regression can drive other
@@ -9618,6 +9632,33 @@ impl RpcDispatcher {
     ) -> Result<Vec<PreparedLiveSessionRefresh>, JsonRpcError> {
         let session_ids = ctx.sessions.list_ids().await;
         let mut prepared = Vec::new();
+        // Application paths are recorded only on prepared sessions; with none
+        // live, skip the semantic diff and metadata derivation under the
+        // config writer lock.
+        if session_ids.is_empty() {
+            return Ok(prepared);
+        }
+        let previous = ctx.config.snapshot();
+        let changed_paths = Config::semantic_changed_paths(&previous, config).unwrap_or_default();
+        // Derive each snapshot's property metadata once, not once per path.
+        let (candidate_capabilities, previous_capabilities) = if changed_paths.is_empty() {
+            (None, None)
+        } else {
+            (
+                Some(config.application_capabilities()),
+                Some(previous.application_capabilities()),
+            )
+        };
+        let application_paths: Vec<_> = changed_paths
+            .into_iter()
+            .filter(|path| {
+                use zeroclaw_config::traits::ApplicationCapability::ModelProviderRefresh;
+                [&candidate_capabilities, &previous_capabilities]
+                    .into_iter()
+                    .flatten()
+                    .any(|capabilities| capabilities.capability(path) == ModelProviderRefresh)
+            })
+            .collect();
         for session_id in session_ids {
             // Capture the generation before acquiring the lock so we can
             // detect same-ID replacement while waiting.
@@ -9748,6 +9789,46 @@ impl RpcDispatcher {
                 &model_name,
             );
             prepared.push(PreparedLiveSessionRefresh {
+                application_paths: application_paths
+                    .iter()
+                    .filter(|path| {
+                        if let LiveSessionRefreshScope::ProviderAliasRename { old_ref, new_ref } =
+                            scope
+                            && let [root, category, family, alias, ..] = path.as_slice()
+                            && root == "providers"
+                            && category == "models"
+                        {
+                            let reference = format!("{family}.{alias}");
+                            if &reference == old_ref || &reference == new_ref {
+                                return true;
+                            }
+                        }
+                        let path_scope = match path.as_slice() {
+                            [root, category, family, alias, ..]
+                                if root == "providers" && category == "models" =>
+                            {
+                                Some(LiveSessionRefreshScope::ModelProvider(format!(
+                                    "{family}.{alias}"
+                                )))
+                            }
+                            [root, alias, field]
+                                if root == "agents" && field == "model_provider" =>
+                            {
+                                Some(LiveSessionRefreshScope::Agent(alias.clone()))
+                            }
+                            [root, ..] if root == "model_routes" => {
+                                Some(LiveSessionRefreshScope::ModelRoutes)
+                            }
+                            _ => None,
+                        };
+                        path_scope.is_some_and(|path_scope| {
+                            path_scope
+                                .resolve_provider_ref(config, &agent_alias, &overrides)
+                                .is_ok_and(|reference| reference.is_some())
+                        })
+                    })
+                    .cloned()
+                    .collect(),
                 session_id,
                 session_generation,
                 _model_provider_update: model_provider_update,
@@ -9774,10 +9855,12 @@ impl RpcDispatcher {
         ctx: Arc<RpcContext>,
         prepared: Vec<PreparedLiveSessionRefresh>,
         config_generation: Arc<Config>,
+        revision: Option<zeroclaw_config::live::ConfigRevision>,
     ) {
         for refresh in prepared {
             let PreparedLiveSessionRefresh {
                 session_id,
+                application_paths,
                 session_generation,
                 _model_provider_update,
                 model_provider,
@@ -9788,6 +9871,11 @@ impl RpcDispatcher {
                 temperature,
                 override_migration,
             } = refresh;
+            if revision
+                .is_some_and(|revision| ctx.config_authority.published_revision() != revision)
+            {
+                continue;
+            }
             // Migrate the stored override first so the session's own reference
             // and the provider box it is about to receive name the same alias
             // for the whole publication, still under this session's guard.
@@ -9815,6 +9903,17 @@ impl RpcDispatcher {
                     },
                 )
                 .await;
+            if let Some(revision) = revision {
+                ctx.config_authority.complete_application(
+                    revision,
+                    &crate::config_application::ConfigApplicationTarget::Session {
+                        id: session_id.clone(),
+                        generation: session_generation,
+                    },
+                    &application_paths,
+                    applied,
+                );
+            }
             if applied {
                 ctx.sessions
                     .clear_pending_generation(&session_id, session_generation)
@@ -9835,7 +9934,7 @@ impl RpcDispatcher {
             &LiveSessionRefreshScope::Agent(agent_alias.to_string()),
         )
         .await?;
-        Self::apply_prepared_live_sessions_refresh(ctx, prepared, Arc::new(config)).await;
+        Self::apply_prepared_live_sessions_refresh(ctx, prepared, Arc::new(config), None).await;
         Ok(())
     }
 
@@ -9925,21 +10024,22 @@ impl RpcDispatcher {
             channel_generation: channel_generation_revocation,
             ..RpcConfigCommitEffects::default()
         };
-        if let Some(scope) = refresh_scope.as_ref() {
+        let revision = if let Some(scope) = refresh_scope.as_ref() {
             Box::pin(self.commit_config_with_live_session_refresh(
                 working,
                 config_commit,
                 scope,
                 effects,
             ))
-            .await?;
+            .await?
         } else {
             self.save_and_publish_config(config_commit, working, effects)
-                .await?;
-        }
+                .await?
+        };
         to_result(ConfigDeleteResult {
             prop: req.prop,
             deleted: true,
+            revision: Some(revision.into()),
         })
     }
 
@@ -10002,25 +10102,30 @@ impl RpcDispatcher {
             config_reservations: _agent_config_reservation.into_iter().collect(),
             ..RpcConfigCommitEffects::default()
         };
+        let mut revision = None;
         let created = if touches_model_routes(&req.path) {
             let mut working = self.ctx.config.read().clone();
             let created = create(&mut working)?;
             if created {
-                Box::pin(self.commit_config_with_live_session_refresh(
-                    working,
-                    config_commit,
-                    &LiveSessionRefreshScope::ModelRoutes,
-                    effects,
-                ))
-                .await?;
+                revision = Some(
+                    Box::pin(self.commit_config_with_live_session_refresh(
+                        working,
+                        config_commit,
+                        &LiveSessionRefreshScope::ModelRoutes,
+                        effects,
+                    ))
+                    .await?,
+                );
             }
             created
         } else {
             let mut working = self.ctx.config.read().clone();
             let created = create(&mut working)?;
             if created {
-                self.save_and_publish_config(config_commit, working, effects)
-                    .await?;
+                revision = Some(
+                    self.save_and_publish_config(config_commit, working, effects)
+                        .await?,
+                );
             }
             created
         };
@@ -10028,6 +10133,7 @@ impl RpcDispatcher {
             path: req.path,
             key: req.key,
             created,
+            revision: revision.map(Into::into),
         })
     }
 
@@ -10057,6 +10163,7 @@ impl RpcDispatcher {
                 path: req.path,
                 key: result.alias,
                 deleted: true,
+                revision: None,
             });
         }
         let config_commit = self
@@ -10104,17 +10211,20 @@ impl RpcDispatcher {
             channel_generation: channel_generation_revocation,
             ..RpcConfigCommitEffects::default()
         };
+        let mut revision = None;
         let deleted = if touches_model_routes(&req.path) {
             let mut working = self.ctx.config.read().clone();
             let deleted = delete_plain(&mut working)?;
             if deleted {
-                Box::pin(self.commit_config_with_live_session_refresh(
-                    working,
-                    config_commit,
-                    &LiveSessionRefreshScope::ModelRoutes,
-                    effects,
-                ))
-                .await?;
+                revision = Some(
+                    Box::pin(self.commit_config_with_live_session_refresh(
+                        working,
+                        config_commit,
+                        &LiveSessionRefreshScope::ModelRoutes,
+                        effects,
+                    ))
+                    .await?,
+                );
             }
             deleted
         } else if let Some(kind) = provider_model_alias_kind {
@@ -10140,21 +10250,25 @@ impl RpcDispatcher {
                 // widest safe scope: it refreshes every session regardless of
                 // their provider ref, ensuring the deleted alias is never
                 // consulted again.
-                Box::pin(self.commit_config_with_live_session_refresh(
-                    working,
-                    config_commit,
-                    &LiveSessionRefreshScope::ModelRoutes,
-                    effects,
-                ))
-                .await?;
+                revision = Some(
+                    Box::pin(self.commit_config_with_live_session_refresh(
+                        working,
+                        config_commit,
+                        &LiveSessionRefreshScope::ModelRoutes,
+                        effects,
+                    ))
+                    .await?,
+                );
             }
             deleted
         } else {
             let mut working = old_config;
             let deleted = delete_plain(&mut working)?;
             if deleted {
-                self.save_and_publish_config(config_commit, working, effects)
-                    .await?;
+                revision = Some(
+                    self.save_and_publish_config(config_commit, working, effects)
+                        .await?,
+                );
             }
             deleted
         };
@@ -10162,6 +10276,7 @@ impl RpcDispatcher {
             path: req.path,
             key: req.key,
             deleted,
+            revision: revision.map(Into::into),
         })
     }
 
@@ -10552,6 +10667,9 @@ impl RpcDispatcher {
                 AgentStatusEntry {
                     alias: alias.clone(),
                     enabled: agent_cfg.enabled,
+                    runtime_profile: config
+                        .runtime_profile_for_agent(alias)
+                        .map(|_| agent_cfg.runtime_profile.trim().to_string()),
                     live_sessions: rpc,
                     persisted_sessions: persisted,
                     channels: agent_cfg.channels.iter().map(|c| c.to_string()).collect(),
@@ -11192,8 +11310,51 @@ impl RpcDispatcher {
         to_result(ConfigSectionsResult { sections })
     }
 
-    fn handle_config_status(&self) -> RpcResult {
+    async fn handle_config_status(&self) -> RpcResult {
         use zeroclaw_config::sections::QUICKSTART_SECTIONS;
+        let application = self
+            .ctx
+            .sessions
+            .with_current_sessions(|sessions| {
+                let grants = self.recheck_authority_after_admission(Method::ConfigStatus)?;
+                let scoped_principal = self.auth.as_ref().filter(|auth| {
+                    auth.principal.is_authenticated()
+                        && grants.as_ref().is_some_and(|grants| !grants.admin)
+                });
+                use crate::config_application::ConfigApplicationTarget;
+                use zeroclaw_api::grants::{Resource, Verb};
+                Ok::<_, JsonRpcError>(self.ctx.config_authority.application_status_for_sessions(
+                    |target| {
+                        match target {
+                            ConfigApplicationTarget::Daemon => true,
+                            ConfigApplicationTarget::Session { id, generation } => sessions
+                                .get(id)
+                                .is_some_and(|session| session.generation == *generation),
+                        }
+                    },
+                    |target| match target {
+                        ConfigApplicationTarget::Daemon => true,
+                        ConfigApplicationTarget::Session { id, generation } => {
+                            sessions.get(id).is_some_and(|session| {
+                                session.generation == *generation
+                                    && scoped_principal.is_none_or(|auth| {
+                                        session.owner_principal_id.as_deref()
+                                            == Some(auth.principal.id.as_str())
+                                    })
+                                    && grants.as_ref().is_some_and(|grants| {
+                                        grants.permits(Resource::Sessions, Verb::Read)
+                                            && grants.may_use_agent(&session.agent_alias)
+                                    })
+                                    && (self.access_policy == RpcAccessPolicy::TrustedLocal
+                                        || session.owner_tui_id.as_deref().is_some_and(|owner| {
+                                            self.tui_id.as_deref() == Some(owner)
+                                        }))
+                            })
+                        }
+                    },
+                ))
+            })
+            .await?;
         let config = self.ctx.config.read().clone();
         let missing: Vec<String> = QUICKSTART_SECTIONS
             .iter()
@@ -11207,6 +11368,7 @@ impl RpcDispatcher {
             "all sections complete".to_string()
         };
         to_result(ConfigStatusResult {
+            application: Some(application),
             needs_quickstart,
             reason,
             has_partial_state: false,
@@ -13511,6 +13673,14 @@ fn plan_replay_notification(
     notification_for_turn_event(session_id, &event)
 }
 
+#[cfg(test)]
+pub(crate) fn notification_for_turn_event_for_test(
+    session_id: &str,
+    event: &TurnEvent,
+) -> Option<String> {
+    notification_for_turn_event(session_id, event)
+}
+
 fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<String> {
     let update = match event {
         TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
@@ -13616,6 +13786,16 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
             entries: entries.clone(),
+        },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => SessionUpdateEvent::BudgetWarning {
+            session_id: session_id.to_string(),
+            current_usd: *current_usd,
+            limit_usd: *limit_usd,
+            period: *period,
         },
         _ => return None,
     };
@@ -13952,7 +14132,11 @@ mod tests {
     #[tokio::test]
     async fn local_session_factory_populates_channels_and_resume_preserves_them() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
         dispatcher.local_session_channel_factory = Some(session_factory_stub());
         dispatcher.set_tui_id_for_test(Some("tui-local".into()));
@@ -14256,7 +14440,11 @@ mod tests {
     #[tokio::test]
     async fn local_acp_rehydration_restores_session_channels() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .tools
+            .optional
+            .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let data_dir = config.data_dir.clone();
         let (mut dispatcher, sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
@@ -18445,6 +18633,11 @@ mod tests {
         std::fs::write(&secret, "outside every agent root").unwrap();
         let (ctx, chat_backend, _acp_store) = persistence_enforcement_ctx(config);
         let (provider, started_rx, _release_tx) = gated_provider();
+        // A live session holds the resolved workspace, as `session/new` and
+        // rehydration store it. The raw temp-dir spelling can be an alias
+        // (`/var` on macOS, an 8.3 short name on Windows), and a scoped prompt
+        // refuses a session held under one before it ever judges an attachment
+        // source.
         install_state_test_session_owned_at(
             &ctx.sessions,
             &chat_backend,
@@ -18452,7 +18645,7 @@ mod tests {
             provider,
             None,
             Some("user:alice"),
-            &agent_workspace,
+            &agent_workspace.canonicalize().unwrap(),
         )
         .await;
         (ctx, agent_workspace, inside, secret, started_rx)
@@ -21960,6 +22153,71 @@ mod tests {
             .await
             .expect_err("still not bob's");
         assert_eq!(err.code, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn session_steer_stamps_the_acting_principal_not_the_session_owner() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = two_user_config(&tmp);
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "carol".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4444),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let ctx = Arc::clone(&fixture.ctx);
+        let alice = scoped_dispatcher(&ctx, 4242).await;
+        let carol = scoped_dispatcher(&ctx, 4444).await;
+        alice
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "a-steer",
+                "chat_mode": "acp",
+            }))
+            .await
+            .expect("alice creates her session");
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let session_generation = sessions.get_generation("a-steer").await.unwrap();
+        let turn_generation = sessions.register_cancel_token_for_generation_for_test(
+            "a-steer",
+            session_generation,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        sessions.register_steering("a-steer", turn_generation, sender);
+        let result = carol
+            .handle_session_steer(&json!({"session_id": "a-steer", "content": "admin correction"}))
+            .await
+            .expect("the administrator may steer another owner's session");
+        assert_eq!(result["accepted"], json!(true));
+
+        let message = receiver.try_recv().expect("RPC steering was queued");
+        let ingress = message
+            .ingress()
+            .expect("authorized RPC steering has provenance");
+        assert_eq!(message.text(), "admin correction");
+        assert_eq!(ingress.sender.as_deref(), Some("user:carol"));
+        assert_eq!(ingress.transport, Transport::Rpc);
+        assert_eq!(ingress.source_class, SourceClass::External);
+        assert_eq!(ingress.trust, TrustClass::Untrusted);
+        assert_eq!(
+            sessions.session_owner_principal("a-steer").await,
+            Some(Some("user:alice".into()))
+        );
     }
 
     /// Durable owner identity is separate from the administrator bypass: an
@@ -27169,6 +27427,23 @@ mod tests {
     }
 
     #[test]
+    fn budget_warning_notification() {
+        let event = TurnEvent::BudgetWarning {
+            current_usd: 8.25,
+            limit_usd: 10.0,
+            period: zeroclaw_api::agent::BudgetWarningPeriod::Day,
+        };
+        let json = notification_for_turn_event("s1", &event).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "budget_warning");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["current_usd"], 8.25);
+        assert_eq!(v["params"]["limit_usd"], 10.0);
+        assert_eq!(v["params"]["period"], "day");
+    }
+
+    #[test]
     fn history_trimmed_notification() {
         let event = TurnEvent::HistoryTrimmed {
             dropped_messages: 12,
@@ -28455,6 +28730,19 @@ mod tests {
         risk_profiles.insert("test-profile".to_string(), RiskProfileConfig::default());
 
         zeroclaw_config::schema::Config {
+            tools: zeroclaw_config::builtin_tools::BuiltinToolsConfig {
+                optional: vec![
+                    "calculator",
+                    "delegate",
+                    "sessions_list",
+                    "sessions_history",
+                    "sessions_current",
+                    "sessions_send",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
             data_dir: workspace_dir,
             config_path: tmp.path().join("config.toml"),
             providers,
@@ -28462,6 +28750,39 @@ mod tests {
             risk_profiles,
             ..zeroclaw_config::schema::Config::default()
         }
+    }
+
+    #[tokio::test]
+    async fn agents_status_runtime_profile_resolves_config_and_omits_unresolved_profiles() {
+        use zeroclaw_config::schema::RuntimeProfileConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .runtime_profiles
+            .insert("coding".into(), RuntimeProfileConfig::default());
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = " coding ".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config.clone());
+
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert_eq!(agent["runtime_profile"], "coding");
+
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = "missing".into();
+        let (dispatcher, _) = make_acp_test_dispatcher(config);
+        let response = dispatcher.handle_agents_status().await.unwrap();
+        let agent = response["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["alias"] == "test-agent")
+            .unwrap();
+        assert!(agent.get("runtime_profile").is_none());
     }
 
     fn make_acp_test_dispatcher(
@@ -35074,11 +35395,18 @@ mod tests {
         dispatcher
     }
 
-    fn make_shared_sessions_dispatcher(
+    /// Another connection's dispatcher on `first`'s daemon: it shares the
+    /// session store and the config write lock, as every connection shares
+    /// the daemon's one context in production, so it queues behind a
+    /// transaction `first` holds open. Its config is its own, so a successor
+    /// it builds stays distinguishable from stale work built from `first`'s.
+    fn make_second_connection_dispatcher(
+        first: &RpcContext,
         config: zeroclaw_config::schema::Config,
-        sessions: Arc<crate::rpc::session::SessionStore>,
     ) -> RpcDispatcher {
-        let ctx = RpcContext::minimal(config, sessions);
+        let authority =
+            crate::LiveConfigAuthority::for_tests_sharing_writer(config, &first.config_authority);
+        let ctx = RpcContext::for_authority(&authority, Arc::clone(&first.sessions));
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         dispatcher.set_authenticated_for_test();
@@ -35099,7 +35427,7 @@ mod tests {
             }),
         )));
         let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
-        let authority = crate::LiveConfigAuthority::new(config);
+        let authority = crate::LiveConfigAuthority::for_tests(config);
         let data_dir = authority.live_handle().read().data_dir.clone();
         let acp_session_store = Some(Arc::new(
             zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir)
@@ -37148,6 +37476,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_application_map_receipts_require_a_committed_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
+        let params = json!({"path": "cost.rates.providers.models.openai", "key": "gpt-4.1"});
+        let created = dispatcher
+            .handle_config_map_key_create(&params)
+            .await
+            .unwrap();
+        assert_eq!(created["created"], true);
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert_eq!(
+            created["revision"],
+            status["application"]["published_revision"]
+        );
+        let unchanged = dispatcher
+            .handle_config_map_key_create(&params)
+            .await
+            .unwrap();
+        assert_eq!(unchanged["created"], false);
+        assert!(unchanged.get("revision").is_none());
+        let saved = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok", "value": 1.5
+            }))
+            .await
+            .unwrap();
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert!(
+            status["application"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| {
+                    record["revision"] == saved["revision"]
+                        && record["path"]
+                            == json!([
+                                "cost",
+                                "rates",
+                                "providers",
+                                "models",
+                                "openai",
+                                "gpt-4.1",
+                                "input_per_mtok"
+                            ])
+                })
+        );
+        let deleted = dispatcher
+            .handle_config_map_key_delete(&params)
+            .await
+            .unwrap();
+        assert_eq!(deleted["deleted"], true);
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert_eq!(
+            deleted["revision"],
+            status["application"]["published_revision"]
+        );
+        let unchanged = dispatcher
+            .handle_config_map_key_delete(&params)
+            .await
+            .unwrap();
+        assert_eq!(unchanged["deleted"], false);
+        assert!(unchanged.get("revision").is_none());
+    }
+
+    #[tokio::test]
+    async fn config_application_status_waits_for_the_real_session_acknowledgement() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_model_refresh_test_config(&tmp);
+        config.permission_profiles.insert(
+            "application-reader".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["*".into()],
+                grants: HashMap::from([
+                    (Resource::Config, vec![Verb::Read]),
+                    (Resource::Sessions, vec![Verb::Read, Verb::Create]),
+                ]),
+                ..Default::default()
+            },
+        );
+        for (alias, uid) in [("reader-one", 4242), ("reader-two", 4343)] {
+            config.users.insert(
+                alias.into(),
+                UserConfig {
+                    uid: Some(uid),
+                    permission_profiles: vec!["application-reader".into()],
+                    ..Default::default()
+                },
+            );
+        }
+        let dispatcher = Arc::new(make_config_set_test_dispatcher(config));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let mut readers = Vec::new();
+        let mut owned_sessions = Vec::new();
+        for uid in [4242, 4343] {
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let mut reader =
+                RpcDispatcher::new(Arc::clone(&dispatcher.ctx), tx, "unix:test".into())
+                    .with_transport(
+                        crate::rpc::transport::TransportKind::Local,
+                        crate::security::auth_provider::Credential::Peercred { uid },
+                    );
+            reader.handle_initialize(&json!({})).await.unwrap();
+            let created = reader
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent", "keep_siblings": true
+                }))
+                .await
+                .unwrap();
+            owned_sessions.push(created["session_id"].as_str().unwrap().to_owned());
+            readers.push(reader);
+        }
+        let generation = dispatcher
+            .ctx
+            .sessions
+            .get_generation(&session_id)
+            .await
+            .unwrap();
+        let (entered, release, _) = dispatcher.ctx.sessions.set_test_gated_op_pause();
+        let waiting = entered.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        let writer = Arc::clone(&dispatcher);
+        let task = zeroclaw_spawn::spawn!(async move {
+            writer
+                .handle_config_set(&json!({
+                    "prop": "providers.models.openai.test-provider.model", "value": "new-model"
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .unwrap();
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+        let pending = dispatcher.handle_config_status().await.unwrap();
+        let records = pending["application"]["records"].as_array().unwrap();
+        let record = records
+            .iter()
+            .find(|record| record["target"]["id"] == session_id)
+            .unwrap();
+        assert_eq!(record["target"]["generation"], generation);
+        assert_eq!(record["outcome"], "pending");
+        assert_eq!(
+            record["path"],
+            json!(["providers", "models", "openai", "test-provider", "model"])
+        );
+        assert_eq!(
+            record["revision"],
+            pending["application"]["published_revision"]
+        );
+        let applied_revision = record["revision"].clone();
+        dispatcher.ctx.sessions.clear_test_gated_op_pause();
+        release.notify_one();
+        let saved = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved["revision"], applied_revision);
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "new-model"
+        );
+        let applied = dispatcher.handle_config_status().await.unwrap();
+        let records = applied["application"]["records"].as_array().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["target"]["id"] == session_id
+                    && record["outcome"] == "applied_live")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record["target"]["kind"] == "daemon"
+                    && record["outcome"] == "queued_for_reload")
+        );
+        assert!(!applied.to_string().contains("test-key"));
+        for (reader, own_session) in readers.iter().zip(&owned_sessions) {
+            let status = reader.handle_config_status().await.unwrap();
+            let visible_sessions: Vec<_> = status["application"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|record| record["target"]["kind"] == "session")
+                .collect();
+            assert_eq!(visible_sessions.len(), 1);
+            assert_eq!(visible_sessions[0]["target"]["id"], *own_session);
+            assert_eq!(visible_sessions[0]["outcome"], "applied_live");
+        }
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["target"]["kind"] == "session")
+                .count(),
+            3,
+            "the operator sees owned and legacy unowned sessions"
+        );
+        dispatcher
+            .handle_config_set(&json!({"prop": "gateway.port", "value": 42618}))
+            .await
+            .unwrap();
+        let later = dispatcher.handle_config_status().await.unwrap();
+        let record = later["application"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["target"]["id"] == session_id)
+            .unwrap();
+        assert_eq!(record["revision"], applied_revision);
+        // A subsequent write to the same path replaces its ledger records.
+        // Its receipt must not be attributable to the earlier request.
+        let newer = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model", "value": "newer-model"
+            }))
+            .await
+            .unwrap();
+        let latest = dispatcher.handle_config_status().await.unwrap();
+        assert_ne!(newer["revision"], saved["revision"]);
+        assert_eq!(
+            newer["revision"],
+            latest["application"]["published_revision"]
+        );
+        let same_path_records: Vec<_> = latest["application"]["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|record| {
+                record["path"] == json!(["providers", "models", "openai", "test-provider", "model"])
+            })
+            .collect();
+        assert!(!same_path_records.is_empty());
+        assert!(same_path_records.iter().all(|record| {
+            record["revision"] == newer["revision"] && record["revision"] != saved["revision"]
+        }));
+        dispatcher.ctx.sessions.remove(&session_id).await;
+        let retired = dispatcher.handle_config_status().await.unwrap();
+        assert!(
+            retired["application"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|record| record["target"]["id"] != session_id)
+        );
+    }
+
+    #[tokio::test]
     async fn config_set_agent_model_provider_refreshes_bound_live_session() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut cfg = make_model_refresh_test_config(&tmp);
@@ -38547,7 +39127,20 @@ mod tests {
                 "prop": "providers.models.openai.test-provider.temperature",
             }))
             .await;
-        assert!(res.is_ok(), "config/delete must succeed: {res:?}");
+        let res = res.expect("config/delete must succeed");
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert_eq!(res["revision"], status["application"]["published_revision"]);
+        assert!(
+            status["application"]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|record| {
+                    record["revision"] == res["revision"]
+                        && record["target"]["id"] == session_id
+                        && record["outcome"] == "applied_live"
+                })
+        );
 
         wait_for_temperature(&dispatcher, &session_id, None).await;
     }
@@ -38769,6 +39362,49 @@ mod tests {
         dispatcher.process_line(&line.to_string()).await;
         let frame = rx.recv().await.expect("RPC response frame");
         serde_json::from_str(&frame).expect("response frame is valid JSON")
+    }
+
+    /// `config/validate` checks an opt-in tool's own settings only in a build
+    /// that carries the tool. A build without project intelligence accepts an
+    /// enabled section whose templates directory does not exist here; a
+    /// build with it still reports the config invalid.
+    #[tokio::test]
+    async fn config_validate_checks_an_opt_in_tool_only_where_it_is_compiled() {
+        use zeroclaw_config::opt_in_tools::OptInTool;
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "root-operator".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        config.project_intel.enabled = true;
+        config.project_intel.templates_dir =
+            Some(tmp.path().join("absent-templates").display().to_string());
+        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
+
+        let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/validate", json!({})).await;
+        let compiled = OptInTool::ProjectIntel.compiled();
+        assert_eq!(response["result"]["valid"], json!(!compiled), "{response}");
+        if compiled {
+            assert!(
+                response["result"]["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("project_intel.templates_dir")),
+                "{response}"
+            );
+        }
     }
 
     fn alice_user_sets() -> Value {
@@ -40082,7 +40718,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -40135,7 +40771,7 @@ mod tests {
         let (_hook, end_count) = EndCountingHook::new();
         runner.register(Box::new(_hook));
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -40324,7 +40960,7 @@ mod tests {
         runner.register(Box::new(_hook));
 
         let test_authority =
-            crate::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+            crate::LiveConfigAuthority::for_tests(zeroclaw_config::schema::Config::default());
         let ctx = Arc::new(crate::rpc::context::RpcContext {
             config_commit_pause: None,
             config: test_authority.live_handle(),
@@ -40758,15 +41394,44 @@ mod tests {
         std::fs::write(&blocked_parent, b"").unwrap();
         let mut cfg = make_two_provider_test_config(&tmp);
         cfg.config_path = blocked_parent.join("config.toml");
-        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let (mut dispatcher, mut rx, _) = make_dispatcher_with_capture(cfg);
+        dispatcher.set_authenticated_for_test();
         let before = dispatcher.ctx.config.snapshot_with_revision();
 
         let params = json!({
             "prop": "providers.models.anthropic.default.model",
             "value": "doomed-value"
         });
-        let result = dispatcher.handle_config_set(&params).await;
-        assert!(result.is_err(), "config/set must fail on the blocked path");
+        let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/set", params).await;
+        assert!(
+            response.get("error").is_some(),
+            "config/set must fail on the blocked path"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Config save failed:"),
+            "the request must reach the persistence failure: {response}"
+        );
+        assert!(
+            response.get("result").is_none(),
+            "a failed save must not return a receipt"
+        );
+        let status = dispatcher.handle_config_status().await.unwrap();
+        assert_eq!(
+            status["application"]["published_revision"],
+            serde_json::to_value(crate::config_application::PublishedConfigRevision::from(
+                before.1
+            ))
+            .unwrap()
+        );
+        assert!(
+            status["application"]["records"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         let after = dispatcher.ctx.config.snapshot_with_revision();
         assert!(
@@ -40889,9 +41554,7 @@ mod tests {
     where
         F: std::future::Future<Output = RpcResult> + Send + 'static,
     {
-        let guard = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let guard = ctx.config_authority.lock_config_writer().await;
         let task = zeroclaw_spawn::spawn!(rpc_call);
         for _ in 0..50 {
             tokio::task::yield_now().await;
@@ -41864,6 +42527,14 @@ mod tests {
     /// meant to reach has to carry that caller's id: an unstamped session is
     /// invisible to it, and the test would exercise the ownership denial
     /// instead of whatever it meant to check.
+    ///
+    /// The session holds `workspace` as given, but `session/new` and
+    /// rehydration hold the resolved path, and a scoped caller's prompt,
+    /// steer, or resume refuses a session held under any other spelling. A
+    /// test that needs one of those to reach the check under test passes the
+    /// canonicalized workspace. The temp dir is not spelled canonically on
+    /// every platform: on macOS it is under `/var`, a link to `/private/var`,
+    /// and on Windows it can go through an 8.3 short name.
     #[allow(clippy::too_many_arguments)]
     async fn install_state_test_session_owned_at(
         sessions: &Arc<crate::rpc::session::SessionStore>,
@@ -43354,6 +44025,7 @@ mod tests {
             "old-model"
         );
 
+        let first_ctx = Arc::clone(&dispatcher.ctx);
         let sessions = Arc::clone(&dispatcher.ctx.sessions);
         let (entered, release, done) = sessions.set_test_gated_op_pause();
         let sid = session_id.clone();
@@ -43384,10 +44056,8 @@ mod tests {
         // Explicitly end the old incarnation before recreating the same ID.
         // A live same-ID session/new must resume rather than replace it.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
-            make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
-        );
+        let dispatcher2 =
+            make_second_connection_dispatcher(&first_ctx, make_model_refresh_test_config(&tmp));
         let replace_sid = session_id.clone();
         let replace = zeroclaw_spawn::spawn!(async move {
             dispatcher2
@@ -43500,9 +44170,9 @@ mod tests {
 
         // Explicitly end the old incarnation before recreating the same ID.
         assert!(sessions.remove(&session_id).await);
-        let dispatcher2 = make_shared_sessions_dispatcher(
+        let dispatcher2 = make_second_connection_dispatcher(
+            &dispatcher.ctx,
             make_model_refresh_test_config(&tmp),
-            Arc::clone(&sessions),
         );
         let workspace = tmp.path().join("workspace");
         let replace_sid = session_id.clone();
@@ -44276,9 +44946,7 @@ mod tests {
         // agent route unresolvable before its queued reconciliation can read
         // config. The construction-time provider remains last-known-good, but
         // pending must prevent callers from observing it with the newer config.
-        let config_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let config_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         let rehydrated = dispatcher
             .rehydrate_reaped_session(&session_id, dispatcher.stamped_grants())
             .await
@@ -44298,9 +44966,7 @@ mod tests {
         // settled before the assertion.
         tokio::task::yield_now().await;
         drop(config_gate);
-        let settled_gate = zeroclaw_config::write_lock::shared_config_write_lock()
-            .lock_owned()
-            .await;
+        let settled_gate = dispatcher.ctx.config_authority.lock_config_writer().await;
         drop(settled_gate);
 
         assert!(matches!(
