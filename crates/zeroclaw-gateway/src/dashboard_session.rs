@@ -4091,7 +4091,9 @@ mod tests {
         client_socket.set_recv_buffer_size(1024).unwrap();
         let stream = client_socket.connect(addr).await.unwrap();
         // The request only reaches this test's loopback listener.
-        let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
+        let mut request = format!("ws://{addr}{path}") // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            .into_client_request()
+            .unwrap();
         request
             .headers_mut()
             .insert("cookie", cookie_for(&cookie).parse().unwrap());
