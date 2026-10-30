@@ -5,11 +5,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::approval::ApprovalManager;
+use crate::approval::{ApprovalManager, ApprovalRequirement};
 use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
+use zeroclaw_api::attribution::ToolProvenance;
+use zeroclaw_api::local_file_diff::{
+    LOCAL_FILE_DIFF_CAPTURE, LOCAL_FILE_DIFFS_ALLOWED, LocalFileDiffCapture,
+};
 use zeroclaw_api::tool::{ToolExecutionCancelled, ToolExecutionContext};
 
 // Items that still live in `loop_` — import via the parent module.
@@ -96,6 +100,7 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub tools_registry: &'a [Box<dyn Tool>],
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
     pub excluded_tools: &'a [String],
+    pub approval: Option<&'a ApprovalManager>,
     pub model_switch_callback: Option<&'a ModelSwitchCallback>,
 }
 
@@ -140,6 +145,34 @@ pub(crate) fn dispatch_tool_name(name: &str, dispatch: ToolDispatchContext<'_>) 
     match resolve_dispatch_tool(name, dispatch, None) {
         DispatchResolution::Available(resolved) => Some(resolved.tool().name().to_owned()),
         DispatchResolution::Unavailable | DispatchResolution::Unknown => None,
+    }
+}
+
+/// Resolve capture admission from the executor's live callable registry and
+/// approval manager. Tool names alone do not grant native trust.
+fn may_capture_local_file_diff(
+    tool: &dyn Tool,
+    dispatch: ToolDispatchContext<'_>,
+    has_event_sink: bool,
+) -> bool {
+    if !has_event_sink
+        || !LOCAL_FILE_DIFFS_ALLOWED
+            .try_with(|allowed| *allowed)
+            .unwrap_or(false)
+        || tool.name() != "file_write"
+        || tool.tool_provenance() != ToolProvenance::Native
+        || dispatch.approval.is_some_and(|approval| {
+            approval.approval_requirement("file_read") == ApprovalRequirement::Prompt
+        })
+    {
+        return false;
+    }
+    match resolve_dispatch_tool("file_read", dispatch, None) {
+        DispatchResolution::Available(read) => {
+            read.tool().name() == "file_read"
+                && read.tool().tool_provenance() == ToolProvenance::Native
+        }
+        DispatchResolution::Unavailable | DispatchResolution::Unknown => false,
     }
 }
 
@@ -352,15 +385,21 @@ async fn execute_one_tool_with_provenance(
             .await;
     }
 
+    let local_file_diff_capture = may_capture_local_file_diff(tool, dispatch, event_tx.is_some())
+        .then(LocalFileDiffCapture::new);
     let context = ToolExecutionContext::new(cancellation_token.cloned());
     let execute = context
         .run(tool.execute_with_context(call_arguments.clone(), &context))
         .instrument(tool_span.clone());
-    let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
-        scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
-    } else {
-        execute.await
-    };
+    let tool_result = LOCAL_FILE_DIFF_CAPTURE
+        .scope(local_file_diff_capture.clone(), async {
+            if let Some(model_switch_callback) = dispatch.model_switch_callback {
+                scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
+            } else {
+                execute.await
+            }
+        })
+        .await;
     if tool_result
         .as_ref()
         .is_err_and(|error| error.is::<ToolExecutionCancelled>())
@@ -555,6 +594,25 @@ async fn execute_one_tool_with_provenance(
             .await;
     }
 
+    // This event has no model/history/observer projection. Release the bounded
+    // previous-content observation only after the ordinary result is complete.
+    // Drop the pair if UI credential scrubbing would change either side, so
+    // the client falls back to its labelled preview without a misleading diff.
+    if let Some(tx) = event_tx
+        && let Ok(out) = &outcome
+        && out.success
+        && let Some(diff) = local_file_diff_capture.and_then(|capture| capture.take())
+        && scrub_credentials(diff.previous()) == diff.previous()
+        && scrub_credentials(diff.written()) == diff.written()
+    {
+        let _ = tx
+            .send(TurnEvent::LocalFileDiff {
+                id: event_call_id,
+                diff,
+            })
+            .await;
+    }
+
     // After the ToolResult card closes, publish the plan if this was a
     // successful TodoWrite. Whole-list replace; parse failures are
     // swallowed (the ToolResult already conveyed success/failure).
@@ -701,6 +759,7 @@ pub(crate) async fn execute_tools_sequential(
                 .as_deref()
                 .unwrap_or(dispatch.excluded_tools),
             model_switch_callback: dispatch.model_switch_callback,
+            approval: dispatch.approval,
         };
         let outcome = match execute_one_tool_with_provenance(
             &call.name,
@@ -742,6 +801,351 @@ mod tests {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
     use zeroclaw_api::tool::{Tool, ToolExecutionContext};
+
+    #[tokio::test]
+    async fn local_file_diff_executor_requires_live_native_read_admission() {
+        use crate::approval::ApprovalManager;
+        use crate::tools::{FileReadTool, FileWriteTool};
+        use zeroclaw_api::agent::TurnEvent;
+        use zeroclaw_api::local_file_diff::LOCAL_FILE_DIFFS_ALLOWED;
+        use zeroclaw_config::autonomy::AutonomyLevel;
+        use zeroclaw_config::schema::RiskProfileConfig;
+
+        let approved = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            auto_approve: vec!["file_read".into()],
+            ..RiskProfileConfig::default()
+        });
+        let prompt = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            always_ask: vec!["file_read".into()],
+            ..RiskProfileConfig::default()
+        });
+        let excluded = ["file_read".to_string()];
+        // The read can be supplied by the current static or activated registry.
+        // Every denied case still completes the authorized write normally.
+        for (label, local, read_mode, exclusions, approval, sink, expected) in [
+            ("native", true, 1, &[][..], &approved, true, true),
+            ("activated", true, 2, &[][..], &approved, true, true),
+            (
+                "other connection",
+                false,
+                1,
+                &[][..],
+                &approved,
+                true,
+                false,
+            ),
+            ("missing read", true, 0, &[][..], &approved, true, false),
+            ("extension read", true, 3, &[][..], &approved, true, false),
+            (
+                "excluded read",
+                true,
+                1,
+                &excluded[..],
+                &approved,
+                true,
+                false,
+            ),
+            ("prompt read", true, 1, &[][..], &prompt, true, false),
+            ("no event sink", true, 1, &[][..], &approved, false, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().canonicalize().unwrap();
+            let previous = "private-deleted-sentinel\nunchanged\n";
+            let written = "replacement\nunchanged\n";
+            std::fs::write(workspace.join("note.txt"), previous).unwrap();
+            let security = Arc::new(crate::security::SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                workspace_dir: workspace.clone(),
+                ..crate::security::SecurityPolicy::default()
+            });
+            let mut tools: Vec<Box<dyn Tool>> =
+                vec![Box::new(FileWriteTool::new(security.clone()))];
+            let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+            match read_mode {
+                1 => tools.push(Box::new(FileReadTool::new(security.clone()))),
+                2 => activated.lock().unwrap().activate(
+                    "file_read".into(),
+                    Arc::new(FileReadTool::new(security.clone())),
+                ),
+                3 => tools.push(Box::new(CountingTool::new(
+                    "file_read",
+                    Arc::new(AtomicUsize::new(0)),
+                ))),
+                _ => {}
+            }
+            let observer = RecordingObserver::new();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let outcome = LOCAL_FILE_DIFFS_ALLOWED
+                .scope(
+                    local,
+                    execute_one_tool(
+                        "file_write",
+                        serde_json::json!({"path": "note.txt", "content": written}),
+                        Some("reused-provider-id"),
+                        ToolDispatchContext {
+                            tools_registry: &tools,
+                            activated_tools: Some(&activated),
+                            excluded_tools: exclusions,
+                            approval: Some(approval),
+                            model_switch_callback: None,
+                        },
+                        &test_turn_meta(),
+                        &observer,
+                        None,
+                        None,
+                        sink.then_some(&tx),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert!(outcome.success, "{label}: {}", outcome.output);
+            assert!(
+                !outcome.output.contains("private-deleted-sentinel"),
+                "{label}"
+            );
+            assert!(
+                !outcome
+                    .output_data
+                    .as_ref()
+                    .is_some_and(|data| data.to_string().contains("private-deleted-sentinel")),
+                "{label}"
+            );
+            assert!(
+                !observer
+                    .last_result()
+                    .unwrap()
+                    .contains("private-deleted-sentinel"),
+                "{label}"
+            );
+            assert!(outcome.error_reason.is_none());
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
+                written
+            );
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            let diff = events.iter().find_map(|event| match event {
+                TurnEvent::LocalFileDiff { id, diff } => {
+                    assert_eq!(id, "reused-provider-id");
+                    Some(diff)
+                }
+                TurnEvent::ToolResult { output, .. } => {
+                    assert!(!output.contains("private-deleted-sentinel"), "{label}");
+                    None
+                }
+                _ => None,
+            });
+            assert_eq!(diff.is_some(), expected, "{label}");
+            if let Some(diff) = diff {
+                assert_eq!(diff.previous(), previous);
+                assert_eq!(diff.written(), written);
+                assert!(matches!(events[1], TurnEvent::ToolResult { .. }));
+                assert!(matches!(events[2], TurnEvent::LocalFileDiff { .. }));
+            }
+        }
+    }
+
+    async fn assert_local_file_diff_dropped_for_credentials(previous: &str, written: &str) {
+        use crate::approval::ApprovalManager;
+        use crate::tools::{FileReadTool, FileWriteTool};
+        use zeroclaw_api::agent::TurnEvent;
+        use zeroclaw_api::local_file_diff::{LOCAL_FILE_DIFFS_ALLOWED, LocalFileDiff};
+        use zeroclaw_config::autonomy::AutonomyLevel;
+        use zeroclaw_config::schema::RiskProfileConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        std::fs::write(workspace.join("note.txt"), previous).unwrap();
+        assert!(LocalFileDiff::new(previous.into(), written.into()).is_some());
+        let security = Arc::new(crate::security::SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            ..crate::security::SecurityPolicy::default()
+        });
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(FileWriteTool::new(security.clone())),
+            Box::new(FileReadTool::new(security)),
+        ];
+        let approval = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            auto_approve: vec!["file_read".into()],
+            ..RiskProfileConfig::default()
+        });
+        let observer = RecordingObserver::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let outcome = LOCAL_FILE_DIFFS_ALLOWED
+            .scope(
+                true,
+                execute_one_tool(
+                    "file_write",
+                    serde_json::json!({"path": "note.txt", "content": written}),
+                    Some("credential-write"),
+                    ToolDispatchContext {
+                        tools_registry: &tools,
+                        activated_tools: None,
+                        excluded_tools: &[],
+                        approval: Some(&approval),
+                        model_switch_callback: None,
+                    },
+                    &test_turn_meta(),
+                    &observer,
+                    None,
+                    None,
+                    Some(&tx),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.success, "{}", outcome.output);
+        assert!(outcome.error_reason.is_none());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
+            written
+        );
+        assert!(!outcome.output.contains("supersecretvalue"));
+        assert!(!observer.last_result().unwrap().contains("supersecretvalue"));
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, TurnEvent::LocalFileDiff { .. }));
+            events.push(event);
+        }
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], TurnEvent::ToolCall { id, .. } if id == "credential-write"));
+        assert!(matches!(
+            &events[1],
+            TurnEvent::ToolResult { id, output, .. }
+                if id == "credential-write"
+                    && output.contains("Before write: existing file")
+                    && !output.contains("supersecretvalue")
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_file_diff_executor_drops_previous_credentials() {
+        assert_local_file_diff_dropped_for_credentials(
+            "token=supersecretvalue\nunchanged\n",
+            "replacement\nunchanged\n",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn local_file_diff_executor_drops_written_credentials() {
+        assert_local_file_diff_dropped_for_credentials(
+            "previous\nunchanged\n",
+            "token=supersecretvalue\nunchanged\n",
+        )
+        .await;
+    }
+
+    struct CaptureProbeTool {
+        native: bool,
+        success: bool,
+        observed_capture: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for CaptureProbeTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "capture-probe"
+        }
+        fn tool_provenance(&self) -> zeroclaw_api::attribution::ToolProvenance {
+            if self.native {
+                zeroclaw_api::attribution::ToolProvenance::Native
+            } else {
+                zeroclaw_api::attribution::ToolProvenance::Extension
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CaptureProbeTool {
+        fn name(&self) -> &str {
+            "file_write"
+        }
+        fn description(&self) -> &str {
+            "Capture completion probe"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            if let Some(capture) = zeroclaw_api::local_file_diff::current_capture() {
+                self.observed_capture.store(true, Ordering::SeqCst);
+                capture.record("private-old-sentinel".into(), "replacement".into());
+            }
+            Ok(crate::tools::ToolResult {
+                success: self.success,
+                output: "ordinary result".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn local_file_diff_drops_failed_capture_and_masks_extension_invocations() {
+        use zeroclaw_api::local_file_diff::{
+            LOCAL_FILE_DIFF_CAPTURE, LOCAL_FILE_DIFFS_ALLOWED, LocalFileDiffCapture,
+        };
+        for native in [false, true] {
+            let observed_capture = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let tools: Vec<Box<dyn Tool>> = vec![
+                Box::new(CaptureProbeTool {
+                    native,
+                    success: false,
+                    observed_capture: observed_capture.clone(),
+                }),
+                Box::new(crate::tools::FileReadTool::new(Arc::new(
+                    crate::security::SecurityPolicy::default(),
+                ))),
+            ];
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let outer_capture = LocalFileDiffCapture::new();
+            let outcome = LOCAL_FILE_DIFFS_ALLOWED
+                .scope(
+                    true,
+                    LOCAL_FILE_DIFF_CAPTURE.scope(
+                        Some(outer_capture.clone()),
+                        execute_one_tool(
+                            "file_write",
+                            serde_json::json!({}),
+                            Some("probe-id"),
+                            ToolDispatchContext {
+                                tools_registry: &tools,
+                                activated_tools: None,
+                                excluded_tools: &[],
+                                approval: None,
+                                model_switch_callback: None,
+                            },
+                            &test_turn_meta(),
+                            &NoopObserver,
+                            None,
+                            None,
+                            Some(&tx),
+                        ),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert!(!outcome.success);
+            assert_eq!(observed_capture.load(Ordering::SeqCst), native);
+            assert!(outer_capture.take().is_none());
+            assert!(!outcome.output.contains("private-old-sentinel"));
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(
+                    event,
+                    zeroclaw_api::agent::TurnEvent::LocalFileDiff { .. }
+                ));
+            }
+        }
+    }
 
     /// Minimal tool that records invocations. Used to verify that the
     /// poisoned-lock recovery path still resolves an activated tool and
@@ -857,6 +1261,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -975,6 +1380,7 @@ mod tests {
                     activated_tools: Some(&activated),
                     excluded_tools: &excluded,
                     model_switch_callback: None,
+                    approval: None,
                 },
                 &meta,
                 &NoopObserver,
@@ -1035,6 +1441,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1175,6 +1582,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1225,6 +1633,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1319,6 +1728,7 @@ mod tests {
                     activated_tools: None,
                     excluded_tools: &[],
                     model_switch_callback: None,
+                    approval: None,
                 },
                 &meta,
                 &NoopObserver,
@@ -1414,6 +1824,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1499,6 +1910,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1572,6 +1984,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1697,6 +2110,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &observer,
@@ -1879,6 +2293,7 @@ mod tests {
                     activated_tools: None,
                     excluded_tools: &[],
                     model_switch_callback: None,
+                    approval: None,
                 },
                 &meta,
                 &observer,
@@ -1997,6 +2412,7 @@ mod tests {
                     activated_tools: None,
                     excluded_tools: &[],
                     model_switch_callback: None,
+                    approval: None,
                 },
                 &meta,
                 &observer,
@@ -2112,6 +2528,7 @@ mod tests {
                     activated_tools: None,
                     excluded_tools: &[],
                     model_switch_callback: None,
+                    approval: None,
                 },
                 &meta,
                 &NoopObserver,
@@ -2180,6 +2597,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -2226,6 +2644,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -2278,6 +2697,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -2712,6 +3132,7 @@ mod tests {
                 tools_registry: &registry,
                 activated_tools: None,
                 excluded_tools: &[],
+                approval: None,
                 model_switch_callback: None,
             },
             &meta,
@@ -2759,6 +3180,7 @@ mod tests {
                 tools_registry: &registry,
                 activated_tools: None,
                 excluded_tools: &[],
+                approval: None,
                 model_switch_callback: None,
             },
             &meta,
