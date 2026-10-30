@@ -184,6 +184,30 @@ model string. The fallback is per-token, so it should be the exception. Which
 providers sit in that fallback set is environment-specific; configure it in
 your own routing, not here.
 
+### Prompt cache affinity
+
+Cached input is priced below fresh input on OpenAI's published rates, and an
+agent turn re-sends the same system prompt and history on every tool iteration,
+so cache hits decide how far the included allowance goes. The Codex backend only
+reuses a cache reliably when a request says which conversation it belongs to.
+On the ChatGPT Codex backend ZeroClaw therefore sends a per-conversation key
+with every request made inside a conversation, as the `prompt_cache_key` body
+field and the `session-id` header. A custom `uri` endpoint receives neither.
+
+The key is derived from the session key with the install's secret key
+(`.secret_key`), so the channel and user identifiers a session key contains are
+not sent, and the backend cannot confirm a guessed session key against it. It is
+the same after a daemon restart and different on every install. An install with
+no secret key sends no key, and so do requests made outside a conversation, such
+as a cron job.
+
+To check it, look at `cached_input_tokens` beside `input_tokens` in the cost
+log (see [Cost tracking](../ops/cost-tracking.md)); the field is omitted when a
+call had no cache hit. Within one conversation, calls after the first normally
+show most of their input as cached. An idle gap, a prompt below the provider's
+minimum cacheable size, or a history trim that rewrites the prefix is a
+legitimate miss.
+
 ## Subscription tiers and limits
 
 ChatGPT tiers relevant to this slot (as of 2026-06). The "allowance" column is
