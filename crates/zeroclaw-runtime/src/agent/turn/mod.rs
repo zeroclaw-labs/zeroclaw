@@ -2774,6 +2774,7 @@ async fn run_tool_call_loop_impl<'a>(
             policy,
             iteration,
             use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
+            &iteration_tool_specs.known_tool_names,
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
