@@ -1118,6 +1118,13 @@ history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = 已超出历史轮次数量限制
 history-trim-reason-recovery = 上下文窗口溢出恢复
+# Context compaction: a model-written summary replaces the older turns.
+history-compaction-summary-header = [上下文摘要 — 之前的 { $turns } 轮对话（{ $messages } 条消息）已压缩为以下摘要]
+history-compaction-reason = 通过摘要压缩上下文
+history-compaction-done = 上下文已压缩：{ $turns } 轮早期对话已摘要（{ $before } → { $after } tokens）。
+history-compaction-failed = 上下文压缩失败：{ $error }
+history-compaction-disabled = 此代理的运行时配置未启用上下文压缩。
+history-compaction-nothing-to-do = 暂无可压缩内容：对话仍然很短。
 history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
 turn-ingress-dropped = 此请求未被处理：{ $reason }
 turn-tool-interrupted-before-result = [在此工具产生结果前被用户中断]

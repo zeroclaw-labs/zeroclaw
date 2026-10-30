@@ -136,3 +136,49 @@ Tool-result length limits are separate. `max_tool_result_chars` bounds an
 individual result when it is recorded; it does not trim conversation history.
 Provider-side context enforcement is also separate, though a provider overflow
 can trigger the runtime's reactive token-budget trim.
+
+## Context compaction
+
+Trimming drops older turns outright. Compaction replaces them with a summary
+the model writes, so the conversation keeps its meaning while the request
+shrinks. It is opt-in, and it composes with trimming instead of replacing it:
+compaction runs first, the whole-turn trim stays the fallback.
+
+```toml
+[runtime_profiles.<name>.context_compression]
+enabled = true
+# Fraction of the selected model's context window that triggers compaction.
+# 0.95 on a 1M window compacts at 950k provider-reported input tokens.
+threshold_ratio = 0.95
+# Whole turns never summarized, at the head and at the tail of the history.
+protect_first_n = 2
+protect_last_n = 4
+# Limits of the summarizing call itself.
+source_max_chars = 50000
+summary_max_chars = 4000
+timeout_secs = 60
+# "strict" keeps identifiers verbatim in the summarizer prompt.
+identifier_policy = "strict"
+```
+
+- The threshold is compared against the **provider-reported input token count
+  of the turn that just finished**: the same number the client's context meter
+  shows. Compaction therefore runs at the turn boundary, after the final
+  response, never while a request is in flight.
+- The summary replaces a range of **whole turns**: a tool call and its result
+  are always summarized or kept together.
+- The summary occupies the same protected head slot as the trim breadcrumb
+  (after the leading system messages), so a later trim never drops it, and a
+  later compaction folds it into the new summary instead of stacking summaries.
+- A failed or timed-out summary falls back to a truncated transcript and still
+  compacts; a summary that produces nothing leaves the history untouched.
+- The event the client sees is the existing `history_trimmed` one, with a
+  reason naming compaction, so ZeroCode's context meter and any dashboard
+  report the shrinkage the moment it happens.
+- `/compact` runs the same compaction immediately, whatever the threshold:
+  it is explicit user intent, so it also works with `enabled = false`. It is
+  answered by the runtime and never dispatched to the model as a prompt.
+
+Knobs with no runtime consumer (`summary_provider`, the deprecated
+`summary_model`, `tool_result_retrim_chars`, `tool_result_trim_exempt`) are
+reported by `zeroclaw doctor` as having no effect.

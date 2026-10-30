@@ -350,19 +350,29 @@ fn default_tool_result_retrim_chars() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
-    /// The runtime context compressor was removed; no runtime execution path
-    /// consumes this flag, so setting it to `true` currently has no effect.
-    /// Defaults to `false` to match actual runtime behavior;
-    /// `Config::collect_warnings` reads an explicit `true` only to report
-    /// `context_compression_unsupported`.
+    /// Master switch for automatic context compaction
+    /// (`crate::agent::context_compaction`): when the provider-reported input
+    /// tokens of a turn reach `threshold_ratio` of the model context window,
+    /// the older turns are replaced by a summary the model writes. Defaults
+    /// to `false`, so compaction is strictly opt-in. The manual `/compact`
+    /// command is explicit user intent and runs even with this flag off.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
+    /// Fraction of the selected model's context window at which automatic
+    /// compaction kicks in. Values outside `(0.0, 1.0]` fall back to the
+    /// default. `0.95` on a 1M window compacts at 950k tokens.
     #[serde(default = "default_threshold_ratio")]
     pub threshold_ratio: f64,
+    /// Whole conversation turns kept verbatim at the head of the history,
+    /// never summarized. The leading system prompt is always kept and does
+    /// not count here.
     #[serde(default = "default_protect_first_n")]
     pub protect_first_n: usize,
+    /// Whole conversation turns kept verbatim at the tail — the current work
+    /// — never summarized.
     #[serde(default = "default_protect_last_n")]
     pub protect_last_n: usize,
+    /// Unused: compaction runs a single summarizing pass per trigger.
     #[serde(default = "default_cc_max_passes")]
     pub max_passes: u32,
     #[serde(default = "default_summary_max_chars")]
@@ -987,11 +997,9 @@ mod tests {
         assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
     }
 
-    // The runtime context compressor was removed; nothing reads
-    // `context_compression` at runtime anymore, so the default must be
-    // `false` (a `true` default would mislead users into thinking the
-    // knob does something). See `context_compression_unsupported` in
-    // `schema.rs` for the companion validation warning.
+    // Automatic compaction is a behaviour change on every long session, so it
+    // stays opt-in: the default is `false`. A `true` default would silently
+    // summarize conversations for operators who never asked for it.
     #[test]
     fn context_compression_config_defaults_to_disabled() {
         assert!(!ContextCompressionConfig::default().enabled);

@@ -81,9 +81,12 @@ pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
 ///   config-load tracing) that need the diagnostic even when a config that
 ///   failed `validate()` is still allowed to boot.
 /// - `context_compression_unsupported`: a `runtime_profiles.<alias>.context_compression`
-///   knob (`enabled = true`, or any other field set to a non-default value)
-///   has no runtime consumer — the context compressor was removed —
-///   so it currently has no effect. One warning per non-default field (see
+///   knob that still has no runtime consumer (`summary_provider`,
+///   the deprecated `summary_model`, `tool_result_retrim_chars`,
+///   `tool_result_trim_exempt`) is set to a non-default value, so it has no
+///   effect. The compaction thresholds, turn protections and prompt limits ARE
+///   consumed by `crate::agent::context_compaction` and are never flagged.
+///   One warning per non-default field (see
 ///   `collect_context_compression_ignored_warnings` in `schema.rs`).
 /// - `proxy_conflicts_with_dns_pinned_tools`: the configured proxy scope
 ///   selects `http_request` and/or `web_fetch`, whose validated DNS answers

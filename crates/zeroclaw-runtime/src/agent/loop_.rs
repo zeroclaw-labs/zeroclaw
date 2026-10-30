@@ -2675,6 +2675,7 @@ pub async fn run(
                         println!("Available commands:");
                         println!("  /help             Show this help message");
                         println!("  /clear /new       Clear conversation history");
+                        println!("  /compact          Compact the conversation into a summary");
                         println!("  /quit /exit       Exit interactive mode");
                         println!(
                             "  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n"

@@ -109,7 +109,7 @@ pub(crate) fn trim_conversation_to_recent_turns(
     }
 }
 
-fn is_turn_boundary(msg: &ChatMessage) -> bool {
+pub(crate) fn is_turn_boundary(msg: &ChatMessage) -> bool {
     msg.role == "user"
         && !msg
             .content
