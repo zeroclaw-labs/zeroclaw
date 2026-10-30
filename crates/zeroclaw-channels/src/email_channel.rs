@@ -157,6 +157,23 @@ impl EmailChannel {
         }
     }
 
+    /// Why a message is automatic mail that must not get a reply (RFC 3834):
+    /// `Auto-Submitted` other than `no`, `Precedence: bulk|list|junk`, or a
+    /// mailing-list header. `None` for mail a person sent.
+    fn automatic_mail_reason(parsed: &mail_parser::Message) -> Option<&'static str> {
+        let header = |name: &'static str| parsed.header_raw(name).map(header_keyword);
+        if header("Auto-Submitted").is_some_and(|v| v != "no") {
+            return Some("auto_submitted");
+        }
+        if header("Precedence").is_some_and(|v| matches!(v.as_str(), "bulk" | "list" | "junk")) {
+            return Some("precedence");
+        }
+        if header("List-Id").is_some() || header("List-Unsubscribe").is_some() {
+            return Some("mailing_list");
+        }
+        None
+    }
+
     /// Extract readable text from a parsed email
     fn extract_text(parsed: &mail_parser::Message) -> String {
         if let Some(text) = parsed.body_text(0) {
@@ -406,6 +423,7 @@ impl EmailChannel {
             });
         let attachments = self.extract_attachments(parsed);
         ParsedEmail {
+            automatic: Self::automatic_mail_reason(parsed),
             msg_id,
             sender,
             reply_to,
@@ -779,11 +797,33 @@ impl EmailChannel {
         email: ParsedEmail,
         tx: &mpsc::Sender<ChannelMessage>,
     ) -> Result<bool> {
+        if let Some(reason) = email.automatic {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_attrs(::serde_json::json!({
+                        "channel": "email",
+                        "alias": self.alias,
+                        "sender": email.sender,
+                        "subject": email.subject,
+                        "reason": reason,
+                    })),
+                "Ignoring automatic email (RFC 3834)"
+            );
+            return Ok(true);
+        }
         if !self.is_sender_allowed(&email.sender) {
             ::zeroclaw_log::record!(
                 WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "channel": "email",
+                        "alias": self.alias,
+                        "sender": email.sender,
+                        "subject": email.subject,
+                        "reason": "not_allowlisted",
+                    })),
                 &format!("Blocked email from {}", email.sender)
             );
             return Ok(true);
@@ -946,6 +986,8 @@ impl EmailChannel {
 
 /// Internal struct for parsed email data
 struct ParsedEmail {
+    /// Set for automatic mail (see `automatic_mail_reason`), which is dropped.
+    automatic: Option<&'static str>,
     msg_id: String,
     sender: String,
     reply_to: Option<String>,
@@ -980,6 +1022,33 @@ fn markdown_to_html(md: &str) -> String {
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
     html_output
+}
+
+/// The keyword of a structured header value, lowercased: RFC 822 comments
+/// (nested, with quoted pairs) and whitespace removed, parameters after the
+/// first `;` dropped. `"No (by hand) ; x=1"` gives `"no"`.
+fn header_keyword(value: &str) -> String {
+    let mut keyword = String::new();
+    let mut depth = 0u32;
+    let mut escaped = false;
+    for c in value.chars() {
+        if depth > 0 {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+        } else if c == '(' {
+            depth = 1;
+        } else if c == ';' {
+            break;
+        } else if !c.is_whitespace() {
+            keyword.push(c.to_ascii_lowercase());
+        }
+    }
+    keyword
 }
 
 fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
@@ -1858,6 +1927,155 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.reply_target, "sender@example.invalid");
         assert!(msg.references.is_empty());
+    }
+
+    #[test]
+    fn automatic_mail_reason_flags_rfc3834_and_list_headers() {
+        let reason = |headers: &str| {
+            let raw = format!("From: a@example.invalid\r\n{headers}Subject: s\r\n\r\nbody");
+            let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
+            EmailChannel::automatic_mail_reason(&parsed)
+        };
+        assert_eq!(reason(""), None);
+        assert_eq!(reason("Auto-Submitted: no\r\n"), None);
+        assert_eq!(reason("Auto-Submitted: No ; comment\r\n"), None);
+        assert_eq!(
+            reason("Auto-Submitted: auto-replied\r\n"),
+            Some("auto_submitted")
+        );
+        assert_eq!(
+            reason("Auto-Submitted: auto-generated\r\n"),
+            Some("auto_submitted")
+        );
+        assert_eq!(reason("Precedence: Bulk\r\n"), Some("precedence"));
+        assert_eq!(reason("Precedence: junk\r\n"), Some("precedence"));
+        assert_eq!(reason("Precedence: first-class\r\n"), None);
+        assert_eq!(reason("Auto-Submitted: no (sent by a person)\r\n"), None);
+        assert_eq!(reason("Auto-Submitted: (a (nested) note) NO\r\n"), None);
+        assert_eq!(reason("Auto-Submitted: no (a \\) b)\r\n"), None);
+        assert_eq!(
+            reason("Auto-Submitted: auto-replied (vacation)\r\n"),
+            Some("auto_submitted")
+        );
+        assert_eq!(
+            reason("Precedence: bulk (newsletter)\r\n"),
+            Some("precedence")
+        );
+        assert_eq!(reason("Precedence: (x) List\r\n"), Some("precedence"));
+        assert_eq!(
+            reason("List-Id: <news.example.invalid>\r\n"),
+            Some("mailing_list")
+        );
+        assert_eq!(
+            reason("List-Unsubscribe: <mailto:u@example.invalid>\r\n"),
+            Some("mailing_list")
+        );
+    }
+
+    /// Dispatches `raw` with the given allowlist and returns whether a
+    /// message reached the agent plus the first log record whose message
+    /// contains `log_needle`.
+    #[allow(clippy::await_holding_lock)]
+    async fn dispatch_and_capture(
+        raw: &'static [u8],
+        peers: Vec<String>,
+        log_needle: &str,
+    ) -> (bool, Option<serde_json::Value>) {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            resolver_from(peers),
+        );
+        let parsed = parse_test_email(raw);
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+        let (tx, mut msg_rx) = mpsc::channel(1);
+        assert!(channel.dispatch_email(email, &tx).await.unwrap());
+        let delivered = msg_rx.try_recv().is_ok();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.contains(log_needle)) =>
+                {
+                    return (delivered, Some(value));
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                _ => {}
+            }
+        }
+        (delivered, None)
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_drops_automatic_mail_from_an_allowed_sender() {
+        let (delivered, record) = dispatch_and_capture(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Auto-Submitted: auto-replied\r\n\
+              Subject: Out of office\r\n\
+              \r\n\
+              away",
+            vec!["*".to_string()],
+            "Ignoring automatic email",
+        )
+        .await;
+
+        assert!(!delivered, "an auto-reply must not start a turn");
+        let record = record.expect("the drop must be logged");
+        assert_eq!(record["event"]["action"], "skip");
+        assert_eq!(record["attributes"]["reason"], "auto_submitted");
+        assert_eq!(record["attributes"]["channel"], "email");
+        assert_eq!(record["attributes"]["alias"], "email_test_alias");
+        assert_eq!(record["attributes"]["sender"], "sender@example.invalid");
+        assert_eq!(record["attributes"]["subject"], "Out of office");
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_delivers_mail_a_person_sent() {
+        let (delivered, record) = dispatch_and_capture(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Auto-Submitted: no\r\n\
+              Subject: Question\r\n\
+              \r\n\
+              hello",
+            vec!["*".to_string()],
+            "Ignoring automatic email",
+        )
+        .await;
+
+        assert!(delivered);
+        assert!(record.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_email_rejects_blocked_sender_with_structured_attrs() {
+        let (delivered, record) = dispatch_and_capture(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Subject: Hello\r\n\
+              \r\n\
+              hi",
+            vec!["@allowed.example.invalid".to_string()],
+            "Blocked email from",
+        )
+        .await;
+
+        assert!(!delivered);
+        let record = record.expect("the rejection must be logged");
+        assert_eq!(record["event"]["action"], "reject");
+        assert_eq!(record["attributes"]["reason"], "not_allowlisted");
+        assert_eq!(record["attributes"]["channel"], "email");
+        assert_eq!(record["attributes"]["alias"], "email_test_alias");
+        assert_eq!(record["attributes"]["sender"], "sender@example.invalid");
+        assert_eq!(record["attributes"]["subject"], "Hello");
     }
 
     #[test]
