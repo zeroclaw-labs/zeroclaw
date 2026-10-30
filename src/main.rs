@@ -3220,6 +3220,33 @@ fn alias_create_refusal(error: zeroclaw_config::alias_refs::CreateError) -> anyh
     }
 }
 
+/// A refused `config patch` op's reason as the operator reads it, in the
+/// selected language and worded as `config set` and `config init` word the
+/// same refusals: an alias an unfinished rename retired names the rename that
+/// frees it.
+#[cfg(feature = "agent-runtime")]
+fn vivify_refusal_message(refusal: &zeroclaw_config::schema::VivifyRefusal) -> String {
+    use zeroclaw_config::schema::VivifyRefusal;
+    match refusal {
+        VivifyRefusal::Reserved => t(
+            "cli-alias-create-reserved-default",
+            "the `default` agent is reserved and cannot be created",
+        ),
+        VivifyRefusal::Retired { alias, pending_to } => ta(
+            "cli-alias-create-retired",
+            &[("alias", alias), ("to", pending_to)],
+            format!(
+                "alias `{alias}` is retired by an unfinished rename to `{pending_to}`; run `zeroclaw agents rename {alias} {pending_to}` first"
+            ),
+        ),
+        VivifyRefusal::RecoveryUnreadable(detail) => ta(
+            "cli-alias-recovery-unreadable",
+            &[("error", detail)],
+            format!("agent lifecycle recovery journal could not be read: {detail}"),
+        ),
+    }
+}
+
 /// Dirty every generated leaf under a newly created map alias so required
 /// default-valued fields survive the incremental writer's empty-leaf pruning.
 #[cfg(feature = "agent-runtime")]
@@ -13375,7 +13402,18 @@ Add pricing to the active provider profile or supply a catalog entry."
                         let err = ConfigApiError::new(code, refusal.to_string())
                             .with_path(&path)
                             .with_op_index(idx);
-                        let human = format!("op[{idx}] `{op_name}` on `{path}`: {refusal}");
+                        let index = idx.to_string();
+                        let reason = vivify_refusal_message(&refusal);
+                        let human = ta(
+                            "cli-config-patch-op-refused",
+                            &[
+                                ("index", &index),
+                                ("op", op_name),
+                                ("path", &path),
+                                ("reason", &reason),
+                            ],
+                            format!("op[{idx}] `{op_name}` on `{path}`: {reason}"),
+                        );
                         config_patch_fail_json_or_human(json, err, human)?;
                     }
                     let comment = match object.get("comment") {
@@ -25508,6 +25546,43 @@ hosts = ["irc.example.net"]
         assert!(
             rendered.contains(&hostile.escape_debug().to_string()) && !rendered.contains('\u{1b}'),
             "the owner reaches the terminal escaped: {rendered:?}"
+        );
+    }
+
+    /// A refused `config patch` op reads as `config set` reads the same
+    /// refusal, through the CLI catalog: a retired alias names the rename to
+    /// re-run, and an unreadable journal carries its reason.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_patch_refusals_render_through_the_cli_catalog() {
+        use zeroclaw_config::schema::VivifyRefusal;
+        assert_eq!(
+            vivify_refusal_message(&VivifyRefusal::Retired {
+                alias: "scout".into(),
+                pending_to: "ranger".into(),
+            }),
+            "alias `scout` is retired by an unfinished rename to `ranger`; run `zeroclaw agents rename scout ranger` first"
+        );
+        assert_eq!(
+            vivify_refusal_message(&VivifyRefusal::RecoveryUnreadable("bad json".into())),
+            "agent lifecycle recovery journal could not be read: bad json"
+        );
+        assert_eq!(
+            vivify_refusal_message(&VivifyRefusal::Reserved),
+            "the `default` agent is reserved and cannot be created"
+        );
+        assert_eq!(
+            ta(
+                "cli-config-patch-op-refused",
+                &[
+                    ("index", "2"),
+                    ("op", "add"),
+                    ("path", "agents.scout"),
+                    ("reason", "refused"),
+                ],
+                "unused fallback",
+            ),
+            "op[2] `add` on `agents.scout`: refused"
         );
     }
 
