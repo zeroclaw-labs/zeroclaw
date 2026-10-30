@@ -2208,6 +2208,9 @@ fn all_tools_with_runtime_on_thread(
             // that a blank override was meant to suppress.
             .with_keenable_api_key_override(WebSearchTool::keenable_api_key_override(
                 root_config,
+            ))
+            .with_firecrawl_api_key_override(WebSearchTool::firecrawl_api_key_override(
+                root_config,
             )),
                 security.clone(),
             ))
