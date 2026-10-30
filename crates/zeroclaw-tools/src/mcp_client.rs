@@ -423,7 +423,7 @@ impl McpServer {
     /// This reads transport-owned atomic connection state and does not acquire
     /// the async server metadata lock.
     pub fn health_check(&self) -> bool {
-        self.transport.health_check()
+        !self.recovery.is_poisoned() && self.transport.health_check()
     }
 
     /// Identity comparison on the underlying transport handle. Two
@@ -2013,6 +2013,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poisoned_recovery_is_reported_as_unhealthy_to_registry() {
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FakeTransport {
+            result: json!({"ok": true}),
+        });
+        let server = server_with_transport("poisoned", transport, 5);
+        assert!(server.health_check());
+        server.recovery.arm(0);
+        server.recovery.poison();
+        assert!(!server.health_check());
+    }
+
+    #[tokio::test]
     async fn recovery_surfaces_reset_and_cleanup_failures() {
         let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FailedResetTransport);
         let server = server_with_transport("broken", transport, 5);
@@ -2291,6 +2303,49 @@ mod tests {
             "expected fail-closed error, got: {detail}"
         );
         // Only the first (cancelled) call ever wrote a tool request.
+        assert_eq!(tool_writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn poisoned_http_recovery_is_evicted_without_replaying_unknown_tool() {
+        let tool_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FailedRehandshakeTransport {
+            tool_writes: Arc::clone(&tool_writes),
+            first_entered: Arc::clone(&first_entered),
+        });
+        let server = server_with_serialized_transport("flaky", transport, 5);
+        let mut registry = McpRegistry {
+            servers: vec![server.clone()],
+            tool_index: HashMap::from([(
+                "flaky__side_effect".to_string(),
+                (0usize, "side_effect".to_string()),
+            )]),
+            server_index: HashMap::from([("flaky".to_string(), 0usize)]),
+        };
+
+        let first_server = server.clone();
+        let call = zeroclaw_spawn::spawn!(async move {
+            first_server.call_tool("side_effect", json!({})).await
+        });
+        first_entered.notified().await;
+        call.abort();
+        let _ = call.await;
+
+        // The failed background handshake must be visible to registry health
+        // even when the remote transport's own health_check still returns true.
+        timeout(Duration::from_secs(3), async {
+            while registry.health_check_all().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed recovery must be reported unhealthy");
+
+        assert_eq!(registry.health_check_all(), vec!["flaky"]);
+        assert_eq!(tool_writes.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.kill_dead_connections().await, vec!["flaky"]);
+        assert!(registry.is_empty());
         assert_eq!(tool_writes.load(Ordering::SeqCst), 1);
     }
 

@@ -169,24 +169,14 @@ fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
 /// The optional server-specific CA is additive: system/default roots remain
 /// enabled, and normal chain and hostname verification stay in force.
 fn build_remote_http_client(config: &McpServerConfig) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
+    // A remote MCP POST may execute a side effect before a 307/308 redirect.
+    // If following that redirect then fails to connect, reqwest reports a
+    // connect error even though the first server already received the POST.
+    // Do not automatically follow redirects for MCP transports: the original
+    // response is handled as an HTTP status, never by replaying the body.
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
 
     if let Some(path) = config.tls_ca_cert_path.as_deref() {
-        let server_name = config.name.clone();
-        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= 10 {
-                attempt.error(std::io::Error::other(format!(
-                    "MCP server `{server_name}`: too many redirects"
-                )))
-            } else if attempt.url().scheme() == "https" {
-                attempt.follow()
-            } else {
-                attempt.error(std::io::Error::other(format!(
-                    "MCP server `{server_name}`: tls_ca_cert_path forbids redirecting to plaintext"
-                )))
-            }
-        }));
-
         if !std::path::Path::new(path).is_absolute() {
             bail!(
                 "MCP server `{}`: TLS CA certificate path must be absolute: `{}`",
@@ -309,6 +299,12 @@ impl McpRequestLifecycle {
     pub(crate) fn mark_outcome_unknown(&self, epoch: u64) {
         self.epoch.store(epoch, Ordering::Release);
         self.phase.store(REQUEST_OUTCOME_UNKNOWN, Ordering::Release);
+    }
+
+    /// A connect-stage error proves the server did not receive the request.
+    /// Restore the pre-write classification so the client can safely retry.
+    fn mark_connect_failed(&self) {
+        self.phase.store(REQUEST_PRE_WRITE, Ordering::Release);
     }
 
     fn mark_completed(&self) {
@@ -1254,10 +1250,14 @@ impl SharedMcpTransportConn for HttpTransport {
         let epoch_guard = lifecycle.begin_write().await;
         req = self.apply_session_header(req);
         lifecycle.mark_outcome_unknown(epoch_guard.epoch());
-        let resp = req
-            .send()
-            .await
-            .context("HTTP request to MCP server failed")?;
+        let resp = req.send().await.map_err(|error| {
+            if error.is_connect() {
+                lifecycle.mark_connect_failed();
+                return anyhow::Error::new(McpTransportError::TransportClosed)
+                    .context("HTTP request to MCP server failed");
+            }
+            anyhow::Error::new(error).context("HTTP request to MCP server failed")
+        })?;
         drop(epoch_guard);
 
         if !resp.status().is_success() {
@@ -2028,7 +2028,14 @@ impl SharedMcpTransportConn for SseTransport {
         }
 
         lifecycle.mark_outcome_unknown(epoch_guard.epoch());
-        let resp = req.send().await.context("SSE POST to MCP server failed")?;
+        let resp = req.send().await.map_err(|error| {
+            if error.is_connect() {
+                lifecycle.mark_connect_failed();
+                return anyhow::Error::new(McpTransportError::TransportClosed)
+                    .context("SSE POST to MCP server failed");
+            }
+            anyhow::Error::new(error).context("SSE POST to MCP server failed")
+        })?;
         let status = resp.status();
         let mut got_direct = None;
 
@@ -2937,6 +2944,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_post_redirect_is_not_followed_or_replayed() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("Location", "http://127.0.0.1:1/replay"),
+            )
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "no-replay".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let request = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("redirected tool POST must not be automatically resent");
+
+        assert!(error.to_string().contains("HTTP 307"), "{error}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(lifecycle.outcome_unknown_epoch().is_none());
+        assert!(lifecycle.pre_write_epoch().is_none());
+    }
+
+    #[tokio::test]
     async fn private_ca_http_fails_unset_and_succeeds_with_matching_ca() {
         let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
 
@@ -3053,9 +3092,8 @@ mod tests {
             .await
             .expect_err("HTTPS-to-HTTP redirect must be rejected");
         assert!(
-            error
-                .to_string()
-                .contains("HTTP request to MCP server failed")
+            error.to_string().contains("HTTP 302"),
+            "the original redirect must be rejected without resending: {error}"
         );
         server.task.await.unwrap();
         assert!(
