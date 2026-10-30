@@ -3842,6 +3842,11 @@ fn system_prompt_for_channel_turn(
     }
 }
 
+/// Heading that opens the text tool-call instructions appended after the
+/// base builder at startup (`build_tool_instructions_for_names`). The channel
+/// turn path never re-adds them, so they must survive every re-cap.
+const TEXT_TOOL_PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
+
 /// Re-apply the agent's `max_system_prompt_chars` budget to a channel system
 /// prompt that was modified after its startup-time finalization.
 ///
@@ -3853,11 +3858,27 @@ fn system_prompt_for_channel_turn(
 /// established sessions kept using the in-cap cached prompt.
 /// `finalize_system_prompt` is a no-op when the prompt already fits and treats
 /// `max_chars == 0` as unlimited, so the established-session path is unchanged.
+///
+/// A plain head-retaining cap can land inside the startup-appended text
+/// tool-call instructions when a refreshed skill section grows the prompt past
+/// the budget, and nothing on the channel path restores them before the
+/// request reaches a non-native-spec provider. The tail from the last tool
+/// protocol heading (the instructions, plus the per-channel signal and peer
+/// map that follow them) is therefore reserved before capping — the same
+/// mechanism `finalize_base_reserving_additions` uses at startup. When the
+/// tail alone meets the cap no reservation can help and the previous
+/// full-budget cap applies.
 fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -> String {
-    zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(
-        prompt,
-        ctx.agent_cfg.resolved.max_system_prompt_chars,
-    )
+    let max_chars = ctx.agent_cfg.resolved.max_system_prompt_chars;
+    if max_chars > 0
+        && let Some(start) = prompt.rfind(TEXT_TOOL_PROTOCOL_HEADER)
+    {
+        let (head, tail) = prompt.split_at(start);
+        if tail.chars().count() < max_chars {
+            return finalize_base_reserving_additions(head.to_string(), tail, max_chars);
+        }
+    }
+    zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(prompt, max_chars)
 }
 
 /// Finalize `base_prompt` against `max_system_prompt_chars` with enough budget
@@ -3910,13 +3931,12 @@ fn channel_tool_available_for_turn(
 }
 
 fn text_tool_protocol_advertised(system_prompt: &str) -> bool {
-    const PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
     const TOOLS_HEADER: &str = "### Available Tools\n\n";
 
-    let Some(protocol_start) = system_prompt.rfind(PROTOCOL_HEADER) else {
+    let Some(protocol_start) = system_prompt.rfind(TEXT_TOOL_PROTOCOL_HEADER) else {
         return false;
     };
-    let protocol = &system_prompt[protocol_start + PROTOCOL_HEADER.len()..];
+    let protocol = &system_prompt[protocol_start + TEXT_TOOL_PROTOCOL_HEADER.len()..];
     let Some(tools_start) = protocol.find(TOOLS_HEADER) else {
         return false;
     };
@@ -47391,9 +47411,16 @@ BTC is currently around $65,000 based on latest tool output."#
 
         // Startup state: no skills on disk yet, so the cached prompt is built
         // under the cap and finalized once, exactly like a running daemon.
+        // The provider is a non-native-spec capture mock with strict tool
+        // parsing disabled and no deferred built-ins, so the startup path
+        // appends the text tool-call instructions after the base builder and
+        // caps the base with their length reserved — the exact production
+        // shape this test guards.
+        let raw_tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("read_skill"))];
+        let effective_tool_names: HashSet<&str> = HashSet::from(["read_skill"]);
         let initial_skills =
             zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
-        let initial_system_prompt = build_system_prompt_with_mode_and_effective_tools(
+        let startup_base_prompt = build_system_prompt_with_mode_and_effective_tools(
             workspace.path(),
             "test-model",
             &[],
@@ -47410,9 +47437,21 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             None,
         );
+        let startup_additions =
+            build_tool_instructions_for_names(&raw_tools, &effective_tool_names);
+        assert!(
+            !startup_additions.is_empty(),
+            "scenario setup: the startup additions must carry the text tool protocol"
+        );
+        let initial_system_prompt =
+            finalize_base_reserving_additions(startup_base_prompt, &startup_additions, PROMPT_CAP);
         assert!(
             initial_system_prompt.chars().count() <= PROMPT_CAP,
             "startup prompt must respect the cap"
+        );
+        assert!(
+            text_tool_protocol_advertised(&initial_system_prompt),
+            "startup prompt must advertise the complete text tool protocol"
         );
         assert_eq!(
             initial_system_prompt
@@ -47459,6 +47498,7 @@ BTC is currently around $65,000 based on latest tool output."#
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig {
                 resolved: zeroclaw_config::schema::ResolvedRuntime {
                     max_system_prompt_chars: PROMPT_CAP,
+                    strict_tool_parsing: false,
                     ..zeroclaw_config::schema::ResolvedRuntime::default()
                 },
                 ..zeroclaw_config::schema::AliasedAgentConfig::default()
@@ -47472,9 +47512,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ),
             ),
             tools_registry: Arc::new(
-                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
-                    Box::new(NamedMockTool("read_skill")),
-                ]),
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(raw_tools),
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(initial_system_prompt),
@@ -47582,6 +47620,14 @@ BTC is currently around $65,000 based on latest tool output."#
             "provider-switch refresh must re-apply the prompt cap; got {} chars",
             switched_prompt.chars().count()
         );
+        assert!(
+            text_tool_protocol_advertised(switched_prompt),
+            "the provider-switch re-cap must retain the complete text tool protocol"
+        );
+        assert!(
+            switched_prompt.contains("**read_skill**"),
+            "the provider-switch re-cap must retain the whole tool listing"
+        );
         assert_eq!(
             switched_prompt
                 .matches("This is an interactive conversation with a user")
@@ -47629,6 +47675,14 @@ BTC is currently around $65,000 based on latest tool output."#
             "system prompt delivered to the provider ({} chars) must respect the \
              {PROMPT_CAP}-char cap after the skill refresh splice",
             delivered_prompt.chars().count()
+        );
+        assert!(
+            text_tool_protocol_advertised(delivered_prompt),
+            "the turn-time re-cap must retain the complete text tool protocol"
+        );
+        assert!(
+            delivered_prompt.contains("**read_skill**"),
+            "the turn-time re-cap must retain the whole tool listing"
         );
         assert_eq!(
             delivered_prompt
