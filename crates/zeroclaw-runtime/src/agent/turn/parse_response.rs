@@ -126,7 +126,8 @@ pub(crate) struct InterpretedResponse {
 
 /// Recover double-encoded structured arguments without interpreting free text.
 /// This is intentionally not a schema validator: opaque or composed schemas
-/// leave the value unchanged for the tool's normal validation path.
+/// leave the value unchanged for the tool's normal validation path. Conditional
+/// schemas permit decoding their explicit type, but not traversing children.
 fn recover_structured_arguments(
     value: &mut serde_json::Value,
     schema: &serde_json::Value,
@@ -135,19 +136,9 @@ fn recover_structured_arguments(
     use serde_json::Value;
 
     if depth >= 64
-        || [
-            "$ref",
-            "$dynamicRef",
-            "allOf",
-            "anyOf",
-            "oneOf",
-            "not",
-            "if",
-            "then",
-            "else",
-        ]
-        .iter()
-        .any(|key| schema.get(*key).is_some())
+        || ["$ref", "$dynamicRef", "allOf", "anyOf", "oneOf", "not"]
+            .iter()
+            .any(|key| schema.get(*key).is_some())
     {
         return;
     }
@@ -166,6 +157,13 @@ fn recover_structured_arguments(
             return;
         }
         *value = parsed;
+    }
+    // The root type remains unambiguous, but conditional child types may differ.
+    if ["if", "then", "else"]
+        .iter()
+        .any(|key| schema.get(*key).is_some())
+    {
+        return;
     }
     match (kind, value) {
         ("object", Value::Object(fields)) => {
@@ -574,7 +572,7 @@ mod tests {
 #[cfg(test)]
 mod argument_preservation_tests {
     use super::*;
-    use crate::tools::{FileWriteTool, Tool, ToolSpec};
+    use crate::tools::{FileWriteTool, ModelRoutingConfigTool, Tool, ToolSpec};
     use serde_json::{Value, json};
     use std::{collections::HashSet, sync::Arc};
     use zeroclaw_config::{autonomy::AutonomyLevel, policy::SecurityPolicy};
@@ -802,6 +800,80 @@ mod argument_preservation_tests {
         );
         assert_eq!(recovered["action"], "upsert");
         assert_eq!(recovered["label"], "Site web");
+    }
+
+    #[tokio::test]
+    async fn conditional_routing_arguments_preserve_action_and_save_route() {
+        let expected = json!({
+            "action": "upsert_scenario",
+            "hint": "coding",
+            "model_provider": "openai",
+            "model": "test-model"
+        });
+        for native in [true, false] {
+            let workspace = tempfile::tempdir().unwrap();
+            let config = zeroclaw_config::schema::Config {
+                config_path: workspace.path().join("config.toml"),
+                data_dir: workspace.path().join("data"),
+                ..zeroclaw_config::schema::Config::default()
+            };
+            config.save().await.unwrap();
+            let tool = ModelRoutingConfigTool::new(
+                Arc::new(config.clone()),
+                Arc::new(SecurityPolicy {
+                    autonomy: AutonomyLevel::Supervised,
+                    workspace_dir: workspace.path().to_owned(),
+                    ..SecurityPolicy::default()
+                }),
+            );
+            let encoded = json!(expected.to_string());
+            // Fallback parsing consumes one layer before runtime recovery.
+            let arguments = if native {
+                encoded
+            } else {
+                json!(encoded.to_string())
+            };
+            let interpreted = interpret(tool.spec(), arguments, native, true).await;
+            assert!(!interpreted.parse_issue_detected);
+            assert_eq!(interpreted.tool_calls.len(), 1);
+            let call = &interpreted.tool_calls[0];
+            assert_eq!(call.arguments, expected, "native: {native}");
+            let result = tool.execute(call.arguments.clone()).await.unwrap();
+            assert!(result.success, "{:?}", result.error);
+            let saved = zeroclaw_config::migration::migrate_to_current(
+                &std::fs::read_to_string(&config.config_path).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved.model_routes.len(), 1);
+            let route = &saved.model_routes[0];
+            assert_eq!(route.hint, "coding");
+            assert_eq!(route.model_provider, "openai");
+            assert_eq!(route.model, "test-model");
+        }
+    }
+
+    #[test]
+    fn conditional_recovery_decodes_outer_type_without_traversing_children() {
+        for keyword in ["if", "then", "else"] {
+            for (mut schema, expected) in [
+                (
+                    json!({"type":"object", "properties":{"child":{"type":"object"}}}),
+                    json!({"child":"{\"x\":1}"}),
+                ),
+                (
+                    json!({"type":"array", "items":{"type":"object"}}),
+                    json!(["{\"x\":1}"]),
+                ),
+            ] {
+                schema[keyword] = json!({});
+                let mut encoded = json!(expected.to_string());
+                recover_structured_arguments(&mut encoded, &schema, 0);
+                assert_eq!(encoded, expected, "schema: {schema}");
+                let mut structured = expected.clone();
+                recover_structured_arguments(&mut structured, &schema, 0);
+                assert_eq!(structured, expected, "schema: {schema}");
+            }
+        }
     }
 
     #[test]
