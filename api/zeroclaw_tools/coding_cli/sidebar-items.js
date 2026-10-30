@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CodingCliExecutionError"],"fn":["add_safe_env","host_native_program","host_native_program_for_command"],"struct":["CodingCliCommand","DirectCodingCliExecutor"],"trait":["CodingCliExecutor"]};

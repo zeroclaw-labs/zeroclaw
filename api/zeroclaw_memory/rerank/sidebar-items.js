@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_CANDIDATE_POOL"],"enum":["RerankStrategy"],"fn":["bounded_final_limit","bounded_pool_cap","collapse_exact_and_near_duplicates","run"],"struct":["RerankConfig"]};

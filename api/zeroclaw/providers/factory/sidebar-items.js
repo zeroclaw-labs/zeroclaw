@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ProviderEndpoint"],"fn":["apply_compat_options","dispatch_family_factory","endpoint_for_family","family_model_context_catalog_auth","get_default_url"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SOP_STORE_VERSION"],"enum":["ProposalKind","ProposalStatus"],"struct":["ClaimToken","PersistedRun","ProposalRecord","RetentionPolicy","SopEventRecord"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["GoalBlockerKind","GoalPauseReason","TaskContinuationConversationScope"],"struct":["GoalBlocker","GoalPauseState","GoalTaskRecord","TaskContinuationContext","TaskGoal"],"trait":["GoalTaskRegistry"]};
