@@ -415,6 +415,8 @@ channel-discord-delivery-failure-note-one = （注意：我无法传送 {$count}
 channel-discord-delivery-failure-note-many = （注意：我无法传送 {$count} 个文件。）
 channel-whatsapp-web-delivery-failure-note-one = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
 channel-whatsapp-web-delivery-failure-note-many = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
+channel-signal-delivery-failure-note-one = （注意：我无法传送 {$count} 个文件。）
+channel-signal-delivery-failure-note-many = （注意：我无法传送 {$count} 个文件。）
 channel-line-bind-success = ✅ 已配对！现在可以聊天了。
 channel-line-bind-invalid-code = ❌ 代码无效。请重试。
 channel-line-bind-rate-limited = ⏳ 尝试次数过多。请在 { $secs }s 后重试。
@@ -452,6 +454,7 @@ cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = 未设置（使用自动检测）
 cli-self-test-web-dist-dir-pass-literal = {$path}（字面路径）
 cli-self-test-web-dist-dir-fail-expansion = 警告：{$path} — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
+cli-self-test-gateway-not-in-build = 未包含在此构建中（仅 CLI）
 cli-service-systemd-linger-disabled-warning = systemd 用户 linger 已禁用。ZeroClaw 的用户服务可能会在注销后停止。启用命令：loginctl enable-linger {$user}
 cli-peripherals-none = 未配置外设。
 cli-peripherals-add-hint = 使用以下命令添加: zeroclaw peripheral add <board> <path>
@@ -1050,6 +1053,9 @@ cli-plugin-info-load-failed =
     请使用此主机附带的 WIT（参见 wit/v0）重新构建插件并重新安装。
 cli-plugin-info-load-not-applicable = 加载：不适用。这是仅技能插件，没有可实例化的组件。
 cli-plugin-info-load-failed-exit = 插件“{$name}”无法在此主机上加载
+cli-plugin-info-load-config-refused =
+    加载：不可以。该组件能在此主机的 WIT 世界中实例化，但运行时拒绝了它的配置：{$error}
+    该配置是名为“{$key}”的 [[plugins.entries]] 行的 `config` 映射。请使其符合已安装软件包的 config_schema；如果软件包未声明 config_schema，请删除其中的值。
 cli-estop-domains-none = {"  "}domain_blocks:  （无）
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    （无）
