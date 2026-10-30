@@ -582,11 +582,11 @@ use zeroclaw_config::schema::{
     OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
     OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
     QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
-    ZerorouterModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StandardComputeModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -660,6 +660,14 @@ impl CompatFamilySpec for AtlasCloudModelProviderConfig {
     const DISPLAY: &'static str = "Atlas Cloud";
     const DEFAULT_URL: &'static str = "https://api.atlascloud.ai/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
+}
+impl CompatFamilySpec for StandardComputeModelProviderConfig {
+    const DISPLAY: &'static str = "Standard Compute";
+    const DEFAULT_URL: &'static str = "https://api.stdcmpt.com/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = Some("standardcompute");
+    // `GET /v1/models` is served without a key.
     const PUBLIC_MODEL_LISTING: bool = true;
 }
 impl CompatFamilySpec for ZerorouterModelProviderConfig {
@@ -2489,6 +2497,21 @@ mod tests {
         assert_eq!(
             get_default_url("atlascloud"),
             Some("https://api.atlascloud.ai/v1")
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn standardcompute_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{ModelEndpoint, StandardComputeEndpoint};
+        assert_eq!(
+            <StandardComputeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            StandardComputeEndpoint::default().uri(),
+            "schema StandardComputeEndpoint and factory DEFAULT_URL disagree"
+        );
+        assert_eq!(
+            get_default_url("standardcompute"),
+            Some("https://api.stdcmpt.com/v1")
         );
     }
 
