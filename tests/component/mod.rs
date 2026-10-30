@@ -7,6 +7,8 @@ mod acp_session_cwd_stdio;
 mod agents_export_cli;
 #[cfg(feature = "agent-runtime")]
 mod agents_rename_recovery_cli;
+#[cfg(all(feature = "agent-runtime", not(feature = "gateway")))]
+mod cli_only_build;
 #[cfg(feature = "agent-runtime")]
 mod config_dir_locale_regression;
 mod config_patch_cli;
@@ -19,10 +21,11 @@ mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
 mod degraded_config_remediation;
-#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+#[cfg(all(feature = "agent-runtime", feature = "gateway", target_os = "linux"))]
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
+#[cfg(feature = "gateway")]
 mod gateway;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
@@ -39,6 +42,7 @@ mod security;
 mod skills_bundle_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
+#[cfg(feature = "gateway")]
 mod whatsapp_webhook_security;
 
 #[cfg(feature = "plugins-wasm")]

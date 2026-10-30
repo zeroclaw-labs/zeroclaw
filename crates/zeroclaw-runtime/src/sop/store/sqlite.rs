@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::model::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SopEventRecord,
@@ -88,6 +88,31 @@ fn guard_revision(
     Ok(())
 }
 
+/// Begin a run write. IMMEDIATE takes the database write lock before the
+/// guard reads the stored row, so another connection (a second engine over
+/// the same file) cannot commit between the guard and the write.
+fn write_transaction(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>, StoreError> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(sql_err)
+}
+
+/// A terminal row is final: an active write never reopens it, and a terminal
+/// write is accepted only as a byte-identical retry.
+fn guard_terminal(
+    run_id: &str,
+    stored_terminal: bool,
+    stored_json: &str,
+    incoming_json: &str,
+    finishing: bool,
+) -> Result<(), StoreError> {
+    if stored_terminal && !(finishing && stored_json == incoming_json) {
+        return Err(StoreError::TerminalRun {
+            run_id: run_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Durable run store. Selected by `build_run_store` when `persist_runs = true`
 /// with the default `"sqlite"` backend.
 pub struct SqliteRunStore {
@@ -123,21 +148,23 @@ impl SqliteRunStore {
 
 impl SopRunStore for SqliteRunStore {
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
-        let g = self.lock()?;
+        let mut g = self.lock()?;
         let id = run.run_id();
         let json = serde_json::to_string(run)?;
-        let existing: Option<(i64, String)> = g
+        let tx = write_transaction(&mut g)?;
+        let existing: Option<(i64, String, bool)> = tx
             .query_row(
-                "SELECT revision, json FROM sop_runs WHERE run_id=?1",
+                "SELECT revision, json, terminal FROM sop_runs WHERE run_id=?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some((rev, existing_json)) = existing {
+        if let Some((rev, existing_json, terminal)) = existing {
+            guard_terminal(id, terminal, &existing_json, &json, false)?;
             guard_revision(id, rev as u64, &existing_json, run.revision, &json)?;
         }
-        g.execute(
+        tx.execute(
             "INSERT INTO sop_runs (run_id, revision, terminal, last_progress_at, json)
              VALUES (?1, ?2, 0, ?3, ?4)
              ON CONFLICT(run_id) DO UPDATE SET
@@ -148,6 +175,7 @@ impl SopRunStore for SqliteRunStore {
             params![id, run.revision as i64, run.last_progress_at, json],
         )
         .map_err(sql_err)?;
+        tx.commit().map_err(sql_err)?;
         Ok(())
     }
 
@@ -159,7 +187,7 @@ impl SopRunStore for SqliteRunStore {
         let mut g = self.lock()?;
         let id = run.run_id();
         let json = serde_json::to_string(run)?;
-        let tx = g.transaction().map_err(sql_err)?;
+        let tx = write_transaction(&mut g)?;
 
         if max_pending > 0 {
             let pending = {
@@ -182,15 +210,16 @@ impl SopRunStore for SqliteRunStore {
             }
         }
 
-        let existing: Option<(i64, String)> = tx
+        let existing: Option<(i64, String, bool)> = tx
             .query_row(
-                "SELECT revision, json FROM sop_runs WHERE run_id=?1",
+                "SELECT revision, json, terminal FROM sop_runs WHERE run_id=?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some((rev, existing_json)) = existing {
+        if let Some((rev, existing_json, terminal)) = existing {
+            guard_terminal(id, terminal, &existing_json, &json, false)?;
             guard_revision(id, rev as u64, &existing_json, run.revision, &json)?;
         }
         tx.execute(
@@ -217,16 +246,17 @@ impl SopRunStore for SqliteRunStore {
         let id = run.run_id();
         let json = serde_json::to_string(run)?;
         let payload = serde_json::to_string(&ev.payload)?;
-        let tx = g.transaction().map_err(sql_err)?;
-        let existing: Option<(i64, String)> = tx
+        let tx = write_transaction(&mut g)?;
+        let existing: Option<(i64, String, bool)> = tx
             .query_row(
-                "SELECT revision, json FROM sop_runs WHERE run_id=?1",
+                "SELECT revision, json, terminal FROM sop_runs WHERE run_id=?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some((rev, existing_json)) = existing {
+        if let Some((rev, existing_json, terminal)) = existing {
+            guard_terminal(id, terminal, &existing_json, &json, false)?;
             guard_revision(id, rev as u64, &existing_json, run.revision, &json)?;
         }
         tx.execute(
@@ -254,16 +284,17 @@ impl SopRunStore for SqliteRunStore {
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
         let json = serde_json::to_string(terminal)?;
-        let tx = g.transaction().map_err(sql_err)?;
-        let existing: Option<(i64, String)> = tx
+        let tx = write_transaction(&mut g)?;
+        let existing: Option<(i64, String, bool)> = tx
             .query_row(
-                "SELECT revision, json FROM sop_runs WHERE run_id=?1",
+                "SELECT revision, json, terminal FROM sop_runs WHERE run_id=?1",
                 params![run_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some((rev, existing_json)) = existing {
+        if let Some((rev, existing_json, stored_terminal)) = existing {
+            guard_terminal(run_id, stored_terminal, &existing_json, &json, true)?;
             guard_revision(run_id, rev as u64, &existing_json, terminal.revision, &json)?;
         }
         tx.execute(
@@ -297,16 +328,17 @@ impl SopRunStore for SqliteRunStore {
         let mut g = self.lock()?;
         let json = serde_json::to_string(terminal)?;
         let payload = serde_json::to_string(&ev.payload)?;
-        let tx = g.transaction().map_err(sql_err)?;
-        let existing: Option<(i64, String)> = tx
+        let tx = write_transaction(&mut g)?;
+        let existing: Option<(i64, String, bool)> = tx
             .query_row(
-                "SELECT revision, json FROM sop_runs WHERE run_id=?1",
+                "SELECT revision, json, terminal FROM sop_runs WHERE run_id=?1",
                 params![run_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some((rev, existing_json)) = existing {
+        if let Some((rev, existing_json, stored_terminal)) = existing {
+            guard_terminal(run_id, stored_terminal, &existing_json, &json, true)?;
             guard_revision(run_id, rev as u64, &existing_json, terminal.revision, &json)?;
         }
         tx.execute(
@@ -843,6 +875,72 @@ mod tests {
     }
 
     #[test]
+    fn terminal_run_is_final() {
+        let s = SqliteRunStore::open_in_memory().unwrap();
+        s.save_run(&run("r1", SopRunStatus::Running, "1")).unwrap();
+        let mut terminal = run("r1", SopRunStatus::Completed, "2");
+        terminal.revision = 1;
+        s.finish_run("r1", &terminal).unwrap();
+
+        // An active write at a newer revision must not reopen the run.
+        let mut reopened = run("r1", SopRunStatus::Running, "3");
+        reopened.revision = 2;
+        let err = s.save_run(&reopened).unwrap_err();
+        assert!(err.to_string().contains("terminal"), "got {err}");
+        assert!(
+            s.save_run_with_event(&reopened, &ev("r1", "step_promoted"))
+                .is_err()
+        );
+        assert!(s.save_run_with_pending_capacity(&reopened, 0).is_err());
+        // A second, different terminal write must not replace the first.
+        let mut refinished = run("r1", SopRunStatus::Failed, "3");
+        refinished.revision = 2;
+        assert!(s.finish_run("r1", &refinished).is_err());
+        assert!(
+            s.finish_run_with_event("r1", &refinished, &ev("r1", "run_failed"))
+                .is_err()
+        );
+        // A byte-identical retry of the terminal write stays idempotent.
+        s.finish_run("r1", &terminal).unwrap();
+
+        let stored = s.load_run("r1").unwrap().unwrap();
+        assert_eq!(stored.revision, 1);
+        assert_eq!(stored.run.status, SopRunStatus::Completed);
+        assert!(
+            s.load_active_runs().unwrap().is_empty(),
+            "the run must not come back on the next restore"
+        );
+        assert!(
+            s.list_events("r1").unwrap().is_empty(),
+            "a refused write appends no event"
+        );
+    }
+
+    /// Each engine opens its own connection to the run database, so the
+    /// terminal guard has to hold across connections, not just within one.
+    #[test]
+    fn terminal_run_is_final_across_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let a = SqliteRunStore::open(&path).unwrap();
+        let b = SqliteRunStore::open(&path).unwrap();
+        a.save_run(&run("r1", SopRunStatus::Running, "1")).unwrap();
+        let mut terminal = run("r1", SopRunStatus::Completed, "2");
+        terminal.revision = 1;
+        a.finish_run("r1", &terminal).unwrap();
+
+        let mut reopened = run("r1", SopRunStatus::Running, "3");
+        reopened.revision = 2;
+        let err = b.save_run(&reopened).unwrap_err();
+        assert!(err.to_string().contains("terminal"), "got {err}");
+        assert!(b.load_active_runs().unwrap().is_empty());
+        assert_eq!(
+            a.load_run("r1").unwrap().unwrap().run.status,
+            SopRunStatus::Completed
+        );
+    }
+
+    #[test]
     fn cancelled_run_is_skipped_on_rehydration_and_releases_claim() {
         let s = SqliteRunStore::open_in_memory().unwrap();
         let mut r1 = run("r1", SopRunStatus::Running, "1");
@@ -1013,6 +1111,42 @@ mod tests {
         let stored = s.load_run("r1").unwrap().unwrap();
         assert_eq!(stored.revision, 5);
         assert_eq!(stored.last_progress_at, "1");
+    }
+
+    /// Two writers that build the same state from the same revision write
+    /// records that differ only in their writer. The second is a competing
+    /// write, not a retry of the first, so it is refused; a retry from the
+    /// writer whose record is stored still matches.
+    #[test]
+    fn same_revision_write_from_another_writer_conflicts() {
+        let s = SqliteRunStore::open_in_memory().unwrap();
+        let mut first = run("r1", SopRunStatus::Running, "1");
+        first.revision = 5;
+        first.writer = Some("engine-a".into());
+        let mut second = first.clone();
+        second.writer = Some("engine-b".into());
+        s.save_run(&first).unwrap();
+        assert!(matches!(
+            s.save_run(&second),
+            Err(StoreError::RevisionConflict { revision: 5, .. })
+        ));
+        s.save_run(&first).unwrap();
+
+        let mut terminal = run("r1", SopRunStatus::Completed, "2");
+        terminal.revision = 6;
+        terminal.writer = Some("engine-a".into());
+        let mut competing = terminal.clone();
+        competing.writer = Some("engine-b".into());
+        s.finish_run("r1", &terminal).unwrap();
+        assert!(matches!(
+            s.finish_run("r1", &competing),
+            Err(StoreError::TerminalRun { .. })
+        ));
+        s.finish_run("r1", &terminal).unwrap();
+        assert_eq!(
+            s.load_run("r1").unwrap().unwrap().writer.as_deref(),
+            Some("engine-a")
+        );
     }
 
     #[test]

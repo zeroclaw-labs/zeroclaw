@@ -829,6 +829,9 @@ fn sender_is_authorized(
                 "plugin": endpoint.instance_id().package(),
                 "channel_alias": endpoint.alias(),
                 "ingress": ingress,
+                // The ID the operator has to admit. Guest-supplied, so it is
+                // bounded like the webhook diagnostics.
+                "sender": bounded_webhook_detail(&message.sender),
                 "error_key": "plugin_channel_sender_denied",
             })),
         "Ignoring channel-plugin inbound from an unauthorized sender"
@@ -1664,6 +1667,59 @@ mod tests {
         let detail = "λ".repeat(WEBHOOK_DIAGNOSTIC_MAX_CHARS + 50);
         let bounded = bounded_webhook_detail(detail);
 
+        assert_eq!(bounded.chars().count(), WEBHOOK_DIAGNOSTIC_MAX_CHARS);
+        assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn sender_denial_record_names_the_bounded_sender() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let scope = crate::instance::test_scope(PluginCapability::Channel, "denial-record", []);
+        let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
+        let oversized = "λ".repeat(WEBHOOK_DIAGNOSTIC_MAX_CHARS + 50);
+        for (ingress, sender) in [("poll", "1234567890"), ("webhook", oversized.as_str())] {
+            let message = ChannelMessage {
+                sender: sender.to_string(),
+                ..Default::default()
+            };
+            assert!(!sender_is_authorized(
+                &deny_all_senders(),
+                &endpoint,
+                &message,
+                ingress
+            ));
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut senders = std::collections::HashMap::new();
+        while senders.len() < 2 {
+            while let Ok(event) = rx.try_recv() {
+                let attributes = &event["attributes"];
+                if attributes["error_key"] == "plugin_channel_sender_denied"
+                    && attributes["channel_alias"] == "denial-record"
+                {
+                    senders.insert(
+                        attributes["ingress"].as_str().unwrap().to_string(),
+                        attributes["sender"].clone(),
+                    );
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "each denial should emit a plugin_channel_sender_denied record; got {senders:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert_eq!(senders["poll"], "1234567890");
+        let bounded = senders["webhook"]
+            .as_str()
+            .expect("the denial record names the sender");
         assert_eq!(bounded.chars().count(), WEBHOOK_DIAGNOSTIC_MAX_CHARS);
         assert!(bounded.ends_with('…'));
     }
