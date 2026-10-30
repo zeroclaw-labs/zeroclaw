@@ -1,6 +1,6 @@
 # Runtime composition contract (proposal)
 
-**Status:** proposed, not implemented. This page is the composition-API proposal that [#10993](https://github.com/zeroclaw-labs/zeroclaw/issues/10993) asks for before any caller moves. It delivers the first acceptance item of that issue and the design half of [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) R1. The only code that accompanies it is the type skeleton in `crates/zeroclaw-runtime/src/composition.rs`, which nothing consumes yet.
+**Status:** proposed; the capability-taking entry points and the supplied-only tool registry are implemented. This page is the composition-API proposal that [#10993](https://github.com/zeroclaw-labs/zeroclaw/issues/10993) asks for before callers move. The contract lives in `crates/zeroclaw-runtime/src/composition.rs`. The runtime entry points listed under step 2 take it through `*_with_capabilities` forms, and their old signatures remain adapters over an explicitly config-backed set. Application wiring (step 3 onward) and the rest of [#7432](https://github.com/zeroclaw-labs/zeroclaw/issues/7432) R1 are separate work.
 
 The goal is the one RFC [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) set for Phase 2 D1: an agent runtime that an embedder can run with capabilities it supplies, where the runtime "has no knowledge of Telegram, Discord, Anthropic, or any specific tool implementation", and where the binary becomes a thin wiring layer.
 
@@ -95,11 +95,19 @@ pub struct RuntimeCapabilities {
 pub trait ProviderSource: Send + Sync {
     fn model_provider(&self, request: &ProviderRequest<'_>)
         -> anyhow::Result<Arc<dyn ModelProvider>>;
+    // Defaults to `model_provider`.
+    fn switched_model_provider(&self, request: &ProviderRequest<'_>)
+        -> anyhow::Result<Arc<dyn ModelProvider>>;
 }
+#[async_trait]
 pub trait MemorySource: Send + Sync {
-    fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>>;
+    async fn memory(&self, request: &MemoryRequest<'_>) -> anyhow::Result<Arc<dyn Memory>>;
 }
 pub trait ToolSource: Send + Sync {
+    // Default Ok(None): the supplied vector is the whole registry.
+    // A source may instead explicitly select a borrowed native recipe.
+    fn native_recipe<'s>(&'s self, request: &ToolRequest<'_>)
+        -> anyhow::Result<Option<&'s NativeRegistryRecipe>> { Ok(None) }
     fn tools(&self, request: &ToolRequest<'_>) -> anyhow::Result<Vec<Box<dyn Tool>>>;
 }
 pub trait ChannelSource: Send + Sync {
@@ -107,7 +115,9 @@ pub trait ChannelSource: Send + Sync {
 }
 ```
 
-`ProviderRequest` carries the config, the agent alias, and an optional explicit provider reference. `MemoryRequest` carries the config and agent alias. `ToolRequest` carries the config, agent alias, resolved `SecurityPolicy`, selected `RuntimeAdapter`, and the agent's memory handle.
+`ProviderRequest` carries the config, the agent alias, an optional explicit provider reference, the model the runtime resolved, and the requesting principal when the entry point knows one (`Option<&PrincipalId>`). The principal is in the request from the start because adding a field to a trait request that embedders implement against is a breaking change later; a source may use it to choose credentials or quotas, and it grants nothing. `ProviderSource::switched_model_provider` serves an agent's mid-session model switch and defaults to `model_provider`; a source overrides it only when a switch resolves credentials or options differently from a session start, as the runtime's config-backed source does to keep the agent's existing switch behavior. `ProviderSource::vision_model_provider` serves the configured `[multimodal]` vision route for an image-bearing turn whose provider lacks vision, and also defaults to `model_provider`; a refusal ends vision routing rather than falling back to config, and the config-backed source overrides it to keep the existing alias-aware vision construction. `MemorySource::memory` is asynchronous because opening a store can touch disk or the network. `MemoryRequest` carries the config and agent alias. `ToolRequest` carries the config, agent alias, resolved `SecurityPolicy`, selected `RuntimeAdapter`, and the agent's memory handle.
+
+On the `Agent` path, which RPC sessions also use, a selected model route is not resolved through the source. `Agent` asks the source once, for its default model's provider. When effort routing, query classification or auto-classify then selects a `[[model_routes]]` entry, it sends that provider the route as a `hint:<name>` selector in place of a model name. The config-backed source's provider decodes these selectors, so configured agents are unchanged. A supplied provider that serves an `Agent` with model routes must resolve `hint:<name>` itself, or the agent must have no routes. The CLI loop and `process_message` instead ask the source again with the route's provider and model. #12092 tracks doing the same on the `Agent` path.
 
 The runtime entry point these feed is proposed as follows. It is **not** in the skeleton, because it cannot exist without an implementation:
 
@@ -134,7 +144,23 @@ pub async fn run(runtime: Runtime) -> anyhow::Result<DaemonExit>;
 3. **Returned handles are borrowed for a scope.** A provider or memory handle belongs to the session or turn that asked for it. Sources may cache and share instances; callers must not stash them past their session.
 4. **One store per agent per generation.** Two memory requests for the same agent in one generation must reach the same underlying store. Today's code guarantees this implicitly by constructing from the same config; the contract makes it an obligation of the source.
 5. **The observer is process-level per generation.** It is an instance, not a source, because it is not resolved per agent.
-6. **Outbound only.** `ChannelSource` covers channels the runtime sends through: replies by alias, scheduled delivery, and approval prompts. Inbound turns arrive through `RuntimeIngress`, not through this contract.
+6. **Channels belong to the supplied source.** `ChannelSource` covers replies by alias, scheduled delivery, approval prompts, and the `cli` session channel. Supplied `None` is authoritative; it does not fall back to the process-global CLI factory. The config-backed `defaults::NoOutboundChannels` adapter explicitly maps `cli` to that registered application factory. The CLI loop retains its existing stdin reader; this adds no inbound turn transport.
+
+Retained sources can receive newer config snapshots during a live model refresh or newly admitted child work. Config-backed sources resolve each request against the supplied snapshot. Hosts must keep retained sources compatible with those snapshots, or rebuild affected sessions and registries when construction wiring changes. A full daemon reload drains old work before replacing its capability set.
+
+### Which principal each caller passes
+
+`ProviderRequest.principal` is the principal the entry point resolved for the turn, and `None` when it has none. It never widens what a turn may do; a source may use it only to choose credentials or quotas. As callers move onto the contract, each passes:
+
+| Caller | Principal |
+| --- | --- |
+| CLI `agent` (interactive and one-shot) | `None`, as today |
+| RPC sessions (`session/new`, rehydration, model changes) | The connection's resolved principal |
+| Cron agent jobs | `None`: a job records no owning principal today. When job ownership lands, the job's owner |
+| SOP drivers and the heartbeat worker | `None`: they run as the daemon, not for a caller |
+| Channels orchestrator | `None` until inbound principal resolution supplies one through `RuntimeIngress` |
+
+With config-backed sources, a `None` principal constructs and switches exactly as the compatibility adapters do, which is what makes each move a no-op for existing configurations.
 
 ### Security policy stays with the runtime
 
@@ -142,7 +168,29 @@ The issue requires resolved security policy to remain explicit across the bounda
 
 - The runtime resolves each agent's `SecurityPolicy` and `RuntimeAdapter` and passes them *into* `ToolRequest`. Native sources are trusted implementations required to build tools against those supplied values. Passing them into a Rust trait does not mechanically confine in-process code: a source can return arbitrary native tools, so runtime admission, policy filtering, and per-call gating and approval remain independent requirements.
 - Building a tool against a policy authorizes nothing. The runtime still gates and approves every call after construction, exactly as today.
-- The runtime may add core tools and remove tools the policy excludes. It never adds a tool the policy forbids because a source returned it.
+- Approval keys one exemption on the tool's name, not its origin. On a non-interactive turn with no approval back-channel, a tool named `shell` skips the outer approval step unless `always_ask` lists it, because the native shell enforces its own command policy and approval. A supplied-only registry can hold a source tool with that name, and it gets the same exemption, so a source `shell` must enforce its own command policy. The other name-keyed checks, for re-entrant agent tools and repeated prompt signatures, only make a call stricter.
+- Supplied-only construction does not add core tools. Both construction modes remove tools the policy or caller/context gates exclude. A source cannot widen execution authority by returning a tool.
+
+### Complete supplied registries and explicit native compatibility
+
+Each eager build asks the tool source once, through `ToolSource::native_recipe`, which construction it wants. It is asked after memory and the security policy are resolved, and before the model provider is built.
+
+- **Supplied-only (the default).** `native_recipe` returns `Ok(None)`, and the vector from `tools()` is the whole registry, even when it is empty. The runtime does not call the native registry factory, load skills, connect MCP servers or peripherals, create the pipeline or `tool_search` helpers, build an unused SOP engine, inject hardware datasheet context, or run post-turn skill creation and skill review. SOP handles the caller already holds stay with the caller. The policy, principal, caller and memory/delivery context filters still apply to the supplied tools.
+- **Native compatibility.** A source that wants the previous behavior returns `Ok(Some(&defaults::native_compat_registry))`; `defaults::NoSuppliedTools` does this. The recipe builds the native registry with the caller's own handles, and the source's tools are added through the same filters. Native names win. A source tool is dropped from the registry and from every child view when it reuses the name of a tool the native recipe built, a peripheral tool, a skill tool (`<skill>__<tool>`), an MCP tool (`<server>__<tool>`, including deferred tools that activate later) or an MCP capability tool (`mcp_resources` and `mcp_prompts` are reserved even when MCP is off), when it reuses `execute_pipeline` while `[pipeline] enabled` is set, and when it reuses `tool_search` and the runtime builds that tool (MCP or built-in schemas are deferred). Source tools never become skill-elevation targets. WASM plugin tools count as native here, because the native recipe loads them: a source tool that reuses a plugin tool's name is dropped. A plugin tool in turn gives way to the built-in, reserved, peripheral and skill names above.
+
+In both modes a source vector that repeats a name keeps its first tool. Every source tool the runtime drops, for a repeated name or for a native name, is logged as a warning that names the tool and what kept the name.
+
+This changes the contract #11090 documented, where native tools were always built and source tools added on top. A custom source that relied on that must now select the native recipe.
+
+`NativeRegistryRecipe` is a `dyn Fn(NativeRecipeInputs<'_>)`. `NativeRecipeInputs` is a `#[non_exhaustive]` struct with named fields: the `ToolRequest`, workspace directory, canvas store, subagent flag, forwarded environment, SOP engine and audit log, live config, execution capability and ACP session view. The runtime builds it, so new inputs can be added without breaking recipes. The recipe is `Send + Sync + 'static`, so a source can own a closure that keeps per-instance state, for example one that wraps `defaults::native_compat_registry`. `native_recipe<'s>(&'s self, &ToolRequest) -> Result<Option<&'s NativeRegistryRecipe>>` borrows only the source. A selection or recipe error ends the build. A recipe may let the tools it returns hold the handles they need, but must not keep caller handles anywhere else. When SOPs are on, the entry point builds the SOP engine (reusing the turn's memory, without a second memory request), or passes the one it was given, and hands it to the recipe; independent delegation passes none.
+
+Selection must not do I/O and must not use `request.memory` beyond comparing identity. Bounded delegation asks only for the selection: `request.memory` is then the parent registry's memory handle, not an opened target store, and neither the recipe nor `tools()` is called. A source that must refuse bounded inheritance does it by returning `Err` from selection. A delegate with no bound capabilities uses native compatibility without asking any source; a bound delegate that is missing its runtime or memory refuses.
+
+Bounded delegation recognizes native memory tools by a typed witness stamped when the native factory built them, together with the tool's `Arc` identity. A name, role or type that looks like memory does not count. Only recognized native memory tools make the delegate open the target agent's memory and replace them. In supplied-only mode, a recognized native memory tool in the parent handle makes the delegation refuse before it opens target memory; other source tools keep their own objects and stores. In native compatibility mode, a memory failure refuses without falling back to the parent's memory. The child delegate carries the target's tools and the same weak witnesses, so a second hop opens its own target memory. Background and parallel workers carry the same pair and keep the caller's policy chain and tool-name filter.
+
+Routing a session's memory to a principal binds the build's native memory tools to the principal's memory once, before any memory operation. The tool objects do not change, so pipeline, skill and parent views see the same routed memory. Routing does not reach source tools: a source builds its tools before routing, against `ToolRequest.memory`, so a source memory tool keeps the handle it was given. In a supplied-only registry that means routing changes the agent's own memory and none of its tools. Routing after a native memory tool has run is refused and leaves the agent unchanged.
+
+`AllToolsResult` now carries private provenance data. Code outside the crate that builds it with a struct literal must use `AllToolsResult::from_prebuilt_tools(tools)` and then set the public fields it owns. Tools added that way have unknown provenance, so they are never treated as native memory tools.
 
 Parity tests in the first implementation slice must show that the effective tool set and approval behavior are unchanged for every agent in a representative config.
 
@@ -178,16 +226,18 @@ The intended destination is the composition owner in the planned `zeroclaw-kerne
 
 Every step keeps existing configuration and effective permissions. Old entry points stay as compatibility adapters until their last caller moves, as the issue's risk section requires.
 
+The table records the staged migration plan. Its tier-1/tier-2 rows describe native compatibility; a supplied-only source skips the native recipe as described above. The measurements and the proposed `Runtime::run_turn` below are historical, not current results.
+
 | Step | Change | Evidence required |
 | --- | --- | --- |
 | 0 | This proposal and the skeleton. No callers. | Review of the API boundary |
 | 1 | `DefaultCapabilities::from_config`: sources that wrap today's `create_*` functions unchanged | Parity tests for provider, memory, and tool-set resolution per agent |
-| 2 | Runtime entry points gain `*_with_capabilities` forms: `agent::loop_::run`, `process_message_shared`, `Agent::from_config*`, `assemble_owned_execution`. Old signatures delegate through `DefaultCapabilities` | Existing agent tests pass unchanged; policy-propagation regression tests |
+| 2 | Runtime entry points gain `*_with_capabilities` forms: `agent::loop_::run`, `process_message_shared`, `Agent::from_config*`, `assemble_owned_execution`, the delegate tool's target construction, and cron agent jobs. Old signatures delegate through a config-backed set that reproduces today's construction | Existing agent tests pass unchanged; policy-propagation regression tests; a stub `ProviderSource` receives the principal |
 | 3 | `src/main.rs` builds `DefaultCapabilities` once and calls the new forms for `agent` and `daemon` | Startup, cancellation, and shutdown regression coverage for CLI and daemon |
 | 4 | The channels starter, cron scheduler, SOP drivers, and `RpcContext` receive the generation's `RuntimeCapabilities`. The gateway starter is deleted at the v0.9.0 cut and receives no capabilities; its own construction disappears as its routes move to RPC | Parity for each migrated starter; no `create_*` calls left in the migrated starters. The gateway is not migrated in place: the check that it cannot re-couple is the dependency ratchet in step 7, not a rule |
 | 5 | Channels orchestrator's per-sender provider cache becomes a `ProviderSource` implementation; ACP moves to the new forms. Sequenced with #11012 | No `create_*` calls left in `zeroclaw-channels` |
 | 6 | Internal callers: delegate, cron, heartbeat, subagents, SOP tool specs | No `create_*` calls left in the runtime outside `DefaultCapabilities` |
-| 7 | `DefaultCapabilities` and tier-3 (optional) tool assembly move to the application layer behind its `ToolSource`. Tier-1 (core) and tier-2 (host-coupled) tools stay runtime-constructed, and the runtime keeps `zeroclaw-tools` as an explained dependency through v0.9.0 (see below); dropping it is v1.0.0 work. Tools are grouped under three coarse Cargo features, `tools-core` (always on), `tools-host`, and `tools-extra` (both default on), plus per-integration features for heavy dependencies (with #10998) | A dependency ratchet test over `cargo metadata` with three rules: the runtime (its `zeroclaw-tools` edge explained), the gateway (no runtime, channels, tools, providers, memory, plugins, config, hardware, or sop-graph), and rpc-proto (api, config, and sop-graph only, no tokio I/O). An independent consumer running a real agent turn through `Runtime::run_turn` with a `ToolSource` that returns an empty tier 3. Size evidence comparing `--no-default-features --features agent-runtime,tools-core` against dist per target (#10998 AC5) |
+| 7 | `DefaultCapabilities` and tier-3 (optional) tool assembly move to the application layer behind its `ToolSource`. Tier-1 (core) and tier-2 (host-coupled) tools stay runtime-constructed, and the runtime keeps `zeroclaw-tools` as an explained dependency through v0.9.0 (see below); dropping it is v1.0.0 work. Tools are grouped under three coarse Cargo features, `tools-core` (always on), `tools-host`, and `tools-extra` (both default on), plus per-integration features for heavy dependencies (with #10998) | A dependency ratchet test over `cargo metadata` with three rules: the runtime (its `zeroclaw-tools` edge explained), the gateway (no runtime, channels, tools, providers, memory, plugins, config, hardware, or sop-graph), and rpc-proto (api, config, and sop-graph only, no tokio I/O). An independent consumer running a real agent turn through `Runtime::run_turn` with a `ToolSource` that returns an empty tier 3 (the existing `tests/fixtures/runtime-composition-consumer` crate already runs supplied-only and native-recipe turns through `run_with_capabilities`). Size evidence comparing `--no-default-features --features agent-runtime,tools-core` against dist per target (#10998 AC5) |
 | 8 | Remove the compatibility adapters | Removal is mechanical once no caller remains |
 
 ## Dependencies that remain, and why
@@ -195,15 +245,15 @@ Every step keeps existing configuration and effective permissions. Old entry poi
 The issue asks for any retained dependency to be explained rather than hidden behind an unused feature. The expected end state is:
 
 - **`zeroclaw-tools`: retained through v0.9.0, as an explained edge.** Tier-1 core tools are split across the two crates today (`shell` and `file_read` in the runtime; `file_write`, `file_edit`, `glob_search`, `content_search`, the memory tools, `git_operations`, and `web_fetch` in `zeroclaw-tools`), and tier-2 tools need runtime internals (the scheduler, canvas store, ask-user handle, SOP engine, session backend, and live config) that `ToolRequest` does not carry. Moving either behind an application `ToolSource` would leak those internals into a public contract. So step 7 moves only tier 3, and the ratchet names this edge. Dropping the dependency is v1.0.0 work.
-- **`zeroclaw-providers` and `zeroclaw-memory`: expected to remain for now**, for reasons outside turn composition: `doctor`, `quickstart`, `migration`, and vision routing construct providers or memory directly and are still hosted in this crate. Each is a separate extraction candidate under the holding-crate plan. Step 7's ratchet should allow exactly these edges and name them, so a new use fails the check.
+- **`zeroclaw-providers` and `zeroclaw-memory`: expected to remain for now**, for reasons outside turn composition: `doctor`, `quickstart` and `migration` construct providers or memory directly and are still hosted in this crate, and the config-backed sources build through these crates. Vision routing is inside turn composition: an image-bearing turn asks its provider source for the configured vision route (`ProviderSource::vision_model_provider`, with the turn's principal), and only the config-backed source builds that route from config. Each is a separate extraction candidate under the holding-crate plan. Step 7's ratchet should allow exactly these edges and name them, so a new use fails the check.
 
 ## Acceptance mapping
 
 | #10993 acceptance item | Delivered by |
 | --- | --- |
 | Document the public composition API, ownership and lifetime rules, `DaemonRegistry`, relevant part of #6864 | This page (step 0) |
-| Independent consumer runs a real agent turn with supplied capabilities, without concrete provider/channel/tool construction inside the runtime | Partial under the proposed step 7: `Runtime::run_turn` would exercise supplied capabilities, but tier-1 core and tier-2 host-coupled tools would remain runtime-constructed. This staged retained-tool design does not fully satisfy the criterion; the remaining construction boundary must be implemented and proved, or the criterion explicitly reconciled in #10993, before acceptance is complete |
-| Dependency checks demonstrate the boundary; retained dependencies explained | Step 7 ratchet and the section above |
+| Independent consumer runs a real agent turn with supplied capabilities, without concrete provider/channel/tool construction inside the runtime | Partly delivered now by `tests/fixtures/runtime-composition-consumer`: a crate that depends only on `zeroclaw-runtime` (without default features), `zeroclaw-api` and `zeroclaw-config` runs real supplied-only and native-recipe turns, with traps that catch native construction. The rest is the proposed step 7: `Runtime::run_turn` would exercise supplied capabilities, but tier-1 core and tier-2 host-coupled tools would remain runtime-constructed. This staged retained-tool design does not fully satisfy the criterion; the remaining construction boundary must be implemented and proved, or the criterion explicitly reconciled in #10993, before acceptance is complete |
+| Dependency checks demonstrate the boundary; retained dependencies explained | Partly delivered by the consumer's dependency ratchet (the runtime's retained `zeroclaw-*` edges, each with an owner and a reason, and no concrete constructors in the capability entry points); the step 7 ratchet and the section above cover the rest |
 | CLI and daemon use the shared contract, with policy, startup, cancellation, and shutdown coverage | Steps 2 and 3 |
 | Implementation PRs and evidence linked to #7432 R1 | Each step's PR |
 
@@ -212,4 +262,4 @@ The issue asks for any retained dependency to be explained rather than hidden be
 These were open when this page was first proposed. The v0.9.0 architecture review settled both.
 
 1. **`run_turn` versus waiting for `RuntimeIngress`.** `run_turn` ships and stays minimal, as a client of the same session actor that `session/prompt` uses. It does not wait for #11012.
-2. **Whether `ProviderSource` receives the requesting principal.** Yes, from the first implementation slice: `ProviderRequest` gains `principal: Option<&PrincipalId>` when the capability-taking constructors land. Adding a field to an embedder-implemented request type later would be a breaking change. The skeleton on this page does not carry the field yet.
+2. **Whether `ProviderSource` receives the requesting principal.** Yes, from the first implementation slice: `ProviderRequest` gains `principal: Option<&PrincipalId>` when the capability-taking constructors land. Adding a field to an embedder-implemented request type later would be a breaking change. The capability-taking constructors carry it.

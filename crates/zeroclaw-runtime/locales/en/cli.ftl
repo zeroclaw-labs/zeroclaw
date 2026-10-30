@@ -1565,6 +1565,10 @@ cli-enroll-pairing-code = {"    "}pairing code : {$code}
 cli-enroll-sas = {"    "}SAS          : {$sas}
 cli-tunnel-tcp-service-published = {"  "}🔒 Tunnel {$service} (TLS passthrough): {$endpoint}
 
+# ── Supplied capabilities (CLI session channel, delegate tool preparation) ──
+cli-agent-error-channel-unavailable = This agent has no channel for the CLI session.
+tool-delegate-error-target-tools-initialization = Tools could not be prepared safely for agent '{$agent_name}'.
+
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
 cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
