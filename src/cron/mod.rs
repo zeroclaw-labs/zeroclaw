@@ -129,14 +129,15 @@ fn escape_terminal_controls(s: &str) -> String {
 }
 
 /// First line of a run's output, with terminal controls escaped, capped at 80
-/// chars, with a marker when the preview had to drop output.
+/// chars, with a marker when the preview had to drop output. Line structure
+/// is decided on the raw output before escaping, so a control character can
+/// never merge or split preview lines.
 fn output_preview(output: &str) -> String {
     const PREVIEW_MAX_CHARS: usize = 80;
-    let escaped = escape_terminal_controls(output);
-    let first_line = escaped.lines().next().unwrap_or("");
-    let truncated =
-        first_line.chars().count() > PREVIEW_MAX_CHARS || escaped.lines().nth(1).is_some();
-    let preview: String = first_line.chars().take(PREVIEW_MAX_CHARS).collect();
+    let first_line = output.lines().next().unwrap_or("");
+    let escaped = escape_terminal_controls(first_line);
+    let truncated = escaped.chars().count() > PREVIEW_MAX_CHARS || output.lines().nth(1).is_some();
+    let preview: String = escaped.chars().take(PREVIEW_MAX_CHARS).collect();
     if truncated {
         format!("{preview}…")
     } else {
@@ -1554,6 +1555,11 @@ mod tests {
         let line = format_run_line(&sample_run(Some("progress\rfinished"), Some(1)));
         assert!(!line.contains('\r'), "line: {line}");
         assert!(line.contains("progress\\rfinished"), "line: {line}");
+
+        // Line structure comes from the raw output: a control character on a
+        // later line must not merge lines or leak into the preview.
+        let preview = output_preview("ok\n\u{1b}[2Jhidden");
+        assert_eq!(preview, "ok…");
     }
 
     #[test]
