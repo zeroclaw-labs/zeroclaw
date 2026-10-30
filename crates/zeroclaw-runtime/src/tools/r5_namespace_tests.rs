@@ -1868,7 +1868,12 @@ async fn late_tool_search_caller_principal_context() {
         config.skill_bundles.insert("late-principal".into(),zeroclaw_config::schema::SkillBundleConfig { directory:Some(bundle_dir.display().to_string()),..Default::default() });
         config.agents.get_mut("namespace").unwrap().skill_bundles=vec!["late-principal".into()];
         let loaded=crate::skills::load_skills_for_agent_from_config(&config,"namespace");
-        assert_eq!(loaded.len(),1); assert_eq!(loaded[0].name,"nested");
+        assert!(loaded.iter().any(|skill| skill.name == "zeroclaw-docs"));
+        assert_eq!(
+            loaded.iter().filter(|skill| skill.name == "nested").count(),
+            1,
+            "the configured bundle skill must remain available alongside built-ins",
+        );
         let mut unrestricted=crate::agent::Agent::from_live_config_with_tui_env_and_principal_tools(zeroclaw_config::live::LiveConfig::new(config.clone()).handle(),"namespace",None,false,true,None,None,None,None).await.unwrap();
         assert!(unrestricted.tool_names().contains(&"execute_pipeline"));
         assert!(unrestricted.tool_names().contains(&skill_tool::composed_tool_name("nested","invoke").as_str()));
