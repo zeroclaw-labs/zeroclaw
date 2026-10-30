@@ -12,12 +12,14 @@
 //!    holds the journal lock while the surface commits the config.
 //! 3. The surface commits, then calls [`acknowledge_commit`], or [`abandon`]
 //!    when the commit failed.
-//! 4. [`converge`] moves every follower, re-checks all of them, and clears the
-//!    record only once nothing is left under the old alias. Each move is
-//!    durable before the record clears: the SQLite stores commit it with full
-//!    sync, and each converge syncs every directory a workspace move or
-//!    cleanup changes before it can clear the record, keeping the record
-//!    open while any of them fails to sync.
+//! 4. [`converge`] syncs the directory holding the config file, so the
+//!    commit is durable before any state follows it, then moves every
+//!    follower, re-checks all of them, and clears the record only once
+//!    nothing is left under the old alias. Each move is durable before the
+//!    record clears: the SQLite stores commit it with full sync, and each
+//!    converge syncs every directory a workspace move or cleanup changes
+//!    before it can clear the record. A sync that fails keeps the record
+//!    open, and one of the config directory moves nothing.
 //!
 //! The record keeps the recovery durable across the window after the commit
 //! and across processes. While it is open the old alias cannot be reused, and
@@ -629,10 +631,19 @@ pub async fn converge(
         record => record,
     };
 
-    let plan = FollowerPlan::resolve(config, from, to, record.as_ref(), stores).await;
+    // The commit has to be durable before any state follows it: a power loss
+    // mid-move must not bring back a config naming `from` while part of its
+    // state already sits under `to`. A config directory that cannot be synced
+    // moves nothing and keeps the record open for a re-run.
     let mut report = ConvergeReport::default();
-    let attempted = plan.act_all(config, from, to, &mut report).await;
-    let outstanding = plan.verify(config, from, to, attempted).await;
+    let outstanding = match sync_config_directory(config).await {
+        Some(unsynced) => vec![unsynced],
+        None => {
+            let plan = FollowerPlan::resolve(config, from, to, record.as_ref(), stores).await;
+            let attempted = plan.act_all(config, from, to, &mut report).await;
+            plan.verify(config, from, to, attempted).await
+        }
+    };
 
     if !outstanding.is_empty() {
         let warnings: Vec<String> = outstanding.iter().map(ToString::to_string).collect();
@@ -2047,25 +2058,40 @@ async fn sync_workspace_directories(config: &Config, from: &str, to: &str) -> Ve
         }
     }
 
-    let follower = FollowerKind::Workspace;
     let mut issues = Vec::new();
     for dir in dirs {
-        match inspect_lifecycle_path(dir).await {
-            PathPresence::Absent => {}
-            PathPresence::Uninspectable(reason) => {
-                issues.push(FollowerIssue::unreadable(follower, reason));
-            }
-            PathPresence::Present => {
-                if let Err(e) = sync_directory(dir).await {
-                    issues.push(FollowerIssue::unreadable(
-                        follower,
-                        format!("could not sync {}: {e}", dir.display()),
-                    ));
-                }
-            }
-        }
+        issues.extend(sync_existing_directory(dir).await);
     }
     issues
+}
+
+/// Sync the directory holding the config file, so the save that committed
+/// the rename survives a power loss before any state follows it. A save
+/// counts as committed once its new file is in place, even when its own sync
+/// of this directory failed; a power loss after state moved could then bring
+/// back a config naming the old alias while its state sits under the new
+/// one, and once the record cleared nothing would retire the old alias.
+///
+/// Every converge syncs it before any follower acts, whether or not there is
+/// anything to move, and reports a failure as the workspace directory syncs
+/// do. A failure moves nothing and keeps the record open, so the next
+/// converge retries it.
+async fn sync_config_directory(config: &Config) -> Option<FollowerIssue> {
+    sync_existing_directory(config.config_path.parent()?).await
+}
+
+/// Sync `dir` when it exists. A directory that does not exist has nothing to
+/// sync; one that cannot be inspected or synced is an unreadable workspace
+/// issue.
+async fn sync_existing_directory(dir: &Path) -> Option<FollowerIssue> {
+    let follower = FollowerKind::Workspace;
+    match inspect_lifecycle_path(dir).await {
+        PathPresence::Absent => None,
+        PathPresence::Uninspectable(reason) => Some(FollowerIssue::unreadable(follower, reason)),
+        PathPresence::Present => sync_directory(dir).await.err().map(|e| {
+            FollowerIssue::unreadable(follower, format!("could not sync {}: {e}", dir.display()))
+        }),
+    }
 }
 
 /// Whether `path` is a real directory with nothing in it. A symlink or a file

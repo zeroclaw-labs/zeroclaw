@@ -2681,6 +2681,72 @@ async fn a_directory_that_does_not_exist_is_not_synced() {
 }
 
 #[tokio::test]
+async fn a_config_directory_that_cannot_be_synced_moves_nothing_until_a_rerun_syncs_it() {
+    let tmp = TempDir::new().unwrap();
+    let before = fixture(&tmp, &[FROM]);
+    let source = seed_workspace(&before, FROM);
+    let after = arm_and_commit(&before).await;
+    let config_dir = after.config_path.parent().unwrap().to_path_buf();
+    let destination = after.default_agent_workspace_dir(TO);
+    let stores = SurfaceStores::none();
+
+    // The directory holding the config file cannot be synced, so a power
+    // loss could still bring back the old alias: nothing may follow the
+    // rename yet.
+    let first = with_failing_sync(config_dir.clone(), converge(&after, FROM, TO, &stores))
+        .await
+        .unwrap();
+    assert_unsynced(&first, &config_dir);
+    assert!(!first.report().workspace_moved);
+    assert!(source.join("MEMORY.md").is_file());
+    assert!(!destination.exists());
+    assert_eq!(records(&after).len(), 1, "the record stays open");
+    assert!(retired_alias(&after, FROM).unwrap().is_some());
+
+    // A re-run syncs it, moves everything, and clears the record.
+    let second = converge(&after, FROM, TO, &stores).await.unwrap();
+    assert!(second.is_converged(), "{:?}", second.warnings());
+    assert!(second.report().workspace_moved);
+    assert!(destination.join("MEMORY.md").is_file());
+    assert!(!source.exists());
+    assert!(records(&after).is_empty());
+    assert_eq!(retired_alias(&after, FROM).unwrap(), None);
+}
+
+#[tokio::test]
+async fn the_config_directory_is_synced_even_when_no_follower_moves_anything() {
+    let tmp = TempDir::new().unwrap();
+    let before = fixture(&tmp, &[FROM]);
+    // Nothing is kept under the old alias, so no follower has anything to
+    // move, yet the rename still committed a config change.
+    let after = arm_and_commit(&before).await;
+    let config_dir = after.config_path.parent().unwrap().to_path_buf();
+    let stores = SurfaceStores::none();
+
+    let outcome = with_failing_sync(config_dir.clone(), converge(&after, FROM, TO, &stores))
+        .await
+        .unwrap();
+    assert_unsynced(&outcome, &config_dir);
+    let report = outcome.report();
+    assert_eq!(
+        (
+            report.workspace_moved,
+            report.memory_rows,
+            report.cron_jobs,
+            report.acp_sessions,
+            report.acp_workspaces,
+            report.sessions_repointed,
+        ),
+        (false, 0, 0, 0, 0, 0)
+    );
+    assert_eq!(records(&after).len(), 1);
+
+    let outcome = converge(&after, FROM, TO, &stores).await.unwrap();
+    assert!(outcome.is_converged(), "{:?}", outcome.warnings());
+    assert!(records(&after).is_empty());
+}
+
+#[tokio::test]
 async fn a_corrupt_journal_fails_every_entry_point_closed() {
     let tmp = TempDir::new().unwrap();
     let config = fixture(&tmp, &[FROM]);
