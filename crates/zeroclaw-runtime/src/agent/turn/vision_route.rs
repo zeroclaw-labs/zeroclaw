@@ -618,7 +618,7 @@ mod tests {
 
         let config: Config = toml::from_str(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.llamacpp.forced_off]
 model = "qwen3-4b"
 vision = false
@@ -1474,7 +1474,7 @@ vision = false
         };
         let config: Config = toml::from_str(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.visionroute]
 uri = "http://127.0.0.1:9/v1"
 model = "vision-model"
@@ -1632,7 +1632,7 @@ model = "vision-model"
         // production dispatch boundary.
         let config: Config = toml::from_str(&format!(
             r#"
-schema_version = 3
+schema_version = 4
 [providers.models.custom.myvision]
 uri = "http://{addr}/v1"
 model = "vision-model"

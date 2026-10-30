@@ -7,7 +7,7 @@ use zeroclaw_config::migration::migrate_to_current_salvaged;
 #[test]
 fn malformed_plugins_entries_reports_dropped_section() {
     let bad = r#"
-schema_version = 3
+schema_version = 4
 
 [plugins]
 enabled = true

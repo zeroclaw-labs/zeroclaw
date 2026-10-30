@@ -80,7 +80,7 @@ async fn config_loaded_docker_runtime_executes_one_docker_run_through_shell_tool
     std::fs::write(
         install.path().join("config.toml"),
         r#"
-schema_version = 3
+schema_version = 4
 
 [runtime]
 kind = "docker"
