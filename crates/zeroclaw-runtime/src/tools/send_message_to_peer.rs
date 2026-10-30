@@ -1529,6 +1529,30 @@ mod tests {
     #[tokio::test]
     async fn peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget()
     {
+        // A unique ledger does not isolate the process-global tracker: other
+        // tests can replace it or change its enabled state during this turn.
+        // Keep the real execute boundary, but run this fixture alone in a child.
+        const CHILD_ENV: &str = "ZEROCLAW_PEER_EXECUTE_COST_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio::process::Command::new(
+                    std::env::current_exe().expect("current test executable"),
+                )
+                .arg("tools::send_message_to_peer::tests::peer_turn_cost_scope_through_execute_boundary_attributes_recipient_and_shares_budget")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CHILD_ENV, "1")
+                .kill_on_drop(true)
+                .status(),
+            )
+            .await
+            .expect("isolated peer cost test should finish within its deadline")
+            .expect("isolated peer cost test should launch");
+            assert!(status.success(), "isolated peer cost test failed: {status}");
+            return;
+        }
+
         use crate::agent::turn::provider_call::enforce_tool_loop_budget;
         use crate::control_plane::ControlPlaneHandle;
         use crate::cost::CostTracker;
@@ -1688,36 +1712,9 @@ mod tests {
         );
         release.notify_one();
 
-        // `execute()` already resolved the recipient's cost context off the
-        // process-global tracker (synchronously, before the detached spawn).
-        // Fetch the SAME Arc: same data_dir means same ledger path, so
-        // `CostTracker::resolve_global` reuses it rather than building a
-        // second one, to observe what the detached turn records.
-        let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-            .expect("execute() must have resolved a process-global cost tracker for an enabled cost config");
-
-        // The recipient's turn runs inside a detached `zeroclaw_spawn::spawn!`
-        // task that `execute()` does not join. Poll for its completion with a
-        // bounded, sleep-free yield loop (the same pattern already used for
-        // detached-task synchronization in `rpc/dispatch.rs`), never a fixed
-        // sleep.
-        let mut recipient_summary = None;
-        for _ in 0..20_000 {
-            let summary = tracker
-                .get_summary_for_agent("recipient")
-                .expect("recipient cost summary should be queryable");
-            if summary.request_count >= 1 {
-                recipient_summary = Some(summary);
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        let recipient_summary = recipient_summary.expect(
-            "the detached recipient turn must complete and record usage against the \
-             recipient alias; if this fires, execute() is no longer threading the \
-             cost-tracking scope into the spawned process_message future",
-        );
-
+        // Terminal settlement follows process_message, including its usage
+        // recording. Wait on that lifecycle fact before asserting accounting,
+        // not on an arbitrary number of reads of a per-instance usage counter.
         let terminal_snapshot = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let snapshot = task_store
@@ -1739,6 +1736,14 @@ mod tests {
             Some("peer turn complete")
         );
         assert!(terminal_snapshot.error.is_none());
+
+        // No other test can replace or reconfigure the singleton in this
+        // child, so this lookup observes the tracker bound by execute().
+        let tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+            .expect("execute() must have resolved a process-global cost tracker for an enabled cost config");
+        let recipient_summary = tracker
+            .get_summary_for_agent("recipient")
+            .expect("recipient cost summary should be queryable after task completion");
 
         // (1) Usage lands on the recipient alias in the per-agent ledger,
         // through the REAL tool boundary end to end - not just the helper.
@@ -1801,5 +1806,6 @@ mod tests {
         .expect("recipient finishes persistence and releases admission");
         assert!(lifecycle.begin_delete("recipient").is_ok());
         server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 }
