@@ -494,7 +494,7 @@ mod tests {
     fn acp_websocket_url_uses_config_host_and_port() {
         assert_eq!(
             acp_websocket_url("ws", "192.0.2.10", 49152, None),
-            "ws://192.0.2.10:49152/acp"
+            "ws://192.0.2.10:49152/acp" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         );
     }
 
@@ -502,7 +502,7 @@ mod tests {
     fn acp_websocket_url_brackets_ipv6_hosts() {
         assert_eq!(
             acp_websocket_url("ws", "::1", 42617, None),
-            "ws://[::1]:42617/acp"
+            "ws://[::1]:42617/acp" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         );
     }
 
