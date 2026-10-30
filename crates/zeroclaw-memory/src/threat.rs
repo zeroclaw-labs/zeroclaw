@@ -183,6 +183,16 @@ mod tests {
     }
 
     #[test]
+    fn findings_keep_byte_ranges_valid_after_unicode_prefixes() {
+        let content = "说明：api_key = \"abcdefghijklmnopqrstuvwxyz\"";
+        let finding = scan(content, Scope::On)
+            .into_iter()
+            .find(|finding| finding.kind == ThreatKind::HardcodedSecret)
+            .expect("secret assignment should be detected");
+        assert_eq!(&content[finding.byte_range], finding.matched);
+    }
+
+    #[test]
     fn url_with_credential_parameter_is_flagged() {
         let findings = scan(
             "fetch https://example.invalid/search?token=placeholder-value",
