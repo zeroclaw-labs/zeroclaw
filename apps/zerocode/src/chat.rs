@@ -51,6 +51,7 @@ use context_menu::{
     ChatContextMenu, ChatContextMenuAction, ChatContextMenuRequest, ChatContextMenuTarget,
 };
 
+mod entry_time;
 mod message_queue;
 mod transcript_layout;
 use message_queue::{AdmissionError, MessageQueue, QueuePauseReason};
@@ -1520,11 +1521,9 @@ impl Chat {
 
     pub(crate) fn note_elicitation_drop(&mut self) {
         if let ChatPhase::Active(ref mut state) = self.phase {
-            state
-                .entries
-                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                    "zc-chat-elicitation-dropped",
-                ))));
+            state.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                "zc-chat-elicitation-dropped",
+            ))));
             state.mark_dirty_append();
         }
     }
@@ -2818,6 +2817,9 @@ impl Chat {
             } else {
                 None
             };
+            // Removing the prompt also removes its turn boundary. Any output
+            // left behind must not acquire the previous loaded prompt's start.
+            let record_turn_end = refused_text.is_none();
             // A busy refusal never started the turn: return the message to
             // the queue before settling, so settling neither cleans up its
             // attachments nor loses its text. The text comes from the
@@ -2843,7 +2845,7 @@ impl Chat {
             } else {
                 QueuePauseReason::MissingCompletion
             };
-            state.settle_turn_from_prompt_response(pause_reason);
+            state.settle_turn_from_prompt_response(pause_reason, record_turn_end);
             let prompt_error = completion.error.clone();
             if let Some(error) = completion.error {
                 let key = if requeued {
@@ -3211,11 +3213,9 @@ impl Chat {
                     // so the carrier owes nothing.
                     state.lag_reattach = None;
                 }
-                state
-                    .entries
-                    .push(ChatEntry::SystemMessage(Arc::<str>::from(
-                        crate::i18n::t_args("zc-chat-resync-failed", &[("error", &error)]),
-                    )));
+                state.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(
+                    crate::i18n::t_args("zc-chat-resync-failed", &[("error", &error)]),
+                )));
                 state.last_error = Some(SessionError::ResyncFailed);
                 state.mark_dirty_append();
                 // Release the operation slot but keep dispatch fail-closed via
@@ -3331,11 +3331,9 @@ impl Chat {
             if !state.cancel_watchdog_expired() {
                 return;
             }
-            state
-                .entries
-                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                    "zc-cancel-timed-out",
-                ))));
+            state.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                "zc-cancel-timed-out",
+            ))));
             state.mark_dirty_append();
             state.commit_turn(String::new(), false);
             settled = true;
@@ -3362,9 +3360,7 @@ impl Chat {
             }
             Err(msg) => {
                 if let ChatPhase::Active(ref mut state) = self.phase {
-                    state
-                        .entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(msg)));
+                    state.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(msg)));
                     state.mark_dirty_append();
                 }
             }
@@ -3469,11 +3465,9 @@ impl Chat {
                     let composer_busy = !state.input_bar.input().trim().is_empty()
                         || state.input_bar.has_pending_attachments();
                     if composer_busy {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-queue-edit-busy",
-                            ))));
+                        state.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(
+                            crate::i18n::t("zc-queue-edit-busy"),
+                        )));
                         state.mark_dirty_append();
                     } else if let Some((text, attachments)) = state.take_queued_for_edit(id) {
                         state.input_bar.load_for_edit(text, attachments);
@@ -3607,18 +3601,16 @@ impl Chat {
                 Err(e) => {
                     let cleanup_report = cleanup_attachment_temps(&attachments);
                     state.surface_cleanup_report(cleanup_report);
-                    state
-                        .entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(
-                            crate::i18n::t_args(
-                                "zc-queue-dispatch-failed",
-                                // The anyhow context includes the local
-                                // attachment path. Keep it out of the
-                                // transcript; the cleanup notice already
-                                // reports the bounded, actionable count.
-                                &[("error", &e.root_cause().to_string())],
-                            ),
-                        )));
+                    state.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(
+                        crate::i18n::t_args(
+                            "zc-queue-dispatch-failed",
+                            // The anyhow context includes the local
+                            // attachment path. Keep it out of the
+                            // transcript; the cleanup notice already
+                            // reports the bounded, actionable count.
+                            &[("error", &e.root_cause().to_string())],
+                        ),
+                    )));
                     state.mark_dirty_append();
                     return;
                 }
@@ -4446,9 +4438,7 @@ impl Chat {
                     } else {
                         crate::i18n::t("zc-chat-thinking-hidden")
                     };
-                    state
-                        .entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(status)));
+                    state.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(status)));
                     state.mark_dirty_append();
                     return false;
                 }
@@ -7922,6 +7912,8 @@ fn render_conversation(
     // depend on it, and a width change invalidates cached layouts.
     let inner_width = area.width.saturating_sub(2);
 
+    state.refresh_labels_day(chrono::Local::now().date_naive());
+
     // ── Rebuild cached lines only when entries changed ────────
     if state.transcript_layout.view().dirty != LinesDirty::Clean
         || state.transcript_layout.view().cached_render_width != inner_width
@@ -9566,6 +9558,13 @@ impl PendingElicitation {
     }
 }
 
+/// Which cached transcript lines a turn-end mark invalidates.
+enum TurnEndChange {
+    None,
+    Tail(usize),
+    Full,
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
     AgentMessage(Arc<str>),
@@ -9773,6 +9772,14 @@ pub struct ChatState {
     /// reaches a terminal outcome.
     active_turn_attachments: Vec<PendingAttachment>,
     entries: Vec<ChatEntry>,
+    /// Time facts per entry in `entries`, index-aligned; they place the
+    /// transcript's gap dividers and turn footers. A shorter vector means
+    /// "no time" for the tail. Kept in step by `push_entry*`, `remove_entry`
+    /// and `clear_entries`.
+    entry_times: Vec<entry_time::EntryStamp>,
+    /// The local date the cached divider and footer labels were rendered
+    /// against ("Today", "Yesterday"); a new day forces a full rebuild.
+    labels_day: Option<chrono::NaiveDate>,
     streaming_text: String,
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
@@ -9946,6 +9953,8 @@ impl ChatState {
             input_bar: InputBarState::with_shared_commands(commands),
             active_turn_attachments: Vec::new(),
             entries: Vec::new(),
+            entry_times: Vec::new(),
+            labels_day: None,
             streaming_text: String::new(),
             streaming_thought: String::new(),
             pending_approval: None,
@@ -10004,6 +10013,85 @@ impl ChatState {
             todo_close_hit_rect: None,
             todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
         }
+    }
+
+    /// Append a transcript entry stamped with the local receive time.
+    fn push_entry(&mut self, entry: ChatEntry) {
+        self.push_entry_at(Some(chrono::Local::now()), entry);
+    }
+
+    /// Append a transcript entry with a known start time (`None`: unknown).
+    fn push_entry_at(&mut self, at: Option<chrono::DateTime<chrono::Local>>, entry: ChatEntry) {
+        self.entry_times
+            .resize(self.entries.len(), entry_time::EntryStamp::default());
+        self.entries.push(entry);
+        self.entry_times.push(entry_time::EntryStamp {
+            at,
+            ends_turn: entry_time::TurnEnd::No,
+        });
+    }
+
+    /// Mark the turn's last output as its end, at `at`, so its footer
+    /// follows it. The first live settle wins: a later terminal frame, or a
+    /// local notice pushed after it, does not move the end. An end inferred
+    /// from a history load (possibly taken mid-turn) is replaced. A turn with
+    /// no output has no end.
+    /// Returns which cached lines the change invalidates.
+    fn mark_turn_end(&mut self, at: chrono::DateTime<chrono::Local>) -> TurnEndChange {
+        let Some(last) = self.entries.len().checked_sub(1) else {
+            return TurnEndChange::None;
+        };
+        if matches!(self.entries[last], ChatEntry::UserMessage { .. }) {
+            return TurnEndChange::None;
+        }
+        self.entry_times
+            .resize(self.entries.len(), entry_time::EntryStamp::default());
+        let mut first = last;
+        while first > 0 && !matches!(self.entries[first - 1], ChatEntry::UserMessage { .. }) {
+            first -= 1;
+        }
+        if self.entry_times[first..=last]
+            .iter()
+            .any(|stamp| stamp.ends_turn == entry_time::TurnEnd::Settled)
+        {
+            return TurnEndChange::None;
+        }
+        let start = first
+            .checked_sub(1)
+            .and_then(|user_index| self.entry_times[user_index].at);
+        let mut moved = false;
+        for stamp in &mut self.entry_times[first..last] {
+            moved |= std::mem::take(&mut stamp.ends_turn) != entry_time::TurnEnd::No;
+        }
+        let stamp = &mut self.entry_times[last];
+        let end = stamp.at.map_or(at, |known| known.max(at));
+        stamp.at = Some(end);
+        stamp.ends_turn = entry_time::TurnEnd::Settled;
+        if moved {
+            // An earlier footer may already be drawn in the cache.
+            TurnEndChange::Full
+        } else if start.is_some_and(|start| entry_time::shows_footer(start, end)) {
+            TurnEndChange::Tail(last)
+        } else {
+            TurnEndChange::None
+        }
+    }
+
+    fn remove_entry(&mut self, index: usize) -> ChatEntry {
+        if index < self.entry_times.len() {
+            self.entry_times.remove(index);
+        }
+        self.entries.remove(index)
+    }
+
+    fn clear_entries(&mut self) {
+        self.entries.clear();
+        self.entry_times.clear();
+    }
+
+    #[cfg(test)]
+    fn entry_time(&self, index: usize) -> Option<chrono::DateTime<chrono::Local>> {
+        self.entry_times.get(index).and_then(|stamp| stamp.at)
     }
 
     fn mark_dirty_append(&mut self) {
@@ -10807,7 +10895,20 @@ impl ChatState {
         out
     }
 
+    /// Cached time labels say "Today" or "Yesterday" relative to the day they
+    /// were rendered; once the local date moves on, rebuild them all.
+    fn refresh_labels_day(&mut self, today: chrono::NaiveDate) {
+        if self.labels_day.is_some_and(|day| day != today) {
+            self.mark_dirty_full();
+        }
+    }
+
     fn rebuild_lines(&mut self, width: u16) {
+        self.rebuild_lines_on(width, chrono::Local::now().date_naive());
+    }
+
+    fn rebuild_lines_on(&mut self, width: u16, today: chrono::NaiveDate) {
+        self.labels_day = Some(today);
         if self.transcript_layout.view().cached_render_width != width {
             self.pending_url_activation = None;
         }
@@ -10821,6 +10922,13 @@ impl ChatState {
         let browse_cursor = self.browse_cursor;
         let browse_multi = &self.browse_multi;
         let tool_disclosures = &self.tool_disclosures;
+        let entries = &self.entries;
+        let marks = entry_time::time_marks_in(
+            |index| matches!(entries[index], ChatEntry::UserMessage { .. }),
+            entries.len(),
+            &self.entry_times,
+            range.clone(),
+        );
         let inputs =
             self.entries[range.clone()]
                 .iter()
@@ -10845,6 +10953,12 @@ impl ChatState {
                     EntryLayoutInput {
                         index,
                         entry,
+                        divider: marks[relative_index]
+                            .divider
+                            .map(|at| entry_time::divider_label(&at, today)),
+                        footer: marks[relative_index]
+                            .footer
+                            .map(|(start, end)| entry_time::footer_label(&start, &end, today)),
                         highlighted,
                         disclosure,
                     }
@@ -11387,8 +11501,7 @@ impl ChatState {
     fn flush_streaming_thought(&mut self) {
         let thought = std::mem::take(&mut self.streaming_thought);
         if !thought.is_empty() {
-            self.entries
-                .push(ChatEntry::AgentThought(Arc::<str>::from(thought)));
+            self.push_entry(ChatEntry::AgentThought(Arc::<str>::from(thought)));
             self.mark_dirty_append();
         }
     }
@@ -11400,8 +11513,7 @@ impl ChatState {
     fn flush_streaming_text(&mut self) -> bool {
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
-            self.entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(text)));
+            self.push_entry(ChatEntry::AgentMessage(Arc::<str>::from(text)));
             self.mark_dirty_append();
             true
         } else {
@@ -11503,7 +11615,7 @@ impl ChatState {
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::CallingTool(name.clone());
                 }
-                self.entries.push(ChatEntry::Tool {
+                self.push_entry(ChatEntry::Tool {
                     tool_call_id: Arc::<str>::from(tool_call_id),
                     name: Arc::<str>::from(name),
                     input_json: Arc::<str>::from(
@@ -11678,8 +11790,7 @@ impl ChatState {
                         ),
                     }
                 };
-                self.entries
-                    .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+                self.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
             }
             SessionUpdate::BudgetWarning {
@@ -11715,8 +11826,7 @@ impl ChatState {
                     ],
                 );
                 self.freeze_prompt_settled_stream();
-                self.entries
-                    .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
+                self.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
             }
             SessionUpdate::TurnComplete {
@@ -11743,8 +11853,9 @@ impl ChatState {
                         if outcome == TurnEndOutcome::Failed {
                             self.last_error = Some(classify_turn_failure(&content));
                         }
-                        self.entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(content.as_str())));
+                        self.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(
+                            content.as_str(),
+                        )));
                         self.mark_dirty_append();
                         self.commit_turn(String::new(), false);
                     }
@@ -11769,8 +11880,7 @@ impl ChatState {
         // daemon-provided final text as a fallback so the turn is never
         // invisible to the user.
         if !self.turn_had_streaming_text && !full_text.is_empty() {
-            self.entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(full_text)));
+            self.push_entry(ChatEntry::AgentMessage(Arc::<str>::from(full_text)));
             self.mark_dirty_append();
         } else if clean
             && !self.turn_had_streaming_text
@@ -11780,10 +11890,9 @@ impl ChatState {
             // Clean completion with no streamed text, no tool calls, and
             // no final content — render a diagnostic so the user knows the
             // turn finished rather than silently vanishing.
-            self.entries
-                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                    "zc-turn-no-output",
-                ))));
+            self.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                "zc-turn-no-output",
+            ))));
             self.mark_dirty_append();
         }
         self.turn_had_streaming_text = false;
@@ -11791,16 +11900,20 @@ impl ChatState {
         // A terminal notification resolves the earlier uncertainty, but the
         // queued backlog still waits for the user's deliberate resume.
         self.message_queue.acknowledge_terminal_notification();
-        self.settle_turn_lifecycle(clean, QueuePauseReason::Generic);
+        self.settle_turn_lifecycle(clean, QueuePauseReason::Generic, true);
     }
 
-    fn settle_turn_from_prompt_response(&mut self, pause_reason: QueuePauseReason) {
+    fn settle_turn_from_prompt_response(
+        &mut self,
+        pause_reason: QueuePauseReason,
+        record_turn_end: bool,
+    ) {
         self.freeze_prompt_settled_stream();
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
             self.turn_had_streaming_text = true;
             let entry_index = self.entries.len();
-            self.entries.push(ChatEntry::AgentMessageContinuation(text));
+            self.push_entry(ChatEntry::AgentMessageContinuation(text));
             self.prompt_settled_stream_entry = Some((self.turn_generation, entry_index));
             self.mark_dirty_append();
         }
@@ -11814,10 +11927,25 @@ impl ChatState {
         // Preserve per-turn provenance for a delayed terminal notification;
         // the next turn resets both flags when its user message is committed.
         self.mark_dirty_append();
-        self.settle_turn_lifecycle(false, pause_reason);
+        self.settle_turn_lifecycle(false, pause_reason, record_turn_end);
     }
 
-    fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
+    fn settle_turn_lifecycle(
+        &mut self,
+        clean: bool,
+        pause_reason: QueuePauseReason,
+        record_turn_end: bool,
+    ) {
+        // A new footer lands under the last cached entry: re-render that
+        // tail; a footer that moved needs every index. A refused prompt's
+        // optimistic row was removed, so the tail can belong to older history.
+        if record_turn_end {
+            match self.mark_turn_end(chrono::Local::now()) {
+                TurnEndChange::None => {}
+                TurnEndChange::Tail(entry_index) => self.mark_dirty_tail(entry_index),
+                TurnEndChange::Full => self.mark_dirty_full(),
+            }
+        }
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
         self.turn_status = TurnStatus::Idle;
@@ -11891,7 +12019,7 @@ impl ChatState {
             self.first_message = Some(t.clone());
         }
         let entry_index = self.entries.len();
-        self.entries.push(ChatEntry::UserMessage {
+        self.push_entry(ChatEntry::UserMessage {
             text: text.map(Arc::<str>::from),
             attachments: attachments.into_iter().map(Arc::<str>::from).collect(),
         });
@@ -11946,7 +12074,7 @@ impl ChatState {
             return None;
         };
         let removed = text.as_deref().unwrap_or_default().to_string();
-        self.entries.remove(entry_index);
+        self.remove_entry(entry_index);
         self.first_message = self.entries.iter().find_map(|entry| {
             let ChatEntry::UserMessage {
                 text: Some(text), ..
@@ -12058,10 +12186,9 @@ impl ChatState {
             self.last_error = Some(SessionError::TurnFailed);
         }
         if interrupted {
-            self.entries
-                .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                    "zc-chat-reconnect-interrupted",
-                ))));
+            self.push_entry(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                "zc-chat-reconnect-interrupted",
+            ))));
             self.mark_dirty_append();
         }
     }
@@ -12328,10 +12455,13 @@ impl ChatState {
             self.turn_had_streaming_text = true;
         }
         self.flush_streaming_thought();
-        self.entries
-            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+        // A local resync notice is not conversation activity.
+        self.push_entry_at(
+            None,
+            ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
                 "zc-chat-resynced-turn-running",
-            ))));
+            ))),
+        );
         self.info_message = None;
         self.lag_reattach = Some(LagReattach {
             generation: self.turn_generation,
@@ -12387,7 +12517,7 @@ impl ChatState {
         carried: Option<(crate::client::TurnEndOutcome, Arc<str>)>,
         prompt_error: Option<String>,
     ) {
-        self.entries.clear();
+        self.clear_entries();
         self.first_message = None;
         self.transcript_layout.reset();
         self.clear_transcript_selection();
@@ -12396,8 +12526,11 @@ impl ChatState {
             ResyncNotice::TurnFinished => crate::i18n::t("zc-chat-resynced-turn-finished"),
             ResyncNotice::Idle => crate::i18n::t("zc-chat-resynced"),
         };
-        self.entries
-            .push(ChatEntry::SystemMessage(Arc::<str>::from(notice_text)));
+        // Reloading history must not shorten the gap since the last exchange.
+        self.push_entry_at(
+            None,
+            ChatEntry::SystemMessage(Arc::<str>::from(notice_text)),
+        );
         self.info_message = None;
         // The reload clears the connection-class errors: a stale
         // `ResyncFailed` from this very resync must not stick once the
@@ -12419,10 +12552,10 @@ impl ChatState {
             match outcome {
                 crate::client::TurnEndOutcome::Failed => {
                     self.last_error = Some(classify_turn_failure(&text));
-                    self.entries.push(ChatEntry::SystemMessage(text.clone()));
+                    self.push_entry(ChatEntry::SystemMessage(text.clone()));
                 }
                 crate::client::TurnEndOutcome::Cancelled => {
-                    self.entries.push(ChatEntry::SystemMessage(text));
+                    self.push_entry(ChatEntry::SystemMessage(text));
                 }
                 crate::client::TurnEndOutcome::Completed => {}
             }
@@ -12442,6 +12575,12 @@ impl ChatState {
 
     fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>, acp_history: bool) {
         for m in messages {
+            // History carries the store's time, or none from an older
+            // daemon; never stamp a reloaded row with the reload time.
+            let at = m
+                .created_at
+                .as_deref()
+                .and_then(entry_time::parse_created_at);
             match m.kind {
                 crate::client::MessageEntryKind::ToolCall => {
                     let input_json = m
@@ -12449,14 +12588,17 @@ impl ChatState {
                         .as_ref()
                         .and_then(|value| serde_json::to_string(value).ok())
                         .unwrap_or_else(|| "null".to_string());
-                    self.entries.push(ChatEntry::Tool {
-                        tool_call_id: Arc::<str>::from(m.tool_call_id.unwrap_or_default()),
-                        name: Arc::<str>::from(
-                            m.tool_name.unwrap_or_else(|| "unknown".to_string()),
-                        ),
-                        input_json: Arc::<str>::from(input_json),
-                        result: m.tool_output.map(bounded_tool_output).map(Arc::<str>::from),
-                    });
+                    self.push_entry_at(
+                        at,
+                        ChatEntry::Tool {
+                            tool_call_id: Arc::<str>::from(m.tool_call_id.unwrap_or_default()),
+                            name: Arc::<str>::from(
+                                m.tool_name.unwrap_or_else(|| "unknown".to_string()),
+                            ),
+                            input_json: Arc::<str>::from(input_json),
+                            result: m.tool_output.map(bounded_tool_output).map(Arc::<str>::from),
+                        },
+                    );
                     continue;
                 }
                 crate::client::MessageEntryKind::ToolResult => {
@@ -12476,14 +12618,17 @@ impl ChatState {
                     {
                         *result = Some(Arc::<str>::from(output));
                     } else {
-                        self.entries.push(ChatEntry::Tool {
-                            tool_call_id: Arc::<str>::from(tool_call_id),
-                            name: Arc::<str>::from(
-                                m.tool_name.unwrap_or_else(|| "unknown".to_string()),
-                            ),
-                            input_json: Arc::<str>::from("null"),
-                            result: Some(Arc::<str>::from(output)),
-                        });
+                        self.push_entry_at(
+                            at,
+                            ChatEntry::Tool {
+                                tool_call_id: Arc::<str>::from(tool_call_id),
+                                name: Arc::<str>::from(
+                                    m.tool_name.unwrap_or_else(|| "unknown".to_string()),
+                                ),
+                                input_json: Arc::<str>::from("null"),
+                                result: Some(Arc::<str>::from(output)),
+                            },
+                        );
                     }
                     continue;
                 }
@@ -12500,23 +12645,43 @@ impl ChatState {
                     if self.first_message.is_none() && !display.trim().is_empty() {
                         self.first_message = Some(display.to_string());
                     }
-                    self.entries.push(ChatEntry::UserMessage {
-                        text: Some(Arc::<str>::from(m.content)),
-                        attachments: vec![],
-                    });
+                    self.push_entry_at(
+                        at,
+                        ChatEntry::UserMessage {
+                            text: Some(Arc::<str>::from(m.content)),
+                            attachments: vec![],
+                        },
+                    );
                 }
                 crate::client::MessageRole::Assistant => {
-                    self.entries
-                        .push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
+                    self.push_entry_at(at, ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
                 }
                 crate::client::MessageRole::System if acp_history => {
                     // ACP history excludes real system prompts in the store.
                     // Its system rows are persisted recovery notices, not
                     // provider instructions. Ordinary Chat has no such contract.
-                    self.entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(m.content)));
+                    self.push_entry_at(at, ChatEntry::SystemMessage(Arc::<str>::from(m.content)));
                 }
                 crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
+            }
+        }
+        // History rows carry the turn's finish time on its last output; mark
+        // each turn's last entry as its end so the footer follows it. A turn
+        // that ends in a system row (an interruption or recovery marker) is
+        // left without an end: recovery stamps its rows when it runs, which
+        // can be hours after the turn stopped.
+        self.entry_times
+            .resize(self.entries.len(), entry_time::EntryStamp::default());
+        for index in 0..self.entries.len() {
+            let ends_turn = !matches!(
+                self.entries[index],
+                ChatEntry::UserMessage { .. } | ChatEntry::SystemMessage(_)
+            ) && self
+                .entries
+                .get(index + 1)
+                .is_none_or(|next| matches!(next, ChatEntry::UserMessage { .. }));
+            if ends_turn && self.entry_times[index].ends_turn == entry_time::TurnEnd::No {
+                self.entry_times[index].ends_turn = entry_time::TurnEnd::Loaded;
             }
         }
         self.mark_dirty_full();
@@ -12539,7 +12704,7 @@ impl ChatState {
         self.model = None;
         self.input_bar.reset();
         let mut cleanup_report = self.input_bar.take_cleanup_report();
-        self.entries.clear();
+        self.clear_entries();
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.transcript_layout.reset();
@@ -12847,6 +13012,408 @@ mod tests {
                 "recognized {text:?}"
             );
         }
+    }
+
+    fn transcript_text(state: &ChatState) -> Vec<String> {
+        state
+            .transcript_layout
+            .view()
+            .cached_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn today_at(hour: u32, minute: u32, second: u32) -> String {
+        use chrono::TimeZone;
+        let day = chrono::Local::now().date_naive();
+        chrono::Local
+            .from_local_datetime(&day.and_hms_opt(hour, minute, second).unwrap())
+            .earliest()
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    /// RFC 3339 time `minutes` before now: a past time on any clock.
+    fn minutes_ago(minutes: i64) -> String {
+        (chrono::Local::now() - chrono::TimeDelta::minutes(minutes)).to_rfc3339()
+    }
+
+    fn timed(role: &str, content: &str, at: String) -> crate::client::MessageEntry {
+        crate::client::MessageEntry {
+            role: role.to_string(),
+            content: content.to_string(),
+            created_at: Some(at),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn day_labels_rebuild_when_the_local_date_changes() {
+        let mut s = state();
+        s.load_history(
+            vec![
+                timed("user", "evening ask", today_at(1, 0, 0)),
+                timed("assistant", "answer", today_at(1, 0, 5)),
+            ],
+            true,
+        );
+        let today = chrono::Local::now().date_naive();
+        s.rebuild_lines_on(80, today);
+        assert!(
+            transcript_text(&s)
+                .iter()
+                .any(|line| line.trim() == "── Today 01:00 ──")
+        );
+        assert_eq!(s.transcript_layout.view().dirty, LinesDirty::Clean);
+
+        s.refresh_labels_day(today);
+        assert_eq!(
+            s.transcript_layout.view().dirty,
+            LinesDirty::Clean,
+            "same day: the cache stands"
+        );
+
+        let tomorrow = today.succ_opt().unwrap();
+        s.refresh_labels_day(tomorrow);
+        assert_ne!(
+            s.transcript_layout.view().dirty,
+            LinesDirty::Clean,
+            "a new day must invalidate cached Today/Yesterday labels"
+        );
+        s.rebuild_lines_on(80, tomorrow);
+        assert!(
+            transcript_text(&s)
+                .iter()
+                .any(|line| line.trim() == "── Yesterday 01:00 ──"),
+            "{:#?}",
+            transcript_text(&s)
+        );
+    }
+
+    #[test]
+    fn transcript_shows_gap_dividers_and_long_turn_footers_not_message_times() {
+        let mut s = state();
+        s.load_history(
+            vec![
+                timed("user", "first ask", today_at(1, 0, 0)),
+                timed("assistant", "slow answer", today_at(1, 31, 40)),
+                // Four minutes later, a quick follow-up: no divider, no footer.
+                timed("user", "quick follow-up", today_at(1, 35, 0)),
+                timed("assistant", "quick answer", today_at(1, 35, 20)),
+                // After a 25-minute gap: a divider.
+                timed("user", "after a break", today_at(2, 0, 0)),
+                timed("assistant", "done", today_at(2, 0, 5)),
+            ],
+            true,
+        );
+        s.rebuild_lines(80);
+        let text = transcript_text(&s);
+        let dividers: Vec<_> = text
+            .iter()
+            .filter(|line| line.contains("── Today "))
+            .collect();
+        assert_eq!(dividers.len(), 2, "{text:#?}");
+        assert!(dividers[0].trim() == "── Today 01:00 ──");
+        assert!(dividers[1].trim() == "── Today 02:00 ──");
+        let footers: Vec<_> = text
+            .iter()
+            .filter(|line| line.starts_with("─── "))
+            .collect();
+        assert_eq!(footers, ["─── 01:00 → 01:31 · 31m 40s"], "{text:#?}");
+        let footer_at = text
+            .iter()
+            .position(|line| line.starts_with("─── "))
+            .unwrap();
+        assert_eq!(text[footer_at - 1], "slow answer");
+        assert!(text[footer_at + 1].starts_with(&crate::i18n::t("zc-chat-label-you")));
+        assert!(
+            text.iter()
+                .filter(
+                    |line| line.starts_with(&crate::i18n::t("zc-chat-label-you"))
+                        || line.starts_with(&crate::i18n::t("zc-chat-label-agent"))
+                )
+                .all(|line| !line.contains(":0") && !line.contains(":3")),
+            "message headers carry no time: {text:#?}"
+        );
+        // The marks sit outside the entries' own line ranges.
+        let view = s.transcript_layout.view();
+        for &(_, lo, hi) in &view.cached_line_ranges {
+            for line in &text[lo..hi] {
+                assert!(!line.starts_with("─── ") && !line.contains("── Today "));
+            }
+        }
+    }
+
+    #[test]
+    fn a_prompt_after_a_reload_notice_keeps_the_last_exchange_gap() {
+        for notice in [ResyncNotice::Idle, ResyncNotice::TurnFinished] {
+            let mut s = state();
+            s.replace_history_after_notification_resync(
+                vec![
+                    timed("user", "old question", minutes_ago(121)),
+                    timed("assistant", "old answer", minutes_ago(120)),
+                ],
+                true,
+                notice,
+                None,
+                None,
+            );
+            // Cache the reloaded history before appending the next live prompt.
+            s.rebuild_lines(80);
+            let notice_text = crate::i18n::t(match notice {
+                ResyncNotice::Idle => "zc-chat-resynced",
+                ResyncNotice::TurnFinished => "zc-chat-resynced-turn-finished",
+            });
+            assert!(
+                transcript_text(&s)
+                    .iter()
+                    .any(|line| line.contains(&notice_text)),
+                "the reload notice remains visible"
+            );
+
+            s.push_user_message(Some("new question".to_string()), Vec::new());
+            let prompt_index = s.entries.len() - 1;
+            let prompt_at = s.entry_time(prompt_index).unwrap();
+            let today = prompt_at.date_naive();
+            s.rebuild_lines_on(80, today);
+            let text = transcript_text(&s);
+            let divider = format!("── {} ──", entry_time::divider_label(&prompt_at, today));
+            let prompt_line = s
+                .transcript_layout
+                .view()
+                .cached_line_ranges
+                .iter()
+                .find(|(index, _, _)| *index == prompt_index)
+                .map(|(_, lo, _)| *lo)
+                .expect("the new prompt is rendered");
+            assert_eq!(
+                text[prompt_line - 1].trim(),
+                divider,
+                "the two-hour gap survives the local {notice:?} notice: {text:#?}"
+            );
+
+            s.mark_dirty_full();
+            s.rebuild_lines_on(80, today);
+            assert_eq!(transcript_text(&s), text);
+        }
+    }
+
+    #[test]
+    fn a_recovered_turn_gets_no_footer_from_its_recovery_time() {
+        let mut s = state();
+        s.load_history(
+            vec![
+                timed("user", "long task", today_at(1, 0, 0)),
+                timed("assistant", "partial", today_at(9, 0, 0)),
+                // Recovery wrote both rows hours later, with one time.
+                timed("system", "[stream interrupted]", today_at(9, 0, 0)),
+            ],
+            true,
+        );
+        s.rebuild_lines(80);
+        let text = transcript_text(&s);
+        assert!(
+            !text.iter().any(|line| line.starts_with("─── ")),
+            "{text:#?}"
+        );
+    }
+
+    #[test]
+    fn a_history_load_taken_mid_turn_hands_the_footer_to_the_live_settle() {
+        let mut s = state();
+        s.load_history(
+            vec![
+                // Relative to now: the live settle below stamps the end
+                // with the current time, so the start must be in the past.
+                timed("user", "long task", minutes_ago(40)),
+                timed("assistant", "partial so far", minutes_ago(30)),
+            ],
+            true,
+        );
+        s.rebuild_lines(80);
+        assert_eq!(
+            transcript_text(&s)
+                .iter()
+                .filter(|line| line.starts_with("─── "))
+                .count(),
+            1,
+            "the loaded turn looks finished at first"
+        );
+        // The turn was still running: more output arrives, then it settles.
+        s.push_entry(ChatEntry::AgentMessage(Arc::from("final answer")));
+        s.mark_dirty_append();
+        s.rebuild_lines(80);
+        s.turn_had_streaming_text = true;
+        s.commit_turn(String::new(), true);
+        assert_eq!(
+            s.transcript_layout.view().dirty,
+            LinesDirty::Full,
+            "a footer that moves invalidates the cached copy"
+        );
+        s.rebuild_lines(80);
+        let text = transcript_text(&s);
+        let footers: Vec<_> = text
+            .iter()
+            .filter(|line| line.starts_with("─── "))
+            .collect();
+        assert_eq!(
+            footers.len(),
+            1,
+            "the stale cached footer must go: {text:#?}"
+        );
+        assert_eq!(text.last(), Some(footers[0]), "{text:#?}");
+    }
+
+    #[test]
+    fn a_footer_on_a_divided_entry_keeps_one_divider() {
+        let mut s = state();
+        let at = entry_time::parse_created_at(&today_at(1, 0, 0)).unwrap();
+        let today = at.date_naive();
+        // A tool-only turn: its single output entry may be the one re-rendered.
+        s.push_user_message(Some("long task".to_string()), Vec::new());
+        s.entry_times[0].at = Some(at);
+        s.mark_dirty_full();
+        s.rebuild_lines_on(80, today);
+        // Re-render the divided user entry itself as a tail change.
+        s.mark_dirty_tail(0);
+        s.rebuild_lines_on(80, today);
+        let text = transcript_text(&s);
+        assert_eq!(
+            text.iter()
+                .filter(|line| line.contains("── Today "))
+                .count(),
+            1,
+            "{text:#?}"
+        );
+        s.mark_dirty_full();
+        s.rebuild_lines_on(80, today);
+        assert_eq!(transcript_text(&s), text);
+    }
+
+    #[test]
+    fn a_live_turn_gets_its_footer_when_it_settles() {
+        let mut s = state();
+        s.push_user_message(Some("long task".to_string()), Vec::new());
+        // Pretend the prompt went out five minutes ago.
+        s.entry_times[0].at = Some(chrono::Local::now() - chrono::TimeDelta::minutes(5));
+        // A streamed reply, committed before the terminal frame.
+        s.push_entry(ChatEntry::AgentMessage(Arc::from("working on it")));
+        s.turn_had_streaming_text = true;
+        s.mark_dirty_append();
+        s.rebuild_lines(80);
+        assert!(
+            !transcript_text(&s)
+                .iter()
+                .any(|line| line.starts_with("─── ")),
+            "no footer while the turn runs"
+        );
+        s.commit_turn(String::new(), true);
+        assert_eq!(
+            s.transcript_layout.view().dirty,
+            LinesDirty::TailChanged(1),
+            "a new footer re-renders only the tail"
+        );
+        s.rebuild_lines(80);
+        let text = transcript_text(&s);
+        let footers: Vec<_> = text
+            .iter()
+            .filter(|line| line.starts_with("─── "))
+            .collect();
+        assert_eq!(footers.len(), 1, "{text:#?}");
+        assert!(footers[0].ends_with("· 5m 00s"), "{}", footers[0]);
+        assert_eq!(text.last(), Some(footers[0]), "the footer closes the turn");
+
+        // A later terminal frame (here it adds a notice) does not move the
+        // end: the footer stays under the turn's output.
+        s.commit_turn(String::new(), true);
+        s.rebuild_lines(80);
+        let later = transcript_text(&s);
+        assert_eq!(later[..text.len()], text[..], "{later:#?}");
+        assert_eq!(
+            later.iter().filter(|line| line.starts_with("─── ")).count(),
+            1,
+            "{later:#?}"
+        );
+        let text = later;
+
+        // The incremental result equals a full rebuild.
+        s.mark_dirty_full();
+        s.rebuild_lines(80);
+        assert_eq!(transcript_text(&s), text);
+    }
+
+    #[test]
+    fn history_entries_take_the_daemon_time_and_stay_aligned() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+
+        let mut s = state();
+        s.load_history(
+            vec![
+                MessageEntry {
+                    role: "user".to_string(),
+                    content: "question".to_string(),
+                    created_at: Some("2026-10-08T17:00:00+00:00".to_string()),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "Tool call: shell".to_string(),
+                    kind: MessageEntryKind::ToolCall,
+                    tool_call_id: Some("call-1".to_string()),
+                    tool_name: Some("shell".to_string()),
+                    created_at: Some("2026-10-08T17:05:00+00:00".to_string()),
+                    ..Default::default()
+                },
+                MessageEntry {
+                    role: "assistant".to_string(),
+                    content: "from an older daemon".to_string(),
+                    ..Default::default()
+                },
+            ],
+            true,
+        );
+        assert_eq!(s.entries().len(), 3);
+        fn utc(s: &ChatState, index: usize) -> Option<String> {
+            s.entry_time(index)
+                .map(|at| at.with_timezone(&chrono::Utc).to_rfc3339())
+        }
+        assert_eq!(utc(&s, 0).as_deref(), Some("2026-10-08T17:00:00+00:00"));
+        assert_eq!(utc(&s, 1).as_deref(), Some("2026-10-08T17:05:00+00:00"));
+        assert_eq!(utc(&s, 2), None, "a reload never invents a time");
+
+        // Live entries are stamped on receipt and stay index-aligned when an
+        // optimistic row is removed.
+        s.push_entry(ChatEntry::SystemMessage(Arc::from("notice")));
+        assert!(s.entry_time(3).is_some());
+        s.remove_entry(1);
+        assert_eq!(utc(&s, 0).as_deref(), Some("2026-10-08T17:00:00+00:00"));
+        assert_eq!(utc(&s, 1), None);
+        assert!(s.entry_time(2).is_some());
+        s.clear_entries();
+        assert_eq!(s.entry_time(0), None);
+    }
+
+    #[test]
+    fn older_daemon_message_entries_without_created_at_still_deserialize() {
+        let entry: crate::client::MessageEntry =
+            serde_json::from_value(serde_json::json!({"role": "user", "content": "hi"})).unwrap();
+        assert_eq!(entry.created_at, None);
+        let entry: crate::client::MessageEntry = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "hi",
+            "created_at": "2026-10-08T17:00:00+00:00"
+        }))
+        .unwrap();
+        assert_eq!(
+            entry.created_at.as_deref(),
+            Some("2026-10-08T17:00:00+00:00")
+        );
     }
 
     #[test]
@@ -25841,6 +26408,7 @@ mod tests {
     fn budget_warning_shows_one_notice_per_period_and_limit() {
         let mut s = state();
         s.apply_update(budget_warning(8.25, 10.0, "day"));
+        assert!(s.entry_time(0).is_some(), "the live notice has a time");
         // The daemon repeats it every turn while spend stays over the line.
         s.apply_update(budget_warning(9.10, 10.0, "day"));
         let notices = system_messages(&s);
@@ -25855,6 +26423,8 @@ mod tests {
         s.apply_update(budget_warning(850.0, 1000.0, "month"));
         let notices = system_messages(&s);
         assert_eq!(notices.len(), 3, "{notices:?}");
+        assert_eq!(s.entry_times.len(), s.entries().len());
+        assert!(s.entry_times.iter().all(|stamp| stamp.at.is_some()));
         assert!(notices[2].contains("monthly"), "{}", notices[2]);
 
         // Coming back to a pair already shown stays quiet, even after others.
@@ -30952,6 +31522,7 @@ mod tests {
                     tool_name: Some("shell".to_string()),
                     tool_input: Some(serde_json::json!({"command": "pwd"})),
                     tool_output: None,
+                    created_at: None,
                 },
                 MessageEntry {
                     role: "tool".to_string(),
@@ -30961,6 +31532,7 @@ mod tests {
                     tool_name: Some("shell".to_string()),
                     tool_input: None,
                     tool_output: Some("/tmp".to_string()),
+                    created_at: None,
                 },
             ],
             false,
@@ -30993,6 +31565,7 @@ mod tests {
                 tool_name: Some("shell".to_string()),
                 tool_input: Some(serde_json::json!({})),
                 tool_output: Some("λ".repeat(9_000)),
+                created_at: None,
             }],
             false,
         );
@@ -31926,6 +32499,62 @@ mod tests {
 
         assert!(!active_state(&mut chat).turn_in_flight);
         assert_eq!(active_state(&mut chat).message_count, 7);
+    }
+
+    #[tokio::test]
+    async fn refused_prompt_preserves_loaded_turn_times() {
+        for (error_code, partial_output) in [
+            (crate::jsonrpc::error_codes::SESSION_BUSY, false),
+            (crate::jsonrpc::error_codes::INVALID_PARAMS, false),
+            (crate::jsonrpc::error_codes::INVALID_PARAMS, true),
+        ] {
+            let (mut chat, mut writer_rx) = test_chat();
+            let mut active = state();
+            active.load_history(
+                vec![
+                    timed("user", "old prompt", "2026-10-08T17:00:00Z".into()),
+                    timed("assistant", "old answer", "2026-10-08T17:00:05Z".into()),
+                ],
+                true,
+            );
+            let render_day = chrono::Local::now().date_naive();
+            active.rebuild_lines_on(80, render_day);
+            let original_times = active.entry_times.clone();
+            let original_text = transcript_text(&active);
+            active
+                .enqueue_message("refused prompt".to_string(), Vec::new())
+                .unwrap();
+            chat.phase = ChatPhase::Active(Box::new(active));
+            chat.pump_all_queues();
+            let request = next_rpc_request(&mut writer_rx, "prompt should be sent").await;
+            if partial_output {
+                active_state(&mut chat).apply_update(SessionUpdate::AgentMessageChunk {
+                    session_id: "sess-1".to_string(),
+                    text: "partial reply before the error".to_string(),
+                });
+            }
+            respond_err(&chat.rpc_out, &request, error_code, "prompt refused");
+            tokio::task::yield_now().await;
+            chat.drain_prompt_completions();
+
+            let active = active_state(&mut chat);
+            assert!(!active.turn_in_flight);
+            assert_eq!(active.entries().len(), 2 + usize::from(partial_output));
+            assert_eq!(
+                active.entry_times[..2],
+                original_times[..],
+                "error code {error_code}"
+            );
+            active.rebuild_lines_on(80, render_day);
+            let text = transcript_text(active);
+            assert_eq!(text[..original_text.len()], original_text[..]);
+            assert!(
+                !transcript_text(active)
+                    .iter()
+                    .any(|line| line.starts_with("─── ")),
+                "a refused prompt cannot add a footer to an old five-second turn"
+            );
+        }
     }
 
     #[tokio::test]
