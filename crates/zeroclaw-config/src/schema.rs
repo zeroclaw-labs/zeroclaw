@@ -920,6 +920,24 @@ pub enum AuthMode {
     OAuth,
 }
 
+/// Authentication mode for Anthropic aliases.
+///
+/// This provider-local type deliberately serializes OAuth as `oauth`, without
+/// changing the established spelling used by other provider families.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicAuthMode {
+    /// Standard API key authentication via the `api_key` field.
+    #[default]
+    ApiKey,
+    /// A stored setup-token profile named after the alias.
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
 /// Prompt-cache entry lifetime to request for this provider's Anthropic
 /// cache markers. `"5m"` is the API default; `"1h"` extends the cache
 /// entry lifetime to one hour so a pause longer than five minutes does
@@ -1359,9 +1377,7 @@ impl ModelEndpoint for AnthropicEndpoint {
     }
 }
 
-/// Anthropic model model_provider config. No family-specific extras yet — typed
-/// slot reserved for future Anthropic-only knobs (cache_control, beta
-/// headers) so they land cleanly without another schema rework.
+/// Anthropic model provider config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1369,6 +1385,11 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// Selects the credential source. Omitting this field preserves the legacy
+    /// `api_key` path, including existing inline setup tokens.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AnthropicAuthMode>,
     /// Models Anthropic may fall back to **server-side, inside one API call**
     /// when the requested model's safety classifiers decline a request
     /// (`stop_reason: "refusal"`). Sent as the native `fallbacks` parameter with
@@ -1381,6 +1402,15 @@ pub struct AnthropicModelProviderConfig {
     /// sends no fallback parameter and no beta value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_fallback_models: Vec<String>,
+}
+
+impl AnthropicModelProviderConfig {
+    /// OAuth setup tokens are accepted only by Anthropic's public API.
+    pub fn has_official_oauth_endpoint(api_url: Option<&str>) -> bool {
+        // The native provider appends its own API path. Normalize only surrounding
+        // whitespace; canonicalizing URL paths could bypass this exact-root allowlist.
+        api_url.is_none_or(|url| url.trim() == AnthropicEndpoint::Default.uri())
+    }
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -24284,6 +24314,46 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
+
+        for (alias, provider) in &self.providers.models.anthropic {
+            if provider.auth_mode != Some(AnthropicAuthMode::OAuth) {
+                continue;
+            }
+            let path = format!("providers.models.anthropic.{alias}");
+            if let Err(error) = crate::helpers::validate_alias_key(alias) {
+                validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "{path}: auth_mode = \"oauth\" requires a canonical alias: {error}"
+                );
+            }
+            if provider.base.api_key.is_some() {
+                validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "{path}: auth_mode = \"oauth\" must not be combined with api_key"
+                );
+            }
+            // This typed slot is already Anthropic. A `kind` override would
+            // select a different implementation after permissive loading and
+            // bypass this alias's stored-profile OAuth contract.
+            if provider.base.kind.is_some() {
+                validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "{path}: auth_mode = \"oauth\" must not be combined with kind"
+                );
+            }
+            if !AnthropicModelProviderConfig::has_official_oauth_endpoint(
+                provider.base.uri.as_deref(),
+            ) {
+                validation_bail!(
+                    InvalidFormat,
+                    path,
+                    "{path}: auth_mode = \"oauth\" requires the official https://api.anthropic.com endpoint"
+                );
+            }
+        }
 
         for (profile_alias, profile) in &self.runtime_profiles {
             if profile.max_execution_tree_iterations == Some(0) {
@@ -51144,6 +51214,7 @@ group_policy = "all"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-fable-5".to_string()],
+                ..Default::default()
             },
         );
 
@@ -51164,6 +51235,7 @@ group_policy = "all"
                     ..Default::default()
                 },
                 server_fallback_models: vec!["claude-opus-4-8".to_string()],
+                ..Default::default()
             },
         );
 
@@ -51759,6 +51831,173 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    #[test]
+    async fn anthropic_legacy_alias_omits_auth_mode_on_round_trip() {
+        let legacy: AnthropicModelProviderConfig =
+            toml::from_str("model = \"claude-sonnet-4-5\"\napi_key = \"sk-ant-oat01-legacy\"\n")
+                .expect("legacy Anthropic alias should deserialize");
+
+        assert_eq!(legacy.auth_mode, None);
+        let serialized = toml::to_string(&legacy).expect("legacy alias should serialize");
+        assert!(
+            !serialized.contains("auth_mode"),
+            "legacy aliases must not be rewritten with auth_mode: {serialized}"
+        );
+    }
+
+    #[test]
+    async fn anthropic_oauth_mode_uses_the_documented_toml_spelling() {
+        let oauth: AnthropicModelProviderConfig = toml::from_str("auth_mode = \"oauth\"\n")
+            .expect("documented oauth spelling should deserialize");
+        assert_eq!(oauth.auth_mode, Some(AnthropicAuthMode::OAuth));
+        assert!(
+            toml::to_string(&oauth)
+                .expect("OAuth config should serialize")
+                .contains("auth_mode = \"oauth\""),
+        );
+        assert!(
+            toml::from_str::<AnthropicModelProviderConfig>("auth_mode = \"o_auth\"\n").is_err(),
+            "the obsolete o_auth spelling must not be accepted"
+        );
+    }
+
+    #[test]
+    async fn anthropic_oauth_rejects_inline_key_and_nonofficial_endpoint() {
+        let mut inline_key = Config::default();
+        inline_key.providers.models.anthropic.insert(
+            "subscription".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("not-allowed-in-oauth-mode".into()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+        assert!(
+            inline_key
+                .validate()
+                .expect_err("OAuth plus api_key must fail")
+                .to_string()
+                .contains("must not be combined")
+        );
+
+        let mut proxy = Config::default();
+        proxy.providers.models.anthropic.insert(
+            "subscription".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some("https://proxy.example".into()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+        assert!(
+            proxy
+                .validate()
+                .expect_err("OAuth must use the official endpoint")
+                .to_string()
+                .contains("official https://api.anthropic.com")
+        );
+
+        let mut kind_override = Config::default();
+        kind_override.providers.models.anthropic.insert(
+            "subscription".into(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".into()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+        assert!(
+            kind_override
+                .validate()
+                .expect_err("OAuth must not dispatch through a kind override")
+                .to_string()
+                .contains("must not be combined with kind")
+        );
+
+        for uri in [
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/",
+            "https://api.anthropic.com?unexpected=query",
+            "https://api.anthropic.com#unexpected-fragment",
+        ] {
+            let mut config = Config::default();
+            config.providers.models.anthropic.insert(
+                "subscription".into(),
+                AnthropicModelProviderConfig {
+                    base: ModelProviderConfig {
+                        uri: Some(uri.into()),
+                        ..Default::default()
+                    },
+                    auth_mode: Some(AnthropicAuthMode::OAuth),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                config
+                    .validate()
+                    .expect_err("OAuth must reject non-root official endpoint")
+                    .to_string()
+                    .contains("official https://api.anthropic.com"),
+                "OAuth must reject non-root official endpoint {uri:?} with the official-endpoint error"
+            );
+        }
+
+        for uri in [
+            None,
+            Some("https://api.anthropic.com"),
+            Some(" https://api.anthropic.com "),
+        ] {
+            let mut config = Config::default();
+            config.providers.models.anthropic.insert(
+                "subscription".into(),
+                AnthropicModelProviderConfig {
+                    base: ModelProviderConfig {
+                        uri: uri.map(str::to_owned),
+                        ..Default::default()
+                    },
+                    auth_mode: Some(AnthropicAuthMode::OAuth),
+                    ..Default::default()
+                },
+            );
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("OAuth must accept {uri:?}: {error}"));
+        }
+    }
+
+    #[test]
+    async fn anthropic_oauth_rejects_noncanonical_profile_aliases() {
+        for alias in ["team:subscription", " subscription", "subscription "] {
+            let mut config = Config::default();
+            config.providers.models.anthropic.insert(
+                alias.to_string(),
+                AnthropicModelProviderConfig {
+                    auth_mode: Some(AnthropicAuthMode::OAuth),
+                    ..Default::default()
+                },
+            );
+
+            let error = config
+                .validate()
+                .expect_err("OAuth alias must use the canonical model-alias grammar");
+            let error = error.to_string();
+            assert!(
+                error.contains("requires a canonical alias"),
+                "unexpected validation error for {alias:?}: {error}"
+            );
+        }
     }
 
     fn effort_routing_config() -> super::Config {

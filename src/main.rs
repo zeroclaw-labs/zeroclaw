@@ -116,6 +116,36 @@ fn discard_until_newline<R: std::io::BufRead>(reader: &mut R) -> std::io::Result
     }
 }
 
+/// Resolve the configured provider for the kernel-only `agent` command without
+/// discarding the alias before it reaches the typed provider factory.
+#[cfg(not(feature = "agent-runtime"))]
+async fn build_foundation_agent_provider(
+    config: &Config,
+    agent_alias: &str,
+) -> Result<(Box<dyn zeroclaw_providers::ModelProvider>, String)> {
+    let (model_provider_ref, resolved_entry) = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .map(|(provider_name, provider_alias, entry)| {
+            (format!("{provider_name}.{provider_alias}"), Some(entry))
+        })
+        // No configured entry means the historical foundation-only fallback is
+        // the bare provider family. A dotted `openai.default` is a configured
+        // alias reference and must fail closed when that entry is absent.
+        .unwrap_or_else(|| ("openai".to_string(), None));
+    let model_name = resolved_entry
+        .and_then(|entry| entry.model.as_deref())
+        .unwrap_or("default")
+        .to_string();
+    // Alias-aware factories may synchronously exchange refresh tokens.
+    let config = config.clone();
+    let model_provider = tokio::task::spawn_blocking(move || {
+        zeroclaw_providers::create_model_provider_from_ref(&config, &model_provider_ref)
+    })
+    .await
+    .context("foundation provider construction task failed")??;
+    Ok((model_provider, model_name))
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "agent-runtime")]
@@ -10015,22 +10045,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     );
                 }
 
-                let (provider_name, resolved_entry) = config
-                    .resolved_model_provider_for_agent(&agent_alias)
-                    .map(|(ty, _alias, entry)| (ty, Some(entry)))
-                    .unwrap_or(("openai", None));
-                let model_provider = zeroclaw::providers::create_model_provider(
-                    provider_name,
-                    resolved_entry.and_then(|e| e.api_key.as_deref()),
-                )?;
-                let model_name = resolved_entry
-                    .and_then(|e| e.model.as_deref())
-                    .unwrap_or("default");
+                let (model_provider, model_name) =
+                    build_foundation_agent_provider(&config, &agent_alias).await?;
                 match message {
                     Some(msg) => {
                         let response =
                             zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                .simple_chat(&msg, model_name, Some(final_temperature))
+                                .simple_chat(&msg, &model_name, Some(final_temperature))
                                 .await?;
                         println!("{response}");
                     }
@@ -10059,7 +10080,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             };
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                    .simple_chat(line.trim(), model_name, Some(final_temperature))
+                                    .simple_chat(line.trim(), &model_name, Some(final_temperature))
                                     .await?;
                             println!("{response}");
                         }
@@ -16754,6 +16775,127 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(not(feature = "agent-runtime"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foundation_agent_provider_keeps_the_configured_anthropic_oauth_alias() {
+        use zeroclaw_api::attribution::Attributable;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, AnthropicAuthMode, AnthropicModelProviderConfig,
+            ModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4-6".to_string()),
+                    ..Default::default()
+                },
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "worker".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.subscription".into(),
+                ..Default::default()
+            },
+        );
+
+        let (provider, model) = build_foundation_agent_provider(&config, "worker")
+            .await
+            .expect("kernel CLI construction must retain the configured alias");
+
+        assert_eq!(model, "claude-sonnet-4-6");
+        assert_eq!(
+            provider.alias(),
+            "subscription",
+            "the foundation-only CLI must use the alias-aware provider factory"
+        );
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn foundation_agent_provider_without_a_configured_entry_keeps_the_bare_openai_fallback() {
+        let config = Config::default();
+
+        let (provider, model) = build_foundation_agent_provider(&config, "worker")
+            .await
+            .expect("the historical bare OpenAI fallback must remain constructible");
+
+        assert_eq!(provider.alias(), "default");
+        assert_eq!(model, "default");
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foundation_agent_provider_refresh_is_async_safe_and_propagates_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, QwenModelProviderConfig,
+        };
+
+        struct EndpointReset;
+        impl Drop for EndpointReset {
+            fn drop(&mut self) {
+                zeroclaw_providers::set_qwen_oauth_endpoint_for_test(None);
+            }
+        }
+        let server = MockServer::start().await;
+        zeroclaw_providers::set_qwen_oauth_endpoint_for_test(Some(format!(
+            "{}/token",
+            server.uri()
+        )));
+        let _reset = EndpointReset;
+        let mut config = Config::default();
+        config.providers.models.qwen.insert(
+            "worker".into(),
+            QwenModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("qwen-fixture".into()),
+                    ..Default::default()
+                },
+                oauth_refresh_token: Some("synthetic-refresh-token".into()),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "worker".into(),
+            AliasedAgentConfig {
+                model_provider: "qwen.worker".into(),
+                ..Default::default()
+            },
+        );
+        for status in [200, 503] {
+            let mock = Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "access_token": "synthetic-access-token", "expires_in": 3600,
+                        "resource_url": format!("{}/v1", server.uri()),
+                    })),
+                )
+                .expect(1)
+                .mount_as_scoped(&server)
+                .await;
+            match build_foundation_agent_provider(&config, "worker").await {
+                Ok((provider, model)) => {
+                    assert_eq!(status, 200);
+                    assert_eq!(model, "qwen-fixture");
+                    assert_eq!(provider.alias(), "worker");
+                }
+                Err(error) => {
+                    assert_eq!(status, 503);
+                    assert!(error.is::<zeroclaw_providers::auth::ProviderCredentialRefreshError>());
+                }
+            }
+            assert_eq!(mock.received_requests().await.len(), 1);
+        }
+    }
 
     #[cfg(feature = "plugins-wasm")]
     #[test]
