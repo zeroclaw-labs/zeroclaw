@@ -56,6 +56,8 @@ pub(super) struct TranscriptLayoutView {
     pub cached_render_start: usize,
     /// Layout width; changing it invalidates tables and every screen index.
     pub cached_render_width: u16,
+    /// Cache input, compared with the live transport policy on every draw.
+    pub cached_path_links: bool,
     pub cached_total_rows: u16,
 }
 
@@ -81,6 +83,7 @@ impl TranscriptLayoutCache {
                 cached_entry_count: 0,
                 cached_render_start: 0,
                 cached_render_width: 0,
+                cached_path_links: false,
                 cached_total_rows: 0,
             },
         }
@@ -180,11 +183,13 @@ impl TranscriptLayoutCache {
         width: u16,
         range: Range<usize>,
         show_thoughts: bool,
+        path_links: bool,
         mut inputs: impl Iterator<Item = EntryLayoutInput<'a>>,
     ) {
-        if self.layout.cached_render_width != width {
+        if self.layout.cached_render_width != width || self.layout.cached_path_links != path_links {
             self.invalidate_full();
             self.layout.cached_render_width = width;
+            self.layout.cached_path_links = path_links;
         }
 
         // A prompt-response fallback may settle just before its final chunks arrive.
@@ -215,8 +220,11 @@ impl TranscriptLayoutCache {
             self.layout
                 .cached_url_regions
                 .retain(|region| region.row < row_start);
-            let mut regions =
-                finalize_url_line_regions(&mut self.layout.cached_lines[line_start..], width);
+            let mut regions = finalize_url_line_regions(
+                &mut self.layout.cached_lines[line_start..],
+                width,
+                path_links,
+            );
             offset_url_line_regions(&mut regions, row_start);
             self.layout.cached_url_regions.extend(regions);
         } else if self.layout.dirty == LinesDirty::Appended
@@ -230,7 +238,7 @@ impl TranscriptLayoutCache {
             self.layout
                 .cached_row_breaks
                 .extend(row_breaks_for_lines(new_lines, width));
-            let mut regions = finalize_url_line_regions(new_lines, width);
+            let mut regions = finalize_url_line_regions(new_lines, width, path_links);
             offset_url_line_regions(&mut regions, self.layout.cached_total_rows);
             self.layout.cached_url_regions.extend(regions);
         } else {
@@ -242,7 +250,7 @@ impl TranscriptLayoutCache {
             }
             self.layout.cached_row_breaks = row_breaks_for_lines(&self.layout.cached_lines, width);
             self.layout.cached_url_regions =
-                finalize_url_line_regions(&mut self.layout.cached_lines, width);
+                finalize_url_line_regions(&mut self.layout.cached_lines, width, path_links);
         }
 
         self.layout.cached_entry_count = range.len();
