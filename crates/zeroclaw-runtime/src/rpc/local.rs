@@ -187,6 +187,7 @@ pub enum LocalRpcCallError {
 
 #[cfg(unix)]
 async fn connect_client(path: &std::path::Path) -> std::io::Result<tokio::net::UnixStream> {
+    platform::require_addressable_path(path)?;
     tokio::net::UnixStream::connect(path).await
 }
 
@@ -1164,6 +1165,14 @@ mod platform {
     /// neither the path nor the limit, and by then the sibling lock file
     /// would already have been created for an endpoint that can never exist.
     pub(super) fn require_bindable_path(path: &Path) -> Result<()> {
+        require_addressable_path(path)?;
+        Ok(())
+    }
+
+    /// Same check as [`require_bindable_path`] for the client side, so a
+    /// connect to an over-long path fails with the remedy instead of std's
+    /// bare `InvalidInput`.
+    pub(super) fn require_addressable_path(path: &Path) -> std::io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
 
         let len = path.as_os_str().as_bytes().len();
@@ -1176,8 +1185,7 @@ mod platform {
                      shorter --config-dir",
                     path.display()
                 ),
-            )
-            .into());
+            ));
         }
         Ok(())
     }
@@ -1619,6 +1627,35 @@ mod tests {
             .await
             .expect_err("absent endpoint must not look like a protocol failure");
         assert!(matches!(error, LocalRpcCallError::Unavailable { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_local_explains_an_overlong_socket_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("d".repeat(platform::MAX_SOCKET_PATH_BYTES));
+        let config = Config {
+            data_dir,
+            ..Config::default()
+        };
+
+        let error = call_local(&config, "agents/list", serde_json::json!({}))
+            .await
+            .expect_err("an over-long socket path cannot connect");
+        let LocalRpcCallError::Unavailable { source, .. } = &error else {
+            panic!("expected Unavailable, got {error:?}");
+        };
+        assert_eq!(source.kind(), ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "this platform allows at most {}",
+                platform::MAX_SOCKET_PATH_BYTES
+            )),
+            "{message}"
+        );
+        assert!(message.contains("ZEROCLAW_SOCKET"), "{message}");
+        assert!(message.contains("--config-dir"), "{message}");
     }
 
     #[cfg(unix)]
