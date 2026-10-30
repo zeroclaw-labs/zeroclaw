@@ -1573,6 +1573,42 @@ impl RpcDispatcher {
         Ok(())
     }
 
+    /// Refuse a rename or delete whose cascade would save a config entry the
+    /// caller may not write. The handler checked the entry the caller named;
+    /// the cascade rewrites every entry that referred to it, such as a
+    /// permission profile's `allowed_channels`, and a `channels.*` writer must
+    /// not reach `permission_profiles.*` that way. The references a cascade
+    /// rewrites are part of the write set, as on the gateway's config routes:
+    /// one ungranted member refuses the whole mutation and nothing is saved.
+    /// The grants are re-resolved live, as in
+    /// [`Self::recheck_config_write_authority`].
+    fn refuse_ungranted_cascade(
+        &self,
+        method: Method,
+        dirty_paths: &[String],
+    ) -> Result<(), JsonRpcError> {
+        use crate::rpc::auth::AuthDenied;
+
+        let refuse = |denied: AuthDenied| -> JsonRpcError {
+            self.audit_auth_denial(method, &denied);
+            rpc_err(denied.code, denied.message)
+        };
+        let Some(grants) = self.recheck_authority_after_admission(method)? else {
+            return Err(refuse(AuthDenied::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-first-call-initialize"),
+            )));
+        };
+        if let Some(path) = dirty_paths
+            .iter()
+            .find(|path| !grants.may_write_config(path))
+        {
+            return Err(refuse(AuthDenied::forbidden(format!(
+                "Principal is not granted config write access to {path:?}, which this change also rewrites"
+            ))));
+        }
+        Ok(())
+    }
+
     /// Fine-grained agent selector for surfaces that address an agent: cron
     /// rows, attachments, personality files, per-agent cost, and SOP
     /// authoring. Composes with the coarse grant the gate already enforced:
@@ -10293,7 +10329,9 @@ impl RpcDispatcher {
             .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
             let deleted = cascade.deleted_entry.is_some();
             if deleted {
-                for path in cascade.dirty_paths() {
+                let dirty = cascade.dirty_paths();
+                self.refuse_ungranted_cascade(Method::ConfigMapKeyDelete, &dirty)?;
+                for path in dirty {
                     working.mark_dirty(&path);
                 }
                 // Scope on the new (post-delete) provider ref is moot — the
@@ -10531,6 +10569,7 @@ impl RpcDispatcher {
                     &req.to,
                 )
                 .map_err(|e| rename_error_to_rpc(&req.path, &req.from, e))?;
+                self.refuse_ungranted_cascade(Method::ConfigMapKeyRename, &report.dirty_paths)?;
                 for path in &report.dirty_paths {
                     working.mark_dirty(path);
                 }
@@ -34170,6 +34209,91 @@ mod tests {
         config
     }
 
+    /// A caller granted `channels.*` renames a channel instance that a
+    /// permission profile's `allowed_channels` names. The cascade would
+    /// rewrite that profile, which the caller may not write, so the whole
+    /// rename is refused and nothing changes. Granted `permission_profiles.*`
+    /// as well, the same rename succeeds and the grant follows the channel.
+    #[tokio::test]
+    async fn config_map_key_rename_refuses_a_cascade_outside_the_callers_write_paths() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        use zeroclaw_config::schema::{PermissionProfileConfig, PluginChannelConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = roster_config_in(&tmp, 4242);
+        config.channels.plugin.insert(
+            "main".into(),
+            PluginChannelConfig {
+                package: "fixture-plugin".into(),
+                ..PluginChannelConfig::default()
+            },
+        );
+        config.permission_profiles.insert(
+            "ops".into(),
+            PermissionProfileConfig {
+                allowed_channels: vec!["plugin.main".into()],
+                ..PermissionProfileConfig::default()
+            },
+        );
+        let writer = config
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the roster profile exists");
+        writer
+            .grants
+            .insert(Resource::Config, vec![Verb::Read, Verb::Update]);
+        writer.config_write_paths = vec!["channels.*".into()];
+        let (ctx, _clears) = make_supervised_generation_ctx(config);
+        let (mut alice, mut rx) = roster_peer(&ctx, 4242).await;
+        let rename = json!({"path": "channels.plugin", "from": "main", "to": "primary"});
+
+        let refused = rpc(
+            &mut alice,
+            &mut rx,
+            1,
+            "config/map-key-rename",
+            rename.clone(),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], json!(FORBIDDEN), "{refused}");
+        let message = refused["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("permission_profiles.ops"), "{message}");
+        {
+            let live = ctx.config.read();
+            assert!(live.channels.plugin.contains_key("main"));
+            assert!(!live.channels.plugin.contains_key("primary"));
+            assert_eq!(
+                live.permission_profiles["ops"].allowed_channels,
+                ["plugin.main"]
+            );
+        }
+        assert!(
+            !tmp.path().join("config.toml").exists(),
+            "nothing was saved"
+        );
+
+        // Granted the profiles too, in the accepted policy and the live config.
+        let mut widened = ctx.config.read().clone();
+        widened
+            .permission_profiles
+            .get_mut("reader")
+            .expect("the roster profile exists")
+            .config_write_paths
+            .push("permission_profiles.*".into());
+        ctx.auth
+            .refresh_from_config(&widened)
+            .expect("the widened policy compiles");
+        ctx.config_authority.publish_for_test(widened);
+        let renamed = rpc(&mut alice, &mut rx, 2, "config/map-key-rename", rename).await;
+        assert_eq!(renamed["result"]["renamed"], json!(true), "{renamed}");
+        let live = ctx.config.read();
+        assert!(live.channels.plugin.contains_key("primary"));
+        assert_eq!(
+            live.permission_profiles["ops"].allowed_channels,
+            ["plugin.primary"]
+        );
+    }
+
     #[tokio::test]
     async fn config_map_key_rename_uses_agent_cascade() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -37429,6 +37553,19 @@ mod tests {
     fn make_supervised_generation_dispatcher(
         config: zeroclaw_config::schema::Config,
     ) -> (RpcDispatcher, Arc<std::sync::atomic::AtomicUsize>) {
+        let (ctx, clears) = make_supervised_generation_ctx(config);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-supervised-generation".to_string());
+        dispatcher.set_authenticated_for_test();
+        (dispatcher, clears)
+    }
+
+    /// A context whose channel generation controls are wired, so a
+    /// `channels.*` or `peer_groups.*` map key can be mutated through the
+    /// real handlers. The counter records live channel registry clears.
+    fn make_supervised_generation_ctx(
+        config: zeroclaw_config::schema::Config,
+    ) -> (Arc<RpcContext>, Arc<std::sync::atomic::AtomicUsize>) {
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
         crate::agent::loop_::register_approval_channel_map_fn(Box::new(|_| HashMap::new()));
@@ -37477,10 +37614,7 @@ mod tests {
             auth,
             plugin_webhooks: None,
         });
-        let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-supervised-generation".to_string());
-        dispatcher.set_authenticated_for_test();
-        (dispatcher, clears)
+        (ctx, clears)
     }
 
     fn make_secret_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
