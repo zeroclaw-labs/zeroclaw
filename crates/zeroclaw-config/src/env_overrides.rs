@@ -261,6 +261,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_agent_discovery_environment_matches_native_config() {
+        let _guard = super::env_test_lock().await;
+        let _vars = [
+            EnvVarGuard::set("ZEROCLAW_a2a__server__enabled", "true"),
+            EnvVarGuard::set(
+                "ZEROCLAW_a2a__server__public_base_url",
+                "http://127.0.0.1:42617",
+            ),
+            EnvVarGuard::set("ZEROCLAW_a2a__client__enabled", "true"),
+            EnvVarGuard::set(
+                "ZEROCLAW_a2a__client__allowed_private_hosts",
+                r#"["127.0.0.1"]"#,
+            ),
+            EnvVarGuard::set("ZEROCLAW_a2a__client__card_cache_ttl_secs", "0"),
+            EnvVarGuard::set(
+                "ZEROCLAW_a2a__client__peers__self__base_url",
+                "http://127.0.0.1:42617",
+            ),
+        ];
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("discovery environment resolves");
+        assert_eq!(applied.paths.len(), 6);
+        assert!(config.a2a.server.enabled);
+        assert_eq!(config.a2a.server.public_base_url, "http://127.0.0.1:42617");
+        assert!(config.a2a.client.enabled);
+        assert_eq!(config.a2a.client.allowed_private_hosts, ["127.0.0.1"]);
+        assert_eq!(config.a2a.client.card_cache_ttl_secs, 0);
+        assert_eq!(config.a2a.client.peers.len(), 1);
+        assert_eq!(config.a2a.client.peers[0].name, "self");
+        assert_eq!(
+            config.a2a.client.peers[0].base_url,
+            "http://127.0.0.1:42617"
+        );
+        assert!(config.a2a.client.peers[0].token.is_empty());
+    }
+
+    #[tokio::test]
     async fn walker_resolves_typed_family_alias_default() {
         let _guard = super::env_test_lock().await;
         let _v = EnvVarGuard::set(

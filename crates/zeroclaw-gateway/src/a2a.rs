@@ -216,6 +216,14 @@ fn identity_description(config: &Config, alias: &str) -> Option<String> {
     let aieos = zeroclaw_runtime::identity::load_aieos_identity(&agent.identity, &workspace_dir)
         .ok()
         .flatten()?;
+    if let Some(description) = aieos
+        .history
+        .and_then(|history| history.origin_story)
+        .as_deref()
+        .and_then(organizational_description)
+    {
+        return Some(description);
+    }
     let identity = aieos.identity?;
     let line = identity
         .bio
@@ -223,6 +231,24 @@ fn identity_description(config: &Config, alias: &str) -> Option<String> {
         .or_else(|| identity.names.and_then(identity_name_line))?;
     let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
     (!collapsed.is_empty()).then_some(collapsed)
+}
+
+/// Organizational identity stays in the existing identity document; cards are
+/// a public projection, not a second registry of roles and responsibilities.
+fn organizational_description(origin_story: &str) -> Option<String> {
+    let field = |label: &str| {
+        origin_story.lines().find_map(|line| {
+            let (key, value) = line.trim().split_once(':')?;
+            (key.eq_ignore_ascii_case(label) && !value.trim().is_empty())
+                .then(|| value.split_whitespace().collect::<Vec<_>>().join(" "))
+        })
+    };
+    let name = field("Name")?;
+    let organization = field("Organization")?;
+    let purpose = field("Purpose")?;
+    Some(format!(
+        "{name}. Organization: {organization}. Purpose: {purpose}"
+    ))
 }
 
 /// Build a name line from identity `names`, preferring the fullest form.
@@ -672,6 +698,43 @@ mod tests {
     use super::*;
     use zeroclaw_config::multi_agent::AgentA2aConfig;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+    #[test]
+    fn organizational_profile_uses_canonical_identity_fields() {
+        assert_eq!(
+            organizational_description(
+                "# Identity\nName: Test Engineer\nOrganization: example/engineering\nPurpose: Review engineering work.\n"
+            ),
+            Some("Test Engineer. Organization: example/engineering. Purpose: Review engineering work.".into())
+        );
+        assert!(organizational_description("Name: Test Engineer\nPurpose: Review work.").is_none());
+    }
+
+    #[test]
+    fn organizational_profile_precedes_demographic_bio_and_preserves_fallback() {
+        let mut config = config_with_published_alias("engineer", true);
+        let agent = config.agents.get_mut("engineer").unwrap();
+        agent.identity.format = "aieos".into();
+        agent.identity.aieos_inline = Some(serde_json::json!({
+            "identity": {"names": {"first": "Test", "last": "Engineer"}, "bio": {"age": 0}},
+            "history": {"origin_story": "Name: Test Engineer\nOrganization: example/engineering\nPurpose: Review engineering work."}
+        }).to_string());
+        let description = build_agent_card(&config, "engineer").unwrap().description;
+        assert!(description.contains("example/engineering"));
+        assert!(description.contains("Review engineering work."));
+        assert!(!description.contains("age"));
+        config
+            .agents
+            .get_mut("engineer")
+            .unwrap()
+            .identity
+            .aieos_inline =
+            Some(r#"{"identity":{"names":{"first":"Test"},"bio":"Existing public bio"}}"#.into());
+        assert_eq!(
+            build_agent_card(&config, "engineer").unwrap().description,
+            "Existing public bio"
+        );
+    }
 
     fn config_with_published_alias(alias: &str, published: bool) -> Config {
         let mut config = Config::default();

@@ -4084,10 +4084,25 @@ pub(crate) async fn assemble_owned_execution_with_admission(
     let mcp_prompt_section = assembled.combined_mcp_prompt_section();
     let crate::tools::scoped::ScopedAssembled {
         registry,
+        ask_user_handle,
+        channel_room_handle,
+        reaction_handle,
+        poll_handle,
+        escalate_handle,
         activated_handle,
         mcp_tool_names,
         ..
     } = assembled;
+    // Match a fresh turn for the step agent, never the parent's channel scope.
+    crate::agent::loop_::seed_channel_handles(
+        config,
+        alias,
+        &ask_user_handle,
+        &channel_room_handle,
+        &reaction_handle,
+        &poll_handle,
+        &escalate_handle,
+    );
     // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
     let tools_registry = registry;
 
@@ -7109,6 +7124,224 @@ mod sop_step_reassembly_tests {
 
     fn tool_names(tools: &[Box<dyn crate::tools::Tool>]) -> Vec<String> {
         tools.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    #[test]
+    fn cross_agent_channel_delivery_uses_step_authority() {
+        // The registered factory is process-global and write-once. Run this
+        // fixture alone rather than racing other channel-factory unit tests.
+        const CHILD: &str = "ZEROCLAW_SOP_CHANNEL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let receipt = tmp.path().join("passed");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "agent::turn::sop_step_reassembly_tests::cross_agent_channel_delivery_uses_step_authority",
+                    "--nocapture",
+                ])
+                .env(CHILD, &receipt)
+                .output()
+                .expect("isolated channel test starts");
+            assert!(
+                output.status.success(),
+                "isolated channel test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // An accidentally stale --exact filter must not pass with zero tests.
+            assert_eq!(
+                std::fs::read(receipt).expect("child ran the fixture"),
+                b"ok"
+            );
+            return;
+        }
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(check_cross_agent_channel_delivery());
+        std::fs::write(std::env::var_os(CHILD).unwrap(), b"ok").unwrap();
+    }
+
+    async fn check_cross_agent_channel_delivery() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, AgentMemoryConfig, MemoryBackendKind, PeerGroupConfig, PeerUsername,
+        };
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OllamaModelProviderConfig,
+            RiskProfileConfig,
+        };
+
+        struct StubChannel(Arc<AtomicUsize>);
+        impl zeroclaw_api::attribution::Attributable for StubChannel {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Channel(
+                    zeroclaw_api::attribution::ChannelKind::Webhook,
+                )
+            }
+            fn alias(&self) -> &str {
+                "fixture"
+            }
+        }
+        #[async_trait::async_trait]
+        impl Channel for StubChannel {
+            fn name(&self) -> &str {
+                "webhook"
+            }
+            async fn send(&self, message: &SendMessage) -> Result<()> {
+                assert_eq!(message.content, "fixture body");
+                assert_eq!(message.recipient, "fixture-recipient");
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn listen(&self, _: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let channel: Arc<dyn Channel> = Arc::new(StubChannel(sends.clone()));
+        crate::agent::loop_::register_channel_map_fn(Box::new(move |config, alias| {
+            assert!(matches!(alias, "permitted" | "unauthorized" | "no-channel"));
+            if config.agents[alias].channels.is_empty() {
+                Default::default()
+            } else {
+                [("webhook.fixture".into(), channel.clone())].into()
+            }
+        }));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        let results = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_results = results.clone();
+        // Exercise the real driver with an empty execution cache, including
+        // provider construction and cross-agent assembly. Each step gets one
+        // immediate send call, followed by a final response after its result.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let result = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["role"] == "tool");
+                let message = if let Some(result) = result {
+                    captured_results
+                        .lock()
+                        .unwrap()
+                        .push(result["content"].as_str().unwrap().to_string());
+                    serde_json::json!({"role":"assistant", "content":"done"})
+                } else {
+                    serde_json::json!({"role":"assistant", "content":"", "tool_calls":[{
+                        "id":"fixture-send", "type":"function",
+                        "function":{"name":"send_via", "arguments":serde_json::json!({
+                            "target":"webhook.fixture", "body":"fixture body"
+                        }).to_string()}
+                    }]})
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id":"fixture-response", "model":"fixture",
+                    "choices":[{"index":0, "message":message, "finish_reason":"stop"}]
+                }))
+            })
+            .expect(6)
+            .mount(&server)
+            .await;
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.tools.optional = vec!["send_via".into()];
+        config.risk_profiles.insert(
+            "fixture".into(),
+            RiskProfileConfig {
+                allowed_tools: vec!["send_via".into()],
+                auto_approve: vec!["send_via".into()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.providers.models.ollama.insert(
+            "fixture".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("fixture".into()),
+                    uri: Some(server.uri()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        for alias in ["permitted", "unauthorized", "no-channel"] {
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    model_provider: "ollama.fixture".into(),
+                    risk_profile: "fixture".into(),
+                    channels: if alias == "no-channel" {
+                        vec![]
+                    } else {
+                        vec!["webhook.fixture".into()]
+                    },
+                    memory: AgentMemoryConfig {
+                        backend: MemoryBackendKind::Markdown,
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        config.peer_groups.insert(
+            "fixture".into(),
+            PeerGroupConfig {
+                channel: "webhook.fixture".into(),
+                agents: vec![AgentAlias::new("permitted"), AgentAlias::new("no-channel")],
+                external_peers: vec![PeerUsername::new("fixture-recipient")],
+                ..Default::default()
+            },
+        );
+        for (alias, expected_result) in [
+            ("permitted", "immediate"),
+            ("unauthorized", "not within any peer group"),
+            ("no-channel", "not found"),
+        ] {
+            let (engine, run_id, action) = start_single_cross_agent_step(alias);
+            let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+            drive_step(
+                engine.clone(),
+                action,
+                &TextProvider,
+                &parent_tools,
+                &crate::observability::NoopObserver {},
+                &mut vec![],
+                None,
+                None,
+                None,
+                Some("outer"),
+                Some(SopStepReassembly {
+                    config: &config,
+                    live_config: None,
+                }),
+                None,
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
+            let step_result = step1_result(&engine, &run_id);
+            assert_eq!(
+                step_result.status,
+                crate::sop::types::SopStepStatus::Completed,
+                "{step_result:?}"
+            );
+            assert_eq!(sends.load(Ordering::SeqCst), 1, "step {alias}");
+            let result = results
+                .lock()
+                .unwrap()
+                .pop()
+                .expect("driver executed send_via");
+            assert!(result.contains(expected_result), "step {alias}: {result}");
+        }
     }
 
     /// Real-scope tie: re-assembling a step's named agent yields THAT agent's

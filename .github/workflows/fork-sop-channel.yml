@@ -1,0 +1,82 @@
+name: Fork SOP channel image
+
+on:
+  push:
+    branches: [fix/sop-channel-v086]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-sop-channel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.repository == 'cwahn/zeroclaw'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: '1.96.0'
+          components: rustfmt, clippy
+      - run: rustfmt --edition 2024 --check crates/zeroclaw-runtime/src/agent/turn/mod.rs
+      # Protect cross-agent channel authority for this v0.8.6 fork patch;
+      # retire this publisher when the upstream repair is adopted.
+      - run: cargo test -p zeroclaw-runtime --lib sop_step_reassembly_tests --locked
+      - run: rustfmt --edition 2024 --check crates/zeroclaw-tools/src/a2a_client.rs crates/zeroclaw-gateway/src/a2a.rs crates/zeroclaw-config/src/env_overrides.rs crates/zeroclaw-config/src/multi_agent.rs
+      - run: cargo test -p zeroclaw-tools --lib a2a_client::tests --locked
+      - run: cargo test -p zeroclaw-gateway --lib a2a::tests --locked
+      # PR #12098: prove the deployment overrides resolve to native discovery
+      # settings; retire with this fork publisher after upstream adoption.
+      - run: cargo test -p zeroclaw-config --lib --locked
+      - run: cargo clippy -p zeroclaw-tools -p zeroclaw-gateway --lib --locked -- -D warnings
+
+  publish:
+    if: github.repository == 'cwahn/zeroclaw'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/build-push-action@1dc73863535b631f98b2378be8619f83b136f4a0 # v6.18.0
+        id: image
+        with:
+          context: .
+          file: Containerfile
+          target: package-fat
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          build-args: ZEROCLAW_BUILD_ID=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/cwahn/zeroclaw
+            org.opencontainers.image.revision=${{ github.sha }}
+          tags: |
+            ghcr.io/cwahn/zeroclaw:sha-${{ github.sha }}
+            ghcr.io/cwahn/zeroclaw:all-features-v0.8.6-sop-channel-1
+      - uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+      - name: Sign and report immutable image
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          cosign sign --yes "ghcr.io/cwahn/zeroclaw@${DIGEST}"
+          echo "ghcr.io/cwahn/zeroclaw@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
