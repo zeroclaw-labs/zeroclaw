@@ -1715,3 +1715,13 @@ turn-repeated-success-advisory = The same tool call returned the same successful
 turn-repeated-failure-recovery = The same tool call failed with the same result repeatedly. Change the approach or explain the blocker. One further identical retry is available before this turn stops.
 turn-repeated-failure-exhausted = The recovery retry failed with the same result, so this turn has stopped. Completed tool results have been preserved. You can retry in a new turn.
 turn-repeated-failure-retry-skipped = Skipped an additional identical call in this recovery batch. Only one recovery retry is available.
+
+# Local CLI admin transport for the configured gateway.
+cli-gateway-admin-client-cert-required = gateway.tls.client_auth requires a client certificate, but CLI admin commands (get-paircode, sop, gateway restart) do not present one. Use a client that presents a mutual-TLS identity to call the admin endpoints.
+cli-gateway-admin-cert-path-empty = gateway.tls.enabled is set but cert_path is empty; set [gateway.tls] cert_path so the CLI can trust the gateway certificate.
+cli-gateway-admin-cert-read-failed = Failed to read gateway TLS certificate at {$path}.
+cli-gateway-admin-cert-invalid = Invalid PEM in gateway TLS certificate at {$path}.
+cli-gateway-admin-cert-empty = Gateway TLS certificate at {$path} contained no certificates.
+cli-gateway-admin-client-build-failed = Failed to build gateway admin HTTP client.
+cli-gateway-admin-shutdown-status = Gateway shutdown responded with status: {$status}.
+cli-gateway-admin-connect-failed = Failed to connect to gateway.
