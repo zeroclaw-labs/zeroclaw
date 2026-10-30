@@ -3410,15 +3410,15 @@ impl Chat {
                 let ChatPhase::Active(ref mut state) = self.phase else {
                     return;
                 };
-                if !state.copy_text_and_clear_selection(&target.text) {
+                let Some(outcome) = state.copy_text_and_clear_selection(&target.text) else {
                     return;
-                }
+                };
                 match target.kind {
                     CopyHitKind::Code => {
-                        state.set_copy_feedback(CopyFeedbackTarget::Code(target.group));
+                        state.set_copy_feedback(CopyFeedbackTarget::Code(target.group), outcome);
                     }
                     CopyHitKind::Message | CopyHitKind::Transcript => {
-                        state.set_overlay_copy_feedback(target.rect);
+                        state.set_overlay_copy_feedback(target.rect, outcome);
                     }
                 }
             }
@@ -3434,9 +3434,8 @@ impl Chat {
                 }
             }
             ChatContextMenuRequest::CopyUrl(url) => {
-                crate::mouse::copy_osc52(&url);
                 if let ChatPhase::Active(ref mut state) = self.phase {
-                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                    let _ = state.copy_text(&url);
                 }
             }
             ChatContextMenuRequest::Queue { id, action } => match action {
@@ -3458,8 +3457,7 @@ impl Chat {
                     let Some(text) = state.queued_text(id).filter(|text| !text.is_empty()) else {
                         return;
                     };
-                    crate::mouse::copy_osc52(&text);
-                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                    let _ = state.copy_text(&text);
                 }
                 ChatContextMenuAction::AddToChat => {}
                 ChatContextMenuAction::Edit => {
@@ -4299,7 +4297,10 @@ impl Chat {
         // The focused composer owns its editing chords before queue shortcuts
         // or transcript copy. Modals and browse mode retain first refusal.
         if state.composer_owns_text_input() && state.input_bar.claims_edit_key(&key) {
-            state.input_bar.handle_key(key);
+            if let InputBarAction::StatusMessage(message) = state.input_bar.handle_key(key) {
+                let cleanup_notice = state.input_bar.take_cleanup_report().notice();
+                state.set_info_notice(append_cleanup_notice(message, cleanup_notice));
+            }
             return false;
         }
 
@@ -5550,12 +5551,16 @@ impl Chat {
                                     ChatContextMenuRequest::AddToChat(region),
                                 )
                                 .await;
-                            } else if state.copy_text_and_clear_selection(&region.text) {
+                            } else if let Some(outcome) =
+                                state.copy_text_and_clear_selection(&region.text)
+                            {
                                 match region.kind {
-                                    CopyHitKind::Code => state
-                                        .set_copy_feedback(CopyFeedbackTarget::Code(region.group)),
+                                    CopyHitKind::Code => state.set_copy_feedback(
+                                        CopyFeedbackTarget::Code(region.group),
+                                        outcome,
+                                    ),
                                     CopyHitKind::Transcript => {
-                                        state.set_overlay_copy_feedback(region.rect);
+                                        state.set_overlay_copy_feedback(region.rect, outcome);
                                     }
                                     CopyHitKind::Message => {}
                                 }
@@ -5623,16 +5628,19 @@ impl Chat {
                         .find(|r| mouse::in_rect(col, row, r.rect))
                         .cloned()
                     {
-                        if state.copy_text_and_clear_selection(&region.text) {
+                        if let Some(outcome) = state.copy_text_and_clear_selection(&region.text) {
                             match region.kind {
                                 CopyHitKind::Code => {
-                                    state.set_copy_feedback(CopyFeedbackTarget::Code(region.group));
+                                    state.set_copy_feedback(
+                                        CopyFeedbackTarget::Code(region.group),
+                                        outcome,
+                                    );
                                 }
                                 CopyHitKind::Message => {
-                                    state.set_overlay_copy_feedback(region.rect);
+                                    state.set_overlay_copy_feedback(region.rect, outcome);
                                 }
                                 CopyHitKind::Transcript => {
-                                    state.set_overlay_copy_feedback(region.rect);
+                                    state.set_overlay_copy_feedback(region.rect, outcome);
                                 }
                             }
                         }
@@ -5835,13 +5843,24 @@ impl Chat {
 
     /// Copy is local even when normal pane dispatch is disabled after a
     /// disconnect. Do not call the general handler: other keys can send RPCs.
-    pub(crate) fn copy_composer_selection(&self, key: &KeyEvent) -> bool {
-        matches!(&self.phase, ChatPhase::Active(state)
-            if state.composer_owns_text_input()
-                && state.input_bar.has_selection()
-                && crate::keymap::InputBarAction::from_chord(key)
-                    == Some(crate::keymap::InputBarAction::CopySelection)
-                && state.input_bar.copy_selection())
+    pub(crate) fn copy_composer_selection(&mut self, key: &KeyEvent) -> bool {
+        let ChatPhase::Active(state) = &mut self.phase else {
+            return false;
+        };
+        if !state.composer_owns_text_input()
+            || crate::keymap::InputBarAction::from_chord(key)
+                != Some(crate::keymap::InputBarAction::CopySelection)
+        {
+            return false;
+        }
+        let Some(result) = state.input_bar.copy_selection() else {
+            return false;
+        };
+        state.set_info_notice(match result {
+            Ok(outcome) => outcome.notice(),
+            Err(error) => crate::clipboard::copy_failure_notice(&error),
+        });
+        true
     }
 
     pub(crate) fn wants_quit_chord(&self, key: &KeyEvent) -> bool {
@@ -7438,10 +7457,6 @@ fn message_copy_label() -> String {
     crate::i18n::t("zc-chat-copy-message")
 }
 
-fn message_copied_label() -> String {
-    crate::i18n::t("zc-chat-copy-message-copied")
-}
-
 #[cfg(test)]
 fn context_menu_copy_selection_label() -> String {
     crate::i18n::t("zc-chat-context-menu-copy-selection")
@@ -8284,7 +8299,7 @@ fn render_copy_feedback(f: &mut Frame, state: &ChatState) {
 
     match feedback.target {
         CopyFeedbackTarget::Code(group) => {
-            let label = message_copied_label();
+            let label = feedback.outcome.label();
             for region in state
                 .copy_hit_regions
                 .iter()
@@ -8296,7 +8311,7 @@ fn render_copy_feedback(f: &mut Frame, state: &ChatState) {
             }
         }
         CopyFeedbackTarget::Overlay(rect) => {
-            render_copied_label(f, &message_copied_label(), rect);
+            render_copied_label(f, &feedback.outcome.label(), rect);
         }
     }
 }
@@ -9739,6 +9754,7 @@ enum CopyFeedbackTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CopyFeedback {
     target: CopyFeedbackTarget,
+    outcome: crate::clipboard::CopyOutcome,
     shown_at: Instant,
 }
 
@@ -9860,7 +9876,7 @@ pub struct ChatState {
     context_copy_regions: Vec<CopyHitRegion>,
     /// Active transcript or queue context menu.
     context_menu: Option<ChatContextMenu>,
-    /// Temporary `[Copied]` overlay for copy labels.
+    /// Temporary overlay for the actual clipboard delivery outcome.
     copy_feedback: Option<CopyFeedback>,
     /// Clickable provider/model title spans from the last draw.
     title_hit_rects: Vec<TitleHitRect>,
@@ -10090,8 +10106,15 @@ impl ChatState {
             .context_menu
             .take()
             .filter(|menu| matches!(menu.target, ChatContextMenuTarget::Queue(_)));
+        // Copy has already cleared its selection. A redraw may only be moving
+        // the viewport for the new info notice; validate feedback against the
+        // next snapshot rather than discarding it before that comparison.
+        let feedback = self
+            .copy_feedback
+            .filter(|_| self.transcript_selection.is_none());
         self.clear_transcript_selection();
         self.context_menu = queue_menu;
+        self.copy_feedback = feedback;
     }
 
     fn begin_transcript_drag(&mut self, column: u16, row: u16) -> bool {
@@ -10275,7 +10298,40 @@ impl ChatState {
             .as_ref()
             .is_some_and(|current| current != &snapshot)
         {
+            let feedback = self.copy_feedback.and_then(|mut feedback| {
+                let current = self.transcript_snapshot.as_ref()?;
+                // Compare transcript-global rows, not their screen positions.
+                // Width or content changes invalidate the original copy target.
+                if current.area.width != snapshot.area.width
+                    || current.total_rows != snapshot.total_rows
+                    || !current
+                        .cells
+                        .keys()
+                        .any(|row| snapshot.cells.contains_key(row))
+                    || current.cells.iter().any(|(row, cells)| {
+                        snapshot.cells.get(row).is_some_and(|next| next != cells)
+                    })
+                {
+                    return None;
+                }
+                if let CopyFeedbackTarget::Overlay(mut rect) = feedback.target {
+                    let x =
+                        i32::from(rect.x) + i32::from(snapshot.area.x) - i32::from(current.area.x);
+                    let y = i32::from(rect.y) + i32::from(snapshot.area.y)
+                        - i32::from(current.area.y)
+                        + i32::from(current.scroll)
+                        - i32::from(snapshot.scroll);
+                    rect.x = u16::try_from(x).ok()?;
+                    rect.y = u16::try_from(y).ok()?;
+                    if rect.intersection(snapshot.area) != rect {
+                        return None;
+                    }
+                    feedback.target = CopyFeedbackTarget::Overlay(rect);
+                }
+                Some(feedback)
+            });
             self.clear_transcript_selection_for_render_change();
+            self.copy_feedback = feedback;
         }
         self.transcript_snapshot = Some(snapshot);
     }
@@ -10407,24 +10463,43 @@ impl ChatState {
                     .as_ref()?
                     .selection_anchor_rect(self.transcript_selection?)
             });
-        if !self.copy_text_and_clear_selection(&text) {
-            return false;
-        }
-        if let Some(anchor) = feedback_anchor {
-            self.set_overlay_copy_feedback(anchor);
-        }
-        true
-    }
-
-    fn copy_text_and_clear_selection(&mut self, text: &str) -> bool {
         if text.is_empty() {
             return false;
         }
-        crate::mouse::copy_osc52(text);
+        if let Some(outcome) = self.copy_text_and_clear_selection(&text)
+            && let Some(anchor) = feedback_anchor
+        {
+            self.set_overlay_copy_feedback(anchor, outcome);
+        }
+        // A failed copy still owns the key and leaves the selection available.
+        true
+    }
+
+    fn copy_text(&mut self, text: &str) -> Option<crate::clipboard::CopyOutcome> {
+        if text.is_empty() {
+            return None;
+        }
+        self.copy_feedback = None;
+        match crate::clipboard::copy_text(text) {
+            Ok(outcome) => {
+                self.set_info_notice(outcome.notice());
+                Some(outcome)
+            }
+            Err(error) => {
+                self.set_info_notice(crate::clipboard::copy_failure_notice(&error));
+                None
+            }
+        }
+    }
+
+    fn copy_text_and_clear_selection(
+        &mut self,
+        text: &str,
+    ) -> Option<crate::clipboard::CopyOutcome> {
+        let outcome = self.copy_text(text)?;
         self.clear_mouse_highlight();
         self.clear_browse_selection();
-        self.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-        true
+        Some(outcome)
     }
 
     fn current_selection_text(&self) -> String {
@@ -12079,15 +12154,20 @@ impl ChatState {
         }
     }
 
-    fn set_overlay_copy_feedback(&mut self, anchor: Rect) {
-        if let Some(rect) = centered_copy_feedback_rect(&message_copied_label(), anchor) {
-            self.set_copy_feedback(CopyFeedbackTarget::Overlay(rect));
+    fn set_overlay_copy_feedback(&mut self, anchor: Rect, outcome: crate::clipboard::CopyOutcome) {
+        if let Some(rect) = centered_copy_feedback_rect(&outcome.label(), anchor) {
+            self.set_copy_feedback(CopyFeedbackTarget::Overlay(rect), outcome);
         }
     }
 
-    fn set_copy_feedback(&mut self, target: CopyFeedbackTarget) {
+    fn set_copy_feedback(
+        &mut self,
+        target: CopyFeedbackTarget,
+        outcome: crate::clipboard::CopyOutcome,
+    ) {
         self.copy_feedback = Some(CopyFeedback {
             target,
+            outcome,
             shown_at: Instant::now(),
         });
     }
@@ -14481,6 +14561,188 @@ mod tests {
     }
 
     #[test]
+    fn terminal_requested_copy_renders_outcome_label_with_matching_width() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use unicode_width::UnicodeWidthStr;
+
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
+        state.browse_cursor = Some(0);
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(10, 1, 20, 1),
+            text: Arc::<str>::from("whole message"),
+            kind: CopyHitKind::Message,
+            group: 0,
+            action: CopyHitAction::Copy,
+        });
+        let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+        crate::clipboard::with_copy_result(Ok(outcome), || {
+            assert!(state.copy_current_selection());
+        });
+        let feedback = state.copy_feedback.expect("requested feedback");
+        assert_eq!(feedback.outcome, outcome);
+        let CopyFeedbackTarget::Overlay(rect) = feedback.target else {
+            panic!("expected overlay");
+        };
+        assert_eq!(
+            usize::from(rect.width),
+            UnicodeWidthStr::width(outcome.label().as_str())
+        );
+        assert_eq!(state.info_message.as_ref().unwrap().text, outcome.notice());
+
+        // Clearing a selection invalidates hit regions; the next draw rebuilds them.
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(10, 1, 20, 1),
+            text: Arc::<str>::from("whole message"),
+            kind: CopyHitKind::Code,
+            group: 0,
+            action: CopyHitAction::Copy,
+        });
+        for target in [
+            CopyFeedbackTarget::Overlay(rect),
+            CopyFeedbackTarget::Code(0),
+        ] {
+            state.set_copy_feedback(target, outcome);
+            let mut terminal = Terminal::new(TestBackend::new(60, 3)).expect("test terminal");
+            terminal
+                .draw(|frame| render_copy_feedback(frame, &state))
+                .expect("draw feedback");
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                rendered.contains(&outcome.label()),
+                "rendered: {rendered:?}"
+            );
+            assert!(!rendered.contains(&crate::clipboard::CopyOutcome::Copied.label()));
+        }
+    }
+
+    #[tokio::test]
+    async fn first_copy_badge_survives_app_notice_resize() {
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for outcome in [
+                crate::clipboard::CopyOutcome::Copied,
+                crate::clipboard::CopyOutcome::TerminalRequested,
+            ] {
+                for code_block in [false, true] {
+                    let (mut chat, _rx) = test_chat();
+                    chat.pane_kind = kind;
+                    let mut code = crate::acp::Acp::new(chat.rpc.clone());
+                    let mut active = state();
+                    for _ in 0..60 {
+                        active.entries.push(ChatEntry::AgentMessage(Arc::from(
+                            "message text\n\n```rust\nlet value = 1;\n```",
+                        )));
+                    }
+                    active.mark_dirty_full();
+                    chat.phase = ChatPhase::Active(Box::new(active));
+                    let (_, before) =
+                        draw_app_notice_frame(crate::app::Mode::Chat, &mut chat, &mut code);
+                    let active = active_state(&mut chat);
+                    let target = if code_block {
+                        let region = active
+                            .copy_hit_regions
+                            .iter()
+                            .rev()
+                            .find(|region| region.kind == CopyHitKind::Code)
+                            .expect("visible code copy target");
+                        CopyFeedbackTarget::Code(region.group)
+                    } else {
+                        let (_, rect) = active.entry_rects.last().expect("visible message");
+                        CopyFeedbackTarget::Overlay(
+                            centered_copy_feedback_rect(&outcome.label(), *rect)
+                                .expect("message feedback rect"),
+                        )
+                    };
+                    crate::clipboard::with_copy_result(Ok(outcome), || {
+                        assert_eq!(
+                            active.copy_text_and_clear_selection("copy payload"),
+                            Some(outcome)
+                        );
+                    });
+                    active.set_copy_feedback(target, outcome);
+                    let (rows, after) =
+                        draw_app_notice_frame(crate::app::Mode::Chat, &mut chat, &mut code);
+                    assert!(
+                        after.height < before.height,
+                        "notice must resize the transcript"
+                    );
+                    assert!(
+                        rows.iter().any(|row| row.contains(&outcome.label())),
+                        "first copy badge missing: {rows:?}"
+                    );
+                    assert!(active_state(&mut chat).copy_feedback.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_keyboard_copy_keeps_transcript_and_browse_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
+        state.browse_cursor = Some(0);
+        state.browse_multi.insert(0);
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 12, 1),
+            &["visible text"],
+        ));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 6, row: 0 },
+            dragged: true,
+        });
+        let selection = state.transcript_selection;
+        state.set_copy_feedback(
+            CopyFeedbackTarget::Overlay(Rect::new(0, 0, 8, 1)),
+            crate::clipboard::CopyOutcome::Copied,
+        );
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer rejected copy");
+        let expected = crate::clipboard::copy_failure_notice(&error);
+        crate::clipboard::with_copy_result(Err(error), || {
+            assert!(
+                state.copy_current_selection(),
+                "an attempted copy owns its key"
+            );
+        });
+        assert_eq!(state.transcript_selection, selection);
+        assert_eq!(state.browse_cursor, Some(0));
+        assert!(state.browse_multi.contains(&0));
+        assert!(
+            state.copy_feedback.is_none(),
+            "failed copy must remove stale success feedback"
+        );
+        assert_eq!(state.info_message.as_ref().unwrap().text, expected);
+    }
+
+    #[test]
+    fn unrelated_copy_keeps_transcript_selection() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
+        let selection = state.transcript_selection;
+        let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+        crate::clipboard::with_copy_result(Ok(outcome), || {
+            assert_eq!(state.copy_text("https://example.com"), Some(outcome));
+        });
+        assert_eq!(state.transcript_selection, selection);
+        assert_eq!(state.info_message.as_ref().unwrap().text, outcome.notice());
+    }
+
+    #[test]
     fn copy_shortcuts_do_not_swallow_normal_y_input() {
         use crate::keymap::ChatTabAction;
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -14807,7 +15069,10 @@ mod tests {
         assert!(state.update_transcript_drag(2, 1));
         state.finish_transcript_drag();
         let selection = state.transcript_selection;
-        state.set_overlay_copy_feedback(Rect::new(0, 0, 5, 2));
+        state.set_overlay_copy_feedback(
+            Rect::new(0, 0, 5, 2),
+            crate::clipboard::CopyOutcome::Copied,
+        );
 
         state.scroll_down(1);
         assert_eq!(state.transcript_selection, selection);
@@ -15050,6 +15315,7 @@ mod tests {
             });
             state.copy_feedback = Some(CopyFeedback {
                 target: CopyFeedbackTarget::Overlay(Rect::new(0, 0, 2, 1)),
+                outcome: crate::clipboard::CopyOutcome::Copied,
                 shown_at: Instant::now(),
             });
 
@@ -30543,6 +30809,7 @@ mod tests {
         });
         s.copy_feedback = Some(CopyFeedback {
             target: CopyFeedbackTarget::Overlay(Rect::new(1, 1, 8, 1)),
+            outcome: crate::clipboard::CopyOutcome::Copied,
             shown_at: Instant::now(),
         });
         s.reset_for_session(
@@ -32210,6 +32477,77 @@ mod tests {
                 "{kind:?}: Esc must close the popup"
             );
             assert!(!state.in_browse_mode());
+        }
+    }
+
+    #[test]
+    fn connected_composer_copy_feedback_reaches_chat_and_code_info_bar() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = runtime.enter();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(rpc));
+            let mut chat = Chat::new(client, kind);
+            let mut active = state();
+            active
+                .input_bar
+                .load_for_edit("selected draft".into(), Vec::new());
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .expect("test terminal");
+            runtime.block_on(chat.handle_key(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                &mut term,
+            ));
+            let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+            crate::clipboard::with_copy_result(Ok(outcome), || {
+                assert!(!runtime.block_on(chat.handle_key(copy, &mut term)));
+            });
+            assert_eq!(
+                active_state(&mut chat).info_message.as_ref().unwrap().text,
+                outcome.notice()
+            );
+            assert_eq!(active_state(&mut chat).input_bar.input(), "selected draft");
+            assert!(active_state(&mut chat).input_bar.has_selection());
+
+            for key in ['c', 'x'] {
+                let error =
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer rejected copy");
+                let expected = crate::clipboard::copy_failure_notice(&error);
+                crate::clipboard::with_copy_result(Err(error), || {
+                    assert!(!runtime.block_on(chat.handle_key(
+                        KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+                        &mut term,
+                    )));
+                });
+                assert_eq!(
+                    active_state(&mut chat).info_message.as_ref().unwrap().text,
+                    expected
+                );
+                assert_eq!(active_state(&mut chat).input_bar.input(), "selected draft");
+                assert!(active_state(&mut chat).input_bar.has_selection());
+                assert!(
+                    chat.wants_quit_chord(&copy),
+                    "failed copy keeps composer ownership"
+                );
+            }
+            assert!(rx.try_recv().is_err(), "composer copy must not issue RPCs");
         }
     }
 
