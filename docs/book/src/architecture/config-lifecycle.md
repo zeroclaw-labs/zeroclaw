@@ -176,10 +176,11 @@ When replacing an existing file, the writer creates a same-directory
 Gateway writes also snapshot the pre-write file and best-effort restore it if
 persistence fails before publishing the new pair.
 
-Two copies outlast the write. `zeroclaw config migrate` and the dashboard's
-migrate keep the pre-migration file as `config.toml.backup`, which the next
-migration replaces. The first rewrite of a file at an older schema version,
-whether a migration or a save from any surface, also copies it to
+The CLI's `zeroclaw config migrate` keeps the pre-migration file as
+`config.toml.backup`, which the next CLI migration replaces. Dashboard migration
+instead writes `config.toml.bak`; the next save can replace that copy, so it is
+not a lasting downgrade backup. The first rewrite of a file at an older schema
+version, whether a migration or a save from any surface, also copies it to
 `config.toml.v<version>.backup` (for example `config.toml.v3.backup`). That
 copy is owner-only, is written once and never replaced, and is the downgrade
 path: an older binary reads it as is. A file already at that name counts only

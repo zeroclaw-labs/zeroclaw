@@ -1404,7 +1404,6 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
     // already succeeded on it), fall back to a fresh serialization.
     if let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>() {
         sync_table(doc.as_table_mut(), &migrated_table);
-        keep_emptied_tables_visible(doc.as_table_mut(), &notices);
         Ok(Some((doc.to_string(), notices)))
     } else {
         let serialized = toml::to_string_pretty(&toml::Value::Table(migrated_table))
@@ -2621,41 +2620,6 @@ fn keep_empty_table_rendered(item: &mut toml_edit::Item) {
     }
 }
 
-/// Give every table on the path to a retired key an explicit header if the
-/// retirement left it empty. An implicit table renders as nothing once empty,
-/// so without this an alias whose only content was retired (for example a
-/// runtime profile that only set `context_compression.summary_model`) would
-/// vanish from the written file while it still exists in the migrated value,
-/// leaving any reference to it dangling.
-fn keep_emptied_tables_visible(root: &mut toml_edit::Table, notices: &[MigrationNotice]) {
-    for notice in notices {
-        let from = match notice {
-            MigrationNotice::Removed { path, .. } => path,
-            MigrationNotice::AssumedV1
-            | MigrationNotice::InferredV3
-            | MigrationNotice::IgnoredEnvOverride { .. } => continue,
-        };
-        let segments: Vec<&str> = from.split('.').collect();
-        let parents = &segments[..segments.len().saturating_sub(1)];
-        let mut table: &mut dyn toml_edit::TableLike = &mut *root;
-        for segment in parents {
-            let Some(item) = table.get_mut(segment) else {
-                break;
-            };
-            if item
-                .as_table_like()
-                .is_some_and(toml_edit::TableLike::is_empty)
-            {
-                keep_empty_table_rendered(item);
-            }
-            let Some(next) = item.as_table_like_mut() else {
-                break;
-            };
-            table = next;
-        }
-    }
-}
-
 fn stamp_schema_version(mut value: toml::Value, version: u32) -> Result<toml::Value> {
     value
         .as_table_mut()
@@ -2780,6 +2744,11 @@ pub(crate) fn sync_table(doc: &mut toml_edit::Table, new: &toml::Table) {
         {
             // Both tables — recurse to preserve nested comments.
             sync_table(doc_sub, new_sub);
+            if new_sub.is_empty() {
+                // The migrated table owns which aliases survive. Retain its
+                // literal keys instead of reconstructing them from notice text.
+                keep_empty_table_rendered(doc_item);
+            }
             continue;
         }
         // Otherwise, replace the value while preserving the key's leading decor.
@@ -8559,40 +8528,38 @@ summary_model = "opus"
     }
 
     #[test]
-    fn structural_migration_keeps_an_emptied_dotted_alias_rendered() {
-        // The V1/V2 route rebuilds the document and then walks each notice's
-        // parents; an empty dotted or implicit alias must still be written.
-        let mut doc: toml_edit::DocumentMut =
-            "a.slow.x = 1\n[b]\nc = { worker.y = 2 }\n".parse().unwrap();
-        doc["a"]["slow"].as_table_like_mut().unwrap().remove("x");
-        doc["b"]["c"]["worker"]
-            .as_table_like_mut()
-            .unwrap()
-            .remove("y");
-        let notices = [
-            MigrationNotice::Removed {
-                path: "a.slow.x".to_string(),
-                reason: "test",
-            },
-            MigrationNotice::Removed {
-                path: "b.c.worker.y".to_string(),
-                reason: "test",
-            },
-        ];
-        keep_emptied_tables_visible(doc.as_table_mut(), &notices);
-        let value: toml::Value = toml::from_str(&doc.to_string()).unwrap();
-        assert!(
-            value["a"]["slow"]
-                .as_table()
-                .is_some_and(toml::Table::is_empty),
-            "{doc}"
-        );
-        assert!(
-            value["b"]["c"]["worker"]
-                .as_table()
-                .is_some_and(toml::Table::is_empty),
-            "{doc}"
-        );
+    fn config_migrate_keeps_quoted_profile_alias_after_retirement() {
+        for version in [2, 3, CURRENT_SCHEMA_VERSION] {
+            for profile in [
+                "[runtime_profiles.\"slow.prod\".context_compression]\nsummary_model = \"haiku\"\n",
+                "runtime_profiles.\"slow.prod\".context_compression.summary_model = \"haiku\"\n",
+                "runtime_profiles = { \"slow.prod\".context_compression.summary_model = \"haiku\" }\n",
+                "runtime_profiles = { \"slow.prod\" = { context_compression = { summary_model = \"haiku\" } } }\n",
+            ] {
+                let raw = format!(
+                    "schema_version = {version}\n{profile}\n[agents.coder]\nruntime_profile = \"slow.prod\"\n"
+                );
+                let (written, _) = migrate_file_with_notices(&raw).unwrap().unwrap();
+                let value: toml::Value = toml::from_str(&written).unwrap();
+                assert!(
+                    value
+                        .get("runtime_profiles")
+                        .and_then(|profiles| profiles.get("slow.prod"))
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(toml::Table::is_empty),
+                    "the literal profile alias must survive V{version} migration:\n{written}"
+                );
+                assert_eq!(
+                    value["agents"]["coder"]["runtime_profile"].as_str(),
+                    Some("slow.prod")
+                );
+                assert!(!written.contains("summary_model"));
+                let load = migrate_to_current_salvaged(&written);
+                assert!(load.config.runtime_profiles.contains_key("slow.prod"));
+                assert!(load.dropped.is_empty() && load.dropped_security.is_empty());
+                assert!(load.notices.is_empty());
+            }
+        }
     }
 
     // ── F2: retirements that used to live outside the table ──
