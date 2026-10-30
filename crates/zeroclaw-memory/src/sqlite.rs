@@ -1084,11 +1084,28 @@ impl SqliteMemory {
                 .collect());
         }
 
-        // Compute query embedding only when needed (skip for BM25-only mode)
-        let query_embedding = if self.search_mode == SearchMode::Bm25 {
-            None
-        } else {
-            self.get_or_compute_embedding(query).await?
+        // Compute query embedding only when needed (skip for BM25-only mode).
+        // In hybrid mode a failing embedder costs the vector stage, not the
+        // keyword results: recall carries on as BM25-only, the same path a
+        // deployment without an embedder takes.
+        let query_embedding = match self.search_mode {
+            SearchMode::Bm25 => None,
+            SearchMode::Embedding => self.get_or_compute_embedding(query).await?,
+            SearchMode::Hybrid => match self.get_or_compute_embedding(query).await {
+                Ok(embedding) => embedding,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                            })),
+                        "memory recall: query embedding failed; using keyword results only"
+                    );
+                    None
+                }
+            },
         };
 
         let conn = self.conn.clone();
@@ -4024,6 +4041,57 @@ mod tests {
         assert_eq!(mem.count().await.unwrap(), 1, "row must be persisted");
         let entry = mem.get("survives").await.unwrap().unwrap();
         assert_eq!(entry.content, "this content must be retained");
+    }
+
+    #[tokio::test]
+    async fn hybrid_recall_keeps_keyword_results_when_embedding_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Hybrid,
+        )
+        .unwrap();
+        mem.store(
+            "budget",
+            "the quarterly budget review is on Friday",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("budget review", 5, None, None, None)
+            .await
+            .expect("recall must not fail when only the embedder does");
+        assert!(
+            hits.iter().any(|entry| entry.key == "budget"),
+            "keyword match must survive an embedder failure: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_only_recall_still_reports_an_embedder_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap();
+
+        assert!(mem.recall("anything", 5, None, None, None).await.is_err());
     }
 
     // ── Embedder hot-swap────────────────────────────────
