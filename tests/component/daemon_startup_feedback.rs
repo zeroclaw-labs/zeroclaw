@@ -51,11 +51,40 @@ s.settimeout(2)
 s.connect(sys.argv[1])
 s.sendall(b'{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"protocol_version\":1},\"id\":1}\n')
 sys.exit(0 if b'\"result\"' in s.recv(4096) else 1)"#;
+    // A build without the gateway has no HTTP endpoint; only the socket must answer.
+    let gateway_probe = if cfg!(feature = "gateway") {
+        let health = format!("http://127.0.0.1:{port}/health");
+        format!("until curl -fsS --max-time 2 {health} >/dev/null; do sleep 0.05; done; ")
+    } else {
+        String::new()
+    };
     format!(
-        "until curl -fsS --max-time 2 http://127.0.0.1:{port}/health >/dev/null; do sleep 0.05; done; until python3 -c {} {}; do sleep 0.05; done; echo ENDPOINTS_READY",
+        "{gateway_probe}until python3 -c {} {}; do sleep 0.05; done; echo ENDPOINTS_READY",
         shell_quote_text(rpc_probe),
         shell_quote(socket),
     )
+}
+
+/// The daemon's JSON-RPC handshake, sent as one line on its socket.
+const RPC_INITIALIZE: &str =
+    r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocol_version":1},"id":1}"#;
+
+fn rpc_initialize_ok(socket: &Path) -> bool {
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) else {
+        return false;
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+        || writeln!(stream, "{RPC_INITIALIZE}").is_err()
+    {
+        return false;
+    }
+    let mut response = [0_u8; 4096];
+    let Ok(read) = stream.read(&mut response) else {
+        return false;
+    };
+    String::from_utf8_lossy(&response[..read]).contains("\"result\"")
 }
 
 fn http_status(port: u16, request: &[u8]) -> Option<u16> {
@@ -135,50 +164,62 @@ allowed_numbers = ["1234567890"]
             .spawn()
             .unwrap();
 
+        // With the gateway, readiness is its HTTP health; without it, the socket.
+        let socket = config_dir.path().join("data").join("daemon.sock");
         let health_request =
             b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut health_status = None;
+        let mut ready = false;
         let mut early_exit = None;
         while Instant::now() < deadline {
             if let Some(status) = child.try_wait().unwrap() {
                 early_exit = Some(status);
                 break;
             }
-            health_status = http_status(port, health_request);
-            if health_status == Some(200) {
+            ready = if cfg!(feature = "gateway") {
+                health_status = http_status(port, health_request);
+                health_status == Some(200)
+            } else {
+                rpc_initialize_ok(&socket)
+            };
+            if ready {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        if early_exit.is_some() || health_status != Some(200) {
+        if early_exit.is_some() || !ready {
             let _ = child.kill();
             let output = child.wait_with_output().unwrap();
             panic!(
-                "{case} daemon failed before health readiness: exit={early_exit:?}, health={health_status:?}\nstdout:\n{}\nstderr:\n{}",
+                "{case} daemon failed before readiness: exit={early_exit:?}, health={health_status:?}\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr),
             );
         }
 
-        let body = r#"{"text":"hello","waId":"1234567890","fromMe":false}"#;
-        let request = format!(
-            "POST /wati HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let post_status = http_status(port, request.as_bytes());
+        let post_status = cfg!(feature = "gateway").then(|| {
+            let body = r#"{"text":"hello","waId":"1234567890","fromMe":false}"#;
+            let request = format!(
+                "POST /wati HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            http_status(port, request.as_bytes())
+        });
 
         let _ = child.kill();
         let output = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        assert_eq!(health_status, Some(200), "{case}: daemon health");
-        assert!(
-            matches!(post_status, Some(404 | 405)),
-            "{case}: retired POST /wati must be unavailable, got {post_status:?}"
-        );
+        if let Some(post_status) = post_status {
+            assert_eq!(health_status, Some(200), "{case}: daemon health");
+            assert!(
+                matches!(post_status, Some(404 | 405)),
+                "{case}: retired POST /wati must be unavailable, got {post_status:?}"
+            );
+        }
         assert!(
             stderr.contains("retired WATI channel config section")
                 && stderr.contains(expected_path),

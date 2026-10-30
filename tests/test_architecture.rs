@@ -37,3 +37,6 @@ mod rpc_proto_boundary;
 mod plugin_webhook_boundary;
 #[path = "architecture/stream_error_terminal.rs"]
 mod stream_error_terminal;
+
+#[path = "architecture/gateway_feature_edges.rs"]
+mod gateway_feature_edges;
